@@ -3787,3 +3787,52 @@ typecheck clean; the worktree's web VITEST cannot run at all (`Cannot find packa
 same broken `node_modules`), so the 4 web files are typecheck-verified only. NOT yet verified: the review
 page's rendering of the kept skills (the tracker push 401'd — the site session expired mid-session), and
 the rehearse path's manual/continue re-entry.
+
+## 2026-08-09 — `debugLagTrace`: attributing a pause to Workday, the channel, or us
+
+**The ask.** Operator: "sometimes random things lag and it is not always the render of a dropdown — a lot
+of times it just randomly will start filling slower, and I want to debug to see if it really is a workday
+thing or if it is some type of bug in my code."
+
+**Why the existing logs could not answer it.** `[CDP-TIME]` says WHERE a page's time went (settle / flat /
+capture / audit) and `debugPageTrace` times every action ≥120ms — but both report DURATIONS, and a duration
+is equally consistent with Workday thinking, the debugger channel being slow, and our own service worker
+being blocked. Nothing distinguished them, which is how earlier rounds ended up blaming Workday for what
+turned out to be ours (the 2026-08-06 relocation bug).
+
+**What was built.** A `debugLagTrace` flag, instrumenting the ONE choke point every CDP command already
+flows through (`cdpSend`, split into a recording wrapper over `cdpSendRaw`). Three clocks that fail
+independently: the service worker's own 500ms timer DRIFT (only we can cause it), a no-op
+`Runtime.evaluate("1")` page probe, and every command timed by method. Each slow command prints its own
+verdict; each page prints a `[LAG]` summary with probe p50/p95, drift, command counts, and worker/attach
+age. Flag OFF ⇒ `cdpSend` is a straight pass-through, so the instrumentation cannot distort what it
+measures.
+
+**A design error, caught by the data and fixed.** The first cut labelled a slow no-op "TRANSPORT". That is
+backwards: `Runtime.evaluate` is scheduled ON the page's main thread, so it cannot separate a jammed
+renderer from a slow channel. A browser-process probe (`Browser.getVersion`) was added to split them and
+then REMOVED — browser-domain commands are not served on a tab-scoped attach, so it reported `–` on every
+beat of two runs while still costing a failing round trip each time. It was also unnecessary: the page
+probe's round trip cannot be faster than the channel, so its **p50 of 1ms across ~1500 commands is itself
+the proof the channel is not a lag source**.
+
+**Three back-to-back runs, cat.wd5/solarturbines, three virgin reqs** (different reqs on purpose, so
+Workday's draft state could not confound the timings), all `visible-fast | painting (visible)`, all
+reaching the REVIEW page. Findings, in order of size:
+
+1. **The LLM provider is the dominant random variable.** `gemini-3.1-flash-lite` answered in 486ms, 646ms
+   and 796ms — and once, same model, same config, same session, in **30657ms**: one attempt, no retry, no
+   key rotation, finishing 343ms inside `LLM_REQUEST_TIMEOUT_MS`. That single call is the entire difference
+   between run 3's 1.9s page 5 and run 2's **32s** page 5 (`flat 31.3s`, `slowest: disabilityForm 31s`).
+   Not Workday, not the fill code.
+2. **`capture` / `scrapeTaOptions` is the largest cost we own — but it is deterministic, not random.**
+   2.0–3.3s per scraped list, scaling with list size; run 1's page 3 spent **16.3s of its 20.5s** there.
+   Worth optimising, but it is not the "randomly slower" the operator is seeing.
+3. **SW timer drift spikes of 1–2.4s appear in all three runs and are NOT yet explained.** Deliberately
+   recorded as unresolved: it is measured with a timer inside an MV3 worker, so part of it may be Chrome
+   deprioritising worker timers rather than a stall that delays the fill. It did not track `capture` time
+   (run 2 page 2: 9s capture, probe p95 16ms), so the obvious hypothesis is already refuted.
+
+**Also corrected:** the live-testing skill claimed `LLM_REQUEST_TIMEOUT_MS` was 20s; it is 30000.
+
+Extension **1174/1175** (`db.test.js` still fails on the missing `fake-indexeddb`).

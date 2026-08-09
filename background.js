@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "pastauth-1";
+const AP_BUILD_MARKER = "lagtrace-2";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -551,7 +551,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -2991,6 +2991,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     const _aiBatch = !(await new Promise((r) => chrome.storage.local.get("disableAiBatch", (v) => r(!!(v && v.disableAiBatch)))));
     const _dbgClobber = await new Promise((r) => chrome.storage.local.get("debugClobber", (v) => r(!!(v && v.debugClobber))));
     const _dbgTrace = await new Promise((r) => chrome.storage.local.get("debugPageTrace", (v) => r(!!(v && v.debugPageTrace))));
+    // Lag trace: start the heartbeat as early as possible so the pre-fill settle is inside the window
+    // too — a page that "starts slow" is often already slow before the first field is touched.
+    const _dbgLag = await new Promise((r) => chrome.storage.local.get("debugLagTrace", (v) => r(!!(v && v.debugLagTrace))));
+    if (_dbgLag) { cdpLagStart(); LOG(`debugLagTrace ON — timing every CDP command, plus a ${500}ms no-op probe and the SW's own scheduling drift, so a pause can be blamed on Workday / the transport / us.`); }
     if (_dbgTrace) LOG(`debugPageTrace ON — streaming a [TRACE] line for every field decision and every wait on page ${(opts && opts.pageNumber) || "?"}.`);
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
@@ -3124,6 +3128,11 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     let paint = "?"; try { paint = await cdpPaintLabel(); } catch (e) { /* label only */ }
     pacing = pacing + " | " + paint;
     LOG(`[CDP-TIME] pacing ${pacing} | settle ${s(settleMs)} | fill ${s(fillMs)} (flat ${s(ph.flat)} · sections ${s(ph.sections)} · stubs ${s(ph.stubs)} · cascade ${s(ph.cascade)}+${s(ph["cascade-late"])} · capture ${s(ph.capture)} · audit ${s(ph.audit)} · sweep ${s(ph.sweep)}) | resume ${s(attachMs)}${slow ? ` | slowest: ${slow}` : ""}`);
+    // The lag decomposition for the SAME page, drained and reset here so consecutive pages of one run
+    // are directly comparable. A run that "randomly gets slower" shows up as the no-op rtt and/or the
+    // SW drift climbing while the command COUNT stays flat — that is the tell that the extra seconds
+    // are not Workday doing more work.
+    try { const lag = cdpLagReport(`page ${(opts && opts.pageNumber) || "?"}`); if (lag) LOG(lag); } catch (e) { /* log-only */ }
   }
 
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches

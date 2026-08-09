@@ -75,6 +75,7 @@ function cdpAttach(tabId) {
         return;
       }
       cdpTabId = tabId;
+      cdpAttachedAt = Date.now();              // lag trace: "does this degrade the longer one attach lives?"
       try { chrome.storage.local.remove("lastRunAbort"); } catch (e) { /* ignore */ } // fresh session — drop any prior operator-cancel marker
       _visCache = { visible: false, at: 0 };   // fresh foreground sampling per run (adaptive pacing)
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
@@ -118,6 +119,8 @@ function cdpDetach() {
       void chrome.runtime.lastError;
       console.log("[ApplyPilot][CDP] detached from tab", id);
       cdpTabId = null;
+      cdpAttachedAt = 0;
+      cdpLagStop();   // the heartbeat probes over the attach — it must never outlive it
       resolve();
     });
   });
@@ -125,7 +128,7 @@ function cdpDetach() {
 
 // Promisified sendCommand against the tracked tab. Rejects on no-attach and on
 // command errors (so callers' try/catch sees real failures, not undefineds).
-function cdpSend(method, params) {
+function cdpSendRaw(method, params) {
   return new Promise((resolve, reject) => {
     if (cdpTabId === null) { reject(new Error("CDP not attached")); return; }
     chrome.debugger.sendCommand({ tabId: cdpTabId }, method, params || {}, (result) => {
@@ -133,6 +136,147 @@ function cdpSend(method, params) {
       else resolve(result);
     });
   });
+}
+
+// Every CDP command flows through here, so it is the one place that can time ALL of them. When the
+// lag trace is off this is a straight pass-through — the instrumentation must not be able to change
+// the timings it exists to measure.
+function cdpSend(method, params) {
+  if (!cdpLagOn) return cdpSendRaw(method, params);
+  const s0 = Date.now();
+  return cdpSendRaw(method, params).then(
+    (r) => { cdpLagNote(method, Date.now() - s0, null); return r; },
+    (e) => { cdpLagNote(method, Date.now() - s0, e); throw e; }
+  );
+}
+
+// ── LAG TRACE (2026-08-09, debugLagTrace) ────────────────────────────────────────────────────────
+// Operator: "sometimes it randomly starts filling slower — is it a Workday thing or a bug in my
+// code?" You cannot answer that from a duration alone: "this field took 4s" is equally consistent
+// with Workday thinking, with the debugger transport being slow, and with our own service worker
+// being blocked. So measure THREE independent clocks and let them disagree:
+//
+//   1. SW scheduling DRIFT — a fixed-interval timer's ACTUAL vs EXPECTED fire time. The interval is
+//      ours and touches nothing else, so a spike means the service worker's own event loop was
+//      blocked (our JS, or Chrome GC/suspension). Workday cannot cause this.
+//   2. NO-OP CDP round trip — Runtime.evaluate("1"). Crosses the whole debugger transport but runs
+//      no Workday code and touches no DOM. A spike means the transport/browser, not the tenant.
+//   3. REAL command duration — every cdpSend, by method. Subtract (2) and what remains is the page
+//      genuinely thinking, i.e. Workday.
+//
+// Without (1) and (2), every pause looks like "the page was slow" — the assumption that has already
+// sent debugging rounds in the wrong direction (the 2026-08-06 relocation bug was ours, not Workday's).
+let cdpLagOn = false;
+let cdpLagWin = null;    // the CURRENT accumulation window; cdpLagReport() drains and resets it per page
+let cdpLagTimer = null;
+let cdpLagBeatAt = 0;
+let cdpAttachedAt = 0;   // for "does this get worse the longer one attach lives?" (the stale-state suspicion)
+const CDP_LAG_BEAT_MS = 500;      // heartbeat interval — fine enough to catch a 1s stall, cheap enough to ignore
+const CDP_LAG_SLOW_CMD_MS = 400;  // stream a line for any SINGLE command at/over this, with its blame
+const CDP_LAG_DRIFT_MS = 400;     // stream a line when the SW loop itself stalls this long
+
+function cdpLagFresh() { return { t0: Date.now(), cmds: new Map(), beats: [] }; }
+
+function cdpLagPct(arr, p) {
+  if (!arr || !arr.length) return null;
+  const a = arr.slice().sort((x, y) => x - y);
+  return a[Math.min(a.length - 1, Math.floor(a.length * p))];
+}
+
+// Median no-op round trip over the recent beats — the "what does a round trip cost RIGHT NOW"
+// baseline that every real command is judged against.
+function cdpLagBaseline() {
+  const w = cdpLagWin;
+  if (!w) return null;
+  const r = w.beats.slice(-12).map((b) => b.rtt).filter((x) => typeof x === "number");
+  return r.length ? cdpLagPct(r, 0.5) : null;
+}
+
+// The whole point of the subsystem: one attribution per slow command.
+function cdpLagBlame(ms, p) {
+  if (p == null) return "no baseline yet";
+  if (p >= ms * 0.5) return `RENDERER BLOCKED — a trivial page eval also costs ~${p}ms right now, so the page's main thread is jammed; the [CDP-TIME] phase breakdown says whose work that is`;
+  if (p >= 200) return `MIXED — the page thread is already ~${p}ms behind, and this command added ~${ms - p}ms of its own`;
+  return `THIS COMMAND'S OWN WORK — a trivial page eval costs ~${p}ms right now, so the channel and the page thread are both free and ~${ms}ms is what this call genuinely took`;
+}
+
+function cdpLagNote(method, ms, err) {
+  const w = cdpLagWin;
+  if (!w) return;
+  let e = w.cmds.get(method);
+  if (!e) { e = { n: 0, total: 0, max: 0, all: [] }; w.cmds.set(method, e); }
+  e.n++; e.total += ms;
+  if (ms > e.max) e.max = ms;
+  if (e.all.length < 5000) e.all.push(ms);   // bounded: a long run must not grow memory without limit
+  if (ms >= CDP_LAG_SLOW_CMD_MS) {
+    const base = cdpLagBaseline();
+    console.log(`[ApplyPilot][LAG] ⏳ ${method} ${ms}ms — ${cdpLagBlame(ms, base)}${err ? " (errored)" : ""}`);
+  }
+}
+
+function cdpLagStart() {
+  const first = !cdpLagOn;
+  cdpLagOn = true;
+  // Idempotent: called at the top of every page, but only the FIRST call opens a window — a later
+  // call must not wipe the one the current page is still accumulating into.
+  if (first || !cdpLagWin) cdpLagWin = cdpLagFresh();
+  if (cdpLagTimer) return;
+  cdpLagBeatAt = Date.now();
+  cdpLagTimer = setInterval(async () => {
+    const now = Date.now();
+    const drift = now - cdpLagBeatAt - CDP_LAG_BEAT_MS;   // >0 ⇒ the SW loop was busy or suspended
+    cdpLagBeatAt = now;
+    let rtt = null;
+    if (cdpTabId !== null) {
+      // ONE probe: a trivial expression that must nonetheless be scheduled ON the page's main thread.
+      // It measures transport AND renderer availability together, which is enough to separate them:
+      // the round trip cannot be FASTER than the transport, so a p50 of ~1ms (measured across all
+      // three 2026-08-09 runs) proves the debugger channel is not a source of lag — and any spike is
+      // therefore the renderer being busy, not the channel.
+      //
+      // A second, browser-process probe (Browser.getVersion) was tried here to split those two apart
+      // and is deliberately gone: browser-domain commands are not served on a TAB-scoped attach, so it
+      // reported "–" on every beat of runs 2 and 3 while still costing a failing round trip each time.
+      // cdpSendRaw, NOT cdpSend — the probe must stay out of the stats it is the baseline for.
+      const s0 = Date.now();
+      try { await cdpSendRaw("Runtime.evaluate", { expression: "1", returnByValue: true }); rtt = Date.now() - s0; }
+      catch (e) { rtt = null; }   // detached / navigating — absence of a reading, not a slow reading
+    }
+    const w = cdpLagWin;
+    if (!w) return;
+    w.beats.push({ at: now, drift, rtt });
+    if (drift >= CDP_LAG_DRIFT_MS) {
+      console.log(`[ApplyPilot][LAG] ⛔ the SERVICE WORKER itself stalled ${drift}ms (expected a beat every ${CDP_LAG_BEAT_MS}ms) — this is OUR side, not Workday`);
+    }
+  }, CDP_LAG_BEAT_MS);
+}
+
+function cdpLagStop() {
+  cdpLagOn = false;
+  if (cdpLagTimer) { clearInterval(cdpLagTimer); cdpLagTimer = null; }
+  cdpLagWin = null;
+}
+
+// Drain the window and return one summary line (or null when the trace is off). Called per page, so
+// consecutive pages of the SAME run can be compared — which is how a run that "randomly gets slower"
+// shows itself: the no-op rtt and the SW drift climb while the command COUNT stays flat.
+function cdpLagReport(label) {
+  const w = cdpLagWin;
+  if (!cdpLagOn || !w) return null;
+  cdpLagWin = cdpLagFresh();
+  const rtts = w.beats.map((b) => b.rtt).filter((x) => typeof x === "number");
+  const drifts = w.beats.map((b) => b.drift).filter((x) => typeof x === "number");
+  const entries = [...w.cmds.entries()];
+  const nCmd = entries.reduce((s, [, e]) => s + e.n, 0);
+  const totMs = entries.reduce((s, [, e]) => s + e.total, 0);
+  const top = entries.sort((a, b) => b[1].total - a[1].total).slice(0, 4)
+    .map(([m, e]) => `${m} ×${e.n} tot ${(e.total / 1000).toFixed(1)}s p95 ${cdpLagPct(e.all, 0.95)}ms max ${e.max}ms`);
+  const n = (x) => (x == null ? "–" : x + "ms");
+  return `[LAG] ${label} · ${nCmd} cmds, ${(totMs / 1000).toFixed(1)}s total in CDP`
+    + ` · PAGE-thread probe p50 ${n(cdpLagPct(rtts, 0.5))} p95 ${n(cdpLagPct(rtts, 0.95))} max ${n(rtts.length ? Math.max(...rtts) : null)}`
+    + ` · SW drift p95 ${n(cdpLagPct(drifts, 0.95))} max ${n(drifts.length ? Math.max(...drifts) : null)}`
+    + ` · worker age ${Math.round((Date.now() - AP_DEV_WORKER_START) / 1000)}s, attach age ${cdpAttachedAt ? Math.round((Date.now() - cdpAttachedAt) / 1000) + "s" : "–"}`
+    + (top.length ? ` · top: ${top.join(" | ")}` : "");
 }
 
 // Best-effort page WAKE: nudge a backgrounded tab out of Chrome's FROZEN lifecycle so Workday's

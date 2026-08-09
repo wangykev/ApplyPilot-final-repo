@@ -45,8 +45,14 @@ localStorage, run `switch_browser` and have the operator reconnect.
 
 **Two traps this session cost real time:**
 - **A 91-second LLM call.** `llm.js` had no request timeout, so one stalled fetch dragged a page fill from
-  ~10s to 100.1s. Now capped at 20s (`LLM_REQUEST_TIMEOUT_MS`). If a page suddenly takes ~100s, check the
-  `[LLM] ok in …ms` lines FIRST — every other call that run was 0.4–1.5s.
+  ~10s to 100.1s. Now capped by `LLM_REQUEST_TIMEOUT_MS`, which is **30000, not the 20s this doc claimed
+  until 2026-08-09**. If a page suddenly takes ~30s or ~100s, check the `[LLM] ok in …ms` lines FIRST.
+- **THE provider is the single biggest source of "it randomly got slower" (measured 2026-08-09).** Three
+  back-to-back cat.wd5 runs: `gemini-3.1-flash-lite` answered in **486ms, 646ms and 796ms** — and once, on
+  the same model with the same config in the same session, in **30657ms**. One attempt, no retry, no key
+  rotation; it simply took that long, finishing 343ms inside the timeout. That ONE call was the whole
+  difference between a 1.9s page and a 32s page. Before blaming a tenant or the fill code for a slow page,
+  subtract the `[LLM]` line — the variance there dwarfs everything else on the page.
 - **Re-running one requisition.** Three runs on the same nvidia req produced a page-2 block naming four
   required-and-empty work-experience fields that the DOM plainly showed filled. A FRESH req sailed through
   with zero errors. Prefer a new requisition over re-running one; if you must re-run, expect Workday's
@@ -88,6 +94,32 @@ misbehaves, turn one on and re-run rather than reasoning from the outcome.
 | `debugAiPrompts` | The questions + options of every `act.llm` call, batched or per-field (the profile blob is stripped). |
 | `debugClobber` | Re-scans after EVERY field and names any OTHER field that changed underneath it — value changed, vanished, or appeared. Costs a scan per field. |
 | `enableAiBatch` | One AI call per page instead of one per question (opt-in). |
+| `debugLagTrace` | **Answers "was that pause Workday or us?"** — see below. Times EVERY CDP command at the `cdpSend` choke point, runs a 500ms no-op page probe, and measures the service worker's own timer drift. Streams `⏳`/`⛔` lines live and prints one `[LAG]` summary per page. |
+
+### `debugLagTrace` — attributing a pause instead of guessing (2026-08-09)
+
+A duration alone cannot tell you who was slow: "this field took 4s" fits Workday thinking, the debugger
+channel being slow, and our own service worker being blocked, equally well. So it measures three clocks
+that fail independently:
+
+- **SW scheduling drift** — a 500ms `setInterval`'s actual vs expected fire time. Only our worker can
+  cause this. ⚠ It is measured with a timer INSIDE an MV3 worker, so some of it may be Chrome
+  deprioritising worker timers rather than a stall that actually delays the fill — do not treat drift
+  alone as proof of a problem until it is shown to track real slowness.
+- **No-op page probe** — `Runtime.evaluate("1")`. Trivial, but must be scheduled on the page's main
+  thread. Its **p50 also bounds transport latency from above**: across ~1500 commands in three runs the
+  p50 was **1ms**, which is what rules the debugger channel out as a lag source. A spike therefore means
+  the RENDERER is jammed, not the channel. (A second browser-process probe was tried and removed —
+  browser-domain commands are not served on a tab-scoped attach.)
+- **Per-command timing** by method, so a slow command can be compared against the live baseline.
+
+Each slow command prints its own verdict — `THIS COMMAND'S OWN WORK` vs `RENDERER BLOCKED` vs `MIXED`.
+When the flag is off, `cdpSend` is a straight pass-through, so the instrumentation cannot distort the
+timings it exists to measure.
+
+**Reading it:** a slow `Runtime.evaluate` is NOT automatically a bug — many of our evals are page-side
+polls that wait by design. The useful signal is the *pairing*: a multi-second command while the no-op
+probe still reads ~1ms means that call genuinely did that much work.
 
 Always-on, no flag needed: `[AI-BATCH]` + `[AI-BATCH-RECON]` (one line per page: candidates, opens, served
 vs fell-back) and **`⚠ REMOUNT`**, which is now an ALARM — see below.

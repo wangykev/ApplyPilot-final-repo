@@ -324,6 +324,28 @@ Now gated: `aiFillField`, `aiCanonicalizeField`, and the employment-status dropd
 Corollary for triage: value GONE ⇒ plausibly Workday (rare). Value CHANGED to another real option ⇒
 ours — look for a lingering list, a stale rect, or a second write, in that order.
 
+## A SLOW page is the LLM until proven otherwise (measured 2026-08-09)
+
+**Subtract the `[LLM]` line before blaming a tenant, the DOM, or the fill code for a slow page.** Provider
+latency is the biggest random variable in the whole pipeline and it dwarfs everything else on the page:
+across three back-to-back cat.wd5 runs `gemini-3.1-flash-lite` answered in 486ms, 646ms and 796ms — and
+once, same model, same config, same session, in **30657ms** (one attempt, no retry, no key rotation,
+finishing 343ms inside the 30s `LLM_REQUEST_TIMEOUT_MS`). That single call was the entire difference
+between a 1.9s page and a **32s** page. A page that "randomly filled slower" is this until the log says
+otherwise.
+
+Rank of per-page cost, from those runs: **LLM (0.5–30s, random)** › `capture`/`scrapeTaOptions` (2–16s,
+OURS but deterministic — it scales with the option-list size) › everything else. The debugger channel is
+NOT a factor: the no-op page probe's p50 is 1ms across ~1500 commands.
+
+**`debugLagTrace`** (`AP_DEV_FLAG`) is the tool that settles it, and it exists because a duration alone
+never could: it times every CDP command at the `cdpSend` choke point, runs a 500ms no-op page probe, and
+measures the service worker's own timer drift — three clocks that fail independently, so each slow command
+prints whether it was the renderer, the channel, or that call's own work. OFF ⇒ pass-through, so it cannot
+distort what it measures. Detail + how to read it: the `live-testing` skill. **Unresolved:** SW timer drift
+spikes of 1–2.4s in every run, not yet tied to anything (and possibly an artefact of timing with a timer
+inside an MV3 worker) — do not treat drift alone as a problem until it is shown to track real slowness.
+
 ## Working principles
 
 - **`apMatch` is TWO objects — Node gets all of lib.js, the SW gets a HAND-WRITTEN literal.** `fill-driver.js` reaches lib.js through `apMatch`, which is `require("./lib.js")` under Node but an explicit object literal in the service worker. So `apMatch.foo(...)` can pass every test and throw `apMatch.foo is not a function` in the browser — live 2026-07-28, the replay walk died mid-run on `apMatch.dateOrderOf` after the collision fix routed the call sites through it. **Adding a lib.js helper that fill-driver uses means updating BOTH: lib.js's `module.exports` AND the SW literal.** Guarded by `test/sw-globals.test.js` (every `apMatch.X` used must be in the literal, and every literal key must be exported by lib.js — both verified to FAIL when broken).
