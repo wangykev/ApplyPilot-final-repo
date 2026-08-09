@@ -4249,8 +4249,24 @@ rather than announcing a form we are not on), and returns `resume_autofilled`, w
 test on either exit alone passes. Every post-auth `reached_form` exit must have an `onResumeUploadPage`
 consult above it; verified to FAIL before the fix, naming `background.js:7508`. Suite 1236/1236.
 
-⚠ **NOT live-exercised.** The post-fix hidden run on moog took `"Continue Application (returning user)"` —
-the account is now signed in and the application exists, so Workday offers Continue instead of the Apply
-chooser, and the Autofill path never ran. Its clean bundle (first page `apply|addressLine1,…,source`,
-19 fields, no junk page) is therefore consistent with the fix but proves nothing about it. Exercising it
-needs a FRESH posting on a signed-OUT session, which is the state that produced the bug.
+**LIVE-VERIFIED on the signed-OUT path (moog.wd5, hidden).** The first post-fix run took
+`"Continue Application (returning user)"` — signed in, application already open — so the Autofill path
+never ran and its clean bundle proved nothing. The operator signed the account out, which is what puts
+Workday back on the Apply chooser; the re-run then exercised the exact broken branch:
+
+    Stage 2 — clicking "Autofill with Resume"
+    Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage
+    Stage 3 — auth screen detected                     [signs in]
+    uploading the résumé for Workday's autofill parse (Kevin's Hardware Resume.pdf)…   <- the fix
+    clicked "Continue (after the résumé upload)."                                       <- the fix
+    résumé page done — Workday parsed it; the next page has 2 field(s).
+    reached the form
+
+Result: **zero `autofillWithResume|` bundle pages**, the first saved page is the real form
+(`apply|addressLine1,…` +19), and page 2 came back `+34` fields INCLUDING `skills` — the résumé-parse
+benefit this path exists for. Ran through to the review page in 185s and reported 200; nothing submitted.
+
+**Technique worth keeping:** to re-test onboarding paths that only occur for a signed-OUT user, sign the
+tester account out of the tenant first. A signed-in session with an open application gets "Continue
+Application" instead of the Apply chooser, so the whole Autofill branch is unreachable — which is exactly
+why this bug survived a full day of testing.
