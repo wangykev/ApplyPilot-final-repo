@@ -23,3 +23,6 @@ Thumbs.db
 # Claude Code worktrees live OUTSIDE this repo (see .claude/settings.local.json
 # WorktreeCreate hook). Never track worktree contents — build output, deps, copies.
 .claude/worktrees/
+
+# local dev-server log (never commit)
+web/nextdev.log
