@@ -544,3 +544,31 @@ test("reconcile: a THIRD date is still a real DISAGREE — accepting two values 
   );
   assert.strictEqual(r.counts.disagree, 1);
 });
+
+// ── one job must key the same from its posting URL and its form URL (moog/hp live 2026-08-09) ──
+// The req-id tiers exist because the path is NOT stable: Workday's form URL carries an "en-US/" locale
+// segment and percent-encodes the location ("Buffalo%2C-NY") while the posting link has neither. Moog's
+// id is R-26-18835 — a separator between the letters and the digits, which the "_R<digits>" tier and the
+// letters+digits tier both required to be absent — so every tier missed, the key fell to the path, and
+// the submit rehearsal REFUSED its own approved bundle ("no approved bundle for job_key …").
+{
+  const { canonicalJobUrl } = require("../lib.js");
+  const { test: t2 } = require("node:test");
+  t2("canonicalJobUrl: the posting URL and the form URL of one job produce ONE key", () => {
+    const same = (a, b, label) => assert.strictEqual(canonicalJobUrl(a), canonicalJobUrl(b), label);
+    same("https://moog.wd5.myworkdayjobs.com/MOOG_External_Career_Site/job/Buffalo-NY/Intern--Electrical-Engineering_R-26-18835",
+         "https://moog.wd5.myworkdayjobs.com/en-US/MOOG_External_Career_Site/job/Buffalo%2C-NY/Intern--Electrical-Engineering_R-26-18835/apply/autofillWithResume",
+         "moog: separator in the req id (R-26-18835)");
+    same("https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/Corvallis-Oregon/Internship_3167270-1",
+         "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/Corvallis%2C-Oregon/Internship_3167270-1/apply",
+         "hp: numeric id with a -1 suffix");
+    // both key off the requisition, not the path
+    assert.strictEqual(canonicalJobUrl("https://moog.wd5.myworkdayjobs.com/x/job/y/z_R-26-18835"), "wd5:r-26-18835");
+    assert.strictEqual(canonicalJobUrl("https://hp.wd5.myworkdayjobs.com/x/job/y/z_3167270-1"), "wd5:3167270-1");
+
+    // REGRESSION: every key that already worked must be byte-identical, or stored bundles orphan.
+    assert.strictEqual(canonicalJobUrl("https://marvell.wd1.myworkdayjobs.com/en-US/MarvellCareers/job/San-Diego%2C-CA/Sr-Principal-SoC-Verification-Engineer_2601615/apply"), "wd1:2601615");
+    assert.strictEqual(canonicalJobUrl("https://x.wd5.myworkdayjobs.com/site/job/Loc/Title_R438146"), "wd5:r438146");
+    assert.strictEqual(canonicalJobUrl("https://copart.wd1.myworkdayjobs.com/site/job/Harrisburg%2C-PA/Title_JR109393"), "wd1:jr109393");
+  });
+}

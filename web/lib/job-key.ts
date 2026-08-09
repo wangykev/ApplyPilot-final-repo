@@ -21,7 +21,14 @@ export function canonicalJobUrl(u: string): string {
     // computed it from the pasted one. Any letters+digits requisition token now keys the same way.
     // The _R tier above is untouched and still matches FIRST, so every existing wdN:r<digits> key is
     // byte-identical — only URLs that had no key at all get one.
-    const alt = (p.pathname.match(/_([A-Za-z]{1,4}\d[\w-]*?)(?=\/|$)/g) || []).pop();
+    // …including ids that SEPARATE the letter prefix from the digits (2026-08-09). Moog posts
+    // `…-Engineering_R-26-18835`: the "_R<digits>" tier needs a digit straight after the R, and this
+    // tier needed one straight after the letters, so BOTH missed and the key fell to the path — which
+    // differs between the posting URL and the form URL by an "en-US/" locale segment AND the location
+    // spelling ("Buffalo-NY" vs "Buffalo%2C-NY"). One job, two keys, and the rehearsal REFUSED its own
+    // approved bundle. Allowing one separator keys both URLs off the requisition instead, which is the
+    // whole point of these tiers: the req id is identical in every spelling of the link.
+    const alt = (p.pathname.match(/_([A-Za-z]{1,4}[-_]?\d[\w-]*?)(?=\/|$)/g) || []).pop();
     if (alt) return (dc || "wd") + ":" + alt.slice(1).toLowerCase();
     // A purely NUMERIC requisition id (2026-08-09). Marvell posts `…-Engineer_2601615` — no "R", no
     // letter prefix — so it matched neither tier above and fell through to the path fallback, which is
@@ -32,7 +39,9 @@ export function canonicalJobUrl(u: string): string {
     // Same failure the letters+digits tier was added for on 2026-08-03, one character narrower.
     // Ordered AFTER both tiers above, so every existing key stays byte-identical; ≥4 digits so an
     // ordinary path number can't be mistaken for a requisition.
-    const num = (p.pathname.match(/_(\d{4,})(?=\/|$)/g) || []).pop();
+    // A trailing "-<n>" is part of the id, not a separate segment (hp.wd5: `…Internship_3167270-1`).
+    // Without this the whole token failed the tier and fell to the encoding-sensitive path again.
+    const num = (p.pathname.match(/_(\d{4,}(?:-\d+)*)(?=\/|$)/g) || []).pop();
     if (num) return (dc || "wd") + ":" + num.slice(1);
     // ⚠ An EMBED url carries its job identity ONLY in the query string: every employer's
     // Greenhouse embed is `job-boards.greenhouse.io/embed/job_app?for=<board>&token=<id>`, so
