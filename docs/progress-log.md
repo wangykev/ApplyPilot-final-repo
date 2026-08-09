@@ -4305,3 +4305,53 @@ guesses all redirected to `community.workday.com/maintenance-page`; cadence load
 moment, so it was four wrong site names, not an outage. Relevant to the recorded TODO for a
 start-of-fill maintenance gate: `isWorkdayMaintenance` cannot distinguish "Workday is down" from "that
 URL is wrong", so a gate keyed on it should say so rather than assert an outage.
+
+## 2026-08-09 (f) — discovery works; kiongroup.wd3 exposes a DEGENERATE PAGE KEY that merges two pages
+
+Used the Discover sweep instead of guessing tenant URLs (operator: "I have code for that"). It behaved
+exactly as designed: scanned simplify 14485 / linkedin 48, read 25 LinkedIn records with **a real employer
+link on 25 of 25, 0 board-only**, and resolved them to employer ATS URLs incl. Workday tenants. It queued
+0 only because every candidate scored **below the ranking threshold** (best 49%), each with its reasons
+logged — the gate working, not a failure. The resolved links are themselves the useful output.
+
+**kiongroup.wd3 — fill reached review; the REHEARSAL halted `replay-page-not-in-bundle`.**
+
+Verified live on the way in:
+- **The social-login chooser fix (2026-08-09) FIRED** — `auth is a social-login chooser — clicking "Sign
+  in with email" to reveal the form.` That fix was committed unit-pinned-only because sonos's posting was
+  dead; this is its first live exercise.
+- **The `job_key` separator widening (2026-08-09) FIRED** — `approved bundle loaded for job_key
+  "wd3:jr-0088855"`. A letters-DASH-digits requisition now keys correctly end to end.
+- The résumé page was consumed correctly (account created, uploaded, parsed, no junk page).
+- `pacing hidden-SLOW (worker throttled)` — the documented wd3 CSP case blocking the blob worker. Fill
+  66.8s vs ~13s on the fast path. Self-diagnosing from the pacing label, as intended.
+
+**THE BUG.** The fill's five page keys (`cdpPageKey` = pathname|field-set):
+
+    apply/autofillWithResume ||                                     <- EMPTY field set
+    apply/autofillWithResume ||                                     <- EMPTY field set
+    apply/autofillWithResume || 90b8915caea31001447e9f7107710000,…
+    apply/autofillWithResume || ethnicityMulti,gender,veteranStatus
+    apply/autofillWithResume || dateSignedOn,disabilityForm,employeeId,name
+
+Two pages produced an EMPTY field-set half, so both collapsed to the SAME key
+`…/apply/autofillWithResume|`. `accumulateBundle` merges on that key, so the second page's entries
+overwrote the first's. My Information's fields therefore appear NOWHERE in the 49-field bundle, and the
+replay correctly reports `page 1: NO matching page in the approved bundle (live flat fields: source,
+candidateIsPreviousWorker, country, legalName--firstName, …)` and halts.
+
+This is the M31 lesson recurring: the field-SET is what makes the key stable, so a page whose flat field
+list reads EMPTY has no identity at all — and a SECOND such page silently destroys the first. The halt is
+correct behaviour (it refuses to replay a bundle that doesn't describe the page), but the data loss
+happened back in the FILL, and nothing flagged it there.
+
+Not yet established: WHY those two pages scanned as zero flat fields. Candidates — a page whose fields
+all sit inside repeating containers (the flat list legitimately empties, e.g. My Experience), and the
+hidden-SLOW pacing letting the key be computed before the field set settled. The two cases want different
+fixes, so this needs the page-key computation traced on this tenant before anything is changed. A
+degenerate key should probably never be allowed to MERGE regardless — falling back to the page ordinal
+would preserve both pages even when the field set is genuinely empty.
+
+Tenants verified end to end today, all hidden, nothing submitted: **moog.wd5** (résumé fix), **cadence.wd1**
+(new tenant, account created, 2× SUBMIT GATE PASSED, AGREE 54 · DISAGREE 0), **marvell.wd1**, plus the
+post-merge regression pass.
