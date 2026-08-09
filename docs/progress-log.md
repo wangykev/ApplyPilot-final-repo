@@ -4270,3 +4270,38 @@ benefit this path exists for. Ran through to the review page in 185s and reporte
 tester account out of the tenant first. A signed-in session with an open application gets "Continue
 Application" instead of the Apply chooser, so the whole Autofill branch is unreachable — which is exactly
 why this bug survived a full day of testing.
+
+## 2026-08-09 (e) — cadence.wd1 verified end to end from a SIGNED-OUT start
+
+Continuing the signed-out sweep. A tenant never applied to is signed-out by construction, so it
+exercises the Autofill-with-Resume branch without any manual sign-out.
+
+**cadence.wd1 — VERIFIED, hidden, nothing submitted.** The fullest onboarding chain yet, all in one run:
+
+    Stage 1 — clicking "Apply (job listing)"
+    Stage 2 — clicking "Autofill with Resume"
+    Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage
+    Stage 3 — auth screen detected
+    [sign-in fails: no account] → creating a Workday account as wangykev+31@gmail.com…
+    uploading the résumé for Workday's autofill parse…
+    clicked "Continue (after the résumé upload)."
+    résumé page done — Workday parsed it; the next page has 8 field(s).
+    reached the application form.
+
+Fill: 5 pages, 57 filled · 8 skipped, 11 flagged, review page reached in 321s. Approved 11/11 on the
+tracker, then **two consecutive rehearsals, both SUBMIT GATE PASSED, AGREE 54 · DISAGREE 0 · MISSING 1 ·
+EXTRA 1** — identical across runs. Also exercised live: account CREATION on a fresh tenant, and the
+tenant-variable field ladder (`education[0].schoolName: tenant renders this as a typeahead (map says
+text) — filling as typeahead (live DOM wins)`).
+
+**A junk-page false alarm, worth writing down.** Grepping the bundle for `autofillWithResume|` reported a
+hit on cadence. It was not one: `/apply/autofillWithResume` is the whole FLOW's path on this tenant, so My
+Information sits on it too. The junk page is identified by an EMPTY field-set half (the key ENDS at the
+`|`), not by the path — cadence's key was `…|addressLine1,city,country,countryRegion,legalName--firstName,…`
+with 13 fields. Check `key.endsWith("|")`, never `key.includes("autofillWithResume|")`.
+
+**⚠ Workday's maintenance page also means "unknown site".** synopsys/lamresearch/teradyne/qualcomm site
+guesses all redirected to `community.workday.com/maintenance-page`; cadence loaded fine at the same
+moment, so it was four wrong site names, not an outage. Relevant to the recorded TODO for a
+start-of-fill maintenance gate: `isWorkdayMaintenance` cannot distinguish "Workday is down" from "that
+URL is wrong", so a gate keyed on it should say so rather than assert an outage.
