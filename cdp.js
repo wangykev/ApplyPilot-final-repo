@@ -381,6 +381,11 @@ async function cdpEval(fn, ...args) {
 const FAST_FACTOR = 0.1;    // fast delays = 1/10 the full delays (rapidfire; raise if a fast fill races — all adaptive sites are gated, so a race retries/flags, never a silent wrong fill)
 const FAST_FLOOR_MS = 10;   // …but never below this (a too-short wait races even full-speed)
 const TYPE_FAST_FLOOR_MS = 15; // per-KEYSTROKE floor (Stage B) — higher than FAST_FLOOR_MS so keystroke-driven listeners still arm the typeahead highlight when typing fast (see cdpTypeChars)
+// One trusted keystroke costing this long means the input pipeline is frame-gated (the tab is not
+// painting), so the REST of the string would cost the same each — cdpTypeChars escalates to the
+// page-side write instead of spending it. Well above a healthy visible keystroke (~10-30ms) and well
+// below the ~1.2-1.5s stall, so a merely-busy page does not trip it.
+const TYPE_STALL_ESCALATE_MS = 250;
 const VIS_TTL_MS = 500;     // re-sample real visibility at most this often (amortize the chrome.tabs/windows round-trip)
 
 let _visCache = { visible: false, at: 0 };
@@ -564,9 +569,30 @@ function cdpSetSyntheticInput(on) {
   if (on) console.log("[ApplyPilot][CDP] synthetic input ENABLED for this run's fill — hidden-tab actuation dispatches page-side (trusted when visible; forceTrustedInput overrides).");
 }
 function cdpSyntheticInputEnabled() { return _synthInputEnabled; } // so a caller can SAVE/RESTORE around a deliberately-trusted step
-async function cdpSynthInput() {
+// The self-ID surface ignores synthetic native-setter WRITES (Workday reported Name and Date empty on a
+// page whose DOM held both) but accepts synthetic CLICKS — the disability checkbox committed and held
+// 2/2 under synthetic, while trusted clicks on it produced the intermittent "did not commit". So the
+// mode is per-KIND there, not per-page: text/date trusted, clicks synthetic.
+let _trustedText = false;
+function cdpSetTrustedText(b) { _trustedText = !!b; }
+function cdpTrustedTextEnabled() { return _trustedText; }
+
+// kind: "text" for value-writing paths (insertText / typeChars / keyTap / selectAllDelete / the date
+// triple-click), anything else = a plain click.
+async function cdpSynthInput(kind) {
   if (!_synthInputEnabled || _forceTrustedInput) return false;
-  return !(await cdpVisible()); // hidden ⇒ synthetic page-side dispatch (fast); visible ⇒ trusted Input.* (proven)
+  if (_trustedText && kind === "text") return false;
+  // POLICY (2026-08-05): synthetic on form pages REGARDLESS of visibility. This used to ask "is the tab
+  // hidden?" (and briefly "is it painting?"), on the assumption trusted input was only expensive when
+  // frames were missing. Measured otherwise: the same page 2 took 11s hidden/synthetic and 14-38s
+  // visible/trusted, with the paint probe confirming the 38.3s run WAS painting. Trusted Input.* is
+  // simply dearer per event — it traverses the browser's input pipeline — and page 2 is event-bound.
+  // Synthetic is the repertoire this file already proves on form pages, and every verify gate
+  // (read-backs, chip/persistence re-reads, the M40 audit) is unchanged, so a synthetic no-op still
+  // ends needs_review rather than a wrong value. Trusted is kept exactly where it is REQUIRED: the auth
+  // form (own attach, never armed), the self-ID text/date fields (above), and the submit click
+  // (cdpSetSyntheticInput(false) immediately before it).
+  return true;
 }
 
 // In-page synthetic click (self-contained; evaluated via cdpEval). Dispatches the page-engine's
@@ -860,7 +886,7 @@ async function cdpTripleClickAt(x, y) {
   // triple-click default — the date path tolerates this because (a) focusDateSegment's ladder
   // falls to el.focus() when the click didn't focus, and (b) synthetic typing REPLACES the whole
   // segment value (cdpSynthSetValue), which is exactly what select+type achieved.
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthClickAt, Math.round(x), Math.round(y), 3);
       if (r && r.ok) { inputLog("triple-click(synth)", "(" + Math.round(x) + "," + Math.round(y) + ") → " + r.hit); return; }
@@ -888,7 +914,7 @@ async function cdpTripleClickAt(x, y) {
 async function cdpInsertText(text) {
   // HIDDEN → native-setter REPLACE + input/change (the React fill technique). Every call site
   // inserts after a clear/select-all, where replace ≡ insert; the caller's read-back poll gates it.
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthSetValue, String(text), false);
       if (r && r.ok) { inputLog("insertText(synth)", JSON.stringify(String(text))); return; }
@@ -908,7 +934,7 @@ async function cdpKeyTap(def) {
   // HIDDEN → synthetic keydown+keyup on the focused element (Tab additionally blurs; Space
   // additionally activates — the two default actions the fill relies on). Enter/Escape are
   // page-handled (Workday listens for the key events themselves), so the dispatch suffices.
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       await cdpEval(cdpSynthKeyTap, def.key, def.code, def.vk, def.modifiers || 0);
       inputLog("key(synth)", JSON.stringify(def.key) + (def.modifiers ? " +mod" + def.modifiers : ""));
@@ -959,11 +985,24 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
   // the big hidden win (a 35-char typeahead candidate = 70 frame-gated Input commands ≈ 40s → 1 eval).
   // REPLACE is correct at every call site: typing always follows a clear (typeInSearch) or a
   // select-all (dates — where replace ≡ what select+type achieved); the read-back/chip gates verify.
-  if (await cdpSynthInput()) {
+  // WHICH PATH TYPED, and what it cost. Added 2026-08-08 chasing the field-of-study lag: the story
+  // "trusted per-char typing is the slow part" only holds if the trusted path RAN, and during a fill walk
+  // synthetic is enabled regardless of visibility — so the fall-through below is the interesting event,
+  // not the happy path. Logged only when it costs real time, so a healthy field stays quiet.
+  const _tcT0 = Date.now();
+  if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthSetValue, String(text), true);
-      if (r && r.ok) { inputLog("typeChars(synth)", JSON.stringify(String(text))); return; }
-    } catch (e) { /* fall through to trusted per-char */ }
+      if (r && r.ok) {
+        const ms = Date.now() - _tcT0;
+        if (ms > 800) console.log(`[ApplyPilot][CDP-TYPE] page-side write took ${ms}ms for ${String(text).length} chars — the eval itself was slow, not the keystrokes.`);
+        inputLog("typeChars(synth)", JSON.stringify(String(text)));
+        return;
+      }
+      console.log(`[ApplyPilot][CDP-TYPE] page-side write DECLINED (${(r && r.reason) || "no ok"}) — falling back to trusted per-char for ${String(text).length} chars.`);
+    } catch (e) {
+      console.log(`[ApplyPilot][CDP-TYPE] page-side write THREW (${String((e && e.message) || e).slice(0, 80)}) — falling back to trusted per-char for ${String(text).length} chars.`);
+    }
   }
   // Per-char gap is ADAPTIVE (Stage B): fast (fg / worker-fast) → scale by FAST_FACTOR but keep the
   // typing-specific TYPE_FAST_FLOOR_MS (> FAST_FLOOR_MS) so keystroke-driven listeners still arm the
@@ -973,13 +1012,52 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
   // (chip/value read-back → needs_review), never a silent wrong fill.
   const fast = await cdpFast();
   const gap = fast ? Math.max(TYPE_FAST_FLOOR_MS, Math.round(perCharDelayMs * FAST_FACTOR)) : perCharDelayMs;
-  for (const ch of String(text)) {
+  // ── ESCALATE OFF A MEASURED STALL (operator, 2026-08-08) ────────────────────────────────────────
+  // Trusted input rides compositor-frame scheduling, so a tab that is NOT PAINTING stalls ~1.2-1.5s per
+  // event — and this loop spends TWO events per character. "Electrical and Computer Engineering" is 35
+  // chars ≈ 70 commands ≈ 90s. That is the field-of-study lag the operator watched: not the option
+  // scrape, but the typing right after it.
+  //
+  // Synthetic mode already avoids this, but it only engages when the tab reports HIDDEN — and an
+  // OCCLUSION (alt-tabbed behind another window) still reports `tab.active && !minimized`, so the label
+  // says visible while the compositor produces no frames. Rather than trust the label, MEASURE the first
+  // keystroke: if it comes back pathologically slow, the remaining characters would each cost the same,
+  // so finish the whole string with the page-side native-setter REPLACE (exactly what the hidden path
+  // above does). Same escalate-on-evidence shape as the dropdown commit's beat ladder.
+  //
+  // Safe because it changes only HOW the text lands, never whether it is verified: every call site
+  // follows a clear/select-all (so REPLACE ≡ what typing achieved) and gates on the echo/read-back poll,
+  // so a synthetic write that does not register still ends needs_review rather than a wrong value.
+  const chars = Array.from(String(text));
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
     const isLetter = /^[a-z]$/i.test(ch);
     const isDigit = /^[0-9]$/.test(ch);
     const code = isLetter ? "Key" + ch.toUpperCase() : isDigit ? "Digit" + ch : ch === " " ? "Space" : "";
     const vk = isLetter || isDigit ? ch.toUpperCase().charCodeAt(0) : ch === " " ? 32 : 0;
+    const t0 = Date.now();
     await cdpKeyTap({ key: ch, code, vk, text: ch });
+    const dt = Date.now() - t0;
+    if (i === 0 && dt >= TYPE_STALL_ESCALATE_MS && chars.length > 4) {
+      const projected = Math.round((dt * chars.length) / 1000);
+      try {
+        const r = await cdpEval(cdpSynthSetValue, String(text), true);
+        if (r && r.ok) {
+          console.log(`[ApplyPilot][CDP] typing STALLED (${dt}ms for one keystroke — the tab is not painting, so trusted input is frame-gated);`
+            + ` ${chars.length} chars would have taken ~${projected}s. Switched to the page-side write for this value.`);
+          inputLog("typeChars(escalated-synth)", JSON.stringify(String(text)));
+          return;
+        }
+      } catch (e) { /* page-side write unavailable — keep typing, slowly but correctly */ }
+    }
     await cdpDelay(gap);
+  }
+  // The trusted per-char path actually ran. Report what it cost per keystroke — that number is the whole
+  // argument: ~10-30ms is a painting tab, ~1.1-1.5s is a frame-gated one.
+  const _tcMs = Date.now() - _tcT0;
+  if (_tcMs > 1200) {
+    console.log(`[ApplyPilot][CDP-TYPE] TRUSTED per-char typing: ${chars.length} chars in ${_tcMs}ms`
+      + ` (~${Math.round(_tcMs / Math.max(1, chars.length))}ms/char, gap ${gap}ms) — ${await cdpPaintLabel()}.`);
   }
 }
 
@@ -988,7 +1066,7 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
 // HIDDEN → native-setter "" + input/change (the page engine's proven "clear before typing"
 // pattern) — synthetic Ctrl+A/Delete run no default actions, so the key path can't clear there.
 async function cdpSelectAllDelete() {
-  if (await cdpSynthInput()) {
+  if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthSetValue, "", false);
       if (r && r.ok) { inputLog("selectAllDelete(synth)", '""'); return; }
@@ -1950,11 +2028,27 @@ function cdpOnboardScan() {
   const passwordInput = present('input[type="password"]') || present('[data-automation-id="password"]');
   // Social-login CHOOSER (e.g. Palo Alto Networks wd5): the email/password form is behind a
   // "Sign in with email" button, alongside federated Apple/Google/LinkedIn buttons we NEVER click.
-  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]');
+  //
+  // The automation-id is NOT stable across tenants (sonos.wd1, 2026-08-09): its chooser renders the
+  // same button with a HASHED id, so the page had zero inputs, this read false, and the run halted
+  // `auth-form-not-rendered` — visible AND hidden, on a screen a human signs into fine. Fall back to
+  // the button's own text, which is what a human reads. Safe against the federated buttons beside it:
+  // they say "Sign in with Apple" / "Sign in with Google", and neither contains "email".
+  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]')
+    || clickables.some((b) => /\bsign[- ]?in\s+with\s+email\b/i.test((b.textContent || "").trim()));
   const markers = {
     adventureButton: present('[data-automation-id="adventureButton"]'),
     continueButton: present('[data-automation-id="continueButton"]'),
     applyManually: present('[data-automation-id="applyManually"]'),
+    // "Autofill with Resume" — the chooser option that makes Workday PARSE the résumé and pre-populate
+    // the application, including the Skills section with its own suggested skills (traced 2026-08-07 on
+    // cat.wd5). Preferred for a FIRST application; never used by a rehearse/submit run, which must not
+    // re-parse (see runCdpOnboard's preferResumeAutofill).
+    autofillWithResume: present('[data-automation-id="autofillWithResume"]'),
+    // The résumé-upload page that Autofill-with-Resume lands on BEFORE My Information: a page with the
+    // upload input and effectively no form fields. Same automation-ids attachResume already drives.
+    resumeUploadInput: present('input[type="file"][data-automation-id="file-upload-input-ref"]'),
+    resumeUploadSuccess: present('[data-automation-id="file-upload-successful"]'),
     useMyLastApplication: present('[data-automation-id="useMyLastApplication"]'),
     signInLink: present('[data-automation-id="signInLink"]'),
     createAccountLink: present('[data-automation-id="createAccountLink"]'),
@@ -1980,8 +2074,48 @@ function cdpOnboardScan() {
   };
   // hasAuthEl: any auth chrome still on the page (blocks a false "success" — see classifyAuthOutcome).
   const hasAuthEl = passwordInput || signInWithEmail || markers.signInSubmit || markers.createAccountSubmit || markers.signInLink || markers.createAccountLink;
+  // ── IS A SUBMIT IN FLIGHT? (2026-08-07, diagnostic) ──────────────────────────────────────────────
+  // The retry ladder concludes "my click did not register" from the auth form still being MOUNTED —
+  // which is also exactly what an in-flight submit looks like, so it re-submits a form that is already
+  // working and the double submit costs a page reload. The fix needs POSITIVE evidence of a no-op, i.e.
+  // some observable that flips while Workday is processing. Nobody has checked whether this form exposes
+  // one, so measure before building on it: report the submit button's disabled/busy state and whether
+  // the password field still holds a value. Read-only; no decision consumes this yet.
+  const submitBtn = document.querySelector('[data-automation-id="signInSubmitButton"]')
+    || document.querySelector('[data-automation-id="click_filter"][aria-label="Sign In"]')
+    || document.querySelector('button[type="submit"]');
+  const pwEl = document.querySelector('input[type="password"]');
+  const authBusy = submitBtn ? {
+    disabled: !!submitBtn.disabled || submitBtn.getAttribute("aria-disabled") === "true",
+    busy: submitBtn.getAttribute("aria-busy") === "true",
+    // A spinner/progress node anywhere in the auth widget is the other likely tell.
+    spinner: !!document.querySelector('[data-automation-id*="spinner" i],[data-automation-id*="progress" i],[role="progressbar"]'),
+    pwFilled: !!(pwEl && pwEl.value),
+  } : null;
+  // ── WHY the auth form refused (2026-08-07) ───────────────────────────────────────────────────────
+  // A Sign In / Create Account that submits to nothing looked identical in the log to one that never
+  // registered the click: both printed "no outcome after 20s and the form is still up". Live on
+  // itron.wd5 the consent tick was FIXED and Create Account still would not go, and the log could not
+  // say why — so the next move was a guess. Workday states the reason on the page; read it.
+  // Distinct from bodyText (12k of everything) because the point is a SHORT, quotable cause.
+  const errNodes = Array.from(document.querySelectorAll(
+    '[data-automation-id="errorMessage"],[data-automation-id="formFieldErrorMessage"],[data-automation-id="validationErrorMessage"],[role="alert"],.css-error,[class*="error" i]'
+  ));
+  const seen = Object.create(null);
+  const authErrors = [];
+  for (const n of errNodes) {
+    if (!n || (n.children && n.children.length > 2)) continue;   // leaf-ish nodes only — never a container
+    const r = n.getBoundingClientRect && n.getBoundingClientRect();
+    if (r && (r.width <= 0 || r.height <= 0)) continue;          // not rendered
+    const t = ((n.textContent || "").replace(/\s+/g, " ").trim());
+    if (!t || t.length > 220 || seen[t]) continue;
+    seen[t] = 1;
+    authErrors.push(t);
+    if (authErrors.length >= 6) break;
+  }
   return {
     url: location.href, host: location.host, title: document.title,
+    authErrors,
     // Was the document still parsing when we read it? The auth widget can be MID-RENDER (auth chrome
     // present, email/password not in the DOM yet) — indistinguishable from "this page has no fields"
     // without this. A hidden tab makes it common; the waitFor timeout logs it (2026-07-27).
@@ -1989,6 +2123,7 @@ function cdpOnboardScan() {
     bodyText,
     formFieldCount: formFields.length,
     emailInput, passwordInput, signInButtonPresent, signInWithEmail, hasAuthEl,
+    authBusy,
     markers
   };
 }
@@ -2203,7 +2338,21 @@ function cdpCoverCheck(selector, cx, cy) {
 // consent/terms/agree/privacy (AssetMark). Returns the LABEL's click point (preferred —
 // native label-activation fires React's change, the radio/checkbox lesson) + the current
 // checked state + the input id, or null. Read-only; the caller coordinate-clicks + verifies.
-function cdpConsentRect() {
+// `mode:"activate"` ticks it FROM INSIDE THE PAGE via native label activation, instead of only
+// reporting a rect for a coordinate click (2026-08-07). Why both live in one function: the FINDER is the
+// hard part (the word-list fallback below), and a second copy of it would be a lockstep dup waiting to
+// drift. Read stays the default, so every existing caller is unchanged.
+//
+// The coordinate click alone was not enough, and the reason is a STALE RECT — the same lesson
+// clickPageNext learned in 2026-07-25. checkConsent measured the label, then dispatched cdpClickAt a
+// full round-trip later (~1.2-1.5s on a hidden tab, where trusted input rides compositor frames), and in
+// between React re-rendered the just-filled password fields' requirement list and REFLOWED the label out
+// from under the saved coordinates. Live on itron.wd5 and radiancetech.wd12: the input is opacity:0 with
+// a 56x20 "I agree" label, the point resolved correctly when measured, and the box still read unchecked
+// afterwards — so Create Account could never submit and onboarding retried for ~12 minutes.
+// This ONLY ever sets the account-creation consent the caller already decided to accept; it never
+// searches for other agreements and never submits anything.
+function cdpConsentRect(mode) {
   let checkbox = document.querySelector('[data-automation-id="agreementCheckbox"] input[type="checkbox"]');
   const bare = document.querySelector('[data-automation-id="agreementCheckbox"]');
   if (!checkbox && bare && bare.tagName === "INPUT") checkbox = bare;
@@ -2233,6 +2382,26 @@ function cdpConsentRect() {
   if (!checkbox) return null;
   const inputId = checkbox.id || null;
   const lab = inputId ? document.querySelector('label[for="' + inputId + '"]') : (checkbox.closest && checkbox.closest("label"));
+  if (mode === "activate") {
+    // Native LABEL activation first — the input is routinely CSS-clipped (opacity:0), and clicking its
+    // <label for> is what flips `checked` AND fires the change event React listens for. This is the same
+    // primitive the radio/checkbox fillers use. Verified in place: false -> true on itron.wd5.
+    const before = !!checkbox.checked;
+    if (!before) {
+      if (lab && lab.click) { try { lab.click(); } catch (e) { /* fall through */ } }
+      if (!checkbox.checked) { try { checkbox.click(); } catch (e) { /* fall through */ } }
+      if (!checkbox.checked) {
+        // Last resort: set the property and fire the events React needs. Never a silent lie — the
+        // caller re-reads `checked` and reports whatever actually stuck.
+        try {
+          checkbox.checked = true;
+          checkbox.dispatchEvent(new Event("input", { bubbles: true }));
+          checkbox.dispatchEvent(new Event("change", { bubbles: true }));
+        } catch (e) { /* report below */ }
+      }
+    }
+    return { checked: !!checkbox.checked, inputId, was: before, via: "in-page" };
+  }
   let target = lab || checkbox;
   if (target.scrollIntoView) target.scrollIntoView({ block: "center", behavior: "instant" });
   let r = target.getBoundingClientRect();
@@ -2429,6 +2598,45 @@ function cdpFocusBySel(sel) {
   return document.activeElement === el;
 }
 
+// Clear a multiselect's search input the REACT-SAFE, FOCUS-INDEPENDENT way: the native value setter
+// plus input/change (the standard React fill technique). The other typeaheads clear with trusted
+// Ctrl+A/Delete (cdpSelectAllDelete), but on the SKILLS widget Ctrl+A does NOT select the input's
+// text — observed by hand: the select-all went to the page, the next keystrokes APPENDED to the stale
+// query, and Enter turned "Docker" + "CubeMars motor drivers" into the chip
+// "DockerCubeMars motor drivers". On this widget a stale query can FABRICATE a skill, so the clear
+// must not depend on where focus happens to be. Live, a trusted-hidden run cleared fine for one skill
+// and then failed on the next two, which is exactly the flakiness a focus-blind primitive produces.
+function cdpClearInputNative(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, reason: "no input" };
+  const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+  try { if (d && d.set) d.set.call(el, ""); else el.value = ""; } catch (e) { return { ok: false, reason: "set threw" }; }
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return { ok: true, value: el.value };
+}
+
+// Open a multiselect by acting on its OWN input, page-side — no coordinates, no paint required.
+// Why this exists (skills, traced 2026-08-07): the input gains data-automation-id="searchBox" only
+// ONCE OPEN, so while closed every searchBox-keyed selector misses it and opening has to go through
+// a COORDINATE click on the container. That click is what failed on a HIDDEN run which worked fine
+// visible — the field logged "could not focus the search box" and added zero skills. By hand, what
+// reliably opened the widget was focus() + click() on the input itself, which is what this does.
+// Returns a diagnostic (not a bare bool) so a failure says WHICH step missed; the caller still polls
+// readHier, because the searchBox id appears on a later React tick.
+function cdpOpenMultiselectInput(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return { ok: false, reason: "no wrapper" };
+  const inp = w.querySelector("input");
+  if (!inp) return { ok: false, reason: "no input" };
+  if (inp.scrollIntoView) inp.scrollIntoView({ block: "center", behavior: "instant" });
+  try { inp.focus(); } catch (e) { /* keep going — the click may still open it */ }
+  const focused = document.activeElement === inp;
+  try { inp.click(); } catch (e) { return { ok: false, reason: "click threw", focused }; }
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+  return { ok: true, focused, openedNow: !!sb };
+}
+
 // Same focus attempt, but it REPORTS what happened instead of a bare boolean — whether the node was
 // there, whether focus() took, and if not, what holds focus instead. "Could not focus" has at least
 // three causes with different fixes, and a boolean cannot tell them apart.
@@ -2620,6 +2828,286 @@ function cdpDevClickBox(args) {
   lab.click();
   return { ok: true };
 }
+
+// READ-ONLY geometry of a checkbox group, to answer whether the FILLER'S actuation and a page-side
+// `label.click()` can differ. The filler clicks the LABEL'S CENTRE COORDINATE
+// (clickRadioLabel → cdpRectReady('label[for=…]') → cdpClickAt). If the input sits AT that centre, one
+// physical click can be seen by both the input and its label, and a checkbox toggles TWICE — checked
+// then instantly unchecked, which is exactly what was observed live. So report, per box: the label and
+// input rects, the label's centre, and what elementFromPoint() actually resolves to there.
+function cdpDevBoxGeom(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return { ok: false, error: "wrapper not found" };
+  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : s);
+  const r2 = (r) => (r ? { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) } : null);
+  return {
+    ok: true,
+    boxes: Array.from(w.querySelectorAll('input[type="checkbox"]')).map((inp) => {
+      const lab = inp.id ? document.querySelector('label[for="' + esc(inp.id) + '"]') : null;
+      const lr = lab ? lab.getBoundingClientRect() : null;
+      const cx = lr ? Math.round(lr.x + lr.width / 2) : null;
+      const cy = lr ? Math.round(lr.y + lr.height / 2) : null;
+      const at = cx != null ? document.elementFromPoint(cx, cy) : null;
+      return {
+        id: inp.id, checked: !!inp.checked,
+        label: (lab && lab.textContent || "").trim().slice(0, 60),
+        inputRect: r2(inp.getBoundingClientRect()), labelRect: r2(lr),
+        labelCentre: cx != null ? [cx, cy] : null,
+        // the whole question: what is under the point the filler clicks?
+        atCentre: at ? (at.tagName + (at.id ? "#" + at.id : "") + (at.getAttribute && at.getAttribute("for") ? "[for=" + at.getAttribute("for") + "]" : "")) : null,
+        atCentreIsThisInput: !!(at && at === inp),
+        atCentreIsThisLabel: !!(at && at === lab),
+        inputInsideLabel: !!(lab && lab.contains(inp)),
+      };
+    }),
+  };
+}
+// The live values of a date composite's segments, read straight off the spinbuttons. Used to RE-TYPE a
+// date with the value it already shows — reading the segments avoids parsing the rendered string, whose
+// order is tenant-variable (MM/DD/YYYY vs DD/MM/YYYY), so no order can be assumed wrongly.
+function cdpReadDateSegValues(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return null;
+  const out = {};
+  for (const seg of ["Month", "Day", "Year"]) {
+    const el = w.querySelector('[data-automation-id="dateSection' + seg + '-input"]');
+    const v = el && el.value != null ? String(el.value).trim() : "";
+    if (v !== "") out[seg.toLowerCase()] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+// What is ACTUALLY at (x,y), and is it the label/input we think we are clicking? The rect is measured in
+// one CDP round trip and the click is dispatched in another, so a scroll or reflow in between silently
+// sends the click somewhere else — the same staleness clickPageNext learned to re-measure for. Without
+// this, "the click didn't register" and "the click landed on something else" are indistinguishable.
+function cdpHitAt(x, y, wantId) {
+  const el = document.elementFromPoint(x, y);
+  if (!el) return { hit: null, mine: false };
+  const forAttr = (el.getAttribute && el.getAttribute("for")) || "";
+  const lab = wantId ? document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(wantId) : wantId) + '"]') : null;
+  const mine = !!(wantId && (forAttr === wantId || el.id === wantId || (lab && (el === lab || lab.contains(el)))));
+  return {
+    hit: el.nodeName + (el.id ? "#" + String(el.id).slice(0, 8) : "") + (forAttr ? "[for=" + String(forAttr).slice(0, 8) + "]" : ""),
+    text: (el.textContent || "").trim().slice(0, 40),
+    mine,
+    // if the label exists but is NOT under the point, the rect we measured has gone stale
+    labelRectNow: lab ? (() => { const r = lab.getBoundingClientRect(); return { y: Math.round(r.y), h: Math.round(r.height), w: Math.round(r.width) }; })() : null,
+  };
+}
+
+// ── IS THE TAB PAINTING? (2026-08-05) ───────────────────────────────────────────────────────────────
+// The input-mode decision has always asked "is the tab HIDDEN?" (cdpVisible = tab.active &&
+// !minimized). What actually determines whether trusted Input.* is fast is whether the tab is
+// PAINTING: those events are drained in step with frame production. A window sitting BEHIND another
+// app satisfies tab.active && !minimized while compositing nothing — the documented occlusion blind
+// spot — so we keep using trusted input and pay ~1.1-1.5s per event.
+//
+// Measured live: the SAME page 2 of the same posting took 11.1s hidden (synthetic input, no frames
+// needed) and 39s on a "visible" run whose window was actually behind another app — with
+// firstYearAttended at 16.8s and fieldOfStudy at 16.2s, i.e. ~1.1s per input event. Every other page in
+// that run was normal, because page 2 is the one dominated by input events.
+//
+// rAF is the honest signal: its callback is driven by frame production, so it simply does not arrive
+// when nothing is being composited. Same philosophy as cdpTimersFast — measure, never assume.
+function cdpPaintProbeSrc() {
+  // Uses the NATIVE rAF stashed by buildOverrideSrc; without it, our own setTimeout-backed polyfill
+  // would answer "painting" on a frameless tab. No native reference ⇒ report unknown, never a guess.
+  return new Promise(function (res) {
+    var raf = window.__apNativeRaf || (window.__apOverridesInstalled ? null : window.requestAnimationFrame);
+    if (!raf) { res({ ok: false, reason: "no native rAF available" }); return; }
+    var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+    var done = false;
+    try {
+      raf(function () {
+        if (done) return; done = true;
+        var t1 = (window.performance && performance.now) ? performance.now() : Date.now();
+        res({ ok: true, ms: Math.round(t1 - t0) });
+      });
+    } catch (e) { res({ ok: false, reason: String(e && e.message || e) }); }
+  });
+}
+
+// Cached, because cdpSynthInput() is consulted on EVERY click and a probe is a page round trip (a
+// visibility read is not). The TTL is short on purpose: the operator alt-tabbing mid-run is exactly the
+// case this exists for, so the answer has to be allowed to change during a page.
+let _paintCache = { at: 0, painting: null };
+const PAINT_PROBE_DEADLINE_MS = 150;   // 60fps = 16ms, 30fps = 33ms — generous, and only paid when NOT painting
+const PAINT_CACHE_TTL_MS = 2000;
+function cdpInvalidatePaint() { _paintCache = { at: 0, painting: null }; }
+// For diagnostics: what the probe last measured, and what Chrome thinks — the pair is the whole point,
+// because "visible but not painting" is the state that used to be invisible in the logs.
+async function cdpPaintLabel() {
+  const painting = await cdpPainting();
+  let vis = "?"; try { vis = (await cdpVisible()) ? "visible" : "hidden"; } catch (e) { /* ignore */ }
+  return painting ? `painting (${vis})` : `NOT painting (chrome says ${vis})`;
+}
+async function cdpPainting() {
+  if (_paintCache.painting !== null && (Date.now() - _paintCache.at) < PAINT_CACHE_TTL_MS) return _paintCache.painting;
+  let painting;
+  try {
+    const r = await Promise.race([
+      cdpEval(cdpPaintProbeSrc),
+      cdpDelay(PAINT_PROBE_DEADLINE_MS).then(() => ({ ok: true, ms: -1, timedOut: true })),
+    ]);
+    // A probe that cannot answer (no native rAF, eval failure) FALLS BACK to Chrome's visibility, so the
+    // worst case is exactly today's behaviour rather than a new failure mode.
+    if (!r || r.ok !== true) painting = await cdpVisible();
+    else painting = !r.timedOut;
+  } catch (e) {
+    try { painting = await cdpVisible(); } catch (e2) { painting = true; }
+  }
+  _paintCache = { at: Date.now(), painting };
+  return painting;
+}
+
+// ── QUIESCENCE (2026-08-04): "is the page still busy?", which no other wait here can answer ─────────
+// Every settle in this file waits for a COUNT to stop changing (field set, options, entries). None can
+// tell you the DOM is mid-reaction, and that is what actually breaks the self-ID checkbox group: the
+// 10ms watch caught our verified check being wiped 281ms later by 29 MutationRecords, with NO click
+// behind it. A human never hits that window because by the time they click, the page has gone quiet.
+//
+// Page side does nothing but STAMP the last mutation. The WAITING happens in the service worker on real
+// wall-clock — a page-side timer would be throttled on a hidden tab, the rule this file already learned
+// three times over.
+function cdpInstallQuietWatch(sel) {
+  try {
+    window.__apQuiet = window.__apQuiet || {};
+    window.__apQuietMo = window.__apQuietMo || {};
+    if (window.__apQuietMo[sel]) return { ok: true, already: true };
+    const w = document.querySelector(sel);
+    // The wrapper's PARENT: a reaction can replace the wrapper itself, and a sibling churning is just as
+    // good a signal that the form is busy. The whole document would never be quiet.
+    const root = (w && w.parentNode) || document.body;
+    window.__apQuiet[sel] = Date.now();
+    const mo = new MutationObserver(() => { window.__apQuiet[sel] = Date.now(); });
+    mo.observe(root, { childList: true, subtree: true, attributes: true });
+    window.__apQuietMo[sel] = mo;
+    return { ok: true, root: root.nodeName };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+function cdpReadQuiet(sel) {
+  const at = (window.__apQuiet || {})[sel];
+  return at ? { ok: true, idleMs: Date.now() - at } : { ok: false };
+}
+
+// ── TEMPORARY DIAGNOSTIC (2026-08-04): watch a checkbox group at 10ms and say WHY it changed ────────
+// The question this settles: when the group loses its check, is the DOM being REBUILT (a re-render) or is
+// the input's `checked` being toggled in place (a click / property write)? Those need opposite fixes and
+// three rounds of reasoning failed to separate them.
+//
+// The discriminator is that `checked` is a PROPERTY, not an attribute: flipping it produces NO
+// MutationRecord. So a state change with a mutation count that did not move = something toggled the input;
+// a state change accompanied by childList mutations = the subtree was replaced. `isTrusted` on the
+// recorded events separates our CDP clicks (trusted) from any page-side/synthetic dispatch.
+//
+// Records TRANSITIONS only, never raw samples — 10ms over a 30s page would be 3000 rows.
+// Gated behind chrome.storage.local.debugGroupWatch; install → fill → drain.
+function cdpInstallGroupWatch(wrapperSel) {
+  try {
+    if (window.__apGW) { try { clearInterval(window.__apGW.timer); window.__apGW.mo && window.__apGW.mo.disconnect(); } catch (e) {} }
+    const st = { sel: wrapperSel, t0: Date.now(), samples: 0, muts: 0, transitions: [], events: [], mutLog: [] };
+    const snap = () => {
+      const w = document.querySelector(wrapperSel);
+      if (!w) return "WRAPPER-ABSENT";
+      const cbs = Array.from(w.querySelectorAll('input[type="checkbox"]'));
+      if (!cbs.length) return "NO-BOXES";
+      return cbs.map((c) => String(c.id || "?").slice(0, 6) + (c.checked ? "=ON" : "=off")).join(" ");
+    };
+    const ids = () => {
+      const w = document.querySelector(wrapperSel);
+      return w ? Array.from(w.querySelectorAll('input[type="checkbox"]')).map((c) => c.id) : [];
+    };
+    // MutationObserver on the wrapper's PARENT so a wholesale replacement of the wrapper is visible too.
+    const w0 = document.querySelector(wrapperSel);
+    const root = (w0 && w0.parentNode) || document.body;
+    st.mo = new MutationObserver((recs) => {
+      st.muts += recs.length;
+      for (const r of recs) {
+        if (st.mutLog.length >= 400) break;
+        st.mutLog.push({ t: Date.now() - st.t0, type: r.type,
+          added: r.addedNodes ? r.addedNodes.length : 0, removed: r.removedNodes ? r.removedNodes.length : 0,
+          attr: r.attributeName || null,
+          inGroup: !!(w0 && r.target && (w0 === r.target || w0.contains(r.target))),
+          target: (r.target && r.target.nodeName) + ((r.target && r.target.getAttribute && r.target.getAttribute("data-automation-id")) ? "[" + r.target.getAttribute("data-automation-id") + "]" : "") });
+      }
+    });
+    try { st.mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["checked", "class", "aria-checked", "data-automation-id"] }); } catch (e) { /* best effort */ }
+    // Capture-phase event log, scoped to this group (its own nodes, or a label pointing at one of its ids).
+    const myIds = ids();
+    st.onEv = (e) => {
+      try {
+        if (st.events.length >= 80) return;
+        const t = e.target;
+        if (!t || !t.nodeName) return;
+        const w = document.querySelector(wrapperSel);
+        const forAttr = (t.getAttribute && t.getAttribute("for")) || "";
+        const mine = (w && w.contains(t)) || (forAttr && myIds.indexOf(forAttr) >= 0);
+        if (!mine) return;
+        st.events.push({ t: Date.now() - st.t0, type: e.type, trusted: !!e.isTrusted,
+          target: t.nodeName + (t.id ? "#" + String(t.id).slice(0, 6) : "") + (forAttr ? "[for=" + String(forAttr).slice(0, 6) + "]" : ""),
+          checkedNow: (t.type === "checkbox") ? !!t.checked : undefined });
+      } catch (err) { /* never let the probe break the page */ }
+    };
+    st.evTypes = ["pointerdown", "mousedown", "mouseup", "click", "change", "input", "focusin", "focusout"];
+    for (const ty of st.evTypes) document.addEventListener(ty, st.onEv, true);
+    let last = null;
+    st.timer = setInterval(() => {
+      st.samples++;
+      const s = snap();
+      if (s !== last) { st.transitions.push({ t: Date.now() - st.t0, s, mutsSoFar: st.muts }); last = s; }
+    }, 10);
+    window.__apGW = st;
+    return { ok: true, sel: wrapperSel, first: snap(), boxes: myIds.length, observing: root.nodeName };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+function cdpDrainGroupWatch() {
+  const st = window.__apGW;
+  if (!st) return { ok: false, error: "not installed" };
+  try { clearInterval(st.timer); st.mo && st.mo.disconnect(); for (const ty of st.evTypes) document.removeEventListener(ty, st.onEv, true); } catch (e) {}
+  const out = { ok: true, samples: st.samples, muts: st.muts, transitions: st.transitions, events: st.events, mutLog: st.mutLog,
+    spanMs: Date.now() - st.t0 };
+  try { delete window.__apGW; } catch (e) { window.__apGW = null; }
+  return out;
+}
+
+// READ-ONLY inventory of EVERY formField wrapper on the page with its widget kind and current value.
+// cdpDevGroups only reports checkbox GROUPS, so it cannot answer "is this field even mounted yet?" —
+// which is the question when a widget appears mid-fill and the settled pre-fill scan never saw it.
+function cdpDevWrappers() {
+  return Array.from(document.querySelectorAll('[data-automation-id^="formField-"]')).map((w) => {
+    const aid = (w.getAttribute("data-automation-id") || "").replace(/^formField-/, "");
+    const btn = w.querySelector('button[aria-haspopup="listbox"]');
+    const cbs = w.querySelectorAll('input[type="checkbox"]');
+    const txt = w.querySelector('input[type="text"], textarea');
+    return {
+      field: aid,
+      widget: btn ? "dropdown" : cbs.length > 1 ? "checkbox_group(" + cbs.length + ")" : cbs.length === 1 ? "checkbox" : txt ? "text" : "other",
+      value: btn ? btn.textContent.trim().slice(0, 46)
+        : cbs.length ? Array.from(cbs).map((c) => c.checked).join(",")
+        : txt ? (txt.value || "") : null,
+      required: !!(w.querySelector("abbr") || w.querySelector('[aria-required="true"]')),
+      // ── THE RAW EVIDENCE, not just our verdict (operator, 2026-08-09) ──────────────────────────────
+      // "you should be able to get this from the DOM, so the fact that you are asking is a problem."
+      // Exactly right: `required` above is a DERIVED boolean, and when a run halted on a required field
+      // the only way to sanity-check it was to re-read the same derivation and learn nothing — so the
+      // question got escalated to a human instead of answered from the page. Report WHICH marker fired,
+      // so "is this really required?" is settled by looking, every time.
+      requiredEvidence: (() => {
+        const ab = w.querySelector("abbr");
+        const lbl = w.querySelector("label,legend");
+        const lblText = lbl ? (lbl.textContent || "").replace(/\s+/g, " ").trim() : "";
+        return {
+          abbrTitle: ab ? (ab.getAttribute("title") || null) : null,   // Workday's <abbr title="required">
+          abbrText: ab ? (ab.textContent || "").trim() : null,         // or a bare <abbr>*</abbr>
+          ariaRequired: !!w.querySelector('[aria-required="true"]'),
+          labelEndsWithStar: /\*\s*$/.test(lblText),
+          label: lblText.slice(0, 60),
+        };
+      })(),
+    };
+  });
+}
 function cdpReadCheckboxGroupState(wrapperSel) {
   const w = document.querySelector(wrapperSel);
   if (!w) return null;
@@ -2635,6 +3123,83 @@ function cdpReadCheckboxGroupState(wrapperSel) {
 // light-DOM query) AND regular in-page modals. Read-only: returns the control's viewport rect for a TRUSTED
 // click (or {found:false}). SAFETY: the affirmative deny-list is checked first so we never click a
 // consent/accept button; if nothing clearly-dismissive is found we return not-found → the caller halts.
+// ── The BACK control, and the leave-page dialog's confirm (2026-08-05) ──────────────────────────────
+// For the phantom-required remedy: Workday's form model has lost an answer its own DOM still shows, and
+// the only remedy not yet refuted is to step BACK one page and Save & Continue forward again, so Workday
+// re-POSTs the previous page and re-DERIVES this one's model. This repo has never touched either control,
+// so these finders are deliberately TOLERANT about markup (no tenant automation-id is assumed) and STRICT
+// about identity — every caller additionally verifies the page signature actually changed, so a wrong
+// click cannot be mistaken for a successful retreat.
+// Generic activation fallback for a control the EXTENSION picked (not one found in page content): focus
+// it, or click it from inside the page. Same lesson as the Sign In press — re-issuing the identical
+// coordinate click cannot recover a click that silently did not register, so a retry has to change the
+// MECHANISM. The caller passes a selector it derived itself (an apply-chain automation-id), never
+// anything scraped from the page, and this still refuses a control whose label reads like a submit or a
+// consent: a fallback that gets a run further must never be the thing that agrees to something.
+function cdpActivateBySelector(sel, mode) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, reason: "selector not found" };
+  const r = el.getBoundingClientRect();
+  const cs = window.getComputedStyle(el);
+  if (r.width <= 0 || r.height <= 0 || cs.display === "none" || cs.visibility === "hidden") return { ok: false, reason: "not visible" };
+  const label = ((el.textContent || "").replace(/\s+/g, " ").trim() || el.getAttribute("aria-label") || "").slice(0, 60);
+  if (/\bsubmit\b|\bagree\b|\baccept\b|\bconsent\b|\bi certify\b/i.test(label)) {
+    return { ok: false, reason: `refusing — the control reads like a submit/consent ("${label}")` };
+  }
+  if (mode === "focus") { el.focus(); return { ok: document.activeElement === el, label }; }
+  try { el.click(); return { ok: true, label, via: "el.click()" }; }
+  catch (e) { return { ok: false, reason: String((e && e.message) || e) }; }
+}
+
+// ── SIGN-IN ACTIVATION FALLBACKS (2026-08-06) ───────────────────────────────────────────────────────
+// The coordinate click on Sign In occasionally just does not take — the form stays up, Workday reports
+// neither an error nor the next page, and re-clicking the SAME way (which is all submitAndWait did) can
+// only reproduce it. Operator-confirmed: no browser dialog was involved, the press simply did not happen.
+// So each retry now escalates to a DIFFERENT activation mechanism. These only ever FOCUS a target; the
+// keystroke itself is dispatched trusted from the SW, because the auth form is the one surface where
+// synthetic input is known not to register.
+function cdpFocusSignInTarget(which) {
+  const vis = (el) => {
+    if (!el || !el.getBoundingClientRect) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const cs = window.getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden";
+  };
+  if (which === "password") {
+    const p = [...document.querySelectorAll('input[type="password"]')].filter(vis).pop();
+    if (!p) return { ok: false, reason: "no visible password input" };
+    p.focus();
+    return { ok: document.activeElement === p, what: "password input" };
+  }
+  const b = [document.querySelector('[data-automation-id="signInSubmitButton"]'),
+             document.querySelector('[data-automation-id="click_filter"][aria-label="Sign In"]'),
+             ...document.querySelectorAll('button[type="submit"],button,[role="button"]')]
+    .filter(Boolean).filter(vis)
+    .find((e) => e.getAttribute("data-automation-id") === "signInSubmitButton"
+      || /^\s*(sign[- ]?in|log[- ]?in|sign[- ]?on)\s*$/i.test((e.textContent || "").trim())
+      || /sign in/i.test(e.getAttribute("aria-label") || ""));
+  if (!b) return { ok: false, reason: "no visible Sign In button" };
+  b.focus();
+  return { ok: document.activeElement === b, what: "Sign In button" };
+}
+// LAST RESORT, page-side: a real .click() on the button, else the form's own submit. Used only after every
+// trusted mechanism has failed and the alternative is halting for the operator. Scoped hard to the sign-in
+// form — it resolves the button by its automation-id/label, so it cannot fire anything on an application
+// page even if this is somehow reached there.
+function cdpDomActivateSignIn() {
+  const b = document.querySelector('[data-automation-id="signInSubmitButton"]')
+    || [...document.querySelectorAll('button,[role="button"]')]
+      .find((e) => /^\s*(sign[- ]?in|log[- ]?in|sign[- ]?on)\s*$/i.test((e.textContent || "").trim()));
+  if (!b) return { ok: false, reason: "no Sign In button in the DOM" };
+  try { b.click(); return { ok: true, via: "el.click()" }; } catch (e) { /* fall through to the form */ }
+  const f = b.closest && b.closest("form");
+  if (f) { try { (f.requestSubmit ? f.requestSubmit(b) : f.submit()); return { ok: true, via: "form.requestSubmit()" }; } catch (e) { /* nothing left */ } }
+  return { ok: false, reason: "click() and form submit both threw" };
+}
+// (cdpFindPageBackControl / cdpFindLeaveDialogConfirm were removed 2026-08-06 with the back-a-page
+// retreat they served -- see the note in background.js's replay nav-timeout branch. cdpActivateBySelector
+// above is the survivor: it is generic and the Apply-press escalation uses it.)
 function cdpFindDismissControl(cx, cy) {
   const isVisible = (el) => {
     if (!el || !el.getBoundingClientRect) return false;
@@ -2883,7 +3448,9 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // does 1 frame then the deadline, provably no-slower than the old code. i<200 is a spin-guard only.
   const pickSel = () => OPT_SELECTORS.find((sel) => optsFor(sel).length) || null;
   let optSel = pickSel();
+  const _fr0 = Date.now();
   for (let t0 = Date.now(), i = 0; Date.now() - t0 < 768 && i < 200 && !optSel && !bannerUp(); i++) { await frame(); optSel = pickSel(); }
+  const firstRenderMs = Date.now() - _fr0;   // 0 when the list was already mounted (the mid-fill case)
   optSel = optSel || '[role="option"]';
   const roleCount = optsFor('[role="option"]').length;                       // non-chip counts (diagnostic)
   const promptCount = optsFor('[data-automation-id="promptOption"]').length;
@@ -2916,7 +3483,19 @@ async function cdpScrapeTaOptions(wrapperSel) {
   // the mount-wait REGIME-INDEPENDENT: fast regime (visible / hidden+worker) frame() ~16ms → up to ~6 polls;
   // rare hidden+CSP-blocked slow regime frame() ~1s (throttled fallback) → 1 poll then the deadline, provably
   // no-slower than the old code (an iteration count would have doubled the stable-2 tail there). i<60 spin-guard.
-  const awaitRender = async (beforeSig) => { for (let t0 = Date.now(), i = 0; Date.now() - t0 < 96 && i < 60; i++) { await frame(); if (curSig() !== beforeSig) return; } };
+  // TIMED-OUT vs BROKE-EARLY (2026-08-06 measurement): 85ms average against a 96ms cap suggests most hops
+  // TIME OUT — i.e. the virtualizer has not committed the new window when we give up, so each hop yields a
+  // PARTIAL window and we need more of them. If that is what is happening, hopping FASTER makes it worse
+  // and waiting LONGER per hop is faster overall. Counting settles it instead of guessing.
+  let hopTimeouts = 0, hopEarly = 0, hopWaitMs = 0;
+  const awaitRender = async (beforeSig) => {
+    const w0 = Date.now();
+    for (let t0 = Date.now(), i = 0; Date.now() - t0 < 96 && i < 60; i++) {
+      await frame();
+      if (curSig() !== beforeSig) { hopEarly++; hopWaitMs += Date.now() - w0; return; }
+    }
+    hopTimeouts++; hopWaitMs += Date.now() - w0;
+  };
   // Measure the CURRENTLY-mounted window's pixel span (viewport + the virtualizer's overscan, typically
   // 2–3× clientHeight). Stepping by a fraction of THIS (not the viewport) means far fewer hops to the bottom
   // — the big visible-scroll speedup — while self-adapting to the tenant's overscan. Falls back to clientHeight.
@@ -2954,7 +3533,7 @@ async function cdpScrapeTaOptions(wrapperSel) {
     }
   }
   const options = Array.from(seen.keys());
-  return { ok: true, options, count: options.length, steps, atBottom, cappedOut: steps >= MAX_STEPS,
+  return { ok: true, options, count: options.length, steps, atBottom, firstRenderMs, hopTimeouts, hopEarly, hopWaitMs, cappedOut: steps >= MAX_STEPS,
     roleCount, promptCount, usedSel: optSel,
     scrollerFound: !!sc, scrollTop: sc ? sc.scrollTop : null, scrollHeight: sc ? sc.scrollHeight : null, clientHeight: sc ? sc.clientHeight : null };
 }
@@ -3596,101 +4175,6 @@ function cdpLlmDemotionSummary() {
 // trusted input; the multi-ATS combobox poll uses QUIESCENCE to tell "the menu isn't coming" from
 // "the page is still busy" — a question its own read latency could only approximate. ────────────
 
-// ── IS THE TAB PAINTING? (2026-08-05) ───────────────────────────────────────────────────────────────
-// The input-mode decision has always asked "is the tab HIDDEN?" (cdpVisible = tab.active &&
-// !minimized). What actually determines whether trusted Input.* is fast is whether the tab is
-// PAINTING: those events are drained in step with frame production. A window sitting BEHIND another
-// app satisfies tab.active && !minimized while compositing nothing — the documented occlusion blind
-// spot — so we keep using trusted input and pay ~1.1-1.5s per event.
-//
-// Measured live: the SAME page 2 of the same posting took 11.1s hidden (synthetic input, no frames
-// needed) and 39s on a "visible" run whose window was actually behind another app — with
-// firstYearAttended at 16.8s and fieldOfStudy at 16.2s, i.e. ~1.1s per input event. Every other page in
-// that run was normal, because page 2 is the one dominated by input events.
-//
-// rAF is the honest signal: its callback is driven by frame production, so it simply does not arrive
-// when nothing is being composited. Same philosophy as cdpTimersFast — measure, never assume.
-function cdpPaintProbeSrc() {
-  // Uses the NATIVE rAF stashed by buildOverrideSrc; without it, our own setTimeout-backed polyfill
-  // would answer "painting" on a frameless tab. No native reference ⇒ report unknown, never a guess.
-  return new Promise(function (res) {
-    var raf = window.__apNativeRaf || (window.__apOverridesInstalled ? null : window.requestAnimationFrame);
-    if (!raf) { res({ ok: false, reason: "no native rAF available" }); return; }
-    var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
-    var done = false;
-    try {
-      raf(function () {
-        if (done) return; done = true;
-        var t1 = (window.performance && performance.now) ? performance.now() : Date.now();
-        res({ ok: true, ms: Math.round(t1 - t0) });
-      });
-    } catch (e) { res({ ok: false, reason: String(e && e.message || e) }); }
-  });
-}
-
-// Cached, because cdpSynthInput() is consulted on EVERY click and a probe is a page round trip (a
-// visibility read is not). The TTL is short on purpose: the operator alt-tabbing mid-run is exactly the
-// case this exists for, so the answer has to be allowed to change during a page.
-let _paintCache = { at: 0, painting: null };
-const PAINT_PROBE_DEADLINE_MS = 150;   // 60fps = 16ms, 30fps = 33ms — generous, and only paid when NOT painting
-const PAINT_CACHE_TTL_MS = 2000;
-function cdpInvalidatePaint() { _paintCache = { at: 0, painting: null }; }
-// For diagnostics: what the probe last measured, and what Chrome thinks — the pair is the whole point,
-// because "visible but not painting" is the state that used to be invisible in the logs.
-async function cdpPaintLabel() {
-  const painting = await cdpPainting();
-  let vis = "?"; try { vis = (await cdpVisible()) ? "visible" : "hidden"; } catch (e) { /* ignore */ }
-  return painting ? `painting (${vis})` : `NOT painting (chrome says ${vis})`;
-}
-async function cdpPainting() {
-  if (_paintCache.painting !== null && (Date.now() - _paintCache.at) < PAINT_CACHE_TTL_MS) return _paintCache.painting;
-  let painting;
-  try {
-    const r = await Promise.race([
-      cdpEval(cdpPaintProbeSrc),
-      cdpDelay(PAINT_PROBE_DEADLINE_MS).then(() => ({ ok: true, ms: -1, timedOut: true })),
-    ]);
-    // A probe that cannot answer (no native rAF, eval failure) FALLS BACK to Chrome's visibility, so the
-    // worst case is exactly today's behaviour rather than a new failure mode.
-    if (!r || r.ok !== true) painting = await cdpVisible();
-    else painting = !r.timedOut;
-  } catch (e) {
-    try { painting = await cdpVisible(); } catch (e2) { painting = true; }
-  }
-  _paintCache = { at: Date.now(), painting };
-  return painting;
-}
-
-// ── QUIESCENCE (2026-08-04): "is the page still busy?", which no other wait here can answer ─────────
-// Every settle in this file waits for a COUNT to stop changing (field set, options, entries). None can
-// tell you the DOM is mid-reaction, and that is what actually breaks the self-ID checkbox group: the
-// 10ms watch caught our verified check being wiped 281ms later by 29 MutationRecords, with NO click
-// behind it. A human never hits that window because by the time they click, the page has gone quiet.
-//
-// Page side does nothing but STAMP the last mutation. The WAITING happens in the service worker on real
-// wall-clock — a page-side timer would be throttled on a hidden tab, the rule this file already learned
-// three times over.
-function cdpInstallQuietWatch(sel) {
-  try {
-    window.__apQuiet = window.__apQuiet || {};
-    window.__apQuietMo = window.__apQuietMo || {};
-    if (window.__apQuietMo[sel]) return { ok: true, already: true };
-    const w = document.querySelector(sel);
-    // The wrapper's PARENT: a reaction can replace the wrapper itself, and a sibling churning is just as
-    // good a signal that the form is busy. The whole document would never be quiet.
-    const root = (w && w.parentNode) || document.body;
-    window.__apQuiet[sel] = Date.now();
-    const mo = new MutationObserver(() => { window.__apQuiet[sel] = Date.now(); });
-    mo.observe(root, { childList: true, subtree: true, attributes: true });
-    window.__apQuietMo[sel] = mo;
-    return { ok: true, root: root.nodeName };
-  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
-}
-function cdpReadQuiet(sel) {
-  const at = (window.__apQuiet || {})[sel];
-  return at ? { ok: true, idleMs: Date.now() - at } : { ok: false };
-}
-
 
 function makeCdpActuation(llmConfig) {
   // Shared by act.trustedFocus and act.trustedType: a real click when we can measure the element,
@@ -3793,6 +4277,10 @@ function makeCdpActuation(llmConfig) {
     pressEnter: () => cdpKeyTap(CDP_KEYS.enter),
     pressEscape: () => cdpKeyTap(CDP_KEYS.escape),
     pressSpace: () => cdpKeyTap(CDP_KEYS.space),
+    // Segment-scoped clear for the DATE composite. Ctrl+A is forbidden there (it spans the whole
+    // composite and resets focus to Month), so Backspace on a triple-click-SELECTED segment is the
+    // only way to empty one — which is what makes a genuine empty→value transition possible.
+    pressBackspace: () => cdpKeyTap(CDP_KEYS.backspace),
     // The ONLY clean non-committing typeahead/source exit (recon 2026-06-26): Enter commits the armed
     // row; Escape hides the popup but KEEPS focus + the armed row → the next field's focus blur-commits
     // the stray; Tab blurs and ABANDONS the armed row without committing. cdpKeyTap is counter-gated so
@@ -3846,8 +4334,20 @@ function makeCdpActuation(llmConfig) {
     // for the summary searchable editor. NO commit (only scrollTop + reads). Logs the count so the
     // operator can SEE the scrape run mid-fill (during-fill logs before the candidate types).
     scrapeTaOptions: async (loc) => {
+      // TIMING + HOP COUNT (2026-08-06): this is one of the slowest single actions in a fill and the only
+      // way to tune it is to know where its time goes. `steps` is the number of scroll hops, `ms` the
+      // wall-clock, and `firstRenderMs` how much of that was spent waiting for the list to mount before a
+      // single hop happened — three different fixes depending on which dominates.
+      const _t0 = Date.now();
       const r = await cdpEval(cdpScrapeTaOptions, loc.wrapperSel);
-      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") + " [role=" + r.roleCount + " prompt=" + r.promptCount + " used=" + r.usedSel + "]" : "FAILED");
+      const ms = Date.now() - _t0;
+      console.log("[ApplyPilot][CDP-SCRAPE-TA]", loc.wrapperSel, r && r.ok
+        ? r.count + " options" + (r.atBottom ? " (reached bottom)" : "") + " in " + ms + "ms"
+          + " [" + r.steps + " hop(s): " + r.hopEarly + " committed / " + r.hopTimeouts + " TIMED OUT, " + r.hopWaitMs + "ms waiting"
+          + (r.firstRenderMs != null ? ", first-render " + r.firstRenderMs + "ms" : "")
+          + (r.cappedOut ? ", CAPPED OUT" : "") + ", ~" + (r.steps ? Math.round((ms - (r.firstRenderMs || 0)) / r.steps) : 0) + "ms/hop]"
+          + " [role=" + r.roleCount + " prompt=" + r.promptCount + " used=" + r.usedSel + "]"
+        : "FAILED in " + ms + "ms");
       return r;
     },
     // Trusted-click commit fallback (multi-match): text-keyed — immune to list
@@ -3905,6 +4405,37 @@ function makeCdpActuation(llmConfig) {
     focusHierSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
     // Diagnostic twin — same attempt, but returns WHY it failed (see cdpFocusDiag).
     focusHierSearchDiag: (loc) => cdpEval(cdpFocusDiag, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
+    // The multiselect's input carries data-automation-id="searchBox" ONLY ONCE OPEN (skills, traced
+    // 2026-08-07), so every searchBox-keyed selector above is unreachable while the widget is closed and
+    // opening otherwise has to go through a COORDINATE click. focus() + click() on the widget's own input
+    // needs no coordinates and no paint — the skills opener alternates the two routes. Returns a
+    // diagnostic (not a bool); the caller polls readHier, since the searchBox id appears a tick later.
+    openHierInput: (loc) => cdpEval(cdpOpenMultiselectInput, loc.wrapperSel),
+    // A TRUSTED coordinate click aimed at the widget's own INPUT rect. openHier's ladder resolves
+    // `multiselectInputContainer` first and clicks its CENTRE, which is fine for a single-value picker but
+    // wrong for a multi-value one: that container GROWS with each chip, so its centre drifts onto a CHIP,
+    // whose DELETE_charm is part of it (live: a skill present after one run was GONE after the next, in a
+    // run that logged our own "chip set changed" signal). The input is a distinct element from the chips,
+    // so a click at ITS centre opens the widget and cannot delete anything.
+    clickHierInputRect: async (loc) => {
+      const r = await cdpEvalRectReady(cdpRectOf, loc.wrapperSel + " input", true);
+      if (!r || r.w <= 0) return false;
+      await cdpClickAt(r.cx, r.cy);
+      return true;
+    },
+    // React-safe, focus-independent clear of the widget's search input (see cdpClearInputNative).
+    clearHierInput: (loc) => cdpEval(cdpClearInputNative, loc.wrapperSel + " input"),
+    // Blur whatever holds focus — the "click out of the box" half of a commit. Workday's date composite
+    // keeps a typed value in the DOM but does not hand it to its own model until the field is left, which
+    // surfaced as a phantom "The field From is required" on a page visibly showing the date.
+    blurActive: () => cdpEval(() => {
+      const el = document.activeElement;
+      if (!el || !el.blur || el === document.body) return { ok: false, reason: "nothing focused" };
+      const aid = (el.getAttribute && el.getAttribute("data-automation-id")) || el.id || el.tagName;
+      el.blur();
+      try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) { /* blur alone may suffice */ }
+      return { ok: true, blurred: aid };
+    }),
     typeInHier: (text) => cdpTypeChars(text, 40),
     clearHierSearch: () => cdpSelectAllDelete(),
     probeHierLeaf: (label) => cdpEval(cdpSourceLeafProbe, label),
@@ -4003,6 +4534,30 @@ function makeCdpActuation(llmConfig) {
     // ── radio / checkbox ──
     readRadioState: (loc) => cdpEval(cdpReadRadioState, loc.wrapperSel),
     readCheckboxGroup: (loc) => cdpEval(cdpReadCheckboxGroupState, loc.wrapperSel), // pick-one checkbox set (self-ID); clickRadioLabel commits by label id
+    // Wait until the DOM around `loc` has stopped mutating for `quietMs`. NEVER hangs: on the ceiling it
+    // reports quiet:false and the caller proceeds anyway — a gate that can block a fill forever is worse
+    // than the bug it guards. Polls SW-side on wall-clock; the page only stamps.
+    // Arm the observer EARLY (idempotent — a second call is `already:true` and does NOT re-stamp), so idle
+    // time accrues during work the caller is doing anyway and the gate below can return immediately.
+    installQuietWatch: (loc) => cdpEval(cdpInstallQuietWatch, loc.wrapperSel),
+    awaitQuiet: async (loc, opts) => {
+      const quietMs = (opts && opts.quietMs) || 400;
+      const ceilingMs = (opts && opts.ceilingMs) || 3000;
+      const t0 = Date.now();
+      try {
+        const ins = await cdpEval(cdpInstallQuietWatch, loc.wrapperSel);
+        if (!ins || !ins.ok) return { quiet: false, waitedMs: 0, error: (ins && ins.error) || "install failed" };
+        // A fresh install stamps NOW, so the first pass always waits one full quiet window — which is the
+        // conservative direction and costs quietMs once per widget.
+        for (;;) {
+          const q = await cdpEval(cdpReadQuiet, loc.wrapperSel);
+          const waited = Date.now() - t0;
+          if (q && q.ok && q.idleMs >= quietMs) return { quiet: true, waitedMs: waited, idleMs: q.idleMs };
+          if (waited >= ceilingMs) return { quiet: false, waitedMs: waited, idleMs: (q && q.idleMs) || null };
+          await cdpDelay(Math.min(80, quietMs));   // real wall-clock, never the adaptive delay
+        }
+      } catch (e) { return { quiet: false, waitedMs: Date.now() - t0, error: String((e && e.message) || e) }; }
+    },
     scanOrphanCheckboxes: () => cdpEval(cdpScanOrphanCheckboxes), // consents rendered OUTSIDE any formField wrapper (read-only inventory for review)
     // Blur whatever the fill last focused (2026-07-25, operator): some tenants only COMMIT a text field —
     // and fire the cascade it triggers — on BLUR, and the fill leaves focus INSIDE the last field it typed
@@ -4015,11 +4570,16 @@ function makeCdpActuation(llmConfig) {
       a.blur();
       return true;
     }),
+    // Returns a TRUTHY object (existing `&&` callers are unaffected) carrying WHERE it clicked and what
+    // was under that point — so a caller reporting "did not commit" can say whether a click was even
+    // dispatched, and whether it landed on the intended label. `false` still means no click happened.
     clickRadioLabel: async (loc, id) => {
       const rect = await cdpRectReady('label[for="' + id + '"]', true); // M29: retry the label rect
-      if (!rect) return false;
+      if (!rect) return false;                                          // no rect ⇒ NOTHING was dispatched
+      let hit = null;
+      try { hit = await cdpEval(cdpHitAt, rect.cx, rect.cy, id); } catch (e) { /* diagnostic only */ }
       await cdpClickAt(rect.cx, rect.cy);
-      return true;
+      return { ok: true, cx: Math.round(rect.cx), cy: Math.round(rect.cy), hit };
     },
     focusInput: (id) => cdpEval(cdpFocusInputById, id),
     readChecked: (id) => cdpEval(cdpReadCheckedById, id),
@@ -4221,6 +4781,17 @@ function makeCdpActuation(llmConfig) {
     // path is byte-identical for anyone who hasn't added a second key.
     llm: async ({ system, user, maxTokens, action }) => {
       if (!llmConfig || !llmConfig.enabled) return { ok: false, error: "AI fill OFF (enable it in the popup)" };
+      // ── TEMPORARY RECON (2026-08-06, chrome.storage.local.debugAiPrompts) ─────────────────────────
+      // Operator ask: "what exactly was the prompt sent to AI, and each time AI actually is called on
+      // this page". Every AI call funnels through here — per-field AND batched — so this is the one
+      // place that cannot miss one. Prompt and reply are truncated: the point is WHICH questions and
+      // WHICH options went out (and what came back), not a verbatim transcript of the profile blob.
+      const _dbgPrompts = await new Promise((r) => { try { chrome.storage.local.get("debugAiPrompts", (v) => r(!!(v && v.debugAiPrompts))); } catch (e) { r(false); } });
+      if (_dbgPrompts) {
+        const qOnly = String(user || "").split("\nApplicant profile:")[0];   // drop the profile blob — same every call
+        console.log(`[ApplyPilot][AI-CALL] action=${action || "fill"} maxTokens=${maxTokens || "?"} — QUESTIONS/OPTIONS: `
+          + qOnly.slice(0, 1400) + (qOnly.length > 1400 ? " …[cut]" : ""));
+      }
       const attempts = typeof resolveLlmRoute === "function"
         ? resolveLlmRoute(llmConfig, action || "fill", LLM_DEFAULT_MODELS)
         : [{ provider: llmConfig.provider, model: llmConfig.model }];

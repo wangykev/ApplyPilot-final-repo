@@ -84,9 +84,19 @@ test("SW GLOBAL SCOPE: every importScripts file exists and parses", () => {
 // That happened live on 2026-07-28: routing the dateOrderOf call sites through apMatch fixed the
 // global-scope collision, Node passed (it takes the require branch), and the replay walk died mid-run
 // with `apMatch.dateOrderOf is not a function`. This pins the SW literal against actual usage.
-test("apMatch: every apMatch.X used in fill-driver.js is present in the SW object literal", () => {
+//
+// SCOPE (widened 2026-08-09): background.js reaches lib.js through the SAME `apMatch` object and was
+// NOT scanned, so it had exactly the hole this test exists to close. A signature-date fix called
+// `apMatch.parseErrorFieldName` from background.js; the suite passed 1185/1185 and the live replay
+// aborted with `apMatch.parseErrorFieldName is not a function`. Both callers are checked now.
+test("apMatch: every apMatch.X used in fill-driver.js AND background.js is present in the SW object literal", () => {
   const src = fs.readFileSync(path.join(ROOT, "fill-driver.js"), "utf8");
-  const used = new Set([...src.matchAll(/\bapMatch\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]));
+  const callers = ["fill-driver.js", "background.js"];
+  const used = new Map(); // name → the file that calls it (for a message that names the culprit)
+  for (const f of callers) {
+    const text = fs.readFileSync(path.join(ROOT, f), "utf8");
+    for (const m of text.matchAll(/\bapMatch\.([A-Za-z_$][\w$]*)/g)) if (!used.has(m[1])) used.set(m[1], f);
+  }
   assert.ok(used.size > 3, `expected several apMatch.* uses, found ${used.size}`);
 
   // The literal is the ELSE branch of the ternary — from "? require(...)" to the closing "};".
@@ -94,8 +104,8 @@ test("apMatch: every apMatch.X used in fill-driver.js is present in the SW objec
   assert.ok(decl, "could not locate the apMatch SW object literal");
   const listed = new Set([...decl[1].matchAll(/([A-Za-z_$][\w$]*)\s*:/g)].map((m) => m[1]));
 
-  const missing = [...used].filter((n) => !listed.has(n)).sort();
-  assert.deepStrictEqual(missing, [], "these names are called as apMatch.X in fill-driver.js but are NOT in the SW object literal, so they are undefined in the extension even though Node tests pass. Add them to the literal (they must also be globals from lib.js).");
+  const missing = [...used.keys()].filter((n) => !listed.has(n)).sort().map((n) => `${n} (called in ${used.get(n)})`);
+  assert.deepStrictEqual(missing, [], "these names are called as apMatch.X but are NOT in the SW object literal, so they are undefined in the extension even though Node tests pass. Add them to the literal (they must also be globals from lib.js).");
 });
 
 test("apMatch: everything the SW literal lists is actually exported by lib.js", () => {

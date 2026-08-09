@@ -105,7 +105,10 @@ const isAiFlag = (e) => e.flag && e.flag.indexOf("ai-") === 0;
 // SUPER-HARD: an AI typeahead pick the applicant didn't claim (ai-closest-forced — forced a value
 // on a required field with no "Other"), OR any AI guess the model itself flagged LOW confidence —
 // the riskiest committed AI answers → loudest, rendered FIRST (≥ legally-loaded).
-const isSuperHard = (e) => e.flag === "ai-closest-forced" || (isAiFlag(e) && e.confidence === "low");
+// LOCKSTEP with web/lib/review-model.ts isSuperHard: an approximate canonicalize and the deterministic
+// last-resort pick are both values the applicant never claimed (2026-08-07).
+const isSuperHard = (e) => e.flag === "ai-closest-forced" || e.flag === "ai-canon-approximate"
+  || e.flag === "required-forced-pick" || (isAiFlag(e) && e.confidence === "low");
 const mustReplace = (e) => isSuperHard(e) || isSensitive(e) || needsAnswer(e) || isEeoGuess(e);
 // Pre-populated: the value was ALREADY on the form (Workday account pre-fill / operator / prior
 // run) — ApplyPilot recorded it but never filled it. "-match" = it equals the profile value (unflagged).
@@ -575,7 +578,9 @@ const fieldRow = (e, opts = {}) => {
   const lab = el("div", { class: "lab" });
   if (opts.review) {
     // super-hard shows ALONGSIDE legally-loaded/demographic/needs-answer (never hides them — safety-first)
-    if (isSuperHard(e)) lab.appendChild(el("span", { class: "lb superhard", text: e.flag === "ai-closest-forced" ? "AI FORCED" : "LOW-CONF AI" }));
+    if (isSuperHard(e)) lab.appendChild(el("span", { class: "lb superhard", text: e.flag === "ai-closest-forced" ? "AI FORCED"
+        : e.flag === "ai-canon-approximate" ? "NOT YOUR VALUE"
+        : e.flag === "required-forced-pick" ? "PLACEHOLDER" : "LOW-CONF AI" }));
     if (isBecameRequired(e)) lab.appendChild(el("span", { class: "lb cascade", text: "✱ BECAME REQUIRED", title: "The form made this field required after you reviewed this application — answer it, then submit again." }));
     else if (isCascadeRevealed(e)) lab.appendChild(el("span", { class: "lb cascade", text: "⤴ REVEALED", title: "This field appeared only after an earlier value committed — confirm it." })); // M6: shows ALONGSIDE any AI/sensitive badge
     if (isSensitive(e)) lab.appendChild(el("span", { class: "lb crit", text: "LEGALLY-LOADED" }));

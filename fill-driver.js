@@ -34,9 +34,15 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       tenantCompanyFromUrl: tenantCompanyFromUrl, dateOrderOf: dateOrderOf,
       // aiFillDate parses the model's reply with the SAME pure parser the mapped date fields use.
       parseYearMonthDay: parseYearMonthDay, isCompensationQuestion: isCompensationQuestion,
-      isSignatureDateQuestion: isSignatureDateQuestion,
+      // replayField re-derives a SIGNATURE date to TODAY and uses this to skip the rewrite when the
+      // approved value already IS today (so a same-day replay stays a zero-actuation no-op).
+      isSignatureDateQuestion: isSignatureDateQuestion, signatureDateDemanded: signatureDateDemanded, signatureDateAskInText: signatureDateAskInText, isJobPostingGone: isJobPostingGone, sameCalendarDate: sameCalendarDate,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
+      // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
+      // search is already fuzzy, and wrong), and missingSkills is what keeps a re-fill idempotent.
+      skillBaseName: skillBaseName, matchSkillOption: matchSkillOption, missingSkills: missingSkills,
+      isSkillsFieldName: isSkillsFieldName, skillChipName: skillChipName,
       // The AI's option list must never include a menu's prompt row ("Select One").
       isPlaceholderOption: isPlaceholderOption, withoutPlaceholderOptions: withoutPlaceholderOptions };
 
@@ -300,6 +306,12 @@ const DEFAULT_BUDGETS = {
   openExpandWindowMs: 2000,
   reopenSettleMs: 400,
   taOpenRetries: 3,       // same race on the typeahead searchBox open/focus
+  // SKILLS is the one field whose cost scales with the PROFILE, not the form: each skill is its own
+  // clear→type→Enter→settle→click round trip (~2–4s), so 24 skills is a real slice of the page. The
+  // cap and the wall-clock budget bound that; whatever they drop is NAMED in the record, never
+  // silently trimmed. Raise them if a profile carries more skills than a page-time budget allows.
+  skillsMaxAdds: 40,
+  skillsBudgetMs: 180000,
   commitCeilingMs: 10000, // click/Enter → observable state change
   commitIntervalMs: 300,
   textReadDelayMs: 500,   // insertText → read-back (legacy; reactive poll below)
@@ -780,6 +792,13 @@ const fillTextCdp = async (act, loc, value, budgets, tag, opts) => {
       await act.delay(budgets.textReadIntervalMs);
     } while (Date.now() < deadline);
     if (textValuesMatch(after, value)) {
+      // COMMIT BY BLURRING, same as the date composite (operator, 2026-08-08). Workday rejected a page
+      // with "Invalid LinkedIn URL" on a field that visibly held a valid URL, and the operator's manual
+      // fix was to click into the box and back out. Several Workday inputs VALIDATE and hand their value
+      // to the form model on blur, so a field we typed and never left can read correct in the DOM and
+      // still be wrong (or unset) as far as Workday is concerned. Blurring is what a human does on the
+      // way to the next field; the read-back above already decided the value, so this only commits it.
+      if (act.blurActive) { try { await act.blurActive(); } catch (e) { /* best-effort */ } }
       let detail = before ? `overwrote "${before}"` : null;
       if (attempt > 1) detail = (detail ? detail + " | " : "") + `self-healed on attempt ${attempt}`;
       return { status: "filled", after, verified: true, detail };
@@ -988,11 +1007,15 @@ const parseAiReply = (text) => {
     const cat = pick("suggested_category", "category");
     return {
       choice: pick("choice", "answer"), justification: pick("justification", "reason"), confidence: _aiConf(obj.confidence),
+      // `approximate` — the CLOSEST option rather than a true synonym. A choice list must always be
+      // answered (a blank required field blocks the page), so the canonicalize prompt asks for the nearest
+      // option instead of UNKNOWN, and this flags that it is nearest-not-equal so review says so loudly.
+      approximate: obj.approximate === true || /^(true|yes)$/i.test(String(obj.approximate || "")),
       maps_to: (!mapsTo || /^none$/i.test(mapsTo)) ? "" : mapsTo,
       suggested_category: (!cat || /^none$/i.test(cat)) ? "" : cat,
     };
   }
-  return { choice: t, justification: "", confidence: "low", maps_to: "", suggested_category: "" }; // unparseable → best-effort
+  return { choice: t, justification: "", confidence: "low", approximate: false, maps_to: "", suggested_category: "" }; // unparseable → best-effort
 };
 
 // AI dropdown fill (AI-1, ALWAYS-GUESS): open + read the LIVE options → the LLM gets the profile +
@@ -1004,7 +1027,283 @@ const parseAiReply = (text) => {
 // sensitive flag — the legally-loaded "reasoning-from-absence" answers (criminal→No, eligibility→No)
 // are surfaced ai-choice-sensitive and the viewer keys PROMINENCE off that flag, NOT off confidence
 // (a High-confidence sensitive answer must not be the easiest to scroll past). Provider-agnostic.
-const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
+// ============================================================================
+// BATCHED AI — one call for a whole page's AI questions (operator 2026-08-05)
+// ============================================================================
+// A screening page can hold many AI-answered questions, and each one used to be its OWN act.llm round
+// trip, fired serially from inside the field loop: N latencies, and N copies of the profile blob in
+// tokens. This batches the TRANSPORT only — every per-question semantic is untouched, because the answer
+// is handed back to the SAME per-field function that would have called the LLM itself (see `preAnswer`),
+// so the match ladder against LIVE options, the read-back, the persistence re-read, `filled_review`, the
+// EEO re-tag and the teach-flow hints all still happen exactly where they did.
+//
+// DEFAULT-ON since 2026-08-06 (`budgets.disableAiBatch` is the kill-switch). It was opt-in until the
+// read-only pre-pass was shown not to disturb the page; across many visible AND hidden fills the
+// [AI-BATCH-RECON] "open problems" field has stayed empty, which is the evidence that gate wanted.
+// The original reasoning, kept because it is why the recon line exists: The pre-pass
+// opens and closes each candidate dropdown to read its options. That is the same read-only open/close
+// `captureChoiceOptions` and `reconDropdownDump` already do — but theirs are live-verified value-preserving
+// and this one is not yet, and a unit test caught the exact hazard: on the stray-on-close class, OUR close
+// can commit a value, which both disturbs the page and robs the fill's own `closeAndVerifyBlank` of a
+// truthful `before` (it reported `ai-nomatch` where the un-batched path correctly reports
+// `ai-nomatch-stray`). Turning this on by default would trade a real safety signal for speed. Enable it,
+// watch one page's [CDP-TIME] + records, then flip the default.
+// FIRST LIVE RUN, 2026-08-06 (waystar.wd1 R3051, 5 pages, flag ON): 11 AI-filled records on 6 LLM calls
+// instead of 11, reached REVIEW, and the pre-pass was INERT — zero strays, zero ai-nomatch/commit-failed,
+// and all five pages' M40 audits "all matched the report". One tenant is not every tenant (the hazard is
+// tenant-specific), so it stays opt-in until a second shape confirms it.
+//
+// THE BATCH IS A CACHE, NOT A GATE. If a question is in it, the per-field path uses the cached answer and
+// makes no call; if it is missing — misprediction, a parse failure, a field the pre-pass never saw — that
+// path calls the LLM by itself exactly as today. So a batch that is wrong or empty costs speed, never
+// correctness, and the whole feature can be switched off with one flag.
+//
+// SCOPE: unanswerable REQUIRED dropdowns (the `infer` kind) — the case that actually appears in bulk on a
+// screening page. Two kinds are deliberately NOT batched:
+//   • canonicalize (a STATED value that matched no option) — batching it needs the option list, and the
+//     only ways to get one are an extra open per mapped dropdown (MEASURED as a net loss: page 1, which
+//     has no AI questions at all, went 2.7s → 4.1s on those probes) or a cross-run cache. Per the
+//     operator 2026-08-06 there is no cross-run caching to rely on: in the real flow a form is filled
+//     ONCE, reviewed, then submitted, so any such cache is always cold. So canonicalize keeps its own
+//     per-field call — which is cheap in practice, since it only fires when a stated value matches
+//     nothing. The prompt still carries its instructions for when a caller supplies one.
+//   • text/textarea — aiFillText has a specialised compensation branch with its own prompt and
+//     placeholder semantics; folding it in is its own pass.
+// The QUESTION is the stable identity, not the automation-id. Workday remounts a dependent question
+// under a NEW id whenever the field it depends on changes, so anything keyed on the id loses track of an
+// answer it already has. Normalized so casing, whitespace and the required "*" cannot split one question
+// into two cache entries.
+function aiLabelKey(label) {
+  return String(label == null ? "" : label).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
+}
+const AI_BATCH_MAX = 24; // beyond this the prompt stops being reliable; the overflow just falls back to per-field calls
+// Room for the batched reply. 400/question is ~5x a well-formed answer (choice + short justification +
+// confidence + maps_to + suggested_category ≈ 70-80 tokens), plus a fixed allowance for the JSON envelope.
+// A cap is not a spend — it only bounds what the model MAY produce.
+function aiBatchMaxTokens(n) { return 512 + 400 * Math.max(1, n | 0); }
+
+function buildBatchAiPrompt(items, profile, jobContext) {
+  const system = "You help an applicant fill out a job-application page. You are given the applicant's profile (JSON) and SEVERAL questions at once. Answer EVERY question, keyed by its id.\n"
+    + "Each question has a \"kind\":\n"
+    + "  • \"infer\" — the applicant did NOT state an answer. Choose the SINGLE best option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record). These are REQUIRED: always choose the most likely option, NEVER refuse and never answer UNKNOWN.\n"
+    + "  • \"canonicalize\" — the applicant ALREADY STATED a value (given as \"stated\"). Your ONLY job is to pick the option that means the SAME thing (vocabulary mapping, e.g. \"Male\"→\"Man\"). You are NOT inferring, deciding, or changing anything. If NO option means the same, answer \"UNKNOWN\". Never pick an option that differs in meaning.\n"
+    + "For every answer give a SHORT justification — one terse phrase, about 12 words, no preamble, no restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give confidence: High, Medium, or Low. "
+    + "ALSO map each question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
+  const qs = items.map((it) => {
+    const o = { id: it.key, kind: it.kind, question: String(it.label || ""), options: it.options || [] };
+    if (it.kind === "canonicalize") o.stated = Array.isArray(it.stated) ? it.stated.join(" / ") : String(it.stated == null ? "" : it.stated);
+    return o;
+  });
+  const user = "Questions: " + JSON.stringify(qs)
+    + "\nApplicant profile: " + JSON.stringify(profile)
+    + "\nJob context: " + JSON.stringify(jobContext || {})
+    + "\n\nReply ONLY with a JSON object and nothing else, one entry per question id:\n"
+    + "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<exact option text, or UNKNOWN for a canonicalize with no equivalent>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
+  return { system, user };
+}
+
+// Tolerant of ```-fences, embedded JSON, and an object-keyed-by-id shape instead of the asked-for array —
+// the same latitude parseAiReply gives a single answer. Returns a Map key → answer; anything unparseable
+// simply yields no entry, and the caller then makes that question's own call.
+function parseBatchAiReply(text, items) {
+  const out = new Map();
+  let t = String(text == null ? "" : text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) {
+    const m = t.match(/\{[\s\S]*\}/);
+    if (m) { try { obj = JSON.parse(m[0]); } catch (e2) { return out; } }
+  }
+  if (!obj || typeof obj !== "object") return out;
+  const known = new Set((items || []).map((i) => i.key));
+  const take = (id, a) => {
+    if (!a || typeof a !== "object") return;
+    const key = String(id == null ? "" : id);
+    if (!known.has(key) || out.has(key)) return;           // ignore ids we never asked about
+    const choice = a.choice == null ? "" : String(a.choice);
+    if (!choice) return;
+    out.set(key, { choice, justification: a.justification == null ? "" : String(a.justification),
+      confidence: _aiConf(a.confidence),   // SAME normalization as parseAiReply — the record/bundle expect it lowercased
+
+      maps_to: a.maps_to == null ? "" : String(a.maps_to),
+      suggested_category: a.suggested_category == null ? "" : String(a.suggested_category) });
+  };
+  if (Array.isArray(obj.answers)) obj.answers.forEach((a) => take(a && a.id, a));
+  else if (Array.isArray(obj)) obj.forEach((a) => take(a && a.id, a));
+  else for (const k of Object.keys(obj)) take(k, obj[k]);   // {id: {...}} shape
+  return out;
+}
+
+// ── ONE dropdown-commit poll, shared by the deterministic and AI paths (2026-08-06) ─────────────────
+// These had diverged, and the AI side was much the worse for it. The deterministic commit reads FIRST
+// (the click's selection usually lands in its own event turn) and then polls on `delayRender`, which is
+// ADAPTIVE — ~10–40ms on a painting tab. The AI commit hand-rolled its own: two unconditional
+// `delayFull(reopenSettleMs)` beats, 800ms flat per field, never scaled by paint state, and NO polling.
+//
+// So an AI dropdown cost ~800ms where an identical deterministic one cost tens of ms — three EEO fields
+// on one page is ~2.4s of pure waiting, which is exactly what the operator saw: the pre-pass flew and the
+// fill crawled. It was also the more FRAGILE of the two: with no poll, a commit that landed at 450ms was
+// reported as failed and sent to review.
+//
+// The safety property is preserved exactly, because it never depended on the beat LENGTH: acceptance
+// requires the trigger to still show the target after a further beat (the persistence re-read), so a
+// momentary pick discarded on render-complete is still never reported filled. A shorter beat only
+// re-polls sooner.
+async function awaitDropdownCommit(act, loc, isTarget, budgets, delayRender, ceilingMs) {
+  let after = null;
+  const deadline = Date.now() + (ceilingMs || budgets.commitCeilingMs);
+  do {
+    const cs = await act.readDropdownState(loc);          // READ-FIRST — no beat before the first look
+    after = cs ? cs.triggerText : after;
+    if (isTarget(after)) {
+      await delayRender(budgets.commitIntervalMs);        // PERSISTENCE: must still hold after a real beat
+      const cs2 = await act.readDropdownState(loc);
+      const after2 = cs2 ? cs2.triggerText : null;
+      if (isTarget(after2)) return { ok: true, after: after2 };
+      after = after2;                                     // reverted — keep polling, never accept
+    }
+    await delayRender(budgets.commitIntervalMs);
+  } while (Date.now() < deadline);
+  return { ok: false, after };
+}
+
+// Which of this page's questions go into the batched call, and what options do they offer? Runs BEFORE
+// any value is written, so it is READ-ONLY: each dropdown is opened, its options read, and closed through
+// the same verified-blank close the recon path uses — a candidate that ends up holding a value would be a
+// bug, so the close is checked rather than assumed.
+//
+// Prediction is deliberately OVER-INCLUSIVE for `infer` and PRECISE for `canonicalize`:
+//  • infer — required + aiEligible + no value from FIELD_MAP. Buckets and the deterministic recognizers
+//    run later and may well answer it, in which case the batched answer is simply never used. Wasted
+//    prompt tokens are the entire cost of a misprediction; under-including would cost a serial call.
+//  • canonicalize — a MAPPED dropdown whose stated value we can prove does not match any live option, run
+//    through the SAME match ladder the fill will use ({containment:false}: a canonicalize exists precisely
+//    because ApplyPilot will not guess). Proving it here costs nothing extra since the options are open.
+// PHASE 1 — decide the candidates WITHOUT touching the page (2026-08-06). Pure, so it is unit-testable
+// and, more importantly, so we can COUNT candidates before spending a single DOM round trip. Live: page 5
+// had exactly one candidate, and the old collector had already opened it (333ms) before discovering the
+// batch could not fire — a pure cost for a call that never happened.
+//   infer        — required + aiEligible + no value from FIELD_MAP. Needs the live options, so it is the
+//                  only kind that costs an open. Over-inclusive on purpose: buckets/recognizers may still
+//                  answer it, and a wasted prompt entry is cheaper than a missed batch.
+//   canonicalize — a stated value we can PROVE matches no option, using the cross-run cache only. Never
+//                  opens (see the measured page-1 regression), so it is free to include.
+// Would a bucket actually PRODUCE a value for this field? Mirrors fillFromBucket's own resolution, minus
+// the actuation: Mode A resolves a bound profile path, Mode B carries its own candidate list. A bucket
+// that resolves to nothing is not an answer, so it must not suppress the AI candidate.
+function bucketWouldAnswer(bucket, profile, widgetType) {
+  if (!bucket) return false;
+  if (bucket.profile_path) {
+    // resolve() REQUIRES the widget type — without it every value comes back { skip: true }, which would
+    // silently make this function always answer "no" and defeat the whole check.
+    const r = resolve(getByPath(profile, bucket.profile_path), widgetType || "dropdown");
+    if (!r || r.skip) return false;
+    const v = r.value !== undefined ? r.value : r.candidates;
+    return Array.isArray(v) ? v.length > 0 : (v != null && String(v).trim() !== "");
+  }
+  const cands = (Array.isArray(bucket.value) ? bucket.value : (bucket.value != null ? [bucket.value] : []))
+    .filter((x) => x != null && String(x).trim() !== "");
+  return cands.length > 0;
+}
+
+// EVERY deterministic tier, modelled (2026-08-06, operator: "the planner should model everything that
+// fills deterministically"). The fill ladder tries FIELD_MAP, then buckets, then the employment
+// recognizers, and only then the AI — but the planner used to model just the first, so a question any of
+// the later tiers would answer was still scouted (a dropdown opened for its options) and still took a
+// slot in the prompt, and its answer was then thrown away. Live on waystar page 3: both sponsorship
+// questions carry hashed ids, so FIELD_MAP knew nothing about them, and buckets answered them from the
+// taught wording — after the planner had already opened them and paid for them in the prompt.
+//
+// Returns the tier that would answer, or null. Order MIRRORS the fill loop, including its gates (buckets
+// only for UNMAPPED fields), so the two cannot disagree about who owns a field.
+//
+// Under-including is safe by construction: the batch is a cache, not a gate, so a field wrongly skipped
+// here simply makes its own per-field call exactly as it does today. Wrongly INCLUDING is what costs.
+function deterministicTierFor(f, profile, bucketIndex, empCompany) {
+  const mappedPath = FIELD_MAP[f.fieldName] || null;
+  if (mappedPath) {
+    // resolve()'s CONTRACT is { candidates } | { skip } — NOT a bare value. Reading it as a scalar is what
+    // produced the live `s.toLowerCase is not a function`.
+    const rs = resolve(getByPath(profile, mappedPath), f.widgetType);
+    // resolve() hands back { candidates } for a choice widget and { value } for a text one — checking only
+    // `candidates` reported every mapped TEXT field as "AI or blank", which is exactly the sort of wrong
+    // explanation this trace exists to avoid.
+    if (rs && !rs.skip && ((Array.isArray(rs.candidates) && rs.candidates.length)
+        || (rs.value !== undefined && rs.value !== null && String(rs.value) !== ""))) return "field-map";
+  }
+  // The employer-match question is decided by decidePreviousWorker, never by the AI — it is answered (or
+  // deliberately left blank + flagged) on its own path.
+  if (f.fieldName === "candidateIsPreviousWorker") return "employer-match";
+  // Buckets — same gate as the loop: UNMAPPED fields only.
+  if (!mappedPath && bucketIndex && bucketIndex.size) {
+    const b = bucketIndex.get(apMatch.normalizeLabel(f.label));
+    if (bucketWouldAnswer(b, profile, f.widgetType)) return "bucket";
+  }
+  // The tenant's own worded employment-status question ("Are you a former X employee?").
+  if (empCompany) {
+    try {
+      const emp = recognizeEmploymentQuestion(f.label, empCompany);
+      const d = emp ? decideEmploymentStatus(emp.tense, empCompany, profile, f.label) : null;
+      if (d && d.fill) return "employment-recognizer";
+    } catch (e) { /* recognizer threw → treat as not-answered; the AI path still covers it */ }
+  }
+  return null;
+}
+
+function planAiBatchCandidates(fields, profile, known, bucketIndex, empCompany) {
+  const out = [];
+  // A question we ALREADY have an answer for is not a candidate — this is what makes a page refill cost
+  // zero calls. Keyed by question, so it holds even when the automation-id changed underneath us.
+  const answered = (f) => !!(known instanceof Map && known.size && known.has(aiLabelKey(f && f.label)));
+  for (const f of fields || []) {
+    if (out.length >= AI_BATCH_MAX) break;
+    if (f.widgetType !== "dropdown") continue;   // text/date/checkbox keep their own call — see the batch header
+    try {
+      if (deterministicTierFor(f, profile, bucketIndex, empCompany)) continue; // some tier owns it — not an AI question
+      if (answered(f)) continue;                 // already decided this page — reuse, never re-ask
+      if (f.isRequired && aiEligible(f)) out.push({ key: f.fieldName, kind: "infer", label: f.label, wrapperSel: f.wrapperSel, needsOpen: true, options: null });
+    } catch (e) { /* this field simply isn't batched — it keeps its own per-field call */ }
+  }
+  return out;
+}
+
+// PHASE 2 — only now touch the page, and only for candidates that need options, and only if a batch can
+// actually fire. Returns { items, recon } — recon is what the [AI-BATCH] log prints so a no-op batch is
+// never mistaken for a working one.
+async function collectAiBatchItems(act, fields, profile, budgets, known, bucketIndex, empCompany, trace) {
+  const t0 = Date.now();
+  const plan = planAiBatchCandidates(fields, profile, known, bucketIndex, empCompany);
+  const recon = { planned: plan.length, plannedKeys: plan.map((c) => c.kind + ":" + c.key),
+    needOpen: plan.filter((c) => c.needsOpen).length, opened: 0, openFailed: [], dropped: [], ms: 0 };
+  // THE COUNT GATE: a batch needs 2+ questions to be worth anything, and that is knowable before any
+  // page contact. One candidate ⇒ spend nothing and let it make its own call.
+  if (plan.length < 2) { recon.dropped.push("fewer than 2 candidates — no page contact"); recon.ms = Date.now() - t0; return { items: [], recon }; }
+  const items = [];
+  for (const c of plan) {
+    if (!c.needsOpen) { items.push({ key: c.key, kind: c.kind, label: c.label, options: c.options, stated: c.stated }); continue; }
+    const loc = { wrapperSel: c.wrapperSel };
+    let before = null;
+    const _o0 = Date.now();
+    try {
+      const r = await openAndReadDropdown(act, loc, budgets);
+      recon.opened++;
+      if (trace) trace(`  scout: read options for "${String(c.label || "").slice(0, 45)}"`, Date.now() - _o0);
+      before = r.before;
+      if (!r.expanded || !r.state || !r.state.optionCount) { recon.openFailed.push(c.key + ":no-options"); await closeAndVerifyBlank(act, loc, before, budgets); continue; }
+      const enabled = apMatch.withoutPlaceholderOptions(r.state.options.filter((o) => !o.disabled).map((o) => o.text));
+      if (enabled.length) items.push({ key: c.key, kind: c.kind, label: c.label, options: enabled });
+      else recon.openFailed.push(c.key + ":all-disabled");
+      const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+      if (cz && cz.blank === false) recon.openFailed.push(c.key + ":CLOSE-STRAYED->" + cz.after); // the hazard the opt-in exists for
+    } catch (e) {
+      recon.openFailed.push(c.key + ":" + String((e && e.message) || e).slice(0, 40));
+      try { await closeAndVerifyBlank(act, loc, before, budgets); } catch (e2) { /* best effort */ }
+    }
+  }
+  recon.ms = Date.now() - t0;
+  return { items, recon };
+}
+
+const aiFillField = async (act, loc, f, profile, jobContext, budgets, preAnswer) => {
   const norm = apMatch.normalize;
   const sensitive = legallyLoaded(f.label);
   const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
@@ -1024,13 +1323,20 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
     + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}";
-  const res = await act.llm({ system, user, maxTokens: 512 });
-  if (!res || !res.ok) { // call failed / empty — infra, NOT a decision
-    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: noCommitAfter(cz), flag: cz.blank ? "ai-call-failed" : "ai-call-failed-stray",
-      detail: "AI call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+  // preAnswer = this question's entry from the page's ONE batched call. Transport only: the answer takes
+  // exactly the path a per-field reply would from here down (match ladder vs the LIVE options, commit,
+  // read-back, persistence re-read, flags). Absent ⇒ make the call, i.e. today's behaviour unchanged.
+  let ai;
+  if (preAnswer) ai = preAnswer;
+  else {
+    const res = await act.llm({ system, user, maxTokens: 512 });
+    if (!res || !res.ok) { // call failed / empty — infra, NOT a decision
+      const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+      return { status: "needs_review", after: noCommitAfter(cz), flag: cz.blank ? "ai-call-failed" : "ai-call-failed-stray",
+        detail: "AI call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+    }
+    ai = parseAiReply(res.text);
   }
-  const ai = parseAiReply(res.text);
   const conf = ai.confidence; // the AI's self-reported inference confidence (high/medium/low)
   const hint = { maps_to: ai.maps_to || "", suggested_category: ai.suggested_category || "" }; // piggyback for the teach flow
   // The choice is a CANDIDATE — clear the match ladder vs the LIVE options. A paraphrase / refusal /
@@ -1047,19 +1353,30 @@ const aiFillField = async (act, loc, f, profile, jobContext, budgets) => {
 
   const target = enabledTexts[m.targetIndex];
   await act.clickDropdownOptionByText(loc, target);
-  await act.delayFull(budgets.reopenSettleMs);
-  let post = await act.readDropdownState(loc);
-  let committed = post && norm(post.triggerText) === norm(target);
-  if (committed) { // M39 persistence: re-read after a real beat — a momentary pick that reverts is NOT a commit
-    await act.delayFull(budgets.reopenSettleMs);
-    post = await act.readDropdownState(loc);
-    committed = post && norm(post.triggerText) === norm(target);
-  }
+  // SAME commit poll as a deterministic pick (2026-08-06): read-first, ADAPTIVE beats, persistence
+  // re-read, poll to the ceiling. This used to be two flat delayFull(reopenSettleMs) beats — 800ms per
+  // AI field no matter how fast the tab was painting, and no poll at all, so a commit landing a beat late
+  // was called a failure. An AI pick is a candidate like any other; it should commit like one.
+  const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets,
+    (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+  const committed = cr.ok;
+  const post = { triggerText: cr.after };
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-commit-failed", confidence: conf, ...hint,
     detail: "AI chose \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
   // ALWAYS filled_review — an AI guess is never silently trusted. If the dropdown held a REAL
   // prefilled value the AI's pick replaced, say so (provenance for the reviewer — the prior
   // answer is otherwise invisible once overwritten).
+  // ── WAIT FOR THE LIST TO UNMOUNT BEFORE THE NEXT FIELD (2026-08-06) ─────────────────────────────
+  // Selecting an option closes the list, but the options LINGER for a beat while they unmount — and they
+  // stay clickable. Every portaled listbox renders at the SAME screen position (live: every commit on
+  // waystar page 3 logged rect=463,298), so the next field's open-click lands exactly where the previous
+  // field's options still are. On page 3 that click hit "No, but I live near one of these locations" —
+  // an option of the RELOCATION list — which silently changed relocation and remounted the dependent
+  // basecamp question under a new id. It read like Workday rewriting our answer; it was us mis-clicking
+  // a list that had not finished unmounting.
+  // fillDropdownCdp has gated on options-GONE (not merely aria-expanded) since 2026-07-06. The AI commit
+  // paths never did, and they are the ones that fill these screening questions.
+  try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort — the verify above already stands */ }
   const overwroteNote = hasLiveValue(before) && norm(before) !== norm(target)
     ? " (overwrote prefilled \"" + before + "\")" : "";
   return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier,
@@ -1284,7 +1601,7 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
 // EEO: the demographic comes from the profile, the AI just maps "Male"→"Man"). The pick must clear
 // the match ladder vs the LIVE options (never blind-commit); always filled_review; UNKNOWN/no-match
 // → needs_review. `stated` = the profile candidate(s) that failed to match.
-const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
+const aiCanonicalizeField = async (act, loc, f, stated, budgets, preAnswer) => {
   const norm = apMatch.normalize;
   const statedStr = Array.isArray(stated) ? stated.join(" / ") : String(stated);
   const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
@@ -1294,18 +1611,40 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
       detail: "AI canonicalize: options did not render (not actuated)" + keptPrefillNote(cz), auditLoc: loc.wrapperSel };
   }
   const enabledTexts = apMatch.withoutPlaceholderOptions(state.options.filter((o) => !o.disabled).map((o) => o.text));
-  const system = "The applicant has ALREADY STATED a value for this field. Your ONLY job is to pick the option from the provided list that means the SAME as the stated value (vocabulary mapping, e.g. \"Male\"→\"Man\"). You are NOT inferring, deciding, or changing anything about the applicant. If NO option means the same, reply UNKNOWN. Never pick an option that differs in meaning.";
+  // ── ALWAYS PICK ONE. NEVER "UNKNOWN" (operator, 2026-08-07) ──────────────────────────────────────
+  // This is a CLOSED LIST, and the form will not accept a blank: "only the large text boxes can be
+  // unknown and choose N/A". So the prompt asks for the nearest option and a truthfulness bit
+  // (`approximate`) instead of letting the model refuse.
+  //
+  // The old prompt said "if NO option means the same, reply UNKNOWN", which is defensible in isolation
+  // and wrong in context: on nvidia.wd5, Phone Device Type offers only ["Home","Home Cellular"] and the
+  // profile says "Mobile", so the model correctly refused, the required field stayed blank, and Workday
+  // refused the whole page. Asking for the closest option answers it in ONE call — the previous shape
+  // needed a second LLM round trip and a second open/close of the same dropdown to recover.
+  //
+  // Honesty is preserved by `approximate`, not by refusing: an exact synonym still commits as
+  // `ai-canonicalized`, while a nearest-match commits as `ai-canon-approximate` and says in the detail
+  // that it is NOT the stated value — so review sees the difference at a glance.
+  const system = "The applicant has ALREADY STATED a value for this field, and you must choose from a CLOSED list of options. "
+    + "Prefer the option that means the SAME as the stated value (vocabulary mapping, e.g. \"Male\"→\"Man\") and set approximate=false. "
+    + "If NO option means exactly the same, choose the CLOSEST option in meaning and set approximate=true. "
+    + "You MUST always choose one of the provided options — never reply UNKNOWN, never invent text, and never leave it empty: "
+    + "the form rejects a blank answer, and a human reviews every approximate choice before anything is submitted.";
   const user = "Field: " + String(f.label || "")
     + "\nThe applicant's STATED value: " + JSON.stringify(statedStr)
-    + "\nOptions (reply with the EXACT text of the matching one): " + JSON.stringify(enabledTexts)
-    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"confidence\":\"High|Medium|Low\"}";
-  const res = await act.llm({ system, user, maxTokens: 128 });
-  if (!res || !res.ok) {
-    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
-    return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-canon-failed",
-      detail: "AI canonicalize call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+    + "\nOptions (reply with the EXACT text of one of these): " + JSON.stringify(enabledTexts)
+    + "\n\nReply ONLY with a JSON object and nothing else:\n{\"choice\":\"<exact option text>\",\"approximate\":true|false,\"confidence\":\"High|Medium|Low\"}";
+  let ai; // preAnswer = this question's entry from the page's ONE batched call (transport only — see aiFillField)
+  if (preAnswer) ai = preAnswer;
+  else {
+    const res = await act.llm({ system, user, maxTokens: 128 });
+    if (!res || !res.ok) {
+      const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+      return { status: "needs_review", after: noCommitAfter(cz), flag: "ai-canon-failed",
+        detail: "AI canonicalize call failed — " + ((res && res.error) || "no reply") + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+    }
+    ai = parseAiReply(res.text);
   }
-  const ai = parseAiReply(res.text);
   const conf = ai.confidence;
   const m = ai.choice ? apMatch.matchCandidates([ai.choice], enabledTexts) : { targetIndex: -1, matchTier: null };
   if (m.targetIndex === -1) { // UNKNOWN / not a real option — never blind-commit a demographic
@@ -1316,15 +1655,64 @@ const aiCanonicalizeField = async (act, loc, f, stated, budgets) => {
   }
   const target = enabledTexts[m.targetIndex];
   await act.clickDropdownOptionByText(loc, target);
-  await act.delayFull(budgets.reopenSettleMs);
-  let post = await act.readDropdownState(loc);
-  let committed = post && norm(post.triggerText) === norm(target);
-  if (committed) { await act.delayFull(budgets.reopenSettleMs); post = await act.readDropdownState(loc); committed = post && norm(post.triggerText) === norm(target); }
+  // Shared commit poll (see awaitDropdownCommit) — adaptive, not two flat 800ms beats.
+  const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets, (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+  const committed = cr.ok, post = { triggerText: cr.after };
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-canon-commit-failed",
     detail: "AI mapped \"" + statedStr + "\" → \"" + target + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
+  // ── WAIT FOR THE LIST TO UNMOUNT BEFORE THE NEXT FIELD (2026-08-06) ─────────────────────────────
+  // Selecting an option closes the list, but the options LINGER for a beat while they unmount — and they
+  // stay clickable. Every portaled listbox renders at the SAME screen position (live: every commit on
+  // waystar page 3 logged rect=463,298), so the next field's open-click lands exactly where the previous
+  // field's options still are. On page 3 that click hit "No, but I live near one of these locations" —
+  // an option of the RELOCATION list — which silently changed relocation and remounted the dependent
+  // basecamp question under a new id. It read like Workday rewriting our answer; it was us mis-clicking
+  // a list that had not finished unmounting.
+  // fillDropdownCdp has gated on options-GONE (not merely aria-expanded) since 2026-07-06. The AI commit
+  // paths never did, and they are the ones that fill these screening questions.
+  try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort — the verify above already stands */ }
   // ALWAYS filled_review — a canonicalized demographic still gets a human glance.
+  // An APPROXIMATE pick is a different claim from a vocabulary map, so it gets its own flag and a detail
+  // that states plainly it is NOT what the applicant said. Same commit, same verification, louder label.
+  if (ai.approximate) {
+    return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier, flag: "ai-canon-approximate", confidence: conf,
+      detail: "NOT your stated value — this form offers no option meaning \"" + statedStr + "\", so the CLOSEST one (\"" + target + "\") was selected so the application can proceed. VERIFY AND CORRECT IT.",
+      options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
   return { status: "filled_review", after: target, verified: true, matchTier: m.matchTier, flag: "ai-canonicalized", confidence: conf,
     detail: "AI canonicalized stated \"" + statedStr + "\" → \"" + target + "\" (vocab map, not inferred)", options: enabledTexts, auditLoc: loc.wrapperSel };
+};
+
+// Commit the LAST-RESORT option on a REQUIRED dropdown nothing else could answer (see
+// pickLastResortOption for the operator rule and the preference order). Deterministic — no LLM, so it
+// works with AI off or an exhausted provider. Everything else is unchanged: the pick still goes through
+// the same open → text-keyed click → commit-verify → close-confirm sequence every other dropdown commit
+// uses, so it can never report a value the page did not take.
+const forceRequiredDropdownPick = async (act, loc, f, budgets, why) => {
+  const norm = apMatch.normalize;
+  const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+  if (!expanded || !state || state.optionCount === 0) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "required-blank-no-options",
+      detail: "a REQUIRED field could not be answered and its options did not render" + keptPrefillNote(cz), auditLoc: loc.wrapperSel };
+  }
+  const enabledTexts = apMatch.withoutPlaceholderOptions(state.options.filter((o) => !o.disabled).map((o) => o.text));
+  const target = pickLastResortOption(enabledTexts);
+  if (!target) {
+    const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+    return { status: "needs_review", after: noCommitAfter(cz), flag: "required-blank-no-options",
+      detail: "a REQUIRED field could not be answered and the list held no selectable option" + keptPrefillNote(cz), options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  await act.clickDropdownOptionByText(loc, target);
+  const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets, (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+  if (!cr.ok) {
+    return { status: "needs_review", after: cr.after, flag: "required-forced-commit-failed",
+      detail: `last-resort pick "${target}" did not commit — the page still blocks on this required field`, options: enabledTexts, auditLoc: loc.wrapperSel };
+  }
+  try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort — the verify above stands */ }
+  return { status: "filled_review", after: target, verified: true, flag: "required-forced-pick", confidence: "low",
+    detail: `PLACEHOLDER — nothing could answer this required field (${why}), so "${target}" was selected only so the application can reach review. VERIFY AND CORRECT IT.`,
+    options: enabledTexts, auditLoc: loc.wrapperSel };
 };
 
 // AI-3 MANDATORY-EEO inference (dropdown) — operator-decided (REVERSES "never AI-guess a demographic").
@@ -1375,10 +1763,9 @@ const aiInferEeoField = async (act, loc, f, profile, budgets) => {
   }
   const opt = enabledTexts[m.targetIndex];
   await act.clickDropdownOptionByText(loc, opt);
-  await act.delayFull(budgets.reopenSettleMs);
-  let post = await act.readDropdownState(loc);
-  let committed = post && norm(post.triggerText) === norm(opt);
-  if (committed) { await act.delayFull(budgets.reopenSettleMs); post = await act.readDropdownState(loc); committed = post && norm(post.triggerText) === norm(opt); }
+  // Shared commit poll (see awaitDropdownCommit) — adaptive, not two flat 800ms beats.
+  const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(opt), budgets, (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+  const committed = cr.ok, post = { triggerText: cr.after };
   if (!committed) return { status: "needs_review", after: post ? post.triggerText : null, flag: "ai-eeo-commit-failed", detail: "AI EEO chose \"" + opt + "\" but the commit did not persist", options: enabledTexts, auditLoc: loc.wrapperSel };
   if (declined) return { status: "filled_review", after: opt, verified: true, matchTier: m.matchTier, flag: "eeo_declined", detail: "AI declined to guess a required demographic → neutral \"" + opt + "\"", options: enabledTexts, auditLoc: loc.wrapperSel };
   return { status: "filled_review", after: opt, verified: true, matchTier: m.matchTier, flag: "ai-eeo-guess", confidence: ai.confidence, detail: "AI inferred a required demographic → \"" + opt + "\" (confident guess — VERIFY)", options: enabledTexts, auditLoc: loc.wrapperSel };
@@ -1655,28 +2042,10 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
       const cs = await act.readDropdownState(loc);
       return { ok: false, after: cs ? cs.triggerText : null };
     }
-    let after = null;
-    const deadline = Date.now() + (ceilingMs || budgets.commitCeilingMs); // ceilingMs: SHORT deadline for the fast overwrite attempt (fail quick → slow refill); full ceiling otherwise
-    do { // READ-FIRST (2026-07-25): the option click's selection usually lands in the click's own event turn — the old delay-then-read paid one commitIntervalMs per commit for nothing; a not-yet-committed read just re-polls. The PERSISTENCE beat below stays delay-first (it must be a real beat).
-      const cs = await act.readDropdownState(loc);
-      after = cs ? cs.triggerText : after;
-      if (committedText(after)) {
-        // PERSISTENCE (the false-verify guard): a pick made before the option list finished
-        // rendering shows for an instant, then is DISCARDED on render-complete — that momentary
-        // value is exactly what produced the false verified:true. Confirm the trigger STILL
-        // shows the target after another beat before accepting; a revert keeps polling (→ honest
-        // needs_review), never a silent wrong fill. This re-read is the interval-LENGTH-INDEPENDENT
-        // gate that makes the adaptive delayRender safe: shrinking the beat only re-polls sooner —
-        // acceptance still requires the target to PERSIST across the beat.
-        await delayRender(budgets.commitIntervalMs);
-        const cs2 = await act.readDropdownState(loc);
-        const after2 = cs2 ? cs2.triggerText : null;
-        if (committedText(after2)) return { ok: true, after: after2 };
-        after = after2; // reverted — not committed; keep polling until the deadline
-      }
-      await delayRender(budgets.commitIntervalMs); // the page commits the pick at its own pace — adaptive under the measured-fast gate (STAGE 2)
-    } while (Date.now() < deadline);
-    return { ok: false, after };
+    // READ-FIRST + adaptive beats + the persistence re-read all live in awaitDropdownCommit now, shared
+    // with the AI commit paths so the two can never drift again (ceilingMs: SHORT deadline for the fast
+    // overwrite attempt — fail quick → slow refill; full ceiling otherwise).
+    return awaitDropdownCommit(act, loc, committedText, budgets, delayRender, ceilingMs);
   };
 
   // Backstop/log: a fresh read must still show the target present + enabled before
@@ -1770,6 +2139,12 @@ const fillDropdownCdp = async (act, loc, candidates, budgets, opts = {}) => {
 // never a silent wrong answer. Zero actuation when the target is already the only one checked.
 const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   if (!act.readCheckboxGroup) return { status: "needs_review", detail: "substrate cannot read a checkbox group" };
+  // START THE QUIESCENCE CLOCK BEFORE THE WORK, not at the gate (2026-08-05). The observer install is
+  // idempotent and only STAMPS on mutation, so installing it here means the several round-trips below
+  // (the option read, and the uncheck-others loop when there is nothing to uncheck) accrue real idle
+  // time. The gate then usually finds the DOM already quiet and returns at once, instead of paying a
+  // full quietMs window per widget purely because a fresh install stamps `now`.
+  if (typeof act.installQuietWatch === "function") { try { await act.installQuietWatch(loc); } catch { /* best effort — the gate re-installs */ } }
   const opts = await act.readCheckboxGroup(loc);
   if (!opts || !opts.length) return { status: "error", detail: "no checkboxes in wrapper" };
   const optionLabels = opts.map((o) => o.labelText);
@@ -1793,19 +2168,122 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   // 2. check the target (skip when it already is)
   let now = await readBack();
   const isOn = (id) => !!(now.find((o) => o.id === id) || {}).checked;
+  let quiet = null, clickInfo = null;
   if (!isOn(target.id)) {
-    await act.clickRadioLabel(loc, target.id);
+    // ── QUIESCENCE GATE (2026-08-04) — don't click into a page that is still reacting ───────────────
+    // The 10ms watch showed our verified check being wiped 281ms later by 29 MutationRecords with NO
+    // click behind it: the page was still digesting the fields filled just before this one (a language
+    // change, a name, three date segments), and the reaction rebuilt these inputs. A human never hits
+    // that window, which is the whole reason this fails for the bot and not by hand.
+    //
+    // Every other wait here tracks a COUNT settling and so cannot see "busy". This waits for the DOM
+    // around the widget to fall silent. It NEVER blocks the fill: on the ceiling it proceeds and says so,
+    // and the persistence re-read below still backstops whatever lands later than any gate.
+    if (typeof act.awaitQuiet === "function") {
+      quiet = await act.awaitQuiet(loc, { quietMs: budgets.groupQuietMs || 400, ceilingMs: budgets.groupQuietCeilingMs || 3000 });
+      // RE-RESOLVE AFTER WAITING — waiting is precisely the window in which a rebuild re-issues the ids,
+      // so the id read before the wait can now point at a node that no longer exists. Live on the first
+      // gated run: clickRadioLabel found no `label[for=<stale id>]`, so NO click was dispatched at all and
+      // the commit "failed" having burned 17.5s. The gate created that window; this closes it.
+      // The LABEL is the stable identity across a rebuild, which is why the match is by text, not id.
+      const fresh = await readBack();
+      if (fresh.length) {
+        const again = fresh.find((o) => String(o.labelText).toLowerCase() === target.labelText.toLowerCase());
+        if (again) { if (again.id !== target.id) quiet.reissuedIds = true; target = again; }
+        now = fresh;
+      }
+      if (isOn(target.id)) { /* the wait was enough on its own — fall through to the verify below */ }
+    }
+    if (!isOn(target.id)) clickInfo = await act.clickRadioLabel(loc, target.id);
     await pollCheckedIs(act, target.id, true, budgets);
     now = await readBack();
   }
-  const on = now.filter((o) => o.checked);
-  const after = (on[0] || {}).labelText || null;
-  if (!isOn(target.id)) return { status: "needs_review", detail: `checkbox-group selection did not commit for "${target.labelText}"`, after, options: optionLabels };
+  let on = now.filter((o) => o.checked);
+  let after = (on[0] || {}).labelText || null;
+  if (!isOn(target.id)) return { status: "needs_review", options: optionLabels, after,
+    detail: `checkbox-group selection did not commit for "${target.labelText}"`
+      + (quiet ? ` (quiescence: waited ${quiet.waitedMs}ms${quiet.quiet ? "" : " — CEILING, still busy"}${quiet.reissuedIds ? "; the rebuild RE-ISSUED the box ids and they were re-resolved" : ""})` : "")
+      // WHICH failure is this? "no click dispatched" and "clicked and it didn't take" need opposite
+      // fixes, and until now they were indistinguishable because the click's return value was discarded.
+      + (clickInfo === false ? " — NO CLICK WAS DISPATCHED: the label had no layout rect"
+         : clickInfo && clickInfo.hit
+           ? ` — clicked (${clickInfo.cx},${clickInfo.cy}); under that point was ${clickInfo.hit.hit}${clickInfo.hit.mine ? " (the right label)" : " — NOT our label, the rect went stale"}${clickInfo.hit.text ? ` "${clickInfo.hit.text}"` : ""}`
+           : clickInfo ? ` — clicked (${clickInfo.cx},${clickInfo.cy}), hit-test unavailable` : "") };
   if (on.length > 1) return { status: "needs_review", flag: "checkbox-group-multi", after: on.map((o) => o.labelText).join("; "), options: optionLabels,
     detail: `more than one option ended CHECKED (${on.map((o) => o.labelText).join(" | ")}) — a pick-one group must hold exactly one; verify` };
+
+  // ── 3. PERSISTENCE RE-READ (2026-08-04) ──────────────────────────────────────────────────────────
+  // The dropdown commit has done this for a long time, for exactly this failure: "a momentary pick
+  // discarded on render-complete is never reported filled". The checkbox group never did, so it
+  // reported `filled` off a read taken microseconds after the click.
+  //
+  // Live on waystar.wd1 (2 of 4 runs), traced: the click LANDS and verifies — the record's own live
+  // `currently:` read showed the right box checked — and then Workday REBUILDS the self-ID widget and it
+  // comes back EMPTY. The M40 audit saw the rebuild ("could not re-read to verify": readCheckboxGroup
+  // returns null when the wrapper is gone and [] when it holds no boxes) and by Save time the group read
+  // "". The walk had already banked `filled`, so it clicked Save & Continue and Workday refused the page.
+  // Timing is NOT the variable — a run that clicked the group ~21s after arriving failed while one that
+  // clicked at ~17s passed — so this cannot be fixed by choosing a better moment to click. What is
+  // reliable is confirming the value SURVIVES, and re-filling when the widget was rebuilt under us.
+  //
+  // Wall-clock on purpose (delayFull, never delayRender): we are waiting on Workday's own rebuild, which
+  // takes real time no matter how fast our pacing is — the same rule the M40 audit settle follows.
+  //
+  // BEAT SHORT, EXIT ON A STREAK (2026-08-05). This used to be 3 fixed rounds of 700ms that `continue`d
+  // on success, so a perfectly healthy group ALWAYS paid the full ~2.1s — twice on a page with two groups.
+  // Exiting as soon as the value has held for `groupPersistHolds` consecutive reads makes the healthy
+  // case ~750ms. The beat also drops 700→250ms, which is not merely cheaper but STRICTER: the observed
+  // wipe landed ~281ms after the click, which the old 700/1400/2100 sampling could straddle entirely,
+  // whereas 250/500/750 brackets it three times. The ceiling stays ~2s of polling for a group that keeps
+  // being rebuilt, and a broken streak (unreadable, or came back cleared) restarts the count — so the
+  // early exit can only ever fire on evidence, never on a timer running out.
+  const beatMs = budgets.groupPersistMs == null ? 250 : budgets.groupPersistMs;
+  const beat = () => (act.delayFull ? act.delayFull(beatMs) : act.delay(beatMs));
+  const rounds = budgets.groupPersistRounds == null ? 8 : budgets.groupPersistRounds;
+  const holdsNeeded = budgets.groupPersistHolds == null ? 3 : budgets.groupPersistHolds;
+  let rebuilt = 0, refills = 0, holds = 0;
+  for (let i = 0; i < rounds && holds < holdsNeeded; i++) {
+    await beat();
+    const live = await act.readCheckboxGroup(loc);
+    // Unreadable = the widget is mid-rebuild (wrapper gone, or present with no boxes). Not a failure on
+    // its own — wait for it to come back and judge it then. The streak restarts: an unreadable beat is
+    // not evidence the value survived.
+    if (!live || !live.length) { rebuilt++; holds = 0; continue; }
+    const hit = live.find((o) => o.id === target.id);
+    // A rebuild can also re-issue the ids, in which case match by LABEL — the label is the stable identity.
+    const byLabel = live.find((o) => String(o.labelText).toLowerCase() === target.labelText.toLowerCase());
+    const stillOn = !!((hit || byLabel) || {}).checked;
+    if (stillOn) { holds++; now = live; on = live.filter((o) => o.checked); after = (on[0] || {}).labelText || null; continue; }
+    holds = 0;
+    // It came back and our value is GONE — re-fill it, then keep confirming.
+    const again = byLabel || hit;
+    if (!again) break;                                   // the option itself no longer exists — let review own it
+    rebuilt++; refills++;
+    await act.clickRadioLabel(loc, again.id);
+    await pollCheckedIs(act, again.id, true, budgets);
+    now = await readBack();
+    on = now.filter((o) => o.checked);
+    after = (on[0] || {}).labelText || null;
+  }
+  // Final judgement on a FRESH read, never a cached one — the claim being made is about the state the
+  // page is in NOW, and a re-fill's own read-back is exactly the stale snapshot that started this bug.
+  const finalLive = await act.readCheckboxGroup(loc);
+  const finalOn = (finalLive || []).filter((o) => o.checked);
+  const heldTarget = finalOn.some((o) => String(o.labelText).toLowerCase() === target.labelText.toLowerCase());
+  if (!finalLive || !finalLive.length) return { status: "needs_review", flag: "checkbox-group-rebuilt", after: null, options: optionLabels,
+    detail: `the widget was rebuilt ${rebuilt}x and never became readable again — cannot confirm "${target.labelText}" stuck` };
+  if (!heldTarget) return { status: "needs_review", flag: "checkbox-group-rebuilt", after: (finalOn[0] || {}).labelText || null, options: optionLabels,
+    detail: `"${target.labelText}" was checked and verified, then the widget was rebuilt ${rebuilt}x and lost it (${refills} re-fill(s) attempted)` };
   return { status: "filled", after, verified: true, matchTier: "label-exact", options: optionLabels,
-    selected_options: on.map((o) => o.labelText),
-    detail: before && before !== after ? `label-click (replaced "${before}")` : "label-click" };
+    selected_options: finalOn.map((o) => o.labelText),
+    ...(refills ? { flag: "checkbox-group-refilled" } : {}),
+    detail: (before && before !== after ? `label-click (replaced "${before}")` : "label-click")
+      + (quiet ? `; waited ${quiet.waitedMs}ms for the DOM to go quiet${quiet.quiet ? "" : " (CEILING — clicked while still busy)"}` : "")
+      + (rebuilt ? `; survived ${rebuilt} widget rebuild(s)${refills ? ` after ${refills} re-fill(s)` : ""}` : "")
+      // Say WHICH evidence the pass rests on: a clean streak, or a ceiling where the last fresh read
+      // happened to hold it. The second is weaker and should not read identically to the first.
+      + (holds >= holdsNeeded ? `; persistence-confirmed (held ${holds} consecutive reads)`
+         : `; persistence-confirmed on the FINAL read only — the ${holdsNeeded}-read streak was never reached in ${rounds} rounds`) };
 };
 
 // Radio: label-text exact match (case-insensitive, candidates in order — M22
@@ -1945,9 +2423,13 @@ const aiFillCheckboxGroup = async (act, loc, f, profile, jobContext, budgets) =>
     flag: "ai-commit-failed", confidence: conf, ...hint,
     detail: "AI chose \"" + target + "\" but the checkbox group did not commit (" + ((cr && cr.detail) || "no result") + ")",
     options: optionLabels, auditLoc: loc.wrapperSel };
+  // Carry the filler's own note through when it has something to say beyond a plain commit — a widget
+  // REBUILD it had to survive or re-fill is exactly what the operator (and the next debugging session)
+  // needs to see, and composing a fresh detail here used to drop it silently.
+  const persistNote = /rebuild|persistence-confirmed/.test(String(cr.detail || "")) ? " [" + cr.detail + "]" : "";
   return { status: "filled_review", after: cr.after, verified: true, matchTier: m.matchTier,
     flag: sensitive ? "ai-choice-sensitive" : "ai-choice", confidence: conf, ...hint,
-    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + cr.after + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : ""),
+    detail: "AI: " + (ai.justification || ("chose " + target)) + " → \"" + cr.after + "\"" + (sensitive ? " — LEGALLY-LOADED, verify" : "") + persistNote,
     options: optionLabels, auditLoc: loc.wrapperSel };
 };
 
@@ -2177,10 +2659,13 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // the type → the async blur landed in that gap → the then-live keptLowerTier re-commit strayed.
   // This puts the scrape entirely BEFORE the loop's single re-assert. (The re-commit itself was later
   // retired — keptLowerTier now Tab-closes in overwriteNoMatchResting, 2026-07-02.)
+  let scrapeMs = 0; // instrumentation (2026-08-08): scrape vs type vs settle, so a slow field names its own phase
   if (opts.onCapture) {
+    const _scT0 = Date.now();
     await act.openHier(loc);
     await awaitListStable(act, (l) => act.readHier(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
     capturedFull = await opts.onCapture();        // scroll-scrape → returns + records options (read-only); leaves the dropdown OPEN
+    scrapeMs = Date.now() - _scT0;
     // PRE-SCRAPE SHORT-CIRCUIT (operator, 2026-07-25). The start-scrape already enumerated the widget's
     // WHOLE option list, so typing a candidate just to learn it isn't offered is pure waste — live, FoS
     // burned ~540ms proving "Electrical and Computer Engineering" was absent before typing the one that
@@ -2274,6 +2759,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // a partial/unfocused box. (The settle above makes a mid-type drop rare; this makes the loop closed, not
     // just probabilistically safe.)
     let snap = null, snapSig = null, landed = false;
+    const _tyT0 = Date.now(); // clear + type + echo-verify — the phase the operator watched lag
     for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
       if (attempt > 1 && !(await ensureSearchFocused())) break; // re-assert focus on retry (blur after a prior clear/type)
       await act.clearHierSearch();
@@ -2290,6 +2776,8 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
       await act.pressTab(); // BLUR before leaving: an armed row from a prior/partial filter must not survive to the next field
       return { status: "needs_review", after: null, verified: false, detail: "could not type the candidate into a focused search box (partial/unfocused) — not actuating Enter blind", settle_trace: trace };
     }
+    step.typeMs = Date.now() - _tyT0; // BEFORE the Enter, so it isolates clear+type+echo from the settle
+    if (scrapeMs) { step.scrapeMs = scrapeMs; scrapeMs = 0; } // charged once, to the first candidate
     await act.pressEnter(); // the filter-Enter (the ONLY filter trigger on this widget)
 
     // RENDER GATE (the core fix): block until the list reaches a CONFIRMED terminal render state — banner or
@@ -2533,6 +3021,344 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
 // filler. (debugStopAfterCategory is now a no-op; that debug dump lived in the removed tryInlineAiSource.)
 const fillSourceCdp = fillTypeaheadCdp;
 
+// Is this the SKILLS multiselect? Deliberately NARROW: the automation-id `skills` (Solar Turbines,
+// LiveRamp) or a label that is exactly "Skills" / "Type to Add Skills", AND a typeahead-family
+// widget. A plain TEXT box labelled "Skills" is a different question with a different answer shape
+// (free prose), and a language-proficiency field must never match — hence the anchored patterns
+// rather than a bare /skill/ test.
+// (The name/label test itself lives in lib.js as isSkillsFieldName, shared with the reconcile's
+// entry-level isSkillsEntry — one predicate, so the fill and the verify cannot disagree.)
+function isSkillsField(f) {
+  if (!f) return false;
+  const w = String(f.widgetType || "");
+  if (w !== "typeahead" && w !== "hierarchical") return false;
+  return apMatch.isSkillsFieldName(f.fieldName, f.label);
+}
+
+// ── SKILLS ("Type to Add Skills") — the MULTI-VALUE typeahead ────────────────────────────────────
+// Same Workday multiselect as cert/source, but it holds a SET, so fillTypeaheadCdp is the wrong
+// shape end to end: that filler commits ONE candidate, treats an existing chip as a pre-fill to
+// KEEP or OVERWRITE, and asserts a single chip on commit (`overwrite-residual-flagged`). Here every
+// commit ADDS, and existing chips are other people's answers, never something to replace.
+//
+// Everything below is keyed to the live trace (cat.wd5, 2026-08-07 — docs/dom-patterns.md):
+//   • It does NOT live-filter. ENTER is the only filter trigger, and the terminal is the
+//     "Search Results" / "No matches found" promptTitle banner — so awaitListTerminal applies as-is.
+//   • The list STAYS OPEN after a commit and the query stays in the box, so N skills go in on ONE
+//     open — no re-open, no re-focus dance between them.
+//   • ⚠ A ZERO-RESULT query + Enter makes Workday ADD THE TYPED TEXT as a brand-new skill. That is
+//     how a dirty box becomes a real wrong answer: mid-trace an uncleared box turned
+//     "Docker" + "CubeMars motor drivers" into the chip "DockerCubeMars motor drivers". So the
+//     clear is a HARD GATE here — unverified-empty means we do NOT press Enter, where every other
+//     typeahead could afford to treat a dirty box as merely a wasted candidate.
+//   • The server's own search is fuzzy and bad ("Yosys" → "Yodiz"), so matchSkillOption allows
+//     exact/qualified ONLY. A skill Workday doesn't know stays OFF the form — never a near-miss.
+// OPTIONAL field, so there is no AI rescue and no forced pick: what can't be matched is reported.
+const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
+  const norm = apMatch.normalize;
+  const wanted = (Array.isArray(skills) ? skills : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean);
+  const pre = await act.readHier(loc);
+  if (!pre) return { status: "error", detail: "skills wrapper not found" };
+  // A résumé-parse chip reads back as "Digital Systems (Suggested)"; that annotation is Workday's own
+  // provenance marker and does NOT appear on its review page, so it is stripped everywhere a chip
+  // becomes a recorded/compared VALUE (see skillChipName).
+  const chipNames = (arr) => (Array.isArray(arr) ? arr : []).map(apMatch.skillChipName).filter(Boolean);
+  const priorChips = chipNames(pre.chips);
+  if (!wanted.length) {
+    return { status: "skipped", after: priorChips.length ? priorChips.join("; ") : null,
+      detail: "no skills in the profile" };
+  }
+  // Idempotency gate — and the reason it is not optional. Workday DROPS an already-selected skill
+  // from its own results, so re-searching a committed "Docker" offers only "Docker (Software)" /
+  // "Dockerfile". Without this the second pass would commit a near-duplicate of every skill it
+  // already added. Base-name comparison, so a qualified chip covers the bare profile name.
+  // ── RECOMMENDED-ONLY (the default) ──────────────────────────────────────────────────────────────
+  // Workday's "Autofill with Resume" parse seeds this field with its OWN suggested skills, and adding
+  // the profile's list on top is slow — every skill is a separate search round trip. So unless the
+  // operator opted in (`profile.fill_all_skills`, the "try to fill all skills" checkbox), we KEEP what
+  // the parse suggested, add nothing, and record it so the review page shows the list for adding or
+  // deleting by hand. Nothing is ever removed here.
+  if (!opts.fillAll) {
+    if (priorChips.length) {
+      return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "skills-suggested",
+        flag: "skills-suggested-kept", confidence: "high", skills_added: [], skills_not_offered: [],
+        detail: `kept the ${priorChips.length} skill(s) Workday suggested from the résumé — "try to fill all skills" is off, so none of the profile's ${wanted.length} were added. Edit the list on the review page.` };
+    }
+    // The parse suggested NOTHING, so "keep the suggestions" would ship an application with no skills at
+    // all. Observed live: the same résumé produced 15 suggestions on one posting, 1 on another and 0 here.
+    // The operator's rule is "leave it be, but record it so users can add or delete" — recording it as a
+    // silent skip would hide it, so an EMPTY field is a review item that names the profile skills waiting.
+    return { status: "needs_review", after: null, flag: "skills-none-suggested", confidence: "none",
+      detail: `Workday's résumé parse suggested no skills, and "try to fill all skills" is off — the field is EMPTY. Add some here, or turn the checkbox on to fill your ${wanted.length} profile skills automatically (slow: roughly 1.5–3s per skill).` };
+  }
+
+  const todo = apMatch.missingSkills(wanted, priorChips);
+  if (!todo.length) {
+    return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "pre-filled",
+      flag: "skills-already-present", confidence: "high",
+      detail: `all ${wanted.length} profile skill(s) are already on the form — kept (no actuation)` };
+  }
+  const cap = Math.max(1, Number(opts.maxAdds || budgets.skillsMaxAdds || 40));
+  const capped = todo.slice(0, cap);
+  const deadline = Date.now() + Number(budgets.skillsBudgetMs || 180000);
+
+  const added = [];      // [{ skill, option, tier }]
+  // notOffered vs failed is a REPORTING distinction that matters to the human: "Workday's taxonomy
+  // doesn't have this skill" is a fact they can act on (add it by hand / drop it), whereas "our typing
+  // or commit didn't land" means re-run. Lumping the second into the first would tell them a skill
+  // doesn't exist when it does.
+  const notOffered = []; // genuinely absent: a no-match banner, no exact/qualified row, or ambiguous
+  const failed = [];     // infra: could not type it, or the click never produced a chip
+  const unclearable = []; // skipped because the search box would not confirm empty (infra, NOT absence)
+  const strays = [];     // a chip we did not ask for — always surfaced
+  const trace = [];
+  const openDiags = [];  // why an open attempt missed — "could not focus" has several distinct causes
+  let stoppedEarly = null;
+
+  // Focus the search box, opening the widget if it is closed. The input only GAINS
+  // data-automation-id="searchBox" once opened (traced), so readHier reports no searchBox until
+  // the open click lands — same bounded open+focus retry the unified filler uses.
+  const ensureFocused = async () => {
+    // MORE attempts than the shared budget, ALTERNATING the two opener routes. Evidence for both:
+    // under trusted input the widget opened on attempt 1 in ~1.3s, while the faster synthetic run
+    // failed all three attempts — the difference being how recently the PRECEDING field committed, so
+    // the open is racing Workday's re-render rather than needing a particular event kind. One settle
+    // beat before the first attempt, then input-route / coordinate-route in turn (never both in one
+    // attempt — a second click toggles an opening multiselect shut).
+    const attempts = Math.max(4, budgets.taOpenRetries);
+    await act.delay(budgets.reopenSettleMs); // let the previous field's re-render land before we click
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      let st = await act.readHier(loc);
+      if (!st || !st.searchBox.present || !st.searchBox.visible) {
+        // ONE opener action per attempt, then POLL. Two routes exist because while closed the input has
+        // no `searchBox` automation-id, so readHier cannot see it: the widget's own input (page-side
+        // focus + click — no coordinates, no paint) and the coordinate click on its container. The input
+        // route goes first; a later attempt falls back to coordinates.
+        //
+        // ⚠ NEVER both in one attempt. The first cut did exactly that and a HIDDEN run then reported
+        // `focused:true, ok:true, openedNow:false` three times over with ZERO skills added: the input
+        // click opened the widget, the immediate coordinate click landed before the searchBox had
+        // mounted, and a second click on a multiselect TOGGLES IT SHUT — so the poll always found it
+        // closed. This is the same toggle-shut invariant the unified typeahead filler documents.
+        // Route A = page-side focus+click (no coordinates); route B = a TRUSTED coordinate click on the
+        // INPUT's own rect. Alternating them is what makes the open survive the re-render race, and a
+        // page-side click alone was NOT enough live (a run using only route A opened nothing).
+        //
+        // ⚠ Route B must target the INPUT, never the shared `openHier`, which clicks the CENTRE of
+        // `multiselectInputContainer`. On a multi-value widget that container GROWS with each chip, so its
+        // centre drifts onto a CHIP — and a chip's `DELETE_charm` is part of it. Live: `Git` was on the
+        // form after one run and GONE after the next, in a run that logged our own "the chip set changed"
+        // signal. Deleting a skill the operator listed is worse than any fill failure.
+        const routeA = (attempt % 2 === 1) && act.openHierInput;
+        if (routeA) openDiags.push(await act.openHierInput(loc)); // NOT `step` — that is per-skill, out of scope
+        else if (act.clickHierInputRect) { if (!(await act.clickHierInputRect(loc))) { await act.delay(budgets.reopenSettleMs); continue; } }
+        else if (!(await act.openHier(loc))) { await act.delay(budgets.reopenSettleMs); continue; }
+        const t0 = Date.now();
+        while (Date.now() - t0 < budgets.taOpenCeilingMs) {
+          await act.delay(budgets.taOpenIntervalMs);
+          st = await act.readHier(loc);
+          if (st && st.searchBox.visible) break;
+        }
+      }
+      if (st && st.searchBox.visible && !st.searchBox.focused) {
+        await act.focusHierSearch(loc);
+        st = await act.readHier(loc);
+      }
+      if (st && st.searchBox.focused) return st;
+      await act.delay(budgets.reopenSettleMs);
+    }
+    return null;
+  };
+
+  // NOTE for anyone debugging a hidden run: forcing TRUSTED input here was tried and is NOT needed.
+  // The hidden failure looked like a trusted-input problem (a hidden synthetic run opened nothing while
+  // the same run under forceTrustedInput opened fine), but an isolation probe — the opener fix below with
+  // the trusted scoping REMOVED — filled the field normally on a hidden synthetic tab. The real cause was
+  // the opener racing Workday's re-render, not the event kind. Don't re-add trusted input here; it roughly
+  // doubles the field's wall-clock and buys nothing.
+  let clearFails = 0;
+  for (const skill of capped) {
+    if (Date.now() > deadline) { stoppedEarly = "time budget"; break; }
+    // `candidate` (not `skill`) because the walk's settle-trace printer reads that key — with the
+    // wrong name every line logged `cand "undefined"`, which is how a readable trace becomes useless.
+    const step = { candidate: skill };
+    trace.push(step);
+    const t0 = Date.now();
+    // Chips BEFORE this skill — the add is verified as a GROWTH from here, so a commit that
+    // silently replaced instead of adding could never read as success.
+    const before = await act.readHier(loc);
+    const chipsBefore = chipNames(before && before.chips);
+    // Compare CLEANED against CLEANED — mixing raw "X (Suggested)" with a cleaned "X" would read as a
+    // brand-new chip on every poll and report a phantom autocommit.
+    const chipSetIsNew = (chips) => chipSetChanged(chipsBefore, chipNames(chips));
+
+    if (!(await ensureFocused())) {
+      // WHY it missed, per attempt — without this the log says only "could not focus", which has at
+      // least three causes (no wrapper / no input / opened but the searchBox id never appeared).
+      step.note = "could not focus the search box — not actuating blind"
+        + (openDiags.length ? " | open: " + JSON.stringify(openDiags.slice(-3)) : "");
+      stoppedEarly = "focus";
+      break;
+    }
+    // HARD CLEAR GATE (this widget only): an unverified-empty box + Enter can CREATE a junk skill out
+    // of the leftover text, so we never press Enter on a box we could not confirm empty.
+    //
+    // But a FAILED clear is not a reason to abandon the field. Live (cat.wd5, first run): the clear
+    // failed ONCE mid-list and the whole field stopped, adding 7 skills and silently giving up on the
+    // rest — Git, Docker, VS Code and Vivado were all still to come and all exist in the taxonomy.
+    // The clear is focus-blind (`cdpSelectAllDelete` types Ctrl+A/Delete at whatever holds focus) and a
+    // commit can move focus off the box, so a single failure is a transient. RETRY with a fresh focus
+    // assert; if it still won't empty, SKIP THIS SKILL (safe — skipping never presses Enter) and carry
+    // on. Only a SECOND consecutive failure ends the field, so a genuinely stuck box can't burn the
+    // whole budget one 6s poll at a time.
+    // The clear itself prefers the REACT-SAFE native-setter write (`clearHierInput`), which does not
+    // care where focus is. Trusted Ctrl+A/Delete is the fallback: on this widget Ctrl+A does not select
+    // the input's text (observed by hand, and live it cleared one skill then failed on the next two).
+    let boxEmpty = false;
+    for (let attempt = 1; attempt <= budgets.taOpenRetries && !boxEmpty; attempt++) {
+      if (attempt > 1 && !(await ensureFocused())) break;
+      if (act.clearHierInput) await act.clearHierInput(loc);
+      else await act.clearHierSearch();
+      boxEmpty = await pollSearchValue(act, () => act.readHier(loc), "", budgets);
+      if (!boxEmpty) { await act.clearHierSearch(); boxEmpty = await pollSearchValue(act, () => act.readHier(loc), "", budgets); }
+    }
+    if (!boxEmpty) {
+      clearFails++;
+      step.note = "search box did not read back EMPTY — skill SKIPPED, no Enter (a dirty box can create a junk skill)";
+      unclearable.push(skill);
+      if (clearFails >= 2) { stoppedEarly = "the search box would not clear"; break; }
+      continue;
+    }
+    clearFails = 0;
+    await act.typeInHier(skill);
+    if (!(await pollSearchValue(act, () => act.readHier(loc), skill, budgets))) {
+      step.note = "could not type the full skill into the box — skipped (no Enter on a partial query)";
+      failed.push(skill);
+      continue; // the NEXT skill re-clears + re-verifies, so a partial can't leak into it
+    }
+    await act.pressEnter(); // the ONLY filter trigger on this widget
+    const outcome = await awaitListTerminal(act, (l) => act.readHier(l), loc, budgets, chipSetIsNew);
+    step.outcome = outcome;
+    const s = await act.readHier(loc);
+    // The fields the walk's settle-trace printer reads, so each skill logs one readable line.
+    step.settleMs = Date.now() - t0;
+    step.count = s && s.pageWide ? s.pageWide.count : null;
+    step.banner = !!(s && s.banner);
+    step.open = !!(s && s.searchBox && s.searchBox.visible);
+    step.chips = chipNames(s && s.chips).join("; ") || null;
+
+    if (outcome === "autocommit") {
+      // Workday committed on its own. On THIS widget that means the query returned zero rows and it
+      // added the typed text verbatim — the one path by which a skill outside the taxonomy actually
+      // lands, so it is a success when the new chip is what we typed, and a stray when it is not.
+      const now = chipNames(s && s.chips);
+      const fresh = now.filter((c) => !chipsBefore.some((p) => norm(p) === norm(c)));
+      const mine = fresh.filter((c) => apMatch.skillBaseName(c) === apMatch.skillBaseName(skill));
+      if (mine.length) { added.push({ skill, option: mine[0], tier: "free-text" }); step.added = mine[0]; }
+      else if (fresh.length) { strays.push(...fresh); step.stray = fresh.join("; "); }
+      else {
+        // "autocommit" without a NEW chip. awaitListTerminal reports it when the chip SET differs from
+        // the one we snapshotted, which a re-render/re-order can also produce (live: `cand "C++" →
+        // autocommit, 0 options` while no C++ chip existed afterwards). Nothing was added and nothing
+        // strayed, so this belongs in a bucket rather than vanishing from the report.
+        failed.push(skill);
+        step.note = "the chip set changed but no new chip matched this skill — nothing added";
+      }
+      continue;
+    }
+    if (outcome !== "results") {
+      // A "No matches found" banner is Workday ANSWERING (the skill is absent); a timeout is us not
+      // knowing, which is a different thing to tell the human.
+      if (outcome === "nomatch") { notOffered.push(skill); step.note = "Workday reported no matches"; }
+      else { failed.push(skill); step.note = "no terminal list within budget (" + outcome + ")"; }
+      continue;
+    }
+    const texts = (s && s.pageWide && s.pageWide.texts) || [];
+    step.offered = texts.slice(0, 8);
+    const m = apMatch.matchSkillOption(skill, texts);
+    if (m.index === -1) {
+      // The results are Workday's FUZZY guesses, not candidates. Committing one would put a skill
+      // the applicant never claimed on the application, so this is a deliberate no-op.
+      notOffered.push(skill);
+      step.note = m.ambiguous
+        ? `${m.ambiguous} match was ambiguous (2+ options) — committed nothing`
+        : `no exact/qualified option (offered: ${texts.slice(0, 4).join(" | ") || "none"})`;
+      continue;
+    }
+    const option = texts[m.index];
+    step.matched = { option, tier: m.tier, alternatives: m.alternatives || null };
+    let ok = false;
+    if (await act.clickHierLeaf(loc, option)) {
+      const tCommit = Date.now(); // NOT t0 — that one times the whole skill, and shadowing it here invites a later bug
+      while (Date.now() - tCommit < budgets.commitCeilingMs) {
+        await act.delay(budgets.commitIntervalMs);
+        const after = await act.readHier(loc);
+        const chips = chipNames(after && after.chips);
+        // GROWTH + identity: the set gained a chip AND that chip is the option we clicked.
+        if (chips.length > chipsBefore.length && chips.some((c) => norm(c) === norm(option))) { ok = true; break; }
+      }
+    }
+    if (ok) { added.push({ skill, option, tier: m.tier, alternatives: m.alternatives || [] }); step.added = option; }
+    else { failed.push(skill); step.note = `matched "${option}" but the chip never appeared`; }
+  }
+
+  // Tab is the only clean exit: it blurs, clears the query and closes the list without committing
+  // (verified on this widget — the box read back empty with no stray chip).
+  const endChips = await tabBlurExit(act, loc, (l) => act.readHier(l));
+  const finalChips = endChips == null ? priorChips : chipNames(endChips);
+  const unexpected = finalChips.filter((c) =>
+    !priorChips.some((p) => norm(p) === norm(c)) && !added.some((a) => norm(a.option) === norm(c)));
+  if (unexpected.length) strays.push(...unexpected);
+
+  const dropped = todo.length - capped.length;
+  const bits = [];
+  // Name the mapping whenever the committed option is not literally the profile's wording — a qualified
+  // hit ("Python → Python (Programming Language)") and, louder, a WIDENED containment hit
+  // ("Vivado → Xilinx Vivado (broader)"), which is the one a human should actually eyeball.
+  const widened = added.filter((a) => a.tier === "containment");
+  if (added.length) bits.push(`added ${added.length}: ` + added.map((a) =>
+    a.tier === "containment"
+      ? `${a.skill} → ${a.option} (broader${(a.alternatives && a.alternatives.length) ? "; Workday also offered " + a.alternatives.join(" / ") : ""})`
+      : (norm(a.option) !== norm(a.skill) ? `${a.skill} → ${a.option}` : a.option)).join(", "));
+  if (priorChips.length) bits.push(`kept ${priorChips.length} already on the form`);
+  if (notOffered.length) bits.push(`NOT in Workday's skill list (add by hand if you want them): ${notOffered.join(", ")}`);
+  if (failed.length) bits.push(`could not be entered (typing/commit did not land — re-run): ${failed.join(", ")}`);
+  if (unclearable.length) bits.push(`skipped — the search box would not clear (retry the page): ${unclearable.join(", ")}`);
+  if (dropped > 0) bits.push(`${dropped} skill(s) not attempted — the ${cap}-skill cap`);
+  // Every skill lands in exactly one bucket, so what's left is genuinely untouched. Counting only
+  // added+notOffered here over-reported it as soon as a third bucket existed.
+  const untouched = capped.length - added.length - notOffered.length - failed.length - unclearable.length;
+  if (stoppedEarly) bits.push(`stopped early (${stoppedEarly}) with ${Math.max(0, untouched)} skill(s) unattempted`);
+  if (strays.length) bits.push(`UNEXPECTED chip(s): ${strays.join(", ")}`);
+
+  const after = finalChips.length ? finalChips.join("; ") : null;
+  const base = { after, verified: !strays.length, matchTier: "skills-multi-add",
+    detail: bits.join(" · ") || "nothing to add", skills_added: added.map((a) => a.option),
+    skills_not_offered: notOffered.slice(), skills_failed: failed.concat(unclearable),
+    skills_widened: widened.map((a) => `${a.skill} → ${a.option}`), settle_trace: trace };
+  if (strays.length) return { ...base, status: "needs_review", flag: "skills-stray", confidence: "none" };
+  // An INFRA bail (focus / an unclearable box) is not a clean outcome, even when the form already holds
+  // chips: skills the profile asked for were never attempted. Reporting a silent `filled` there hid a
+  // hidden-tab run that added NOTHING behind seven chips a previous run had put on. So it is surfaced —
+  // flagged when something was added, needs_review when nothing was.
+  if (stoppedEarly && stoppedEarly !== "time budget") {
+    return { ...base, status: added.length ? "filled_review" : "needs_review",
+      flag: "skills-incomplete", confidence: added.length ? "medium" : "none" };
+  }
+  if (!added.length) {
+    // The field is BLANK and the profile had values — that is the case the review gate exists for.
+    return { ...base, status: finalChips.length ? "filled" : "needs_review",
+      flag: finalChips.length ? null : "skills-none-matched", confidence: finalChips.length ? "high" : "none" };
+  }
+  // A WIDENED (containment) commit is a value the operator authorized us to infer, not one they wrote —
+  // so the field goes to review naming each widening, exactly as every other non-exact commit in this
+  // codebase does. Exact/qualified-only stays a silent `filled`.
+  if (widened.length) {
+    return { ...base, status: "filled_review", flag: "skills-containment", confidence: "medium" };
+  }
+  return { ...base, status: "filled", flag: null, confidence: "high" };
+};
+
 // ── AI typeahead fallback (the parked "AI picks from the captured list on a no-match") ───────────
 // When a FLAT typeahead exhausts its tiers and GENUINELY no-matches (genuineNoMatch — every candidate
 // gave a banner/absent), hand the captured option list + the profile to the LLM, commit its pick
@@ -2562,6 +3388,33 @@ const parseAiTypeaheadReply = (text) => {
 
 // "Other" detection (normalize lowercases + strips trailing (+digits) + collapses whitespace).
 const isOtherOption = (o) => apMatch.normalize(o) === "other";
+
+// ── LAST-RESORT PICK for a REQUIRED choice field (operator rule, 2026-08-07) ─────────────────────────
+// "Every dropdown will commit a value even if AI can't accurately determine the correct one. Getting to
+// the review page is 1st priority with everything reconned correctly."
+//
+// A required dropdown left blank BLOCKS Save & Continue, so the walk halts and the operator gets NOTHING
+// — no review page, no bundle, nothing to correct. A flagged wrong answer is strictly better: the
+// application reaches review with every other field intact and this one shouting for attention.
+//
+// Runs only after every ladder above it has failed (deterministic match, buckets, canonicalize, the AI
+// always-guess), and only for REQUIRED fields — an optional blank harms nothing and is still left alone.
+// It is DETERMINISTIC and needs no LLM, so it also covers AI OFF and an exhausted/erroring provider.
+//
+// Preference order is "least-wrong first", not "first in the list":
+//   1. a DECLINE option ("Prefer not to say" / "Decline to answer") — on any question, refusing to
+//      answer is the least-wrong thing to put in a box you cannot answer, and on a demographic it is
+//      the only defensible pick.
+//   2. "Other" — the next most neutral.
+//   3. the first real option — genuinely arbitrary, and flagged as such.
+// Always `filled_review` with a loud flag, and the detail SAYS it is a placeholder, so the review editor
+// (and submitPrecondition, via the unapproved-flagged gate) treats it as a question, never as an answer.
+const LAST_RESORT_DECLINE_RE = /prefer not|decline|do not wish|don'?t wish|not.*(disclose|answer)|choose not|rather not|undeclared|no response/i;
+const pickLastResortOption = (enabledTexts) => {
+  const opts = (enabledTexts || []).filter((t) => t != null && String(t).trim() !== "");
+  if (!opts.length) return null;
+  return opts.find((t) => LAST_RESORT_DECLINE_RE.test(t)) || opts.find(isOtherOption) || opts[0];
+};
 
 // Parse the AI's TREE-CATEGORY reply: {choice, confidence} (no `represented` — the category is a
 // navigation step, not the answer). Tolerant like parseAiTypeaheadReply (```-fences / embedded / non-JSON).
@@ -3065,9 +3918,142 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // employer list. (2026-07-25.)
   const empCompany = apMatch.tenantCompanyFromUrl(scan.url) || (jobContext && jobContext.company) || null;
   const results = [];
+  // ── TEMPORARY PAGE TRACE (2026-08-06, budgets.debugPageTrace) ───────────────────────────────────
+  // Operator: "I want logs to see what is going on every time it seems to pause." Emitted with
+  // console.log rather than collected and returned, so the lines STREAM into the SW console while the
+  // page is filling — a trace you can only read afterwards is no use for watching a pause happen.
+  // Every entry carries the elapsed ms of the step it closes, and anything over 1s is marked so the
+  // pauses stand out without reading timings.
+  const _traceOn = !!budgets.debugPageTrace;
+  const _t0page = Date.now();
+  const trace = (msg, ms) => {
+    if (!_traceOn) return;
+    const at = ((Date.now() - _t0page) / 1000).toFixed(1);
+    const took = ms == null ? "" : ` — ${ms >= 1000 ? "⏸ " : ""}${(ms / 1000).toFixed(2)}s`;
+    console.log(`[ApplyPilot][TRACE +${at}s] ${msg}${took}`);
+  };
+  // Per-ACTION timing (operator: "include the time it takes each action to run"). Wraps a CURATED list
+  // of async I/O primitives rather than proxying the whole object — some members are plain values or
+  // sync, and turning those into promises would break their callers. Only actions at or over the
+  // threshold print, so the poll loops (which fire constantly and finish in ms) stay out of the way and
+  // every real pause shows up. This is where the invisible time actually goes: opening a widget, waiting
+  // for options to settle, the commit beats, and the wall-clock delays.
+  const TRACE_ACTION_MS = 120;
+  if (_traceOn) {
+    const timed = ["scanPage", "openDropdown", "readDropdownState", "clickDropdownOptionByText", "closeDropdown",
+      "focusInput", "typeText", "typeDigits", "clearText", "pressEnter", "pressTab", "pressEscape", "pressSpace",
+      "clickRadioLabel", "readRadioState", "readCheckboxGroup", "awaitQuiet", "installQuietWatch", "selExists",
+      "readDateSegment", "focusDateSegment", "scrapeTaOptions", "openHier", "readHier", "typeInHier",
+      "clearHierSearch", "readTypeahead", "openTypeahead", "repeatingScan", "llm",
+      "delay", "delayFull", "delayRender"];
+    const shown = (a) => {
+      if (a == null) return "";
+      if (typeof a === "string") return a.length > 28 ? JSON.stringify(a.slice(0, 28) + "…") : JSON.stringify(a);
+      if (typeof a === "number" || typeof a === "boolean") return String(a);
+      if (a.wrapperSel) return String(a.wrapperSel).replace(/^\[data-automation-id="formField-/, "").replace(/"\]$/, "").slice(0, 34);
+      return "";
+    };
+    for (const name of timed) {
+      const fn = act[name];
+      if (typeof fn !== "function" || fn.__apTimed) continue;   // act is reused across pages AND the
+      // cascade recurses into drivePageFill, so without this guard each pass wrapped the wrapper: one
+      // call printed several times under different page clocks, and the overhead grew every page.
+      const wrapped = async (...args) => {
+        const s0 = Date.now();
+        try { return await fn.apply(act, args); }
+        finally {
+          const ms = Date.now() - s0;
+          if (ms >= TRACE_ACTION_MS) trace(`    · ${name}(${args.map(shown).filter(Boolean).slice(0, 2).join(", ")})`, ms);
+        }
+      };
+      wrapped.__apTimed = true;
+      act[name] = wrapped;
+    }
+  }
+  const clobberLog = [];   // TEMPORARY (budgets.debugClobber): fields changed by ANOTHER field's write
+  // Seed the baseline from the UP-FRONT scan, or the very first field's write has nothing to be compared
+  // against — which is exactly the write most likely to knock out a dependent question.
+  let clobberPrev = budgetsIn && budgetsIn.debugClobber
+    ? new Map((scan.fields || []).map((x) => [x.fieldName, x])) : null;
+  // ── BATCHED AI PRE-PASS + OVERLAP (2026-08-05) ────────────────────────────────────────────────────
+  // Identify the page's AI questions and read their options BEFORE filling anything, fire ONE call, and
+  // let it fly while the deterministic fields fill. By the time the loop reaches an AI question the reply
+  // is usually already in hand, so the page pays ~0 for it instead of one serial round trip per question.
+  // The result is a CACHE consulted by the normal per-field AI path — never a gate (see buildBatchAiPrompt).
+  const aiBatch = { answers: new Map(), promise: null, items: [], awaited: false, error: null, recon: null };
+  // ── ONE ANSWER PER QUESTION, FOR THE WHOLE PAGE (2026-08-06) ─────────────────────────────────────
+  // Keyed by the QUESTION, not the automation-id, and SHARED with the recursive cascade fills through
+  // opts.aiAnswers. Two problems, one cause: the cascade re-fill calls drivePageFill again, which built a
+  // FRESH batch with no memory of the first, so a revealed field asked the model again — and the model is
+  // free to answer differently. Live on waystar page 3 that produced a flip-flop: relocation was filled
+  // "Yes, I am open to relocating", then re-answered "No, but I live near one of the locations", then
+  // "Yes" again. Each CHANGE remounts the dependent basecamp question under a new id, which is why the
+  // page could never settle and Save was refused on a required field that had been answered twice.
+  // With the answer cached by question: a remounted field is recognised as the SAME question and filled
+  // from the cache — no second call, and byte-identical to the first answer, so nothing remounts again.
+  const aiAnswerByLabel = (opts && opts.aiAnswers instanceof Map) ? opts.aiAnswers : new Map();
+  let aiBatchScanMs = 0;
+  if (act.aiEnabled && !only && !onlySec && budgets.enableAiBatch) {
+    const t0Batch = Date.now();
+    try {
+      trace(`SCOUT starting — ${scan.fields.length} field(s) on the page`);
+      const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, aiAnswerByLabel, bucketIndex, empCompany, trace);
+      trace(`SCOUT done — ${collected.items.length} AI question(s), ${collected.recon.opened} dropdown(s) opened`, collected.recon.ms);
+      aiBatch.items = collected.items; aiBatch.recon = collected.recon;
+      if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
+        const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
+        // NOT awaited: this is the overlap. The deterministic loop runs against the live page while the
+        // model works. Errors are captured, never thrown — a failed batch just means per-field calls.
+        // OUTPUT BUDGET SCALES WITH THE BATCH (2026-08-06, operator). Every answer carries a choice, a
+        // ~12-word justification, a confidence, maps_to and suggested_category, so N questions need
+        // roughly N times the room — a single flat cap would truncate the very pages this exists for.
+        // Generosity is FREE: max_tokens is a CAP, not a reservation, and billing follows the tokens
+        // actually generated. Truncation is not a shorter answer, it is a BROKEN one: the reply is JSON,
+        // so a cut-off reply fails to parse and the whole page falls back to per-field calls — losing
+        // exactly the saving the batch exists for. So the per-question allowance is set well above what a
+        // well-formed answer needs rather than tuned to the average.
+        trace(`AI CALL fired — ${aiBatch.items.length} question(s) in ONE call (cap ${aiBatchMaxTokens(aiBatch.items.length)}); the deterministic fill runs while it is in flight`);
+        aiBatch.promise = act.llm({ system, user, maxTokens: aiBatchMaxTokens(aiBatch.items.length) })
+          .then((res) => {
+            if (!res || !res.ok) { aiBatch.error = (res && res.error) || "no reply"; return; }
+            aiBatch.answers = parseBatchAiReply(res.text, aiBatch.items);
+            // Re-key onto the QUESTION so a remount under a new id still finds its answer.
+            for (const it of aiBatch.items) { const a = aiBatch.answers.get(it.key); if (a) aiAnswerByLabel.set(aiLabelKey(it.label), Object.assign({ _kind: it.kind }, a)); }
+          })
+          .catch((e) => { aiBatch.error = String((e && e.message) || e); });
+      }
+    } catch (e) { aiBatch.error = String((e && e.message) || e); }
+    aiBatchScanMs = Date.now() - t0Batch;
+  }
+  // Consulted at each AI site: await the in-flight call ONCE, then serve from the map. Counts served vs
+  // fell-back, because "did the batch actually do anything" is otherwise invisible in the log — the first
+  // live run looked like it was still calling per-field and there was no way to tell collection from
+  // key-matching from a parse miss.
+  aiBatch.served = 0; aiBatch.fellBack = 0;
+  // Lookup is by QUESTION. A cached answer is reused even when the automation-id has changed underneath
+  // us, and even when it came from an earlier per-field call rather than the batch — one answer per
+  // question per page, always.
+  const aiBatchAnswer = async (f, wantKind) => {
+    const lk = aiLabelKey(f && f.label);
+    const usable = (a) => (a && (!a._kind || !wantKind || a._kind === wantKind)) ? a : null;
+    const cached = lk ? usable(aiAnswerByLabel.get(lk)) : null;
+    if (cached) { aiBatch.served++; return cached; }        // same QUESTION, whatever id it now carries
+    if (!aiBatch.promise) { aiBatch.fellBack++; return null; }
+    if (!aiBatch.awaited) {
+      aiBatch.awaited = true;
+      const w0 = Date.now();
+      trace(`WAITING on the AI reply (first AI field reached: "${String((f && f.label) || "").slice(0, 50)}")`);
+      await aiBatch.promise;
+      trace(`AI reply in hand — every AI answer for this page is now known`, Date.now() - w0);
+    }
+    const hit = usable((lk && aiAnswerByLabel.get(lk)) || aiBatch.answers.get(f && f.fieldName));
+    if (hit) { aiBatch.served++; if (lk) aiAnswerByLabel.set(lk, hit); } else aiBatch.fellBack++;
+    return hit;
+  };
   // [CDP-TIME] phase accounting (2026-07-25): where a page's wall-clock actually goes — logged by the
   // SW per page so pacing is retuned on EVIDENCE, not guesses. Zero behavior change; log-only.
   const timings = {};
+  if (aiBatchScanMs) timings.aiBatchScan = aiBatchScanMs; // read-only option scan for the batched call
   const markPhase = (k, t0) => { timings[k] = (timings[k] || 0) + (Date.now() - t0); };
   let _phaseT0 = Date.now();
 
@@ -3076,6 +4062,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     const _fieldT0 = Date.now();
     const loc = { wrapperSel: f.wrapperSel };
     const mappedPath = FIELD_MAP[f.fieldName] || null;
+    // WHAT IT IS ABOUT TO DO, and on what evidence. deterministicTierFor is the same predicate the
+    // planner uses, so this line states which tier OWNS the field before a single event is dispatched —
+    // "thinking", not just "doing".
+    if (_traceOn) {
+      const tier = deterministicTierFor(f, profile, bucketIndex, empCompany);
+      const cached = aiAnswerByLabel.get(aiLabelKey(f.label));
+      trace(`FIELD "${String(f.label || f.fieldName).slice(0, 60)}" [${f.fieldName}] ${f.widgetType}${f.isRequired ? " REQUIRED" : " optional"}`
+        + ` · holds ${JSON.stringify(f.currentValue == null ? "" : String(f.currentValue).slice(0, 30))}`
+        + ` · plan: ${tier ? "DETERMINISTIC (" + tier + ")" : (cached ? "AI (answer already known: \"" + String(cached.choice).slice(0, 30) + "\")" : "AI or blank")}`);
+    }
     const rawValue = mappedPath ? getByPath(profile, mappedPath) : undefined;
 
     const record = {
@@ -3187,6 +4183,18 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           record.resolved = want;
           Object.assign(record, await fillCheckboxCdp(act, loc, want, budgets));
         }
+      } else if (isSkillsField(f)) {
+        // SKILLS holds a SET, so it is routed away from the single-value typeahead path before the
+        // unmapped skip that used to leave it empty. Not in FIELD_MAP because FIELD_MAP resolves ONE
+        // value through resolve(); here the whole `profile.skills` array is the answer.
+        record.mappedPath = "skills";
+        const list = (profile && Array.isArray(profile.skills)) ? profile.skills : [];
+        record.rawValue = list.length ? list.slice() : null;
+        record.resolved = list.slice();
+        // OPT-IN, because the cost scales with the profile (~1.5–3s per skill) while Workday's résumé
+        // parse has usually already suggested a reasonable set. Off ⇒ keep the suggestions and record
+        // them for review; on ⇒ add every profile skill the taxonomy will accept.
+        Object.assign(record, await fillSkillsCdp(act, loc, list, budgets, { fillAll: !!(profile && profile.fill_all_skills) }));
       } else if (!mappedPath) {
         record.status = "skipped";
         record.detail = "no mapping";
@@ -3308,14 +4316,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
               record.detail = `${decision.detail}; already held "${before}" — kept (no actuation)`;
             } else {
               await act.clickDropdownOptionByText(loc, target);
-              await act.delayFull(budgets.reopenSettleMs);
-              let post = await act.readDropdownState(loc);
-              let committed = post && norm(post.triggerText) === norm(target);
-              if (committed) { // persistence re-read — a momentary pick that reverts is NOT a commit
-                await act.delayFull(budgets.reopenSettleMs);
-                post = await act.readDropdownState(loc);
-                committed = post && norm(post.triggerText) === norm(target);
-              }
+              // Shared commit poll (see awaitDropdownCommit): read-first, ADAPTIVE beats, persistence
+              // re-read, poll to the ceiling — instead of two flat delayFull beats that ignore paint state.
+              const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets,
+                (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+              const committed = cr.ok, post = { triggerText: cr.after };
+              // Options linger while unmounting and every listbox renders at the same coordinates, so the
+              // next field's open-click can land on THIS list. Gate on options-gone (see aiFillField).
+              try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort */ }
               record.mappedPath = "(employment-status)"; record.rawValue = empCompany || null;
               record.resolved = [decision.fill];
               record.options = enabledTexts;
@@ -3400,10 +4408,32 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const canonicalize = !!mappedPath && record.resolved != null && record.genuineNoMatch === true && f.widgetType === "dropdown";
       try {
         let aiRes = null;
-        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets); // map a STATED value (never infers) — runs for required OR optional (operates on a value the user PROVIDED, not a guess)
+        // The page's ONE batched call, if it covered this question. Kind must agree: an `infer` answer
+        // must never be spent on a canonicalize (or the reverse) — they are answering different prompts.
+        // Ask for the kind THIS branch needs. An infer answer must never be spent on a canonicalize (or
+        // the reverse) — they answer different prompts. A cached answer has no batch item behind it, so
+        // the kind travels with the answer rather than being looked up in aiBatch.items.
+        const wantKind = canonicalize ? "canonicalize" : "infer";
+        // ONLY CONSULT THE BATCH IF THIS FIELD WOULD USE AN AI ANSWER (2026-08-06). aiBatchAnswer AWAITS
+        // the in-flight call, so asking it about a field that is not AI-eligible blocks the walk for the
+        // model's full latency and then throws the answer away. Live on waystar page 3: an OPTIONAL
+        // textarea with no mapping ("What is your desired salary?") hit this and stalled the page 3.56s
+        // before being skipped — and it stalled it EARLY, cutting short the very overlap the batch exists
+        // to create. The eligibility test is the same one the branches below use.
+        const willUseAi = canonicalize || (f.isRequired && aiEligible(f));
+        const batched = willUseAi ? await aiBatchAnswer(f, wantKind) : null;
+        const preInfer = !canonicalize ? batched : null;
+        const preCanon = canonicalize ? batched : null;
+        // Canonicalize ALWAYS picks an option now (see aiCanonicalizeField) — a closed list must be
+        // answered, so there is no "declined" case left to recover from here. The previous shape added a
+        // SECOND llm call and a SECOND open/close of the same dropdown purely to undo the first call's
+        // refusal; asking once for the nearest option removes both. A reply that is still not a real
+        // option (hallucinated text) is refused by the match ladder inside canonicalize, and the
+        // deterministic last-resort backstop below is what guarantees the field is never left blank.
+        if (canonicalize) aiRes = await aiCanonicalizeField(act, loc, f, record.resolved, budgets, preCanon); // maps a STATED value — runs for required OR optional
         else if (f.isRequired && aiEligible(f)) { // INFER only for REQUIRED fields — optional stays at its deterministic skipped/blank result, no LLM
           aiRes = (f.widgetType === "dropdown")
-            ? await aiFillField(act, loc, f, profile, jobContext, budgets)
+            ? await aiFillField(act, loc, f, profile, jobContext, budgets, preInfer)
             : (f.widgetType === "date")
               ? await aiFillDate(act, loc, f, profile, jobContext, budgets)
               : await aiFillText(act, loc, f, profile, jobContext, budgets);
@@ -3412,6 +4442,14 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess";
         }
         if (aiRes) Object.assign(record, aiRes);
+        // REMEMBER IT, keyed by the question: if this same question comes back under a different
+        // automation-id (a remount), it must get the IDENTICAL answer, from the cache, with no new call.
+        // Re-answering is what made the page oscillate.
+        if (aiRes && !batched && aiRes.after != null && String(aiRes.after) !== "") {
+          const lk = aiLabelKey(f.label);
+          if (lk) aiAnswerByLabel.set(lk, { _kind: wantKind, choice: String(aiRes.after), justification: "",
+            confidence: aiRes.confidence || "", maps_to: aiRes.maps_to || "", suggested_category: aiRes.suggested_category || "" });
+        }
       } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI fill error: " + String((e && e.message) || e); }
     }
 
@@ -3459,6 +4497,39 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       } catch (e) { record.status = "needs_review"; record.flag = "ai-error"; record.detail = "AI radio fallback error: " + String((e && e.message) || e); }
     }
 
+    // ── FINAL BACKSTOP: a REQUIRED DROPDOWN never ends this page BLANK (operator, 2026-08-07) ─────────
+    // "Every dropdown will commit a value even if AI can't accurately determine the correct one. Getting
+    // to the review page is 1st priority with everything reconned correctly."
+    //
+    // Everything above can legitimately end with nothing: the deterministic match misses, buckets miss,
+    // canonicalize declines, the AI declines / errors / has no key / is switched OFF entirely. Each of
+    // those is individually correct — and the SUM of them is a halted walk that hands the operator no
+    // review page at all. This turns that into a flagged placeholder they can fix in one click.
+    //
+    // Placed DEAD LAST on purpose — after canonicalize, after the AI infer, after the confidence-gated
+    // EEO path and the required-radio rescue. An earlier position pre-empted the EEO path, which has a
+    // genuinely better answer for a demographic (it declines to "Undeclared" rather than picking one).
+    // Deterministic, so it still works when the AI is the thing that failed, or is switched off.
+    //
+    // ONLY when the field is genuinely EMPTY. A dropdown that already HOLDS something — a tenant pre-fill
+    // we deliberately kept, or a value that strayed and was surfaced for review — is not blocking
+    // anything, and overwriting it would destroy a real answer to solve a problem that does not exist.
+    // `hasLiveValue` treats the "Select One" placeholder as empty, which is exactly the blocking case.
+    if (record.widgetType === "dropdown" && f.isRequired
+        && record.status !== "filled" && record.status !== "filled_review"
+        && !hasLiveValue(record.after)) {
+      try {
+        const why = record.flag ? `${record.flag}: ${record.detail || "no answer"}` : (record.detail || "no answer available");
+        const forced = await forceRequiredDropdownPick(act, loc, f, budgets, why);
+        if (forced && forced.status === "filled_review") Object.assign(record, forced);
+        else if (forced) record.detail = `${record.detail || ""} · last-resort pick also failed (${forced.flag}: ${forced.detail || "?"})`;
+      } catch (e) {
+        // NEVER swallow this. A silent catch here cost a live round: the backstop appeared not to run at
+        // all, and there was nothing in the log to say whether it had thrown or been gated out.
+        record.detail = `${record.detail || ""} · last-resort pick ERRORED: ${String((e && e.message) || e)}`;
+      }
+    }
+
     // ── Required CHECKBOX-GROUP AI fallback ── same reasoning as the radio pass above, for the
     // pick-one SET shape. A required one nothing can answer blocks Save & Continue forever (live:
     // PSECU's required ethnicity group). A bare `checkbox` is deliberately NOT here — ticking one is
@@ -3488,7 +4559,38 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       if (ord.length) record.date_order = ord;
     }
     record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
+    if (_traceOn) {
+      trace(`  ⤷ ${record.status}${record.after != null && record.after !== "" ? ' "' + String(record.after).slice(0, 40) + '"' : ""}`
+        + `${record.flag ? " [" + record.flag + "]" : ""}${record.matchTier ? " via " + record.matchTier : ""}`
+        + `${record.detail ? " — " + String(record.detail).slice(0, 110) : ""}`, Date.now() - _fieldT0);
+    }
     results.push(record);
+
+    // ── TEMPORARY RECON (2026-08-06, budgets.debugClobber) — WHO WIPED THAT FIELD? ─────────────────
+    // Operator, waystar page 3: filling the relocation question CLEARS the dependent basecamp answer,
+    // and the page then cannot Save because basecamp is required and empty. The end state is visible in
+    // the FIELD-DIAG dump, but the CAUSE is not: by then we only know the value is gone, not which of
+    // our own writes removed it. This re-scans after EVERY field and names any OTHER field that changed
+    // underneath it — value changed, or the wrapper appeared/vanished (a REMOUNT shows as both).
+    // Opt-in, because it costs one read-only scanPage per field; off, this whole block is one boolean.
+    if (budgets.debugClobber) {
+      try {
+        const after = ((await act.scanPage()) || {}).fields || [];
+        const now = new Map(after.map((x) => [x.fieldName, x]));
+        if (clobberPrev) {
+          for (const [name, was] of clobberPrev) {
+            if (name === f.fieldName) continue;                       // the field we just wrote
+            const is = now.get(name);
+            if (!is) { clobberLog.push(`after filling ${f.fieldName}: field ${name} "${String(was.label || "").slice(0, 40)}" VANISHED from the page`); continue; }
+            const a = was.currentValue == null ? "" : String(was.currentValue);
+            const b = is.currentValue == null ? "" : String(is.currentValue);
+            if (a !== b) clobberLog.push(`after filling ${f.fieldName}: field ${name} "${String(is.label || "").slice(0, 40)}" changed "${a}" → "${b}" WITHOUT being touched`);
+          }
+          for (const [name, is] of now) if (!clobberPrev.has(name)) clobberLog.push(`after filling ${f.fieldName}: field ${name} "${String(is.label || "").slice(0, 40)}" APPEARED`);
+        }
+        clobberPrev = now;
+      } catch (e) { /* diagnostic only — never disturb the fill */ }
+    }
 
     // Let one field's transient UI settle before the next opens (also the
     // natural blur of the prior field — the sequential-cleanup rule).
@@ -3705,17 +4807,49 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // something did. A tenant that reveals even later still surfaces the honest way: the field blocks Save
   // & Continue → nav-timeout diagnostics + AI-4 remediation.
   const cascadeSeen = new Set(scan.fields.map((f) => f.fieldName)); // flat fields already processed up front
+  // ── TEMPORARY RECON (2026-08-06) — remove once the page-3 remount question is settled. ─────────────
+  // Operator: answering the relocation question CLEARS the dependent basecamp answer, the page then
+  // half-refills, re-answers relocation, clears basecamp again, and finally cannot Save because basecamp
+  // is required and empty. The suspicion this exists to prove or kill: Workday is not clearing the value,
+  // it is REMOUNTING the dependent question under a NEW automation-id (two different ids for that same
+  // question have already shown up across runs). If so, our filled record points at a dead wrapper while
+  // the live widget is blank and required — which is exactly the observed ending.
+  // A remount is invisible to `cascadeSeen`, which keys on fieldName, so it reads as "a brand-new field".
+  // Matching on the LABEL across a scan boundary is what makes it visible.
+  const normLbl = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
+  const labelOfSeen = new Map(scan.fields.map((f) => [f.fieldName, f.label]));
+  const cascadeRecon = [];
   const cascadePass = async () => {
     if (targeted) return;
     for (let round = 0; round < budgets.maxCascadeRounds; round++) {
       let reFields;
       try { reFields = (await act.scanPage()).fields || []; } catch (e) { break; } // re-scan blip → stop (non-fatal)
+      const liveNames = new Set(reFields.map((f) => f.fieldName));
       const revealed = reFields.filter((f) => !cascadeSeen.has(f.fieldName));
+      // VANISHED: a field we already processed that is no longer in the DOM. On its own that is the
+      // documented cascade-REMOVED case; paired with a revealed field carrying the SAME label it is a
+      // REMOUNT, and that pairing is the whole point of this log.
+      const vanished = [...cascadeSeen].filter((n) => !liveNames.has(n));
+      for (const f of revealed) {
+        const twin = vanished.find((n) => normLbl(labelOfSeen.get(n)) && normLbl(labelOfSeen.get(n)) === normLbl(f.label));
+        // A REMOUNT is now an ALARM, not routine chatter: the stray-click fix (closeDropdownConfirmed on
+        // the AI commit paths) removed the thing that caused them, so one appearing again means either a
+        // new tenant behaviour or that gate regressing. Always logged. The ordinary reveal/vanish lines
+        // are diagnostics and ride the trace flag.
+        if (twin) cascadeRecon.push(`⚠ REMOUNT r${round}: "${String(f.label || "").slice(0, 60)}" changed id ${twin} → ${f.fieldName} — a dependent question was re-created. Expected to be GONE since the AI commit paths began confirming the option list unmounts; investigate that gate first.`);
+        else if (_traceOn) cascadeRecon.push(`revealed r${round}: ${f.fieldName} "${String(f.label || "").slice(0, 60)}"`);
+        labelOfSeen.set(f.fieldName, f.label);
+      }
+      for (const n of vanished) {
+        if (_traceOn && !revealed.some((f) => normLbl(f.label) === normLbl(labelOfSeen.get(n)))) cascadeRecon.push(`vanished r${round}: ${n} "${String(labelOfSeen.get(n) || "").slice(0, 40)}" (no same-label replacement — a genuine cascade-REMOVE)`);
+      }
       if (!revealed.length) break; // nothing new (the common case) → done, zero extra work
       const revealedNames = new Set(revealed.map((f) => f.fieldName));
       revealed.forEach((f) => cascadeSeen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
       try {
-        const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: revealedNames });
+        // Share the page's answer cache: a revealed/REMOUNTED field is usually a question we have
+        // already answered, and it must get the SAME answer rather than a fresh (possibly different) one.
+        const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: revealedNames, aiAnswers: aiAnswerByLabel });
         for (const r of (sub && sub.results) || []) {
           r.cascadeRevealed = true; // provenance: appeared only AFTER a value committed → the submit gate forces a re-review
           r.detail = (r.detail ? r.detail + " | " : "") + "REVEALED by an earlier field's value (cascade re-scan)";
@@ -3782,9 +4916,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // Summary editability: scrape the full option list for choice fields that lack one (tagged FoS
   // typeaheads + prefilled-kept dropdowns) into the records — at END OF PAGE (fields settled/closed →
   // reliable fresh re-open) and BEFORE the M40 audit (which re-reads each value + backstops any stray).
-  // opts.optionCache: the SW-loaded cross-run option store (see captureChoiceOptions) — cosmetic only.
   _phaseT0 = Date.now();
-  if (!targeted) await captureChoiceOptions(act, results, budgets, opts && opts.optionCache);
+  { const _c0 = Date.now();
+    trace("CAPTURE options for the review editor (read-only re-opens)");
+    if (!targeted) await captureChoiceOptions(act, results, budgets);
+    trace("CAPTURE done", Date.now() - _c0); }
   markPhase("capture", _phaseT0); _phaseT0 = Date.now();
   if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
   markPhase("audit", _phaseT0); _phaseT0 = Date.now();
@@ -3833,7 +4969,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const sessionWarning = (srcRec && srcRec.status === "needs_review" && srcRec.optionsLoaded === false)
     ? "Likely session expired — the \"How did you hear about us?\" options never loaded (server fetch failed). Refresh, log in, and reopen the form, then retry."
     : null;
-  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings };
+  // aiBatchInfo: what the batch actually DID this page, so the log can say so. Without it a batch that
+  // collected nothing is indistinguishable from one that worked, which is exactly how the first live run
+  // read as "still calling AI on each field".
+  const aiBatchInfo = (act.aiEnabled && budgets.enableAiBatch)
+    ? { candidates: aiBatch.items.length, kinds: aiBatch.items.map((i) => i.kind + ":" + i.key),
+        fired: !!aiBatch.promise, answers: aiBatch.answers.size,
+        served: aiBatch.served || 0, fellBack: aiBatch.fellBack || 0,
+        scanMs: aiBatchScanMs, error: aiBatch.error || null, recon: aiBatch.recon || null }
+    : null;
+  return { url: scan.url, repeatingFieldCount: scan.repeatingFieldCount || 0, results, counts, needsReview, sessionWarning, audit: auditEntries, sectionShapes, timings, aiBatchInfo, cascadeRecon, clobberLog };
 }
 
 // ============================================================================
@@ -3987,9 +5132,25 @@ const normTitle = (s) => String(s == null ? "" : s).toLowerCase()
   .replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
 const camelWords = (s) => normTitle(String(s || "").replace(/([a-z])([A-Z])/g, "$1 $2"));
 const titleContains = (a, b) => !!(a && b && (a === b || a.includes(b) || b.includes(a)));
-function sectionsFromErrorNames(names) {
+function sectionsFromErrorNames(names, flatFields) {
   const norm = normTitle, words = camelWords, contains = titleContains;
-  const nList = (Array.isArray(names) ? names : []).map(norm).filter((n) => n && n.length >= 3); // <3 chars = too generic to anchor a section re-run
+  let nList = (Array.isArray(names) ? names : []).map(norm).filter((n) => n && n.length >= 3); // <3 chars = too generic to anchor a section re-run
+  // A name that IS a FLAT field on this page is not a section field (2026-08-04). The match below is
+  // bidirectional containment, so a bare "Name" matches schoolName / companyName and drags whole
+  // sections into a re-run: live on waystar's Self Identify page, the one remaining error "Name" — the
+  // signature field, sitting right there as a flat field — re-ran workExperience AND education, which
+  // cleared nothing and burned the attempt that halt-on-no-progress then spent. EXACT match only, so
+  // this can never suppress a genuine section field that merely resembles a flat one.
+  const flat = Array.isArray(flatFields) ? flatFields : [];
+  if (flat.length && nList.length) {
+    const owned = new Set();
+    for (const f of flat) {
+      if (!f) continue;
+      const l = norm(f.label); if (l) owned.add(l);
+      const w = words(f.fieldName); if (w) owned.add(w);
+    }
+    nList = nList.filter((n) => !owned.has(n));
+  }
   if (!nList.length) return [];
   const out = [];
   for (const sec of PAGE_SECTIONS) {
@@ -5340,6 +6501,22 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
       // M/D/Y bug; mechanics probe proved it the sole culprit). focusDateSegment
       // triple-click-SELECTS the segment, so typing REPLACES it — no clear needed.
       // (Any future per-tenant clear must be segment-scoped Backspace, NEVER Ctrl+A.)
+      //
+      // ── FORCED TRANSITION (2026-08-05, budgets.forceSegmentTransition) ──────────────────────────
+      // Re-typing the SAME digits over a triple-click selection leaves the value BYTE-IDENTICAL, so no
+      // value transition occurs. That is fine for an ordinary fill and useless for the one case this
+      // flag exists for: Workday's model calling a date field empty while its own DOM — and React's
+      // props AND fiber — hold the value (traced live on waystar's Self Identify page: domValue "8",
+      // reactProps "8", reactFiber "8", ariaInvalid null, and still "The field Date is required").
+      // Writing the value it already has cannot re-answer the question. Emptying the segment first
+      // produces a real empty→value transition, which is the only lever left that does not depend on
+      // Workday agreeing with its own DOM. Backspace is segment-scoped (the selection), never Ctrl+A.
+      // Best-effort by construction: if the clear no-ops we still type the value, so the worst case is
+      // exactly today's behaviour, and the read-back below judges the result either way.
+      if (b.forceSegmentTransition && typeof act.pressBackspace === "function") {
+        await act.pressBackspace();
+        await act.delay(b.textReadIntervalMs);
+      }
       if (how === "insertText") await act.typeText(val); else await act.typeDigits(val);
       // Reactive read-back: POLL the segment until it equals the COMPLETE value (parseInt
       // exact — a half-typed "1" of "15" must NOT satisfy it), ceiling = give-up only. Never
@@ -5372,6 +6549,17 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
     trace[seg] = (r && r.focusRung ? r.focusRung : "focus-failed") + "/" + (r && r.ok ? r.inputMethod : ((r && r.inputMethod) || "?") + "-FAILED");
     if (!r || !r.ok) allVerified = false;
   }
+
+  // ── COMMIT THE COMPOSITE BY BLURRING IT (operator, 2026-08-08) ─────────────────────────────────
+  // Workday rejected Save & Continue with "The field From is required and must have a value" on a page
+  // whose date segments visibly HELD those values — a phantom error. The operator's manual fix says what
+  // is missing: "all I did was click into and then click out of the box". Clicking out is a BLUR, and
+  // this filler never issued one: it typed each segment, read it back, and moved on. The DOM had the
+  // value; Workday's own model never received the commit.
+  //
+  // Same family as every other React-state lesson here (a native-setter write that no event follows).
+  // The read-back above is unchanged, so this can only ADD a commit — it never decides the value.
+  if (act.blurActive) { try { await act.blurActive(); } catch (e) { /* best-effort — the value is already typed */ } }
 
   const afterStr = ["Month", "Day", "Year"].filter((s) => after[s] != null).map((s) => after[s]).join("/");
   const detail = "segments " + JSON.stringify(trace);
@@ -5421,7 +6609,13 @@ function auditActualFromRaw(widgetType, raw) {
     // a GROUP can hold several — compare the whole set, or a two-answer field reads as a mismatch
     case "checkbox_group": { const ok = Array.isArray(raw) && raw.length > 0; const on = ok ? raw.filter((o) => o.checked).map((o) => o.labelText) : [];
       return { actual: on.length ? apMatch.joinGroupValue(on) : null, readable: ok }; }
-    case "typeahead": case "hierarchical": return { actual: raw && raw.chips ? raw.chips.join("; ") : null, readable: !!raw };
+    // Chips go through skillChipName so Workday's "(Suggested)" provenance marker is stripped on BOTH
+    // sides of the comparison. The fill records the bare name (that is what the review page prints), so
+    // without this the audit re-read the annotated chip and flagged a correctly-kept skills field as an
+    // audit-mismatch — observed the moment the stripping was introduced. A no-op for every other
+    // typeahead, whose chips carry no such marker.
+    case "typeahead": case "hierarchical":
+      return { actual: raw && raw.chips ? raw.chips.map(apMatch.skillChipName).join("; ") : null, readable: !!raw };
     case "date": {
       if (!Array.isArray(raw)) return { actual: null, readable: false };
       const parts = [];
@@ -5535,6 +6729,18 @@ async function replayField(act, entry, budgets) {
   const sel = deriveFlatWrapperSel(entry);
   if (!sel) return { status: "error", detail: "could not derive a selector from field_id " + JSON.stringify(entry.field_id) };
   const loc = { wrapperSel: sel };
+  // ── THE REPLAY FOLLOWS THE REVIEW PAGE, INCLUDING FOR A SIGNATURE DATE (operator, 2026-08-08) ─────
+  // This used to re-derive a signature date to TODAY on every replay, to dodge Workday's
+  // "Error-Date / Enter today's date" on a bundle approved yesterday. That fixed a stale date and
+  // introduced a worse bug: it wrote a value the human had NOT approved — including onto a date they
+  // had left BLANK — and on the Self Identify page that write CASCADES, making Name and the disability
+  // group required. The rehearse then halted on two questions the human never saw, caused entirely by
+  // our own unapproved write.
+  //
+  // The rule is now the operator's: the replay always follows the review page. Today's date may only be
+  // written REACTIVELY — when Save & Continue actually comes back with "Enter today's date", the walk
+  // stamps it and re-clicks (see the signature-date remediation in runCdpReplayWalk). That keeps the
+  // approval contract intact and still clears the one error the proactive rewrite existed for.
   const value = entry.current_value;
   // A checkbox GROUP's answer is a SET. `groupSelection` prefers the authoritative array the review
   // editor writes and falls back to splitting the joined string for a bundle written before it
@@ -5561,6 +6767,19 @@ async function replayField(act, entry, budgets) {
       return Object.assign({ replay: "cleared" }, await fillTextCdp(act, loc, "", b, tag));
     }
     return { status: "skipped", replay: "cleared", detail: "left blank (cleared in review; a fresh form defaults to blank)" };
+  }
+
+  // SKILLS: the approved value is a SET joined "A; B; C", so the single-candidate typeahead replay would
+  // hand Workday that whole string as one skill and fail every time. Split it back and run the additive
+  // filler, which is idempotent by construction (missingSkills skips what the form already holds, so a
+  // second rehearsal actuates nothing) — that is also why this sits ABOVE skip-if-correct: an ordering
+  // difference between the chips and the stored string must not read as a mismatch and trigger a re-add.
+  if (isSkillsField({ widgetType: widget, fieldName: replayEntryFieldName(entry), label: entry.question_label })) {
+    // fillAll:true regardless of the profile toggle — a replay is not making the policy choice, it is
+    // reproducing the list a human APPROVED. (On a rehearse the form re-entered via Continue already
+    // holds those skills, so missingSkills makes this a no-op; the flag only matters if one is absent.)
+    return Object.assign({ replay: "skills-multi" },
+      await fillSkillsCdp(act, loc, apMatch.splitGroupValue(value), b, { fillAll: true }));
   }
 
   // SKIP-IF-CORRECT (minimal-diff replay): read the field's LIVE value FIRST; if it already equals the
@@ -6028,26 +7247,15 @@ async function captureDropdownOptions(act, loc, budgets) {
 // dropdown in review, same as page-2 does). Dispatch by widget; cache per option-set key so
 // same-vocabulary fields (FoS across education entries; language/proficiency dropdowns across entries)
 // re-open ONCE, not N times. Non-fatal throughout.
-// optionCache (2026-07-25 speed round, OPTIONAL): a CROSS-RUN store the SW loads from
-// chrome.storage and persists back after the page (engine computes / SW does I/O — the driver
-// only reads/mutates the plain object handed in). key → { options, at }. It serves ONLY this
-// cosmetic surface (the review editor's <select>/combobox lists) — the fill/match ladder always
-// reads LIVE options, so a stale list can never cause a wrong fill (a stale pick at review just
-// no-matches on replay → needs_review). Fed for FREE from records that already carry options
-// (committed dropdowns / start-scraped typeaheads), so a re-run at the same tenant — where run 1's
-// committed value is now a tier-0 prefilled-keep — skips the cold re-open (~5.6s server lists)
-// entirely. TTL'd on read; entries the cache served are NOT re-stamped (so staleness still expires).
-const OPTION_CACHE_TTL_MS = 7 * 24 * 3600 * 1000;
-async function captureChoiceOptions(act, results, budgets, optionCache) {
+// The CROSS-RUN option cache was REMOVED 2026-08-06 (operator). It only ever helped a SECOND run against
+// the same tenant, and that is a testing artifact, not the product: in the real flow a form is filled
+// ONCE, reviewed, then submitted, so the store was always cold when it mattered. Worse, it made repeat
+// test runs measurably faster than a genuine first fill, which silently distorted timing comparisons.
+// The per-PAGE `cache` below stays — it dedupes same-vocabulary fields within one page (FoS across
+// education entries, proficiency dropdowns across language entries) and is real work avoided, now.
+async function captureChoiceOptions(act, results, budgets) {
   if (!act) return;
   const cache = new Map(); // key → options[] | null (already attempted THIS page)
-  const oc = (optionCache && typeof optionCache === "object") ? optionCache : null;
-  const ocGet = (key) => {
-    const e = oc && oc[key];
-    return (e && Array.isArray(e.options) && e.options.length && (Date.now() - (e.at || 0)) < OPTION_CACHE_TTL_MS) ? e.options : null;
-  };
-  const ocPut = (key, options) => { if (oc && Array.isArray(options) && options.length) oc[key] = { options: options.slice(), at: Date.now() }; };
-  let cacheHits = 0;
   for (const rec of results || []) {
     if (!rec || !rec.auditLoc) continue;
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
@@ -6066,16 +7274,13 @@ async function captureChoiceOptions(act, results, budgets, optionCache) {
       key = "dd:" + String(rec.fieldName).split(".").pop(); // recName stem (degree/language/readingProficiency) — same stem ⇒ same option vocabulary
       scrape = () => captureDropdownOptions(act, { wrapperSel: rec.auditLoc }, budgets);
     } else continue;
-    if (Array.isArray(rec.options) && rec.options.length) { ocPut(key, rec.options); continue; } // committed dropdown / start-scraped typeahead already has them → FEED the store (free)
+    if (Array.isArray(rec.options) && rec.options.length) continue; // committed dropdown / start-scraped typeahead already carries them
     if (!cache.has(key)) {
-      const stored = ocGet(key);
-      if (stored) { cache.set(key, stored.slice()); cacheHits++; } // cross-run hit → ZERO actuation (no cold re-open); not re-stamped
-      else { const scraped = await scrape(); cache.set(key, scraped); ocPut(key, scraped); }
+      cache.set(key, await scrape());
     }
     const opts = cache.get(key);
     if (opts && opts.length) rec.options = opts.slice();
   }
-  if (cacheHits) console.log(`[ApplyPilot][CDP-TIME] option-capture: ${cacheHits} field(s) served from the cross-run option cache (no cold re-open).`);
 }
 
 // ============================================================================
@@ -6664,5 +7869,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

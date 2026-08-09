@@ -13,6 +13,109 @@ Lever and Ashby are a different shape — one page, no login, no draft, a submit
 blank form rather than resuming one — with their own dev loop and their own hard-won debugging rules.
 For those, read the **`ats-tenants`** skill. The never-submit invariant below is shared.
 
+## START HERE — state as of 2026-08-06
+
+Everything the 2026-08-05 list warned about is resolved; that list is gone. Current state:
+
+**The page-3 class of failure is FIXED and the fix is verified.** Symptom was a required dropdown ending
+blank after a sibling "changed itself". Cause was ours: every portaled listbox renders at the same screen
+coordinates, options linger while unmounting and stay clickable, and the AI commit paths never waited for
+the list to unmount — so the next field's open-click landed on the previous field's options. One
+`closeDropdownConfirmed` in three places. Result: 4/4 clean runs (2 hidden, 2 visible), page 3 19.4s → 7.0s.
+If a `⚠ REMOUNT` line ever appears again, that gate is the first suspect.
+
+**AI batching is ON by default** (`disableAiBatch` is the kill-switch). A page's AI questions go out as ONE
+call fired before the deterministic fill. It is a CACHE, NOT A GATE — a question it misses makes its own
+per-field call, so a broken batch costs speed, never an answer. Answers are cached **by question, not
+automation-id**, so a page refill makes ZERO calls and cannot contradict the first pass.
+
+**Baselines to compare against** (waystar, page 3 = the screening page):
+`visible ~7–10s · hidden ~19s` per page-3 fill; the typeahead option scrape is ~2.3s (249 options, 22 hops)
+and **hidden is within 6% of visible** — the non-painting problem is handled by the worker-timer override,
+so do NOT attribute a slow hidden run to paint. LLM latency ranged **1.0s–10.0s** across one session; that
+variance swamps most page-level timing comparisons, so never conclude from a single run.
+
+**Two things that will bite you in the first ten minutes:**
+- **The site session expires every ~20 minutes.** `reportApplication` 401s and the completed fill's bundle
+  never reaches the tracker — there is no re-push, so the whole fill must be re-run. Re-link on
+  `/app/connect` → **"Link for tracking only"** (NOT "Sync everything", which overwrites the profile).
+  Do it right before any run whose review you intend to keep.
+- **Drive the UI with JS `.click()`.** MCP ref-clicks and focus+Return both fail to reach React on
+  `/app/run` — the run silently never starts. Firing the extension message directly
+  (`AP_RUN_APPLICATION` / `AP_SUBMIT_APPLICATION`) is equivalent and is what worked all session.
+
+**Other mechanics:** keep every in-page `setTimeout` poll ≤30s (`Runtime.evaluate` dies at ~45s and you lose
+the read, not the run). If the MCP tab group flips to a Chrome profile with no `applypilot.extensionId` in
+localStorage, run `switch_browser` and have the operator reconnect.
+
+**Two traps this session cost real time:**
+- **A 91-second LLM call.** `llm.js` had no request timeout, so one stalled fetch dragged a page fill from
+  ~10s to 100.1s. Now capped at 20s (`LLM_REQUEST_TIMEOUT_MS`). If a page suddenly takes ~100s, check the
+  `[LLM] ok in …ms` lines FIRST — every other call that run was 0.4–1.5s.
+- **Re-running one requisition.** Three runs on the same nvidia req produced a page-2 block naming four
+  required-and-empty work-experience fields that the DOM plainly showed filled. A FRESH req sailed through
+  with zero errors. Prefer a new requisition over re-running one; if you must re-run, expect Workday's
+  accumulated state and do not read it as a code failure.
+
+**Burned fixtures:** `waystar R3132` now returns ALREADY APPLIED (~8 runs). Many waystar drafts exist under
+`tester+12@gmail.com`. Start a fresh tester rather than adding to that pile.
+
+## FIRST: prove the extension is running YOUR code (2026-08-07)
+
+The service-worker start line carries a build marker:
+
+```
+[ApplyPilot][DEV] service worker started (…) · build backstop-1
+```
+
+Bump `AP_BUILD_MARKER` (top of `background.js`) whenever a live run has to prove the reload picked up your
+edit, and check the marker after `AP_RELOAD` **before** reasoning about behaviour at all.
+
+This exists because a whole round was spent on a fix that was never running. Two commits' worth of changes
+were completely inert across three reload-and-rerun cycles; the log could not distinguish "gated out" from
+"threw" from "not loaded", so the time went into re-reading correct code. The cause was the **wrong Chrome
+browser** — a second profile had the same extension ID loaded from a stale copy, so `AP_PING` answered
+`{ok:true}`, `AP_RELOAD` restarted a worker, runs executed, and everything looked healthy while none of the
+edits were present.
+
+`AP_PING` succeeding does NOT mean you are on the right browser. The marker does. And note the operator has
+had to redirect the browser connection more than once in a session — re-check the marker after any
+`switch_browser`, not just at the start.
+
+## Diagnostic flags — turn these on before guessing (2026-08-06)
+
+All are `AP_DEV_FLAG` toggles, and they exist because guessing cost several rounds each. When a page
+misbehaves, turn one on and re-run rather than reasoning from the outcome.
+
+| Flag | What it shows |
+|---|---|
+| `debugPageTrace` | Per-field **plan before acting** (`plan: DETERMINISTIC (bucket)` / `AI (answer already known: …)`), the outcome after, every wait named (`SCOUT`, `AI CALL fired`, `WAITING on the AI reply`, `CAPTURE`), and **every action ≥120ms timed**. `⏸` marks anything over 1s. |
+| `debugAiPrompts` | The questions + options of every `act.llm` call, batched or per-field (the profile blob is stripped). |
+| `debugClobber` | Re-scans after EVERY field and names any OTHER field that changed underneath it — value changed, vanished, or appeared. Costs a scan per field. |
+| `enableAiBatch` | One AI call per page instead of one per question (opt-in). |
+
+Always-on, no flag needed: `[AI-BATCH]` + `[AI-BATCH-RECON]` (one line per page: candidates, opens, served
+vs fell-back) and **`⚠ REMOUNT`**, which is now an ALARM — see below.
+
+### The rule that ends a whole class of wrong theories
+
+**Workday can rarely REMOVE a committed value. It NEVER rewrites one into a different option.** (Operator,
+2026-08-06.) So a field that later holds a *different* valid option was changed by US. Do not go looking
+for an explanation on Workday's side.
+
+This cost a full round. On waystar page 3, relocation was committed `"Yes, I am open to relocating"` and
+later read `"No, but I live near one of these locations"`. It was written up as Workday rewriting the
+value, and two remedies were built on that premise. The real cause: **every portaled listbox renders at
+the same screen coordinates** (every commit logged `rect=463,298`), the options **linger while unmounting
+and stay clickable**, so the next field's open-click landed on the previous field's list. Changing
+relocation remounted the dependent basecamp question under a new id, blank and required → Save refused.
+
+Fix: the AI commit paths now call `closeDropdownConfirmed` (gate on options-GONE, not `aria-expanded`),
+which `fillDropdownCdp` has done since 2026-07-06. Result on the form that failed reliably: **4/4 clean
+runs, 2 hidden + 2 visible**, `remount 0 · stalls 0 · drift 0`, page 3 19.4s → 7.0s.
+
+Triage order when a value changes under you: lingering list → stale rect → a second write.
+
 ## THE INVARIANT: nothing is ever submitted
 
 Every run in this doc is a FILL (stops at Workday's review page) or a REHEARSAL (`arm:false` — runs
@@ -109,24 +212,42 @@ Sanity-check before anything else: `await window.__apSend({type:"AP_PING"})` →
 
 ## The run loop
 
+**`javascript_tool` runs in an ISOLATED world.** Its `window` is not the page's, so a native-setter
+write does NOT reach React's state — the input shows the URL, React still holds `""`, and the Run
+button stays `disabled` forever. The old recipe (native set + `input` event, alone) does not work.
+What works is priming the value and then letting a REAL keystroke produce React's own event:
+
 ```js
-// Set the job URL. NEVER type a URL with the computer tool — it drops characters (a real run
-// died on "magna/Magna" -> "magnaMagna"). Use the native setter.
-const el = [...document.querySelectorAll("input")].find(i => /company\.wd5/.test(i.placeholder || ""));
+// 1. Prime the FULL url via the native setter (not a prefix — see below), then focus.
+const el = [...document.querySelectorAll("input")].find(i => /wd\d|myworkday/.test(i.placeholder||""));
 const set = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
 set.call(el, JOB_URL);
 el.dispatchEvent(new Event("input", { bubbles: true }));
-await new Promise(r => setTimeout(r, 1000));
-
-// VERIFY before clicking — the button is disabled until the URL validates, and a click on a
-// disabled button is a silent no-op that looks exactly like a run that produced nothing.
-const btn = [...document.querySelectorAll("button")].find(b => /^Run$/.test(b.textContent.trim()));
-if (el.value.length > 40 && !btn.disabled) btn.click();
+el.focus();
 ```
+Then **one real keystroke** with the computer tool — `x` then `BackSpace`. React's own handler fires,
+reads the full primed value out of the DOM, and enables the button. Verify, then click:
+```js
+const btn = [...document.querySelectorAll("button")].find(b => /^Run$/.test(b.textContent.trim()));
+({ len: el.value.length, disabled: btn.disabled });   // MUST be disabled:false before you click
+```
+
+**Click the button with JS `focus()` + a real `Return` keypress, not screenshot coordinates.**
+Coordinates drift: the screenshot is scaled, and the scale changes whenever the window resizes, so a
+`kx/ky` computed from an earlier screenshot lands somewhere else. Focus the button in JS, press
+`Return` with the computer tool, and the click is coordinate-independent:
+```js
+btn.focus(); document.activeElement.textContent;   // confirm it's the Run button, THEN press Return
+```
+If you must use coordinates, recompute the scale from the CURRENT screenshot's dimensions and
+confirm the target with `document.elementFromPoint(x, y)` before pressing.
 
 Then poll `__tail()` every ~40s. A fill is 1–4 minutes depending on page count and AI calls.
 
 For the rehearsal, same URL, but match `/Rehears/` instead of `/^Run$/`.
+
+**`Runtime.evaluate` has a ~45s ceiling.** Any in-page poll you write must finish in ≤30s slices and
+be called repeatedly, or the eval itself times out and you lose the read (not the run).
 
 ## Reading the logs — the rules that stop false conclusions
 
@@ -139,9 +260,28 @@ const last = (r.lines || []).slice(-1)[0];
 Math.round((Date.now() - last.t) / 1000);   // age in seconds — is this even your run?
 ```
 
+**Age is not enough — grade from a CURSOR.** An age check tells you the log is fresh, not that the
+line you're reading belongs to *this* run. Two runs a minute apart both look fresh. Stamp a cursor
+before you click, and only grade lines after it:
+
+```js
+window.__cur = async () => ((await window.__apSend({type:"AP_DEV_LOGS", limit:1})).lines||[]).slice(-1)[0]?.t || Date.now();
+const since = await window.__cur();          // BEFORE clicking Run
+// ...after the run...
+const r = await window.__apSend({ type:"AP_DEV_LOGS", limit:500, pattern:"REVIEW page" });
+(r.lines||[]).filter(l => l.t > since);      // only these are yours
+```
+I graded a run on the previous run's lines and reported a pass that wasn't real. The cursor is cheap;
+use it every time.
+
 **Silence can be the success signal.** The walk logs only FLAGGED records (`⚠`). A deterministic
 `filled` is not logged. So "no line for field X" often means X filled cleanly — do not read it as
 "X did not run".
+
+**Never assume whether a run was visible.** The operator may hide or alt-tab the tab mid-run, and an
+occluded tab still reports `tab.active && !minimized`. Read it from the log's own pacing line
+(`cdpPacingLabel`, plus the paint label) — that is ground truth. I labelled a hidden run "visible"
+and used it as no-regression evidence; the operator had to correct me.
 
 **Lines worth grepping**
 
@@ -180,6 +320,32 @@ whole flow and the easiest to get wrong.
 Then rehearse and confirm the log shows your value being written (`"Florida"→"Georgia"`) and the
 review page agreeing.
 
+## Debug levers — flags and probes
+
+`AP_DEV_FLAG` writes a whitelisted key into `chrome.storage.local`; the SW reads it per run, so no
+reload is needed. **Clear every flag when you're done** — several disable safety backstops, and a
+forgotten flag silently invalidates every later measurement.
+
+```js
+await window.__apSend({ type:"AP_DEV_FLAG", key:"forceTrustedInput", value:true });
+await window.__apSend({ type:"AP_DEV_FLAG", key:"forceTrustedInput", value:null }); // clear
+```
+
+| Flag | Effect |
+|---|---|
+| `forceTrustedInput` | reverts the whole run to trusted `Input.*` — the slow-but-proven path |
+| `forceWorkerTimersOff` | forces the ~1Hz throttled page-timer path (regression-test the slow path) |
+| `skipPreSaveReverify` | skips the pre-Save re-verify. **Disables a real backstop — clear it.** |
+| `debugInputTrace` | per-event input log; the keystroke-by-keystroke replay |
+| `debugGroupWatch` | ~10ms polling of a checkbox group's state, drained into the log |
+
+Read-only probes: `AP_DEV_WD_PROBE` inspects a live Workday tab without running a fill. The steps are
+opt-in **message keys**, not a mode string — `{type:"AP_DEV_WD_PROBE", urlContains:"waystar",
+fieldName:"disabilityStatus", geom:true, wrappers:true, checkIds:[...], coordClickIds:[...],
+reload:true}`. `reload:true` re-enters the page so you see what Workday renders BEFORE any fill.
+It returns `{ok:false, error:"busy"}` while a run or sweep is in flight — probe between runs, not
+during one. `AP_DEV_ATS_SCAN` is the equivalent for GH/Lever/Ashby.
+
 ## Traps that produce false results
 
 - **Don't close tabs mid-run.** `AP_DEV_CLOSE_TABS` while a run is tearing down produces
@@ -188,9 +354,24 @@ review page agreeing.
   blocks sign-in invisibly — the extension cannot see browser chrome. Symptom: sign-in submits with
   no outcome. Close stale tabs and retry.
 - **`npx next build` clobbers the dev server's `.next`.** Never build while the dev server serves.
-- **Multiple Chrome browsers connected** → you MUST ask the user which one; never pick.
+- **Never start a SECOND dev server against the same `web/`.** Two `next dev` processes share `.next`
+  and corrupt each other's build — the tell is the page loading unstyled with 404s on every CSS
+  chunk, which looks like a broken app. Fix: kill all node servers, `rm -rf web/.next`, start ONE.
+- **Multiple Chrome browsers connected** → you MUST ask the user which one; never pick. Browser names
+  can go stale mid-session; if a tool lands in the wrong browser, `switch_browser` and re-confirm by
+  opening a known page before doing anything else.
+- **The website session expires silently.** `reportApplication` starts 401ing and `/app/run`
+  redirects to `/login`; the extension log says nothing useful. Check with a `/api/applications`
+  fetch that returns `{"ok":false,"reason":"not-signed-in"}`. **Ask the operator to sign in — never
+  enter credentials yourself.**
+- **The LLM keys exhaust.** After ~25 runs: `no usable API key for gemini: every key is disabled,
+  rejected, or resting`. Every AI field then fails and the run looks like a fill regression. Check
+  `[LLM]` lines before blaming code; the fix is a new key from the operator.
 - **A dead posting returns HTTP 200** and a generic "Careers" page. Confirm with the CxS API before
   blaming the code: `GET /wday/cxs/<tenant>/<board>/job/<path>` → 403 means unpublished.
+- **Some gates are not ours to pass.** A tenant's Terms-and-Conditions checkbox, an SSO wall, or a
+  captcha is an operator step — `externalGateHalt` names these. Do not tick a legal agreement to get
+  a run further, and report the tenant as externally blocked rather than failed.
 
 ## Phantom errors — when to bump the login
 
@@ -204,6 +385,25 @@ before retrying the FAILING form; a fresh account on a fresh form works immediat
 `login recorded for this run — tester+NN@gmail.com @ <Tenant>`.
 
 Prefer tenants where the account already exists: no email verification, so no Gmail dependency.
+
+## Starting a FRESH tester account
+
+Repeated runs against one form give Workday stale server state (see Phantom errors) and eventually an
+ALREADY APPLIED page that ends the run before it starts. A fresh tester is the clean reset, and it is the
+right way to begin a regression sweep.
+
+1. `/app/credentials` — set the login email to the next unused alias (`tester+NN@gmail.com`). Use the
+   native setter + a real keystroke, then Save; look for `✓ Saved`.
+2. The account will NOT exist on any tenant, so **onboarding must create it and verify by email**. That
+   makes Gmail auto-verify a hard dependency for the first run on each tenant — check it is connected
+   before starting, or the run halts `verification-required-gmail-off`.
+3. Confirm it took: the run log prints `login recorded for this run — tester+NN@gmail.com @ <Tenant>`, and
+   the tracker row shows the same under "Signed in as".
+4. **First run on a fresh account is slower** (account creation + email round trip). Do not read that
+   run's timings as a baseline; use the second run on that tenant.
+
+A fresh tester also resets the "already applied" state, so a previously-burned req becomes usable again —
+but prefer a genuinely unused req so the two variables stay separated.
 
 ## Finding postings to test with
 
@@ -280,3 +480,111 @@ State what was observed, with the log line. Distinguish:
 
 Never report a tenant as working end to end without the `SUBMIT GATE PASSED` line from a run whose
 age you checked.
+
+### The sign-in "8-9s" — answered (2026-08-07)
+
+It was NOT Workday being slow, and not the retry ladder. **Success was not being recognised.**
+`classifyAuthOutcome` required `formFieldCount > 0`, so a sign-in that had plainly worked read as
+`unknown` until Workday mounted the fields — and the caller burned its whole budget, then re-submitted the
+auth form or reloaded the page. The live proof, jabil.wd5's SUCCESSFUL sign-in:
+
+```
+still waiting at 2.0s — title "Careers"      formFields 0 · hasAuthEl false · markers [none]
+timed out after 4000ms (52 reads)
+last state:  title "Principal Product Test Engineer…" · formFields 0 · markers [applyFlowPage]
+sign-in outcome: unknown
+```
+
+Three fixes, in order of how much they mattered:
+1. `applyFlowPage` + no auth chrome now counts as success (waiting for fields here is duplicated work —
+   both walks call `awaitFieldSetSettled` anyway).
+2. An EMPTY page after a submit must PERSIST across 3 consecutive reads before it earns a reload — an
+   empty page right after an auth POST is a navigation in progress, not a dead shell.
+3. The first retry rung 500ms → 4000ms; 500ms timed out on 3/3 sign-ins whose clicks had all worked.
+
+For reference: filling starts **~135ms** after success is detected, so there is nothing to win after
+sign-in itself. And you cannot force a sign-in by clicking Sign Out — Workday's session self-restores from
+a persistent cookie. Clearing site cookies is the only reliable way.
+
+### Fresh-account findings (2026-08-07) — read before starting one
+
+A fresh alias exercises the ACCOUNT-CREATION path, which the tenants on the scoreboard below never did
+(they all had accounts). Two blockers lived there and are now fixed; three facts remain:
+
+- **The login alias MUST be an alias of the CONNECTED mailbox.** Gmail auto-verify polls
+  `wangykev@gmail.com`, so a `tester+NN@gmail.com` login is a completely different inbox and the
+  verification mail never arrives — the run sits in "polling Gmail… (up to 120s)" and halts. Use
+  `wangykev+NN@gmail.com`. Switching to it turned `analogdevices.wd1` from blocked into a full
+  `SUBMIT GATE PASSED` on the next run (`verification link found — navigating the tab to it`).
+- **The post-verify sign-in can lose a race.** Straight after auto-verify, ADI halted `auth-unknown`
+  with the page at `readyState loading` — a 500ms first wait classifying a still-loading page. A plain
+  re-run signed straight in. Retry once before believing it.
+- **Polling the localhost tab with `javascript_tool` ACTIVATES it**, so a run launched `background:false`
+  logs `tab HIDDEN` and you will mislabel it. To measure a genuinely visible run, fire it and then wait
+  WITHOUT touching Chrome (a backgrounded `sleep`), reading the log only afterwards.
+- **`window.__last` is as unreliable as the log ring.** An aborted run's promise resolves late and
+  overwrites it, so a result object can belong to a run you killed two tenants ago. Grade the TAIL against
+  a cursor, exactly as with log lines.
+
+**The self-ID disability blocker was a COLON, and is FIXED** (2026-08-07). Worth knowing because it was
+mis-described for several sessions as "the checkbox unchecks itself", which sent a whole round chasing a
+Workday-side ghost.
+
+- **Workday's part is real**: re-entering a SAVED application DROPS the disability answer while its
+  siblings on the same page keep theirs. So the replay always meets `disabilityStatus ""*`.
+- **Our part was the bug**: `parseErrorFieldName` strips a trailing `:`; `normalizeLabel` strips only `*`.
+  So `"Please check one of the boxes below"` (from the error) never equalled
+  `"Please check one of the boxes below:*"` (the live label), and both recovery paths reported "match no
+  field on this page" while the field sat there with an approved value. Fixed by `errorLabelKey`.
+- **The tell is pass-then-fail**: the recovery only runs after Workday has dropped the value, i.e. on a
+  RE-ENTRY. `analogdevices.wd1` passed rehearsal #1 and failed #2, deterministically — if you only ever
+  rehearse once per tenant you will not see this. **Rehearse twice.**
+
+**waystar's variant is also FIXED** — it was two more faults stacked on the same page:
+
+- **Synthetic CLICKS don't reach Workday's model on the self-ID page.** The tell is our read-back and
+  Workday disagreeing: `page 5 replay: … 0 FAILED` immediately followed by
+  `re-click fallback: error text present — a real validation block`. The whole page now goes TRUSTED on
+  the replay, clicks included. Result: force-re-fills 0, page 5 advances on the first Save.
+- **A signature date goes stale overnight.** `Error-Date "Enter today's date"` — the bundle was approved
+  08/06 and replayed 08/07. `replayField` now re-derives it, and `reconcileReviewPage` compares against
+  today to match (fixing only one half traded a nav-timeout for a submit block). **A one-day-old approval
+  is enough**, so any review not submitted the day it was filled hits this — test it deliberately by
+  approving one day and rehearsing the next.
+
+**A test-writing warning from this round.** The first draft of the reconcile tests passed for the WRONG
+reason: the fixture used the wrong argument shape, every row landed in `missing_on_review`, and "0
+disagreements" looked like success. They now assert `tier === "keyed"` to prove they reach the real
+compare. Always check WHICH path your fixture exercises, not just the verdict.
+
+### Scoreboard as of 2026-08-07
+
+| Tenant | State |
+|---|---|
+| `itron.wd5` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account created this run |
+| `nvidia.wd5` (NEW) | **verified live 2026-08-07** — `AGREE 47 · DISAGREE 0` → `SUBMIT GATE PASSED` on rehearsals #1 AND #2. Needed the required-dropdown backstop (its Phone Device Type offers only Home / Home Cellular, no "Mobile"). Page fills hidden: 11.7 · 17.1 · 2.9 · 3.4 · 6.8s |
+| `marvell.wd1` (NEW) | fill verified live 2026-08-07 — REVIEW after 5 pages, reported 200. Approve/rehearse not yet run |
+| `jabil.wd5` (NEW) | **blocked** — its `Type to Add Skills*` is REQUIRED, and skills is the deferred unmapped section. The AI forced `"No Items."` (the empty-list placeholder), the commit correctly did not persist, and the walk halted naming the field. This turns the deferred SKILLS work into a hard blocker for any tenant that makes it required |
+| `analogdevices.wd1` (NEW) | **verified live 2026-08-07** — `SUBMIT GATE PASSED` on rehearsals #1, #3, #4; #2 is what caught the colon bug |
+| `magna.wd3` (path-hosted) | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, hidden, fresh account |
+| `radiancetech.wd12` (NEW) | fill verified live (REVIEW, 5 pages); rehearsal blocked on the self-ID group |
+| `waystar.wd1` | **verified live 2026-08-07** — `SUBMIT GATE PASSED`, `AGREE 41 · DISAGREE 0`; needed all four self-ID fixes |
+| `cat.wd5` | fill verified live (REVIEW, 5 pages); rehearsal blocked page 1, no error text (stale draft) |
+| `analogdevices.wd1`, `jabil.wd5` | blocked on email verification — see the alias note above |
+| Aptiv, PSECU, clearesult, Home Depot | verified live (earlier sessions, pre-existing accounts) |
+| `copart` | externally blocked (operator gate) |
+| `clearwater` | unresolved |
+
+### Scoreboard as of 2026-08-06 — 7 of 10
+
+| Tenant | State |
+|---|---|
+| Aptiv, PSECU, clearesult, Home Depot | **verified live** (earlier sessions) |
+| `cat.wd5` | **verified live** — REVIEW after 5 pages, ~16s total fill |
+| `magna.wd3` (path-hosted) | **verified live** — REVIEW after 4 pages, ~10s |
+| `waystar.wd1` | **verified live 2026-08-06** — full loop to `SUBMIT GATE PASSED`; needed the self-ID replay-input fix and the stray-click fix |
+| `copart` | externally blocked (operator gate) — not a code failure |
+| `radiancetech`, `clearwater` | unresolved; need postings |
+
+Three to go. Prefer tenants with an existing account (no email verification), and one
+`wdN.myworkdaysite.com` path-hosted tenant for URL/job-key variety.

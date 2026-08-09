@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { planAiBatchCandidates, deterministicTierFor, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, pickLastResortOption, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -513,8 +513,40 @@ function makeFakeAct(fields, opts) {
 
     // radio / checkbox
     readRadioState: async (loc) => byLoc(loc).options.map((o) => ({ ...o })),
+    // Quiescence gate: `quietDelayMs`/`quietNever` on a field model a page that is still reacting.
+    awaitQuiet: async (loc, opts) => {
+      const f = byLoc(loc);
+      log.push(["awaitQuiet", loc.wrapperSel]);
+      if (f.quietNever) return { quiet: false, waitedMs: (opts && opts.ceilingMs) || 3000 };
+      return { quiet: true, waitedMs: f.quietDelayMs || 0 };
+    },
     // checkbox GROUP (pick-one checkbox set — the OFCCP self-ID). Same shape as readRadioState.
-    readCheckboxGroup: async (loc) => { const f = byLoc(loc); return f.options ? f.options.map((o) => ({ ...o })) : null; },
+    // `rebuildScript` models Workday REBUILDING the widget under us (live on waystar 2026-08-04): a queue
+    // consumed one entry per read — "gone" = wrapper missing (null), "empty" = present with no boxes ([]),
+    // "cleared" = comes back with every box UNCHECKED (our value discarded), anything else = read normally.
+    readCheckboxGroup: async (loc) => {
+      const f = byLoc(loc);
+      // `rebuildAlways` takes over once the script is exhausted and then applies to EVERY later read.
+      // A fixed-length script cannot express "this never sticks" without hardcoding how many rounds the
+      // loop happens to run, so a script running dry silently turned a never-sticks fixture into a
+      // recovers-eventually one. Compose them: the script covers the pre-loop reads, this covers the rest.
+      const scripted = Array.isArray(f.rebuildScript) && f.rebuildScript.length;
+      if (!scripted && f.rebuildAlways) {
+        log.push(["readCheckboxGroup", f.rebuildAlways]);
+        if (f.rebuildAlways === "gone") return null;
+        if (f.rebuildAlways === "empty") return [];
+        if (f.rebuildAlways === "cleared") f.options.forEach((o) => { o.checked = false; });
+        return f.options ? f.options.map((o) => ({ ...o })) : null;
+      }
+      if (scripted) {
+        const step = f.rebuildScript.shift();
+        log.push(["readCheckboxGroup", step]);
+        if (step === "gone") return null;
+        if (step === "empty") return [];
+        if (step === "cleared") { f.options.forEach((o) => { o.checked = false; }); }
+      }
+      return f.options ? f.options.map((o) => ({ ...o })) : null;
+    },
     clickRadioLabel: async (loc, id) => {
       log.push(["clickRadioLabel", id]);
       const f = byLoc(loc);
@@ -1389,6 +1421,468 @@ const aiDd = (flags) => Object.assign({
   triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }]
 }, flags || {});
 
+// ── BATCHED AI: one call per PAGE instead of one per question (2026-08-05) ──
+// The win is N round trips → 1, with the call fired before the deterministic fill so it overlaps. The
+// safety requirement is that batching changes the TRANSPORT ONLY: every answer still clears the match
+// ladder against the LIVE options and still commits through the same verified path.
+const AI_BATCH_BUDGETS = { ...T_BUDGETS, enableAiBatch: true }; // batching is DEFAULT-ON in the SW; the driver still takes the flag
+const aiDd2 = (id, label, opts) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown",
+  isRequired: true, label, triggerText: "Select One",
+  options: [{ text: "Select One", disabled: true }].concat((opts || ["Yes", "No"]).map((t) => ({ text: t }))) });
+
+test("AI batch: TWO AI questions on a page cost ONE llm call, and both commit", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Are you legally authorized to work in the US?*"),
+                           aiDd2("q2", "Do you require sponsorship?*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [
+      { id: "q1", choice: "Yes", justification: "profile says authorized", confidence: "High" },
+      { id: "q2", choice: "No", justification: "no sponsorship needed", confidence: "High" }] }) });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const calls = act.log.filter(([m]) => m === "llm").length;
+  assert.strictEqual(calls, 1, `one batched call for the whole page, not one per question (saw ${calls})`);
+  const q1 = out.results.find((r) => r.fieldName === "q1"), q2 = out.results.find((r) => r.fieldName === "q2");
+  assert.strictEqual(q1.status, "filled_review", q1.detail);
+  assert.strictEqual(q1.after, "Yes");
+  assert.strictEqual(q2.status, "filled_review", q2.detail);
+  assert.strictEqual(q2.after, "No");
+  assert.match(q1.detail, /profile says authorized/, "the per-question justification survives the batch");
+  assert.strictEqual(q1.confidence, "high", "and so does its confidence");
+});
+
+test("AI batch: a batched answer STILL clears the match ladder — an off-list choice never blind-commits", async () => {
+  // The whole safety contract in one test: batching must not become a way to skip the ladder.
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [
+      { id: "q1", choice: "Maybe", confidence: "High" },      // NOT an option
+      { id: "q2", choice: "No", confidence: "High" }] }) });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const q1 = out.results.find((r) => r.fieldName === "q1");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.notStrictEqual(q1.after, "Maybe", "THE INVARIANT: the model's off-list text is never committed");
+  assert.strictEqual(q1.status, "filled_review", "but a required field must not be left blank");
+  assert.strictEqual(q1.flag, "required-forced-pick");
+  assert.ok(["Yes", "No"].includes(q1.after), "the committed value is a REAL option from the live list");
+  assert.match(q1.detail, /PLACEHOLDER/, "and it says plainly that it is a placeholder");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q2").after, "No", "its sibling still commits");
+});
+
+test("AI batch is a CACHE, not a gate: a question the batch missed makes its OWN call", async () => {
+  // Misprediction, a dropped id, a partial parse — none of these may cost an ANSWER, only speed.
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: [JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" }] }), // q2 absent
+                            '{"choice":"No","justification":"per-field fallback","confidence":"Medium"}'] });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 2, "the batch + ONE per-field call for the miss");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
+  const q2 = out.results.find((r) => r.fieldName === "q2");
+  assert.strictEqual(q2.status, "filled_review", q2.detail);
+  assert.strictEqual(q2.after, "No", "the missed question was still answered, by its own call");
+});
+
+test("AI batch: the kill-switch falls back to one call PER question", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS); // batching NOT enabled
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 2, "one call per question, exactly as before batching");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
+});
+
+test("debugClobber: names the field that was wiped and the write that did it", async () => {
+  // Live on waystar page 3: filling the relocation question CLEARS the dependent basecamp answer, and
+  // the page then cannot Save because basecamp is required and empty. The end state was visible in the
+  // FIELD-DIAG dump; the CAUSE was not. This flag re-scans after every field and attributes the change
+  // to the write that caused it (a REMOUNT shows as a vanish + an appear).
+  const a = { wrapperSel: "[w-a]", fieldName: "trigger", widgetType: "text", isRequired: true, label: "Trigger" };
+  const b = { wrapperSel: "[w-b]", fieldName: "dependent", widgetType: "text", isRequired: true, label: "Dependent" };
+  const act = makeFakeAct([a, b]);
+  // The up-front scan sees the dependent answer present; every scan AFTER it sees the tenant's wipe.
+  let scans = 0;
+  act.scanPage = async () => {
+    const first = scans++ === 0;
+    return { fields: [
+      { fieldName: "trigger", label: "Trigger", currentValue: "", wrapperSel: "[w-a]", widgetType: "text" },
+      { fieldName: "dependent", label: "Dependent", currentValue: first ? "Atlanta, GA" : "", wrapperSel: "[w-b]", widgetType: "text" }] };
+  };
+  const out = await drivePageFill(act, { personal_info: {} }, {}, {},
+    { ...T_BUDGETS, debugClobber: true, maxCascadeRounds: 0 });
+  const hit = (out.clobberLog || []).find((l) => /dependent/.test(l) && /WITHOUT being touched/.test(l));
+  assert.ok(hit, "the wipe must be attributed to the write that caused it: " + JSON.stringify(out.clobberLog));
+  assert.match(hit, /Atlanta, GA/, "and it names the value that was lost");
+  assert.match(hit, /after filling trigger/, "and the write that caused it");
+});
+
+test("debugClobber: OFF by default → no extra page scans (it is a diagnostic, not a cost)", async () => {
+  const act = makeFakeAct([{ wrapperSel: "[w-a]", fieldName: "trigger", widgetType: "text", isRequired: true, label: "Trigger" }]);
+  let scans = 0;
+  const real = act.scanPage;
+  act.scanPage = async () => { scans++; return real(); };
+  await drivePageFill(act, { personal_info: {} }, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 0 });
+  const withFlag = scans; scans = 0;
+  await drivePageFill(act, { personal_info: {} }, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 0, debugClobber: true });
+  assert.ok(scans > withFlag, `the flag adds the per-field scans (off=${withFlag}, on=${scans})`);
+});
+
+test("AI answer STABILITY: the same question under a NEW automation-id reuses the answer, no second call", async () => {
+  // The waystar page-3 oscillation. Workday remounts a dependent question under a new id whenever the
+  // field it depends on CHANGES, and the cascade re-fill calls drivePageFill recursively — which used to
+  // build a fresh batch with no memory of the first, so the remounted question was asked again and the
+  // model was free to answer differently. Live that produced Yes -> No -> Yes on the relocation question,
+  // and every CHANGE remounted the dependent question again, so the page never settled and Save was
+  // refused on a required field that had been answered twice.
+  // The question is the stable identity, so the answer is cached by LABEL and shared with the recursion.
+  const q = (id) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown", isRequired: true,
+    label: "Would you be open to relocating?", triggerText: "Select One",
+    options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] });
+  const act = makeFakeAct([q("id_before")], { aiEnabled: true,
+    // If it ever asks twice it gets the OPPOSITE answer — so a second call cannot hide in a green test.
+    ai: ['{"choice":"Yes","confidence":"High"}', '{"choice":"No","confidence":"High"}'] });
+  const shared = new Map();
+  const r1 = await drivePageFill(act, {}, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 0 }, { aiAnswers: shared });
+  assert.strictEqual(r1.results[0].after, "Yes");
+  // Same question comes back under a DIFFERENT id — exactly what a remount looks like to us.
+  const act2 = makeFakeAct([q("id_after_remount")], { aiEnabled: true,
+    ai: ['{"choice":"No","confidence":"High"}'] });   // a fresh call here would answer "No"
+  const r2 = await drivePageFill(act2, {}, {}, {}, { ...T_BUDGETS, maxCascadeRounds: 0 }, { aiAnswers: shared });
+  assert.strictEqual(r2.results[0].after, "Yes", "the remounted question must reuse the FIRST answer, not re-ask");
+  assert.strictEqual(act2.log.filter(([m]) => m === "llm").length, 0, "and it must not call the model at all");
+});
+
+test("AI memory: a page REFILL reuses every answer and calls the model ZERO times", async () => {
+  // Operator's fix: "if this page needs to be refilled, it should remember the previous answers and not
+  // recall AI". The SW now holds one answer map per PAGE and hands it to every drivePageFill for that
+  // page — the initial fill, the cascade recursion, and AI-4's re-fills. Before this, each re-fill was a
+  // fresh invocation with an empty cache, so it asked again and could answer DIFFERENTLY; that
+  // contradiction is what remounted dependent questions and made the page unsaveable.
+  const q = (id, label) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown", isRequired: true,
+    label, triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "Yes" }, { text: "No" }] });
+  const fields = () => [q("a", "Would you relocate?"), q("b", "Available three days a week?")];
+  const memory = new Map();                                   // what the SW keeps per page
+  const first = makeFakeAct(fields(), { aiEnabled: true,
+    ai: JSON.stringify({ answers: [{ id: "a", choice: "Yes", confidence: "High" }, { id: "b", choice: "Yes", confidence: "High" }] }) });
+  const r1 = await drivePageFill(first, {}, {}, {}, { ...AI_BATCH_BUDGETS, maxCascadeRounds: 0 }, { aiAnswers: memory });
+  assert.strictEqual(r1.results.find((r) => r.fieldName === "a").after, "Yes");
+  assert.strictEqual(first.log.filter(([m]) => m === "llm").length, 1, "one batched call on the first pass");
+
+  // THE REFILL. Every canned reply now says "No", so any re-ask flips the answers and fails this test.
+  const again = makeFakeAct(fields(), { aiEnabled: true,
+    ai: ['{"choice":"No","confidence":"High"}', '{"choice":"No","confidence":"High"}',
+         JSON.stringify({ answers: [{ id: "a", choice: "No" }, { id: "b", choice: "No" }] })] });
+  const r2 = await drivePageFill(again, {}, {}, {}, { ...AI_BATCH_BUDGETS, maxCascadeRounds: 0 }, { aiAnswers: memory });
+  assert.strictEqual(again.log.filter(([m]) => m === "llm").length, 0, "a refill must not call the model at all");
+  assert.strictEqual(r2.results.find((r) => r.fieldName === "a").after, "Yes", "and must re-commit the SAME answer");
+  assert.strictEqual(r2.results.find((r) => r.fieldName === "b").after, "Yes");
+});
+
+test("AI batch: the output cap SCALES with the number of questions", async () => {
+  // A flat cap truncates exactly the pages the batch exists for: 6 questions each needing a choice, a
+  // justification, a confidence, maps_to and suggested_category do not fit in one question's worth of
+  // room, and a truncated JSON reply is not a shorter answer -- it fails to parse, so the whole page
+  // falls back to per-field calls. Generosity is free: max_tokens is a CAP, not a reservation.
+  const caps = [];
+  const mk = (n) => {
+    const fields = [];
+    for (let i = 0; i < n; i++) fields.push(aiDd2("q" + i, "Question " + i + "?*"));
+    const act = makeFakeAct(fields, { aiEnabled: true,
+      ai: JSON.stringify({ answers: fields.map((f) => ({ id: f.fieldName, choice: "Yes", confidence: "High" })) }) });
+    const realLlm = act.llm;
+    act.llm = async (req) => { caps.push(req.maxTokens); return realLlm(req); };
+    return act;
+  };
+  await drivePageFill(mk(2), {}, {}, {}, AI_BATCH_BUDGETS);
+  await drivePageFill(mk(6), {}, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(caps.length, 2, "one batched call each: " + JSON.stringify(caps));
+  assert.ok(caps[1] > caps[0], `6 questions must get a bigger budget than 2 (got ${caps[0]} then ${caps[1]})`);
+  // Enough room for a well-formed answer per question, with real headroom.
+  assert.ok(caps[1] >= 6 * 200, `and enough room per question (got ${caps[1]} for 6)`);
+});
+
+// ── The planner must model EVERY deterministic tier, not just FIELD_MAP ─────────────────────────────
+// The fill ladder is FIELD_MAP -> buckets -> employment recognizers -> AI. Modelling only the first meant
+// a question a later tier would answer was still scouted (its dropdown opened for options) and still took
+// a slot in the prompt, and the answer was then discarded. Live on waystar page 3: both sponsorship
+// questions carry hashed ids, so FIELD_MAP knew nothing, and BUCKETS answered them from the taught
+// wording -- after the planner had already opened them and paid for them.
+const plnField = (id, label) => ({ wrapperSel: "[w-" + id + "]", fieldName: id, widgetType: "dropdown",
+  isRequired: true, label });
+
+test("planner: a BUCKET-answerable question is not an AI candidate", async () => {
+  const f = plnField("69dab8dbb3371001adc84c25b7120000", "Do you currently require sponsorship?*");
+  const profile = { work_authorization: { requires_sponsorship_now: false } };
+  const buckets = [{ profile_path: "work_authorization.requires_sponsorship_now",
+    questions: ["Do you currently require sponsorship?"] }];
+  const idx = buildBucketIndex(buckets);
+  assert.strictEqual(deterministicTierFor(f, profile, idx, null), "bucket");
+  assert.deepStrictEqual(planAiBatchCandidates([f], profile, null, idx, null), [],
+    "the bucket owns it — no scout, no prompt slot");
+  // …and with NO bucket it is still an AI candidate, so the skip is the bucket's doing and not a
+  // side effect of the hashed id.
+  assert.strictEqual(planAiBatchCandidates([f], profile, null, buildBucketIndex([]), null).length, 1);
+});
+
+test("planner: a bucket that resolves to NOTHING does not suppress the AI candidate", async () => {
+  // A bucket bound to an EMPTY profile path is not an answer. Suppressing on its mere existence would
+  // leave a required field to the blank path instead of the AI.
+  const f = plnField("hashed_q", "Do you currently require sponsorship?*");
+  const idx = buildBucketIndex([{ profile_path: "work_authorization.requires_sponsorship_now",
+    questions: ["Do you currently require sponsorship?"] }]);
+  assert.strictEqual(deterministicTierFor(f, { work_authorization: {} }, idx, null), null);
+  assert.strictEqual(planAiBatchCandidates([f], { work_authorization: {} }, null, idx, null).length, 1);
+});
+
+test("planner: the employer-match question is never an AI candidate", async () => {
+  const f = plnField("candidateIsPreviousWorker", "Have you previously been employed by Waystar?*");
+  assert.strictEqual(deterministicTierFor(f, {}, null, null), "employer-match");
+  assert.deepStrictEqual(planAiBatchCandidates([f], {}, null, null, null), []);
+});
+
+test("planner: a FIELD_MAP-answerable question is not an AI candidate (unchanged)", async () => {
+  const f = plnField("country", "Country*");
+  assert.strictEqual(deterministicTierFor(f, { personal_info: { country: "United States" } }, null, null), "field-map");
+  const f2 = plnField("country", "Country*");
+  assert.strictEqual(deterministicTierFor(f2, { personal_info: {} }, null, null), null, "…but an EMPTY mapped path is not an answer");
+});
+
+test("debugPageTrace: tracing changes NOTHING about the fill (it wraps the act primitives)", async () => {
+  // The per-action timer replaces act.* methods with timed wrappers. That is exactly the kind of
+  // instrumentation that can quietly alter behaviour -- a wrapper that drops a return value, or turns a
+  // sync member into a promise, would break the fill while looking like a logging change. So run the SAME
+  // page both ways and require identical records.
+  const mk = () => makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")], { aiEnabled: true,
+    ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" }, { id: "q2", choice: "No", confidence: "High" }] }) });
+  const shape = (o) => o.results.map((r) => [r.fieldName, r.status, r.after, r.flag || null]);
+  const plain = await drivePageFill(mk(), {}, {}, {}, AI_BATCH_BUDGETS, { aiAnswers: new Map() });
+  const traced = await drivePageFill(mk(), {}, {}, {}, { ...AI_BATCH_BUDGETS, debugPageTrace: true }, { aiAnswers: new Map() });
+  assert.deepStrictEqual(shape(traced), shape(plain), "tracing must be observationally inert");
+});
+
+test("AI batch: an INELIGIBLE field never waits on the in-flight call", async () => {
+  // Live on waystar page 3, caught by the trace: an OPTIONAL textarea with no mapping ("What is your
+  // desired salary?") reached the AI site, AWAITED the batch, blocked the walk 3.56s, and was then
+  // skipped -- and it blocked EARLY, cutting short the overlap the batch exists to create. The batch may
+  // only be consulted by a field that would actually use an AI answer.
+  const optionalText = { wrapperSel: "[w-txt]", fieldName: "salary_q", widgetType: "textarea",
+    isRequired: false, label: "What is your desired salary?" };
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*"), optionalText],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
+                                                      { id: "q2", choice: "No", confidence: "High" }] }) });
+  let awaited = 0;
+  const realLlm = act.llm;
+  act.llm = async (r) => { awaited++; return realLlm(r); };
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(awaited, 1, "still exactly one batched call");
+  const txt = out.results.find((r) => r.fieldName === "salary_q");
+  assert.strictEqual(txt.status, "skipped", "the optional unmapped textarea stays blank, no AI");
+  // The batch bookkeeping must not count it either — it never consulted the batch at all.
+  assert.strictEqual(out.aiBatchInfo.served, 2, "only the two eligible dropdowns were served");
+});
+
+test("debugPageTrace: the action timer is applied ONCE, even across recursive fills", async () => {
+  // `act` is reused across pages and the cascade recurses into drivePageFill, so in-place wrapping
+  // stacked: one call printed several times under different page clocks, and the overhead grew per page.
+  const act = makeFakeAct([aiDd2("q1", "Pick one*")], { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
+  const B = { ...T_BUDGETS, debugPageTrace: true, maxCascadeRounds: 0 };
+  await drivePageFill(act, {}, {}, {}, B);
+  const once = act.readDropdownState;
+  await drivePageFill(act, {}, {}, {}, B);
+  assert.strictEqual(act.readDropdownState, once, "a second fill must not re-wrap an already-timed primitive");
+});
+
+test("AI commit waits for the option list to UNMOUNT before the next field (the stray-click race)", async () => {
+  // Operator's diagnosis, and the log backs it: every portaled listbox renders at the SAME screen
+  // position (every commit on waystar page 3 logged rect=463,298). Selecting an option closes the list,
+  // but the options linger a beat while unmounting and stay CLICKABLE — so the next field's open-click
+  // lands where the previous field's options still are. On page 3 that click hit "No, but I live near one
+  // of these locations", an option of the RELOCATION list, silently changing relocation and remounting
+  // the dependent basecamp question. It looked like Workday rewriting our answer; it was us mis-clicking.
+  // fillDropdownCdp has gated on options-GONE since 2026-07-06; the AI commit paths never did.
+  const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  // closeDropdownConfirmed gates on the LISTBOX being gone, re-pressing Escape each round — so the
+  // observable signature is an Escape after the commit click.
+  // Model the hazard itself: after the commit the listbox LINGERS for one read, still holding clickable
+  // options (a few reads, since the commit poll consumes some). A fake that closes instantly would let a missing gate pass.
+  const seq = [];
+  let committed = false, lingered = 0;
+  const realRead = act.readDropdownState;
+  act.readDropdownState = async (l) => {
+    const st = await realRead(l);
+    if (committed && lingered < 4) { lingered++; return Object.assign({}, st, { listboxPresent: true, optionCount: 3 }); }
+    return st;
+  };
+  const realEsc = act.pressEscape;
+  act.pressEscape = async (...a) => { seq.push("escape"); return realEsc ? realEsc(...a) : undefined; };
+  const realClick = act.clickDropdownOptionByText;
+  act.clickDropdownOptionByText = async (...a) => { committed = true; seq.push("commit"); return realClick(...a); };
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review", rec.detail);
+  assert.strictEqual(rec.after, "No");
+  const c = seq.indexOf("commit");
+  assert.ok(c >= 0, "it committed: " + JSON.stringify(seq));
+  assert.ok(seq.indexOf("escape", c) > c,
+    "the AI commit must confirm the list is GONE after committing, before the next field: " + JSON.stringify(seq));
+});
+
+test("a DETERMINISTIC field that cannot match the live options still reaches the AI", async () => {
+  // Operator's question: the batch planner EXCLUDES fields a deterministic tier owns, so they are never
+  // in the batched call. If such a field then opens and finds its value is not among the live options,
+  // does it still get AI help? It must -- otherwise excluding it from the batch would silently downgrade
+  // it to blank. The batch is a CACHE, not a GATE: the field simply makes its own per-field call.
+  const f = { wrapperSel: "[w-x]", fieldName: "country", widgetType: "dropdown", isRequired: true,
+    label: "Country*", triggerText: "Select One",
+    options: [{ text: "Select One", disabled: true }, { text: "United States of America (+1)" }, { text: "Canada" }] };
+  // FIELD_MAP maps `country` -> personal_info.country. A stated value that matches NO live option.
+  const profile = { personal_info: { country: "Freedonia" } };
+  // The planner says this field is deterministic, so it is NOT batched…
+  assert.strictEqual(deterministicTierFor(f, profile, null, null), "field-map");
+  assert.deepStrictEqual(planAiBatchCandidates([f], profile, null, null, null), []);
+  // …and yet the fill still gets AI help, via the CANONICALIZE path (a stated value, mapped to the vocab).
+  const act = makeFakeAct([f], { aiEnabled: true, ai: '{"choice":"United States of America (+1)","confidence":"High"}' });
+  const rec = (await drivePageFill(act, profile, {}, {}, AI_BATCH_BUDGETS)).results[0];
+  assert.ok(act.log.some(([m]) => m === "llm"), "it must call the model per-field: " + rec.detail);
+  assert.strictEqual(rec.status, "filled_review", rec.detail);
+  assert.strictEqual(rec.after, "United States of America (+1)");
+  assert.strictEqual(rec.flag, "ai-canonicalized", "a STATED value maps vocabulary; it is never re-inferred");
+});
+
+test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async () => {
+  // Live on waystar page 5: a single candidate (disabilityForm). The old collector opened it to read
+  // options — 333ms — and only then found it could not fire a batch of one. Candidacy is decidable
+  // without touching the page, so the count gate is checked FIRST.
+  const act = makeFakeAct([aiDd2("only", "Pick one*")], { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const rc = out.aiBatchInfo.recon;
+  assert.strictEqual(rc.planned, 1, "it is a candidate…");
+  assert.strictEqual(rc.opened, 0, "…but nothing was opened for a batch that cannot fire");
+  assert.match(rc.dropped.join(" "), /fewer than 2/);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "only").after, "Yes", "and it still fills, per-field");
+});
+
+test("AI batch: opens ONLY the candidates that need options, and reports the count", async () => {
+  // The recon line is the check the operator makes against what they see on screen: infer fields open
+  // (twice overall — once here read-only, once to commit), everything else opens zero extra times.
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
+                                                      { id: "q2", choice: "No", confidence: "High" }] }) });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const rc = out.aiBatchInfo.recon;
+  assert.strictEqual(rc.planned, 2);
+  assert.strictEqual(rc.needOpen, 2, "both infer candidates need live options");
+  assert.strictEqual(rc.opened, 2, "and exactly those two were opened — no others");
+  assert.deepStrictEqual(rc.openFailed, [], "and no read-only close left a value behind");
+});
+
+test("AI batch: a STATED value is never a batch candidate (canonicalize is not batched)", async () => {
+  // Batching a canonicalize needs its option list, and the only sources are an extra open per mapped
+  // dropdown (measured a net loss) or a cross-run cache, which does not exist in the real fill-once flow.
+  // So a mapped field with a stated value must never enter the plan, whatever its value's type.
+  const fields = [{ wrapperSel: "[w-num]", fieldName: "postalCode", widgetType: "dropdown", isRequired: true, label: "Postal Code" }];
+  assert.deepStrictEqual(planAiBatchCandidates(fields, { personal_info: { postal_code: 30301 } }), [],
+    "a NUMERIC stated value is skipped — and resolve()'s {candidates} shape must not reach the ladder as an object");
+  assert.deepStrictEqual(planAiBatchCandidates(fields, { personal_info: { postal_code: "30301" } }), [],
+    "same for a string");
+});
+
+test("AI batch: an unanswerable REQUIRED dropdown IS a candidate, and needs its options", async () => {
+  const plan = planAiBatchCandidates(
+    [{ wrapperSel: "[w-q]", fieldName: "some_screening_q", widgetType: "dropdown", isRequired: true, label: "Do you consent?*" }], {});
+  assert.strictEqual(plan.length, 1);
+  assert.strictEqual(plan[0].kind, "infer");
+  assert.strictEqual(plan[0].needsOpen, true, "infer is the one kind that costs an open");
+});
+
+test("AI batch: an OPTIONAL unmapped dropdown is never a candidate (optional stays deterministic-or-blank)", async () => {
+  assert.deepStrictEqual(planAiBatchCandidates(
+    [{ wrapperSel: "[w-o]", fieldName: "opt_q", widgetType: "dropdown", isRequired: false, label: "Optional?" }], []), []);
+});
+
+test("AI batch: a NON-STRING profile value must not abort the page's whole batch", async () => {
+  // Live regression, found only because the [AI-BATCH] log line existed: the collector threw
+  // `s.toLowerCase is not a function` on a mapped dropdown whose profile value was a NUMBER, and because
+  // the guard only wrapped the open/close, collection aborted at field 1 — 0 candidates, batch never
+  // fired, every question fell back to a per-field call. Indistinguishable from "the feature does
+  // nothing", which is how the operator spotted it on the page.
+  // postalCode IS in FIELD_MAP, so a NUMERIC postal code reaches the match ladder directly.
+  const numeric = { wrapperSel: "[w-num]", fieldName: "postalCode", widgetType: "dropdown", isRequired: false,
+    label: "Postal Code", triggerText: "Select One", options: [{ text: "Select One", disabled: true }, { text: "30301" }] };
+  const act = makeFakeAct([numeric, aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
+                                                      { id: "q2", choice: "No", confidence: "High" }] }) });
+  // A warm option cache is what routes a stated value straight into the ladder with no open.
+  const out = await drivePageFill(act, { personal_info: { postal_code: 30301 } }, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 1,
+    "the two good questions still batch into ONE call despite the numeric field");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q2").after, "No");
+  assert.strictEqual(out.aiBatchInfo.candidates, 2, "the two AI questions were collected");
+  assert.strictEqual(out.aiBatchInfo.served, 2, "and both were served from the batch, not per-field");
+  assert.strictEqual(out.aiBatchInfo.error, null, "collection completed — no page-wide abort");
+});
+
+test("AI commit uses the ADAPTIVE beat, not the never-scaled delayFull (the slow-AI-fill bug)", async () => {
+  // Operator, watching a page: the pre-pass flew and then the AI fields filled visibly slower than the
+  // deterministic ones. Cause: aiFillField hand-rolled its commit as two flat delayFull(reopenSettleMs)
+  // beats — 800ms per field regardless of paint state, and no poll — while a deterministic pick used the
+  // adaptive, read-first, poll-to-ceiling path. An AI pick is a candidate like any other and must commit
+  // like one. delayFull is reserved for waits that must ALWAYS be real (the M40 settle); a commit poll
+  // is not one of them, because its persistence re-read is what makes it safe, not the beat length.
+  const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const fullWaits = [];
+  const realFull = act.delayFull;
+  act.delayFull = async (ms) => { fullWaits.push(ms); return realFull ? realFull(ms) : undefined; };
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "filled_review", rec.detail);
+  assert.strictEqual(rec.after, "No");
+  // The old commit spent reopenSettleMs on delayFull TWICE (click-beat + persistence-beat). The shared
+  // poll spends it ZERO times — it uses the adaptive delayRender instead. Counting is what distinguishes
+  // them, since other machinery legitimately uses delayFull elsewhere in the page.
+  const settleBeats = fullWaits.filter((ms) => ms === T_BUDGETS.reopenSettleMs).length;
+  assert.ok(settleBeats < 2,
+    `the AI commit must not spend the never-scaled reopenSettle beats (saw ${settleBeats}): ` + JSON.stringify(fullWaits));
+});
+
+test("AI commit still REFUSES a pick that does not persist (the shared poll keeps the safety gate)", async () => {
+  // The speed fix must not weaken the false-verify guard: a pick shown for one read and then discarded
+  // is NOT a commit, however fast the beats are.
+  const act = makeFakeAct([aiDd({ revertsAfterCommit: true, revertValue: "Select One" })],
+    { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review", "a momentary pick is never reported filled");
+  assert.strictEqual(rec.flag, "ai-commit-failed");
+  assert.notStrictEqual(rec.after, "No");
+});
+
+test("AI batch: aiBatchInfo reports what actually happened (the observability that found the bug)", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" }] }) });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  const ab = out.aiBatchInfo;
+  assert.strictEqual(ab.candidates, 2);
+  assert.strictEqual(ab.fired, true);
+  assert.strictEqual(ab.answers, 1, "only one answer came back");
+  assert.strictEqual(ab.served, 1);
+  assert.strictEqual(ab.fellBack, 1, "the uncovered question is COUNTED, so a silent no-op is visible");
+});
+
+test("AI batch: a batch that FAILS entirely still answers every question per-field", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: [{ ok: false, error: "429 exhausted" },      // the batched call fails
+                            '{"choice":"Yes","confidence":"High"}', '{"choice":"No","confidence":"High"}'] });
+  const out = await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q1").after, "Yes", "a dead batch costs speed, never an answer");
+  assert.strictEqual(out.results.find((r) => r.fieldName === "q2").after, "No");
+});
+
+test("AI batch: the option scan leaves every candidate dropdown BLANK (read-only pre-pass)", async () => {
+  const act = makeFakeAct([aiDd2("q1", "Pick one*"), aiDd2("q2", "Pick two*")],
+    { aiEnabled: true, ai: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", confidence: "High" },
+                                                      { id: "q2", choice: "No", confidence: "High" }] }) });
+  await drivePageFill(act, {}, {}, {}, AI_BATCH_BUDGETS);
+  // Exactly one commit per field: the pre-pass must never have armed or committed an option itself.
+  const clicks = act.log.filter(([m]) => m === "clickDropdownOptionByText");
+  assert.strictEqual(clicks.length, 2, "one commit per field — the read-only scan committed nothing: " + JSON.stringify(clicks));
+});
+
 test("AI fallback: a matched JSON answer → filled_review + ai-choice-sensitive + the AI's confidence + justification (NEVER silent)", async () => {
   const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: '{"choice":"No","justification":"the applicant is an enrolled student, so under 18 is implausible","confidence":"High"}' });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
@@ -1432,20 +1926,27 @@ test("Buckets M4 piggyback: maps_to 'none' normalizes to \"\" (the teach card st
 test("AI fallback: a literal UNKNOWN reply is just a non-option → needs_review (ai-nomatch), blank, no commit (the gate is dropped — guess, don't refuse)", async () => {
   const act = makeFakeAct([aiDd({ label: "Favorite color?" })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.after, null, "blank — UNKNOWN matched no option");
-  assert.strictEqual(rec.flag, "ai-nomatch");
-  assert.strictEqual(rec.confidence, "low", "carries the AI's confidence even on a non-match");
-  assert.ok(!act.log.some(([m]) => m === "clickDropdownOptionByText"), "never committed");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.notStrictEqual(rec.after, "UNKNOWN", "THE INVARIANT: 'UNKNOWN' is not an option and is never committed");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "required-forced-pick");
+  assert.ok(["Yes", "No"].includes(rec.after), "a REAL option was selected so the page can advance");
 });
 
 test("AI fallback: LLM choice not among the options → needs_review (ai-nomatch), never blind-commit", async () => {
   const act = makeFakeAct([aiDd({ label: "Favorite color?" })], { aiEnabled: true, ai: '{"choice":"Maybe","justification":"unsure","confidence":"Medium"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "ai-nomatch");
-  assert.strictEqual(rec.after, null);
-  assert.ok(!act.log.some(([m]) => m === "clickDropdownOptionByText"), "a non-option reply is never committed");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.notStrictEqual(rec.after, "Maybe", "THE INVARIANT: a non-option reply is never committed");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "required-forced-pick");
+  assert.ok(["Yes", "No"].includes(rec.after), "the value is a REAL option");
 });
 
 test("AI fallback HOLD 2: a non-option choice + a value STRAYS on close → ai-nomatch-stray surfaces the STRAYED value (never a false blank)", async () => {
@@ -1481,10 +1982,15 @@ test("AI fallback on a PREFILLED dropdown: a FAILED LLM call reports the live ke
 test("AI fallback on a BLANK dropdown: a FAILED LLM call stays after:null ('Select One' is the placeholder, not a value — regression pin)", async () => {
   const act = makeFakeAct([aiDd()], { aiEnabled: true, ai: { ok: false, error: "HTTP 503: high demand" } });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "ai-call-failed");
-  assert.strictEqual(rec.after, null, "genuinely blank — the placeholder never masquerades as a kept value");
-  assert.ok(!/prefilled/.test(rec.detail), "no kept-prefill note on a blank field");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  // The provider FAILING is exactly when the deterministic backstop has to carry the page.
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "required-forced-pick");
+  assert.ok(["Yes", "No"].includes(rec.after), "a real option, chosen without any LLM");
+  assert.match(rec.detail, /ai-call-failed/, "the record still records WHY it fell back");
 });
 
 test("AI fallback on a PREFILLED dropdown: a no-match reply ALSO reports the kept prefilled value", async () => {
@@ -1518,7 +2024,11 @@ test("AI: sensitive-vs-not prominence DATA — both flags + distinct reasons per
 });
 
 test("parseAiReply: plain JSON, ```-fenced, embedded, bad-confidence, and a non-JSON fallback", () => {
-  assert.deepStrictEqual(parseAiReply('{"choice":"Yes","justification":"j","confidence":"High"}'), { choice: "Yes", justification: "j", confidence: "high", maps_to: "", suggested_category: "" });
+  assert.deepStrictEqual(parseAiReply('{"choice":"Yes","justification":"j","confidence":"High"}'), { choice: "Yes", justification: "j", confidence: "high", approximate: false, maps_to: "", suggested_category: "" });
+  // `approximate` — the model saying "this is the CLOSEST option, not a synonym" (see aiCanonicalizeField).
+  assert.strictEqual(parseAiReply('{"choice":"Home Cellular","approximate":true}').approximate, true);
+  assert.strictEqual(parseAiReply('{"choice":"Man","approximate":"yes"}').approximate, true, "tolerates a string");
+  assert.strictEqual(parseAiReply('{"choice":"Man"}').approximate, false, "absent → a true map, not an approximation");
   assert.strictEqual(parseAiReply('```json\n{"choice":"No","confidence":"Low"}\n```').choice, "No");
   assert.strictEqual(parseAiReply('Here is my answer: {"choice":"Maybe","confidence":"Medium"}').confidence, "medium");
   assert.strictEqual(parseAiReply('{"choice":"X","confidence":"bogus"}').confidence, "low", "unknown confidence → low");
@@ -1743,8 +2253,11 @@ test("AI-3 EEO inference (mapped-but-empty required → the confidence-gated pat
 test("AI INVARIANT: toggle OFF ⇒ act.llm NEVER called (no spend; stays deterministic)", async () => {
   const act = makeFakeAct([aiDd()], { aiEnabled: false, ai: "No" });
   const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
-  assert.ok(!act.log.some(([m]) => m === "llm"), "AI OFF → the LLM is never consulted");
-  assert.strictEqual(out.results[0].status, "skipped", "stays the deterministic skipped (no mapping)");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "THE INVARIANT: AI OFF → the LLM is never consulted (no spend)");
+  // The required-dropdown backstop is DETERMINISTIC, so it still runs with AI off — that is the point:
+  // the page must reach review whether or not a model was available.
+  assert.strictEqual(out.results[0].status, "filled_review", "a required dropdown still commits with AI off");
+  assert.strictEqual(out.results[0].flag, "required-forced-pick");
 });
 
 test("optional gate: an UNMAPPED OPTIONAL EEO dropdown gets NO AI — left blank, no LLM ('blank optional EEO too')", async () => {
@@ -1850,9 +2363,13 @@ test("closeAndVerifyBlank REGRESSION (the live false-stray): list slow / won't c
 test("AI fallback REGRESSION: a non-option choice with a slow-to-close list (value stays placeholder) → ai-nomatch BLANK, not a false ai-nomatch-stray", async () => {
   const act = makeFakeAct([aiDd({ label: "Favorite color?", escapeWontClose: true })], { aiEnabled: true, ai: '{"choice":"UNKNOWN","justification":"no basis","confidence":"Low"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.strictEqual(rec.status, "needs_review");
-  assert.strictEqual(rec.flag, "ai-nomatch", "a blank field whose list was slow to close is reported clean, not STRAYED");
-  assert.strictEqual(rec.after, null);
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "required-forced-pick", "a slow-to-close list is still not a STRAY");
+  assert.ok(["Yes", "No"].includes(rec.after));
 });
 
 test("dropdown: commit shows the target then REVERTS (pick before render-complete) → needs_review, never a false verified:true", async () => {
@@ -2725,6 +3242,184 @@ test("checkbox group: a MAPPED value checks the matching option (label-exact) an
   assert.strictEqual(rec.after, "Male");
   assert.strictEqual(rec.matchTier, "label-exact");
   assert.strictEqual(field.options.filter((o) => o.checked).length, 1, "exactly ONE option ends checked");
+});
+
+// ── PERSISTENCE RE-READ: Workday REBUILDS the widget after a verified fill (live waystar 2026-08-04) ──
+// The click lands and verifies, then the widget is rebuilt and comes back EMPTY. The dropdown commit has
+// always guarded this ("a momentary pick discarded on render-complete is never reported filled"); the
+// checkbox group reported `filled` off a read taken microseconds after the click, so the walk banked a
+// success and clicked Save & Continue into a page Workday then refused.
+// initial opts + pre-click readBack + the post-quiescence RE-RESOLVE read + post-click readBack
+const PRE_LOOP_READS = [null, null, null, null];
+const genderGroup = (rebuildScript) => {
+  const field = selfIdField({ fieldName: "gender" });
+  field.options = [{ id: "m", labelText: "Male", checked: false }, { id: "f", labelText: "Female", checked: false }];
+  field.groupOptions = field.options.map((o) => ({ ...o }));
+  if (rebuildScript) field.rebuildScript = rebuildScript;
+  return field;
+};
+
+test("checkbox group quiescence: the DOM is waited on BEFORE the first click, never after", async () => {
+  // Ordering is the whole point: a gate checked after the click guards nothing.
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const seq = act.log.map(([m]) => m);
+  const q = seq.indexOf("awaitQuiet"), c = seq.indexOf("clickRadioLabel");
+  assert.ok(q >= 0, "the quiescence gate ran: " + JSON.stringify(seq.slice(0, 8)));
+  assert.ok(q < c, `awaitQuiet must precede the click (got awaitQuiet@${q}, click@${c})`);
+});
+
+test("checkbox group quiescence: ids RE-ISSUED during the wait are re-resolved, so the click still lands", async () => {
+  // The regression the gate itself introduced, live: ids are read, we wait up to 3s, then click by id —
+  // and a rebuild during that wait leaves label[for=<stale id>] absent, so NO click is dispatched at all
+  // and the commit "fails". The label is the stable identity, so re-resolve by text after waiting.
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  const realQuiet = act.awaitQuiet;
+  act.awaitQuiet = async (loc, opts) => {
+    // rebuild DURING the wait: same labels, brand-new ids (what a React remount does)
+    field.options = field.options.map((o) => ({ ...o, id: o.id + "-v2" }));
+    field.groupOptions = field.options.map((o) => ({ ...o }));
+    return realQuiet(loc, opts);
+  };
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "must still commit after the ids changed: " + rec.detail);
+  assert.strictEqual(rec.after, "Male");
+  const clicked = act.log.filter(([m]) => m === "clickRadioLabel").map(([, id]) => id);
+  assert.ok(clicked.includes("m-v2"), "clicked the RE-ISSUED id, not the stale one: " + JSON.stringify(clicked));
+});
+
+test("checkbox group: a commit failure says whether a click was even DISPATCHED", async () => {
+  // Live run 8: "did not commit" with no way to tell whether we clicked and it was ignored, or never
+  // clicked at all — because clickRadioLabel's return value was thrown away. Those need opposite fixes.
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  act.clickRadioLabel = async () => false;            // no layout rect ⇒ nothing dispatched
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.match(out.results[0].detail, /NO CLICK WAS DISPATCHED/, out.results[0].detail);
+});
+
+test("checkbox group: a commit failure names what the click actually landed on", async () => {
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  act.clickRadioLabel = async () => ({ ok: true, cx: 524, cy: 299,
+    hit: { hit: "DIV#overlay", text: "", mine: false } });   // landed somewhere else
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.match(out.results[0].detail, /NOT our label, the rect went stale/, out.results[0].detail);
+  assert.match(out.results[0].detail, /DIV#overlay/);
+});
+
+test("checkbox group quiescence: a page that never goes quiet still gets clicked (never hangs)", async () => {
+  const field = genderGroup();
+  field.quietNever = true;
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "the ceiling must not block the fill");
+  assert.strictEqual(rec.after, "Male");
+  assert.match(rec.detail, /CEILING — clicked while still busy/, "and it says it went ahead un-quiet: " + rec.detail);
+});
+
+test("checkbox group quiescence: a substrate without awaitQuiet still fills (older/other substrates)", async () => {
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  delete act.awaitQuiet;
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "Male");
+});
+
+test("checkbox group persistence: a rebuild that comes back UNCHECKED is re-filled, not reported filled", async () => {
+  // read #1 = the post-click verify (normal), then the widget is rebuilt with everything cleared.
+  const field = genderGroup([...PRE_LOOP_READS, "cleared"]);
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", "re-filled and confirmed: " + rec.detail);
+  assert.strictEqual(rec.after, "Male");
+  assert.strictEqual(rec.flag, "checkbox-group-refilled");
+  assert.match(rec.detail, /rebuild/i);
+  assert.strictEqual(field.options.filter((o) => o.checked).length, 1, "exactly ONE ends checked on the form");
+});
+
+test("checkbox group persistence: a rebuild that KEEPS losing it ends needs_review, never a false filled", async () => {
+  const field = genderGroup([...PRE_LOOP_READS]);
+  field.rebuildAlways = "cleared";          // never sticks, however many rounds the loop runs
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review", "a value that will not stick must reach review");
+  assert.strictEqual(rec.flag, "checkbox-group-rebuilt");
+  assert.match(rec.detail, /rebuilt/i);
+});
+
+test("checkbox group persistence: unreadable to the end (wrapper gone) is needs_review, not filled", async () => {
+  // The exact live signature: readCheckboxGroup returns null (wrapper missing) — "could not re-read".
+  const field = genderGroup([...PRE_LOOP_READS]);
+  field.rebuildAlways = "gone";
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "checkbox-group-rebuilt");
+  assert.match(rec.detail, /never became readable/i);
+});
+
+test("checkbox group persistence: a healthy group EXITS on the hold streak, it does not burn every round", async () => {
+  // The cost bug (2026-08-05): the loop `continue`d on success instead of breaking, so a group with
+  // nothing wrong with it always paid every round — ~2.1s at the old 3x700ms, twice on a two-group page.
+  // Pinned via the READ COUNT rather than wall-clock so it cannot pass by the beat merely being shorter:
+  // with a ceiling of 8 rounds and a 2-read streak, a healthy group must read the group exactly twice
+  // inside the loop. The pre-fix code ignores the streak entirely and reads 8 times.
+  const field = genderGroup();
+  const act = makeFakeAct([field]);
+  let loopReads = 0;
+  const real = act.readCheckboxGroup;
+  act.readCheckboxGroup = async (loc) => { loopReads++; return real(loc); };
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {},
+    { ...T_BUDGETS, groupPersistMs: 1, groupPersistRounds: 8, groupPersistHolds: 2 });
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", rec.detail);
+  assert.strictEqual(rec.after, "Male");
+  // 4 pre-loop reads (options, pre-click, post-quiescence re-resolve, post-click verify)
+  // + 2 loop reads (the streak) + 1 final fresh read + 1 M40 audit re-read = 8.
+  // Burning all 8 rounds instead of stopping at the streak would be 14.
+  assert.strictEqual(loopReads, 8, `must stop at the streak, not the ceiling (saw ${loopReads} reads)`);
+  assert.match(rec.detail, /held 2 consecutive reads/, rec.detail);
+});
+
+test("checkbox group persistence: a BROKEN streak restarts, so the early exit can never fire on a timer", async () => {
+  // The early exit is only safe because it rests on consecutive evidence. A beat that comes back cleared
+  // (re-filled) or unreadable must reset the count, or "held N reads" would be a claim about elapsed time.
+  const field = genderGroup([...PRE_LOOP_READS, null, "cleared"]); // hold, then LOSE it, then hold again
+  const act = makeFakeAct([field]);
+  let loopReads = 0;
+  const real = act.readCheckboxGroup;
+  act.readCheckboxGroup = async (loc) => { loopReads++; return real(loc); };
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {},
+    { ...T_BUDGETS, groupPersistMs: 1, groupPersistRounds: 8, groupPersistHolds: 2 });
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled", rec.detail);
+  assert.strictEqual(rec.flag, "checkbox-group-refilled", "the loss was seen and re-filled");
+  // The one hold before the loss must NOT count toward the streak that ends the loop.
+  assert.ok(loopReads > 7, `the broken streak must have restarted the count (saw ${loopReads} reads)`);
+  assert.match(rec.detail, /held 2 consecutive reads/, rec.detail);
+});
+
+test("checkbox group persistence: a transient unreadable beat that comes back CHECKED still passes clean", async () => {
+  // A rebuild we merely observed mid-flight must not be punished — the value survived it.
+  const field = genderGroup([...PRE_LOOP_READS, "empty"]);
+  const act = makeFakeAct([field]);
+  const out = await drivePageFill(act, { self_identification: { gender: "Male" } }, {}, {}, T_BUDGETS);
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "Male");
+  assert.notStrictEqual(rec.flag, "checkbox-group-rebuilt");
+  assert.match(rec.detail, /persistence-confirmed/);
 });
 
 test("checkbox group: replacing a checked option UNCHECKS the current one first (the tenant refuses a second check)", async () => {
@@ -5295,6 +5990,8 @@ function makeFakeDateAct(segs, opts) {
       return { value: segs[seg].value, focused: focused === seg };
     },
     clearText: async () => { log.push(["clearText", focused]); if (focused && segs[focused]) segs[focused].value = ""; },
+    // Segment-scoped clear (the triple-click selection): empties ONLY the focused segment.
+    pressBackspace: async () => { log.push(["pressBackspace", focused]); if (focused && segs[focused]) segs[focused].value = ""; },
     typeDigits: async (text) => {
       log.push(["typeDigits", focused, text]);
       if (!focused) return;
@@ -5310,10 +6007,54 @@ function makeFakeDateAct(segs, opts) {
   };
 }
 const seg0 = () => ({ value: "" });
-const runDate = (segs, parsed, opts) => {
+const runDate = (segs, parsed, opts, budgetOverrides) => {
   const act = makeFakeDateAct(segs, opts);
-  return fillDateCompositeCdp(act, { wrapperSel: "[w-date]" }, parsed, T_BUDGETS).then((rec) => ({ rec, act }));
+  return fillDateCompositeCdp(act, { wrapperSel: "[w-date]" }, parsed,
+    budgetOverrides ? { ...T_BUDGETS, ...budgetOverrides } : T_BUDGETS).then((rec) => ({ rec, act }));
 };
+
+// ── forceSegmentTransition (2026-08-05) ─────────────────────────────────────
+// Live on waystar's Self Identify page during a REPLAY: Workday reported "The field Date is required
+// and must have a value" on a composite whose DOM, React props AND React fiber all held 8/5/2026 with
+// ariaInvalid null. The phantom-required remedy re-typed the same digits over the triple-click
+// selection — a byte-identical write, so no value transition ever reached Workday's model, and the
+// page stayed blocked. These pin that the flag produces a real empty→value transition, and that an
+// ordinary fill is completely unaffected by its existence.
+test("date composite: forceSegmentTransition EMPTIES each segment before re-typing the SAME value", async () => {
+  const segs = { Month: { value: "8" }, Day: { value: "5" }, Year: { value: "2026" } };
+  const { rec, act } = await runDate(segs, { month: "8", day: "5", year: "2026" }, undefined,
+    { forceSegmentTransition: true });
+  assert.strictEqual(rec.status, "filled", rec.detail);
+  assert.strictEqual(rec.after, "8/5/2026", "ends on the same value it started with");
+  // The point is the TRANSITION, so assert the ordering per segment: focus → backspace → type.
+  const seq = act.log.filter(([m]) => /focusDateSegment|pressBackspace|typeDigits/.test(m));
+  for (const seg of ["Month", "Day", "Year"]) {
+    const f = seq.findIndex(([m, s]) => m === "focusDateSegment" && s === seg);
+    const b = seq.findIndex(([m, s]) => m === "pressBackspace" && s === seg);
+    const t = seq.findIndex(([m, s]) => m === "typeDigits" && s === seg);
+    assert.ok(f >= 0 && b > f && t > b,
+      `${seg}: expected focus→backspace→type, got ${JSON.stringify(seq.map((x) => x.slice(0, 2)))}`);
+  }
+});
+
+test("date composite: WITHOUT the flag no Backspace is ever sent (ordinary fills unchanged)", async () => {
+  const segs = { Month: { value: "8" }, Day: { value: "5" }, Year: { value: "2026" } };
+  const { rec, act } = await runDate(segs, { month: "8", day: "5", year: "2026" });
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(act.log.filter(([m]) => m === "pressBackspace").length, 0,
+    "the ordinary date path must not gain a keystroke: " + JSON.stringify(act.log.map((x) => x[0])));
+});
+
+test("date composite: forceSegmentTransition still fills when the substrate has no pressBackspace", async () => {
+  // Older/other substrates: the flag must degrade to today's behaviour, never throw.
+  const segs = { Month: seg0(), Year: seg0() };
+  const act = makeFakeDateAct(segs);
+  delete act.pressBackspace;
+  const rec = await fillDateCompositeCdp(act, { wrapperSel: "[w-date]" }, { month: "12", year: "2024" },
+    { ...T_BUDGETS, forceSegmentTransition: true });
+  assert.strictEqual(rec.status, "filled", rec.detail);
+  assert.strictEqual(rec.after, "12/2024");
+});
 
 test("date composite: M/Y fills + verifies each segment", async () => {
   const segs = { Month: seg0(), Year: seg0() };
@@ -5982,7 +6723,7 @@ test("M40 audit BATCHED: readAuditRaw throwing falls back to per-field (never ab
 // ── AI-4: validation-error remediation ──────────────────────────────────────
 // The remediation LOOP itself lives in runCdpWalk (SW glue — live-verified eyes-on, not unit-tested);
 // these pin the decision/parse UNITS it depends on.
-const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, canonicalJobUrl, expandErrorSamples } = require("../lib.js");
+const { reconcileReviewPage, parseErrorFieldName, errorSetUnchanged, mappedFieldsFromErrors, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredEntriesAbsentFromScan, cascadeEntryFor, canonicalJobUrl, expandErrorSamples, externalGateHalt, isSelfIdPage } = require("../lib.js");
 
 // ── expandErrorSamples — the concatenated-banner split (the 2026-07-01 live Tier-0 miss) ────────
 test("AI-4 expandErrorSamples: splits Workday's CONCATENATED error banner into individual errors", () => {
@@ -6189,14 +6930,44 @@ test("cascadeEntryFor: produces an EMPTY, UNAPPROVED review question — never a
 
 // ── requiredBlankOnPage — "filled + verified, then lost it" (live 2026-07-28) ───────────────────────
 // The disability checkbox group replayed and VERIFIED checked, then Save & Continue reported it empty.
-// The fill walk catches this with its M40 audit; the replay had nothing, so it saved a page it believed
-// was complete. This is the mirror of newlyRequiredGaps: the bundle HAS an answer, the page lost it.
+// This is the mirror of newlyRequiredGaps: the bundle HAS an answer, the page lost it.
+// This comment used to add "the fill walk catches this with its M40 audit", and that was the reason the
+// fill walk was left without the guard. 2026-08-04 refuted it live on waystar.wd1 and radiancetech.wd12:
+// the audit REPORTED the doubt (audit-unverifiable — it could not re-read the group) and the walk saved
+// anyway. Reporting a doubt is not resolving it, so BOTH walks now run this check before Save & Continue.
 test("requiredBlankOnPage: a required field the bundle answered but the page shows blank is reported", () => {
   const live = [{ fieldName: "disabilityStatus", label: "Please check one of the boxes below:", widgetType: "checkbox_group", isRequired: true, value: null }];
   const entries = [{ field_id: "P5::formField-disabilityStatus", current_value: "I don't wish to answer" }];
   const lost = requiredBlankOnPage(live, entries);
   assert.strictEqual(lost.length, 1);
   assert.strictEqual(lost[0].approved, "I don't wish to answer", "carries the value to put back");
+});
+
+// ── requiredEntriesAbsentFromScan — the hole requiredBlankOnPage left (2026-08-04) ─────────────────
+// A required field whose wrapper is MISSING from the live scan is not merely un-refilled by
+// requiredBlankOnPage — it is invisible to it. "Missing from the scan" is exactly what the M40 audit
+// reports as audit-unverifiable, which is how the disability self-ID group walked past that guard.
+test("requiredEntriesAbsentFromScan: a required answered entry the scan never reported is surfaced", () => {
+  const entries = [{ field_id: "P5::formField-disabilityStatus", widget_type: "checkbox_group",
+    is_required: true, current_value: "No, I do not have a disability and have not had one in the past" }];
+  const live = [{ fieldName: "disabilityForm", isRequired: true, value: "English" }]; // group absent
+  const got = requiredEntriesAbsentFromScan(live, entries);
+  assert.strictEqual(got.length, 1);
+  assert.strictEqual(got[0].name, "disabilityStatus");
+  assert.match(got[0].approved, /^No, I do not have a disability/);
+});
+test("requiredEntriesAbsentFromScan: silent when the field IS in the scan, or there is nothing to restore", () => {
+  const e = (o) => Object.assign({ field_id: "P5::formField-x", is_required: true, current_value: "v" }, o);
+  // present in the scan → requiredBlankOnPage's job, not this one
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([{ fieldName: "x", value: null }], [e({})]), []);
+  // optional → never
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([], [e({ is_required: false })]), []);
+  // no answer to put back → newlyRequiredGaps owns it
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([], [e({ current_value: "" })]), []);
+  // the résumé has its own re-attach step
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([], [e({ widget_type: "file_upload" })]), []);
+  // a soft-deleted row is not restored
+  assert.deepStrictEqual(requiredEntriesAbsentFromScan([], [e({ is_deleted: true })]), []);
 });
 
 test("requiredBlankOnPage: does NOT claim fields it can't fix, or fields that are fine", () => {
@@ -6295,6 +7066,57 @@ test("duplicateErrorSection: a non-duplicate error, or a duplicate about nothing
   assert.strictEqual(duplicateErrorSection(["The field School is required"]), null, "a plain required-field error must not trigger a section delete");
   assert.strictEqual(duplicateErrorSection(["Duplicate entries are not allowed"]), null, "names no section → no guess");
   assert.strictEqual(duplicateErrorSection([]), null);
+});
+
+// ── isSelfIdPage — the surface that ignores synthetic writes (2026-08-04) ───────────────────────
+test("isSelfIdPage: recognized by its own fields, not by tenant", () => {
+  const f = (...n) => n.map((x) => ({ fieldName: x }));
+  assert.strictEqual(isSelfIdPage(f("disabilityForm", "name", "employeeId", "dateSignedOn", "disabilityStatus")), true, "the live waystar page 5 field set");
+  assert.strictEqual(isSelfIdPage(f("disabilityStatus")), true, "the OFCCP group alone is enough");
+  assert.strictEqual(isSelfIdPage(f("name", "dateSignedOn")), true, "the signature pair is enough");
+  // and it must NOT claim ordinary pages, or every page would lose the hidden-tab speed win
+  assert.strictEqual(isSelfIdPage(f("legalName--firstName", "addressLine1", "phoneNumber")), false, "page 1");
+  assert.strictEqual(isSelfIdPage(f("ethnicity", "gender", "hispanicOrLatino", "veteranStatus")), false, "voluntary disclosures");
+  assert.strictEqual(isSelfIdPage(f("name")), false, "a bare name field is not a signature block");
+  assert.strictEqual(isSelfIdPage([]), false);
+});
+
+// ── sectionsFromErrorNames must not route a FLAT field's own name to a section (2026-08-04) ──────
+test("sectionsFromErrorNames: a bare \"Name\" that IS a flat field on this page routes nowhere", () => {
+  // Live: the one remaining error on Self Identify was "Name" — the signature field, right there as a
+  // flat field — and it re-ran workExperience AND education because containment matches schoolName.
+  const flat = [{ fieldName: "name", label: "Name" }, { fieldName: "dateSignedOn", label: "Date" }];
+  assert.deepStrictEqual(sectionsFromErrorNames(["Name"], flat), [], "must not drag sections in");
+  // …while a genuine section field still routes, with the same flat list present
+  assert.ok(sectionsFromErrorNames(["Degree"], flat).length > 0, "a real section field still routes with the same flat list present");
+});
+test("sectionsFromErrorNames: with no flat list it behaves exactly as before (back-compat)", () => {
+  assert.ok(sectionsFromErrorNames(["Name"]).length > 0, "the old loose behaviour is unchanged when no page context is given");
+});
+
+// ── EXTERNAL GATES (2026-08-04) ────────────────────────────────────────────────────────────────
+// The LIVE copart text, verbatim from the error page the walk dumped.
+const COPART_ASSESSMENT = "Error-Page ErrorYou must complete the assessment test to continue with your job application.";
+test("externalGateHalt: the live copart assessment wording is recognized as an external gate", () => {
+  const g = externalGateHalt([COPART_ASSESSMENT], null);
+  assert.ok(g, "must be recognized — otherwise the halt blames the fill for a step no fill can do");
+  assert.strictEqual(g.reason, "assessment-required");
+  assert.match(g.evidence, /assessment test/i, "the halt quotes Workday's own words");
+});
+test("externalGateHalt: found in the error-PAGE text too, not just the split samples", () => {
+  const g = externalGateHalt([], "Page Error You must complete the assessment test to continue. Take Assessment Back Save and Continue");
+  assert.ok(g && g.reason === "assessment-required");
+});
+test("externalGateHalt: an ORDINARY validation error is NEVER called an external gate", () => {
+  // The dangerous direction: mislabelling a real fill failure as the operator's problem would hide a bug.
+  assert.strictEqual(externalGateHalt(["Error-URLThe field URL is required and must have a value."], null), null);
+  assert.strictEqual(externalGateHalt(["Error-Page ErrorThe field Date is required"], null), null);
+  assert.strictEqual(externalGateHalt(["You can't add duplicate website URLs."], null), null);
+  assert.strictEqual(externalGateHalt(["Please check one of the boxes below"], null), null);
+  assert.strictEqual(externalGateHalt([], null), null);
+  assert.strictEqual(externalGateHalt([""], ""), null);
+  // "assessment" as a passing noun, with no requirement wording, is not a gate either
+  assert.strictEqual(externalGateHalt(["Your assessment scores will be shared with the hiring team."], null), null);
 });
 
 test("sectionEntriesFromResults: builds one entry per row with a composite signature over ALL its fields", () => {
@@ -6635,52 +7457,10 @@ test("choice-capture: two same-stem repeating dropdowns share ONE open (stem cac
   assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1); // cached by stem "readingProficiency"
 });
 
-// ── choice-capture CROSS-RUN option cache (2026-07-25 speed round) ──────────────────────────
-// The SW loads/persists the store (chrome.storage `optionListCache`, tenant-scoped); the driver
-// only reads/mutates the plain object handed in. COSMETIC surface only (the review editor's
-// choice lists) — the fill/match ladder always reads LIVE options, so a stale list can never
-// cause a wrong fill.
-test("choice-capture cache: a fresh cache entry serves a prefilled-kept dropdown with ZERO re-opens", async () => {
-  const recs = [{ fieldName: "country", widgetType: "dropdown", status: "filled", auditLoc: "[w-country]" }];
-  const cache = { "dd:country": { options: ["United States of America", "Canada"], at: Date.now() } };
-  const { act, calls } = makeDropdownAct();
-  await captureChoiceOptions(act, recs, T_BUDGETS, cache);
-  assert.deepStrictEqual(recs[0].options, ["United States of America", "Canada"]);
-  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 0, "cache hit → no cold re-open (the ~5.6s server-list cost skipped)");
-});
-
-test("choice-capture cache: a committed record's options FEED the store (free); a live scrape is written back", async () => {
-  const recs = [
-    { fieldName: "language[0].language", widgetType: "dropdown", status: "filled", auditLoc: "[w-lang]", options: ["English", "Chinese"] }, // committed → feeds the store
-    { fieldName: "education[0].degree", widgetType: "dropdown", status: "filled", auditLoc: "[w-degree]" }                                  // optionless → scraped → written back
-  ];
-  const cache = {};
-  const { act } = makeDropdownAct();
-  await captureChoiceOptions(act, recs, T_BUDGETS, cache);
-  assert.deepStrictEqual(cache["dd:language"].options, ["English", "Chinese"], "committed options feed the store so a re-run's tier-0 keep hits the cache");
-  assert.deepStrictEqual(cache["dd:degree"].options, ["Bachelors", "Masters", "Doctorate"], "scraped options written back");
-  assert.ok(cache["dd:language"].at > 0 && cache["dd:degree"].at > 0, "entries are stamped for the TTL");
-});
-
-test("choice-capture cache: a STALE (TTL-expired) entry is ignored → live scrape, fresh write-back", async () => {
-  const recs = [{ fieldName: "country", widgetType: "dropdown", status: "filled", auditLoc: "[w-country]" }];
-  const cache = { "dd:country": { options: ["Stale Land"], at: Date.now() - 8 * 24 * 3600 * 1000 } }; // > 7d TTL
-  const { act, calls } = makeDropdownAct();
-  await captureChoiceOptions(act, recs, T_BUDGETS, cache);
-  assert.deepStrictEqual(recs[0].options, ["Bachelors", "Masters", "Doctorate"], "stale entry NOT served");
-  assert.strictEqual(calls.filter((c) => c[0] === "openDropdown").length, 1, "re-scraped live");
-  assert.deepStrictEqual(cache["dd:country"].options, ["Bachelors", "Masters", "Doctorate"], "fresh scrape replaces the stale entry");
-});
-
-test("choice-capture cache: typeahead records hit the cache by captureKey (no re-open)", async () => {
-  const recs = [taggedRec({ auditLoc: "[w-fos-0]" })];
-  const cache = { "ta:fieldOfStudy": { options: ["Cached Studies"], at: Date.now() } };
-  const { act, calls } = makeCaptureAct();
-  await captureChoiceOptions(act, recs, CAP_BUDGETS, cache);
-  assert.deepStrictEqual(recs[0].options, ["Cached Studies"]);
-  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 0, "no re-open on a cache hit");
-  assert.strictEqual(calls.filter((c) => c[0] === "openHier").length, 0, "the field is never even opened");
-});
+// The cross-run option cache was REMOVED 2026-08-06 (operator): it only ever helped a SECOND run
+// against the same tenant, which is a testing artifact — in the real flow a form is filled once,
+// reviewed, then submitted, so the store was always cold when it mattered, and it made repeat test
+// runs faster than a genuine first fill. The per-PAGE dedupe above is what remains, and is tested there.
 
 test("closeDropdownConfirmed: polls on delayRender (adaptive) with a wall-clock bound — options-gone gate unchanged", async () => {
   // The 2026-07-25 pacing change: the close-settle beat is delayRender (adaptive under the measured-
@@ -8328,8 +9108,13 @@ test("AI dropdown: the AI cannot COMMIT the placeholder even if it names it", as
   // the field lands in review instead of committing a value the form counts as empty.
   const act = makeFakeAct([phDd()], { aiEnabled: true, ai: '{"choice":"Select One","justification":"j","confidence":"High"}' });
   const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
-  assert.notStrictEqual(rec.after, "Select One", "the placeholder is never committed as the answer");
-  assert.strictEqual(rec.status, "needs_review", "no valid choice → review, not a bogus fill");
+  // NEW CONTRACT (operator, 2026-08-07): a REQUIRED dropdown never ends BLANK — a blank one blocks
+  // Save & Continue and the operator gets no review page at all. The invariant this test exists for is
+  // UNCHANGED and still asserted: the model's off-list text is NEVER committed. What follows is the
+  // deterministic last-resort pick, flagged loudly as a placeholder.
+  assert.notStrictEqual(rec.after, "Select One", "THE INVARIANT: the placeholder is never committed as the answer");
+  assert.strictEqual(rec.status, "filled_review", "a required field still gets a real option so the page advances");
+  assert.strictEqual(rec.flag, "required-forced-pick");
 });
 
 test("submit gate: a REQUIRED choice field still holding the placeholder BLOCKS submit", async () => {
@@ -8782,6 +9567,35 @@ test("signature date: a date naming a DIFFERENT event is never stamped with toda
     assert.ok(!apMatchLib.isSignatureDateQuestion(t), t);
 });
 
+// ── Workday demands the signature date in MORE THAN ONE WORDING (marvell live 2026-08-09) ──
+// The replay may write exactly one unapproved value — today's date — and only when Workday asks. The
+// ask was matched as the literal "Enter today's date"; marvell page 5 instead said "The field Date is
+// required and must have a value", nothing fired, and the rehearsal halted `replay-blocked`.
+//
+// The second assertion is the one that matters. The wrapper on that page already READ `current value
+// is 8/9/2026`: Workday re-renders the date from its saved copy but dropped it server-side, so the
+// screen shows an answer the model does not have — and `skipIfCorrect` therefore actuated nothing.
+// Requiring the field to be blank would have been the obvious guard and would have missed every real
+// occurrence, because blankness is exactly the evidence this failure destroys.
+test("signature date: Workday's GENERIC required-wording is an ask, even when the field shows a value", () => {
+  const dateField = { fieldName: "date", label: "Date*", widgetType: "date", isRequired: true, value: "8/9/2026" };
+  const marvell = ["Error-DateThe field Date is required and must have a value."];
+
+  // the generic wording is recognized, and the DISPLAYED value does not disqualify it
+  assert.equal(apMatchLib.signatureDateDemanded(marvell, [dateField]), dateField);
+  assert.equal(apMatchLib.signatureDateDemanded(marvell, [Object.assign({}, dateField, { value: "" })]).fieldName, "date");
+  // the original explicit wording still fires
+  assert.equal(apMatchLib.signatureDateDemanded(["Enter today's date"], [dateField]), dateField);
+
+  // …and it stays narrow: a required error on a DIFFERENT date event is never a signature-date ask,
+  // because stamping today there would be a wrong answer rather than a missing one.
+  const startDate = { fieldName: "startDate", label: "Desired Start Date*", widgetType: "date", isRequired: true, value: "" };
+  assert.equal(apMatchLib.signatureDateDemanded(["The field Desired Start Date is required and must have a value."], [startDate]), null);
+  // an error naming some OTHER field never drags the date field in
+  assert.equal(apMatchLib.signatureDateDemanded(["The field Last Name is required and must have a value."], [dateField]), null);
+  assert.equal(apMatchLib.signatureDateDemanded([], [dateField]), null);
+});
+
 // ── a date the FORM re-formatted is the same date (Home Depot live 2026-08-04) ──
 // Approved "5/1/2028"; Workday's review page displays "05/01/2028". Identical calendar date, zero-
 // padded by the form — and the submit gate blocked on it as a DISAGREE. Same shape as 80,000/80000:
@@ -8830,18 +9644,207 @@ test("review reconcile: a zero-padded date AGREES on the KEYED path, not just th
 // Operator 2026-08-04: with "Electrical Engineering" already committed it typed "Electrical and
 // Computer Engineering" first, found nothing, then moved on — a search the complete scrape had already
 // ruled out. The short-circuit's no-match branch was gated to normal fills only.
+// Reaching that branch needs THREE things the first version of this test had none of: opts.onCapture
+// (without it the whole pre-scrape block is skipped and capturedFull stays null), a capture that
+// carries the non-enumerable `scrapeComplete` the real onCapture stamps on, and the log name the
+// typeahead actually writes (`typeInHier` — not `typeInSourceSearch`/`typeText`, which no fake emits,
+// so the old assertion read an always-empty array and passed with the fix reverted.)
+const completeCapture = (act, loc) => async () => {
+  const sc = await act.scrapeTaOptions(loc);
+  if (!sc.ok) return null;
+  const opts = sc.options.slice();
+  // mirrors captureChoiceOptions: complete = reached the bottom AND not capped
+  Object.defineProperty(opts, "scrapeComplete", { value: !!sc.atBottom && !sc.cappedOut, enumerable: false });
+  return opts;
+};
+
 test("typeahead pre-filled: a provably-absent higher tier is never typed", async () => {
-  const OPTS = ["Electrical Engineering", "Mechanical Engineering", "Computer Science"];
-  const f = srcField({
-    wrapperSel: "[w-fos]",
-    chips: ["Electrical Engineering"],                       // already committed
-    startOptions: OPTS, startAtBottom: true,                 // a COMPLETE scrape
+  const LOC = { wrapperSel: "[w-ta]" };
+  const f = taField({
+    fieldName: "fieldOfStudy",
+    chips: ["Electrical Engineering"],                        // already committed → tier 1 of the list below
+    scrapeOptions: ["Electrical Engineering", "Mechanical Engineering", "Computer Science"], // COMPLETE (atBottom)
   });
   const act = makeFakeAct([f], {});
-  const r = await fillTypeaheadCdp(act, { wrapperSel: "[w-fos]" },
-    ["Electrical and Computer Engineering", "Electrical Engineering"], T_BUDGETS);
-  const typed = act.log.filter(([m]) => m === "typeInSourceSearch" || m === "typeText").map(([, v]) => String(v));
-  assert.ok(!typed.some((t) => /Computer/.test(t)),
+  const r = await fillTypeaheadCdp(act, LOC,
+    ["Electrical and Computer Engineering", "Electrical Engineering"], T_BUDGETS,
+    { onCapture: completeCapture(act, LOC) });
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, v]) => String(v));
+  assert.deepStrictEqual(typed, [],
     "the absent higher tier must not be typed — the complete scrape already ruled it out: " + JSON.stringify(typed));
-  assert.match(String(r.after || ""), /Electrical Engineering/, "the prefill is kept, which is the same verdict as before");
+  assert.match(String(r.after || ""), /^Electrical Engineering$/,
+    "the prefill is kept, which is the same verdict the type/Enter walk would have reached");
+});
+
+// The guard on the above: absence must be proven, not assumed. An INCOMPLETE scrape of the same
+// widget must still type the higher tier, because the server may filter to a value the partial
+// list never showed.
+test("typeahead pre-filled: an INCOMPLETE scrape still types the higher tier (absence unproven)", async () => {
+  const LOC = { wrapperSel: "[w-ta]" };
+  const f = taField({
+    fieldName: "fieldOfStudy",
+    chips: ["Electrical Engineering"],
+    scrapeNotAtBottom: true,                                  // partial → cannot prove absence
+    scrapeOptions: ["Electrical Engineering", "Mechanical Engineering"],
+    filterMap: { "Electrical and Computer Engineering": { autoCommit: "Electrical and Computer Engineering" } },
+  });
+  const act = makeFakeAct([f], {});
+  const r = await fillTypeaheadCdp(act, LOC,
+    ["Electrical and Computer Engineering", "Electrical Engineering"], T_BUDGETS,
+    { onCapture: completeCapture(act, LOC) });
+  const typed = act.log.filter(([m]) => m === "typeInHier").map(([, v]) => String(v));
+  assert.deepStrictEqual(typed, ["Electrical and Computer Engineering"],
+    "a partial list cannot rule the tier out — it must still be typed");
+  assert.strictEqual(r.after, "Electrical and Computer Engineering", "and the upgrade committed");
+});
+
+// ── A SIGNATURE DATE replays as TODAY, not as the stored answer (2026-08-07) ────────────────────────
+// The self-ID attestation date is the day the form is COMPLETED. The fill path already stamps it
+// deterministically; the replay wrote back whatever the bundle held, so an approved bundle signed
+// YESTERDAY replayed yesterday's date and Workday refused the page with "Error-Date Enter today's
+// date" (live, waystar.wd1: approved 08/06, replayed 08/07). That error names no field, so the
+// error-routing paths cannot rescue it either. analogdevices passed the same page only because its
+// bundle happened to be filled the SAME day -- a one-day-old approval is enough to break it.
+const _mmddyyyy = (d) => `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+const SIG_TODAY = _mmddyyyy(new Date());
+const SIG_YESTERDAY = _mmddyyyy(new Date(Date.now() - 86400000));
+const sigEntry = (label, value) => ({
+  field_id: "P5::formField-dateSignedOn", canonical_field: null,
+  question_label: label, widget_type: "text", current_value: value, edit_kind: null,
+});
+const sigField = () => ({ wrapperSel: '[data-automation-id="formField-dateSignedOn"]', fieldName: "dateSignedOn", widgetType: "text", value: "" });
+
+// RULE CHANGE (operator, 2026-08-08): the replay FOLLOWS THE REVIEW PAGE, including for a signature
+// date. Re-deriving it to today on every replay wrote a value the human had not approved — including
+// onto a date they left BLANK — and on the Self Identify page that write CASCADES (Name and the
+// disability group become required), so the rehearse halted on questions the human never saw. Today's
+// date is now written only REACTIVELY, when Workday answers Save & Continue with "Enter today's date"
+// (the stamp lives in runCdpReplayWalk, not here).
+test("replayField: a STALE signature date replays the APPROVED value, not today", async () => {
+  const f = sigField();
+  const r = await replayField(makeFakeAct([f]), sigEntry("Date*", SIG_YESTERDAY), T_BUDGETS);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(f.value, SIG_YESTERDAY, "the replay must not invent a value the review page did not approve");
+  assert.notStrictEqual(f.value, SIG_TODAY);
+});
+
+test("replayField: the explicit signature wordings are NOT re-derived either", async () => {
+  for (const label of ["Date Signed", "Today's Date", "Signature Date", "Date of Completion"]) {
+    const f = sigField();
+    await replayField(makeFakeAct([f]), sigEntry(label, SIG_YESTERDAY), T_BUDGETS);
+    assert.strictEqual(f.value, SIG_YESTERDAY, `${label} must replay what was approved`);
+  }
+});
+
+test("replayField: an UNAPPROVED (blank) signature date is left alone — the cascade bug", async () => {
+  // The specific live failure: the proactive rewrite stamped a date the human had left blank, which made
+  // Name and the disability checkbox group required, and the rehearse then halted on both.
+  const f = sigField();
+  const r = await replayField(makeFakeAct([f]), sigEntry("Date*", ""), T_BUDGETS);
+  assert.notStrictEqual(f.value, SIG_TODAY, "a blank approval must not become today's date");
+  assert.ok(r.status === "skipped" || f.value === "", `expected no write, got ${JSON.stringify(r)}`);
+});
+
+test("replayField: a signature date that is ALREADY today writes today (never yesterday)", async () => {
+  const f = sigField();
+  await replayField(makeFakeAct([f]), sigEntry("Date Signed", SIG_TODAY), T_BUDGETS);
+  assert.strictEqual(f.value, SIG_TODAY);
+});
+
+test("replayField: a date naming a DIFFERENT event still replays the APPROVED value", async () => {
+  for (const label of ["Start Date", "Date of Birth", "Graduation Date", "Expiration Date", "From", "To"]) {
+    const f = sigField();
+    await replayField(makeFakeAct([f]), sigEntry(label, SIG_YESTERDAY), T_BUDGETS);
+    assert.strictEqual(f.value, SIG_YESTERDAY, `${label} must replay what the human approved, not today`);
+  }
+});
+
+// ── A DECLINED canonicalize must not leave a REQUIRED dropdown BLANK (2026-08-07) ───────────────────
+// Canonicalize is deliberately strict ("if NO option means the same, reply UNKNOWN") so it never bends a
+// stated value into a different meaning. On a REQUIRED field that leaves a blank, and a blank required
+// field blocks Save & Continue — so the walk halts having filled nothing. The typeahead path already
+// refuses to end that way (`ai-closest-forced`); dropdowns had no equivalent.
+//
+// Live on nvidia.wd5 page 1, with this exact option list: Phone Device Type offers ONLY "Home" and
+// "Home Cellular" — there is no "Mobile" — so the stated value legitimately maps to nothing, and Workday
+// refused the page: "The field Phone Device Type is required and must have a value."
+const nvidiaPhoneType = (flags) => Object.assign({
+  wrapperSel: "[w-phonetype]", fieldName: "phoneType", widgetType: "dropdown", isRequired: true,
+  label: "Phone Device Type*", triggerText: "Select One",
+  options: [{ text: "Select One", disabled: true }, { text: "Home" }, { text: "Home Cellular" }],
+}, flags || {});
+const PHONE_PROFILE = { personal_info: { phone_device_type: "Mobile" } };
+
+test("canonicalize on a CLOSED list always picks — approximate:true commits with its own loud flag, in ONE call", async () => {
+  // Operator rule (2026-08-07): "only the large text boxes can be unknown and choose N/A" — a dropdown is
+  // a closed list and the form rejects a blank, so the prompt asks for the NEAREST option instead of
+  // UNKNOWN. That answers it in ONE llm call and ONE open of the dropdown; the previous shape needed a
+  // second call and a second open purely to undo the first call's refusal.
+  const act = makeFakeAct([nvidiaPhoneType()], { aiEnabled: true, ai: '{"choice":"Home Cellular","approximate":true,"confidence":"Medium"}' });
+  const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.after, "Home Cellular");
+  assert.strictEqual(rec.flag, "ai-canon-approximate", "an approximation is NOT the same claim as a vocab map");
+  assert.match(rec.detail, /NOT your stated value/, "review must be told it is not what the applicant said");
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 1, "ONE llm call — no fallthrough round trip");
+});
+
+test("canonicalize: an EXACT vocab map keeps ai-canonicalized (approximate absent/false)", async () => {
+  const act = makeFakeAct([nvidiaPhoneType({ options: [{ text: "Select One", disabled: true }, { text: "Mobile Phone" }, { text: "Home" }] })],
+    { aiEnabled: true, ai: '{"choice":"Mobile Phone","approximate":false,"confidence":"High"}' });
+  const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
+  assert.strictEqual(rec.flag, "ai-canonicalized", "a true synonym is not flagged as an approximation");
+  assert.strictEqual(rec.after, "Mobile Phone");
+  assert.doesNotMatch(rec.detail || "", /NOT your stated value/);
+});
+
+test("canonicalize decline: an OPTIONAL dropdown still stays blank — never a forced guess", async () => {
+  const act = makeFakeAct([nvidiaPhoneType({ isRequired: false })], { aiEnabled: true,
+    ai: ['{"choice":"UNKNOWN"}', '{"choice":"Home Cellular","confidence":"Medium"}'] });
+  const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
+  assert.strictEqual(rec.status, "needs_review", "an optional blank does not block the page — never guess it");
+  assert.strictEqual(rec.flag, "ai-canon-nomatch");
+  assert.strictEqual(rec.after, null);
+});
+
+test("canonicalize SUCCESS is untouched — exactly one LLM call when the stated value does map", async () => {
+  const act = makeFakeAct([nvidiaPhoneType()], { aiEnabled: true, ai: '{"choice":"Home Cellular","confidence":"High"}' });
+  const rec = (await drivePageFill(act, PHONE_PROFILE, {}, {}, T_BUDGETS)).results.find((r) => r.fieldName === "phoneType");
+  assert.strictEqual(rec.flag, "ai-canonicalized", "a clean vocab map keeps its own flag");
+  assert.strictEqual(rec.after, "Home Cellular");
+  assert.strictEqual(act.log.filter(([m]) => m === "llm").length, 1, "no second call on the success path");
+});
+
+// ── The required-dropdown backstop must be LAST, and must never overwrite a real value ─────────────
+// Both of these are bugs the backstop HAD when first written, caught by the existing suite:
+//   • placed before the EEO path, it pre-empted a genuinely better answer (EEO declines to the neutral
+//     option rather than picking a demographic at random);
+//   • without an emptiness guard it overwrote a kept tenant PRE-FILL with a placeholder.
+test("required-dropdown backstop: the EEO decline path WINS — the backstop never pre-empts a better answer", async () => {
+  const opts = [{ text: "Select One", disabled: true }, { text: "Female" }, { text: "Male" }, { text: "Undeclared" }];
+  // A MAPPED-but-empty required EEO dropdown; the model answers with LOW confidence → the EEO path
+  // overrides to the neutral decline. The backstop must not touch it afterwards.
+  const act = makeFakeAct([genderField({ isRequired: true, options: opts })], { aiEnabled: true, ai: '{"choice":"Male","confidence":"Low"}' });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.flag, "eeo_declined", "the EEO path owns this field, not the backstop");
+  assert.strictEqual(rec.after, "Undeclared");
+  assert.notStrictEqual(rec.flag, "required-forced-pick");
+});
+
+test("required-dropdown backstop: a KEPT PRE-FILL is never overwritten by a placeholder", async () => {
+  // The field already holds a real tenant value and the LLM call fails. Nothing is blocking, so the
+  // backstop must stay out of it — overwriting would destroy a real answer.
+  const act = makeFakeAct([aiDd({ triggerText: "Yes" })], { aiEnabled: true, ai: { ok: false, error: "HTTP 503" } });
+  const rec = (await drivePageFill(act, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "Yes", "the pre-filled value survives");
+  assert.notStrictEqual(rec.flag, "required-forced-pick", "the backstop must not fire on a field that holds a value");
+});
+
+test("pickLastResortOption: prefers a DECLINE option, then Other, then the first real option", () => {
+  assert.strictEqual(pickLastResortOption(["Yes", "No", "Prefer not to say"]), "Prefer not to say");
+  assert.strictEqual(pickLastResortOption(["Yes", "No", "Other"]), "Other");
+  assert.strictEqual(pickLastResortOption(["Home", "Home Cellular"]), "Home", "no decline/Other → the first real option");
+  assert.strictEqual(pickLastResortOption(["Decline to answer", "Other"]), "Decline to answer", "decline beats Other");
+  assert.strictEqual(pickLastResortOption([]), null);
+  assert.strictEqual(pickLastResortOption(null), null);
 });

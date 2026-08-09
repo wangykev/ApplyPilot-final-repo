@@ -5,7 +5,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage, parseErrorFieldName, phantomRequiredTargets,
-  classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow } = require("../lib.js");
+  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey, blankAuthPersists, isJobPostingGone, BLANK_AUTH_MIN_READS } = require("../lib.js");
 
 // Fold the pure settle rule over a sequence of page reads → the 1-based read it accepts at (null = never).
 const settleAt = (reads) => {
@@ -393,4 +393,206 @@ test("classifyWorkdayPage: a REAL auth screen is still auth, even with an apply 
   assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, passwordInput: true, hasAuthEl: true, markers: { continueButton: true } }), "auth");
   assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, emailInput: true, hasAuthEl: true, markers: { applyManually: true } }), "auth");
   assert.strictEqual(classifyWorkdayPage({ formFieldCount: 0, signInWithEmail: true, hasAuthEl: true, markers: {} }), "auth");
+});
+
+// ── The half-torn-down apply chain (2026-08-07, live: radiancetech.wd12 + magna.wd3) ────────────────
+// A healthy JD page has adventureButton and NO applyManually; a healthy /apply chooser has
+// applyManually + useMyLastApplication and NO adventureButton (verified against a cleanly-loaded
+// chooser). Both at once means the SPA swapped views without tearing the old one down, so the
+// coordinate click hits a dead layer, reports success, and the page never moves. Onboarding used to
+// burn the full 45s budget and re-issue the identical click three rounds over, then halt backToApply.
+const STUCK = {
+  // the exact marker set the live run logged on every read for 45s
+  markers: { adventureButton: true, applyManually: true, useMyLastApplication: true },
+  formFieldCount: 0, hasAuthEl: false, emailInput: false, passwordInput: false,
+  title: "Senior FPGA Engineer",
+};
+test("applyChainStuckMixed: Apply + Apply Manually mounted together is the stuck state", () => {
+  assert.strictEqual(applyChainStuckMixed(STUCK), true);
+});
+test("applyChainStuckMixed: a healthy JD page is NOT stuck (no applyManually)", () => {
+  assert.strictEqual(applyChainStuckMixed({ markers: { adventureButton: true }, formFieldCount: 0, hasAuthEl: false }), false);
+});
+test("applyChainStuckMixed: a healthy chooser is NOT stuck (no adventureButton)", () => {
+  assert.strictEqual(applyChainStuckMixed({ markers: { applyManually: true, useMyLastApplication: true }, formFieldCount: 0, hasAuthEl: false }), false);
+});
+test("applyChainStuckMixed: never fires once auth or the form has rendered — that is 'not landed yet', not stuck", () => {
+  assert.strictEqual(applyChainStuckMixed({ ...STUCK, hasAuthEl: true }), false, "auth element present");
+  assert.strictEqual(applyChainStuckMixed({ ...STUCK, passwordInput: true }), false, "credential field present");
+  assert.strictEqual(applyChainStuckMixed({ ...STUCK, formFieldCount: 4 }), false, "the form is up");
+});
+test("applyChainStuckMixed: tolerates a missing/blank state", () => {
+  assert.strictEqual(applyChainStuckMixed(null), false);
+  assert.strictEqual(applyChainStuckMixed({}), false);
+});
+
+// ── The self-ID disability blocker: error text vs a label ending in a COLON (2026-08-07) ────────────
+// Workday drops the disability answer when you RE-ENTER a saved application (siblings on the same page
+// keep theirs), so the replay lands on `disabilityStatus ""*` -- present, required, empty, with an
+// approved value in the bundle. It then halted having done nothing, because parseErrorFieldName strips
+// a trailing ":" off the extracted name while normalizeLabel strips only "*" -- so the two sides could
+// never be equal for a label that ends in a colon. Reproduced deterministically on analogdevices.wd1
+// (rehearsal #1 passed, #2 failed) and seen on radiancetech.wd12, itron.wd5 and waystar.wd1.
+const SELFID_ERR = "Error-Please check one of the boxes below:The field Please check one of the boxes below is required and must have a value.";
+const SELFID_LABEL = "Please check one of the boxes below:*";   // verbatim, as the live scan reports it
+
+test("errorLabelKey: the live self-ID error name and the live colon label agree", () => {
+  const title = parseErrorFieldName(SELFID_ERR);
+  assert.strictEqual(title, "Please check one of the boxes below");
+  assert.strictEqual(errorLabelKey(title), errorLabelKey(SELFID_LABEL));
+});
+test("errorLabelKey: strips a trailing *, :, and both in either order", () => {
+  const want = "please check one of the boxes below";
+  for (const v of ["Please check one of the boxes below",
+                   "Please check one of the boxes below:",
+                   "Please check one of the boxes below*",
+                   "Please check one of the boxes below:*",
+                   "Please check one of the boxes below*:",
+                   "Please check one of the boxes below : * "]) {
+    assert.strictEqual(errorLabelKey(v), want, `failed for ${JSON.stringify(v)}`);
+  }
+});
+test("errorLabelKey: does NOT merge two genuinely different labels", () => {
+  assert.notStrictEqual(errorLabelKey("Country:"), errorLabelKey("Country Phone Code:"));
+  assert.notStrictEqual(errorLabelKey("Name:"), errorLabelKey("Legal Name:"));
+});
+test("errorLabelKey: tolerates blank/missing input", () => {
+  assert.strictEqual(errorLabelKey(null), "");
+  assert.strictEqual(errorLabelKey("  "), "");
+  assert.strictEqual(errorLabelKey("***"), "");
+});
+
+// phantomRequiredTargets is one of the strict-equality matchers the colon defeated. The live page:
+// disabilityStatus is on the page, REQUIRED and EMPTY -> a REAL validation block, not the blur-race
+// phantom. Before the fix it returned "match no field on this page", which is a different (and wrong)
+// reason and sent the walk down the wrong branch.
+const SELFID_LIVE = [
+  { fieldName: "disabilityForm", label: "Language*", value: "English", isRequired: true },
+  { fieldName: "name", label: "Name*", value: "Kevin Wang", isRequired: true },
+  { fieldName: "employeeId", label: "Employee ID", value: "", isRequired: false },
+  { fieldName: "dateSignedOn", label: "Date*", value: "08/07/2026", isRequired: true },
+  { fieldName: "disabilityStatus", label: SELFID_LABEL, value: "", isRequired: true },
+];
+test("phantomRequiredTargets: the self-ID error now MATCHES its field and is reported as genuinely empty", () => {
+  const r = phantomRequiredTargets([parseErrorFieldName(SELFID_ERR)], SELFID_LIVE);
+  assert.strictEqual(r.phantom, false, "an empty required field is a real block, not the phantom");
+  assert.match(r.reason, /genuinely empty on the page/);
+  assert.match(r.reason, /disabilityStatus/, "it must name the field it matched");
+  assert.doesNotMatch(r.reason, /match no field/, "the colon must no longer defeat the match");
+});
+test("phantomRequiredTargets: the same field HOLDING a value is the phantom (blur race)", () => {
+  const held = SELFID_LIVE.map((f) => (f.fieldName === "disabilityStatus" ? { ...f, value: "No, I do not have a disability and have not had one in the past" } : f));
+  const r = phantomRequiredTargets([parseErrorFieldName(SELFID_ERR)], held);
+  assert.strictEqual(r.phantom, true);
+  assert.strictEqual(r.targets[0].fieldName, "disabilityStatus");
+});
+
+// ── A blank auth page must be PERSISTENT before it earns a reload (2026-08-07) ──────────────────────
+// Every isBlankAuthPage condition is also satisfied by an SPA mid-navigation (old view torn down, new one
+// not mounted, readyState already "complete"). Straight after an auth POST that is the EXPECTED
+// transient. Reloading there throws away a navigation about to finish and restarts the whole sign-in —
+// traced live as where the 8-9s went. The reload rule itself is right (cat.wd5: the shell really was
+// dead); what was missing is WHEN it may fire.
+const BLANK = { readyState: "complete", formFieldCount: 0, hasAuthEl: false, emailInput: false,
+  passwordInput: false, signInWithEmail: false, markers: {}, bodyText: "© 2026 Workday, Inc." };
+const AUTH_BACK = { ...BLANK, passwordInput: true, emailInput: true, formFieldCount: 2,
+  markers: { signInSubmit: true } };
+const FORM_BACK = { ...BLANK, formFieldCount: 14, markers: { formField: true } };
+
+test("blankAuthPersists: a run of blank reads (the dead cat.wd5 shell) → reload", () => {
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK, BLANK]), true);
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK, BLANK, BLANK]), true);
+});
+test("blankAuthPersists: ONE non-blank read anywhere ⇒ it was navigating, NOT a dead shell", () => {
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK, FORM_BACK]), false, "the form arrived — never reload");
+  assert.strictEqual(blankAuthPersists([BLANK, AUTH_BACK, BLANK]), false, "auth chrome came back mid-window");
+  assert.strictEqual(blankAuthPersists([FORM_BACK, BLANK, BLANK]), false);
+});
+test("blankAuthPersists: a SINGLE blank read is never enough — that was the bug", () => {
+  assert.strictEqual(blankAuthPersists([BLANK]), false, "one read is what used to trigger the reload");
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK]), false, "still under the minimum");
+  assert.strictEqual(BLANK_AUTH_MIN_READS >= 3, true, "the minimum must be more than a couple of reads");
+});
+test("blankAuthPersists: tolerates junk / empty input, and honours an explicit minReads", () => {
+  assert.strictEqual(blankAuthPersists([]), false);
+  assert.strictEqual(blankAuthPersists(null), false);
+  assert.strictEqual(blankAuthPersists([BLANK, null, BLANK]), false, "nulls are dropped, so 2 reads < 3");
+  assert.strictEqual(blankAuthPersists([BLANK, BLANK], 2), true, "an explicit lower minimum is honoured");
+});
+
+// ── Past auth is past auth, even before the fields mount (2026-08-07) ───────────────────────────────
+// `success` required form FIELDS, so a sign-in that had plainly worked read as "unknown" until Workday
+// mounted them — and the caller burned its whole budget, then re-submitted the auth form or reloaded.
+// Measured on jabil.wd5's successful sign-in: formFields 0, hasAuthEl false, markers [applyFlowPage],
+// title already the job posting — and the outcome came back "unknown".
+test("classifyAuthOutcome: applyFlowPage with NO auth chrome is success even at formFields 0", () => {
+  assert.strictEqual(classifyAuthOutcome({
+    bodyText: "Principal Product Test Engineer, Advance Compute",
+    formFieldCount: 0, hasAuthEl: false, markers: { applyFlowPage: true },
+  }), "success", "the application shell is up and auth chrome is gone — the fields are just a beat behind");
+});
+test("classifyAuthOutcome: applyFlowPage does NOT beat a verify or wrong-credentials message", () => {
+  assert.strictEqual(classifyAuthOutcome({
+    bodyText: "A verification email has been sent to your inbox.",
+    formFieldCount: 0, hasAuthEl: false, markers: { applyFlowPage: true },
+  }), "verify", "the message is decisive — it is checked first");
+  assert.strictEqual(classifyAuthOutcome({
+    bodyText: "The email or password you entered is incorrect.",
+    formFieldCount: 0, hasAuthEl: false, markers: { applyFlowPage: true },
+  }), "wrong_credentials");
+});
+test("classifyAuthOutcome: applyFlowPage with auth chrome STILL up is not success", () => {
+  assert.strictEqual(classifyAuthOutcome({
+    bodyText: "Sign In", formFieldCount: 2, hasAuthEl: true,
+    markers: { applyFlowPage: true, signInSubmit: true },
+  }), "unknown", "the live jabil sign-in page carries applyFlowPage AND signInSubmit — never success");
+});
+test("classifyAuthOutcome: a bare loading page is still unknown (no applyFlowPage, no fields)", () => {
+  assert.strictEqual(classifyAuthOutcome({ bodyText: "loading…", formFieldCount: 0, hasAuthEl: false, markers: {} }), "unknown");
+});
+
+// ── the social-login chooser is recognized by TEXT, not just its automation-id (sonos.wd1 2026-08-09) ──
+// Some tenants put the email/password form behind a "Sign in with email" button next to federated
+// Apple/Google buttons. That shape was already handled, but keyed to
+// [data-automation-id="SignInWithEmailButton"] — and sonos.wd1 renders the same button with a HASHED
+// id. The page therefore had zero inputs, signInWithEmail read false, and the run halted
+// auth-form-not-rendered both visible and hidden, on a screen a human signs into fine.
+//
+// Both the detector (cdp.js) and the click (background.js) now fall back to the button's own text.
+// Pinned against the SHIPPED regex rather than a copy, so the two can't drift apart, and asserted to
+// reject the federated buttons sitting beside it — clicking one of those would be an SSO attempt.
+test("social-login chooser: 'Sign in with email' is matched by text, and SSO buttons are not", () => {
+  const fs = require("fs"), path = require("path");
+  const root = path.join(__dirname, "..");
+  const sources = { "cdp.js": null, "background.js": null };
+  for (const f of Object.keys(sources)) {
+    const src = fs.readFileSync(path.join(root, f), "utf8");
+    const LITERAL = "\\bsign[- ]?in\\s+with\\s+email\\b";
+    assert.ok(src.includes(LITERAL), `${f} should match the chooser button by text (the automation-id is not stable across tenants)`);
+    sources[f] = new RegExp(LITERAL, "i");
+  }
+  for (const re of Object.values(sources)) {
+    assert.ok(re.test("Sign in with email"), "the sonos/PANW button text must match");
+    assert.ok(re.test("SIGN IN WITH EMAIL"), "case must not matter");
+    assert.ok(re.test("Sign-in with email"), "the hyphenated spelling must match");
+    // never the federated buttons rendered beside it — we do not click those
+    assert.ok(!re.test("Sign in with Apple"));
+    assert.ok(!re.test("Sign in with Google"));
+    assert.ok(!re.test("Sign in with LinkedIn"));
+  }
+});
+
+// ── a posting that no longer exists says so, instead of blaming the sign-in form (sonos.wd1 2026-08-09) ──
+// The job URL rendered Workday's not-found shell in 132 characters. There is no Apply button on it, so
+// the run walked on to the auth wait and halted "auth-form-not-rendered — the sign-in fields never
+// appeared" — which reads as a sign-in bug on a tenant that signs in fine, and cost exactly that detour.
+test("job posting gone: Workday's not-found shell is recognized, and a real posting is not", () => {
+  assert.ok(isJobPostingGone("Skip to main content\nThe page you are looking for doesn't exist.\nSearch for Jobs"));
+  assert.ok(isJobPostingGone("The page you are looking for does not exist."));   // unabbreviated
+  assert.ok(isJobPostingGone("the page you   are looking\n for doesn't exist")); // wrapped + collapsed
+  // a real posting must never trip it, including one that talks about existing systems
+  assert.ok(!isJobPostingGone("Junior Embedded Software Development Engineer\nApply\nSonos"));
+  assert.ok(!isJobPostingGone("You will extend the existing platform and improve pages users are looking for."));
+  assert.ok(!isJobPostingGone(""));
+  assert.ok(!isJobPostingGone(null));
 });

@@ -473,3 +473,102 @@ test("STRUCTURED: a multi-field section stays strict — a cross-entry swap stil
   assert.ok(!r.agree.some((a) => a.tier === "entry-reordered"),
     "a multi-field section must never take the order-free re-pair path: " + JSON.stringify(r.agree.map((a) => a.tier)));
 });
+
+// ── A SIGNATURE date reconciles against TODAY, matching what the replay writes (2026-08-07) ─────────
+// replayField re-derives a signature date to today (Workday refuses the page with "Enter today's date"
+// otherwise). Without the matching change here the reconcile compared the page against the stale
+// APPROVED literal and reported the replay's own correct behaviour as a contradiction, blocking the
+// gate: `= "Date*": approved "8/6/2026" but the page shows "08/07/2026"` (live, waystar.wd1).
+// All four assertions go through the KEYED path (a `key` on the record) so they test the real compare,
+// not the value-presence fallback.
+const _mmddyyyy = (d) => `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`;
+const SIG_TODAY = _mmddyyyy(new Date());
+const SIG_YESTERDAY = _mmddyyyy(new Date(Date.now() - 86400000));
+const _pad = (s) => { const [m, d, y] = s.split("/"); return `${String(m).padStart(2, "0")}/${String(d).padStart(2, "0")}/${y}`; };
+
+test("reconcile: an approved-YESTERDAY signature date AGREES with today shown on the page", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: _pad(SIG_TODAY) })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 0, "the replay writes today on purpose — not a contradiction");
+  assert.strictEqual(r.agree[0].tier, "keyed", "must be the keyed compare, not value-presence");
+});
+
+test("reconcile: a signature date showing some OTHER day still DISAGREES", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: "01/02/2020" })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 1, "a page date that is not today is still a real contradiction");
+});
+
+test("reconcile: a NON-signature date is still held to the APPROVED value", () => {
+  const ok = reconcileReviewPage(
+    [rrec({ label: "Start Date", key: "startDate", value: _pad(SIG_YESTERDAY) })],
+    [entry({ question_label: "Start Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-startDate" })]
+  );
+  assert.strictEqual(ok.counts.disagree, 0, "a start date matching its approved value agrees");
+  const bad = reconcileReviewPage(
+    [rrec({ label: "Start Date", key: "startDate", value: _pad(SIG_TODAY) })],
+    [entry({ question_label: "Start Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-startDate" })]
+  );
+  assert.strictEqual(bad.counts.disagree, 1, "a start date silently changed to today IS a contradiction");
+});
+
+// ── After the 2026-08-08 policy change, EITHER value is correct for a signature date ────────────────
+// The replay no longer re-derives a signature date; it follows the review page, and today is stamped
+// only REACTIVELY when Workday returns "Enter today's date". So both outcomes are legitimate:
+//   Workday never asked → the page holds the APPROVED value
+//   Workday asked       → the walk stamped TODAY and re-saved
+// Comparing against today alone (which is what the previous commit did, correctly, for the OLD replay
+// behaviour) would now report a false DISAGREE on the first case and block a clean submit.
+test("reconcile: a signature date matching its APPROVED value agrees (Workday never asked)", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: _pad(SIG_YESTERDAY) })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 0, "the page shows exactly what was approved — never a contradiction");
+});
+test("reconcile: a signature date stamped TODAY also agrees (Workday asked, the walk re-saved)", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: _pad(SIG_TODAY) })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 0, "the reactive stamp is a legitimate page value too");
+});
+test("reconcile: a THIRD date is still a real DISAGREE — accepting two values is not accepting any", () => {
+  const r = reconcileReviewPage(
+    [rrec({ label: "Date", key: "dateSignedOn", value: "01/02/2020" })],
+    [entry({ question_label: "Date*", current_value: SIG_YESTERDAY, field_id: "P5::formField-dateSignedOn" })]
+  );
+  assert.strictEqual(r.counts.disagree, 1);
+});
+
+// ── one job must key the same from its posting URL and its form URL (moog/hp live 2026-08-09) ──
+// The req-id tiers exist because the path is NOT stable: Workday's form URL carries an "en-US/" locale
+// segment and percent-encodes the location ("Buffalo%2C-NY") while the posting link has neither. Moog's
+// id is R-26-18835 — a separator between the letters and the digits, which the "_R<digits>" tier and the
+// letters+digits tier both required to be absent — so every tier missed, the key fell to the path, and
+// the submit rehearsal REFUSED its own approved bundle ("no approved bundle for job_key …").
+{
+  const { canonicalJobUrl } = require("../lib.js");
+  const { test: t2 } = require("node:test");
+  t2("canonicalJobUrl: the posting URL and the form URL of one job produce ONE key", () => {
+    const same = (a, b, label) => assert.strictEqual(canonicalJobUrl(a), canonicalJobUrl(b), label);
+    same("https://moog.wd5.myworkdayjobs.com/MOOG_External_Career_Site/job/Buffalo-NY/Intern--Electrical-Engineering_R-26-18835",
+         "https://moog.wd5.myworkdayjobs.com/en-US/MOOG_External_Career_Site/job/Buffalo%2C-NY/Intern--Electrical-Engineering_R-26-18835/apply/autofillWithResume",
+         "moog: separator in the req id (R-26-18835)");
+    same("https://hp.wd5.myworkdayjobs.com/ExternalCareerSite/job/Corvallis-Oregon/Internship_3167270-1",
+         "https://hp.wd5.myworkdayjobs.com/en-US/ExternalCareerSite/job/Corvallis%2C-Oregon/Internship_3167270-1/apply",
+         "hp: numeric id with a -1 suffix");
+    // both key off the requisition, not the path
+    assert.strictEqual(canonicalJobUrl("https://moog.wd5.myworkdayjobs.com/x/job/y/z_R-26-18835"), "wd5:r-26-18835");
+    assert.strictEqual(canonicalJobUrl("https://hp.wd5.myworkdayjobs.com/x/job/y/z_3167270-1"), "wd5:3167270-1");
+
+    // REGRESSION: every key that already worked must be byte-identical, or stored bundles orphan.
+    assert.strictEqual(canonicalJobUrl("https://marvell.wd1.myworkdayjobs.com/en-US/MarvellCareers/job/San-Diego%2C-CA/Sr-Principal-SoC-Verification-Engineer_2601615/apply"), "wd1:2601615");
+    assert.strictEqual(canonicalJobUrl("https://x.wd5.myworkdayjobs.com/site/job/Loc/Title_R438146"), "wd5:r438146");
+    assert.strictEqual(canonicalJobUrl("https://copart.wd1.myworkdayjobs.com/site/job/Harrisburg%2C-PA/Title_JR109393"), "wd1:jr109393");
+  });
+}

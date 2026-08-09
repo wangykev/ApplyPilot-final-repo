@@ -3481,3 +3481,505 @@ from settle start (the page has often already had its 2.5s by the time the loop 
 appealing and would reclaim most of the dead time, but it is strictly less conservative — on a page
 whose mounting finishes at 4s the loop could accept at 3s — and nothing measured here justifies that
 trade. If it is ever attempted, it needs a slow-form counter-example first, not a fast-form win.
+
+## 2026-08-04 — waystar.wd1: what Workday does NOT persist when you re-enter a saved application
+
+Two tenants (waystar.wd1, radiancetech.wd12) halted on the SAME page with the same error —
+`Error-Please check one of the boxes below:The field Please check one of the boxes below: is
+required and must have a value` — after the fill had committed the disability self-ID group and
+logged the value. The audit could not re-read the group (`audit-unverifiable`), and by Save time
+`disabilityStatus ""*`. The standing suspicion was that the self-ID form's own Language dropdown
+(`disabilityForm`) re-renders the form and wipes the box. Traced it instead of guessing further.
+
+**Page map (waystar, 6 steps).** The apply flow names its steps, and the disability group lives on
+step 5, NOT with the other EEO questions on step 4:
+
+    step 1 My Information        step 4 Voluntary Disclosures
+    step 2 My Experience         step 5 Self Identify      <- disabilityStatus, disabilityForm,
+    step 3 Application Questions step 6 Review                name, dateSignedOn, employeeId
+
+The progress bar is a `<li>` list and is NOT clickable — you cannot jump to a step; only Save and
+Continue advances.
+
+**The finding.** Re-entered the completed (unsubmitted) application through Candidate Home ->
+`actionMenuTarget` -> "Continue Application", which restarts at step 1, and read step 4's DOM. The
+extension had filled and saved that page minutes earlier and the review page had agreed. On
+re-entry:
+
+    ethnicity                 dropdown  "Asian (United States of America)"   PERSISTED
+    gender                    dropdown  "Male"                              PERSISTED
+    veteranStatus             dropdown  "I AM NOT A VETERAN"                 PERSISTED
+    hispanicOrLatino          dropdown  "Select One"                         ** NOT persisted **
+    acceptTermsAndAgreements  checkbox  false                                ** NOT persisted **
+
+and Workday demanded both again:
+
+    Error-Please indicate if you are Hispanic or Latino?
+    Error-I have read and accept the Terms and Conditions for submitting an application with Waystar
+
+So **Workday does not persist every answer on these pages across a re-entry of the flow** — three
+sibling dropdowns on the SAME page came back filled while a fourth dropdown and the checkbox came
+back empty. Nothing about the fill explains that; the server simply did not keep them.
+
+**Why this reframes the disability bug.** The wiped field here is a CHECKBOX, and `disabilityStatus`
+is a `checkbox_group`. The likelier mechanism is therefore not "the Language dropdown re-renders the
+form" but "**Workday re-initialises checkbox-family widgets on the self-ID / voluntary-disclosure
+pages to unchecked whenever the page is (re)entered or re-rendered, so the value only holds if it is
+set and saved within the same visit**". That fits every observation: the commit read back fine, the
+audit hit the group mid-re-init and could not read it (`audit-unverifiable`), and Save saw nothing.
+It is also intermittent, because it depends on a re-render landing after the commit.
+
+**Consequence for the walks.** A value being on the form when we set it is not the same claim as
+Workday having kept it, so the only reliable check is a fresh read immediately before Save — which is
+what the pre-Save re-verify does, now on BOTH walks (2026-08-04). Verified live on this exact field:
+
+    page 5: 1 REQUIRED field(s) were filled but read BLANK now — re-filling before Save & Continue:
+      "Please check one of the boxes below:*" (filled "No, I do not have a disability and have not had one in the past")
+       ✓ re-filled — the page holds the filled values again.
+    ✓ page 5 → advanced.   ✓✓ reached the REVIEW page after 5 page(s)
+
+waystar had halted on that page twice before; it then went fill -> approve -> rehearse ->
+AGREE 53 · DISAGREE 0 -> SUBMIT GATE PASSED.
+
+**Not settled.** Whether the re-initialisation is triggered by the Language dropdown specifically, by
+any re-render, or purely by page (re)entry. Answering it needs a tab PARKED on step 5, which the
+pre-Save re-verify now prevents by healing the page — the trace hit its limit here because advancing
+past step 4 by hand requires ticking "I have read and accept the Terms and Conditions", which the bot
+must not do on the operator's behalf. Give `AP_DEV_WD_PROBE` a way to reach step 5 itself (it already
+does the check-a-box-and-re-read experiment) and the question closes.
+
+## 2026-08-04 (b) — the self-ID checkbox group: Workday REBUILDS it after a verified fill
+
+Correcting the entry above, which blamed the Language dropdown, and correcting two further guesses of
+mine along the way. The operator settled the first one by hand: with the box already checked, switching
+Language English↔Spanish does NOT uncheck it (the probe agreed — the box stayed checked while every
+label turned Spanish). Then: "I saw the fill click it and immediately after uncheck it."
+
+**Measured, four instrumented runs** (`debugInputTrace` for the click log, `skipPreSaveReverify` so the
+backstop could not hide the failure):
+
+    run  settle  flat fill  group clicked ≈  in initial scan  fill verify  audit             outcome
+    A    2.6s    3.8s       ~6.4s            no               ok           could not re-read HALT
+    B    6.1s    10.9s      ~17s             no               ok           matched           review
+    C    1.3s    7.8s       ~9.1s            YES              ok           matched           review
+    D    2.3s    18.5s      ~20.8s           no               ok           could not re-read HALT
+
+**Timing is not the variable.** D clicked the group ~20.8s after the page arrived and FAILED; B clicked
+at ~17s and passed. So this is not "we click it before it is ready", and no settle-before-clicking gate
+fixes it. Both of those were my hypotheses; both are wrong.
+
+**We do not double-click it either.** The trusted-input log shows exactly ONE click on the group per run,
+then nothing until Save & Continue. The uncheck is not ours.
+
+What the record says on a failing run — the smoking gun, because `currently:` is a LIVE read:
+
+    ⚠ [needs_review] disabilityStatus (checkbox_group) — "Please check one of the boxes below:*"
+       → "No, I do not have a disability and have not had one in the past"
+       | AUDIT: could not re-read to verify
+       | currently: "No, I do not have a disability and have not had one in the past"
+
+So the click LANDED and verified. Then the M40 audit could not read the group at all
+(`readCheckboxGroup` → null when the wrapper is gone, `[]` when it holds no boxes), and by Save time the
+field read `""`. **Workday rebuilds the widget after we fill it, and it comes back empty.** The operator
+watched exactly that: checked, then instantly unchecked. Predictor across all four runs: failure ⟺ "audit
+could not re-read" (2/2 failures, 2/2 passes read fine).
+
+**Fix — the same guard the dropdown commit has always had** ("a momentary pick discarded on
+render-complete is never reported filled"), which the checkbox group never had: after a verified commit,
+re-read on real wall-clock (`delayFull`, since we are waiting on Workday's rebuild); unreadable ⇒
+mid-rebuild, wait and judge when it returns; returned empty ⇒ re-fill and keep confirming; bounded, and
+judged on a FRESH read, never a re-fill's own read-back. A rebuild that keeps eating the value ends
+`needs_review` + `checkbox-group-rebuilt` instead of a false `filled`. Ids are matched by LABEL too — a
+rebuild can re-issue them.
+
+**Verified:** 4 consecutive passes with `skipPreSaveReverify` ARMED, i.e. the pre-Save re-verify could not
+have masked a failed first fill. Against a pre-fix rate of 2 failures in 4, that is ~6% by chance — good
+evidence, not proof; this is a flake and it deserves re-checking whenever page 5 is touched.
+
+**Still open:** what triggers the rebuild. It is asynchronous relative to our fill and to the audit
+(2 of 4 runs), which is why the fix confirms persistence rather than trying to schedule around it.
+
+## 2026-08-04 (c) — HIDDEN runs: Workday rejects synthetic text/date on the Self Identify page
+
+Operator's instinct, and it found a bug the visible runs never could: "test it on hidden too". Hidden is
+a different actuation path — `cdpSynthInput()` returns true only when the tab is hidden, so a background
+fill dispatches page-side synthetic events instead of trusted `Input.*`.
+
+    hidden + SYNTHETIC   2 / 2 FAILED
+    hidden + TRUSTED     1 / 1 passed      (chrome.storage.local.forceTrustedInput)
+    visible (trusted)    11 / 12 passed
+
+The two hidden failures are identical, and the shape is new:
+
+    page errors (2):
+      • Error-NameThe field Name is required and must have a value.
+      • Error-DateThe field Date is required and must have a value.
+    [FIELD-DIAG] name="Kevin Wang"* · dateSignedOn="08/04/2026"* · disabilityStatus="No, I do not have…"*
+
+**Workday says the fields are empty while the DOM plainly holds the values.** So the synthetic
+native-setter write lands in the DOM and the application never registers it. That is the SAME failure
+this repo already recorded for the AUTH form ("fields read back OK but the Sign In submit never fired;
+the auth app doesn't register native-setter values"), which is why onboarding stays trusted. The Self
+Identify page is a second such surface, and `forceTrustedInput` clears it outright.
+
+Two useful side-findings:
+
+* **The checkbox-group fixes hold under synthetic.** `disabilityStatus` committed and kept its value on
+  both hidden runs (quiescence gate waited 440ms / 425ms). The group was never the hidden problem.
+* **No DOM-based guard can catch this.** The pre-Save re-verify, `requiredBlankOnPage` and the new
+  required-unverified/unfilled halts all read the DOM — which agrees with us. Only Workday disagrees.
+
+**Why the existing remediation does not save it.** The ladder already has both a Tier-1 trusted re-fill
+and a Tier-0.5 phantom-required nudge, and the 2026-08-02 entry already demoted the nudge below the
+trusted re-write for exactly this reason. It still fails here because:
+
+  1. Tier 1 selects fields via `mappedFieldsFromErrors`, which only considers fields present in
+     `FIELD_MAP` (`if (!f || !fm[f.fieldName]) continue`). `name` and `dateSignedOn` on this page are
+     AI/recognizer-filled and are NOT in FIELD_MAP, so `refill` comes back empty and Tier 1 is skipped.
+  2. Tier 0.5 then runs, correctly identifies the phantom ("Workday says Name + Date are empty, but the
+     page HOLDS …"), and applies a focus→blur nudge via `cdpEval` — page-side again, i.e. the very kind
+     of interaction this surface ignores. `remediation made NO PROGRESS` and the walk halts.
+
+**The fix this points at** (not yet built): the phantom-required remedy should RE-TYPE the value the page
+already holds using TRUSTED input, rather than nudging it page-side. It changes no value, needs no
+FIELD_MAP entry, and trusted input is the one thing measured to work here. Restoring synthetic afterwards
+keeps the hidden-tab speed win for the rest of the page, exactly as Tier 1 already does.
+
+## 2026-08-05 — page 2 is slow because of TRUSTED INPUT, not occlusion (correcting the entry above)
+
+I attributed a 39s page 2 to the occlusion blind spot: window behind another app, so trusted input
+stalls on missing frames. Then a run on a tab the new paint probe CONFIRMED was painting took 38.3s.
+So occlusion was not the cause.
+
+    hidden  + synthetic    11.1s, 10.9s
+    visible + trusted      14s, 39s, 38.3s      (the 38.3s one: probe says "painting (visible)")
+
+Trusted `Input.*` is simply more expensive per event than a page-side synthetic dispatch — it goes
+through the browser's whole input pipeline, while synthetic is one Runtime.evaluate. Page 2 is the page
+dominated by input events (work experience + education text, dates, a typeahead, websites), so that is
+where the difference shows; every other page sits at 6-11s in both modes. The 14s-vs-38s spread tracks
+how much SECTION work a run had — the 38.3s run spent 14.5s on `website[0].url` alone, a field the 14s
+run never touched.
+
+What the paint probe is actually worth, stated honestly: it measures the right thing and it logs it, so
+"visible but not painting" is no longer invisible. But the new case it enables — visible AND not
+painting — has not been shown to exist or to matter, and it is NOT what made page 2 slow. It is a
+diagnostic win, not the speed win the previous entry implied.
+
+The speed lever the data does point at: if synthetic is ~3x cheaper per event and page 2 is
+event-bound, the question is not "when are we not painting" but "why use trusted input on form pages at
+all, when synthetic is already proven there and hidden runs finish page 2 in 11s". That is a policy
+change, with trusted kept where it is REQUIRED: the auth form, the self-ID page's text/date fields, and
+the single irreversible submit click.
+
+## 2026-08-05 — waystar.wd1 Self Identify: Workday's MODEL loses the Date, and four remedies that do not fix it
+
+Observed during a REHEARSAL (replay) on `waystar.wd1`, page 5 ("Self Identify"), reproducibly across
+three arrivals in one run. Save & Continue is refused with:
+
+```
+Error-Date  The field Date is required and must have a value.
+```
+
+…on a `dateSignedOn` composite that plainly holds the value. The `[FIELD-DIAG]` dump is unambiguous —
+every layer we can read agrees the value is present:
+
+```
+INPUT[dateSectionMonth-input] domValue "8"    reactProps "8"    reactFiber "8"    ariaValueNow "8"    ariaInvalid null
+INPUT[dateSectionDay-input]   domValue "5"    reactProps "5"    reactFiber "5"    ariaValueNow "5"    ariaInvalid null
+INPUT[dateSectionYear-input]  domValue "2026" reactProps "2026" reactFiber "2026" ariaValueNow "2026" ariaInvalid null
+wrapper text: "Date*current value is 8/5/2026 08/05/2026 … Error: The field Date is required and must have a value."
+```
+
+So this is **not** the synthetic-input class (React would be empty) and **not** a value that reverted
+(the DOM would be empty). Per the diag's own legend: *both set ⇒ Workday's model disagrees with its own
+DOM.* The thing holding "unanswered" is Workday's **form model**, server-side of the React tree — and
+nothing typed into the page reaches it.
+
+**Four remedies tried, all refuted live:**
+
+1. **Trusted re-write of the field** (`fillDateCompositeCdp`, synthetic forced off). No effect.
+2. **focus→blur commit nudge** (`nudgePhantomRequired`). No effect — now failed live 3x total.
+3. **Byte-identical re-type is a no-op by construction.** Both of the above re-enter *the value the page
+   already shows*: `focusDateSegment` triple-click-SELECTS the segment and typing the same digits leaves
+   it identical, so no value transition ever occurs. `forceSegmentTransition` (2026-08-05) now empties
+   each segment with a **segment-scoped Backspace** first — never Ctrl+A, which spans the whole composite
+   and resets focus to Month — giving a real empty→value transition. Still did not clear the error, but
+   it is kept because writing a value over itself cannot re-answer a question even in principle.
+4. **Reload + replay from page 1.** Refuted: page 5 reached 3x, phantom fired 2x, both re-entries hit the
+   identical error. Removed from the code with a ⛔ marker so it is not re-added.
+
+**What #4 DID establish** (worth keeping, it is the operator's "only refill what didn't latch"): the
+return trip is cheap, because the answers that latched are still saved. Page 1 on re-entry:
+`15 field(s) — 0 changed, 13 already-correct, 2 not-actuated, 0 FAILED`. So `skipIfCorrect` behaves
+exactly as intended; the cost of re-entry is not the problem, the *remedy* is.
+
+**The untried remedy — implement this next (operator's, and the only one not yet refuted).** NOT a
+reload: click **Back** one page, confirm Workday's leave-page dialog, verify the previous page, then
+**Save & Continue forward** again. The mechanism differs in kind: it makes Workday re-POST the previous
+page and re-DERIVE this page's model server-side, rather than restoring the same broken model that a
+reload restores. Prerequisite: this repo has never touched Workday's Back control or its confirm dialog,
+so **trace both first** (footer/breadcrumb automation-ids, and whether the dialog is a real modal or a
+portaled overlay) before writing the handler.
+
+**Attribution note.** Do not reflexively blame phantom state from repeated runs. This form was run twice
+before the rehearsal, so stale server state is plausible — but the fill walk SAVED this same page
+successfully minutes earlier, and the failure is specific to re-entering a SAVED application, which is
+what a replay always does. It is consistent with the already-recorded finding that Workday drops some
+self-ID answers on re-entry while sibling dropdowns persist.
+
+## 2026-08-07 — SKILLS ("Type to Add Skills") on cat.wd5: the multi-value typeahead, traced end to end
+
+First full trace of the Skills widget, done by hand in the operator's own signed-in session on the Solar
+Turbines draft (`cat.wd5/solarturbines`, page 2 "My Experience", `formField-skills`, label
+**"Type to Add Skills"**, OPTIONAL). It had been `skipped: no mapping` since 2026-06-04. Everything below
+was observed, and several points refute what the single-value typeahead path would have assumed.
+
+**Structure.** Closed, the wrapper holds `multiSelectContainer[data-uxi-widget-type=multiselect]` →
+`multiselectInputContainer` → `div[data-automation-hiddensearch=false]` → `input#skills--skills`
+(placeholder "Search") + `promptAriaInstruction` reading **"0 items selected"**.
+
+- **The input GAINS `data-automation-id="searchBox"` only once opened** (and `hiddensearch` flips to
+  `true`). So `cdpReadHierState` reports `searchBox.present:false` on a closed widget — the open click is
+  a precondition for reading it at all, not just for typing.
+- **On open with an empty query the list is "No Items."** There is no browsable catalog, so a start-scrape
+  (`makeStartCapture`) and `captureChoiceOptions` both come back empty here — no pre-scrape
+  short-circuit, and no option list for the review editor. That is a property of the widget, not a bug.
+- The open list is also where the **chip-contamination rule** proves itself again: a page-wide
+  `promptOption` read returned "Carnegie Mellon University" and "Electrical and Computer Engineering" —
+  the *school* and *field-of-study* chips from the Education section above. `cdpReadHierState`'s
+  `selectedItemList` exclusion already removes them.
+
+**It does NOT live-filter — ENTER is the filter trigger** (the US Bank `source` family). Typing "Python"
+and waiting 2s left the list on "No Items."; Enter produced the `promptTitle` banner **"Search Results"**.
+
+**Chip anatomy** (the delete affordance, and why a chip embeds an option):
+```
+li[data-automation-id=menuItem][role=presentation]
+  div[data-automation-id=selectedItem][role=option][aria-label="Docker, press delete to clear value."]
+    div[data-automation-id=DELETE_charm][role=presentation]      ← the X
+    p[data-automation-id=promptOption]  "Docker"                 ← why a chip reads as an option
+```
+After a commit `promptAriaInstruction` reads **"1 item selected, Docker"** — a clean read-back signal.
+
+### The findings that decide the design
+
+**1. The taxonomy RENAMES, so a plain exact match fills almost nothing.** "Python" is offered ONLY as
+`Python (Programming Language)` (plus `Python IDLE`) — there is no bare "Python" row. "Docker" is offered
+as BOTH `Docker` and `Docker (Software)`. The trailing parenthetical is a QUALIFIER Workday added, the
+same shape `normalize()` already strips off a dial code `(+1)`. Hence `skillBaseName` + a "qualified"
+match tier, with a **bare exact winning** so "Docker" never resolves to "Docker (Software)".
+
+**2. The search is SERVER-SIDE FUZZY and answers almost anything — its results are NOT candidates.**
+Measured:
+
+| typed | Workday returned |
+|---|---|
+| `Yosys` | **Yodiz**, GoSystem Tax RS |
+| `ODrive` | **Top Drive**, Optical Disk Drives |
+| `CubeMars motor drivers` | Motor Drives, Motor Controllers |
+| `zzqqxwvj` (gibberish) | z/VM, Xilinx Zynq |
+
+Every one of those came back under a "Search Results" banner, indistinguishable in shape from a real hit.
+So containment, Levenshtein and "take the first row" are not weak tiers on this field — they are wrong
+answers waiting to be committed onto an application. **Exact/qualified only**, ambiguity-guarded; a skill
+Workday does not know stays OFF the form and is named for the human.
+
+**3. Committing ADDS and the list STAYS OPEN.** A synthetic pointer sequence
+(`pointerdown→mousedown→pointerup→mouseup→click`) on the leaf committed fine — chip added, **query still
+in the box, list still rendered** — so N skills go in on ONE open, with no re-open or re-focus between
+them. Note this widget does NOT need trusted input for the commit (unlike the Self Identify page).
+
+**4. ⚠ A ZERO-RESULT query + Enter makes Workday ADD THE TYPED TEXT as a brand-new skill.** This is how a
+dirty box becomes a fabricated answer, and it happened during the trace: with "Docker" left in the box a
+`ctrl+a` that did not take effect meant the next skill APPENDED, and Enter created the chip
+**"DockerCubeMars motor drivers"** — a skill nobody claimed. (Deleted via `DELETE_charm`.) On every other
+typeahead a dirty box merely wastes a candidate; here it writes a wrong value. So the clear is a **HARD
+GATE** on this field: unverified-empty ⇒ do not press Enter.
+It is also the ONLY path by which an off-taxonomy skill can land verbatim — but it is not reachable on
+demand, because the fuzzy search nearly always returns *something* (see the gibberish row above).
+
+**5. An already-selected skill DISAPPEARS from its own future results.** With "Docker" committed,
+re-searching `Docker` offered only `Docker (Software)` and `Dockerfile`. Two consequences: re-clicking
+cannot toggle a chip off (the row is not there), and **a re-fill that does not dedup against the existing
+chips will commit a near-duplicate** — the exact reason `missingSkills` compares BASE names in both
+directions, so a `Python (Programming Language)` chip covers a profile "Python".
+
+**Tab-blur is the clean exit** (as everywhere else): the query cleared, the list closed, the `searchBox`
+automation-id disappeared, and NO stray chip was created.
+
+**Résumé auto-parse did NOT pre-populate anything here.** The widget was empty on arrival, because this
+pipeline reaches the form via **Apply Manually**, which skips Workday's résumé-parse step — so the
+operator's "check what the parse already populated first" is still the right rule (a human who clicks
+Autofill with Resume WILL see chips), but on our path the field starts blank and the dedup guard is what
+makes the rule safe rather than an optimisation.
+
+**Left on the page:** one legitimate chip, `Docker` (a real skill of the operator's) — deliberately kept
+as a pre-existing-chip fixture for verifying the never-touch rule on the next run.
+
+## 2026-08-07 (b) — SKILLS live: what actually breaks it, VISIBLE vs HIDDEN
+
+Six real runs on the same Solar Turbines draft (`cat.wd5`), fill walk, one operator profile of 24 skills.
+The widget works on both surfaces, but only after the OPEN was fixed — and the fix is not the one the
+symptom suggested.
+
+**VISIBLE (trusted input) — worked first time.** Added 7 of 24 and the qualified tier fired live:
+`C → C (Programming Language)`, `Python → Python (Programming Language)`,
+`Java → Java (Programming Language)`, plus exact hits `SystemVerilog`, `Modbus`, `Raspberry Pi`, `Linux`.
+`slowest: skills 33s` for the whole field — it dominates page 2 and always will.
+
+**HIDDEN (synthetic input) — failed with a misleading signature.** Three open attempts per skill, each
+reporting `{focused:true, ok:true, openedNow:false}`: the input was found and focused, but the searchBox
+automation-id never appeared, so ZERO skills were added while seven chips from an earlier run sat there
+looking like success. **The same run with `forceTrustedInput` opened and searched normally**
+(`cand "C++" → results (1314ms, 7 options, open:true)`), which reads exactly like "this widget needs
+trusted events" — the documented pattern for the auth form and the Self Identify page.
+
+**That conclusion was wrong, and an isolation probe is what showed it.** Scoping trusted input to the
+field did NOT fix it (verified from the log: "synthetic input ENABLED" appeared twice, so the switch and
+restore both ran). What fixed it was the OPENER:
+
+- **Never fire both opener routes in one attempt.** The first cut clicked the input page-side and then
+  immediately coordinate-clicked the container; the second click landed before the searchBox mounted, and
+  a second click on a multiselect **toggles it shut** — so the poll always found it closed. This is the
+  same toggle-shut invariant the unified typeahead filler already documents.
+- **Retry, alternating routes, after a settle beat.** The open races Workday's re-render right after the
+  preceding field commits — which is why the SLOWER trusted run opened on attempt 1 and the faster
+  synthetic run missed every time. With one settle beat and the two routes alternating, a hidden
+  *synthetic* run filled the field normally: 13 candidates processed, adding `JavaScript`,
+  `Altium Designer`, `Git`, `Docker (Software)`, then `RViz`, `Fusion 360`, `Yosys` on the next run.
+- **So do NOT re-add trusted input to this field.** It roughly doubles the field's wall-clock and buys
+  nothing; the note in `fillSkillsCdp` says so at the call site.
+
+**The clear is the other flaky primitive, and the reason matters.** `cdpSelectAllDelete` (trusted
+Ctrl+A + Delete) is focus-blind, and on THIS widget Ctrl+A does not select the input's text — by hand the
+select-all went to the page and the next keystrokes APPENDED. Live it cleared fine for seven skills, then
+failed, and the field (first cut) abandoned the rest of the list — losing Git, Docker, VS Code and Vivado,
+all of which the taxonomy has. Now: a React-safe native-setter clear (`clearHierInput`) is tried first,
+trusted Ctrl+A is the fallback, a failure RETRIES, and only a second consecutive failure ends the field —
+a skipped skill is reported as an infra failure, never as "Workday doesn't have it".
+
+**Coverage varies RUN TO RUN, because the result set is a ranked top-7.** `Yosys`, `RViz` and `Fusion 360`
+matched on one run and not the previous one. And strictness has a real cost worth stating plainly: a skill
+whose only offered row is a differently-named relative (e.g. `Vivado` against rows like `Xilinx Vivado`)
+is deliberately left OFF — accepting it would be the containment guess this project bans. Those skills are
+named in the record so the human can add them by hand.
+
+**An `autocommit` terminal can fire with NO new chip** (live: `cand "C++" → autocommit, 0 options`, and no
+C++ chip afterwards). `awaitListTerminal` reports autocommit whenever the chip SET differs from the
+snapshot, which a re-order/re-render also produces. Nothing added, nothing strayed — so it is bucketed as
+a failure rather than disappearing from the report.
+
+### ⚠ The coordinate opener can DELETE a chip — aim at the INPUT, never the container
+
+The signal above is what exposed it. `Git` was on the form after one run and **GONE** after the next, in the
+very run that logged `cand "C++" → autocommit, 0 options` — our own "the chip set changed" test firing on a
+REMOVAL, not an addition.
+
+Cause: the shared `openHier` ladder resolves `[data-automation-id="multiselectInputContainer"]` first and
+clicks its **centre**. That is safe on a single-value picker, but this container **grows with every chip**,
+so its centre drifts onto a CHIP — and `DELETE_charm` (the X) is a child of the chip. The opener was
+deleting skills it had just added.
+
+Fix: the coordinate route now targets the **input's own rect** (`clickHierInputRect`); the input is a
+distinct element from the chip list, so the click opens the widget and cannot delete anything. Both routes
+are still needed — a run using ONLY the page-side focus+click opened nothing (1 candidate, `needs_review`),
+so the reliable open is the trusted coordinate click; it just has to be aimed correctly.
+
+**Converged result (hidden, synthetic):** 11 remaining candidates attempted, `ROS 2` and `Git` added,
+**nothing lost**, status `filled` — 15 of the profile's 24 skills on the form. The nine that stay off
+(`C++`, `HTML/CSS`, `CAN`, `ODrive`, `CubeMars motor drivers`, `rqt`, `PCB design`, `VS Code`, `Vivado`)
+have no exact-or-qualified row in Workday's taxonomy on this tenant, and are named in the record.
+
+## 2026-08-07 (c) — SKILLS: the CONTAINMENT tier, and exactly what Workday offers
+
+Operator decision: accept a containment match for skills so `Vivado` lands. Enabled as the LAST tier in
+`matchSkillOption`, and the guards below are not caution for its own sake — every one of them fired on the
+very run that verified the feature. **This is a skills-only exception; the rest of the codebase keeps
+"containment is a guess".**
+
+What Workday actually returned for the nine skills that had not matched (top rows, one live run):
+
+| typed | Workday's rows | outcome |
+|---|---|---|
+| `Vivado` | **Xilinx Vivado**, Vivado HLS | **CONTAINMENT → "Xilinx Vivado"** (2 rows contain it → tie broken on Workday's ranking; the alternative is named in the review) |
+| `PCB design` | PCB Design … | **matched** |
+| `rqt` | Retek, RFQ Responses, ReQlogic, Retesting | **free-text add** — zero real matches, so Workday added `rqt` verbatim |
+| `CAN` | CANopen, CANape, Canorus, **Can Openers** | **refused** — and note "Can Openers" IS a whole-word hit for "can". The **lone-token ≥5 chars** gate is the only thing standing between an embedded engineer and a "Can Openers" skill |
+| `C++` | C (Programming Language), C NMR, C/AL, C-Arm | refused (no row contains `c++`; committing "C (Programming Language)" would be a different skill) |
+| `HTML/CSS` | CSS HTML, XHTML CSS, Cshtml, CSS Framework | refused (the phrase never appears) |
+| `ODrive` | Top Drive, Optical Disk Drives, Driveline | refused |
+| `CubeMars motor drivers` | Motor Drives, Motor Controllers, Motor Driving | refused |
+| `VS Code` | ISM Code, CodeTwo, M-Code, Code V (Software) | refused |
+
+**The three guards:**
+1. **WHOLE-WORD, never raw substring.** Boundaries are non-alphanumeric. Plain `includes` would match
+   `Git` inside "Di**git**al" and `CAN` inside "**Can**adian" — a marketing skill on an embedded
+   engineer's application.
+2. **Distinctiveness:** multi-word, or a lone token ≥5 chars (`skillContainmentEligible`). Modelled on the
+   employer-match scan's rule. Blocks `CAN`, `C++`, `Git`, `rqt` from widening at all; passes `Vivado`.
+3. **Ranking tie-break:** several containing rows → Workday's own first result (the "pick the first" rule
+   the exact tier and `clickHierLeaf` already use), with the rejected rows carried into the review so a
+   human can switch. Refusing instead is what kept `Vivado` off the form on the previous run.
+
+**Every widened commit is `filled_review` + `skills-containment`**, and the detail spells out
+`Vivado → Xilinx Vivado (broader; Workday also offered Vivado HLS)`. `missingSkills` also treats a BROADER
+chip as covering the profile name, or the next pass would search `Vivado` again, find the selected row gone
+(Workday hides it) and widen onto `Vivado HLS` alongside.
+
+**Result: 18 of 24** — `Altium Designer`, `C (Programming Language)`, `Docker (Software)`, `Fusion 360`,
+`Git`, `Java (Programming Language)`, `JavaScript`, `Linux`, `Modbus`, `PCB design`,
+`Python (Programming Language)`, `Raspberry Pi`, `ROS 2`, `RViz`, `SystemVerilog`, `Yosys`, `rqt`,
+`Xilinx Vivado`. The remaining six are the refusals above, all correct.
+
+## 2026-08-07 (d) — AUTOFILL WITH RESUME: the flow a first application should actually take
+
+Operator's manual finding: the first application on a tenant should click **Autofill with Resume**, not
+Apply Manually, because Workday then parses the résumé and pre-populates the form — including the Skills
+section with its own suggestions. Traced and implemented the same day.
+
+**The chooser** (after `adventureButton`) offers four options, all by automation-id:
+`autofillWithResume` ("Autofill with Resume") · `applyManually` · `useMyLastApplication` (already in
+APPLY_REJECT) · `applyWithLinkedIn`.
+
+**The page order changes.** Autofill-with-Resume lands on `/apply/autofillWithResume` — a RÉSUMÉ page
+that comes BEFORE My Information:
+
+| step | page | notes |
+|---|---|---|
+| 1 | résumé upload | `input[type=file][data-automation-id="file-upload-input-ref"]`, gate `file-upload-successful`, footer `pageFooterNextButton` reading **"Continue"** — every id `attachResume` already drives |
+| 2 | My Information | the same 14 `formField-*` wrappers as the manual flow |
+| 3+ | My Experience, … | unchanged |
+
+**⚠ The résumé page reports ONE bare `formField-` wrapper**, so `isPastAuth` (fieldCount > 0 && no auth
+chrome) called it "the form". Onboarding therefore excludes it explicitly and consumes it — upload +
+Continue — before any reached-form return. First cut waited only 6s for it to mount, timed out, and the
+WALK picked the page up instead: it attached the résumé itself and wrote a junk 1-field bundle page. The
+wait is now render-budgeted (15s visible / 30s hidden), and the log shows onboarding owning it:
+`résumé page done — Workday parsed it; the next page has 14 field(s)`.
+
+**What the parse actually gives you, and why the fill still refills everything.** Live it filled name,
+country, phone type/code/number — and left `addressLine1`, `city`, `countryRegion`, `postalCode` and
+`source` EMPTY, and `candidateIsPreviousWorker` unanswered (Workday blocked Save & Continue on it). So the
+autofill is a bonus layer, never a substitute: the walk treats the page as a blank form and refills it.
+(A caution for anyone reading state by hand: a radio group's `input.value` is `"true"`/`"false"` as an
+ATTRIBUTE regardless of selection, and a checkbox's is `"on"` — reading those as state made the parse look
+like it had answered both when it had answered neither. Read `.checked`.)
+
+**Skills after the parse — the payoff.** The Skills multiselect arrives pre-populated, and each parsed chip
+is annotated: `Computer Hardware (Suggested)`, `Digital Systems (Suggested)`. Counts vary by run (1 on one
+posting, **15** on another).
+
+- **The "(Suggested)" suffix is UI provenance, not part of the name.** Workday's own review page prints the
+  bare name (operator), so `skillChipName` strips it wherever a chip becomes a recorded, deduped or
+  replayed VALUE — otherwise the bundle stores a value the review page never shows and the reconcile
+  reports a correctly-filled skill as missing.
+- **It has to be stripped on BOTH sides.** The moment the fill recorded bare names, the M40 audit — which
+  re-reads the raw chips — flagged a correctly-kept field `skills:audit-mismatch` on a live run.
+  `auditActualFromRaw` now cleans chips too (a no-op for every other typeahead).
+- Also of note: the review page needs a **"more (+)"** click to reveal the full list, and drops the
+  "(Suggested)" annotation. Both expected; neither affects the fill.
+
+**REHEARSE/SUBMIT deliberately does NOT come here.** It applies manually / continues, so the saved skills
+survive and Workday does not re-parse the résumé over them — `preferResumeAutofill` is set only by the
+FILL run (`AP_RUN_APPLICATION`).

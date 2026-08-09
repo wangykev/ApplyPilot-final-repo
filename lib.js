@@ -521,6 +521,157 @@ function splitGroupValue(v) {
   const s = String(v == null ? "" : v);
   return s.trim() === "" ? [] : s.split(GROUP_JOIN).map((x) => x.trim()).filter(Boolean);
 }
+// ── Workday SKILLS ("Type to Add Skills") ────────────────────────────────────
+// A MULTI-VALUE typeahead over Workday's OWN skill taxonomy. Traced live on cat.wd5 2026-08-07
+// (docs/dom-patterns.md). Two OBSERVED facts drive every helper here:
+//
+//  1. The taxonomy RENAMES. "Python" is offered only as "Python (Programming Language)" — there is
+//     no bare "Python" row — while "Docker" is offered as BOTH "Docker" and "Docker (Software)".
+//     So a plain exact match finds nothing for most skills, and that trailing parenthetical is a
+//     QUALIFIER Workday added, the same shape normalize() already strips off a dial code "(+1)".
+//
+//  2. The search is SERVER-SIDE FUZZY and answers almost anything. "Yosys" → "Yodiz" + "GoSystem
+//     Tax RS"; "ODrive" → "Top Drive" + "Optical Disk Drives"; even "zzqqxwvj" returns rows. The
+//     server has ALREADY fuzzed, badly — so containment, Levenshtein and "take the first row" are
+//     not weak tiers here, they are wrong answers waiting to be committed. Only an exact name
+//     (bare or qualified) may be committed; anything else is left for the human to add by hand.
+const SKILL_QUALIFIER_RE = /\s*\([^()]*\)\s*$/; // ONE trailing "(...)" — never a mid-string paren
+
+// Workday annotates a chip the RÉSUMÉ PARSE contributed as "Digital Systems (Suggested)" (traced live
+// 2026-08-07 on the Autofill-with-Resume flow). That suffix is UI provenance, not part of the skill's
+// name — Workday's own review page prints the bare name — so it is stripped before a chip is recorded,
+// deduped or replayed. Without this the bundle stores a value the review page never shows, and the
+// reconcile reports a correctly-filled skill as missing. Only this exact marker is removed; a real
+// qualifier like "(Programming Language)" is part of the name and stays.
+function skillChipName(s) {
+  return String(s == null ? "" : s).replace(/\s*\((?:suggested|recommended)\)\s*$/i, "").trim();
+}
+
+// "Python (Programming Language)" → "python". A name that is NOTHING but a parenthetical is kept
+// whole, so a degenerate option can't collapse to "" and match everything.
+function skillBaseName(s) {
+  const full = normalize(String(s == null ? "" : s));
+  const bare = full.replace(SKILL_QUALIFIER_RE, "").trim();
+  return bare || full;
+}
+
+// Match ONE profile skill against the live search results → { index, tier } (index -1 = commit
+// NOTHING). Two tiers, and deliberately no containment and no fuzzy tier (fact 2 above):
+//   • "exact"     — the option IS the skill               ("Docker" → "Docker")
+//   • "qualified" — the skill plus Workday's parenthetical ("Python" → "Python (Programming Language)")
+// A bare exact WINS, so "Docker" never resolves to "Docker (Software)" while the plain row is on
+// offer. Both tiers are AMBIGUITY-GUARDED: if two rows match, we cannot tell which the human meant
+// (e.g. "Python (Programming Language)" vs a hypothetical "Python (Snake)"), so we commit nothing.
+function matchSkillOption(skill, optionTexts) {
+  const opts = Array.isArray(optionTexts) ? optionTexts.map((t) => String(t == null ? "" : t)) : [];
+  const want = normalize(String(skill == null ? "" : skill));
+  if (!want || !opts.length) return { index: -1, tier: null };
+  const hits = (fn) => { const out = []; opts.forEach((t, i) => { if (fn(t)) out.push(i); }); return out; };
+  const exact = hits((t) => normalize(t) === want);
+  if (exact.length === 1) return { index: exact[0], tier: "exact" };
+  if (exact.length > 1) return { index: -1, tier: null, ambiguous: "exact" };
+  const wantBase = skillBaseName(want);
+  const qualified = hits((t) => skillBaseName(t) === wantBase);
+  if (qualified.length === 1) return { index: qualified[0], tier: "qualified" };
+  if (qualified.length > 1) return { index: -1, tier: null, ambiguous: "qualified" };
+  // TIER 3 — CONTAINMENT, an OPERATOR-AUTHORIZED exception to the standing "containment is a guess"
+  // rule (2026-08-07), so a skill Workday only lists under a broader name still lands: "Vivado" →
+  // "Xilinx Vivado". It is the LAST tier, it is ambiguity-guarded, and every commit through it is
+  // flagged for review — the operator sees exactly what was widened.
+  //
+  // WHOLE-WORD, not raw substring, and that is the load-bearing part. Plain `includes` on this
+  // vocabulary is actively wrong: "Git" is inside "Di**git**al" and "CAN" is inside "**Can**adian",
+  // so a raw substring tier would put a marketing skill on an embedded engineer's application.
+  if (!skillContainmentEligible(want)) return { index: -1, tier: null };
+  const contained = hits((t) => skillWholeWordIn(normalize(t), want));
+  if (contained.length === 1) return { index: contained[0], tier: "containment" };
+  if (contained.length > 1) {
+    // SEVERAL broader rows contain the skill. Refusing here is what kept "Vivado" off the form — live,
+    // Workday offered more than one row containing it. The tie is broken on WORKDAY'S OWN RANKING (its
+    // first result for that query), the same "pick the first" rule the exact tier and clickHierLeaf
+    // already use, rather than on a preference of ours about which product name is the "real" one. The
+    // alternatives ride along so the review names what else was on offer and the human can switch.
+    return { index: contained[0], tier: "containment",
+             alternatives: contained.slice(1).map((i) => opts[i]) };
+  }
+  return { index: -1, tier: null };
+}
+
+// Split a normalized skill into tokens, keeping the characters real skill names carry (+ # .) so
+// "c++", "c#" and "node.js" stay single tokens instead of dissolving.
+function skillTokens(s) {
+  return String(s == null ? "" : s).split(/[^a-z0-9+#.]+/).filter(Boolean);
+}
+
+// May this skill be matched by CONTAINMENT at all? A DISTINCTIVENESS gate, modelled on the
+// employer-match scan's rule (multi-word, or a lone word long enough to be unambiguous). A short lone
+// token is exactly where containment goes wrong — "CAN" (the bus) against "Canadian Payroll", "rqt",
+// "C++" — so those stay exact/qualified-only. "Vivado" (6) and "PCB design" (2 words) pass.
+const SKILL_CONTAINMENT_MIN_LONE = 5;
+function skillContainmentEligible(skill) {
+  const t = skillTokens(normalize(String(skill == null ? "" : skill)));
+  if (!t.length) return false;
+  return t.length >= 2 || t[0].length >= SKILL_CONTAINMENT_MIN_LONE;
+}
+
+// Does `needle` appear in `haystack` as a whole word / contiguous word sequence? Both are expected
+// normalized. Boundaries are non-alphanumeric (or the string ends), which is what separates
+// "vivado" ⊂ "xilinx vivado" (a real match) from "git" ⊂ "digital" (not one).
+function skillWholeWordIn(haystack, needle) {
+  const h = String(haystack == null ? "" : haystack), n = String(needle == null ? "" : needle);
+  if (!h || !n) return false;
+  const esc = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("(^|[^a-z0-9])" + esc + "([^a-z0-9]|$)").test(h);
+}
+
+// The SHARED core of the skills detector. The fill path recognises a live SCAN field and the
+// reconcile recognises a bundle ENTRY; routing both through this one predicate is what stops them
+// drifting into disagreeing about which field this even is. Deliberately anchored, never a bare
+// /skill/ test — a language-proficiency field and a prose "Skills" box must not match.
+function isSkillsFieldName(name, label) {
+  if (/(^|[-_])skills$/i.test(String(name == null ? "" : name))) return true;
+  const l = String(label == null ? "" : label).replace(/\*+\s*$/, "").trim();
+  return /^(type to add\s+)?skills$/i.test(l);
+}
+
+// A review-bundle entry for the skills field. `field_id` is "<page>::formField-<name>".
+function isSkillsEntry(entry) {
+  if (!entry) return false;
+  const wt = String(entry.widget_type || "");
+  if (wt !== "typeahead" && wt !== "hierarchical") return false;
+  let s = String(entry.field_id == null ? "" : entry.field_id);
+  const i = s.lastIndexOf("formField-");
+  if (i !== -1) s = s.slice(i + "formField-".length);
+  return isSkillsFieldName(s, entry.question_label);
+}
+
+// Which of `wanted` are not already on the widget, in profile order. Compared on the BASE name in
+// both directions, because a chip Workday created reads back QUALIFIED: a "Python (Programming
+// Language)" chip already covers the profile's "Python". Without that, a second pass would search
+// "Python" again, find the bare row GONE (Workday drops an already-selected skill from its own
+// results — observed), and commit "Python IDLE" as a near-duplicate. Also dedupes `wanted` against
+// itself, so a profile listing a skill twice can't add it twice.
+function missingSkills(wanted, chips) {
+  const chipList = (Array.isArray(chips) ? chips : []).map((c) => normalize(String(c == null ? "" : c))).filter(Boolean);
+  const have = new Set(chipList.map(skillBaseName).filter(Boolean));
+  const out = [];
+  for (const raw of (Array.isArray(wanted) ? wanted : [])) {
+    const s = String(raw == null ? "" : raw).trim();
+    if (!s) continue;
+    const base = skillBaseName(s);
+    if (!base || have.has(base)) continue;
+    // A chip committed through the CONTAINMENT tier reads back BROADER than the profile name
+    // ("Vivado" landed as "Xilinx Vivado"), so a base-name comparison alone would call it missing and
+    // search again — and Workday drops the selected row from its own results, so the next containment
+    // hit would be a DIFFERENT variant ("Vivado HLS") added alongside. Same whole-word + eligibility
+    // rule as the matcher, so a "Digital Marketing" chip never counts as covering "Git".
+    if (skillContainmentEligible(base) && chipList.some((c) => skillWholeWordIn(c, base))) continue;
+    have.add(base);
+    out.push(s);
+  }
+  return out;
+}
+
 // A checkbox GROUP's recorded value is a JOINED set ("Asian; White"), and Workday's review page
 // prints the options separately — so looking for the joined string finds nothing and a correct
 // two-answer field reads as MISSING. Expand a group entry into its individual values before matching.
@@ -607,6 +758,107 @@ function normalizeLabel(s) {
   return String(s == null ? "" : s).toLowerCase().replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
 }
 
+// ── ERROR-TEXT ↔ FIELD-LABEL matching key (2026-08-07) ──────────────────────────────────────────────
+// `parseErrorFieldName` strips a trailing colon off the name it extracts (its own trailing-char class
+// includes ":"), but `normalizeLabel` strips only "*" and whitespace. So for any field whose visible
+// label ENDS IN A COLON the two sides can never be equal, and every strict-equality error→field matcher
+// silently finds nothing:
+//
+//   error  "…The field Please check one of the boxes below is required" → "please check one of the boxes below"
+//   label  "Please check one of the boxes below:*"                      → "please check one of the boxes below:"
+//
+// That one character is the whole self-ID disability blocker. Reproduced deterministically on
+// analogdevices.wd1 (passed rehearsal #1, failed #2) and seen on radiancetech.wd12, itron.wd5 and
+// waystar.wd1: Workday drops the disability answer when you RE-ENTER a saved application (its siblings
+// on the same page keep theirs), so the replay lands on `disabilityStatus ""*` — present, required,
+// empty, WITH an approved value in the bundle — and then the force-re-fill and the phantom-required
+// guard both report "match no field on this page" and the run halts having done nothing.
+//
+// Deliberately NOT folded into normalizeLabel: that one is LOCKSTEP with the website's
+// `normalizeQuestion` for answer-bucket matching, and widening it would change which taught wordings
+// match on both sides. This key is only for matching Workday's own error text to a field on the page,
+// where a slightly loose match is already documented as safe (re-filling an already-correct field is a
+// no-op). Strips any trailing run of "*", ":", ";", ".", ",", and dashes, in any order.
+function errorLabelKey(s) {
+  return String(s == null ? "" : s).toLowerCase()
+    .replace(/\s+/g, " ").trim()
+    .replace(/[*:;.,–—-\s]+$/, "")
+    .trim();
+}
+
+// Is Workday DEMANDING the signature date on this page? Returns the live field it means, or null.
+//
+// The replay may write exactly one value the review page did not approve — today's date — and only
+// because Workday ASKED. Recognizing the ask used to be a single wording, `"Enter today's date"`.
+// Live on marvell page 5 the ask reads "The field Date is required and must have a value", so nothing
+// fired and the rehearsal halted `replay-blocked` on a page that was one re-type from advancing.
+//
+// The load-bearing detail is WHY the field is rejected, because it changes what counts as evidence.
+// The trace showed the wrapper already holding the value: `Date* current value is 8/9/2026`. Workday
+// re-renders the date from its saved copy but has DROPPED it server-side (the same self-ID class as
+// the disability checkbox and hispanicOrLatino), so the page shows an answer the model does not have.
+// The replay then does nothing at all, because `skipIfCorrect` reads the screen, sees today's date and
+// takes the zero-actuation path — the value is correct in the DOM and absent where it counts.
+//
+// So this deliberately does NOT require the field to be blank. Blankness is the one piece of evidence
+// that is guaranteed absent in the failure it exists to catch. What it requires instead:
+//   • the field is a SIGNATURE-date question (isSignatureDateQuestion rejects start/birth/graduation/
+//     expiry/from/to — a wrong stamp there would be a wrong answer, not a missing one), and
+//   • Workday itself named it — either by spelling out the ask, or by naming that exact field in the
+//     error text. We never pick a date field Workday did not complain about.
+// The caller re-types with budgets that carry no `skipIfCorrect`, so the value is actuated for real
+// and handed to the model, which is the whole point.
+// TEXT-ONLY half of the check, so a nav-timeout with nothing to do with a date never pays for an extra
+// page scan. Kept here rather than inlined at the call site because background.js reaches lib.js through
+// the hand-written `apMatch` literal: every helper it calls has to be listed there, and one that is not
+// throws only in the browser (Node sees all of lib.js, so the suite stays green — live 2026-08-09,
+// `apMatch.parseErrorFieldName is not a function` aborted a replay that was otherwise fixed).
+// Workday's own 404 for a requisition that no longer exists — the posting was filled, pulled, or the
+// link went stale. Live (sonos.wd1 2026-08-09): the job URL rendered "The page you are looking for
+// doesn't exist." in 132 characters. Nothing is wrong with the extension on this page, but every
+// downstream stage reads it as its OWN failure: there is no Apply button to click, so the run walks
+// on to the auth wait and halts `auth-form-not-rendered — the sign-in fields never appeared`, which
+// sends whoever reads it hunting for a sign-in bug on a tenant that signs in fine. It cost exactly
+// that detour before the page was opened by hand.
+//
+// Text-based on purpose: this is Workday's generic not-found shell, with no automation-id of its own
+// and no posting markup to key off. Anchored on the full sentence so a job description that happens
+// to contain the word "exist" can't trip it, and paired by the caller with a genuinely empty page.
+const JOB_GONE_RE = /\bthe page you are looking for\s+(?:doesn'?t|does not)\s+exist\b/i;
+function isJobPostingGone(bodyText) {
+  return JOB_GONE_RE.test(String(bodyText == null ? "" : bodyText).replace(/\s+/g, " "));
+}
+function signatureDateAskInText(errorTexts) {
+  return (errorTexts || []).some((t) => {
+    const s = String(t == null ? "" : t);
+    if (/enter\s+today'?s\s+date/i.test(s)) return true;
+    const n = parseErrorFieldName(s);
+    return !!(n && isSignatureDateQuestion(n));
+  });
+}
+function signatureDateDemanded(errorTexts, liveFields) {
+  const texts = (errorTexts || []).map((t) => String(t == null ? "" : t)).filter(Boolean);
+  if (!texts.length) return null;
+  const sigFields = (liveFields || []).filter((f) => f
+    && (f.widgetType === "date" || f.widgetType === "text")
+    && isSignatureDateQuestion(f.label));
+  if (!sigFields.length) return null;
+
+  // (1) EXPLICIT ask — Workday spelled out what it wants, so any signature-date field on the page is it.
+  if (texts.some((t) => /enter\s+today'?s\s+date/i.test(t))) return sigFields[0];
+
+  // (2) GENERIC ask — Workday only says a field is required. Ground it on the NAME it used.
+  for (const t of texts) {
+    const named = parseErrorFieldName(t);
+    if (!named) continue;
+    const key = errorLabelKey(named);
+    if (!key) continue;
+    const hit = sigFields.find((f) => errorLabelKey(f.label) === key);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 // AI-4 Tier-1 (DETERMINISTIC, no AI): the MAPPED fields an error set names. For each error →
 // parseErrorFieldName → match a scan field by label (equal OR bidirectional-containment after
 // normalizeLabel) → keep only fields with `fieldMap[fieldName]` truthy (deterministically
@@ -654,6 +906,56 @@ function expandErrorSamples(samples) {
     }
   }
   return out;
+}
+
+// ── SURFACES THAT IGNORE SYNTHETIC INPUT (2026-08-04) ───────────────────────────────────────────────
+// Measured on waystar's Self Identify page: a HIDDEN run (which dispatches page-side synthetic events)
+// failed 2/2 with Workday reporting Name and Date as required-and-empty on a page whose DOM plainly held
+// both, and the SAME run passed with forceTrustedInput. A trusted re-type afterwards cleared the date but
+// not the name, so patching it up after the fact is not reliable — the values have to be entered trusted
+// in the first place. This is the second such surface: the AUTH form behaves identically, which is why
+// onboarding has always run trusted.
+//
+// Detected by its OWN FIELDS, not by tenant, because the reason we care is a property of the surface
+// rather than of the company. The signature block is the tell: the OFCCP disability self-ID group, its
+// language selector, or the name+date signature pair.
+function isSelfIdPage(scanFields) {
+  const names = new Set((Array.isArray(scanFields) ? scanFields : []).map((f) => f && f.fieldName).filter(Boolean));
+  if (names.has("disabilityStatus") || names.has("disabilityForm")) return true;
+  return names.has("dateSignedOn") && names.has("name");
+}
+
+// ── EXTERNAL GATES: a page Workday refuses for a reason no fill can satisfy (2026-08-04) ──────────
+// Live on copart.wd12 (Software Engineering Intern): five pages filled and verified, then Save &
+// Continue came back "You must complete the assessment test to continue with your job application.
+// Take Assessment". Nothing was wrong with the fill — Workday wants a step that happens OUTSIDE the
+// application form, and a human has to take it. The walk halted, but it halted as a generic
+// nav-timeout: it warned "PAGE 5 MAY NOW BE DIRTY — eyeball it" (the page is not dirty) and named
+// `employeeId — no mapping` as "the likely validation cause" (it is unrelated — the error text names
+// no field at all). That reads as an ApplyPilot bug and sends the operator hunting a mapping gap.
+//
+// DELIBERATELY NARROW. A loose matcher here is the DANGEROUS direction: labelling a genuine fill
+// failure "the operator's problem" would hide a real bug behind a needs_operator halt. So each entry
+// requires wording that can only mean an out-of-band step, and anything unrecognized keeps the
+// existing nav-timeout path byte-for-byte.
+const EXTERNAL_GATES = [
+  { reason: "assessment-required",
+    rx: /\b(?:complete|take|finish)\b[^.]{0,40}\bassessment\b|\bassessment\b[^.]{0,30}\b(?:required|must be completed)\b/i,
+    detail: "Workday requires an assessment/test to be completed before this page will advance. That happens outside the application form — a human has to take it; the bot never will." },
+];
+// Returns {reason, detail, evidence} for the FIRST recognized gate, else null. Reads the split error
+// samples AND the whole error-page text, because the wording has been seen in both.
+function externalGateHalt(errorTexts, errorPageText) {
+  const texts = (Array.isArray(errorTexts) ? errorTexts : [errorTexts])
+    .concat([errorPageText])
+    .map((t) => String(t == null ? "" : t))
+    .filter((t) => t.trim() !== "");
+  for (const t of texts) {
+    for (const g of EXTERNAL_GATES) {
+      if (g.rx.test(t)) return { reason: g.reason, detail: g.detail, evidence: t.slice(0, 300) };
+    }
+  }
+  return null;
 }
 
 // AI-4 Tier-0 trigger: the known Magna/Workday phantom "Duplicate language entries are not allowed"
@@ -830,8 +1132,28 @@ function canonicalJobUrl(u) {
     // computed it from the pasted one. Any letters+digits requisition token now keys the same way.
     // The _R tier above is untouched and still matches FIRST, so every existing wdN:r<digits> key is
     // byte-identical — only URLs that had no key at all get one.
-    const alt = (p.pathname.match(/_([A-Za-z]{1,4}\d[\w-]*?)(?=\/|$)/g) || []).pop();
+    // …including ids that SEPARATE the letter prefix from the digits (2026-08-09). Moog posts
+    // `…-Engineering_R-26-18835`: the "_R<digits>" tier needs a digit straight after the R, and this
+    // tier needed one straight after the letters, so BOTH missed and the key fell to the path — which
+    // differs between the posting URL and the form URL by an "en-US/" locale segment AND the location
+    // spelling ("Buffalo-NY" vs "Buffalo%2C-NY"). One job, two keys, and the rehearsal REFUSED its own
+    // approved bundle. Allowing one separator keys both URLs off the requisition instead, which is the
+    // whole point of these tiers: the req id is identical in every spelling of the link.
+    const alt = (p.pathname.match(/_([A-Za-z]{1,4}[-_]?\d[\w-]*?)(?=\/|$)/g) || []).pop();
     if (alt) return (dc || "wd") + ":" + alt.slice(1).toLowerCase();
+    // A purely NUMERIC requisition id (2026-08-09). Marvell posts `…-Engineer_2601615` — no "R", no
+    // letter prefix — so it matched neither tier above and fell through to the path fallback, which is
+    // ENCODING-SENSITIVE: Workday serves the location segment percent-encoded ("San-Diego%2C-CA") while
+    // a hand-typed or redirected URL may carry the bare comma. The two spellings produced two different
+    // keys for one job, so the submit run REFUSED its own approved bundle:
+    //   REFUSING: no approved bundle for job_key "…" (no-remote-bundle)
+    // Same failure the letters+digits tier was added for on 2026-08-03, one character narrower.
+    // Ordered AFTER both tiers above, so every existing key stays byte-identical; ≥4 digits so an
+    // ordinary path number can't be mistaken for a requisition.
+    // A trailing "-<n>" is part of the id, not a separate segment (hp.wd5: `…Internship_3167270-1`).
+    // Without this the whole token failed the tier and fell to the encoding-sensitive path again.
+    const num = (p.pathname.match(/_(\d{4,}(?:-\d+)*)(?=\/|$)/g) || []).pop();
+    if (num) return (dc || "wd") + ":" + num.slice(1);
     // Strip the FORM-page tail so a posting URL and its form URL key identically:
     // /apply(…) (Workday + Lever) and /application (Ashby — 2026-07-31; without this a
     // submit run keyed on the posting could never find the fill's reported bundle).
@@ -841,7 +1163,9 @@ function canonicalJobUrl(u) {
     // pull a DIFFERENT company's approved bundle — the review page showed 'all approved' while
     // the gate refused, naming a field from the other application. Keep the job token when the
     // path alone cannot identify the job.
-    const path = (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
+    // decodeURI-ish: fold percent-escapes so "%2c" and "," cannot key differently (see the numeric tier).
+    const decoded = (() => { try { return decodeURIComponent(p.pathname); } catch (e) { return p.pathname; } })();
+    const path = (p.origin + decoded).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
     const tok = p.searchParams.get("token") || p.searchParams.get("gh_jid");
     if (tok && /\/embed\/job_app$|\/embed\/job_board$/.test(path)) return path + "?token=" + String(tok).toLowerCase();
     return path;
@@ -1060,7 +1384,27 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     const cv = e.current_value;
     if (cv == null || String(cv).trim() === "") continue;          // the extension claims no value here
     if (isAiPlaceholder(cv)) { placeholders++; continue; }          // an unreplaced AI mark, not a real value
-    const wt = e.widget_type, cvs = String(cv), nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
+    // ── A SIGNATURE date may legitimately read as EITHER the approved value OR today (2026-08-08) ──
+    // This compared against today UNCONDITIONALLY, because the replay used to re-derive a signature
+    // date on every run. That is no longer true: the replay now follows the review page, and today is
+    // stamped only REACTIVELY, when Workday itself comes back with "Enter today's date" (see the
+    // signature-date remediation in runCdpReplayWalk). Both outcomes are therefore correct:
+    //   • Workday never asked  → the page holds the APPROVED value
+    //   • Workday asked        → the walk stamped TODAY and re-saved
+    // Comparing to today alone would now report a FALSE DISAGREE on the first case and block a clean
+    // submit — the mirror of the bug the unconditional substitution was added to fix.
+    //
+    // So accept either, and nothing else: a page showing some THIRD date still disagrees, which is the
+    // property that matters. Narrow by construction — isSignatureDateQuestion rejects any label naming
+    // a different event (start / birth / graduation / expiry / from / to).
+    const wt = e.widget_type;
+    let cvs = String(cv);
+    let altCvs = null;
+    if ((wt === "date" || wt === "text") && isSignatureDateQuestion(e.question_label)) {
+      const t = new Date();
+      altCvs = `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`;
+    }
+    const nlabel = normalizeLabel(e.question_label), nval = normalize(cvs);
     const base = { label: e.question_label != null ? e.question_label : null, value_bundle: cvs,
                    field_id: e.field_id != null ? e.field_id : null, widget_type: wt != null ? wt : null,
                    canonical_field: e.canonical_field != null ? e.canonical_field : null,
@@ -1081,15 +1425,19 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
     //    string would find nothing and call a correct two-answer field MISSING, so each selected
     //    option is checked on its own and the row AGREES only when every one of them is present.
     //    A group with a single selection falls through to the normal path unchanged. ──
+    //    SKILLS is the other multi-value field and prints the same way (one value per skill), so it
+    //    takes this path too — matching the joined "A; B; C" as one string would report a correctly
+    //    filled 20-skill field as MISSING on every rehearsal.
     const groupVals = wt === "checkbox_group" ? groupSelection(e) : [];
-    if (groupVals.length > 1) {
-      claimed++; claimedValues.push(...groupVals.map((g) => normalize(g)));
-      const absent = groupVals.filter((g) => {
+    const setVals = groupVals.length ? groupVals : (isSkillsEntry(e) ? splitGroupValue(cvs) : []);
+    if (setVals.length > 1) {
+      claimed++; claimedValues.push(...setVals.map((g) => normalize(g)));
+      const absent = setVals.filter((g) => {
         const n = normalize(g);
         if (n.length >= 4 || (n.length >= 3 && !AMBIGUOUS_SHORT.test(n))) return !presentTier(g);
         return !items.some((it) => it.nlabel && labelMatches(it.nlabel, nlabel) && valueTier(n, it.nval));
       });
-      if (!absent.length) agree.push({ ...base, value_review: cvs, tier: "checkbox-group-set" });
+      if (!absent.length) agree.push({ ...base, value_review: cvs, tier: groupVals.length ? "checkbox-group-set" : "skills-set" });
       else missing_on_review.push({ ...base, detail: "not shown on the review page: " + absent.join("; ") });
       continue;
     }
@@ -1117,7 +1465,10 @@ function reconcileReviewPage(reviewItems, bundleEntries, opts) {
         else disagree.push({ ...base, value_review: cand.value });
       } else {
         claimed++; claimedValues.push(nval);
-        if (valuesAgree(cvs, cand.value)) agree.push({ ...base, value_review: cand.value, tier: rep ? "entry" : "keyed" });
+        // altCvs is set ONLY for a signature date: today is an equally-correct page value there, because
+        // the walk stamps it reactively when Workday demands it. Any other date still disagrees.
+        if (valuesAgree(cvs, cand.value) || (altCvs && valuesAgree(altCvs, cand.value)))
+          agree.push({ ...base, value_review: cand.value, tier: rep ? "entry" : "keyed" });
         else verdictFor(base, cvs, cand, rep && rep.section); // a shuffled row is not a contradiction
       }
       continue;
@@ -1246,6 +1597,25 @@ function classifyAuthOutcome(state) {
   if (ONBOARD_VERIFY_RX.test(t)) return "verify";
   if (ONBOARD_WRONG_RX.test(t)) return "wrong_credentials";
   if ((s.formFieldCount || 0) > 0 && !s.hasAuthEl) return "success";
+  // ── PAST AUTH IS PAST AUTH, EVEN BEFORE THE FIELDS MOUNT (2026-08-07) ────────────────────────────
+  // Success used to require form FIELDS, so a sign-in that had plainly worked read as "unknown" until
+  // Workday finished mounting them — and the caller spent its whole budget waiting, then re-submitted
+  // the auth form or reloaded the page. Measured on jabil.wd5, the successful sign-in:
+  //
+  //   still waiting at 2.0s — title "Careers"      formFields 0 · hasAuthEl false · markers [none]
+  //   timed out after 4000ms (52 reads)
+  //   last state:  title "Principal Product Test Engineer…" · formFields 0 · markers [applyFlowPage]
+  //   sign-in outcome: unknown
+  //
+  // `applyFlowPage` is Workday's APPLICATION-FLOW container — you cannot be on it without being signed
+  // in — and `hasAuthEl` false means every piece of auth chrome is gone. That is success; the fields are
+  // simply a beat behind. Waiting for them HERE is duplicated work: both walks call
+  // awaitFieldSetSettled before touching a page, which waits for a non-zero, stable field count. So an
+  // early success costs nothing and saves the whole remainder of the auth budget.
+  //
+  // Deliberately narrow: it still requires NO auth element, and the verify / wrong-credentials text
+  // checks above run FIRST, so a page mid-auth or reporting an error can never reach here.
+  if (s.markers && s.markers.applyFlowPage && !s.hasAuthEl) return "success";
   return "unknown";
 }
 
@@ -1340,6 +1710,27 @@ function jobPageSettleStep(read, state) {
 // real content is NOT blank. `readyState` is optional so an older scan (which didn't report it) simply
 // never matches — fail-closed.
 const BLANK_PAGE_BOILERPLATE_MAX = 700; // a genuinely empty shell is just the cookie/skip-link text
+// ── IS THE BLANK PAGE PERSISTENT, OR JUST MID-NAVIGATION? (2026-08-07) ──────────────────────────────
+// `isBlankAuthPage` is a single-read test, and every condition it checks is ALSO satisfied by an SPA
+// mid-navigation: the old view torn down, the new one not yet mounted, `readyState` already "complete".
+// Straight after an auth POST that is the EXPECTED transient, not a failure — so reloading there throws
+// away a navigation that was about to finish and restarts the whole sign-in. Traced live: a false
+// re-click produced exactly this, and the reload is where the 8-9s went.
+//
+// The reload rule itself is right — it came from cat.wd5, where the empty shell was PERSISTENT and only
+// a refresh recovered it. What was missing is WHEN it may fire. So: require the blank state to HOLD
+// across several consecutive reads rather than trusting one. A single non-blank read anywhere in the
+// window means the page was moving, and moving pages are not reloaded.
+//
+// PURE so the decision is unit-testable; the caller does the polling.
+const BLANK_AUTH_MIN_READS = 3;
+function blankAuthPersists(reads, minReads) {
+  const rs = (Array.isArray(reads) ? reads : []).filter((r) => r != null);
+  const need = Number(minReads) > 0 ? Number(minReads) : BLANK_AUTH_MIN_READS;
+  if (rs.length < need) return false;              // not enough evidence to call it stuck
+  return rs.every((s) => isBlankAuthPage(s));      // ANY page that moved ⇒ it was navigating, not dead
+}
+
 function isBlankAuthPage(state) {
   const s = state || {};
   if (s.readyState !== "complete") return false;          // still loading ⇒ absence proves nothing
@@ -1376,10 +1767,10 @@ function phantomRequiredTargets(errorTitles, liveFields) {
   const holds = (v) => v === true || (v != null && v !== "" && v !== false && !/^select one$/i.test(String(v)));
   const matched = [], unmatched = [];
   for (const title of titles) {
-    const want = normalizeLabel(title);
+    const want = errorLabelKey(title);   // colon-tolerant — see errorLabelKey
     // Visible label first, then the automation-id — some tenants word the error after the id.
-    const hit = fields.find((f) => normalizeLabel((f && f.label) || "") === want)
-      || fields.find((f) => normalizeLabel((f && f.fieldName) || "") === want);
+    const hit = fields.find((f) => errorLabelKey((f && f.label) || "") === want)
+      || fields.find((f) => errorLabelKey((f && f.fieldName) || "") === want);
     if (hit) matched.push({ title, fieldName: hit.fieldName, wrapperSel: hit.wrapperSel, value: hit.value });
     else unmatched.push(title);
   }
@@ -1418,6 +1809,29 @@ function classifyWorkdayPage(state) {
   if (m.adventureButton || m.continueButton || m.applyManually || m.useMyLastApplication) return "job-description";
   if (isBlankAuthPage(s)) return "blank";
   return "unknown";
+}
+
+// ── THE STUCK, HALF-TORN-DOWN APPLY CHAIN (2026-08-07) ───────────────────────────────────────────────
+// The JD page offers `adventureButton` (Apply). The /apply CHOOSER offers `applyManually` +
+// `useMyLastApplication` — and, verified live on a cleanly-loaded radiancetech.wd12 chooser, it does NOT
+// carry `adventureButton`. So the two markers are MUTUALLY EXCLUSIVE on any healthy page, and seeing them
+// TOGETHER means the SPA swapped views without tearing the old one down: a coordinate click then lands on
+// a layer that is no longer live, reports success, and nothing moves.
+//
+// This is not theoretical — it is what two tenants actually did on a fresh account (radiancetech.wd12 and
+// magna.wd3, hidden AND foreground). Every read for the full 45s budget showed
+// `markers [adventureButton, applyManually, useMyLastApplication]`, the click "succeeded" each time, and
+// onboarding halted `backToApply` after re-issuing the identical click three rounds over (~135s).
+//
+// Deliberately NARROW: it requires the contradiction AND no auth element AND no form fields, so a page
+// mid-render toward the auth screen (which is simply "not landed yet") can never match. It is a signal to
+// change the ACTIVATION MECHANISM, never to give up — the caller still escalates and still waits.
+function applyChainStuckMixed(state) {
+  const s = state || {};
+  const m = s.markers || {};
+  if (s.hasAuthEl || s.emailInput || s.passwordInput) return false; // already at/near auth — just not landed
+  if ((s.formFieldCount || 0) > 0) return false;                    // a form is up; nothing is stuck
+  return !!(m.adventureButton && m.applyManually);
 }
 
 // Workday's candidate-home "My Applications" list — the page behind the already-applied page's "View My
@@ -1605,6 +2019,35 @@ function newlyRequiredGaps(liveFields, bundleEntries, pageKey, errorTitles) {
 //
 // Deliberately the same blank/carve-out rules as bundleSubmitBlockers so the three checks agree: a
 // checkbox stores "false" (never empty), file_upload has its own re-attach step.
+// The HOLE in requiredBlankOnPage (2026-08-04): it walks the live scan, so a required field whose
+// wrapper is MISSING from that scan is not merely un-refilled — it is invisible. And "missing from the
+// scan" is exactly what the M40 audit reports as `audit-unverifiable`, which is how the disability
+// self-ID group slipped past the one guard meant to catch it.
+//
+// So: required entries that HOLD an answer and are NOT in the live scan at all. The caller must probe the
+// DOM for each one before believing it (cdpPageScan filters out fields inside repeating containers, so
+// absence from that list is not proof of absence from the page — the same lesson replayFlatFields learned).
+function requiredEntriesAbsentFromScan(liveFields, bundleEntries) {
+  const nameOf = (e) => {
+    const id = String((e && e.field_id) || "");
+    const tail = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+    return tail.indexOf("formField-") === 0 ? tail.slice("formField-".length) : tail;
+  };
+  const blank = (v) => v == null || String(v).trim() === "";
+  const present = new Set((liveFields || []).map((f) => f && f.fieldName).filter(Boolean));
+  const out = [];
+  for (const e of bundleEntries || []) {
+    if (!e || e.is_required !== true) continue;
+    if (e.widget_type === "file_upload" || e.widget_type === "section") continue; // own re-attach / display-only
+    if (e.is_deleted) continue;
+    const name = nameOf(e);
+    if (!name || present.has(name)) continue;
+    if (blank(e.current_value)) continue;                 // nothing to put back → newlyRequiredGaps owns it
+    out.push({ name, entry: e, approved: String(e.current_value) });
+  }
+  return out;
+}
+
 function requiredBlankOnPage(liveFields, bundleEntries) {
   const nameOf = (e) => {
     const id = String((e && e.field_id) || "");
@@ -1621,6 +2064,53 @@ function requiredBlankOnPage(liveFields, bundleEntries) {
     const entry = byName.get(f.fieldName);
     if (!entry || blank(entry.current_value)) continue;   // nothing approved to put back → newlyRequiredGaps owns it
     out.push({ field: f, entry, approved: String(entry.current_value) });
+  }
+  return out;
+}
+
+// A LIVE required field that is BLANK, whose answer we already have under a DIFFERENT automation-id
+// (2026-08-06). Workday REMOUNTS a dependent question under a new id whenever the field it depends on
+// changes, so the bundle can hold "Which basecamp…" as filled under id A while the page shows the same
+// question, blank and required, under id B. Both existing pre-Save checks key on the BUNDLE's id, so
+// neither sees it: one reports "in the bundle but NOT on the page — left alone, not fatal", and Save is
+// then clicked into a rejection that cannot be anything else. Live on waystar page 3, repeatedly.
+//
+// The QUESTION is the stable identity, so match on the label and re-fill at the id the page is using NOW.
+// Deliberately narrow, because a label match is weaker evidence than an id match:
+//   - the live field must be REQUIRED and BLANK (nothing is ever overwritten by this),
+//   - the entry must actually hold a value (otherwise the cascade/review path owns it, not us),
+//   - and the entry's OWN field must be absent from the page — if it is still there, this is not a
+//     remount and requiredBlankOnPage owns it.
+// Returns { field, entry, approved, fromName } — `field` is the LIVE field, so the caller fills the id
+// that exists rather than the one that used to.
+function requiredBlankByLabel(liveFields, bundleEntries) {
+  const nameOf = (e) => {
+    const id = String((e && e.field_id) || "");
+    const tail = id.includes("::") ? id.slice(id.lastIndexOf("::") + 2) : id;
+    return tail.indexOf("formField-") === 0 ? tail.slice("formField-".length) : tail;
+  };
+  // A dropdown sitting on its PLACEHOLDER is empty, whatever the scan calls it. Live: the remounted
+  // basecamp field read "Select One", so a plain empty-string test saw it as filled and this whole
+  // recovery silently did nothing while Workday refused the page for that exact field being required.
+  const blank = (v) => v == null || String(v).trim() === "" || isPlaceholderOption(String(v));
+  const key = (x) => errorLabelKey(x);   // colon-tolerant, same reason as phantomRequiredTargets
+  const live = new Set((liveFields || []).map((f) => f && f.fieldName));
+  const byLabel = new Map();
+  for (const e of bundleEntries || []) {
+    if (!e || e.is_deleted) continue;
+    if (blank(e.current_value)) continue;
+    if (live.has(nameOf(e))) continue;               // its own field is still on the page → not a remount
+    const k = key(e.question_label);
+    if (k && !byLabel.has(k)) byLabel.set(k, e);
+  }
+  const out = [];
+  if (!byLabel.size) return out;
+  for (const f of liveFields || []) {
+    if (!f || f.isRequired !== true || f.widgetType === "file_upload") continue;
+    if (!blank(f.value)) continue;
+    const entry = byLabel.get(key(f.label));
+    if (!entry) continue;
+    out.push({ field: f, entry, approved: String(entry.current_value), fromName: nameOf(entry) });
   }
   return out;
 }
@@ -1778,8 +2268,10 @@ function reportOutcome(status) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate, reportOutcome,
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
+  skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
+  skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, mappedFieldsFromErrors, expandErrorSamples, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

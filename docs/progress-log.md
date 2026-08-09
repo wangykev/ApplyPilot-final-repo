@@ -3609,3 +3609,538 @@ Chime. Lever: Shield AI, gopuff, Zoox, Spotify, Sonatype. Ashby: Notion, Cohere,
 Linear, Speak, OpenEvidence.
 
 Also filled clean but not yet through the gate: Veeva, Runway, Mem0, Slingshot AI. Suite 1090/1090.
+
+## 2026-08-06 — one AI call per page, and the stray click that was blamed on Workday
+
+Two threads: making the AI cheaper, and chasing a page-3 failure on waystar that had survived several
+rounds. The second one is the lesson.
+
+### The bug: "Workday keeps rewriting our answer"
+
+waystar page 3 filled, then Save was refused because a required dropdown ("Which basecamp location…")
+was blank. Traced repeatedly: relocation was committed `"Yes, I am open to relocating"` and later read
+`"No, but I live near one of these locations"`; that change remounted the dependent basecamp question
+under a NEW automation-id, blank; our record pointed at the dead one.
+
+It was written up as Workday rewriting the value on its own, and **two remedies were built on that
+premise** — a reload-and-replay re-entry (live-refuted, removed the same day) and a back-a-page retreat
+(never fired once, removed today). Both treated a symptom.
+
+The operator ended it with a rule: **Workday can rarely REMOVE a committed value, but NEVER rewrites one
+into a different option.** So a value that CHANGED is ours. That is now in CLAUDE.md as a triage rule,
+because it eliminates a whole class of wrong explanation in one line.
+
+The real cause, once we looked for our own write: **every portaled listbox renders at the same screen
+coordinates** (every commit on that page logged `rect=463,298`), and the options **linger a beat while
+unmounting and stay clickable**. So the next field's open-click landed on the previous field's list —
+on the option that happened to sit at that point. `fillDropdownCdp` has gated on options-GONE (not
+`aria-expanded`) since 2026-07-06 for exactly this cross-field stray; **the AI commit paths never called
+it**, and they are what fill screening questions. One `closeDropdownConfirmed` in three places.
+
+Result on the form that failed reliably: **4/4 clean runs, 2 hidden + 2 visible** — `remount 0 · stalls 0
+· drift 0`, page 3 **19.4s → 7.0s**. Not recovered from; absent.
+
+### Batched AI — one call per page
+
+The AI questions on a page are now identified, their options read, and sent as ONE call fired before the
+deterministic fill so it overlaps. **Transport only**: each answer goes back to the same per-field
+function that would have called the model itself, so the match ladder against LIVE options, the commit,
+the read-back, `filled_review` and the EEO re-tag all still happen where they did. The batch is a CACHE,
+NOT A GATE — a question it misses makes its own call, so a wrong or empty batch costs speed, never an
+answer. Default-on as of today (`disableAiBatch` is the kill-switch).
+
+Answers are cached **by QUESTION, not automation-id**, and shared with the cascade recursion and both
+AI-4 re-fill paths, so a page REFILL makes **zero** calls and cannot contradict the first pass —
+contradiction was what remounted dependent questions.
+
+Things that had to be fixed to get there, each found by instrumentation rather than reasoning:
+- The collector threw on a non-string profile value and **silently collected nothing** — a totally broken
+  batch and a working one produce identical output, differing only in speed.
+- `resolve()` returns `{candidates}` for a choice widget and `{value}` for text; reading it as a scalar
+  produced that throw and mislabelled every mapped text field.
+- The planner modelled only `FIELD_MAP`, so bucket- and recognizer-answerable questions were scouted and
+  prompted anyway. It now models every deterministic tier.
+- An OPTIONAL unmapped textarea **awaited the call and blocked the page 3.56s** before being skipped —
+  the batch was consulted before the eligibility gate.
+- An AI pick committed via two flat `delayFull(reopenSettleMs)` beats — **800ms/field**, never scaled,
+  no polling — while a deterministic pick used the adaptive poll. One shared `awaitDropdownCommit` now.
+
+### Also fixed
+
+- **The self-ID input policy never reached the REPLAY walk** (it lived in `fillAndPersistPage`, which the
+  replay only calls for refills), so the replay wrote text/date SYNTHETICALLY on the one surface that
+  ignores synthetic writes. Fixing it took **waystar to SUBMIT GATE PASSED** — 7 of 10 tenants.
+- **Sign In and Apply presses now escalate the MECHANISM** on retry (coordinate click → focus+Enter →
+  password-field Enter → in-page activation) instead of re-issuing the identical click. Confirmed live:
+  `sign-in fallback 1 … (the coordinate click did not register)`.
+- **A checkbox group cost ~2.5s when nothing was wrong** — the persistence loop never broke early. Now
+  exits on a 3-read hold streak at a 250ms beat, which is also *stricter*: the observed wipe lands ~281ms
+  after the click, which 700/1400/2100 could straddle and 250/500/750 brackets three times.
+- **The cross-run option cache is gone** (operator): a form is filled ONCE in the real flow, so it was
+  always cold when it mattered — and it made repeat test runs faster than a genuine first fill,
+  distorting every timing measured against it.
+
+### Diagnostics kept, because each one found a bug
+
+`debugPageTrace` (per-field plan-before-acting, every wait named, every action ≥120ms timed),
+`debugAiPrompts`, `debugClobber`, plus the always-on `[AI-BATCH]` line and a `⚠ REMOUNT` alarm — the
+last always-on deliberately, since a remount should now never happen and a regression you only see when
+a flag is enabled is one you find late.
+
+Measured and left alone: the typeahead scroll scrape is at its floor (249 options, 22 hops, 21 of them
+committing, ~86ms per commit — the widget's latency, not our pacing), and hidden runs are **within 6% of
+visible** on the same scrape, so the non-painting problem is already handled by the worker-timer override.
+Earlier page-level hidden/visible gaps were LLM latency variance (1.0s–10.0s across today's runs), not paint.
+
+Extension 1099/1099.
+
+## 2026-08-07 — fresh-account regression + expansion sweep: two onboarding blockers fixed, 4 tenants to the gate
+
+A regression + expansion sweep on a **brand-new tester alias** (`tester+30@gmail.com`), chosen so no
+tenant would have a pre-existing account. That turned out to be the point: every failure this sweep was
+in the ACCOUNT-CREATION path, which the previous scoreboard had never exercised — its tenants all had
+accounts already. Two real blockers, both the same shape, both now fixed.
+
+**1. Stage 2 (Apply Manually) had no activation ladder.** Stage 1 (the Apply click) got one on
+2026-08-06 because "the coordinate click can report success and still not register". Stage 2 clicked
+once, waited the full render budget, and gave up. Live on `radiancetech.wd12` AND `magna.wd3`: the click
+reported success, the chooser never moved for 45s, and the applyStage loop re-issued the IDENTICAL click
+two more rounds before halting `backToApply` — ~135s to fail, on a page whose Apply Manually is a plain
+`<a href>` that navigates fine when activated in-page. The stuck page is diagnosable: every read logged
+`markers [adventureButton, applyManually, useMyLastApplication]`, and a cleanly-loaded chooser does NOT
+carry `adventureButton` — the two are mutually exclusive on any healthy page, so together they mean the
+SPA swapped views without tearing the old one down. Stage 2 now mirrors Stage 1 (4s → focus+Enter →
+in-page activation → render budget), plus a shortcut when the pure `applyChainStuckMixed` recognises that
+state. Unit-pinned, and verified to discriminate: the naive marker-only check fails the guard test.
+
+**2. The account-creation consent tick was a single blind coordinate click.** It measured the label, fired
+one click, logged whatever it then found, and carried on. When the click missed, the box stayed unchecked,
+Create Account could not submit, and the auth loop spent **~12 minutes** re-clicking a button that was
+never going to fire. Diagnosed on the live page rather than guessed: the input is `opacity:0` with a 56×20
+"I agree" `<label for>`, the finder resolves it correctly, and `elementFromPoint` at the computed centre
+returns that very label — so the rect was right when MEASURED and wrong when USED. **A stale rect**: read
+one CDP round-trip before the click was dispatched (~1.2–1.5s hidden), while the just-filled password
+fields' requirement list reflows the label out from under it. Exactly the lesson `clickPageNext` learned on
+2026-07-25. Now: re-measure before every attempt, re-read `checked` after every attempt, escalate to
+in-page native label activation. It NEVER halts (operator's call) — if everything fails it says so and lets
+the submit report the failure. Live log: `consent checkbox — checked via in-page label activation (the
+coordinate click was not registering)`.
+
+**3. Diagnostic — the auth page's own error is now logged.** "Create Account submit: no outcome after 20s
+and the form is still up" read identically whether the click never registered or Workday rejected the
+submission, which cost a round. `cdpOnboardScan` now collects up to 6 short RENDERED leaf-ish error nodes
+into `authErrors`, and `describeState` appends `pageErrors=[...]` to the dump it already prints.
+
+**Results.** `itron.wd5` (NEW) and `magna.wd3` (path-hosted) reached **SUBMIT GATE PASSED** hidden, on a
+fresh account, nothing submitted. `waystar.wd1`, `cat.wd5` and `radiancetech.wd12` (NEW) all reached the
+REVIEW page. Extension **1104/1104**.
+
+**The dominant remaining blocker is the self-ID disability checkbox group**, now reproduced on THREE
+tenants (waystar, radiancetech, and itron on a second pass into the saved application). Two distinct
+shapes: waystar's bundle HAS the entry and the replay cannot make it stick (`asked for [No, I do not have
+a disability…] and it holds []`), while radiancetech/itron report `the approved bundle has no entry for [Please
+check one of the boxes below] on this page`. Consistent with the traced note that Workday does not persist
+some self-ID answers across re-entry.
+
+**Two testing facts worth keeping.** (a) Email auto-verify can never work with a `tester+NN@gmail.com`
+alias — the connected mailbox is `wangykev@gmail.com`, so `tester+NN` is a DIFFERENT inbox; an
+email-verify tenant needs `wangykev+NN@gmail.com`. This silently blocked `analogdevices.wd1` and
+`jabil.wd5`. (b) Polling the localhost tab with `javascript_tool` ACTIVATES it, so a run launched
+`background:false` logs `tab HIDDEN` — a "visible" run must be left alone while it works.
+
+## 2026-08-07 (later) — the self-ID disability blocker was a COLON
+
+Same-day follow-up to the sweep above. The blocker that had been open across several sessions and was
+written up as *"the disability checkbox unchecks itself"* is a one-character string mismatch in OUR code.
+
+**What Workday does** (real, and not the bug): re-entering a SAVED application drops the disability
+answer, while its siblings on the same page keep theirs. The `[FIELD-DIAG]` dump says it plainly —
+`disabilityForm "English"* · name "Kevin Wang"* · employeeId "" · dateSignedOn "08/07/2026"* ·
+disabilityStatus ""*`. Consistent with the earlier `workday-selfid-not-persisted` trace.
+
+**What we did wrong**: `parseErrorFieldName` strips a trailing `:` off the name it extracts (its
+trailing-char class includes it); `normalizeLabel` strips only `*` and whitespace. So for a field whose
+visible label ENDS IN A COLON the two sides can never be equal:
+
+```
+error  "…The field Please check one of the boxes below is required" → "please check one of the boxes below"
+label  "Please check one of the boxes below:*"                      → "please check one of the boxes below:"
+```
+
+Every strict-equality error→field matcher therefore found nothing, on the one page where it mattered:
+the force-re-fill reported *"the approved bundle has no entry for [Please check one of the boxes below]"*
+and the phantom-required guard reported *"which match no field on this page"* — both while
+`disabilityStatus` sat right there, required, empty, with an approved value in the bundle. The walk
+halted having done nothing.
+
+**Reproduced deterministically, not inferred.** `analogdevices.wd1` passed rehearsal #1
+(`SUBMIT GATE PASSED`) and failed #2 with exactly this; `itron.wd5` did the same; `radiancetech.wd12`
+matches. That pass-then-fail pattern is the tell: the recovery path only runs once Workday has dropped
+the value, which only happens on a RE-ENTRY.
+
+**Fix**: `errorLabelKey` (lib.js, pure) — normalize, then strip any trailing run of `*`, `:`, `;`, `.`,
+`,` and dashes in any order — used by the three strict matchers (`phantomRequiredTargets`,
+`requiredBlankByLabel`, and the replay's force-re-fill site). Deliberately NOT folded into
+`normalizeLabel`, which is LOCKSTEP with the website's `normalizeQuestion` for answer-bucket matching;
+widening that would change which taught wordings match on both sides. Error→field matching is a
+different job, and a loose match there is already documented as safe.
+
+**Verified**: the identical rehearsal that failed twice now logs
+`page 5: FORCE-re-filling 1 error-named field(s) [disabilityStatus]` → `✅✅✅ SUBMIT GATE PASSED`, twice
+in a row. Unit-pinned on the VERBATIM live strings and verified to discriminate (reverting
+`errorLabelKey` to `normalizeLabel` fails 4 of the new tests). Extension **1110/1110**.
+
+**Still open — a DIFFERENT shape on waystar.wd1.** There the *initial* replay's own verify fails
+(`asked for [No, I do not have a disability…] and it holds []`) and halts `replay-mismatch` BEFORE any
+error text exists, so this fix cannot reach it. That is an actuation failure on the checkbox group, not
+an error-matching one, and it needs its own round — likely the same mechanism-escalation medicine the
+Apply and consent clicks just got.
+
+## 2026-08-07 (later still) — waystar's self-ID variant: synthetic clicks, then a stale signature date
+
+Chasing the one shape the colon fix could not reach turned up TWO more faults, stacked on the same page.
+Both were found by reading the replay's own log rather than by theorising, and each was confirmed by a
+controlled change before being kept.
+
+**1. Synthetic CLICKS don't reach Workday's model on the self-ID page.** Text/date went trusted here on
+2026-08-06; clicks were left synthetic on the strength of a 2026-08-05 fill-path note ("committed and
+held 2/2 under synthetic; trusted clicks produce the intermittent did-not-commit"). Every ADI rehearsal
+refuted that, identically:
+
+```
+page 5 replay: 5 field(s) — 3 changed, 1 already-correct, 1 not-actuated, 0 FAILED
+page 5 Save & Continue: {"clicked":true}
+re-click fallback: error text present — NOT re-clicking (a real validation block)
+```
+
+Our read-back says the box IS checked; Workday says that field is required. The force-re-fill then
+re-wrote the SAME field with TRUSTED input and the page advanced — every time — which is a repeated
+demonstration that trusted clicks DO commit here. So the whole page now goes trusted on the replay,
+clicks included. Controlled result on the run that always hit the block: **force-re-fills 0, validation
+blocks 0, page 5 advances on the FIRST Save** — one Save cycle cheaper, and the only thing that can reach
+waystar's variant, where the synthetic click didn't even update the DOM (`asked for […] and it holds []`)
+and so failed the strict verify BEFORE any error text existed for the force-re-fill to key on.
+
+**2. A signature date goes stale overnight.** With page 5 finally advancing, waystar surfaced
+`Error-Date "Enter today's date"` — the bundle was approved 08/06 and replayed on 08/07. The fill path
+already stamps a signature date deterministically (`isSignatureDateQuestion`); the REPLAY wrote back the
+stored literal. This also explains why ADI passed the same page all along: its bundle was filled the SAME
+day. **A one-day-old approval is enough**, which makes it a guaranteed failure for any review not
+submitted the day it was filled — the normal case. `replayField` now re-derives it to today.
+
+**2b. And the reconcile had to move with it.** Fixing only the replay traded a nav-timeout for a submit
+block: `≠ "Date*": approved "8/6/2026" but the page shows "08/07/2026"`. `reconcileReviewPage` now
+compares a signature date against today too. Both stay narrow — `isSignatureDateQuestion` rejects any
+label naming a different event — and both stay strict: a page showing any date other than today still
+disagrees.
+
+**waystar.wd1 now passes**: `page 5 → advanced` · `AGREE 41 · DISAGREE 0` · `✅✅✅ SUBMIT GATE PASSED`.
+Extension **1117/1117**. One test-writing note worth keeping: the first draft of the reconcile tests
+passed for the WRONG reason — every row landed in `missing_on_review` because the fixture used the wrong
+argument shape — so they now assert `tier === "keyed"` to prove they exercise the real compare.
+
+## 2026-08-07 (d) — SKILLS: the multi-value typeahead, built from a hand trace
+
+`Type to Add Skills` has been `skipped: no mapping` since 2026-06-04 — the last always-empty field on
+page 2. The plan on the books was "a repeat-commit loop around `fillTypeaheadCdp`". The trace says that
+would have been wrong in a way unit tests could never have caught, so the trace came first: page 2 of a
+real Solar Turbines draft (`cat.wd5`), driven by hand in the operator's own session, reading the DOM
+after every keystroke. Full observation record: dom-patterns 2026-08-07.
+
+**What the widget actually does.** It does not live-filter (ENTER is the filter trigger, banner "Search
+Results"); the input only GAINS `data-automation-id="searchBox"` once opened; the open list is
+"No Items." so there is nothing to start-scrape; a commit ADDS a chip and leaves the list open with the
+query intact, so N skills go in on one open; Tab-blur exits clean. A synthetic pointer-sequence click
+commits fine here — no trusted input needed.
+
+**Three findings changed the design.**
+
+**1. The taxonomy renames, so exact-only would have filled almost nothing.** "Python" is offered ONLY as
+`Python (Programming Language)`; "Docker" is offered as BOTH `Docker` and `Docker (Software)`. That
+trailing parenthetical is Workday's own qualifier — the same shape `normalize()` already strips off a
+dial code `(+1)` — hence `skillBaseName` and a "qualified" match tier, with a bare exact winning so
+"Docker" never resolves to "Docker (Software)".
+
+**2. The search is server-side FUZZY, so its results are NOT candidates.** `Yosys` → **Yodiz**;
+`ODrive` → **Top Drive**; even `zzqqxwvj` → `z/VM`. All under the same "Search Results" banner as a real
+hit. Containment and Levenshtein would each have committed one of those onto an application, which is the
+precise failure this project's match ladder exists to prevent — so this field allows exact/qualified only,
+ambiguity-guarded, and a skill Workday doesn't know stays OFF the form and is NAMED for the human. No AI:
+it is optional, and guessing a demonstrated-bad row is worse than a blank.
+
+**3. A dirty search box FABRICATES a skill.** A zero-result query + Enter makes Workday add the typed text
+as a brand-new skill. Mid-trace a `ctrl+a` that didn't land meant the next skill appended to the old
+query, and Enter created the chip **"DockerCubeMars motor drivers"** — a skill nobody claimed. On every
+other typeahead a dirty box merely wastes a candidate; here it writes a wrong answer. So the clear is a
+HARD GATE: unverified-empty ⇒ the field stops rather than press Enter. (That same behaviour is also the
+only way an off-taxonomy skill lands verbatim, and it is accepted when the new chip IS what we typed —
+Workday completed it, we didn't guess it.)
+
+**And one that makes a re-fill safe.** An already-selected skill DISAPPEARS from its own later results:
+with `Docker` committed, re-searching it offered only `Docker (Software)` and `Dockerfile`. So a re-fill
+that didn't dedup would commit a near-duplicate — `missingSkills` compares BASE names in both directions
+(a `Python (Programming Language)` chip covers the profile's "Python"), all-present is zero actuation, and
+the replay is idempotent by construction.
+
+**Shipped.** `skillBaseName`/`matchSkillOption`/`missingSkills` (lib.js, mirrored into the SW `apMatch`
+literal — the lockstep guard caught this one immediately, for a comment containing `field:` that its
+literal parser read as a key), `isSkillsField` + `fillSkillsCdp` (fill-driver.js), routed in
+`drivePageFill`'s flat loop and in `replayField` (splitting the approved `"A; B; C"` back apart, ABOVE
+skip-if-correct so chip order can't read as a mismatch). Each commit is verified as chip-set GROWTH plus
+identity of the new chip; `skillsMaxAdds`/`skillsBudgetMs` bound a cost that scales with the profile
+(~2–4s/skill), and whatever they drop is named rather than silently trimmed.
+
+### Live verification, and the three things it changed
+
+Six runs on the same Solar Turbines draft. **Visible worked first time** — 7 of 24 added, with the
+qualified tier firing exactly as designed (`C → C (Programming Language)`, `Python → Python (Programming
+Language)`, `Java → Java (Programming Language)`) — and `slowest: skills 33s`, so this field dominates
+page 2 and always will. Then three defects the fake could never have shown:
+
+**1. A single transient clear failure abandoned the rest of the list.** The visible run added 7 and quit;
+Git, Docker, VS Code and Vivado were all still to come and all exist in the taxonomy. The clear is
+focus-blind (trusted Ctrl+A/Delete) and on this widget Ctrl+A does not even select the input's text. Now a
+React-safe native-setter clear goes first, a failure RETRIES, and only a SECOND consecutive failure ends
+the field — and a skipped skill is reported as an infra failure, never as "Workday doesn't have it".
+
+**2. The hidden failure was NOT what it looked like, and the wrong fix nearly shipped.** A hidden run added
+ZERO skills, logging `{focused:true, ok:true, openedNow:false}` three times per skill; the byte-identical
+run under `forceTrustedInput` opened and searched fine. That is the exact signature of the auth-form /
+Self-Identify class ("this surface needs trusted events"), so trusted input was scoped to the field — and
+it did NOT help (the log proved the switch ran: "synthetic input ENABLED" appeared twice, once at run start
+and once for the restore). The real cause was the OPENER: it fired BOTH routes in one attempt, so the
+coordinate click landed before the searchBox mounted and a second click TOGGLES a multiselect shut — the
+same toggle-shut invariant the unified typeahead filler already documents. One settle beat plus alternating
+routes across retries fixed it, and **an isolation probe with the trusted scoping removed then filled the
+field normally on a hidden synthetic tab**: 13 candidates processed, adding `JavaScript`,
+`Altium Designer`, `Git`, `Docker (Software)`, then `RViz`, `Fusion 360`, `Yosys`. The trusted path was
+deleted (it doubles the field's wall-clock for nothing) and the call site now says so, so nobody re-adds it
+off the back of the same misleading symptom.
+
+**3. A readable trace matters.** The step key was `skill`, but the walk's settle-trace printer reads
+`candidate`, so every line logged `cand "undefined"` — the diagnostic was there and useless. Renamed, and
+each step now carries the printer's fields (`settleMs`/`count`/`banner`/`open`/`chips`) plus the open
+diagnostic, which is how cause 2 was finally attributed instead of guessed at a fourth time.
+
+**Two honest limits.** Coverage varies RUN TO RUN because the result set is a ranked top-7 (`Yosys` matched
+on one run, not the previous). And strictness costs coverage: a skill whose only offered row is a
+differently-named relative (`Vivado` against `Xilinx Vivado`) is left OFF rather than guessed — named in
+the record for the human. That is the intended trade, not a gap.
+
+**4. The opener was DELETING skills, and our own diagnostic caught it.** `Git` was on the form after one run
+and gone after the next — in the run that logged `cand "C++" → autocommit, 0 options`, i.e. the chip-set
+change test firing on a REMOVAL. `openHier` clicks the centre of `multiselectInputContainer`, which on a
+multi-value widget grows with every chip until its centre sits on a CHIP, whose delete X is a child. The
+coordinate route now aims at the INPUT's own rect. Both routes are still required: a run with only the
+page-side focus+click opened nothing (1 candidate, `needs_review`), so the trusted coordinate click is the
+reliable opener — it just has to be aimed at something that isn't a chip.
+
+**Converged**, hidden and synthetic: 11 remaining candidates attempted, `ROS 2` and `Git` added, nothing
+lost, `[filled]` — **15 of the profile's 24 skills on the form**. The nine that stay off (`C++`, `HTML/CSS`,
+`CAN`, `ODrive`, `CubeMars motor drivers`, `rqt`, `PCB design`, `VS Code`, `Vivado`) have no exact-or-
+qualified row on this tenant and are named in the record for the human.
+
+## 2026-08-08 — Autofill-with-Resume end to end, and the two writes that were never approved
+
+Two operator bug reports, both traced to US writing values the human never approved, and both fixed and
+live-verified on cat.wd5 in one sitting.
+
+**1. The phantom "required" errors were a missing BLUR.** Workday refused Save & Continue with
+`Error-To / Error-From / The field is required` and `Invalid LinkedIn URL` on a page that visibly HELD
+all of those values. Operator: *"all I did to manually fix it is to click into and then click out of the
+box."* Clicking out is a blur, and neither `fillDateCompositeCdp` nor `fillTextCdp` ever issued one —
+they typed, read back, and moved on. Several Workday inputs hand their value to the form model (and run
+validation) on blur, so a field we typed and never LEFT reads correct in the DOM and is unset as far as
+Workday is concerned. Both fillers now blur after the read-back verify.
+
+*Why it surfaced with Autofill-with-Resume and never with Apply Manually:* on a blank form we fill
+several fields per entry, so the next field's click incidentally blurs the previous one. On an autofilled
+form Workday has already populated most of an entry, so we often touch a single field — and nothing ever
+blurs it. Same code, different exposure. Verified: the page that halted the previous run advanced with
+only the blur added.
+
+**2. The replay INVENTED a signature date, and that write cascaded.** Operator: *"reherse filled out the
+date when it was not approved in the review summary. and then when date gets filled, name and disability
+checkbox becomes required so it failed."* Exactly right. `replayField` re-derived any signature date to
+TODAY on every replay (a 2026-08-07 fix for Workday's "Enter today's date" on a day-old bundle), but it
+overrode `current_value` unconditionally — including onto a date the human had left BLANK. On the Self
+Identify page that write CASCADES: Name and the disability group become required, neither has an approved
+answer, and the rehearse halts on two questions the human never saw.
+
+New rule, the operator's: **the replay always follows the review page.** Today's date is written only
+REACTIVELY — when Save & Continue actually returns "Enter today's date", the walk stamps that page's
+signature-date field and re-clicks once (bounded per run, refuses to guess if no signature-date field is
+on the page). The old tests were updated to the new rule rather than deleted, plus a new pin for the
+exact live failure: an UNAPPROVED (blank) signature date must be left alone.
+
+**Verified end to end** on a clean bundle: fill reached REVIEW after 5 pages via `/apply/autofillWithResume`
+→ approved `3 / 3 flagged` → rehearse replayed every page and reached the submit gate, with page 5 reading
+
+    page 5: 4 approved entries NOT actuated (left as-is): name (cleared), employeeId (cleared),
+            dateSignedOn (cleared), disabilityStatus (cleared)
+    ✓ page 5 → advanced.
+    review page vs approved: AGREE 47 · DISAGREE 0 · MISSING 3 · EXTRA 1 · AMBIGUOUS 0
+
+The date was left alone, the self-ID fields stayed blank, nothing cascaded, and the reconcile is clean.
+
+**The gate then blocked for an HONEST reason, not a regression:** the website rows deleted to clear
+Workday's phantom-duplicate error did not come back on the review page, so submitting would file the
+application without them (`phantomLost`). That is the retention premise being CHECKED rather than assumed
+— the same URL-loss issue already recorded for clearwater, now reproduced on cat.wd5.
+
+**Still open from the autofill flow:** the parse leaves repeating entries we do not own (an education
+entry that was entirely EMPTY blocked a page), and it writes `linkedInAccount`, which we skip as unmapped
+and therefore never validate — Workday rejected its own value. Both need the section reconcile to clean
+up after the parse, not just fill what is empty.
+
+### The CONTAINMENT tier (operator decision, same day)
+
+"Accept the containment match for skills so Vivado lands too." Added as the LAST tier in
+`matchSkillOption` — a **skills-only** exception to the standing "containment is a guess" rule, which
+CLAUDE.md's match-ladder section now records explicitly rather than leaving the code and the doc
+contradicting each other.
+
+The guards are not caution for its own sake; each one fired on the verifying run:
+
+- **Whole-word, never raw substring.** `includes` would match `Git` inside "Di**git**al" and `CAN` inside
+  "**Can**adian".
+- **Distinctiveness** (multi-word, or a lone token ≥5 chars). On that very run `CAN` was offered
+  **"Can Openers"** — a genuine whole-word hit. This gate is all that kept it off the application.
+- **Ranking tie-break.** The first attempt REFUSED `Vivado` (`containment match was ambiguous (2+ options)`)
+  because Workday offers both `Xilinx Vivado` and `Vivado HLS` — so the tie now breaks on Workday's own
+  first result, with the alternatives carried into the review so a human can switch.
+
+Every widened commit is `filled_review` + `skills-containment`, detail
+`Vivado → Xilinx Vivado (broader; Workday also offered Vivado HLS)`. `missingSkills` also treats a BROADER
+chip as covering the profile name, or the next pass would re-search `Vivado`, find the selected row hidden,
+and widen onto `Vivado HLS` alongside it.
+
+**18 of 24 now land** (`Xilinx Vivado` and `PCB design` via containment; `rqt` via Workday's free-text add).
+The six refusals — `C++`, `HTML/CSS`, `CAN`, `ODrive`, `CubeMars motor drivers`, `VS Code` — are all
+correct: the offered rows are different skills. Per-skill evidence table: dom-patterns 2026-08-07 (c).
+
+Extension **1147/1148** (`test/skills.test.js`, 36 pins; the one failure is `db.test.js` — `fake-indexeddb`
+is missing from this worktree's `node_modules`, unrelated and pre-existing). One operator call still open:
+whether a partial fill should nag review or just name the absent skills in the detail (current behaviour).
+
+## 2026-08-07 (e) — the flow a first application should take: AUTOFILL WITH RESUME
+
+Operator's manual finding, which reframes the skills work: a first application should click **Autofill with
+Resume**, so Workday parses the résumé and seeds the form — including the Skills section — and the fill then
+refills it as if blank. Traced, built and live-verified the same day; DOM detail in dom-patterns 2026-08-07 (d).
+
+**Onboarding.** `runCdpOnboard` gained `preferResumeAutofill`, set only by `AP_RUN_APPLICATION`. Stage 2
+now chooses `autofillWithResume` over `applyManually` for a fill run; a REHEARSE/SUBMIT run deliberately
+keeps manual/continue so saved skills survive and the résumé is not re-parsed. The flow inserts a RÉSUMÉ
+page before My Information, which onboarding consumes with the existing `attachResume` (same ids) and a
+Continue click. Two things had to be got right:
+
+- **`isPastAuth` had to exclude it.** The page reports one bare `formField-` wrapper, so the past-auth test
+  called it "the form".
+- **The wait had to be generous.** At 6s the upload input had not mounted, so onboarding timed out and the
+  WALK adopted the page — attaching the résumé itself and writing a junk 1-field bundle page. Nothing
+  broke, but the résumé page is pre-form. Now render-budgeted, and the log reads
+  `résumé page done — Workday parsed it; the next page has 14 field(s)`.
+
+**The parse is a bonus layer, not a substitute.** Live it filled name/country/phone and left the entire
+address, `source`, and `candidateIsPreviousWorker` empty — Workday refused Save & Continue on the last one.
+A method note worth keeping: reading a radio group's `input.value` gives `"true"`/`"false"` as an
+ATTRIBUTE and a checkbox's gives `"on"`, regardless of selection. Reading those as state made the parse
+look like it had answered both fields when it had answered neither, and I reported that before catching it.
+Read `.checked`.
+
+**Skills policy, per the operator's spec.** New `profile.fill_all_skills` (a checkbox on the profile, with
+the warning that it makes each application noticeably longer). OFF (default) ⇒ keep Workday's suggestions,
+add nothing, record the list for the review page. ON ⇒ add every profile skill the taxonomy accepts on top.
+A replay always passes `fillAll:true` — it reproduces an approved list rather than re-deciding policy. The
+setting is excluded from teach's default-wording seeding (`NON_ANSWER_FIELDS`), since no form asks it.
+
+**And a fix that cascaded from a fix.** Parsed chips read back annotated (`Computer Hardware (Suggested)`),
+which Workday's review page does not print — so `skillChipName` strips it wherever a chip becomes a value.
+That immediately flagged a correctly-kept field `skills:audit-mismatch` on a live run, because the M40
+audit re-reads the RAW chips: cleaning one side is worse than cleaning neither. `auditActualFromRaw` now
+cleans too, and the next run read `audit: re-read 26 filled field(s) — all matched the report`.
+
+**Verified live** on three fresh cat.wd5 postings: `Stage 2 — clicking "Autofill with Resume"` → résumé
+page consumed by onboarding → 15 suggested skills kept (`kept the 15 skill(s) Workday suggested from the
+résumé — "try to fill all skills" is off`) → `✓✓ reached the REVIEW page after 5 page(s)`.
+
+Extension **1153/1154** (42 skills pins; `db.test.js` still fails on the missing `fake-indexeddb`). Web
+typecheck clean; the worktree's web VITEST cannot run at all (`Cannot find package '@/lib/job-key'` — the
+same broken `node_modules`), so the 4 web files are typecheck-verified only. NOT yet verified: the review
+page's rendering of the kept skills (the tracker push 401'd — the site session expired mid-session), and
+the rehearse path's manual/continue re-entry.
+
+## 2026-08-09 — live sweep: marvell + moog verified, four fixes
+
+Continued the live regression/expansion sweep. Every run a fill or a rehearsal
+(`arm:false`); nothing was ever submitted.
+
+**Verified live to SUBMIT GATE PASSED (rehearsed twice each, hidden):**
+- **marvell.wd1** — AGREE 31 · DISAGREE 0 · MISSING 1 (`Language*`, the known
+  informational case: Workday's summary doesn't render it).
+- **moog.wd5** — NEW tenant, clean first fill (5 pages, 65 fields, 8 flagged),
+  AGREE 44 · DISAGREE 0.
+
+**Not verified, with the reason:**
+- **sonos.wd1** — the requisition is GONE (Workday's not-found page). Not a code
+  failure; see fix 3.
+- **hp.wd5** — reaches sign-in and requires Gmail email verification, which timed
+  out (120s). Skipped per the operator's standing instruction.
+
+### Fixes
+
+1. **The apMatch lockstep guard did not scan background.js.** It pins that every
+   `apMatch.X` call is present in the SW's hand-written literal — the check Node
+   can never do, since it takes the `require()` branch. It only read
+   fill-driver.js, so background.js had exactly the hole the test exists to close:
+   a call to `apMatch.parseErrorFieldName` passed 1185/1185 and aborted the live
+   replay with "is not a function". Both callers scanned now; the message names
+   the offending file.
+
+2. **Workday has a second wording for "the signature date is required."** The
+   replay may write one unapproved value — today's date — and only when asked. The
+   ask was matched as the literal "Enter today's date"; marvell page 5 says "The
+   field Date is required and must have a value", so nothing fired and the
+   rehearsal halted `replay-blocked`.
+
+   The diagnostic is what mattered: the wrapper already held the value (`current
+   value is 8/9/2026`, React props AND fiber set). Workday re-renders the date from
+   its saved copy but has dropped it server-side — the same self-ID class as the
+   disability checkbox — so the page displays an answer the model does not have,
+   and `skipIfCorrect` reads the screen and actuates nothing. `signatureDateDemanded`
+   therefore does NOT require the field to be blank: blankness is the one piece of
+   evidence this failure destroys, and requiring it would have been the obvious
+   guard that missed every real occurrence. It requires instead that the field is a
+   signature-date question and that Workday named it.
+
+3. **A posting that no longer exists now says so.** sonos's job URL renders
+   Workday's not-found shell in 132 characters. Nothing is wrong with the extension
+   there, but with no Apply button the run walked on to the auth wait and halted
+   "the sign-in fields never appeared" — which reads as a sign-in bug on a tenant
+   that signs in fine, and cost exactly that detour. Now `job-posting-not-found`
+   in ~2s.
+
+4. **The social-login chooser is matched by text.** Some tenants put the email form
+   behind "Sign in with email" beside federated Apple/Google buttons; that shape was
+   handled but keyed to one automation-id, and sonos hashes it. Detector and click
+   fall back to the button's text (the click stamps an attribute, since clickTarget
+   takes a selector). Unit-pinned but NOT live-exercised — sonos's posting is dead
+   either way.
+
+5. **job_key: requisition ids that separate letters from digits.** A job must key
+   identically from its posting URL and its form URL, because the fill stores the
+   bundle under one and the submit run looks it up by the other. The form URL adds
+   an `en-US/` segment and percent-encodes the location, so the path fallback can't
+   do it. Moog's id is `R-26-18835` — a separator where both req tiers wanted a
+   digit — so every tier missed and the rehearsal REFUSED its own approved bundle.
+   HP's `_3167270-1` failed the numeric tier the same way. Both tiers allow one
+   separator now; existing keys are byte-identical (regression-pinned on marvell,
+   `_R438146`, `JR109393`). Lockstep with `web/lib/job-key.ts`.
+
+### Still open
+- The signature-date stamp is unit-pinned but has not been observed firing live —
+  the marvell block is intermittent and has not recurred since.
+- `web/` vitest fails to resolve its `@/lib/*` alias for 7 suites. Verified
+  identical with all changes stashed: pre-existing, unrelated.
+- Suite 1189/1189; web typecheck clean.
