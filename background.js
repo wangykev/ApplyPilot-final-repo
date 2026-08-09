@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "autofill-auth-1";
+const AP_BUILD_MARKER = "selfid-fill-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -194,19 +194,33 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // reviewUrl before replay — see pullApprovedBundle). reviewUrl is optional for backward
   // compat (pullApprovedBundle derives it from ingestUrl when absent).
   if (type === "AP_SET_SESSION") {
-    chrome.storage.local.set(
-      {
-        apSession: {
-          ingestUrl: message.ingestUrl || "",
-          ingestKey: message.ingestKey || "",
-          reviewUrl: message.reviewUrl || "",
+    // ── SAY THAT THE CREDENTIAL LANDED (2026-08-09) ────────────────────────────────────────────────
+    // This stored the reporting key silently, so when every report started coming back 401 there was no
+    // way to tell the two candidate causes apart: the site minting a key the extension never received,
+    // or the extension holding a key the server had since deleted. The site says "synced" either way —
+    // it reports the server action's result, not the extension's. `getSession` DELETES the old row
+    // before inserting the new one, so a push that never arrives leaves the extension permanently 401.
+    // NEVER log the key itself: only its length and whether it CHANGED, which is all the diagnosis needs.
+    chrome.storage.local.get("apSession", (prev) => {
+      const oldKey = (prev && prev.apSession && prev.apSession.ingestKey) || "";
+      const newKey = message.ingestKey || "";
+      chrome.storage.local.set(
+        {
+          apSession: {
+            ingestUrl: message.ingestUrl || "",
+            ingestKey: newKey,
+            reviewUrl: message.reviewUrl || "",
+          },
         },
-      },
-      () => {
-        const err = chrome.runtime.lastError;
-        sendResponse(err ? { ok: false, error: err.message } : { ok: true });
-      }
-    );
+        () => {
+          const err = chrome.runtime.lastError;
+          console.log(`[ApplyPilot] reporting credential ${err ? "FAILED to store: " + err.message
+            : `stored — key ${newKey ? newKey.length + " chars" : "MISSING (empty!)"}, ${
+              !oldKey ? "first one" : newKey === oldKey ? "UNCHANGED from the previous one" : "replaces the previous one"}`}`);
+          sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+        }
+      );
+    });
     return true;
   }
 
@@ -2965,19 +2979,31 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     }
   } catch (e) { LOG("[GROUP-WATCH] install skipped:", String((e && e.message) || e)); }
 
-  // ── A SELF-ID PAGE: TRUSTED for TEXT/DATE, SYNTHETIC for CLICKS (2026-08-05) ────────────────────
+  // ── A SELF-ID PAGE GOES FULLY TRUSTED, CLICKS INCLUDED (2026-08-09) ─────────────────────────────
   // Workday ignores synthetic native-setter WRITES on this surface — hidden runs failed with Name and
-  // Date reported required-and-empty on a page whose DOM plainly held both, and forceTrustedInput fixed
-  // exactly that. But it ACCEPTS synthetic clicks, and prefers them: the disability checkbox committed
-  // and held 2/2 under synthetic, whereas trusted clicks on it produce the intermittent "did not commit"
-  // (quiet page, click dispatched, hit-test confirming the right label, no toggle). Forcing the WHOLE
-  // page trusted therefore fixed the text fields and re-exposed the checkbox.
+  // Date reported required-and-empty on a page whose DOM plainly held both. That much is unchanged.
   //
-  // So the split is per-KIND, not per-page: value writes go trusted, the label click stays synthetic.
+  // What changed is the CLICK half. This used to keep clicks synthetic, on a 2026-08-05 note that the
+  // disability checkbox "committed and held 2/2 under synthetic, whereas trusted clicks produce the
+  // intermittent did-not-commit". The REPLAY path was moved to fully-trusted on 2026-08-07 on stronger,
+  // repeated evidence (our read-back said the box was checked while Workday still called the field
+  // required, and a trusted re-write cleared it every time) — and that has since run clean.
+  //
+  // The FILL path kept the old split, and it is still biting. Live on marvell.wd1, page 5:
+  //   ⚠ page 5: NOT clicking Save & Continue — 1 REQUIRED field(s) we TRIED to fill produced no value
+  //     • "Please check one of the boxes below:*" [ai-commit-failed] — AI chose "No, I do not have a
+  //       disability…" but the checkbox group did not commit
+  // So the two paths now share ONE policy on this surface rather than disagreeing about it, which is
+  // also why the replay's version is the one to copy: it is the one with live evidence behind it.
+  //
+  // Verification is untouched: fillCheckboxGroupCdp still re-reads and requires exactly one box on, so
+  // a click that does not take ends needs_review — never a silent wrong answer.
   const _selfId = isSelfIdPage((preScan && preScan.fields) || []);
+  const _selfIdPrevSynthetic = cdpSyntheticInputEnabled();
   if (_selfId) {
-    LOG("this is a SELF-ID page — TRUSTED input for text/date (Workday ignores synthetic writes here), SYNTHETIC for the checkbox click (trusted clicks flake on it).");
+    LOG("this is a SELF-ID page — forcing TRUSTED input, CLICKS INCLUDED (Workday's model ignores synthetic writes AND synthetic clicks here).");
     cdpSetTrustedText(true);
+    cdpSetSyntheticInput(false);
   }
   const _fillT0 = Date.now();
   let out;
@@ -2997,7 +3023,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
     out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
   } finally {
-    if (_selfId) cdpSetTrustedText(false); // never leave the next page paying for this one
+    if (_selfId) {
+      cdpSetTrustedText(false);                        // never leave the next page paying for this one
+      cdpSetSyntheticInput(_selfIdPrevSynthetic);      // ditto for the click override — restore the run's mode
+    }
   }
   const fillMs = Date.now() - _fillT0;
   if (_gwSel) {
