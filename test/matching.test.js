@@ -108,3 +108,30 @@ test("below the 90 bar → targetIndex -1 (escalate, never guess)", () => {
   assert.strictEqual(m.targetIndex, -1);
   assert.strictEqual(m.matchTier, null);
 });
+
+// ── a rejected report must be LOUD, and name the cause it can name (2026-08-06) ──────────────────────
+test("reportOutcome: 2xx is silent success; 401/403 names the key rotation; others are loud too", () => {
+  const lib = require("../lib.js");
+  for (const ok of [200, 201, 204]) {
+    const r = lib.reportOutcome(ok);
+    assert.strictEqual(r.ok, true, ok + " is success");
+    assert.strictEqual(r.loud, false, "a healthy report says nothing extra");
+  }
+  for (const stale of [401, 403]) {
+    const r = lib.reportOutcome(stale);
+    assert.strictEqual(r.ok, false);
+    assert.strictEqual(r.loud, true);
+    assert.strictEqual(r.reason, "stale-key", stale + " is the rotated-key case");
+    assert.match(r.message, /Sync everything/, "it must say how to fix it");
+    assert.match(r.message, /nothing reached the tracker/i, "and what was lost");
+  }
+  // a server error is not a key problem, but is still not silence
+  const err = lib.reportOutcome(500);
+  assert.strictEqual(err.reason, "http-500");
+  assert.strictEqual(err.loud, true);
+  assert.doesNotMatch(err.message, /key/i, "do not blame the key for a server fault");
+  // no response at all (fetch threw / site down) is its own case
+  const none = lib.reportOutcome(undefined);
+  assert.strictEqual(none.reason, "no-response");
+  assert.strictEqual(none.loud, true);
+});

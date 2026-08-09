@@ -331,6 +331,23 @@ async function cdpSetFocusEmulation(enabled) {
   catch (e) { return false; }
 }
 
+// ── WHY THERE IS NO SCREENCAST HERE ANY MORE (removed 2026-08-07) ────────────────────────────────────
+// There was one: Page.startScreencast put a hidden tab under capture, which makes Chrome keep producing
+// frames for it, and that genuinely worked. It was added because Greenhouse's server-backed comboboxes
+// "burn 16-31s hidden and then reach review unanswered".
+//
+// That symptom had nothing to do with paint. It was OUR page overrides landing on a document that was
+// already running: the timers those widgets schedule their search on got swapped mid-flight and the
+// widgets never resolved again. Forcing frames let the half-broken page grind through often enough to
+// look like a fix. Installing the overrides before the document exists (see runAtsApplicationRun) fixed
+// the cause, and the workaround measured as pure cost afterwards — Discord hidden filled 16.9s dark vs
+// 17.2s under capture, and Reddit's rehearsal (the run that FAILED without forcing on 2026-08-06)
+// passed its whole gate dark: 23 fields replayed, 0 failures, 0 blockers.
+//
+// If a future tenant genuinely needs frames, this is the lever and it does work — bring it back
+// deliberately, with a measurement, rather than as a hedge. It is not free: capture makes the renderer
+// paint, and at everyNthFrame:1 the JPEG encoding starved the very renderer it was meant to free.
+
 // ── Hidden-tab SPA-transition unblock (2026-07-03) ───────────────────────────
 // A HIDDEN/minimized tab has requestAnimationFrame FULLY PAUSED (and timers
 // throttled to ~1Hz). The CDP fill survives that (React commits on a channel that
@@ -2155,7 +2172,14 @@ function cdpOnboardScan() {
   const passwordInput = present('input[type="password"]') || present('[data-automation-id="password"]');
   // Social-login CHOOSER (e.g. Palo Alto Networks wd5): the email/password form is behind a
   // "Sign in with email" button, alongside federated Apple/Google/LinkedIn buttons we NEVER click.
-  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]');
+  //
+  // The automation-id is NOT stable across tenants (sonos.wd1, 2026-08-09): its chooser renders the
+  // same button with a HASHED id, so the page had zero inputs, this read false, and the run halted
+  // `auth-form-not-rendered` — visible AND hidden, on a screen a human signs into fine. Fall back to
+  // the button's own text, which is what a human reads. Safe against the federated buttons beside it:
+  // they say "Sign in with Apple" / "Sign in with Google", and neither contains "email".
+  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]')
+    || clickables.some((b) => /\bsign[- ]?in\s+with\s+email\b/i.test((b.textContent || "").trim()));
   const markers = {
     adventureButton: present('[data-automation-id="adventureButton"]'),
     continueButton: present('[data-automation-id="continueButton"]'),
@@ -3207,6 +3231,24 @@ function cdpDevWrappers() {
         : cbs.length ? Array.from(cbs).map((c) => c.checked).join(",")
         : txt ? (txt.value || "") : null,
       required: !!(w.querySelector("abbr") || w.querySelector('[aria-required="true"]')),
+      // ── THE RAW EVIDENCE, not just our verdict (operator, 2026-08-09) ──────────────────────────────
+      // "you should be able to get this from the DOM, so the fact that you are asking is a problem."
+      // Exactly right: `required` above is a DERIVED boolean, and when a run halted on a required field
+      // the only way to sanity-check it was to re-read the same derivation and learn nothing — so the
+      // question got escalated to a human instead of answered from the page. Report WHICH marker fired,
+      // so "is this really required?" is settled by looking, every time.
+      requiredEvidence: (() => {
+        const ab = w.querySelector("abbr");
+        const lbl = w.querySelector("label,legend");
+        const lblText = lbl ? (lbl.textContent || "").replace(/\s+/g, " ").trim() : "";
+        return {
+          abbrTitle: ab ? (ab.getAttribute("title") || null) : null,   // Workday's <abbr title="required">
+          abbrText: ab ? (ab.textContent || "").trim() : null,         // or a bare <abbr>*</abbr>
+          ariaRequired: !!w.querySelector('[aria-required="true"]'),
+          labelEndsWithStar: /\*\s*$/.test(lblText),
+          label: lblText.slice(0, 60),
+        };
+      })(),
     };
   });
 }
@@ -4271,7 +4313,27 @@ function cdpLlmDemotionSummary() {
   return { count: cdpLlmDemotions.length, byModel, firstError: worst.error, model: worst.model };
 }
 
+
+// ── PORTED VERBATIM from the multi-ats branch (77abbdf, operator's) so the two paths share ONE
+// implementation rather than two variants that drift. Workday uses these to choose synthetic vs
+// trusted input; the multi-ATS combobox poll uses QUIESCENCE to tell "the menu isn't coming" from
+// "the page is still busy" — a question its own read latency could only approximate. ────────────
+
+
 function makeCdpActuation(llmConfig) {
+  // Shared by act.trustedFocus and act.trustedType: a real click when we can measure the element,
+  // DOM.focus when we cannot (a hidden tab can report a 0x0 rect, and the coordinate path would then
+  // silently do nothing — which is exactly how the first version of this looked like a failed fix).
+  const this_trustedFocus = async (sel) => {
+    let how = null;
+    try {
+      const rect = await cdpRectReady(sel, true);
+      if (rect && rect.w > 0) { await cdpClickAt(rect.cx, rect.cy); how = "click"; }
+    } catch (e) { /* fall through */ }
+    if (!how) { try { await cdpDomFocus(sel); how = "dom-focus"; } catch (e) { how = null; } }
+    try { console.log(`[ApplyPilot][CDP] trustedFocus ${JSON.stringify(sel)} → ${how || "FAILED"}`); } catch (e) { /* log only */ }
+    return how;
+  };
   return {
     // AI-1: the brain gates the AI-fallback on this BEFORE opening a field (so a disabled
     // toggle never opens/actuates). Mirrors act.llm's own enabled check (both read llmConfig).
@@ -4313,6 +4375,35 @@ function makeCdpActuation(llmConfig) {
         attempt++;
       }
     },
+    // Shared page-state probes (ported from the Workday branch): "is the tab producing frames?"
+    // and "has this subtree stopped mutating?". The multi-ATS poll needs the second to tell an
+    // absent menu from a page that is still reacting.
+    // A TRUSTED click on an element, for the widgets that will not wake for a synthetic one.
+    // Greenhouse's location combobox is the case that earned this (2026-08-06): a synthetic open
+    // click leaves its suggestion service asleep — the fill typed "Tallahassee" and waited 22.7s for
+    // nothing — while ONE real click makes the very same synthetic typing return
+    // "Tallahassee, Florida, United States" in about a second. In an ATS run cdpClickAt is already
+    // trusted (synthetic mode is only armed for Workday fills), so this is a genuine
+    // Input.dispatchMouseEvent, not another page-side dispatch.
+    // …and TRUSTED KEYSTROKES for the same widgets. A real click alone was not enough: with
+    // `trustedFocus → click` in the log, Greenhouse's school box still sat `loading` and its location
+    // box still showed nothing, while the manual test that worked used a real click AND real typing
+    // (2026-08-06). cdpTypeChars sends genuine key events, which is what these async loaders are
+    // watching for; ordinary synthetic typing keeps driving every other widget on the page.
+    trustedType: async (sel, text) => {
+      const how = await this_trustedFocus(sel);
+      if (!how) return false;
+      try {
+        await cdpSelectAllDelete();          // clear whatever is there, trusted
+        await cdpTypeChars(String(text));    // real keydown/keypress/keyup per character
+        return true;
+      } catch (e) { return false; }
+    },
+    trustedFocus: (sel) => this_trustedFocus(sel),
+    painting: () => cdpPainting(),
+    paintLabel: () => cdpPaintLabel(),
+    quietInstall: (sel) => cdpEval(cdpInstallQuietWatch, sel),
+    quietRead: (sel) => cdpEval(cdpReadQuiet, sel),
     clearText: () => cdpSelectAllDelete(),
     typeText: (text) => cdpInsertText(text), // recon (a): trusted beforeinput+input, survives blur
     readTextValue: (loc, tag) => cdpEval(cdpReadTextState, loc.wrapperSel, tag),

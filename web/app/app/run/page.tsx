@@ -70,7 +70,7 @@ export default async function RunPage() {
       <PageHeader
         eyebrow="Autopilot"
         title="Run an application"
-        description="Paste a Workday job link and press Run. The extension opens it in a new tab, grabs the job description, applies, signs in and verifies your email if the tenant needs it, then fills every page — stopping at the review page for you to approve. It never submits."
+        description="Paste a job link — Workday, Greenhouse, Lever or Ashby — and press Run. The extension opens it in a new tab, grabs the job description, and fills the application: on Workday it applies, signs in (verifying your email if the tenant needs it) and works through every page, stopping at the review page; the one-page boards have no review step, so it fills the form and hands it straight to you. It never submits."
       />
       <RunPanel />
       {/* Find work to run: sweeps the job boards for new postings and fills the queue.

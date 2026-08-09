@@ -786,6 +786,79 @@ function errorLabelKey(s) {
     .trim();
 }
 
+// Is Workday DEMANDING the signature date on this page? Returns the live field it means, or null.
+//
+// The replay may write exactly one value the review page did not approve — today's date — and only
+// because Workday ASKED. Recognizing the ask used to be a single wording, `"Enter today's date"`.
+// Live on marvell page 5 the ask reads "The field Date is required and must have a value", so nothing
+// fired and the rehearsal halted `replay-blocked` on a page that was one re-type from advancing.
+//
+// The load-bearing detail is WHY the field is rejected, because it changes what counts as evidence.
+// The trace showed the wrapper already holding the value: `Date* current value is 8/9/2026`. Workday
+// re-renders the date from its saved copy but has DROPPED it server-side (the same self-ID class as
+// the disability checkbox and hispanicOrLatino), so the page shows an answer the model does not have.
+// The replay then does nothing at all, because `skipIfCorrect` reads the screen, sees today's date and
+// takes the zero-actuation path — the value is correct in the DOM and absent where it counts.
+//
+// So this deliberately does NOT require the field to be blank. Blankness is the one piece of evidence
+// that is guaranteed absent in the failure it exists to catch. What it requires instead:
+//   • the field is a SIGNATURE-date question (isSignatureDateQuestion rejects start/birth/graduation/
+//     expiry/from/to — a wrong stamp there would be a wrong answer, not a missing one), and
+//   • Workday itself named it — either by spelling out the ask, or by naming that exact field in the
+//     error text. We never pick a date field Workday did not complain about.
+// The caller re-types with budgets that carry no `skipIfCorrect`, so the value is actuated for real
+// and handed to the model, which is the whole point.
+// TEXT-ONLY half of the check, so a nav-timeout with nothing to do with a date never pays for an extra
+// page scan. Kept here rather than inlined at the call site because background.js reaches lib.js through
+// the hand-written `apMatch` literal: every helper it calls has to be listed there, and one that is not
+// throws only in the browser (Node sees all of lib.js, so the suite stays green — live 2026-08-09,
+// `apMatch.parseErrorFieldName is not a function` aborted a replay that was otherwise fixed).
+// Workday's own 404 for a requisition that no longer exists — the posting was filled, pulled, or the
+// link went stale. Live (sonos.wd1 2026-08-09): the job URL rendered "The page you are looking for
+// doesn't exist." in 132 characters. Nothing is wrong with the extension on this page, but every
+// downstream stage reads it as its OWN failure: there is no Apply button to click, so the run walks
+// on to the auth wait and halts `auth-form-not-rendered — the sign-in fields never appeared`, which
+// sends whoever reads it hunting for a sign-in bug on a tenant that signs in fine. It cost exactly
+// that detour before the page was opened by hand.
+//
+// Text-based on purpose: this is Workday's generic not-found shell, with no automation-id of its own
+// and no posting markup to key off. Anchored on the full sentence so a job description that happens
+// to contain the word "exist" can't trip it, and paired by the caller with a genuinely empty page.
+const JOB_GONE_RE = /\bthe page you are looking for\s+(?:doesn'?t|does not)\s+exist\b/i;
+function isJobPostingGone(bodyText) {
+  return JOB_GONE_RE.test(String(bodyText == null ? "" : bodyText).replace(/\s+/g, " "));
+}
+function signatureDateAskInText(errorTexts) {
+  return (errorTexts || []).some((t) => {
+    const s = String(t == null ? "" : t);
+    if (/enter\s+today'?s\s+date/i.test(s)) return true;
+    const n = parseErrorFieldName(s);
+    return !!(n && isSignatureDateQuestion(n));
+  });
+}
+function signatureDateDemanded(errorTexts, liveFields) {
+  const texts = (errorTexts || []).map((t) => String(t == null ? "" : t)).filter(Boolean);
+  if (!texts.length) return null;
+  const sigFields = (liveFields || []).filter((f) => f
+    && (f.widgetType === "date" || f.widgetType === "text")
+    && isSignatureDateQuestion(f.label));
+  if (!sigFields.length) return null;
+
+  // (1) EXPLICIT ask — Workday spelled out what it wants, so any signature-date field on the page is it.
+  if (texts.some((t) => /enter\s+today'?s\s+date/i.test(t))) return sigFields[0];
+
+  // (2) GENERIC ask — Workday only says a field is required. Ground it on the NAME it used.
+  for (const t of texts) {
+    const named = parseErrorFieldName(t);
+    if (!named) continue;
+    const key = errorLabelKey(named);
+    if (!key) continue;
+    const hit = sigFields.find((f) => errorLabelKey(f.label) === key);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 // AI-4 Tier-1 (DETERMINISTIC, no AI): the MAPPED fields an error set names. For each error →
 // parseErrorFieldName → match a scan field by label (equal OR bidirectional-containment after
 // normalizeLabel) → keep only fields with `fieldMap[fieldName]` truthy (deterministically
@@ -1059,8 +1132,28 @@ function canonicalJobUrl(u) {
     // computed it from the pasted one. Any letters+digits requisition token now keys the same way.
     // The _R tier above is untouched and still matches FIRST, so every existing wdN:r<digits> key is
     // byte-identical — only URLs that had no key at all get one.
-    const alt = (p.pathname.match(/_([A-Za-z]{1,4}\d[\w-]*?)(?=\/|$)/g) || []).pop();
+    // …including ids that SEPARATE the letter prefix from the digits (2026-08-09). Moog posts
+    // `…-Engineering_R-26-18835`: the "_R<digits>" tier needs a digit straight after the R, and this
+    // tier needed one straight after the letters, so BOTH missed and the key fell to the path — which
+    // differs between the posting URL and the form URL by an "en-US/" locale segment AND the location
+    // spelling ("Buffalo-NY" vs "Buffalo%2C-NY"). One job, two keys, and the rehearsal REFUSED its own
+    // approved bundle. Allowing one separator keys both URLs off the requisition instead, which is the
+    // whole point of these tiers: the req id is identical in every spelling of the link.
+    const alt = (p.pathname.match(/_([A-Za-z]{1,4}[-_]?\d[\w-]*?)(?=\/|$)/g) || []).pop();
     if (alt) return (dc || "wd") + ":" + alt.slice(1).toLowerCase();
+    // A purely NUMERIC requisition id (2026-08-09). Marvell posts `…-Engineer_2601615` — no "R", no
+    // letter prefix — so it matched neither tier above and fell through to the path fallback, which is
+    // ENCODING-SENSITIVE: Workday serves the location segment percent-encoded ("San-Diego%2C-CA") while
+    // a hand-typed or redirected URL may carry the bare comma. The two spellings produced two different
+    // keys for one job, so the submit run REFUSED its own approved bundle:
+    //   REFUSING: no approved bundle for job_key "…" (no-remote-bundle)
+    // Same failure the letters+digits tier was added for on 2026-08-03, one character narrower.
+    // Ordered AFTER both tiers above, so every existing key stays byte-identical; ≥4 digits so an
+    // ordinary path number can't be mistaken for a requisition.
+    // A trailing "-<n>" is part of the id, not a separate segment (hp.wd5: `…Internship_3167270-1`).
+    // Without this the whole token failed the tier and fell to the encoding-sensitive path again.
+    const num = (p.pathname.match(/_(\d{4,}(?:-\d+)*)(?=\/|$)/g) || []).pop();
+    if (num) return (dc || "wd") + ":" + num.slice(1);
     // Strip the FORM-page tail so a posting URL and its form URL key identically:
     // /apply(…) (Workday + Lever) and /application (Ashby — 2026-07-31; without this a
     // submit run keyed on the posting could never find the fill's reported bundle).
@@ -1070,7 +1163,9 @@ function canonicalJobUrl(u) {
     // pull a DIFFERENT company's approved bundle — the review page showed 'all approved' while
     // the gate refused, naming a field from the other application. Keep the job token when the
     // path alone cannot identify the job.
-    const path = (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
+    // decodeURI-ish: fold percent-escapes so "%2c" and "," cannot key differently (see the numeric tier).
+    const decoded = (() => { try { return decodeURIComponent(p.pathname); } catch (e) { return p.pathname; } })();
+    const path = (p.origin + decoded).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
     const tok = p.searchParams.get("token") || p.searchParams.get("gh_jid");
     if (tok && /\/embed\/job_app$|\/embed\/job_board$/.test(path)) return path + "?token=" + String(tok).toLowerCase();
     return path;
@@ -2148,11 +2243,34 @@ function devLogSelect(ring, opts) {
 
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
+
+// ── DID THE WEBSITE ACCEPT OUR REPORT? (2026-08-06) ──────────────────────────────────────────────────
+// The push was fire-and-forget: any non-2xx was logged once at a normal volume and swallowed, so a
+// rejected report meant the tracker silently stopped updating while fills looked perfectly healthy
+// (live 2026-08-05: three fills in a row never reached the site). 401 has a specific, fixable cause
+// worth naming rather than a generic failure: `syncEverything` MINTS a key and DELETES every prior one,
+// so a sync from any other tab, window or dev server invalidates the key this extension holds.
+// Pure so it can be tested; the caller does the logging and the storage marker.
+function reportOutcome(status) {
+  const code = Number(status);
+  if (code >= 200 && code < 300) return { ok: true, loud: false, reason: null, message: null };
+  if (code === 401 || code === 403) {
+    return {
+      ok: false, loud: true, reason: "stale-key",
+      message: "THE WEBSITE REJECTED THIS REPORT (" + code + ") — nothing reached the tracker. The extension's " +
+        "ingest key is stale: every \"Sync everything\" mints a NEW key and deletes the old one, so a sync from " +
+        "another tab, window or dev server invalidates this one. Re-sync on /app/connect from the site you use.",
+    };
+  }
+  if (!code) return { ok: false, loud: true, reason: "no-response", message: "THE REPORT NEVER GOT A RESPONSE — nothing reached the tracker (site down, or the wrong origin)." };
+  return { ok: false, loud: true, reason: "http-" + code, message: "THE WEBSITE REJECTED THIS REPORT (" + code + ") — nothing reached the tracker." };
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
   skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
-  skillTokens, skillContainmentEligible, skillWholeWordIn,
+  skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

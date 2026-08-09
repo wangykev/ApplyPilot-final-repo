@@ -503,24 +503,43 @@ test("driver: an AI pick that is not a live option still leaves the OPTIONS on t
 });
 
 // ── a TRUNCATED option list must not render as a pick-one <select> (live 2026-07-31) ─────
-test("atsAttachOptions: a complete list becomes options; a long one becomes captured_options + typeahead", () => {
+// PARTIAL IS PROVENANCE, NOT LENGTH (revised 2026-08-07). The caller says whether the list was
+// reached by TYPING; length alone was throwing away options we had already read — Discord's dial
+// `country` menu holds all 244 entries in the DOM and `discipline--0` all 72, so the old >= 60 rule
+// stored 60 of them and told the operator it was "not the full list".
+test("atsAttachOptions: a list read unfiltered is complete however long; a searched one is partial", () => {
   const short = { widgetType: "dropdown" };
   ats.atsAttachOptions(short, ["Yes", "No"]);
   assert.deepStrictEqual(short.options, ["Yes", "No"]);
   assert.strictEqual(short.widgetType, "dropdown", "a complete list stays a select");
   assert.ok(!short.captured_options);
 
-  const long = { widgetType: "dropdown" };
-  ats.atsAttachOptions(long, Array.from({ length: 2000 }, (_, i) => "School " + i));
-  assert.strictEqual(long.options, null, "a partial list must NOT masquerade as the full option set");
-  assert.strictEqual(long.captured_options.length, 60);
-  assert.strictEqual(long.widgetType, "typeahead", "review renders a type-to-filter editor + partial note");
-  assert.strictEqual(long.optionsPartial, true);
+  // 244 countries read on OPEN — the whole list, and review must get all of it
+  const countries = { widgetType: "dropdown" };
+  ats.atsAttachOptions(countries, Array.from({ length: 244 }, (_, i) => "Country " + i));
+  assert.strictEqual(countries.options.length, 244, "an unfiltered read is the complete list");
+  assert.strictEqual(countries.captured_options, null);
+  assert.strictEqual(countries.widgetType, "dropdown", "a complete list stays a pick-one");
+  assert.ok(!countries.optionsPartial);
 
-  // a widget that returns EXACTLY one page is the partial case too (live: 60 of ~2000 schools)
+  // the SAME length, reached by typing → a filtered view, and it must say so
+  const searched = { widgetType: "dropdown" };
+  ats.atsAttachOptions(searched, Array.from({ length: 244 }, (_, i) => "Country " + i), true);
+  assert.strictEqual(searched.options, null, "a partial list must NOT masquerade as the full option set");
+  assert.strictEqual(searched.widgetType, "typeahead", "review renders a type-to-filter editor + partial note");
+  assert.strictEqual(searched.optionsPartial, true);
+
+  // a page-sized read reached by typing is partial too (live: 100 of ~3300 schools)
   const exact = { widgetType: "dropdown" };
-  ats.atsAttachOptions(exact, Array.from({ length: 60 }, (_, i) => "S" + i));
-  assert.strictEqual(exact.widgetType, "typeahead", "a page-sized read is partial, not complete");
+  ats.atsAttachOptions(exact, Array.from({ length: 60 }, (_, i) => "S" + i), true);
+  assert.strictEqual(exact.widgetType, "typeahead", "a searched page is partial, not complete");
+
+  // …and a list too big to store is truncated, but SAYS it was — never silently
+  const huge = { widgetType: "dropdown" };
+  ats.atsAttachOptions(huge, Array.from({ length: 2000 }, (_, i) => "School " + i));
+  assert.strictEqual(huge.options, null);
+  assert.strictEqual(huge.captured_options.length, 400);
+  assert.strictEqual(huge.optionsPartial, true, "a truncated list must never claim to be complete");
 
   const none = { widgetType: "dropdown" };
   ats.atsAttachOptions(none, []);
@@ -558,6 +577,902 @@ test("driver: on a LONG list the review options narrow to the near-matches; a sh
   const shown = r.captured_options || r.options || [];
   assert.ok(shown.includes("Carnegie Mellon University - Pittsburgh"), "the operator must SEE the real choices");
   assert.ok(shown.length <= 20, "a 302-option list is narrowed to the relevant neighbourhood");
+});
+
+// ── a SERVER-BACKED list that answers LATE (live 2026-08-04, Discord's school picker) ────────
+// Traced on a hidden tab, from the instant the query was typed: 0 options + "No options" at 4ms,
+// "Loading..." at 24ms, "Swarthmore College" at 4049ms. So the fill's flat 2s budget could never
+// have worked — and its retry made it worse by RE-TYPING, which restarts the widget's own
+// debounce and discards the search already in flight.
+// A PAGE of a long server-backed list — 100 rows, the way Greenhouse actually renders one. Fixtures
+// used to stand this in with a single row, which the driver now (correctly) reads as a COMPLETE list
+// and therefore does not search — so the stand-in has to look like the thing it stands for.
+const PAGE_OF_SCHOOLS = Array.from({ length: 100 }, (_, i) => "Aalborg University " + i);
+
+const SCHOOL_BUCKETS = [{ questions: ["School"], profile_path: "education.0.school_or_university" }];
+const SCHOOL_PROFILE = Object.assign({}, PROFILE, { education: [{ school_or_university: "Swarthmore College" }] });
+const SCHOOL_SCAN = {
+  ...GH_SCAN,
+  fields: [{ fieldName: "school--0", inputSel: "#school--0", widgetType: "select", label: "School", isRequired: true, value: null, domIndex: 0 }],
+};
+
+test("driver: a list still LOADING is waited out, and the search is never restarted", async () => {
+  // The fake answers LATER than the soft search budget — the shape that used to end needs_review.
+  const ANSWER_MS = 2600;
+  let query = "", typedAt = null, committed = null;
+  const typeCalls = [];
+  const act = fakeAct({
+    atsInjScan: () => SCHOOL_SCAN,
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjTypeInCombo: (sel, t) => { typeCalls.push(t); query = t; typedAt = Date.now(); return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: query }),
+    atsInjReadOptions: () => {
+      // page 1 of a 3300-school list: the value we want is NOT on it
+      if (!query) return { ok: true, open: true, options: PAGE_OF_SCHOOLS.map((t) => ({ text: t })), loading: false };
+      const answered = typedAt != null && Date.now() - typedAt >= ANSWER_MS;
+      // …and while the server search runs, the widget shows an EMPTY menu ("No options")
+      return { ok: true, open: true, options: answered ? [{ text: "Swarthmore College" }] : [], loading: !answered };
+    },
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+  const r = out.results[0];
+  assert.strictEqual(r.status, "filled", "a slow list is not an absent option: " + r.detail);
+  assert.strictEqual(r.after, "Swarthmore College");
+  assert.strictEqual(typeCalls.filter((t) => t === "Swarthmore College").length, 1, "the query is typed once");
+});
+
+test("driver: a list that never finishes loading says SO, instead of 'listed no options'", async () => {
+  const saved = Object.assign({}, ats.ATS_POLL);
+  Object.assign(ats.ATS_POLL, { open: 20, openCeil: 120, retry: 20, retryCeil: 120, search: 20, searchCeil: 200, restore: 20, restoreCeil: 60, showing: 20, showingCeil: 60 });
+  try {
+    let query = "";
+    const typeCalls = [];
+    const act = fakeAct({
+      atsInjScan: () => SCHOOL_SCAN,
+      atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+      atsInjTypeInCombo: (sel, t) => { typeCalls.push(t); query = t; return { ok: true }; },
+      atsInjReadComboInput: () => ({ ok: true, value: query }),
+      atsInjReadOptions: () => ({ ok: true, open: true, options: [], loading: true }), // never answers
+      atsInjCommitOption: () => ({ ok: true }),
+      atsInjReadValue: () => ({ ok: true, value: null }),
+      atsInjCloseCombo: () => ({ ok: true }),
+    });
+    const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+    const r = out.results[0];
+    assert.strictEqual(r.status, "needs_review");
+    assert.match(r.detail, /still loading/, "the operator must learn the FORM was slow, not that the answer is missing");
+    // and it must never have restarted that search: re-typing throws away what is in flight
+    assert.strictEqual(typeCalls.filter((t) => t === "Swarthmore College").length, 1,
+      "a widget that reported LOADING is waited out, never re-typed");
+  } finally { Object.assign(ats.ATS_POLL, saved); }
+});
+
+test("driver: a LOCAL list that rendered raggedly still gets its one re-type nudge", async () => {
+  // The counterpart to the rule above, pinned so protecting async searches does not quietly
+  // remove the recovery that a client-side widget (no loading state, e.g. Greenhouse's #country)
+  // does need: nothing is in flight, so one re-type can only help.
+  const saved = Object.assign({}, ats.ATS_POLL);
+  Object.assign(ats.ATS_POLL, { open: 20, openCeil: 40, retry: 200, retryCeil: 200, search: 20, searchCeil: 20, restore: 20, restoreCeil: 20, showing: 20, showingCeil: 20 });
+  try {
+    let query = "", committed = null;
+    const typeCalls = [];
+    const act = fakeAct({
+      atsInjScan: () => SCHOOL_SCAN,
+      atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+      atsInjTypeInCombo: (sel, t) => { typeCalls.push(t); query = t; return { ok: true }; },
+      atsInjReadComboInput: () => ({ ok: true, value: query }),
+      // empty until the query has been typed TWICE — a widget that needed the nudge. `loading` is
+      // never set: a client-side list has no fetch to report.
+      atsInjReadOptions: () => {
+        const nudged = typeCalls.filter((t) => t === "Swarthmore College").length >= 2;
+        if (!query) return { ok: true, open: true, options: PAGE_OF_SCHOOLS.map((t) => ({ text: t })) };
+        return { ok: true, open: true, options: nudged ? [{ text: "Swarthmore College" }] : [] };
+      },
+      atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+      atsInjReadValue: () => ({ ok: true, value: committed }),
+      atsInjCloseCombo: () => ({ ok: true }),
+    });
+    const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+    assert.strictEqual(out.results[0].status, "filled", "the nudge must still exist for a local widget");
+    assert.strictEqual(committed, "Swarthmore College");
+  } finally { Object.assign(ats.ATS_POLL, saved); }
+});
+
+test("driver: the option a by-name search found is not cleared away before the click", async () => {
+  // A long server-backed list does not carry the value on its unfiltered first page at all, so
+  // clearing the query to 'unfilter' the menu throws away the very option we matched, and the
+  // commit then fails option-not-found. Modelled exactly: the menu shows what the query matches,
+  // and a click only lands on an option that is currently VISIBLE (as in the real DOM).
+  const PAGE1 = PAGE_OF_SCHOOLS;
+  const ALL = PAGE1.concat(["Swarthmore College"]);
+  let query = "", committed = null;
+  const visible = () => (query ? ALL.filter((s) => s.toLowerCase().startsWith(query.toLowerCase())) : PAGE1);
+  const act = fakeAct({
+    atsInjScan: () => SCHOOL_SCAN,
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjTypeInCombo: (sel, t) => { query = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: query }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: visible().map((t) => ({ text: t })), loading: false }),
+    atsInjCommitOption: (sel, t) => (visible().includes(t) ? ((committed = t), { ok: true }) : { ok: false, error: "option-not-found" }),
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+  const r = out.results[0];
+  assert.strictEqual(r.status, "filled", "the searched option must still be on screen when we click it: " + r.detail);
+  assert.strictEqual(committed, "Swarthmore College");
+});
+
+test("driver: a PAGED list never claims the profile answer is absent", async () => {
+  // Live 2026-08-04: the school field reported 'your profile answer isn't one of this form's
+  // options' after reading 100 of ~3300 schools whose search had timed out — sending the operator
+  // to look for a missing option that is really there, and hiding the real problem.
+  const page1 = Array.from({ length: 100 }, (_, i) => "University " + i);   // page-sized read
+  let query = "";
+  const act = fakeAct({
+    atsInjScan: () => SCHOOL_SCAN,
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjTypeInCombo: (sel, t) => { query = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: query }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: page1.map((t) => ({ text: t })) }),
+    atsInjCommitOption: () => ({ ok: false, error: "option-not-found" }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+  const r = out.results[0];
+  assert.strictEqual(r.status, "needs_review");
+  assert.doesNotMatch(r.detail, /isn't one of this form's options/, "a paged list cannot prove absence");
+  assert.match(r.detail, /never answered our search/);
+  // and review must get a TYPE-or-filter editor, not a pick-one <select> of the near-matches:
+  // narrowing 100 read options down to 20 must not launder a paged list into a complete one
+  assert.strictEqual(r.optionsPartial, true, "a narrowed page is still a partial list");
+  assert.strictEqual(r.options, null, "options[] would render as the whole truth");
+  assert.ok((r.captured_options || []).length, "the operator still sees what we did read");
+
+  // …but a SHORT, complete list CAN prove it, and must keep saying so plainly.
+  const act2 = fakeAct({
+    atsInjScan: () => SCHOOL_SCAN,
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjTypeInCombo: (sel, t) => { query = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: query }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "MIT" }, { text: "Stanford University" }] }),
+    atsInjCommitOption: () => ({ ok: false, error: "option-not-found" }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out2 = await ats.driveAtsPageFill(act2, "greenhouse", SCHOOL_PROFILE, {}, {}, { buckets: SCHOOL_BUCKETS });
+  assert.match(out2.results[0].detail, /isn't one of this form's options/);
+});
+
+// ── a NUMBERED option list must not defeat an exact profile answer (live 2026-08-05) ──────
+test("atsEnumStrip: list numbering is display scaffolding, not part of the answer", () => {
+  assert.strictEqual(ats.atsEnumStrip("1. United States of America"), "United States of America");
+  assert.strictEqual(ats.atsEnumStrip("2) Canada"), "Canada");
+  assert.strictEqual(ats.atsEnumStrip("10. Located Elsewhere"), "Located Elsewhere");
+  // …and values that merely START with digits keep every character
+  assert.strictEqual(ats.atsEnumStrip("1 - 3 years"), "1 - 3 years");
+  assert.strictEqual(ats.atsEnumStrip("401(k) eligible"), "401(k) eligible");
+  assert.strictEqual(ats.atsEnumStrip("2026 graduate"), "2026 graduate");
+  assert.strictEqual(ats.atsEnumStrip(""), "");
+});
+
+test("driver: a numbered dropdown fills from the exact profile value, committing the REAL text", async () => {
+  // GitLab's "Where are you currently based?*" renders "1. United States of America" while the
+  // profile holds "United States of America": exact missed, containment is off for dropdowns by
+  // design, and fuzzy scored 88.9% against the 90 bar — so a REQUIRED field the profile answers
+  // perfectly was left empty for the operator.
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "select", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["1. United States of America", "2. Canada", "3. Located Elsewhere"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Where are you currently based?"], profile_path: "personal_info.country" }];
+  const profile = { ...PROFILE, personal_info: { ...PROFILE.personal_info, country: "United States of America" } };
+  const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, { buckets });
+  const r = out.results[0];
+  assert.strictEqual(r.status, "filled", "an exact profile answer must not be lost to list numbering: " + r.detail);
+  assert.strictEqual(r.matchTier, "exact-normalized");
+  assert.strictEqual(committed, "1. United States of America", "the click uses the option's REAL text");
+  assert.strictEqual(r.after, "1. United States of America");
+});
+
+test("driver: an unmounted menu is not an empty menu — the open poll SETTLES", async () => {
+  // A react-select paints its list a beat after the open click. Believing that beat ("0 options")
+  // is what read a required 3-option question as empty and mis-routed it (2026-08-05). The soft
+  // deadline is deliberately 1ms here: only a settle — not a bigger number — can pass this.
+  const saved = Object.assign({}, ats.ATS_POLL);
+  Object.assign(ats.ATS_POLL, { open: 1, openCeil: 2000, retry: 1, retryCeil: 20, search: 1, searchCeil: 20, restore: 1, restoreCeil: 20, showing: 1, showingCeil: 200 });
+  try {
+    // Faithful widget: a click TOGGLES the menu (the documented rule), and after opening it needs
+    // a couple of reads before its list paints. So giving up on the first empty read and then
+    // force-clicking just shuts it again — the failure loop seen live.
+    let isOpen = false, openedAt = 0, committed = null; const opens = [];
+    const MOUNT_MS = 60;   // the menu paints 60ms after the click — a TIME, like the real widget
+    const act = fakeAct({
+      atsInjScan: () => ({
+        ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+        fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "select", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+      }),
+      atsInjOpenAndReadOptions: (sel, force) => { opens.push(!!force); isOpen = !isOpen; openedAt = Date.now(); return { ok: true, opened: isOpen }; },
+      atsInjReadOptions: () => {
+        if (!isOpen || Date.now() - openedAt < MOUNT_MS) return { ok: true, open: false, options: [] };  // mounting
+        return { ok: true, open: true, options: ["1. United States of America", "2. Canada"].map((t) => ({ text: t })) };
+      },
+      atsInjTypeInCombo: () => ({ ok: true }),
+      atsInjReadComboInput: () => ({ ok: true, value: "" }),
+      atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+      atsInjReadValue: () => ({ ok: true, value: committed }),
+      atsInjCloseCombo: () => ({ ok: true }),
+    });
+    const profile = { ...PROFILE, personal_info: { ...PROFILE.personal_info, country: "United States of America" } };
+    const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, {});
+    assert.strictEqual(out.results[0].status, "filled", "the poll must wait for the menu to mount: " + out.results[0].detail);
+    assert.strictEqual(committed, "1. United States of America");
+    // The load-bearing assertion, and the one that is independent of any clock: waiting for the
+    // menu to mount means the forced-toggle recovery never has to run. A clock-only poll gives up
+    // on the mounting beat and then force-clicks — which SHUTS the menu it was waiting for.
+    assert.deepStrictEqual(opens, [false], "one plain open, no forced toggles");
+  } finally { Object.assign(ats.ATS_POLL, saved); }
+});
+
+test('driver: "where are you based?" answered by a 3-option pick-one, not a places lookup', async () => {
+  // Live 2026-08-05, GitLab: the label reads like a places question, so the fill typed a city and
+  // waited out a suggestion service that never answers — reporting "places never loaded" on a
+  // REQUIRED field whose own widget was already showing the answer.
+  let committed = null; const typed = [];
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "location", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["1. United States of America", "2. Canada", "3. Located Elsewhere"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: (sel, t) => { if (t) typed.push(t); return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const profile = { ...PROFILE, personal_info: { ...PROFILE.personal_info, country: "United States of America" } };
+  const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, {});
+  const r = out.results[0];
+  assert.strictEqual(r.status, "filled", "the widget's own list answers it: " + r.detail);
+  assert.strictEqual(committed, "1. United States of America");
+  assert.deepStrictEqual(typed, [], "no city was typed at a widget that is not a places box");
+
+  // …and a REAL places widget (no options until you type) still types and waits.
+  let asked = null;
+  const act2 = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t",
+      fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: asked ? [{ text: "Tallahassee, FL, USA" }] : [] }),
+    atsInjTypeInCombo: (sel, t) => { if (t) asked = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: asked || "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out2 = await ats.driveAtsPageFill(act2, "greenhouse", profile, {}, {}, {});
+  assert.strictEqual(asked, "Tallahassee", "a places box is still asked by city");
+  assert.strictEqual(out2.results[0].status, "filled");
+});
+
+test("router: a location question survives a TIERED country list (no crash, every tier tried)", async () => {
+  // The profile stores ladders as arrays, and personal_info.country is one of them. Handing the
+  // array to the match ladder threw `s.toLowerCase is not a function` and killed the field
+  // mid-fill (live 2026-08-05). Every tier must arrive as its own candidate.
+  const profile = { ...PROFILE, personal_info: { ...PROFILE.personal_info, country: ["Afghanistan", "United States of America"] } };
+  const r = ats.atsRouteLabel("Where are you currently based?", {}, profile, {});
+  assert.ok(Array.isArray(r.candidates), "tiered candidates, not one joined string");
+  assert.ok(r.candidates.every((c) => typeof c === "string"), "no nested arrays reach the ladder");
+  assert.ok(r.candidates.includes("United States of America"));
+  assert.strictEqual(typeof r.value, "string");
+
+  // and end to end: the later tier is the one that matches the form's numbered option
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "select", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["1. United States of America", "2. Canada"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, {});
+  assert.strictEqual(out.results[0].status, "filled", out.results[0].detail);
+  assert.strictEqual(committed, "1. United States of America");
+});
+
+// ── the RÉSUMÉ goes in the résumé slot, and nowhere else (live 2026-08-04) ─────────────────
+test("replay: the résumé is attached ONLY to the résumé field, never the cover letter", async () => {
+  // Greenhouse renders the cover letter as a file dropzone too. The replay used to treat every
+  // file field as the résumé, which put Kevin's résumé in the cover-letter slot on a rehearsal —
+  // on a real submit that files the wrong document, and no gate can catch it (the strict verify
+  // only re-checks approved VALUES, and the bundle carries no file for a skipped field).
+  const attached = [];
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/discord/jobs/1", title: "t",
+      fields: [
+        { fieldName: "resume", inputSel: "#resume", widgetType: "file_upload", label: "Resume", isRequired: true, value: null, domIndex: 0 },
+        { fieldName: "cover_letter", inputSel: "#cover_letter", widgetType: "file_upload", label: "Cover Letter", isRequired: false, value: null, domIndex: 1 },
+      ],
+    }),
+    attachResume: async (ref) => { attached.push(ref.inputSel); return { ok: true, name: "resume.pdf", verified: true }; },
+  });
+  // a submit/replay run: valueFor answers for BOTH entries (the cover letter was skipped, so it
+  // carries an empty value — which is NOT permission to attach something)
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { valueFor: () => "" });
+  assert.deepStrictEqual(attached, ["#resume"], "exactly one attach, to the résumé field");
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+  assert.strictEqual(by.resume.status, "filled");
+  assert.strictEqual(by.cover_letter.status, "skipped");
+  assert.match(by.cover_letter.detail, /cover letter|not the r/i);
+});
+
+test("replay: a dial composite keeps its dial routing, so an approved code commits", async () => {
+  // The replay used to route every non-file field as a plain value, actuating Greenhouse's
+  // phone-dial composite as an ordinary select. Live 2026-08-05 that ended `skipped` and blocked
+  // an otherwise-clean submit. The approved value here is the bare country: only the dial path
+  // (which strips the option's trailing "+<digits>" for matching) can land it.
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "country", inputSel: "#country", widgetType: "select", label: "Country", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "United States +1" }, { text: "Canada +1" }] }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { valueFor: () => "United States" });
+  assert.strictEqual(out.results[0].status, "filled", "the dial path must survive the replay: " + out.results[0].detail);
+  assert.strictEqual(committed, "United States +1", "the click uses the option's real text");
+});
+
+test("driver: a BUSY page is waited out; the quiet watch is what says the menu isn't coming", async () => {
+  // Ported from the Workday branch: the page stamps its last mutation, the SW does the waiting.
+  // While the subtree is still churning, an absent menu means "mid-reaction", not "no such menu" —
+  // the distinction my read-latency proxy could only guess at (live 2026-08-05).
+  const saved = Object.assign({}, ats.ATS_POLL);
+  Object.assign(ats.ATS_POLL, { open: 1, openCeil: 3000, retry: 1, retryCeil: 1, search: 1, searchCeil: 1, restore: 1, restoreCeil: 1, showing: 1, showingCeil: 1, busyIdleMs: 300 });
+  try {
+    const MOUNT_AT = Date.now() + 900;     // the menu appears well after the soft deadline
+    let quietCalls = 0, committed = null;
+    const act = fakeAct({
+      atsInjScan: () => ({
+        ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+        fields: [{ fieldName: "gender", inputSel: "#gender", widgetType: "select", label: "Gender", isRequired: false, value: null, domIndex: 0 }],
+      }),
+      atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+      atsInjReadOptions: () => (Date.now() < MOUNT_AT
+        ? { ok: true, open: false, options: [] }
+        : { ok: true, open: true, options: [{ text: "Male" }, { text: "Female" }] }),
+      atsInjTypeInCombo: () => ({ ok: true }),
+      atsInjReadComboInput: () => ({ ok: true, value: "" }),
+      atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+      atsInjReadValue: () => ({ ok: true, value: committed }),
+      atsInjCloseCombo: () => ({ ok: true }),
+    });
+    act.quietInstall = async () => ({ ok: true });
+    act.quietRead = async () => { quietCalls++; return { ok: true, idleMs: 40 }; };   // still mutating
+    const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+    assert.ok(quietCalls > 0, "the poll must consult the quiet watch before believing an empty menu");
+    assert.strictEqual(out.results[0].status, "filled", "a busy page is waited out: " + out.results[0].detail);
+    assert.strictEqual(committed, "Male");
+  } finally { Object.assign(ats.ATS_POLL, saved); }
+});
+
+test("replay: an approved value that carries the form's own numbering still matches", async () => {
+  // A commit stores the option's REAL text, so the bundle holds "1. United States of America".
+  // Stripping the numbering from the live options but not from the approved value made the replay
+  // of a field the fill had just filled report "isn't one of this form's options" (live 2026-08-05).
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/gitlab/jobs/1", title: "t",
+      fields: [{ fieldName: "q_based", inputSel: "#q_based", widgetType: "select", label: "Where are you currently based?", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["1. United States of America", "2. Canada"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { valueFor: () => "1. United States of America" });
+  assert.strictEqual(out.results[0].status, "filled", "the approved value must match the option it came from: " + out.results[0].detail);
+  assert.strictEqual(committed, "1. United States of America");
+});
+
+test("router: a signature/completion date is TODAY, and only for that question", async () => {
+  // Live 2026-08-05, Lever: eeo[disabilitySignatureDate] reached the AI free-text path and came back
+  // "As soon as possible" — an availability answer on a date field, after a 19.2s LLM call.
+  const mmddyyyy = /^\d{2}\/\d{2}\/\d{4}$/;
+  for (const label of ["Date", "Today's Date", "Signature Date", "Date Signed"]) {
+    const r = ats.atsRouteLabel(label, {}, PROFILE, {});
+    assert.ok(r && mmddyyyy.test(String(r.value)), label + " should route to today's date, got " + JSON.stringify(r && r.value));
+    assert.strictEqual(r.source, "signature-date");
+  }
+  // …and NEVER a date that names a different event — stamping today on one of these is a wrong answer
+  for (const label of ["Start Date", "Earliest start date", "Date of Birth", "Graduation Date", "Expiration Date"]) {
+    const r = ats.atsRouteLabel(label, {}, PROFILE, {});
+    assert.notStrictEqual(r && r.source, "signature-date", label + " must not be answered with today");
+  }
+  // it fills deterministically, unflagged, through the ordinary text path
+  const values = {};
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "lever", url: "https://jobs.lever.co/shieldai/uuid/apply", title: "t",
+      fields: [{ fieldName: "eeo[disabilitySignatureDate]", inputSel: "#sig", widgetType: "text", label: "Date", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+  });
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  assert.strictEqual(out.results[0].status, "filled", "deterministic, so no review flag: " + out.results[0].detail);
+  assert.ok(mmddyyyy.test(String(values["#sig"])), "wrote today's date, got " + JSON.stringify(values["#sig"]));
+});
+
+test("radio: the bundle stores the option we chose, not a label that carries its description", async () => {
+  // Lever's EEO options render the whole description inside the label, so the read-back is a
+  // paragraph while the option vocabulary is the answer alone. Persisting the paragraph made the
+  // REPLAY of a verified fill come back stated-value-unmatched (live 2026-08-05, Shield AI).
+  const OPTION = "Asian (Not Hispanic or Latino)";
+  const DISPLAY = OPTION + "A person having origins in any of the original peoples of the Far East, Southeast Asia, or the Indian Subcontinent.";
+  const scan = {
+    ats: "lever", url: "https://jobs.lever.co/shieldai/uuid/apply", title: "t",
+    fields: [{ fieldName: "eeo[race]", inputSel: 'input[name="eeo[race]"]', widgetType: "radio",
+      label: "Race", isRequired: false, value: null, domIndex: 0,
+      options: [OPTION, "White (Not Hispanic or Latino)", "Decline to self identify"] }],
+  };
+  const act = fakeAct({
+    atsInjScan: () => scan,
+    atsInjCheckOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: DISPLAY }),   // the label, description and all
+  });
+  const profile = { ...PROFILE, self_identification: { ...PROFILE.self_identification, race_ethnicity: OPTION } };
+  const out = await ats.driveAtsPageFill(act, "lever", profile, {}, {}, {});
+  const r = out.results[0];
+  assert.ok(r.status === "filled" || r.status === "filled_review", "the click verified: " + r.detail);
+  assert.strictEqual(r.after, OPTION, "the persisted value must be in the form's own option vocabulary");
+
+  // and that value replays: it now matches the live option list
+  let checked = null;
+  const act2 = fakeAct({
+    atsInjScan: () => scan,
+    atsInjCheckOption: (sel, t) => { checked = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: checked ? checked + "some description" : null }),
+  });
+  const out2 = await ats.driveAtsPageFill(act2, "lever", profile, {}, {}, { valueFor: () => OPTION });
+  assert.strictEqual(checked, OPTION);
+  assert.notStrictEqual(out2.results[0].status, "needs_review", "the approved value must replay: " + out2.results[0].detail);
+});
+
+test("AI free-text: the calls run CONCURRENTLY, and each answer still lands on its own field", async () => {
+  // Live 2026-08-05, Shield AI (Lever): 7 serial calls of 1.6-5.2s were 26.2s of a 32.6s fill (80%).
+  // A free-text decision needs no DOM, so the calls overlap; the safety path is unchanged.
+  const CALL_MS = 120;
+  let inFlight = 0, peak = 0;
+  const values = {};
+  const fields = Array.from({ length: 6 }, (_, i) => ({
+    fieldName: "cards[u" + i + "][field0]", inputSel: "#c" + i, widgetType: "textarea",
+    label: "Why do you want to work here? (" + i + ")", isRequired: true, value: null, domIndex: i,
+  }));
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, CALL_MS));
+      inFlight--;
+      return { ok: true, text: JSON.stringify({ answer: "ANSWER-" + peak, justification: "j", confidence: "High" }) };
+    },
+    atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+  });
+  const t0 = Date.now();
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  const elapsed = Date.now() - t0;
+
+  assert.ok(peak > 1, "the calls must overlap — peak concurrency was " + peak);
+  assert.ok(elapsed < 6 * CALL_MS, `serial would cost >= ${6 * CALL_MS}ms; took ${elapsed}ms`);
+  // …and every field still got ITS OWN answer, flagged, through the normal path
+  assert.strictEqual(out.results.length, 6);
+  for (const r of out.results) {
+    assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
+    assert.strictEqual(r.flag, "ai-text", "an AI answer is ALWAYS flagged");
+    assert.ok(String(r.after || "").startsWith("ANSWER-"), r.fieldName + " got " + JSON.stringify(r.after));
+  }
+  assert.strictEqual(new Set(Object.keys(values)).size, 6, "each field written once, to its own selector");
+});
+
+test("AI choice: scan-known options are decided CONCURRENTLY, each pick still cleared vs live options", async () => {
+  // The Lever measurement's 7 slow calls were all `cards[…]` RADIOS, whose options come from the scan
+  // — so no DOM is needed to decide them, and they no longer queue behind each other.
+  const CALL_MS = 120;
+  let inFlight = 0, peak = 0, checked = {};
+  const fields = Array.from({ length: 6 }, (_, i) => ({
+    fieldName: "cards[u" + i + "][field0]", inputSel: 'input[name="cards[u' + i + '][field0]"]',
+    widgetType: "radio", label: "Custom screening question " + i, isRequired: true, value: null, domIndex: i,
+    options: ["A United States Citizen", "A Permanent Resident", "Neither"],
+  }));
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async () => {
+      inFlight++; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, CALL_MS));
+      inFlight--;
+      return { ok: true, text: JSON.stringify({ choice: "A United States Citizen", justification: "profile", confidence: "High" }) };
+    },
+    atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
+    atsInjCheckOption: (sel, t) => { checked[sel] = t; return { ok: true }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: checked[sel] || null }),
+  });
+  const t0 = Date.now();
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  const elapsed = Date.now() - t0;
+
+  assert.ok(peak > 1, "radio decisions must overlap — peak concurrency was " + peak);
+  assert.ok(elapsed < 6 * CALL_MS, `serial would cost >= ${6 * CALL_MS}ms; took ${elapsed}ms`);
+  for (const r of out.results) {
+    assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
+    assert.strictEqual(r.after, "A United States Citizen");
+    assert.ok(/ai-/.test(String(r.flag)), "an AI answer is ALWAYS flagged, got " + r.flag);
+  }
+  assert.strictEqual(Object.keys(checked).length, 6, "each field committed to its own group");
+});
+
+test("AI choice prefetch: a decision is DISCARDED when the live options differ from the scan's", async () => {
+  // The prompt must always reflect what the form is showing. If the live list has changed since the
+  // scan (a cascade, a re-render), the prefetched pick is thrown away and the question re-asked.
+  let calls = 0;
+  const fields = [{
+    fieldName: "q1", inputSel: "#q1", widgetType: "select", label: "Pick one", isRequired: true,
+    value: null, domIndex: 0, options: ["Stale A", "Stale B"],
+  }];
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async () => { calls++; return { ok: true, text: JSON.stringify({ choice: "Live One", justification: "j", confidence: "High" }) }; },
+    atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "Live One" }, { text: "Live Two" }, { text: "Live Three" }] }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: "Live One" }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(out.results[0].after, "Live One");
+  assert.ok(calls >= 1, "the question is asked against the LIVE list");
+});
+
+test("location: a Greenhouse suggestion list is waited for, whatever google.maps says", async () => {
+  // Traced live 2026-08-06 on Reddit: `google.maps` is absent and no maps script is ever requested,
+  // yet typing "Tallahassee" returns "Tallahassee, Florida, United States" from GREENHOUSE'S OWN
+  // service. A probe I added the day before skipped the wait whenever google.maps was missing, which
+  // was every Greenhouse form — manufacturing "suggestions never loaded" on a widget that works.
+  let typed = null, committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/reddit/jobs/1", title: "t",
+      fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjPlacesReady: () => ({ ok: true, places: false }),   // no google.maps — must NOT matter
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, loading: false,
+      options: (typed ? ["Tallahassee, Florida, United States", "Tallahassee, Georgia, United States"] : []).map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: (sel, t) => { if (t) typed = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed || "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(typed, "Tallahassee", "asked by city");
+  assert.strictEqual(committed, "Tallahassee, Florida, United States", "the city+state suggestion is picked");
+  assert.notStrictEqual(out.results[0].status, "needs_review", "a working widget must not be reported broken: " + out.results[0].detail);
+});
+
+test("location: a bucket-supplied city still matches the widget's own suggestion, and nothing is discarded", async () => {
+  // Live 2026-08-06, Ashby/Cohere: the box offered "Pittsburgh, Pennsylvania, United States", the
+  // bucket value was "Pittsburgh, PA", and because a bucket routes BEFORE the label ladder the field
+  // was matched as a strict dropdown → no hit, 17.5s spent, and the record then claimed the widget
+  // "listed no options" while handing review nothing to pick.
+  const SUGGESTIONS = ["Pittsburgh, Pennsylvania, United States", "Pittsburgh, Kansas, United States"];
+  let typed = null, committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "ashby", url: "https://jobs.ashbyhq.com/cohere/uuid/application", title: "t",
+      fields: [{ fieldName: "ap-ats-combobox-3", inputSel: "#ap-ats-combobox-3", widgetType: "select", label: "Location", isRequired: false, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    // suggestions appear only once the city has been typed — a places-style widget
+    atsInjReadOptions: () => ({ ok: true, open: true, options: (typed ? SUGGESTIONS : []).map((t) => ({ text: t })), loading: false }),
+    atsInjTypeInCombo: (sel, t) => { if (t) typed = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed || "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Location"], value: ["Pittsburgh, PA"] }];
+  const out = await ats.driveAtsPageFill(act, "ashby", PROFILE, {}, {}, { buckets });
+  const r = out.results[0];
+  assert.strictEqual(typed, "Pittsburgh", "a location box is asked by CITY, not by the whole string");
+  assert.notStrictEqual(r.status, "skipped", "the widget offered a real match: " + r.detail);
+  assert.strictEqual(committed, "Pittsburgh, Pennsylvania, United States");
+});
+
+test("a search that saw options never reports 'listed no options'", async () => {
+  // The same run's second defect: the suggestions vanish when the query is cleared, and the record
+  // then described a widget that had just offered five as having offered none — with nothing attached
+  // for review to pick from.
+  let typed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t",
+      fields: [{ fieldName: "q1", inputSel: "#q1", widgetType: "select", label: "Pick one", isRequired: true, value: null, domIndex: 0, options: [] }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    // options exist ONLY while the query is present; clearing loses them (the live shape)
+    atsInjReadOptions: () => ({ ok: true, open: true, options: (typed ? [{ text: "Something Else" }, { text: "Another Thing" }] : []), loading: false }),
+    atsInjTypeInCombo: (sel, t) => { typed = t || null; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed || "" }),
+    atsInjCommitOption: () => ({ ok: false, error: "option-not-found" }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Pick one"], value: ["Not On The List"] }];
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { buckets });
+  const r = out.results[0];
+  assert.doesNotMatch(String(r.detail), /listed no options/, "it saw options — say so: " + r.detail);
+  const shown = r.options || r.captured_options || [];
+  assert.ok(shown.includes("Something Else"), "review must get the options the search surfaced");
+});
+
+test("assertion-lead: the same self-ID answer in different words, and it refuses when unsure", () => {
+  // Live 2026-08-06, Lever/gopuff diversity survey: the profile holds "I am not a protected veteran"
+  // (the Workday/Greenhouse wording), the form offers "I am not a U.S. veteran". Neither contains the
+  // other and fuzzy scores ~63%, so a STATED answer reached review.
+  const VET = ["I identify as a U.S. veteran", "I am not a U.S. veteran", "Prefer not to answer"];
+  assert.strictEqual(ats.atsAssertionLead("I am not a protected veteran", VET), "I am not a U.S. veteran");
+  assert.strictEqual(ats.atsAssertionLead("I identify as a veteran", VET), "I identify as a U.S. veteran");
+  // a POSITIVE assertion must never answer a NEGATIVE option — that would invert a legal self-ID
+  assert.strictEqual(ats.atsAssertionLead("I identify as a veteran", ["I am not a U.S. veteran", "Prefer not to answer"]), null);
+  // 2+ candidates of the same polarity ⇒ refuse rather than guess a demographic
+  assert.strictEqual(ats.atsAssertionLead("I am not a veteran", ["I am not a veteran A", "I am not a veteran B"]), null);
+  // a value that is not a first-person assertion is none of this bridge's business
+  assert.strictEqual(ats.atsAssertionLead("Asian", VET), null);
+  assert.strictEqual(ats.atsAssertionLead("", VET), null);
+  assert.strictEqual(ats.atsAssertionLead("I am not a veteran", []), null);
+});
+
+test("driver: a stated veteran status fills through the assertion bridge, flagged not silent", async () => {
+  let checked = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "lever", url: "https://jobs.lever.co/gopuff/uuid/apply", title: "t",
+      fields: [{ fieldName: "surveysResponses[u][responses][field5]", inputSel: 'input[name="vet"]', widgetType: "radio",
+        label: "Are you a veteran?", isRequired: false, value: null, domIndex: 0,
+        options: ["I identify as a U.S. veteran", "I am not a U.S. veteran", "Prefer not to answer"] }],
+    }),
+    atsInjCheckOption: (sel, t) => { checked = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: checked }),
+  });
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  const r = out.results[0];
+  assert.strictEqual(checked, "I am not a U.S. veteran");
+  assert.strictEqual(r.matchTier, "assertion-lead");
+  assert.strictEqual(r.status, "filled_review", "a non-exact tier is always flagged, never silent");
+});
+
+test("an AI-GUESSED demographic wears the loud badge, and ordinary questions do not", async () => {
+  // Live 2026-08-06, Reddit: a veteran question ("No military service") and a transgender question
+  // answered from the profile's GENDER both wore an ordinary `ai-choice` badge. The Workday path has
+  // used `ai-eeo-guess` — the review editor's loudest — since AI-3; this path never set it.
+  const mk = (label, options) => fakeAct({
+    aiEnabled: true,
+    llm: async () => ({ ok: true, text: JSON.stringify({ choice: options[0], justification: "j", confidence: "High" }) }),
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/reddit/jobs/1", title: "t",
+      fields: [{ fieldName: "q", inputSel: "#q", widgetType: "select", label, isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: options.map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: options[0] }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  // the wordings that were missed
+  for (const label of ["Military service", "Do you identify as transgender?", "What are your pronouns?", "Do you identify as LGBTQ+?", "What is your age range?"]) {
+    const out = await ats.driveAtsPageFill(mk(label, ["No military service", "I am a veteran"]), "greenhouse", PROFILE, {}, {}, {});
+    assert.strictEqual(out.results[0].flag, "ai-eeo-guess", label + " must carry the demographic badge");
+  }
+  // …and a normal screening question must NOT be mislabelled as a demographic
+  // (deliberately a question no recogniser owns — "how did you hear" has its own deterministic ladder
+  // and would never reach the AI at all)
+  const out = await ats.driveAtsPageFill(mk("Which internal team interests you most?", ["Platform", "Ads"]), "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(out.results[0].flag, "ai-choice", "an ordinary question keeps the ordinary badge");
+  // an over-18 question is legally loaded but NOT a protected characteristic
+  const age = await ats.driveAtsPageFill(mk("Are you over the age of 18?", ["Yes", "No"]), "greenhouse", PROFILE, {}, {}, {});
+  assert.notStrictEqual(age.results[0].flag, "ai-eeo-guess");
+});
+
+test("replay: an APPROVED typed location counts as committed; a FILL still asks for review", async () => {
+  // Greenhouse's candidate-location needs google.maps.places, which never loads in this browser — a
+  // human gets no suggestions either. On a REPLAY the operator has already approved the exact text and
+  // the box holds it, so calling it needs_review fails the strict verify and blocks the gate forever
+  // (live 2026-08-06, Reddit: the only failure left in an otherwise clean rehearsal).
+  const mk = () => {
+    let typed = null;
+    return { act: fakeAct({
+      atsInjScan: () => ({
+        ats: "greenhouse", url: "https://job-boards.greenhouse.io/reddit/jobs/1", title: "t",
+        fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
+      }),
+      atsInjPlacesReady: () => ({ ok: true, places: false }),   // the library never loaded
+      atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+      atsInjReadOptions: () => ({ ok: true, open: true, options: [] }),
+      atsInjTypeInCombo: (sel, t) => { if (t) typed = t; return { ok: true }; },
+      atsInjReadComboInput: () => ({ ok: true, value: typed || "" }),
+      atsInjCloseCombo: () => ({ ok: true }),
+      atsInjReadValue: () => ({ ok: true, value: typed }),
+    }) };
+  };
+  // REPLAY: the approved value is in the box ⇒ committed (flagged), so the gate can pass
+  const rep = await ats.driveAtsPageFill(mk().act, "greenhouse", PROFILE, {}, {}, { valueFor: () => "Tallahassee, Florida" });
+  assert.strictEqual(rep.results[0].status, "filled_review", "an approved typed location is committed: " + rep.results[0].detail);
+  assert.strictEqual(rep.results[0].flag, "location-typed-unverified", "…and it stays flagged, never silent");
+
+  // FILL: nobody has approved anything yet, so it must still reach review
+  const fill = await ats.driveAtsPageFill(mk().act, "greenhouse", PROFILE, {}, {}, {});
+  assert.strictEqual(fill.results[0].status, "needs_review", "a fresh fill still asks the human");
+
+  // …AND THE AUDIT OVERRULES ALL OF IT. Live 2026-08-06 on Reddit the box did NOT keep the text, the
+  // M40 re-read found it empty, and the field was downgraded — so the gate refused a form whose
+  // required location really was blank. That is the safety property; without it this grade would let a
+  // submit through with an empty required field.
+  let typed2 = null;
+  const discards = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/reddit/jobs/1", title: "t",
+      fields: [{ fieldName: "candidate-location", inputSel: "#candidate-location", widgetType: "location", label: "Location (City)", isRequired: true, value: null, domIndex: 0 }],
+    }),
+    atsInjPlacesReady: () => ({ ok: true, places: false }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [] }),
+    atsInjTypeInCombo: (sel, t) => { if (t) typed2 = t; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed2 || "" }),
+    atsInjCloseCombo: () => { typed2 = null; return { ok: true }; },   // the widget DISCARDS free text
+    atsInjReadValue: () => ({ ok: true, value: typed2 }),
+  });
+  const lost = await ats.driveAtsPageFill(discards, "greenhouse", PROFILE, {}, {}, { valueFor: () => "Tallahassee, Florida" });
+  assert.strictEqual(lost.results[0].status, "needs_review", "a box that discarded the value is NOT committed: " + lost.results[0].detail);
+  assert.match(String(lost.results[0].detail), /audit/i, "and the audit is what says so");
+});
+
+test("degree level: bridges the granularity gap, and NEVER invents a credential", () => {
+  // Live 2026-08-06, Discord: the reconned 10-option list offers "Bachelor's Degree" while the profile
+  // states "Bachelor of Science" (ladder: "Bachelors", "Bachelor of Science (BS)"). The apostrophe and
+  // the "Degree" suffix defeat exact, containment (off for dropdowns) and fuzzy (~56%).
+  const GENERIC = ["Associate's Degree", "Bachelor's Degree", "Master's Degree", "Doctor of Medicine (M.D.)", "High School"];
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelor of Science", "Bachelors"], GENERIC), "Bachelor's Degree");
+  assert.strictEqual(ats.atsDegreeMatch(["Master of Science"], GENERIC), "Master's Degree");
+  assert.strictEqual(ats.atsDegreeMatch(["MBA"], GENERIC), "Master's Degree");
+
+  // ⚠ THE ONE THAT MATTERS: a PhD is not an MD. A first cut bucketed every doctorate together and
+  // matched "Doctor of Medicine (M.D.)" because it was the only doctorate on the list — a confident
+  // wrong credential, the worst failure this project has.
+  assert.strictEqual(ats.atsDegreeMatch(["Doctor of Philosophy"], GENERIC), null);
+  assert.strictEqual(ats.atsDegreeMatch(["PhD"], GENERIC), null);
+  assert.strictEqual(ats.atsDegreeMatch(["Doctor of Medicine"], GENERIC), "Doctor of Medicine (M.D.)");
+  assert.strictEqual(ats.atsDegreeMatch(["PhD"], ["Bachelor's Degree", "Doctorate"]), "Doctorate");
+  assert.strictEqual(ats.atsDegreeMatch(["Juris Doctor"], GENERIC), null, "a JD is not an MD either");
+
+  // two options at the SAME level is a real choice — the human makes it
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelor of Science"], ["Bachelor of Science", "Bachelor of Arts"]), null);
+  // and a value that names no level is none of this bridge's business
+  assert.strictEqual(ats.atsDegreeMatch(["Yes"], GENERIC), null);
+  assert.strictEqual(ats.atsDegreeMatch([], GENERIC), null);
+});
+
+test("driver: a degree question fills through the level bridge, flagged; other dropdowns unaffected", async () => {
+  let committed = null;
+  const mk = (label) => fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/discord/jobs/1", title: "t",
+      fields: [{ fieldName: "degree--0", inputSel: "#degree--0", widgetType: "select", label, isRequired: false, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: ["Associate's Degree", "Bachelor's Degree", "Master's Degree"].map((t) => ({ text: t })) }),
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Degree", "Highest level of education"], value: ["Bachelor of Science"] }];
+  const out = await ats.driveAtsPageFill(mk("Degree"), "greenhouse", PROFILE, {}, {}, { buckets });
+  assert.strictEqual(committed, "Bachelor's Degree");
+  assert.strictEqual(out.results[0].matchTier, "degree-level");
+  assert.strictEqual(out.results[0].status, "filled_review", "a non-exact tier is always flagged");
+
+  // the bridge is gated on the LABEL: an unrelated dropdown with degree-ish values must not use it
+  committed = null;
+  const other = await ats.driveAtsPageFill(mk("Which team?"), "greenhouse", PROFILE, {}, {}, { buckets });
+  assert.notStrictEqual(other.results[0].matchTier, "degree-level");
+});
+
+test("a COMPLETE list is matched whole, never searched — typing would filter the answer away", async () => {
+  // Traced live 2026-08-06 on Discord's degree box: opening it renders all 10 options, and typing the
+  // profile's own wording ("Bachelor of Science") filters that to "No options", because the widget
+  // matches TYPED TEXT while the form's vocabulary is "Bachelor's Degree". Searching a list you can
+  // already see in full can only hide the answer.
+  const typed = [];
+  let committed = null;
+  const act = fakeAct({
+    atsInjScan: () => ({
+      ats: "greenhouse", url: "https://job-boards.greenhouse.io/discord/jobs/1", title: "t",
+      fields: [{ fieldName: "degree--0", inputSel: "#degree--0", widgetType: "select", label: "Degree", isRequired: false, value: null, domIndex: 0 }],
+    }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    // the widget filters on the typed text, exactly like the live one
+    atsInjReadOptions: () => {
+      const all = ["Associate's Degree", "Bachelor's Degree", "Master's Degree"];
+      const q = typed[typed.length - 1] || "";
+      const shown = q ? all.filter((t) => t.toLowerCase().includes(q.toLowerCase())) : all;
+      return { ok: true, open: true, loading: false, options: shown.map((t) => ({ text: t })) };
+    },
+    atsInjTypeInCombo: (sel, t) => { typed.push(t || ""); return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: typed[typed.length - 1] || "" }),
+    atsInjCommitOption: (sel, t) => { committed = t; return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: committed }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const buckets = [{ questions: ["Degree"], value: ["Bachelor of Science"] }];
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, { buckets });
+  assert.strictEqual(committed, "Bachelor's Degree", "matched from the whole list: " + out.results[0].detail);
+  assert.deepStrictEqual(typed.filter(Boolean), [], "a complete list must never be searched");
+});
+
+test("atsListIsComplete: a short settled list is complete; a page or a loading one is not", () => {
+  const opts = (n) => ({ ok: true, open: true, options: Array.from({ length: n }, (_, i) => ({ text: "o" + i })) });
+  assert.strictEqual(ats.atsListIsComplete(opts(10)), true);
+  assert.strictEqual(ats.atsListIsComplete(opts(59)), true);
+  assert.strictEqual(ats.atsListIsComplete(opts(60)), false, "a page-sized read is a PAGE, not the whole list");
+  assert.strictEqual(ats.atsListIsComplete(opts(100)), false);
+  assert.strictEqual(ats.atsListIsComplete({ ok: true, open: true, options: [] }), false, "nothing rendered proves nothing");
+  assert.strictEqual(ats.atsListIsComplete({ ok: true, open: true, loading: true, options: [{ text: "a" }] }), false, "still fetching");
+  assert.strictEqual(ats.atsListIsComplete(null), false);
 });
 
 // An employer page that EMBEDS the ATS form in an iframe (Greenhouse's #grnhse_app widget) must
@@ -811,4 +1726,274 @@ test("commit read-back: polls until the value appears, instead of sampling once"
   assert.equal(rec.after, "No", "detail was: " + rec.detail);
   assert.ok(/^filled/.test(String(rec.status)), "status was " + rec.status);
   assert.ok(reads >= 3, "it actually polled (reads=" + reads + ")");
+});
+
+// ── SELECT-ALL-THAT-APPLY identity checkboxes (Ashby/Sierra, live 2026-08-07) ──────────────
+// The diversity survey renders each identity as its OWN checkbox, so the LABEL is an option
+// rather than a question. The profile answers those dimensions in whole sentences, which used
+// to match neither /^(yes|true)$/ nor /^(no|false)$/ — so two questions the profile ALREADY
+// ANSWERS were reported as "your profile answer isn't one of this form's options". Leaving the
+// box unchecked IS that answer, so it must be silent, and it must not actuate anything.
+test("checkbox: a stated NEGATIVE leaves an identity box unchecked, silently and untouched", async () => {
+  for (const stated of ["No, I don't have a disability", "I am not a protected veteran", "No"]) {
+    let touched = false;
+    const act = fakeAct({ atsInjSetChecked: () => { touched = true; return { ok: true, checked: true }; } });
+    const f = { fieldName: "cb", widgetType: "checkbox", label: "Person with disability", isRequired: false, options: [] };
+    const rec = {};
+    const produced = await ats.atsActuateField(act, "ashby", f, { inputSel: "#cb" }, rec, [stated], null, {}, {}, {});
+    assert.ok(produced, stated + ": the driver must OWN this field, not fall through to needs_review");
+    assert.strictEqual(rec.status, "skipped", stated + " → status was " + rec.status);
+    assert.ok(!rec.flag, stated + " must not be flagged for review, it is answered");
+    assert.strictEqual(touched, false, stated + " must not click the box");
+  }
+});
+
+test("checkbox: an answer that NAMES the identity ticks it; a different identity does not", async () => {
+  const mk = (label) => ({ fieldName: "cb", widgetType: "checkbox", label, isRequired: false, options: [] });
+  // exact-normalized name → the affirmative
+  let checked = false;
+  const act = fakeAct({ atsInjSetChecked: () => { checked = true; return { ok: true, checked: true }; } });
+  const rec = {};
+  await ats.atsActuateField(act, "ashby", mk("Asian"), { inputSel: "#cb" }, rec, ["Asian"], null, {}, {}, {});
+  assert.strictEqual(checked, true, "an answer naming this identity should tick it");
+  assert.strictEqual(rec.status, "filled_review", "an EEO box we ticked is always shown to the human");
+
+  // NOT a near-miss: "East Asian" must not decide a box labelled "Asian" (an "East Asian" box may exist)
+  let checked2 = false;
+  const act2 = fakeAct({ atsInjSetChecked: () => { checked2 = true; return { ok: true, checked: true }; } });
+  const rec2 = {};
+  const produced2 = await ats.atsActuateField(act2, "ashby", mk("Asian"), { inputSel: "#cb" }, rec2, ["East Asian"], null, {}, {}, {});
+  assert.strictEqual(checked2, false, "a containment near-miss must never tick a demographic box");
+  assert.strictEqual(produced2, false, "it should fall through so the human picks it");
+});
+
+test("checkbox: an ordinary consent is unchanged — required auto-checks, refused required flags", async () => {
+  let checked = false;
+  const act = fakeAct({ atsInjSetChecked: () => { checked = true; return { ok: true, checked: true }; } });
+  const rec = {};
+  const f = { fieldName: "consent", widgetType: "checkbox", label: "I agree to the terms", isRequired: true, options: [] };
+  await ats.atsActuateField(act, "ashby", f, { inputSel: "#c" }, rec, null, null, {}, {}, {});
+  assert.strictEqual(checked, true);
+  assert.strictEqual(rec.status, "filled");
+
+  const rec2 = {};
+  const act2 = fakeAct({ atsInjSetChecked: () => ({ ok: true, checked: true }) });
+  await ats.atsActuateField(act2, "ashby", f, { inputSel: "#c" }, rec2, ["No"], null, {}, {}, {});
+  assert.strictEqual(rec2.status, "needs_review", "a required box the profile refuses is never auto-consented");
+});
+
+// ── a US state has two spellings, and a places service knows only one (live 2026-08-07) ────
+// Same profile, same ATS, two Ashby forms an hour apart: "Pittsburgh, Pennsylvania," committed in
+// 2.2s while "Pittsburgh, PA" returned nothing for 17.5s and reached review claiming the places
+// service hadn't responded. It had; it just didn't know that spelling. So the QUERY is now the city
+// alone — which every spelling agrees on — and the PICK carries the strictness instead.
+test("atsPlacePick: reaches past a same-named city to the state we actually hold, either spelling", () => {
+  const T = ["Pittsburgh, California, United States", "Pittsburgh, Pennsylvania, United States"];
+  assert.deepStrictEqual(ats.atsPlacePick("Pittsburgh, PA", T), { index: 1, tier: "exact-normalized" });
+  assert.deepStrictEqual(ats.atsPlacePick("Pittsburgh, Pennsylvania", T), { index: 1, tier: "exact-normalized" });
+  // REGION_ABBREV covers Canadian provinces, so they work identically — not an accident
+  assert.deepStrictEqual(ats.atsPlacePick("Toronto, ON", ["Toronto, Ontario, Canada"]), { index: 0, tier: "exact-normalized" });
+});
+
+test("atsPlacePick: a city offered ONLY in a state we do not hold is answered but FLAGGED", () => {
+  const T = ["Pittsburgh, California, United States", "Pittsburgh, Pennsylvania, United States"];
+  const r = ats.atsPlacePick("Pittsburgh, TX", T);
+  assert.strictEqual(r.tier, "containment", "a different place of the same name is never the exact tier");
+  assert.strictEqual(r.stateMismatch, true, "the human has to see this one");
+  // …and with no state to check against, the first city row stands as before
+  assert.deepStrictEqual(ats.atsPlacePick("Pittsburgh", T), { index: 0, tier: "exact-normalized" });
+  // a city that simply is not offered is NOT forced onto some other row
+  assert.strictEqual(ats.atsPlacePick("Austin, TX", T), null);
+  assert.strictEqual(ats.atsPlacePick("", T), null);
+});
+
+test("atsPlacePick: a state ABBREV must sit in its own segment, never match inside a word", () => {
+  // ", PA" must not be satisfied by "Palo Alto" or "Spain"; the guard is the segment boundary
+  const T = ["Springfield, Palo Alto County, United States", "Springfield, PA, United States"];
+  assert.deepStrictEqual(ats.atsPlacePick("Springfield, PA", T), { index: 1, tier: "exact-normalized" });
+});
+
+test("the location label is what gates the places path (a bucket routes before the map)", () => {
+  for (const l of ["Where are you currently located?", "Where are you currently based?", "Current location", "Location"]) {
+    assert.ok(ats.ATS_LOCATION_LABEL_RE.test(l), l + " should read as a location question");
+  }
+  assert.ok(!ats.ATS_LOCATION_LABEL_RE.test("Preferred work location policy"), "not every label with 'location' is a places box");
+});
+
+// ── the how-did-you-hear label tolerates an adverb (live 2026-08-07, Roblox) ─────────────────
+// "How did you FIRST hear about this role?" missed the rung, so a REQUIRED question the profile
+// answers exactly fell to the AI — which answered "LinkedIn", correctly, after an LLM call, then
+// flagged it ai-choice and parked it in review for a human to re-confirm what the profile said.
+test("router: how-did-you-hear matches the real wordings boards use, adverb or not", () => {
+  const hits = [
+    "How did you first hear about this role?",
+    "How did you hear about us?",
+    "How did you originally hear about this opportunity?",
+    "How did you find this job?",
+    "Where did you first hear about this position?",
+    "How do you hear about this role?",
+  ];
+  for (const l of hits) {
+    const r = ats.atsRouteLabel(l, {}, PROFILE, {});
+    assert.ok(r && r.path === "how_did_you_hear.preferred", l + " → " + JSON.stringify(r && r.path));
+    assert.deepStrictEqual(r.candidates, ["LinkedIn", "Handshake"], "the ladder is handed over in order");
+  }
+  // "How'd you hear about us?" too
+  assert.ok(ats.atsRouteLabel("How'd you hear about us?", {}, PROFILE, {}).path === "how_did_you_hear.preferred");
+  // …and it does not swallow unrelated questions that merely mention hearing or finding. The old
+  // wording ended at the verb, so the last one routed here and would have answered an interview
+  // question with "LinkedIn".
+  for (const l of ["What did you hear about our culture?", "How did you find working with your last team?"]) {
+    const r = ats.atsRouteLabel(l, {}, PROFILE, {});
+    assert.ok(!r || r.path !== "how_did_you_hear.preferred", l + " should NOT route to the source ladder");
+  }
+});
+
+// ── grouped controls belong to the grouping pass, in EVERY ATS branch (live 2026-08-07) ─────
+// Greenhouse's general element loop skipped only `hidden`, so each box of a checkbox group was
+// pushed twice: once as a REQUIRED "text" field keyed on the box's own id, then again as the real
+// checkbox_group. On Gusto's 12-box "How did you hear about this opportunity? (select all that
+// apply)", each phantom text field bought its own LLM call answering "N/A" with no basis — 12 of
+// that form's 21 review items were one question. And it is worse than noise: atsInjSetText on a
+// checkbox writes its .value, which is the string that option would SUBMIT. Lever and Ashby have
+// always skipped both. No DOM harness exists for the injected scanners, so this pins the invariant
+// at the source, the way the self-containment test above does.
+test("atsInjScan: no ATS branch treats a radio or checkbox as a plain input", () => {
+  const src = String(ats.atsInjScan);
+  const skips = [...src.matchAll(/el\.type === "hidden"[^\n]*/g)].map((m) => m[0]);
+  assert.ok(skips.length >= 3, `expected a general element loop per ATS branch, found ${skips.length}`);
+  skips.forEach((line, i) => {
+    assert.ok(/type === "radio"/.test(line) && /type === "checkbox"/.test(line),
+      `general element loop #${i + 1} skips only hidden — grouped controls are handled by the grouping ` +
+      `pass, and classifying them here creates phantom required text fields over the same boxes: ` +
+      line.trim());
+  });
+});
+
+// ── a protected characteristic can be asked without naming the dimension (live 2026-08-07) ──
+// Chime words its GENDER question "I identify as:" — no "gender", no "sex" — so the detector missed
+// it and an AI-guessed protected characteristic wore the ordinary `ai-choice` badge, while the field
+// directly below it ("I identify my sexual orientation as:") got the loud demographic one.
+test("atsIsEeoLabel: the self-identification frame counts, dimension word or not", () => {
+  for (const l of [
+    "I identify as:",
+    "I identify my sexual orientation as:",
+    "I identify my race/ethnicity as (please mark all that apply):",
+    "How do you identify?",
+    "Gender", "Veteran Status:", "Do you have a disability?", "Are you Hispanic or Latino?",
+  ]) assert.ok(ats.atsIsEeoLabel(l), l + " should read as a demographic question");
+
+  // and it must not swallow ordinary questions that merely contain the word "identify"
+  for (const l of [
+    "How did you identify this opportunity?",
+    "Please identify your preferred start date",
+    "Identify the technologies you have used",
+  ]) assert.ok(!ats.atsIsEeoLabel(l), l + " is NOT a demographic question");
+});
+
+// ── a closed posting is not a broken pipeline (live 2026-08-07) ──────────────────────────────
+// Twilio and Binance both halted "form-not-rendered ... open the tab and check", which sends the
+// operator to debug a fill on a job that no longer exists. Both said so before we looked for a form.
+test("atsPostingGone: names a dead posting, and stays silent on a healthy one", () => {
+  // Lever answers a removed posting with this exact title
+  assert.match(String(ats.atsPostingGone({ title: "Not found" },
+    "https://jobs.lever.co/binance/7deee48b-bc3a-454b-9224-953d3f65c244",
+    "https://jobs.lever.co/binance/7deee48b-bc3a-454b-9224-953d3f65c244/apply")), /Not found/);
+
+  // Greenhouse REDIRECTS a removed posting to the board index, dropping the job id
+  assert.ok(ats.atsPostingGone({ title: "Current openings at Twilio" },
+    "https://job-boards.greenhouse.io/twilio/jobs/7781659",
+    "https://job-boards.greenhouse.io/twilio"), "a board-index landing means the job is gone");
+
+  // …and the URL rule alone catches it even when the title is unhelpful
+  assert.match(String(ats.atsPostingGone({ title: "Careers" },
+    "https://job-boards.greenhouse.io/twilio/jobs/7781659", "https://job-boards.greenhouse.io/twilio")),
+    /7781659/);
+
+  // HEALTHY: the id survives the hop to /apply and /application, so nothing is claimed
+  for (const [req, land] of [
+    ["https://job-boards.greenhouse.io/discord/jobs/8649856002", "https://job-boards.greenhouse.io/discord/jobs/8649856002"],
+    ["https://jobs.lever.co/zoox/5fb23003-057f-4488-84c2-80ca98cc795d", "https://jobs.lever.co/zoox/5fb23003-057f-4488-84c2-80ca98cc795d/apply"],
+    ["https://jobs.ashbyhq.com/sierra/8152eaf6-012b-4154-95e2-7d6c52faba93", "https://jobs.ashbyhq.com/sierra/8152eaf6-012b-4154-95e2-7d6c52faba93/application"],
+  ]) assert.strictEqual(ats.atsPostingGone({ title: "Some Role" }, req, land), null, req);
+
+  // no evidence at all → no claim (a missing JD must not read as a dead posting)
+  assert.strictEqual(ats.atsPostingGone(null, "https://jobs.ashbyhq.com/x/abc", "https://jobs.ashbyhq.com/x/abc"), null);
+});
+
+// ── a query can annihilate a COMPLETE list, and the answer survives anyway (live 2026-08-07) ──
+// Measured on Discord's `discipline--0`: 72 options on open; typing the profile's own wording
+// ("Electrical and Computer Engineering", which that form words differently) filters the menu to
+// ZERO; clearing brings all 72 back. Lists of >= 60 take the SEARCH branch, so this looked like a
+// correctness risk resting on the restore poll — it is NOT. A search that finds nothing never
+// overwrites `read`, so the on-open list survives even if the restore never returns. This pins that
+// structural guarantee, which is easy to break by "simplifying" the search loop into an
+// unconditional assignment; the fixture's restore deliberately never comes back.
+test("combobox: a query that wipes the menu does not lose the list we read on open", async () => {
+  // 72 options, exactly like the real discipline box: big enough to take the SEARCH branch
+  // (atsListIsComplete only skips typing under ATS_OPTION_CAP), which is the whole point.
+  const DEGREES = ["Associate's Degree", "Bachelor's Degree", "Master's Degree", "Doctorate", "Other"]
+    .concat(Array.from({ length: 67 }, (_, i) => "Field of Study " + i));
+  let typedEver = false;
+  const act = fakeAct({
+    atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields: [
+      { fieldName: "degree--0", inputSel: "#degree--0", widgetType: "select", label: "Degree", isRequired: true, value: null, domIndex: 0 },
+    ] }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    // the widget never recovers its list once a query has touched it — the restore poll times out
+    atsInjReadOptions: () => ({ ok: true, open: true, loading: false,
+      options: (typedEver ? [] : DEGREES).map((t) => ({ text: t, disabled: false })) }),
+    atsInjTypeInCombo: () => { typedEver = true; return { ok: true }; },
+    atsInjReadComboInput: () => ({ ok: true, value: "Bachelor of Science" }),
+    atsInjCommitOption: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: "Bachelor's Degree" }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const profile = { ...PROFILE, education: [{ degree: "Bachelor of Science", school_or_university: "CMU" }] };
+  const out = await ats.driveAtsPageFill(act, "greenhouse", profile, {}, {}, {
+    buckets: [{ questions: ["Degree"], profile_path: "education.0.degree" }],
+  });
+  const r = out.results[0];
+  assert.ok(typedEver, "the test must actually exercise the search branch");
+  assert.notStrictEqual(r.status, "needs_review",
+    "the answer was in the list we read on open — detail was: " + r.detail);
+  assert.strictEqual(r.after, "Bachelor's Degree");
+  // …and review still gets every option we read. It lands in captured_options rather than options
+  // because we TYPED for this list, and once a query has touched a menu we cannot tell a restored
+  // static list from page one of a server-backed one — see atsAttachOptions.
+  assert.strictEqual((r.captured_options || []).length, DEGREES.length,
+    "review gets the list we read on open, not the wiped one");
+});
+
+// ── A purely NUMERIC requisition id, and percent-encoding (2026-08-09) ─────────────────────────────
+// Marvell posts `…-Engineer_2601615` — no "R", no letter prefix — so it matched neither requisition
+// tier and fell through to the origin+pathname fallback. That fallback is ENCODING-SENSITIVE: Workday
+// serves the location segment as "San-Diego%2C-CA" while a hand-typed or redirected URL carries the
+// bare comma, so ONE job produced TWO keys and the submit run refused its own approved bundle:
+//   REFUSING: no approved bundle for job_key "…" (no-remote-bundle)
+test("canonicalJobUrl: a numeric requisition keys the same from the posting and the form URL", () => {
+  const lib = require("../lib.js");
+  const posting = "https://marvell.wd1.myworkdayjobs.com/en-US/MarvellCareers/job/San-Diego-CA/Sr-Principal-SoC-Verification-Engineer_2601615";
+  const form = "https://marvell.wd1.myworkdayjobs.com/en-US/MarvellCareers/job/San-Diego%2C-CA/Sr-Principal-SoC-Verification-Engineer_2601615/apply";
+  assert.strictEqual(lib.canonicalJobUrl(posting), "wd1:2601615");
+  assert.strictEqual(lib.canonicalJobUrl(posting), lib.canonicalJobUrl(form), "the encoded comma must not fork the key");
+});
+test("canonicalJobUrl: percent-encoding never forks the FALLBACK key either", () => {
+  const lib = require("../lib.js");
+  const a = "https://example.com/en-US/board/job/San-Diego-CA/Some-Role";
+  const b = "https://example.com/en-US/board/job/San-Diego%2C-CA/Some-Role";
+  // Different spellings of the SAME segment agree; a genuinely different path still does not.
+  assert.strictEqual(lib.canonicalJobUrl(b), lib.canonicalJobUrl("https://example.com/en-US/board/job/San-Diego,-CA/Some-Role"));
+  assert.notStrictEqual(lib.canonicalJobUrl(a), lib.canonicalJobUrl("https://example.com/en-US/board/job/Austin-TX/Some-Role"));
+});
+test("canonicalJobUrl: the existing _R and letters+digits tiers are byte-identical", () => {
+  const lib = require("../lib.js");
+  assert.strictEqual(lib.canonicalJobUrl("https://waystar.wd1.myworkdayjobs.com/en-US/Waystar/job/Atlanta-GA/SWE_R3051"), "wd1:r3051");
+  assert.strictEqual(lib.canonicalJobUrl("https://copart.wd12.myworkdayjobs.com/en-US/copart/job/Dallas-TX/SWE_JR109441"), "wd12:jr109441");
+  assert.strictEqual(lib.canonicalJobUrl("https://cat.wd5.myworkdayjobs.com/en-US/solarturbines/job/X/Y_R0000381898"), "wd5:r0000381898");
+});
+test("canonicalJobUrl: a short path number is NOT mistaken for a requisition", () => {
+  const lib = require("../lib.js");
+  // ≥4 digits required, so an ordinary segment number keys by path as before.
+  assert.notStrictEqual(lib.canonicalJobUrl("https://x.wd1.myworkdayjobs.com/en-US/b/job/L/Role_12"), "wd1:12");
 });

@@ -9567,6 +9567,35 @@ test("signature date: a date naming a DIFFERENT event is never stamped with toda
     assert.ok(!apMatchLib.isSignatureDateQuestion(t), t);
 });
 
+// ── Workday demands the signature date in MORE THAN ONE WORDING (marvell live 2026-08-09) ──
+// The replay may write exactly one unapproved value — today's date — and only when Workday asks. The
+// ask was matched as the literal "Enter today's date"; marvell page 5 instead said "The field Date is
+// required and must have a value", nothing fired, and the rehearsal halted `replay-blocked`.
+//
+// The second assertion is the one that matters. The wrapper on that page already READ `current value
+// is 8/9/2026`: Workday re-renders the date from its saved copy but dropped it server-side, so the
+// screen shows an answer the model does not have — and `skipIfCorrect` therefore actuated nothing.
+// Requiring the field to be blank would have been the obvious guard and would have missed every real
+// occurrence, because blankness is exactly the evidence this failure destroys.
+test("signature date: Workday's GENERIC required-wording is an ask, even when the field shows a value", () => {
+  const dateField = { fieldName: "date", label: "Date*", widgetType: "date", isRequired: true, value: "8/9/2026" };
+  const marvell = ["Error-DateThe field Date is required and must have a value."];
+
+  // the generic wording is recognized, and the DISPLAYED value does not disqualify it
+  assert.equal(apMatchLib.signatureDateDemanded(marvell, [dateField]), dateField);
+  assert.equal(apMatchLib.signatureDateDemanded(marvell, [Object.assign({}, dateField, { value: "" })]).fieldName, "date");
+  // the original explicit wording still fires
+  assert.equal(apMatchLib.signatureDateDemanded(["Enter today's date"], [dateField]), dateField);
+
+  // …and it stays narrow: a required error on a DIFFERENT date event is never a signature-date ask,
+  // because stamping today there would be a wrong answer rather than a missing one.
+  const startDate = { fieldName: "startDate", label: "Desired Start Date*", widgetType: "date", isRequired: true, value: "" };
+  assert.equal(apMatchLib.signatureDateDemanded(["The field Desired Start Date is required and must have a value."], [startDate]), null);
+  // an error naming some OTHER field never drags the date field in
+  assert.equal(apMatchLib.signatureDateDemanded(["The field Last Name is required and must have a value."], [dateField]), null);
+  assert.equal(apMatchLib.signatureDateDemanded([], [dateField]), null);
+});
+
 // ── a date the FORM re-formatted is the same date (Home Depot live 2026-08-04) ──
 // Approved "5/1/2028"; Workday's review page displays "05/01/2028". Identical calendar date, zero-
 // padded by the form — and the submit gate blocked on it as a DISAGREE. Same shape as 80,000/80000:

@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "fastretry-1";
+const AP_BUILD_MARKER = "gaptrace-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -113,6 +113,8 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
+const AP_BUILD = "2026-08-07-posting-gone";
+
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
   try { console.log(`[ApplyPilot][RUN] » ${phase}${detail ? " — " + detail : ""}`); } catch (e) { /* ignore */ }
@@ -133,6 +135,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           ok: true,
           app: "ApplyPilot",
           version: chrome.runtime.getManifest().version,
+          // BUILD MARKER (bump when verifying a specific change is live). The service worker only
+          // re-reads files when it RESTARTS, and chrome.runtime.reload() is unreliable under repeated
+          // use — during 2026-08-06 several runs silently executed pre-edit code while AP_PING answered
+          // happily from the old worker, and the staleness was only caught by noticing a log line's
+          // FORMAT. One field beats that guesswork.
+          build: AP_BUILD,
           hasProfile: !!profile,
           hasResume
         });
@@ -194,19 +202,38 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // reviewUrl before replay — see pullApprovedBundle). reviewUrl is optional for backward
   // compat (pullApprovedBundle derives it from ingestUrl when absent).
   if (type === "AP_SET_SESSION") {
-    chrome.storage.local.set(
-      {
-        apSession: {
-          ingestUrl: message.ingestUrl || "",
-          ingestKey: message.ingestKey || "",
-          reviewUrl: message.reviewUrl || "",
+    // ── SAY THAT THE CREDENTIAL LANDED (2026-08-09) ────────────────────────────────────────────────
+    // This stored the reporting key silently, so when every report started coming back 401 there was no
+    // way to tell the two candidate causes apart: the site minting a key the extension never received,
+    // or the extension holding a key the server had since deleted. The site says "synced" either way —
+    // it reports the server action's result, not the extension's. `getSession` DELETES the old row
+    // before inserting the new one, so a push that never arrives leaves the extension permanently 401.
+    // NEVER log the key itself: only its length and whether it CHANGED, which is all the diagnosis needs.
+    chrome.storage.local.get("apSession", (prev) => {
+      const oldKey = (prev && prev.apSession && prev.apSession.ingestKey) || "";
+      const newKey = message.ingestKey || "";
+      chrome.storage.local.set(
+        {
+          apSession: {
+            ingestUrl: message.ingestUrl || "",
+            ingestKey: newKey,
+            reviewUrl: message.reviewUrl || "",
+          },
         },
-      },
-      () => {
-        const err = chrome.runtime.lastError;
-        sendResponse(err ? { ok: false, error: err.message } : { ok: true });
-      }
-    );
+        () => {
+          const err = chrome.runtime.lastError;
+          // …and WHERE it will report. With more than one dev server around (or a localhost/prod mix)
+          // "which tracker did this fill land in?" is a real question, and the host answers it. The key
+          // itself still never goes near a log — only its length and whether it changed.
+          let host = "?";
+          try { host = new URL(message.ingestUrl || "").host || "?"; } catch (e) { /* keep "?" */ }
+          console.log(`[ApplyPilot] reporting credential ${err ? "FAILED to store: " + err.message
+            : `stored — key ${newKey ? newKey.length + " chars" : "MISSING (empty!)"}, ${
+              !oldKey ? "first one" : newKey === oldKey ? "UNCHANGED from the previous one" : "replaces the previous one"}, reporting to ${host}`}`);
+          sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+        }
+      );
+    });
     return true;
   }
 
@@ -287,7 +314,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           try {
             const background = message.background === true;
             emitRunProgress("Opening the job posting", (background ? "in a background tab — " : "") + atsKind);
-            const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
+            // BLANK on purpose: runAtsApplicationRun attaches, registers our page overrides, and only
+            // THEN navigates here to the posting — so the form's document starts with them rather than
+            // having them swapped in mid-life, which is what killed Greenhouse's async comboboxes.
+            const tab = await new Promise((res) => chrome.tabs.create({ url: "about:blank", active: !background }, res));
             if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
             await waitTabComplete(tab.id, 20000);
             const res = await runAtsApplicationRun(tab.id, atsKind, store, startUrl);
@@ -330,6 +360,17 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           `${settle.hasPosting ? ", posting content present" : ", posting content NOT found (the scrape may be partial)"}`
         );
 
+        // The posting is GONE (filled, pulled, or a stale link). Stop here and SAY so: without this the
+        // run finds no Apply button, walks on to the auth wait and halts "the sign-in fields never
+        // appeared", which reads as a sign-in bug on a tenant that signs in fine (sonos.wd1 2026-08-09).
+        if (apMatch.isJobPostingGone(settle.bodyText || "")) {
+          console.log(`[ApplyPilot][RUN] ⛔ this posting no longer exists — Workday returned its not-found page for ${startUrl}`);
+          emitRunProgress("Stopped — this job posting no longer exists");
+          sendResponse({ ok: true, stopped: "job-posting-not-found", needs_operator: true,
+            detail: "Workday says this posting doesn't exist — it was probably filled or pulled. Nothing was filled; the link needs replacing." });
+          return;
+        }
+
         // Grab the job description BEFORE onboarding clicks Apply (which navigates away). Best-effort:
         // a failed/empty scrape never blocks the run. Plain scripting read — no debugger needed yet.
         let jd = null;
@@ -361,11 +402,26 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             const att = await cdpAttach(tabId);
             if (att.ok) {
               const emb = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
-              const embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
-              const embAts = embUrl && detectAts(embUrl);
+              let embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
+              let embAts = embUrl && detectAts(embUrl);
+              // …and if it does not EMBED one, does it LINK to one? An employer careers page often
+              // renders its own UI with an Apply link straight to the ATS (live 2026-08-05:
+              // `www.coinbase.com/careers/positions/<id>?gh_jid=<id>` has no iframe, so the run fell
+              // into the WORKDAY onboarding and halted `auth-form-not-rendered` — a Greenhouse
+              // application one link away). Same finder + ambiguity-refusing picker the ATS pipeline
+              // already uses for its own landing hops, so nothing new can pick a wrong target: 2+
+              // distinct candidates refuse rather than guess. ⚠ The link must be READ from the page —
+              // a Greenhouse embed URL cannot be constructed from a job id (it 404s without `for` and
+              // a validityToken; dom-patterns 2026-08-01).
+              if (!embAts || embAts === "workday") {
+                const links = await cdpEval(atsInjFindApplyLinks).catch(() => null);
+                const linkUrl = links && atsPickApplyLink(links.links || [], detectAts);
+                const linkAts = linkUrl && detectAts(linkUrl);
+                if (linkAts && linkAts !== "workday") { embUrl = linkUrl; embAts = linkAts; }
+              }
               await cdpDetach();
               if (embAts && embAts !== "workday") {
-                console.log(`[ApplyPilot][RUN] this page embeds a ${embAts} application — driving it with that pipeline: ${embUrl}`);
+                console.log(`[ApplyPilot][RUN] this page ${emb && emb.srcs && emb.srcs.length ? "embeds" : "links to"} a ${embAts} application — driving it with that pipeline: ${embUrl}`);
                 const res = await runAtsApplicationRun(tabId, embAts, store, embUrl, { applyHops: 1, originUrl: startUrl });
                 sendResponse({ ...res, jd, tabId, startUrl });
                 return;
@@ -525,6 +581,13 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // how a run is tailed without re-reading the whole buffer. `pattern` is a case-insensitive regex over
   // the line text (e.g. "CDP-TIME|HALT"), `limit` caps the reply (newest kept, `truncated` says so), and
   // `clear` empties the buffer after replying. Allowed DURING a run — watching a live walk is the point.
+  if (type === "AP_DEV_FLAG") {
+    // dev-only: flip a chrome.storage.local debug flag (forceWorkerTimersOff, forceTrustedInput)
+    const key = String(message.key || "");
+    if (!/^(forceWorkerTimersOff|forceTrustedInput)$/.test(key)) { sendResponse({ ok: false, error: "unknown flag" }); return true; }
+    chrome.storage.local.set({ [key]: !!message.value }, () => sendResponse({ ok: true, key, value: !!message.value }));
+    return true;
+  }
   if (type === "AP_DEV_LOGS") {
     const sel = devLogSelect(apDevLog, { since: message.since, pattern: message.pattern, limit: message.limit });
     sendResponse({
@@ -804,7 +867,9 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           if (!detectAts(startUrl) && atsKind) LOG(`the URL names no ATS, but this application was filled by the ${atsKind} pipeline — using it`);
           if (atsKind && atsKind !== "workday") {
             emitRunProgress(arm ? "Submitting" : "Rehearsing", atsKind + " — " + (background ? "background tab" : "foreground tab"));
-            const tab = await new Promise((res) => chrome.tabs.create({ url: startUrl, active: !background }, res));
+            // BLANK for the same reason as the fill run: runAtsSubmitRun installs the overrides, then
+            // navigates to the form, so the replay drives a document that started with them.
+            const tab = await new Promise((res) => chrome.tabs.create({ url: "about:blank", active: !background }, res));
             if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
             await waitTabComplete(tab.id, 20000);
             const res = await runAtsSubmitRun(tab.id, atsKind, pull.bundle, { arm, startUrl });
@@ -947,6 +1012,9 @@ async function waitJobPageSettled(tabId, ceilingMs = 12000, intervalMs = 300) {
           // a stable byte count trustworthy rather than a pause mid-hydration.
           hasPosting: !!document.querySelector('[data-automation-id="jobPostingDescription"], [data-automation-id="jobPostingHeader"]'),
           ready: document.readyState,
+          // A bounded sample, only so the caller can tell Workday's "this posting doesn't exist" shell
+          // apart from a slow render. Capped because a real posting's body is large and this is polled.
+          text: ((document.body && document.body.innerText) || "").slice(0, 400),
         }),
       });
       s = (res && res[0] && res[0].result) || null;
@@ -957,10 +1025,10 @@ async function waitJobPageSettled(tabId, ceilingMs = 12000, intervalMs = 300) {
     last = s;
     state = jobPageSettleStep(s, state);
     if (state.accept) {
-      return { settled: true, chars: s.len, hasPosting: !!s.hasPosting, ready: s.ready, waitedMs: Date.now() - t0 };
+      return { settled: true, chars: s.len, hasPosting: !!s.hasPosting, ready: s.ready, bodyText: s.text || "", waitedMs: Date.now() - t0 };
     }
   }
-  return { settled: false, reason: "ceiling", chars: last ? last.len : 0, hasPosting: !!(last && last.hasPosting), waitedMs: Date.now() - t0 };
+  return { settled: false, reason: "ceiling", chars: last ? last.len : 0, hasPosting: !!(last && last.hasPosting), bodyText: (last && last.text) || "", waitedMs: Date.now() - t0 };
 }
 
 function waitTabComplete(tabId, timeoutMs) {
@@ -2965,19 +3033,31 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     }
   } catch (e) { LOG("[GROUP-WATCH] install skipped:", String((e && e.message) || e)); }
 
-  // ── A SELF-ID PAGE: TRUSTED for TEXT/DATE, SYNTHETIC for CLICKS (2026-08-05) ────────────────────
+  // ── A SELF-ID PAGE GOES FULLY TRUSTED, CLICKS INCLUDED (2026-08-09) ─────────────────────────────
   // Workday ignores synthetic native-setter WRITES on this surface — hidden runs failed with Name and
-  // Date reported required-and-empty on a page whose DOM plainly held both, and forceTrustedInput fixed
-  // exactly that. But it ACCEPTS synthetic clicks, and prefers them: the disability checkbox committed
-  // and held 2/2 under synthetic, whereas trusted clicks on it produce the intermittent "did not commit"
-  // (quiet page, click dispatched, hit-test confirming the right label, no toggle). Forcing the WHOLE
-  // page trusted therefore fixed the text fields and re-exposed the checkbox.
+  // Date reported required-and-empty on a page whose DOM plainly held both. That much is unchanged.
   //
-  // So the split is per-KIND, not per-page: value writes go trusted, the label click stays synthetic.
+  // What changed is the CLICK half. This used to keep clicks synthetic, on a 2026-08-05 note that the
+  // disability checkbox "committed and held 2/2 under synthetic, whereas trusted clicks produce the
+  // intermittent did-not-commit". The REPLAY path was moved to fully-trusted on 2026-08-07 on stronger,
+  // repeated evidence (our read-back said the box was checked while Workday still called the field
+  // required, and a trusted re-write cleared it every time) — and that has since run clean.
+  //
+  // The FILL path kept the old split, and it is still biting. Live on marvell.wd1, page 5:
+  //   ⚠ page 5: NOT clicking Save & Continue — 1 REQUIRED field(s) we TRIED to fill produced no value
+  //     • "Please check one of the boxes below:*" [ai-commit-failed] — AI chose "No, I do not have a
+  //       disability…" but the checkbox group did not commit
+  // So the two paths now share ONE policy on this surface rather than disagreeing about it, which is
+  // also why the replay's version is the one to copy: it is the one with live evidence behind it.
+  //
+  // Verification is untouched: fillCheckboxGroupCdp still re-reads and requires exactly one box on, so
+  // a click that does not take ends needs_review — never a silent wrong answer.
   const _selfId = isSelfIdPage((preScan && preScan.fields) || []);
+  const _selfIdPrevSynthetic = cdpSyntheticInputEnabled();
   if (_selfId) {
-    LOG("this is a SELF-ID page — TRUSTED input for text/date (Workday ignores synthetic writes here), SYNTHETIC for the checkbox click (trusted clicks flake on it).");
+    LOG("this is a SELF-ID page — forcing TRUSTED input, CLICKS INCLUDED (Workday's model ignores synthetic writes AND synthetic clicks here).");
     cdpSetTrustedText(true);
+    cdpSetSyntheticInput(false);
   }
   const _fillT0 = Date.now();
   let out;
@@ -3001,7 +3081,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
     out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
   } finally {
-    if (_selfId) cdpSetTrustedText(false); // never leave the next page paying for this one
+    if (_selfId) {
+      cdpSetTrustedText(false);                        // never leave the next page paying for this one
+      cdpSetSyntheticInput(_selfIdPrevSynthetic);      // ditto for the click override — restore the run's mode
+    }
   }
   const fillMs = Date.now() - _fillT0;
   if (_gwSel) {
@@ -3693,7 +3776,7 @@ async function flushLlmUsage() {
   llmUsageBuffer = [];
   try {
     const apSession = await new Promise((r) => chrome.storage.local.get("apSession", (x) => r((x && x.apSession) || null)));
-    if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return; // not connected — nothing to report to
+    if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return { ok: false, reason: "not-connected", status: 0 }; // not connected — nothing to report to
     const url = String(apSession.usageUrl || apSession.ingestUrl.replace(/\/report\/?$/, "/usage"));
     const res = await fetch(url, {
       method: "POST",
@@ -3803,7 +3886,7 @@ async function getRunLoginFor(bundleUrl) {
 // writes that status when the operator authorizes a submit from its Run page).
 async function reportApplication(bundle, jobContext) {
   try {
-    if (!bundle) return;
+    if (!bundle) return { ok: false, reason: "no-bundle", status: 0 };
     const { apSession } = await new Promise((res) => chrome.storage.local.get("apSession", res));
     if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return;
     const needs = bundle.needs_review_count || 0;
@@ -3832,9 +3915,27 @@ async function reportApplication(bundle, jobContext) {
       headers: { "content-type": "application/json", "authorization": "Bearer " + apSession.ingestKey },
       body: JSON.stringify(payload)
     });
+    // A rejected report USED to be one quiet line, so the tracker could stop updating while every
+    // fill looked healthy (live 2026-08-05: three in a row never landed). Say it loudly, name the
+    // cause when we know it, leave a marker the UI can read, and put it on the run's progress feed —
+    // the operator is watching that, not the service-worker console.
+    const outcome = reportOutcome(res && res.status);
     console.log("[ApplyPilot] application reported —", res && res.status, `(${payload.status}, ${needs} need review)`);
+    if (!outcome.ok) {
+      console.log("[ApplyPilot] ⛔⛔ " + outcome.message);
+      try { await chrome.storage.local.set({ apReportError: { at: Date.now(), status: (res && res.status) || 0, reason: outcome.reason } }); } catch (e) { /* best effort */ }
+      emitRunProgress("Report rejected", outcome.reason === "stale-key" ? "re-sync the extension on /app/connect (its key was rotated)" : outcome.message);
+    } else {
+      try { await chrome.storage.local.remove("apReportError"); } catch (e) { /* best effort */ }
+    }
+    // …and TELL THE CALLER. It used to return nothing, so the ATS run announced "Reported to the
+    // website." unconditionally — printed one line under the ⛔ saying the tracker never got it
+    // (live 2026-08-07, after a key rotation). A run that reports its own failure as success is
+    // worse than one that stays quiet, because the contradiction reads as a logging glitch.
+    return { ok: !!outcome.ok, reason: outcome.reason || null, status: (res && res.status) || 0 };
   } catch (e) {
     console.log("[ApplyPilot] application report skipped:", String((e && e.message) || e));
+    return { ok: false, reason: "exception", status: 0 };
   }
 }
 
@@ -3968,6 +4069,16 @@ function makeAtsActuation(llmConfig) {
     delayFull: cdpDelay,
     eval: (fn, ...args) => cdpEval(fn, ...args),
     wakePage: () => cdpWakePage(), // hidden-tab unfreeze between polls (the discover rule)
+    // ⚠ FORWARD THE SHARED PROBES. This object is hand-built, so anything added to makeCdpActuation
+    // is invisible here — which silently disabled two fixes: the quiescence watch (the ATS poll fell
+    // back to read latency, the proxy it was meant to replace) and trustedFocus (the widget-wake that
+    // showed no log line at all because `act.trustedFocus` was undefined). Guarded by a test now.
+    trustedFocus: workday.trustedFocus,
+    trustedType: workday.trustedType,
+    painting: workday.painting,
+    paintLabel: workday.paintLabel,
+    quietInstall: workday.quietInstall,
+    quietRead: workday.quietRead,
     attachResume: async (ref) => {
       const stored = await getResume().catch(() => null);
       if (!stored || !stored.base64) return { ok: false, error: "no resume stored (upload one in the popup / website)" };
@@ -3975,14 +4086,33 @@ function makeAtsActuation(llmConfig) {
       if (!r || !r.ok) return { ok: false, error: (r && r.error) || "attach failed" };
       // async-upload confirmation (GH uploads on change): poll for the filename to render
       // ANYWHERE near the input OR input.files to still hold it — bounded, wall-clock.
+      // Poll for EITHER signal (see atsInjReadFileState): the input while it still holds the file, or
+      // the filename the form renders once its upload finishes. Reading only the input meant the loop
+      // could not succeed at all on an ATS that clears it, so it always ran the full ceiling — 15.2s
+      // on Coinbase for an upload that lands instantly by hand. 250ms, because a confirmation that
+      // arrives in 400ms should not be charged 700.
       const deadline = Date.now() + 15000;
       let last = null;
       while (Date.now() < deadline) {
-        last = await cdpEval(atsInjReadValue, ref.ats || "greenhouse", ref.inputSel, "file_upload");
-        if (last && last.ok && last.value) return { ok: true, name: last.value, verified: true };
-        await cdpDelay(700);
+        // UNFREEZE between polls (the discovery rule, cdpWakePage → Page.setWebLifecycleState
+        // "active"). A hidden tab is not producing frames, and both of our success signals — the
+        // input vanishing, the filename rendering — are things the widget has to RE-RENDER to show.
+        // Measured on one form, same code: résumé 0.3s visible vs 7.8s hidden.
+        await cdpWakePage();
+        last = await cdpEval(atsInjReadFileState, ref.inputSel, stored.filename || "resume.pdf");
+        const name = last && last.ok ? (last.fromInput || last.rendered) : null;
+        if (name) return { ok: true, name, verified: true, detail: last.inputGone ? "the form replaced its upload control with the attachment" : null };
+        await cdpDelay(250);
       }
-      return { ok: true, name: r.name, verified: false, detail: "attached (confirmation not read — verify on the form)" };
+      // Say WHAT WE SAW on the last tick, or the next occurrence is another 15s guess: which signals
+      // were present tells you whether the upload never happened, or happened and we looked in the
+      // wrong place (the confirmation row can sit outside the input's few parent levels).
+      try {
+        console.log(`[ApplyPilot][ATS-RUN] resume confirm gave up after 15s — fromInput=${JSON.stringify((last && last.fromInput) || null)} rendered=${JSON.stringify((last && last.rendered) || null)} progress=${JSON.stringify((last && last.progress) || null)} error=${JSON.stringify((last && last.error) || null)}`);
+      } catch (e) { /* log only */ }
+      const why = last && last.error ? " — the form said: " + String(last.error).slice(0, 80)
+        : last && last.progress ? " — the form was still uploading" : "";
+      return { ok: true, name: r.name, verified: false, detail: "attached (confirmation not read" + why + " — verify on the form)" };
     },
   };
 }
@@ -3990,6 +4120,39 @@ function makeAtsActuation(llmConfig) {
 // FILL run: posting → form → fill → review bundle → website. NEVER submits — there is no
 // page-advance click on these single-page forms at all; the only submit-capable click
 // lives in runAtsSubmitRun behind authorize+arm.
+// The posting-page settle for an ATS run, asked over CDP. waitJobPageSettled reads through
+// chrome.scripting, which is HOST-GATED — and greenhouse/lever/ashby are deliberately NOT in
+// host_permissions (this pipeline drives them through the debugger instead, which is the whole
+// reason it needs no new permissions). So on every ATS run it failed on its first read with
+// "read-failed: Cannot access contents of url", logged a settle that never happened, and left the JD
+// scrape reading whatever had rendered by then. We are already attached here, so ask that way.
+//
+// `hasPosting` is reported false on purpose: it keys off Workday's own automation-ids, so claiming it
+// here would be a lie that shortcuts the accept rule. Without it the shared, unit-pinned
+// jobPageSettleStep requires THREE equal non-zero reads instead — the honest path for a page whose
+// content we cannot positively identify.
+async function waitAtsPostingSettled(ceilingMs = 8000, intervalMs = 300) {
+  const t0 = Date.now();
+  const deadline = t0 + ceilingMs;
+  let state = null, last = null;
+  while (Date.now() < deadline) {
+    await cdpDelay(intervalMs);
+    let s = null;
+    try {
+      s = await cdpEval(function () {
+        return { len: ((document.body && document.body.innerText) || "").length, hasPosting: false, ready: document.readyState };
+      });
+    } catch (e) {
+      return { settled: false, reason: "read-failed:" + String((e && e.message) || e), chars: last ? last.len : 0, waitedMs: Date.now() - t0 };
+    }
+    if (!s) continue;
+    last = s;
+    state = jobPageSettleStep(s, state);
+    if (state.accept) return { settled: true, chars: s.len, ready: s.ready, waitedMs: Date.now() - t0 };
+  }
+  return { settled: false, reason: "ceiling", chars: last ? last.len : 0, waitedMs: Date.now() - t0 };
+}
+
 async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // THE JOB IDENTITY IS THE LINK WE WERE GIVEN, not wherever the form turned out to live. A
   // landing hop (employer redirect, embedded frame, apply link) changes the URL, and keying the
@@ -4001,8 +4164,35 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
-    await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock (Ashby is an SPA)
-    await cdpSetFocusEmulation(true).catch(() => {}); // hidden tab keeps repainting (the discover lever)
+    // ⚠ OUR OVERRIDES BREAK A DOCUMENT THEY LAND ON MID-LIFE. Settled 2026-08-06: they replace
+    // setTimeout/setInterval/rAF (so a hidden tab's timers escape throttling), and Greenhouse's async
+    // react-selects schedule their search on exactly those. Installing them into an ALREADY-RUNNING
+    // document leaves the page half-native/half-ours, and those widgets never resolve again — the
+    // "dead form" whose only cure was a refresh. The operator spotted the shape of it first: opening
+    // the link from the website always broke location, copy-pasting the same link never did.
+    //
+    // The overrides still earn their place on a hidden tab, so the fix is not to drop them: it is to
+    // INSTALL THEM BEFORE THE DOCUMENT EXISTS. An ATS run opens its tab BLANK and navigates below, so
+    // the registration (Page.addScriptToEvaluateOnNewDocument) is in place before the posting is ever
+    // fetched and every document the run touches starts with it. That costs NOTHING — it is the same
+    // single navigation the run always made, just moved to after the install. A reload here would have
+    // worked too and was rejected for being a second page load.
+    await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
+    await cdpSetFocusEmulation(true).catch(() => {});
+
+    // …and NOW open the posting, so its document runs with the overrides from its first byte. Defensive
+    // about the starting URL: a caller that hands over an already-loaded tab (the redirect chase below
+    // re-enters this function on a tab it just navigated) skips this and keeps its own document.
+    {
+      const at = await cdpEval(function () { return location.href; }).catch(() => null);
+      if (!at || at === "about:blank" || at.startsWith("chrome://")) {
+        LOG(`opening the posting under our page overrides: ${startUrl}`);
+        await cdpNavigate(startUrl);
+        await waitTabComplete(tabId, 20000);
+        const settle = await waitAtsPostingSettled().catch(() => null);
+        if (settle) LOG(`posting ${settle.settled ? "settled" : "did NOT settle (" + settle.reason + ")"} after ${settle.waitedMs}ms — ${settle.chars} chars`);
+      }
+    }
 
     // JD scrape on the POSTING page (we may still be on it) before navigating away.
     emitRunProgress("Reading the job description");
@@ -4133,6 +4323,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     }
     if (!ready.ready) {
       const hereX = await cdpEval(function () { return location.href; }).catch(() => null);
+      // CLOSED IS NOT BROKEN. Say which one it is — they have different next steps.
+      const gone = atsPostingGone(jd, originUrl || startUrl, hereX);
+      if (gone) {
+        LOG(`this posting is GONE — ${gone}`);
+        return { ok: true, needs_operator: true, stopped: "posting-gone", jd,
+          detail: "This job is no longer posted — " + gone + ". Nothing is wrong with the fill; pick another posting." };
+      }
       return { ok: true, needs_operator: true, stopped: "form-not-rendered",
         detail: "No " + ats + " application form rendered at " + (hereX || startUrl) + " and no apply link could be followed — open the tab and check, then re-run.", jd };
     }
@@ -4151,7 +4348,18 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
     const prepared = prepareProfile(store.profile);
-    const out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+
+    // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
+    // here, added when Greenhouse forms would land in a state where every server-backed combobox returned
+    // nothing at all; that state was our own page overrides landing on an already-running document, and
+    // it is fixed at the cause now (see the install above). What is left is the honest kind: a form whose
+    // places/search service genuinely does not respond — live, Ashby's location combobox, which fails
+    // identically on a reload, under screen capture, and by hand. Retrying that costs a second full fill
+    // and changes nothing, so the field reaches review self-explaining and we name it here.
+    if ((out.deadAsync || []).length) {
+      LOG(`the form's own async widget(s) never answered: ${out.deadAsync.join(", ")} — left for review rather than retried`);
+    }
 
     // ONE page ⇒ one bundle write (the walk's clear-once + accumulate collapses to a set).
     const pageKey = (() => { try { return new URL(out.url).pathname; } catch (e) { return "application"; } })();
@@ -4167,16 +4375,36 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     bundle.ats = ats;
     bundle.jobKeyUrl = originUrl; // stable identity across landing hops (see the top of this fn)
     await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
-    await reportApplication(bundle, jobContext);
+    const reported = await reportApplication(bundle, jobContext);
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
     // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
     const fillMs = Date.now() - fillT0;
     const perField = out.results.length ? Math.round(fillMs / out.results.length) : 0;
     let visNow = null; try { visNow = await cdpVisible(); } catch (e) {}
-    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"})`);
-    LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. Reported to the website.`);
+    // MEASURED paint state next to Chrome's visibility (the Workday branch's rule): "visible but
+    // not painting" is the state that used to be invisible in the logs, and it is exactly when a
+    // widget's own renders crawl — which this pipeline reads as an empty menu.
+    let paint = "?"; try { paint = await cdpPaintLabel(); } catch (e) {}
+    // …and NAME the slowest fields. "1540ms/field" cannot tell you whether the cost is spread or
+    // sitting in two widgets waiting out a ceiling — which is the only thing worth retuning.
+    // The résumé is ALWAYS named, whatever it cost: it is the field whose time varies most between a
+    // visible and a hidden run, so "it wasn't in the slowest list" is not the same as knowing.
+    const res = out.results.find((r) => /resume|\bcv\b/i.test(r.fieldName || "") || r.widgetType === "file_upload");
+    const resPart = res ? ` | resume ${((res.elapsedMs || 0) / 1000).toFixed(1)}s` : "";
+    const slow = out.results
+      .filter((r) => (r.elapsedMs || 0) >= 1500)
+      .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
+      .map((r) => `${r.fieldName} ${(r.elapsedMs / 1000).toFixed(1)}s`).join(", ");
+    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`);
+    // Say what ACTUALLY happened to the report. reportApplication used to return nothing, so this
+    // line claimed "Reported to the website." even when the line directly above it was the ⛔ saying
+    // the tracker had rejected it.
+    const landed = reported && reported.ok
+      ? "Reported to the website."
+      : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
+    LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. ${landed}`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
-    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
+    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok), walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };
   } finally {
@@ -4197,7 +4425,6 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
     await cdpInstallPageOverrides();
     await cdpSetFocusEmulation(true).catch(() => {});
-
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real
     // form from an embedded frame, and the fill followed it there. Starting from the caller's
@@ -5253,13 +5480,15 @@ async function runCdpReplayWalk(tabId, opts) {
         // on two questions the human never saw, entirely because of our own unapproved write.
         // Here the value is only ever written after Workday demands it, it can only ever be today, and
         // the page is re-Saved once. Bounded per RUN.
-        if (dateStamps < 2 && samples.some((t) => /enter\s+today'?s\s+date/i.test(String(t)))) {
+        // Cheap TEXT-ONLY pre-check so a nav-timeout that has nothing to do with a date never pays for
+        // an extra page scan: either Workday spelled the ask out, or it named a field whose name reads
+        // like a signature date. The grounded decision is signatureDateDemanded, against the live DOM.
+        if (dateStamps < 2 && apMatch.signatureDateAskInText(samples)) {
           const today = (() => { const t = new Date(); return { month: String(t.getMonth() + 1), day: String(t.getDate()), year: String(t.getFullYear()) }; })();
           let stamped = null;
           try {
             const fscan = await cdpEval(cdpPageScan);
-            const df = ((fscan && fscan.fields) || []).find((f) => (f.widgetType === "date" || f.widgetType === "text")
-              && apMatch.isSignatureDateQuestion(f.label));
+            const df = apMatch.signatureDateDemanded(samples, (fscan && fscan.fields) || []);
             if (df) {
               const loc = { wrapperSel: df.wrapperSel };
               const r = df.widgetType === "date"
@@ -6299,9 +6528,22 @@ async function runCdpOnboard(tabId, opts) {
     // rather than attaching into a page that isn't ready — that races Workday's own parse setup, and the
     // clear-then-attach inside attachResume is exactly the wrong thing to do mid-flight.
     if (!(s.markers && s.markers.resumeUploadInput)) {
-      const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1,
+      // ── AUTH CAN INTERRUPT THIS (2026-08-09) ──────────────────────────────────────────────────────
+      // "Autofill with Resume" on a session Workday does not trust redirects to SIGN IN, and the wait
+      // below could never be satisfied there — so it burned its whole budget and halted
+      // `resume-upload-input-missing`, blaming an upload control on a page that was asking for a
+      // password. Live on nvidia.wd5: `still waiting at 4.1s — title "Sign In"`, repeated to 16s+.
+      // Landing on auth is a NORMAL branch of this flow (it is the first-run path for any signed-out
+      // user), so break out and let the auth stage do its job, exactly as the terminal-state exits
+      // inside waitFor already do for already-applied and maintenance pages.
+      const authNow = (sc) => !!(sc && (sc.hasAuthEl || sc.passwordInput || sc.emailInput || sc.signInWithEmail));
+      const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1 || authNow(sc),
         await renderBudget(12000, 25000), "resume-upload-input");
       s = w.scan || s;
+      if (authNow(s)) {
+        LOG("Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage (the résumé page comes after).");
+        return { scan: s, needsAuth: true };
+      }
       if ((s.formFieldCount || 0) > 1) { LOG("the résumé page moved on by itself — already past it."); return { scan: s }; }
       if (!(s.markers && s.markers.resumeUploadInput)) {
         return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-upload-input-missing",
@@ -6982,6 +7224,9 @@ async function runCdpOnboard(tabId, opts) {
           const r = await consumeResumeUploadPage(st);
           if (r.halt) return r.halt;
           st = r.scan || st;
+          // The résumé page can bounce to SIGN IN. Re-enter the auth loop rather than announcing a form
+          // we are not on — claiming reached-form here would hand the walk an auth screen to fill.
+          if (r.needsAuth) continue;
           resumeAutofilled = true;
         }
         LOG("reached the application form.");
@@ -7012,7 +7257,20 @@ async function runCdpOnboard(tabId, opts) {
       // check so the chooser isn't mistaken for a forced SSO redirect.
       if (!st.passwordInput && !st.emailInput && st.signInWithEmail) {
         LOG('auth is a social-login chooser — clicking "Sign in with email" to reveal the form.');
-        const c = await clickTarget(['[data-automation-id="SignInWithEmailButton"]'], "Sign in with email");
+        // The automation-id is not stable across tenants (sonos.wd1 hashes it), so fall back to the
+        // button's own text. clickTarget needs a CSS selector and there is no text selector, so STAMP
+        // the match with an attribute and click that — the same trick the Ashby scan uses for a combobox
+        // with no id. Text-matched against the federated buttons beside it is safe: "Sign in with Apple"
+        // and "Sign in with Google" do not contain "email", and we never click those.
+        await cdpEval(function () {
+          var els = Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"]'));
+          for (var i = 0; i < els.length; i++) {
+            var t = (els[i].textContent || "").trim();
+            if (/\bsign[- ]?in\s+with\s+email\b/i.test(t)) { els[i].setAttribute("data-ap-signin-email", "1"); return true; }
+          }
+          return false;
+        });
+        const c = await clickTarget(['[data-automation-id="SignInWithEmailButton"]', '[data-ap-signin-email="1"]'], "Sign in with email");
         if (!c.clicked) return haltNeedsOperator("signin-with-email-blocked", c.blockedBy || "could not click Sign in with email", st);
         await cdpWakePage();
         const w = await waitFor((s) => s.passwordInput || s.emailInput || s.markers.createAccountLink || s.markers.signInSubmit || isPastAuth(s), 15000, "email-sign-in-form");
@@ -7391,7 +7649,9 @@ async function runCdpOnboard(tabId, opts) {
         const r = await consumeResumeUploadPage(st);
         if (r.halt) return r.halt;
         st = r.scan || st;
-        resumeAutofilled = true;
+        // Bounced to sign-in: leave resumeAutofilled FALSE and fall through to Stage 3, which signs in
+        // and then consumes the résumé page on the other side (that path already exists above).
+        if (!r.needsAuth) resumeAutofilled = true;
       }
     } else if (st.markers.applyManually) {
       LOG('Stage 2 — clicking "Apply Manually".');

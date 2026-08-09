@@ -7,6 +7,7 @@ import { SectionCard } from "@/components/app/SectionCard";
 import { sendToExtension, extensionMessagingAvailable, openRunProgressPort, type ExtResponse, type RunProgress } from "@/lib/extension";
 import { linkedExtensionId } from "@/lib/extension-sync";
 import { saveRunJob, saveRunSubmit, type RunLogin } from "./actions";
+import { getSession } from "../connect/actions";
 import { clsx } from "@/lib/clsx";
 
 type Jd = { title?: string; company?: string; text?: string; url?: string };
@@ -243,6 +244,30 @@ export function RunPanel() {
   const busy = running || submitting;
   const validUrl = /^https?:\/\/\S+$/i.test(url.trim());
 
+  // REFRESH THE EXTENSION'S CREDENTIAL BEFORE EVERY RUN (2026-08-07). Minting a key DELETES the
+  // user's previous ones, so any later sync silently invalidates whatever the extension is holding,
+  // and the failure lands at the worst possible moment: a fill completes and never reaches the
+  // tracker, or a submit run pulls the approved bundle, gets 401, and REFUSES (correctly -- it will
+  // not replay a different application's answers). Both were hit repeatedly while testing.
+  //
+  // A run is the moment the credential has to be good, so make it good then. One server action,
+  // and runs are mutually exclusive, so this can never rotate a key out from under one in flight.
+  // Best effort: if it fails we still start, and the extension reports the 401 loudly on its own.
+  async function refreshExtensionSession(extId: string) {
+    try {
+      const res = await getSession();
+      if (!res.ok) return;
+      await sendToExtension(extId, {
+        type: "AP_SET_SESSION",
+        ingestUrl: res.session.ingestUrl,
+        ingestKey: res.session.ingestKey,
+        reviewUrl: res.session.reviewUrl,
+      });
+    } catch {
+      /* the run proceeds; a stale key surfaces as the extension's own loud report */
+    }
+  }
+
   async function run(background: boolean) {
     const startUrl = url.trim();
     if (!validUrl || busy) return;
@@ -253,6 +278,7 @@ export function RunPanel() {
     }
     setPhase({ s: "running", background });
     setProgress({ phase: background ? "Starting in the background…" : "Starting…", detail: "", at: 0 });
+    await refreshExtensionSession(extId);
 
     // Open a live-progress port BEFORE kicking off the run so we catch the earliest phases. The
     // extension streams { phase, detail } over it as onboard/fill progresses; it's UI sugar only —
@@ -314,6 +340,7 @@ export function RunPanel() {
     setProgress({ phase: armed ? "Starting the submit run…" : "Starting the rehearsal…", detail: "", at: 0 });
     portRef.current = openRunProgressPort(extId, (p) => setProgress(p));
 
+    await refreshExtensionSession(extId);
     const resp = await sendToExtension(extId, { type: "AP_SUBMIT_APPLICATION", startUrl, arm: armed, background: submitBg });
 
     portRef.current?.disconnect();

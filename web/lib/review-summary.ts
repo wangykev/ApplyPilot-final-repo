@@ -69,6 +69,7 @@ export type ReviewEntry = {
   detail?: string | null;
   options?: string[] | null; // full list, plain dropdowns
   captured_options?: string[] | null; // partial filtered set, typeaheads
+  options_partial?: boolean | null;   // the FILL says these are a filtered view, not the whole list
   // checkbox_group: the AUTHORITATIVE selection, because a group can hold more than one (traced live
   // on PSECU's ethnicityMulti — two options checked, both saved). current_value stays the joined
   // display string so the blank tests / submit gate / review reconcile keep reading one value.
@@ -130,6 +131,11 @@ export type WalkStatus = {
 
 export type ReviewBundle = {
   schema_version?: string;
+  /** Which pipeline filled this: "workday" | "greenhouse" | "lever" | "ashby". The extension has
+   *  written it since 2026-08-02 (a submit run cannot re-derive it from an employer URL). The UI
+   *  needs it because the one-page ATSs have NO review page, so Workday's "stopped before the review
+   *  page" wording describes something that does not exist on them. */
+  ats?: string | null;
   page?: string | null;
   page_number?: number | null;
   page_label?: string | null;

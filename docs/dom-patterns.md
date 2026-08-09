@@ -2730,6 +2730,13 @@ handled in `ats.js`'s combobox path — all four are "the widget lied or wasn't 
    "some options": while the widget searches it keeps showing the PREVIOUS page, so an
    exit-on-non-empty reads a stale list and calls the value absent.
 
+**RESOLVED 2026-08-04 — see the entry at the end of this file.** The list was answering all along,
+just later than the poll waited (~4.4s on a hidden tab), and it renders "No options" while it
+searches. Two things had to change: an empty menu is no longer an answer while the widget reports
+`loading`, and the retry no longer re-types (which restarted the widget's debounce and discarded the
+in-flight search — so the old path could not have succeeded at any budget).
+
+Original write-up:
 ⚠ **Still unresolved (honest limitation):** Discord's `school--0` async list returns results for
 a hand-typed "Carnegie Mellon" in ~2s but returns NOTHING to the same query during a fill
 (`typed=true stuck=true got="Carnegie Mellon"` and `list(0)` across ~5s of polling, foreground
@@ -3162,6 +3169,318 @@ form holding the values, and only the second one is worth anything.
 The ethnicity set lands in MISSING on the review-page reconcile, which is correct and non-blocking:
 Workday's own summary page does not render the self-identification section at all, so absence there
 is not evidence the value was lost (the 2026-07-28 rule).
+
+## 2026-08-04 — a server-backed combobox says "No options" while it is still SEARCHING (Greenhouse `school--0`)
+
+Closes the 2026-07-31 (b) "still unresolved" limitation: Discord's school list answered a hand-typed
+query in ~2s but returned nothing to the identical query during a fill. Traced by running the
+shipped `atsInjReadOptions` **verbatim in the live page** on a HIDDEN tab, sampling on every DOM
+mutation from the instant the query was typed:
+
+| t | options | `loading` | menu text |
+|---|---|---|---|
+| 4–9ms | 0 | **false** | **"No options"** |
+| 23ms | 0 | **true** | "Loading..." |
+| 4049–4459ms | 1 | false | the real answer ("Swarthmore College" / "Bowdoin College") |
+
+- **The empty menu is a LIE, and it arrives before the loading state does.** The widget renders a
+  definitive "No options" for ~15ms before react-select's async `loadOptions` marks itself busy. So a
+  poll that treats "no options" as an answer can be wrong twice: during that window, and for the
+  whole 4s that follows.
+- **Nothing about this is fixable by tuning a flat budget.** Measured across four fresh queries on
+  one form: the search fires at **312–873ms** after typing (a ~300ms debounce, inflated by the hidden
+  tab's ~1Hz timer throttle) and renders at **390–4459ms**. The variance is why this looked
+  intermittent, and why it "did not reproduce" on some re-tests. `loading` is the only signal that
+  separates "no such option" from "not yet".
+- **Re-typing is the worst possible recovery.** The fill's retry cleared and re-typed the query,
+  which restarts the widget's own debounce and throws away the search already in flight — so the
+  second poll started from zero and gave up sooner. The old path could therefore never succeed on
+  this widget no matter how long it ran.
+- **The unfiltered first page is NOT a superset of the search result.** The list serves 100 rows
+  starting "Aalborg University"; the value being searched for is not on it at all (`page=1` is a real
+  network fetch, `?term=` is another). So clearing the query to "unfilter" the menu before clicking
+  DELETES the option we just matched — the commit then fails `option-not-found`. Read the menu
+  first; clear only when the option genuinely is not on screen (which is the case that rule was
+  written for — the 2026-08-02 polarity bridge, where the match came from the unfiltered list).
+- **Cache note for anyone re-tracing this:** react-select caches by query, so re-testing the SAME
+  query answers in ~9ms with no network and looks like a pass. Use a school you have not typed yet.
+
+Verified live on the fixed path, in one sequence on the real widget: type → wait through `loading`
+(4.4s) → click the searched option WITHOUT clearing → `.select__single-value` reads "Bowdoin
+College". Nothing was submitted.
+
+**Still not proven:** the 2026-08-02 (b) `#country` empty-list observation. That widget is
+client-side (244 local options, no `loading` state) so it is a different mechanism, and it has never
+reproduced. What HAS changed is that the fill no longer force-toggles and re-types a menu that is
+open and still holding its query — i.e. the "two clicks = shut, then type into a closed widget"
+shape that entry named as its leading theory is now impossible. Treat it as removed-by-construction,
+not as diagnosed.
+
+## 2026-08-05 — multi-ATS end to end on GitLab: numbered options, a pick-one that reads like a places box, and the résumé slot
+
+The session that closed the loop (fill → review → approve → rehearse → `WOULD CLICK SUBMIT`) on
+`job-boards.greenhouse.io/gitlab/jobs/…`. Six defects, each caught by a live run and none visible
+from the unit suite.
+
+- **⚠ THE RÉSUMÉ WAS ATTACHED TO THE COVER-LETTER SLOT (replay only).** Greenhouse renders the cover
+  letter as a **file dropzone**, and the replay treated every `file_upload` field as the résumé. The
+  fill never did — its router maps `cover_letter` → skip — so this was invisible until a rehearsal,
+  where the operator SAW the same PDF in both slots. No gate can catch it: the strict verify only
+  re-checks approved VALUES, and the bundle carries no file for a field the fill skipped. Diagnostic
+  that settles it either way: `AP_DEV_ATS_SCAN` stops reporting a file field once it holds a file, so
+  **23 fields + no file fields = both slots filled; 24 fields + `cover_letter value:null` = correct**.
+- **⚠ NUMBERED OPTIONS DEFEAT EVERY TIER.** GitLab renders `"1. United States of America"` /
+  `"2. Canada"` / `"3. Located Elsewhere"`. Against the profile's exact `"United States of America"`:
+  exact fails, containment is deliberately off for dropdowns, and fuzzy scores **88.9%** against the
+  90 bar — so a REQUIRED field the profile answers perfectly was left for the operator. The
+  enumeration is display scaffolding (`atsEnumStrip`), stripped for MATCHING only. It must be stripped
+  on **BOTH** sides: a commit stores the option's REAL text, so on a replay the approved value arrives
+  carrying the numbering, and stripping only the options makes a field fail to match the very value it
+  produced minutes earlier.
+- **⚠ "Where are you currently based?" IS NOT ALWAYS A PLACES BOX.** The label recognizer routed it to
+  the places-autocomplete path, which typed a city and waited out a suggestion service that never
+  answers, reporting "places never loaded" — while the widget itself was a three-option pick-one whose
+  own list already held the answer. The live widget now wins over the label's guess (the Workday
+  widget-adaptive rule), and the location route's candidates are TIERED: city+state first, then
+  country. Note the profile stores ladders as ARRAYS, so `personal_info.country` may itself be a list —
+  handing it to the ladder as one candidate threw `s.toLowerCase is not a function` mid-fill.
+- **⚠ A SERVER-BACKED LIST SAYS "No options" WHILE IT IS STILL SEARCHING** (full trace: 2026-08-04).
+  Latency for the same class of query on ONE session: **390ms, 4.0s, 4.5s, >12s, >20s** — with a direct
+  fetch of the same query returning HTTP 200 in 2971ms and no rate limiting. No flat budget can work;
+  `loading` is the only honest signal.
+- **A menu that has not MOUNTED is not an empty menu.** react-select paints its list a beat after the
+  open click, and believing that beat is what mis-routed the pick-one above. But the converse bites
+  too: waiting indefinitely for a menu that will never appear cost 20s per field on the replay, where
+  Greenhouse's phone-dial composite reads as a plain select. The poll now separates the states —
+  LOADING (full ceiling), mounted-but-empty (one confirming read), never-mounted (brief grace) — and
+  asks the operator's **quiescence watch** whether the page is still mutating before believing any of
+  it. Read latency is a poor proxy for this: it measures the CDP round trip, not the page.
+- **A PAGED list cannot prove absence.** 100 of ~3300 schools were read, narrowed to their 20 nearest
+  matches, and then rendered as a pick-one `<select>` that did not contain the operator's school —
+  while the record claimed the answer "isn't one of this form's options". Narrowing must not launder a
+  partial list into a complete one.
+
+**Measured effect of the round on the same form:** fill 166.3s → **35.4s** (6650 → 1540 ms/field),
+because fields resolve instead of waiting out ceilings; and the rehearsal went `1 failure` → **0
+failures → WOULD CLICK SUBMIT**. `[ATS-TIME]` now prints the MEASURED paint state
+(`NOT painting (chrome says hidden)`), so "visible but not painting" is diagnosable in ATS logs too.
+
+## 2026-08-05 (b) — four forms end to end, and an employer page that LINKS (not embeds) its ATS
+
+Breadth round (operator: "any greenhouse, any ashby, any lever form … all work end to end"). Each ran
+fill → review → approve → rehearse, and each ended `WOULD CLICK SUBMIT`; nothing was submitted.
+
+| ATS | Company | Fields replayed | Fill |
+|---|---|---|---|
+| Greenhouse | GitLab (AI Engineer) | 23 | 35.4s |
+| Lever | Shield AI (Electrical Engineer I) | 39 | 32.8s |
+| Ashby | Notion (AI Applications Engineer) | 19 | 19.4s |
+| Greenhouse, employer-hosted | Coinbase (`www.coinbase.com/careers/positions/<id>?gh_jid=<id>`) | 30 | 68.7s |
+
+- **⚠ AN EMPLOYER PAGE MAY LINK ITS ATS RATHER THAN EMBED IT.** The pre-onboard probe (2026-08-02)
+  only looked for an embedded FRAME, so Coinbase — its own careers UI with an Apply link to
+  `job-boards.greenhouse.io` — matched no ATS host, fell into the WORKDAY onboarding, and halted
+  `auth-form-not-rendered` on a page that has no sign-in at all. The probe now also asks
+  `atsInjFindApplyLinks` + the ambiguity-refusing `atsPickApplyLink` (the same pair the ATS pipeline
+  uses for its own landing hops), and hands the resolved URL to the right pipeline. ⚠ The link must be
+  READ from the page — a Greenhouse embed URL cannot be constructed from a `gh_jid` (2026-08-01).
+- **Lever's EEO block, two traps in one field set.** `eeo[disabilitySignatureDate]` reached the AI
+  free-text path and answered **"As soon as possible"** — an availability answer on a date field, after
+  a 19.2s LLM call. And `eeo[race]` renders each option's whole DESCRIPTION inside its label, so the
+  read-back is a paragraph while the option vocabulary is the answer alone; persisting the read-back
+  put a value in the bundle that no live option could match, and the replay of a verified fill came
+  back `stated-value-unmatched`.
+- **The one-page ATSs have NO review page**, so Workday's "stopped before the review page" / "on page
+  N" wording describes something that does not exist on them. `bundle.ats` (written since 2026-08-02)
+  now drives the halt-banner copy.
+- Slowest fields per run, now that `[ATS-TIME]` names them: Coinbase `resume 15.2s`,
+  `candidate-location 10.6s`; Ashby `ap-ats-combobox-3 12.2s` (the stamped, identity-less location
+  combobox). Résumé attach and the location widgets are where the remaining time is — not matching.
+
+## 2026-08-05 (c) — making a HIDDEN tab render, and the two waits that were never about the page
+
+### Three different things get called "visible", and they need different levers
+
+| What is being changed | Lever | What it fixes |
+|---|---|---|
+| what the page BELIEVES | `document.visibilityState` spoof (the Workday walk's escalation path), `Emulation.setFocusEmulationEnabled` | page logic gated on visibility/focus |
+| whether LAYOUT happens | `Emulation.setDeviceMetricsOverride` | 0×0 `getBoundingClientRect` on a hidden tab (2026-08-01) |
+| whether FRAMES are produced | **`Page.startScreencast`** (capture), or real tab visibility | anything that must PAINT — e.g. a react-select menu |
+
+The first two were already in the arsenal, which is why the gap survived: worker timers replace TIMERS,
+focus emulation changes BELIEF, `setWebLifecycleState` only un-freezes. None makes the compositor draw,
+and cdp.js's own note had concluded a pure rAF-pause "only true tab visibility resumes". **A tab UNDER
+CAPTURE keeps producing frames**, and the paint probe proves it by measuring native rAF delivery:
+`render forcing ON (screencast) — paint: painting (hidden)` on a tab `chrome.tabs` calls hidden.
+
+**⚠ THE CAPTURE RATE IS LOAD-BEARING.** At `everyNthFrame:1` Chrome captures and JPEG-encodes every
+frame, and the encoding STARVES the renderer it was meant to free — the same starvation lesson as
+polling too hard (2026-07-31). Measured on one form, one field:
+
+| capture | `gender` select |
+|---|---|
+| every frame | **33452ms, no options rendered at all** |
+| ~1 fps (32×24, quality 1) | **72ms, filled exact-normalized** |
+
+Frames must be ACKed (Chrome stops after two un-acked), the stream must be torn down with the attach,
+and `chrome.storage.local.forceRenderOff` opts out.
+
+**⚠ FOOTGUN for the Workday side:** `cdpSynthInput()` chooses synthetic-vs-trusted from
+`cdpPainting()`. Forcing frames makes a hidden tab report PAINTING, so a Workday run with render
+forcing on would switch to TRUSTED input while hidden — ~1.2-1.5s per event, the exact cost the
+synthetic path exists to avoid. If render forcing is enabled there, the input-mode decision needs its
+own signal (real visibility) rather than the paint probe.
+
+### The résumé attach was never the upload
+
+`resume confirm gave up after 15s — fromInput null rendered null error "not-found:#resume"`.
+**Greenhouse REMOVES the `<input type=file>` once its upload completes**, so a poll watching
+`input.files[0].name` cannot ever succeed — it ran the full ceiling every time and recorded the attach
+`verified:false`, while the résumé sat attached on the form (by hand it is instant). An absent input is
+now read as the widget having replaced itself with its attachment row, and the filename rendered on the
+page is the confirmation. Waking the page between ticks matters too, since both signals need a
+re-render: **15.2s → 0.3s hidden, 0.3s visible.**
+
+### A places box with no places library
+
+Greenhouse's `candidate-location` needs `google.maps.places`, which never loads in this browser — a
+HUMAN gets no suggestions either (2026-07-31) — and the fill still paid the full budget proving it:
+10.6s. Ask the page whether the library exists before waiting on it. **10.6s → 6.5s.**
+
+### One field, one budget
+
+The option-poll ceiling was per POLL, so a by-name search plus its retry could each spend it: 44.6s on
+one widget whose menu never rendered. It is a per-FIELD allowance now, and the AI fallback no longer
+re-opens and re-polls a list the deterministic pass just proved unreadable (it paid that ceiling twice
+and reached the same `needs_review` either way).
+
+## 2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings
+
+**Greenhouse serves its application form FROM the posting URL.** Lever and Ashby navigate on to
+`/apply` and `/application`. That single difference decided which ATS was broken by page overrides
+installed on an already-running document: the ones that navigate get a fresh document for free.
+
+**A Greenhouse checkbox group is `input[type=checkbox]` sharing `name="question_<id>[]"`,** with
+per-box ids `question_<id>[]_<optionId>` and a `<fieldset id="question_<id>[]">` around them. The
+legend carries the question ("How did you hear about this opportunity? (select all that apply) *")
+and each box's `<label for>` carries the option ("LinkedIn", "Glassdoor", "Indeed", …). Observed on
+Gusto with 12 boxes. Note the fieldset's id EQUALS the inputs' name, so a selector keyed on
+`[id*=…]` matches both the fieldset and every box.
+
+**Ashby renders a diversity survey as SELECT ALL THAT APPLY.** Each identity is its own checkbox —
+"Person with disability", "Veteran", "Neurodiverse", "Parent", "Refugee or immigrant" — so the label
+is an option VALUE, not a question. Observed on Sierra. Consequence: `atsIsEeoLabel` (which knows
+dimension NAMES: veteran, disability, race) matches some of these and not others ("Asian" is a value,
+not a dimension), so it cannot be the gate for deciding one.
+
+**An Ashby field labelled "Location" can be a COUNTRY box.** ElevenLabs pairs the label with the
+description *"Country you're currently residing in"*, and its suggestion service answers country
+queries only — "Pittsburgh" returns nothing, while the country returns
+`["United States", "American Samoa", "US Virgin Islands"]`. The label alone cannot tell you which
+kind of box you have; the live widget can. Third instance of that rule, after GitLab's three-option
+pick-one and Discord's already-rendered degree list.
+
+**Ashby's places service knows "Pittsburgh, Pennsylvania" and not "Pittsburgh, PA".** Same profile,
+same ATS, two forms an hour apart: the full-state spelling HIT in 2203ms and committed, the
+abbreviation returned nothing across a 17.5s budget. Neither spelling is canonical — the profile
+stores whichever the operator typed — so the query is the city alone and the state is enforced at the
+pick instead (`atsPlacePick`).
+
+## 2026-08-07 (later) — are ATS option menus virtualized? Measured: no
+
+Asked because Workday's picker is, and the ATS path has no scroll accumulator. Each menu was opened
+in the live DOM, its `[role=option]` counted, scrolled to the bottom with a dispatched `scroll` event,
+and counted again.
+
+| widget | on open | after scrolling to the bottom |
+|---|---|---|
+| GH `country` (phone dial composite) | **244**, last "Zimbabwe+263" | 244 |
+| GH `discipline--0` | **72**, last "Veterinary Medicine" | 72 |
+| GH `degree--0` | 10, last "Other" | 10 |
+| GH EEO gender / race | 3 / 8 | 3 / 8 |
+| Ashby location combobox | **0** | 5 after typing "Pitt" |
+| Lever | no combobox at all — 4 native `<select>` | n/a |
+
+Plain react-select renders every filtered option into the menu DOM and CSS-clips it; a windowed menu
+(`react-window` / `WindowedMenuList`) would mount only a slice, and none of these does. So a single
+`querySelectorAll` over the open menu already reads the whole list, and **no scroll accumulator is
+needed on this substrate** — the difference from Workday is real, not an oversight in the port.
+
+⚠ Two consequences worth keeping:
+- The long lists are COMPLETE, so treating >= 60 options as "one page" was throwing away options we
+  had already read (see progress-log).
+- Ashby's location box is genuinely server-backed: empty on open, answers only what you type. It can
+  never be enumerated by scrolling, which is why it carries a note in review instead.
+
+**Ashby "Location" can be a COUNTRY box.** ElevenLabs pairs the label with the description
+*"Country you're currently residing in"* and its service answers country queries only.
+
+**Chime words its GENDER question "I identify as:"** — no dimension word anywhere in the label, while
+the field directly below it reads "I identify my sexual orientation as:". A demographic detector keyed
+only on dimension names splits those two apart.
+
+**A removed posting is visible before you look for a form.** Lever serves the title `Not found`;
+Greenhouse 302s to the company board index (title `Current openings at <Company>`), dropping the job
+id from the URL.
+
+## 2026-08-08 — the 2.5s settle floor: measured, and it stays
+
+`waitAtsFormReady` accepts on three equal non-zero field counts **AND** `Date.now() - start >= 2500`.
+That floor is pure waiting on a form that rendered instantly — on the fast Lever forms it is longer
+than the fill — so it was worth trying to replace with a real signal. It was instrumented, measured
+on live forms, and **the replacement was refuted**. The floor stays. Do not re-run this without
+reading the numbers below.
+
+**What was instrumented (all reverted).** An in-flight request counter (`window.__apInflight`,
+wrapping `fetch`/`XHR` to count only) installed with the page overrides — the one place that runs
+before the document exists and so sees the form's own first requests — plus a 150ms page-side sampler
+recording `[t, form-control count, in-flight]` from document start, and a per-tick trace in the settle
+loop. The accept rule was left on the floor throughout; the run only observed.
+
+**The forms mount long before the settle loop looks.** Settle-relative traces:
+
+| form | count final at | accepted at |
+|---|---|---|
+| Ashby / Sierra (35 fields) | 496ms | 3500ms |
+| Ashby / Linear (12) | 530ms | 4906ms |
+| Ashby / OpenEvidence (13) | ≤1542ms (first read) | 2941ms |
+| GH / Discord (25) | 13ms (first read) | 2814ms |
+
+So the floor is typically 2–4.5s of dead time. That is the prize, and it is real.
+
+**Why DOM quiescence cannot claim it.** Ashby/Sierra, from document start:
+`159ms c=0 q=0 | 1351ms c=0 q=1 | 2040ms c=60 q=1 | 2110ms c=60 q=0 | 2266ms c=61 q=0`.
+At 2040ms the DOM has been still for a while — and a request is still in flight, with one more control
+to come. Quiescence would accept a form short of a field. This is the 2026-07-31 failure (Ashby
+accepted at 9 of 13 fields) reproduced in miniature.
+
+**Why in-flight cannot claim it either — the refutation.** GH/Discord, from document start:
+`280ms c=34 q=0 | 1716ms c=35 q=2 | 1807ms c=36 q=1 | 2250ms c=36 q=0`.
+At **280ms the count is stable AND nothing is in flight**, and two more controls arrive **1.4 seconds
+later** on requests that had not started yet. `q == 0` means "no request in flight right now", never
+"no more requests coming". A stable-count + zero-in-flight rule accepts a form missing two controls.
+
+Sierra adds a second, smaller objection: the count grew at 2266ms while `q` had already been 0 since
+2110ms — React renders a tick AFTER the fetch resolves, so even a correct drain needs a settle margin
+behind it.
+
+**Conclusion.** There is no observable signal that distinguishes "finished mounting" from "quiet before
+the next burst", because the distinguishing event is in the future. The floor is a crude but honest way
+of waiting long enough for the next burst to *start*. It is not tuned and it is not clever; it is the
+only thing measured that works.
+
+⚠ Two traps found while doing this, both worth keeping:
+- **Wrapping `fetch` must bind the receiver.** `_f.apply(this, …)` throws `Illegal invocation` for a
+  bare `fetch(url)` from a strict-mode bundle, and that alone stopped an Ashby form from mounting at
+  all — `form did not settle within 25000ms (last field count 0)`. Bind to `window`.
+- **A comment inside `buildOverrideSrc` cannot contain a backtick.** That function returns a template
+  literal, so a backtick in a comment terminates it and cdp.js stops parsing.
+
+**A follow-up that was considered and NOT taken:** measure the floor from DOCUMENT START rather than
+from settle start (the page has often already had its 2.5s by the time the loop begins). It is
+appealing and would reclaim most of the dead time, but it is strictly less conservative — on a page
+whose mounting finishes at 4s the loop could accept at 3s — and nothing measured here justifies that
+trade. If it is ever attempted, it needs a slow-form counter-example first, not a fast-form win.
 
 ## 2026-08-04 — waystar.wd1: what Workday does NOT persist when you re-enter a saved application
 

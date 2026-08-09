@@ -84,9 +84,19 @@ test("SW GLOBAL SCOPE: every importScripts file exists and parses", () => {
 // That happened live on 2026-07-28: routing the dateOrderOf call sites through apMatch fixed the
 // global-scope collision, Node passed (it takes the require branch), and the replay walk died mid-run
 // with `apMatch.dateOrderOf is not a function`. This pins the SW literal against actual usage.
-test("apMatch: every apMatch.X used in fill-driver.js is present in the SW object literal", () => {
+//
+// SCOPE (widened 2026-08-09): background.js reaches lib.js through the SAME `apMatch` object and was
+// NOT scanned, so it had exactly the hole this test exists to close. A signature-date fix called
+// `apMatch.parseErrorFieldName` from background.js; the suite passed 1185/1185 and the live replay
+// aborted with `apMatch.parseErrorFieldName is not a function`. Both callers are checked now.
+test("apMatch: every apMatch.X used in fill-driver.js AND background.js is present in the SW object literal", () => {
   const src = fs.readFileSync(path.join(ROOT, "fill-driver.js"), "utf8");
-  const used = new Set([...src.matchAll(/\bapMatch\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]));
+  const callers = ["fill-driver.js", "background.js"];
+  const used = new Map(); // name → the file that calls it (for a message that names the culprit)
+  for (const f of callers) {
+    const text = fs.readFileSync(path.join(ROOT, f), "utf8");
+    for (const m of text.matchAll(/\bapMatch\.([A-Za-z_$][\w$]*)/g)) if (!used.has(m[1])) used.set(m[1], f);
+  }
   assert.ok(used.size > 3, `expected several apMatch.* uses, found ${used.size}`);
 
   // The literal is the ELSE branch of the ternary — from "? require(...)" to the closing "};".
@@ -94,8 +104,8 @@ test("apMatch: every apMatch.X used in fill-driver.js is present in the SW objec
   assert.ok(decl, "could not locate the apMatch SW object literal");
   const listed = new Set([...decl[1].matchAll(/([A-Za-z_$][\w$]*)\s*:/g)].map((m) => m[1]));
 
-  const missing = [...used].filter((n) => !listed.has(n)).sort();
-  assert.deepStrictEqual(missing, [], "these names are called as apMatch.X in fill-driver.js but are NOT in the SW object literal, so they are undefined in the extension even though Node tests pass. Add them to the literal (they must also be globals from lib.js).");
+  const missing = [...used.keys()].filter((n) => !listed.has(n)).sort().map((n) => `${n} (called in ${used.get(n)})`);
+  assert.deepStrictEqual(missing, [], "these names are called as apMatch.X but are NOT in the SW object literal, so they are undefined in the extension even though Node tests pass. Add them to the literal (they must also be globals from lib.js).");
 });
 
 test("apMatch: everything the SW literal lists is actually exported by lib.js", () => {
@@ -106,4 +116,43 @@ test("apMatch: everything the SW literal lists is actually exported by lib.js", 
   const lib = require("../lib.js");
   const notExported = listed.filter((n) => typeof lib[n] !== "function").sort();
   assert.deepStrictEqual(notExported, [], "the SW literal maps these to lib.js globals, but lib.js does not export them — so the Node branch of apMatch would be missing what the SW branch has (the two branches must agree)");
+});
+
+// ── the SAME trap, in ats.js (2026-08-05) ────────────────────────────────────────────────────────────
+// ats.js reaches lib.js and fill-driver.js through `atsLib` / `atsFd`, which are ALSO two different
+// objects: everything under Node (require), a HAND-WRITTEN literal in the service worker. The apMatch
+// guard above never covered them, so `atsLib.foo(...)` could pass every test and throw in the browser —
+// found while wiring the signature-date recognizer, which lives in lib.js and was NOT in the literal.
+for (const [ns, from] of [["atsLib", "lib.js"], ["atsFd", "fill-driver.js"]]) {
+  test(`${ns}: every ${ns}.X used in ats.js is present in the SW object literal`, () => {
+    const src = fs.readFileSync(path.join(ROOT, "ats.js"), "utf8");
+    const used = new Set([...src.matchAll(new RegExp("\\b" + ns + "\\.([A-Za-z_$][\\w$]*)", "g"))].map((m) => m[1]));
+    assert.ok(used.size > 2, `expected several ${ns}.* uses, found ${used.size}`);
+    const decl = new RegExp("const " + ns + " = [\\s\\S]*?\\n\\s*: (\\{[\\s\\S]*?\\});").exec(src);
+    assert.ok(decl, `could not locate the ${ns} SW object literal`);
+    const listed = new Set([...decl[1].matchAll(/([A-Za-z_$][\w$]*)\s*:/g)].map((m) => m[1]));
+    const missing = [...used].filter((n) => !listed.has(n)).sort();
+    assert.deepStrictEqual(missing, [], `these names are called as ${ns}.X in ats.js but are NOT in the SW object literal, so they are undefined in the extension even though Node tests pass (they must also be globals from ${from})`);
+  });
+}
+
+// ── the ATS actuation must expose everything ats.js asks of it (2026-08-06) ──────────────────────────
+// makeAtsActuation is a HAND-BUILT object, so a capability added to makeCdpActuation is invisible to
+// the ATS driver. That silently disabled two fixes: the quiescence watch (the option poll quietly fell
+// back to the read-latency proxy it was meant to replace) and trustedFocus (the widget-wake produced no
+// log line at all, because `act.trustedFocus` was undefined). Node tests could not catch it — the fakes
+// provide these methods directly — so this checks the real wiring the way the apMatch guard does.
+test("ATS act: every act.X used in ats.js is provided by makeAtsActuation", () => {
+  const ats = fs.readFileSync(path.join(ROOT, "ats.js"), "utf8");
+  const bg = fs.readFileSync(path.join(ROOT, "background.js"), "utf8");
+  // Comments mention capabilities they do not call (ats.js's header cites Workday's act.clickSubmit),
+  // so scan CODE only — otherwise the guard fails on prose and gets muted, which is worse than absent.
+  const code = ats.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  const used = new Set([...code.matchAll(/\bact\.([A-Za-z_$][\w$]*)/g)].map((m) => m[1]));
+  assert.ok(used.size > 5, `expected several act.* uses, found ${used.size}`);
+  const decl = /function makeAtsActuation\([\s\S]*?return (\{[\s\S]*?\n  \});/.exec(bg);
+  assert.ok(decl, "could not locate the makeAtsActuation returned object");
+  const provided = new Set([...decl[1].matchAll(/^\s{4}([A-Za-z_$][\w$]*)\s*:/gm)].map((m) => m[1]));
+  const missing = [...used].filter((n) => !provided.has(n)).sort();
+  assert.deepStrictEqual(missing, [], "ats.js calls these on `act`, but makeAtsActuation does not provide them — they are undefined in the extension even though the test fakes supply them");
 });

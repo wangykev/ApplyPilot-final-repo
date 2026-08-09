@@ -176,12 +176,20 @@ export async function getSyncBundle(): Promise<BundleResult> {
 
     // mint a fresh ingest key (rotates prior keys); only the hash is stored
     const key = generateApiKey();
-    await supabase.from("api_keys").delete().eq("user_id", user.id);
-    await supabase.from("api_keys").insert({
+    // The key is only usable if its HASH actually landed in api_keys — the report route looks it up and
+    // 401s ("Invalid key") when it is absent. Both statements used to be un-awaited-for-error, so a
+    // failed insert left the user with NO row at all (the delete having already rotated the old key
+    // away) while this action still returned ok with a key. The extension then stored a credential that
+    // could never authenticate, the page said "synced", and every report 401'd with nothing anywhere
+    // saying why — which is exactly the state a live session hit (2026-08-09). Surface it instead.
+    const delRes1 = await supabase.from("api_keys").delete().eq("user_id", user.id);
+    if (delRes1.error) return { ok: false, error: `Could not rotate the old reporting key: ${delRes1.error.message}` };
+    const insRes1 = await supabase.from("api_keys").insert({
       user_id: user.id,
       key_hash: hashApiKey(key),
       label: "extension",
     });
+    if (insRes1.error) return { ok: false, error: `Could not store the reporting key: ${insRes1.error.message}` };
     const session = {
       ingestUrl: `${SITE_URL}/api/extension/report`,
       ingestKey: key,
@@ -207,8 +215,16 @@ export async function getSession(): Promise<SessionResult> {
     const { supabase, user } = auth;
 
     const key = generateApiKey();
-    await supabase.from("api_keys").delete().eq("user_id", user.id);
-    await supabase.from("api_keys").insert({ user_id: user.id, key_hash: hashApiKey(key), label: "extension" });
+    // The key is only usable if its HASH actually landed in api_keys — the report route looks it up and
+    // 401s ("Invalid key") when it is absent. Both statements used to be un-awaited-for-error, so a
+    // failed insert left the user with NO row at all (the delete having already rotated the old key
+    // away) while this action still returned ok with a key. The extension then stored a credential that
+    // could never authenticate, the page said "synced", and every report 401'd with nothing anywhere
+    // saying why — which is exactly the state a live session hit (2026-08-09). Surface it instead.
+    const delRes = await supabase.from("api_keys").delete().eq("user_id", user.id);
+    if (delRes.error) return { ok: false, error: `Could not rotate the old reporting key: ${delRes.error.message}` };
+    const insRes = await supabase.from("api_keys").insert({ user_id: user.id, key_hash: hashApiKey(key), label: "extension" });
+    if (insRes.error) return { ok: false, error: `Could not store the reporting key: ${insRes.error.message}` };
     return {
       ok: true,
       session: {

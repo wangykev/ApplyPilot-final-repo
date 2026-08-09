@@ -27,7 +27,8 @@ const atsLib = (typeof module !== "undefined" && module.exports)
   ? require("./lib.js")
   : { normalize: normalize, matchCandidates: matchCandidates, normalizeLabel: normalizeLabel,
       ensureHttps: ensureHttps, canonicalJobUrl: canonicalJobUrl, isAiPlaceholder: isAiPlaceholder,
-      AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV };
+      AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV,
+      isSignatureDateQuestion: isSignatureDateQuestion };
 const atsFd = (typeof module !== "undefined" && module.exports)
   ? require("./fill-driver.js")
   : { resolve: resolve, buildReviewBundle: buildReviewBundle, buildBucketIndex: buildBucketIndex,
@@ -273,9 +274,38 @@ function atsRouteLabel(label, f, profile, defaults) {
   // Location questions on a combobox widget (Ashby's "Where are you currently located?"
   // has NO field identity at all — the label is the only durable key). kind:"location"
   // routes the driver to the type-then-scoped-read combobox flow.
-  if (/where are you (currently )?(located|based)|current location|^location( \(city\))?$|city of residence/i.test(L)) {
+  if (ATS_LOCATION_LABEL_RE.test(L)) {
     const v = atsComposeValue("city_state", profile);
-    if (v) return { kind: "location", value: v, source: "map", path: "(city+state)" };
+    // TIERED, most specific first — because "where are you based?" is NOT always a places
+    // autocomplete. GitLab renders it as a three-option pick-one ("1. United States of America" /
+    // "2. Canada" / "3. Located Elsewhere"), where a city+state string can never match and the
+    // COUNTRY is the answer (live 2026-08-05: a REQUIRED field left empty while the profile held
+    // the exact country). The city is still tried first, so a real places widget is unaffected.
+    // country may itself be a TIERED LIST (the profile stores ladders as arrays, e.g.
+    // ["United States of America", "United States"]) — flatten it into candidates rather than
+    // handing an array to the match ladder, which normalizes strings and throws on anything else
+    // (live 2026-08-05: `s.toLowerCase is not a function` killed the field mid-fill).
+    const rawCountry = profile && profile.personal_info ? profile.personal_info.country : null;
+    const country = (Array.isArray(rawCountry) ? rawCountry : [rawCountry])
+      .filter((x) => typeof x === "string" && x.trim());
+    // `candidates` (not `value`) is how this router hands over a TIERED list — a bare array in
+    // `value` gets String()'d into one comma-joined string. `value` stays the city, which is what
+    // a real places box should be typed with.
+    const cands = [v].concat(country).filter(Boolean);
+    if (cands.length) return { kind: "location", value: cands[0], candidates: cands, source: "map", path: "(city+state)" };
+  }
+
+  // A SIGNATURE / COMPLETION DATE IS TODAY — never an AI guess. Live 2026-08-05 on Lever's EEO block:
+  // `eeo[disabilitySignatureDate]` fell through to the AI free-text path, which answered "As soon as
+  // possible" (an availability answer on a date field) after a 19.2s LLM call — the slowest field of
+  // the run. The applicant is completing the form now, so the answer is deterministic. Same recognizer
+  // the Workday path uses, and it is deliberately narrow: any label naming a DIFFERENT event (start,
+  // birth, graduation, expiry…) is refused rather than stamped with today.
+  if (atsLib.isSignatureDateQuestion(label)) {
+    const d = new Date();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return { value: `${mm}/${dd}/${d.getFullYear()}`, source: "signature-date", path: "(today)" };
   }
 
   // Compensation + availability (STATED only — an empty profile value falls through to AI/blank).
@@ -292,7 +322,17 @@ function atsRouteLabel(label, f, profile, defaults) {
   }
 
   // How-did-you-hear — the same ladder the Workday source picker uses.
-  if (/how did you (hear|find)|how'd you hear|where did you (hear|find)/i.test(L)) {
+  // ONE ADVERB IS ALLOWED IN THE MIDDLE (2026-08-07). Roblox asks "How did you FIRST hear about this
+  // role?" and the old wording missed it, so a REQUIRED question the profile answers exactly went to
+  // the AI, which answered "LinkedIn" — the right value, arrived at the expensive way, flagged
+  // ai-choice, and parked in review for a human to re-confirm something the profile already said.
+  // Same class as the boolean-ladder leak: a deterministic answer that the label match let slip.
+  // "how did you <word> hear/find" is idiomatic only for this question, so a single wildcard word is
+  // safe and generalizes past guessing at first/originally/initially one at a time.
+  // …and the verb must be followed by what the question is ABOUT. The old wording ended at the verb,
+  // so "How did you find working with your last team?" routed here too — it would have answered an
+  // interview question with "LinkedIn". Every real wording continues with about / of / this / us / our.
+  if (/(?:how|where)(?: did| do|'d) you (?:\w+ )?(?:hear|find)\s+(?:out\s+)?(?:about|of|this|us|our)\b/i.test(L)) {
     const hdyh = (profile && profile.how_did_you_hear) || (defaults && defaults.how_did_you_hear);
     if (hdyh && Array.isArray(hdyh.preferred) && hdyh.preferred.length) return { candidates: [...hdyh.preferred], source: "map", path: "how_did_you_hear.preferred", detail: "how_did_you_hear.preferred" };
   }
@@ -354,7 +394,16 @@ function atsInjScan(ats) {
     // React-select combobox inputs (role=combobox) — includes EEOC + question_* selects.
     // The phone dial-code "country" and the intl-tel-input search box are recognized here too.
     for (const el of form.querySelectorAll("input, textarea")) {
-      if (el.type === "hidden" || !vis(el.closest("div") || el)) continue;
+      // ⚠ RADIO AND CHECKBOX BELONG TO THE GROUPING PASS BELOW, not here (2026-08-07). This loop
+      // skipped only `hidden`, so every box in a Greenhouse group was pushed TWICE: once here as a
+      // required "text" field keyed on the box's own id, and again below as the real checkbox_group.
+      // Live on Gusto's "How did you hear about this opportunity? (select all that apply)" — 12
+      // boxes — each phantom text field was REQUIRED, so each one bought its own LLM call, which
+      // answered "N/A" with no basis, and 12 of that form's 21 review items were this one question.
+      // Worse than noise: atsInjSetText on a checkbox writes its .value, which is the string that
+      // would be SUBMITTED for that option. The Lever and Ashby branches have always skipped both.
+      if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox") continue;
+      if (!vis(el.closest("div") || el)) continue;
       const id = el.id || "";
       if (!id || /^iti-|^g-recaptcha|^react-select/.test(id)) continue;
       if (/requiredInput/.test(String(el.className || ""))) continue; // the react-select native-validation mirror
@@ -610,16 +659,28 @@ function atsInjReadOptions(inputSel) {
   // react-select-<name>-option-N; aria-controls / aria-owns carries the id when open.
   const listboxId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
   let scope = listboxId ? document.getElementById(listboxId) : null;
-  if (!scope) {
-    const container = el.closest(".select__container") || el.closest(".ashby-application-form-field-entry") || document;
-    scope = container.querySelector('.select__menu, [role="listbox"]') || null;
-  }
-  if (!scope) return { ok: true, open: false, options: [] };
+  const shell = el.closest(".select__container") || el.closest(".select") || el.closest(".ashby-application-form-field-entry") || el.parentElement;
+  if (!scope) scope = (shell || document).querySelector('.select__menu, [role="listbox"]') || null;
+  // LOADING is the ONLY thing that separates "the list has no such option" from "the list has
+  // not answered yet" — and a server-backed menu ANNOUNCES "No options" while its own search is
+  // still pending, so an empty read is not an answer. Traced live 2026-08-04 on Discord's
+  // school picker (a hidden tab), from the instant the query was typed:
+  //     t=4ms    0 options, "No options"      ← what a 2s poll used to believe
+  //     t=24ms   0 options, "Loading..."      ← the loading indicator appears
+  //     t=4049ms 1 option,  "Swarthmore College"
+  // react-select renders .select__loading-indicator / a "Loading..." menu message while its
+  // async loadOptions runs; aria-busy covers the same idea on other widgets.
+  const loading = !!(
+    (shell && shell.querySelector('[class*="loading"]')) ||
+    el.getAttribute("aria-busy") === "true" ||
+    (scope && /^\s*loading\b/i.test((scope.textContent || "").replace(/\s+/g, " ")))
+  );
+  if (!scope) return { ok: true, open: false, options: [], loading };
   const opts = [...scope.querySelectorAll('[role="option"], .select__option')].map((o) => ({
     text: (o.textContent || "").replace(/\s+/g, " ").trim(),
     disabled: o.getAttribute("aria-disabled") === "true",
   })).filter((o) => o.text);
-  return { ok: true, open: true, options: opts };
+  return { ok: true, open: true, options: opts, loading };
 }
 
 // Type into an open combobox's input (native setter + input) — react-select filters live.
@@ -769,6 +830,77 @@ function atsInjLeverLocCommit(name, id) {
   return { ok: true, v: el.value, selected: !!hid.value };
 }
 
+// WHY THE ATTACH LOOKED SLOW (2026-08-05): the confirmation poll read `input.files[0].name`, and these
+// ATSs CLEAR the input once their upload XHR completes — the same lesson Workday's attach learned as
+// "success is the confirmation ROW, not the input". So on Coinbase the poll ran its FULL 15s ceiling,
+// returned `verified:false`, and charged the run 15.2s for an upload the operator sees land instantly.
+// Read both: the input while it still holds the file, and the FILENAME the form renders near the field
+// once the upload is done. Error text is reported, never fatal on its own — Workday's role="alert" is a
+// STATUS channel ("… loading"), and a false "upload failed" is worse than a slow one (2026-07-29).
+function atsInjReadFileState(inputSel, wantName) {
+  const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+  // Does the page SHOW the file we attached? Matched on the filename's stem, because a widget may
+  // render it truncated or re-quoted. >=4 chars so a short stem cannot match by coincidence.
+  const stem = String(wantName || "").replace(/\.[a-z0-9]+$/i, "").trim().toLowerCase();
+  const shownOnPage = () => {
+    if (stem.length < 4) return null;
+    const body = txt(document.body).toLowerCase();
+    return body.includes(stem) ? String(wantName) : null;
+  };
+  const el = document.querySelector(inputSel);
+  if (!el) {
+    // ⚠ AN ABSENT INPUT IS NOT A FAILURE. Greenhouse REPLACES the <input type=file> with its
+    // attachment row once the upload completes, so the element we were polling is GONE — and the
+    // poll spent its whole 15s ceiling on `not-found:#resume` while the résumé sat attached on the
+    // form (live 2026-08-05, GitLab + Coinbase; by hand the attach is instant). The filename
+    // rendered on the page is the confirmation.
+    const shown = shownOnPage();
+    return { ok: true, inputGone: true, fromInput: null, rendered: shown, error: null, progress: null };
+  }
+  const fromInput = (el.files && el.files[0] && el.files[0].name) || null;
+  // widen a few levels: the confirmation row is a sibling of the input's immediate wrapper
+  let scope = el.parentElement;
+  for (let i = 0; i < 3 && scope && scope.parentElement; i++) scope = scope.parentElement;
+  const body = txt(scope);
+  const m = /[\w()\-.,' ]+\.(pdf|docx?|rtf|txt)/i.exec(body);
+  const rendered = (m ? m[0].trim() : null) || shownOnPage();
+  const alerts = scope ? [...scope.querySelectorAll('[role="alert"],[class*="error"]')].map(txt).filter(Boolean) : [];
+  const bad = alerts.find((t) => /(error|failed|unsupported|too large|invalid|not allowed|try again)/i.test(t)) || null;
+  const progress = alerts.find((t) => /(loading|uploading|in progress|processing|\d+%)/i.test(t)) || null;
+  return { ok: true, inputGone: false, fromInput, rendered, error: bad, progress };
+}
+
+
+// Greenhouse's location box is backed by google.maps places. In this browser that library never loads
+// — a HUMAN gets no suggestions either (2026-07-31) — and the fill still paid the full places budget
+// on every such form: 10.6s on Coinbase, for a service that cannot answer. Ask the page whether the
+// library is even there before waiting on it. Absent ⇒ go straight to the honest typed-unverified
+// path; present ⇒ wait exactly as before, because then the suggestions really are coming.
+function atsInjPlacesReady() {
+  try {
+    const g = window.google;
+    const has = !!(g && g.maps && g.maps.places);
+    return { ok: true, places: has };
+  } catch (e) { return { ok: true, places: false }; }
+}
+
+// Bring the field being filled into view. On a VISIBLE run the operator is watching, and a fill that
+// jumps around off-screen is impossible to follow or to trust (operator, 2026-08-06). It also gives a
+// hidden tab a reason to lay the element out, which is what the coordinate paths need — trustedFocus
+// already scrolls for exactly that reason, so this brings the ordinary path in line.
+// `block:"center"` rather than the default, so the field is not left tucked under a sticky header.
+function atsInjScrollIntoView(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, error: "not-found:" + sel };
+  try {
+    const target = el.closest("label, fieldset, .select__container, div") || el;
+    target.scrollIntoView({ block: "center", inline: "nearest" });
+  } catch (e) {
+    try { el.scrollIntoView(); } catch (e2) { return { ok: false, error: String((e2 && e2.message) || e2) }; }
+  }
+  return { ok: true };
+}
+
 // Attach the resume: rebuild the File page-side (strings only across the boundary — the
 // attachResume lesson), set input.files via DataTransfer, dispatch change.
 function atsInjAttachFile(inputSel, base64, filename, mime) {
@@ -860,24 +992,159 @@ function atsNearOptions(texts, query, limit) {
   return scored.slice(0, limit || 20).map((x) => x.t);
 }
 
+// Poll budgets for the combobox family, in ms: a SOFT deadline plus a hard CEILING that is only
+// ever reached by a widget still reporting `loading` when the soft deadline passes (see
+// atsInjReadOptions). A healthy widget exits on its first read and pays neither. `search` is
+// sized from the live measurement that earned this: Discord's school list answered at 4049ms on
+// a hidden tab, so the old flat 2000ms could not have worked no matter how it retried.
+const ATS_POLL = {
+  // The first render after opening. The soft deadline only applies once the menu has actually
+  // SETTLED (see pollFor): an empty read while the menu node isn't even mounted is not an answer,
+  // any more than a half-mounted Workday page is. This matters beyond speed — an empty first read
+  // is what decides whether a location-routed field is a places box or a pick-one (live
+  // 2026-08-05: a REQUIRED 3-option question was read as empty at 1.8s, treated as a places
+  // lookup, and left unanswered while its own widget was about to show the answer).
+  open: 1800, openCeil: 6000,
+  retry: 1500, retryCeil: 4000,     // after a forced re-open
+  // A typed by-name query. The ceiling is paid ONLY while the widget still reports loading, so
+  // it is not a flat cost — and it has to be generous because the list behind it is a slow,
+  // highly variable third-party service: measured on ONE session, Greenhouse's school endpoint
+  // answered a fresh query in 390ms, 4049ms, 4459ms and then >12s (a direct fetch of the same
+  // query: HTTP 200 in 2971ms, no rate limiting). An 8s ceiling missed the bad end of that
+  // spread, which is a REQUIRED field going unanswered — much more expensive than the wait.
+  // A healthy search answers in ~1.3s (measured on Discord: "Loading..." → result, and
+  // "Loading..." → "No options" for a genuine miss). A widget still loading after this is the
+  // dead-form state, and the remedy is the page refresh the run now performs — so waiting longer only
+  // delays the fix. Was 20000, which cost ~20s per silent widget before the reload could help.
+  search: 2000, searchCeil: 6000,
+  restore: 1200, restoreCeil: 3000, // clearing the query to report real options
+  showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
+  loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
+  fieldMaxMs: 20000,                // TOTAL option-polling allowance for ONE field (see pollFor)
+  mountGrace: 1200,                 // extra wait for a menu that has NEVER mounted (see pollFor)
+  responsiveReadMs: 400,            // fallback signal when the quiet watch is unavailable (see pollFor)
+  busyIdleMs: 300,                  // DOM mutated this recently ⇒ the page is still reacting, keep waiting
+};
+// A location question whose widget already shows this few options is a pick-one, not a places
+// autocomplete (see the location branch in atsActuateField).
+// A location QUESTION, by wording. Shared, because the bucket rung has to ask it too: a taught
+// bucket answers before the label ladder runs, so a location field whose value came from a bucket used
+// to be matched as an ordinary dropdown — and "Pittsburgh, PA" cannot match the suggestion
+// "Pittsburgh, Pennsylvania, United States" under the strict ladder, even though the widget offered it
+// (live 2026-08-06, Ashby/Cohere: five real suggestions, no hit, 17.5s spent).
+const ATS_LOCATION_LABEL_RE = /where are you (currently )?(located|based)|current location|^location( \(city\))?$|city of residence/i;
+
+// A US STATE HAS TWO SPELLINGS AND A PLACES SERVICE KNOWS ONLY ONE (2026-08-07). Live on Ashby, the
+// same profile on two forms an hour apart: "Pittsburgh, Pennsylvania," HIT in 2.2s and committed,
+// while "Pittsburgh, PA" returned nothing for 17.5s and reached review as "the form's places service
+// didn't respond" — which is not what happened. The service answered fine; it had never heard of that
+// spelling. The profile stores whichever spelling the operator typed and a bucket can supply its own,
+// so neither can be canonical.
+//
+// So a places box is searched with the CITY ALONE, which every spelling agrees on. That is a looser
+// QUERY, and the comment on the search loop already notes a looser query never loosens the answer —
+// but only because the PICK stays strict, and picking "the first row containing the city" is not
+// strict when the city is Pittsburgh (PA, CA, TX) or Springfield. Filing against the wrong state at
+// the exact-normalized tier is precisely the silent-wrong-value failure this ladder exists to
+// prevent. Hence: prefer the row that also agrees on the STATE, in EITHER spelling; if we hold a
+// state and no row agrees, still answer, but at the flagged tier so a human sees it. Mirrors the
+// Lever location path, which has resolved city+state through REGION_ABBREV since 2026-08-02.
+// A DEAD POSTING IS NOT A BROKEN PIPELINE (2026-08-07). Two runs in a row halted
+// "form-not-rendered ... open the tab and check", which sends the operator to debug the fill on a job
+// that simply no longer exists. Both said so plainly before we ever looked for a form: Lever answers
+// a removed posting with the title "Not found", and Greenhouse REDIRECTS to the company's board index
+// ("Current openings at Twilio"), dropping the job id from the URL on the way.
+//
+// The URL check is the general one and the title checks corroborate it — a posting we asked for by id
+// that we are no longer standing on is gone, whatever the page says. Returns a REASON to quote back,
+// or null when there is no evidence, because "I could not drive this form" and "this job is closed"
+// are different problems with different next steps.
+function atsPostingGone(jd, requestedUrl, landedUrl) {
+  const title = String((jd && jd.title) || "").trim();
+  if (/^(not found|404|page not found|job not found)$/i.test(title)) return 'the posting page reports "' + title + '"';
+  if (/^current openings at/i.test(title)) return 'it redirected to the board index ("' + title + '")';
+  const idOf = (u) => {
+    const t = String(u || "");
+    const m = /\/jobs?\/(\d{4,})/.exec(t) ||
+      /\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i.exec(t);
+    return m ? m[1].toLowerCase() : null;
+  };
+  const want = idOf(requestedUrl);
+  if (want && landedUrl && !String(landedUrl).toLowerCase().includes(want)) {
+    return "the posting id " + want + " is no longer in the URL we landed on";
+  }
+  return null;
+}
+
+function atsPlacePick(candidate, texts) {
+  const c = String(candidate == null ? "" : candidate);
+  const city = c.split(",")[0].trim().toLowerCase();
+  if (!city) return null;
+  const rows = (texts || []).map((t, i) => ({ t: String(t == null ? "" : t), i }))
+    .filter((r) => r.t.toLowerCase().includes(city));
+  if (!rows.length) return null;
+  const tierOf = (r) => (r.t.toLowerCase().startsWith(city) ? "exact-normalized" : "containment");
+
+  const abbrevOf = atsLib.REGION_ABBREV || {};                     // "pennsylvania" → "pa"
+  const nameOf = Object.create(null);
+  for (const k of Object.keys(abbrevOf)) nameOf[abbrevOf[k]] = k;  // "pa" → "pennsylvania"
+  const state = (c.split(",")[1] || "").trim().toLowerCase();
+  // whatever the profile gave us, plus its other spelling — deduped, empties dropped
+  const forms = [...new Set([state, abbrevOf[state], nameOf[state]].filter(Boolean))];
+  if (!forms.length) return { index: rows[0].i, tier: tierOf(rows[0]) };   // no state to check against
+
+  const agrees = (t) => forms.some((s) => (s.length === 2
+    ? new RegExp(",\\s*" + s + "\\b", "i").test(t)   // an abbrev must sit in its own segment
+    : t.toLowerCase().includes(s)));
+  const withState = rows.find((r) => agrees(r.t));
+  if (withState) return { index: withState.i, tier: tierOf(withState) };
+  // the city is offered, but never in the state we hold — a DIFFERENT place of the same name.
+  return { index: rows[0].i, tier: "containment", stateMismatch: true };
+}
+const ATS_LOC_PICKONE_MAX = 12;
 const ATS_OPTION_CAP = 60;
-function atsAttachOptions(rec, texts) {
+// `partial` FORCES the partial treatment for a list we have already narrowed. Live 2026-08-04: a
+// 100-option page read was narrowed to its 20 near-matches, which then looked like a COMPLETE
+// short list — so review offered the operator a pick-one <select> of 20 schools that did not
+// include theirs, with no way to type the real one. Narrowing must never launder a paged list into
+// a complete one; the caller knows which it is.
+// Is what we read the WHOLE option set? A short, settled, non-loading list is complete: everything the
+// widget has is on screen, so a no-match is a real answer and typing could only filter it away. A
+// page-sized read (>= the cap) is a paged/server-backed list, where searching by name is the only way
+// to reach an option that was never rendered.
+function atsListIsComplete(read) {
+  const opts = ((read && read.options) || []).filter((o) => !o.disabled);
+  return opts.length > 0 && opts.length < ATS_OPTION_CAP && !(read && read.loading);
+}
+
+// PARTIAL IS ABOUT PROVENANCE, NOT LENGTH (2026-08-07). This used to call any list of >= 60 partial,
+// which is the wrong test and threw away options we had already read: traced live on Discord, the
+// dial `country` menu holds all **244** entries in the DOM (…"Zimbabwe+263") and `discipline--0` all
+// **72**, unchanged after scrolling to the bottom — react-select renders every option and CSS-clips
+// it. We stored 60 of them and printed "not the full list", so review offered a truncated picker for
+// a field whose whole list was in hand. (Checked while confirming the ATS path needs no scroll
+// accumulator at all — unlike Workday's virtualized picker. Full survey: dom-patterns 2026-08-07.)
+//
+// The true rule: a list read on OPEN — nothing typed, not loading — IS the complete list, however
+// long. A list that only exists because we typed a query is a filtered view of it, and a
+// server-backed page (the 3300-school picker serving 100 at a time) is genuinely one page. Callers
+// pass that provenance; `undefined` means "read unfiltered", which is the common case.
+const ATS_OPTION_STORE_MAX = 400; // a complete list longer than this is stored truncated, and SAYS so
+function atsAttachOptions(rec, texts, partial) {
   const list = (texts || []).filter(Boolean);
   if (!list.length) return;
-  // >= not >: a virtualized widget commonly returns EXACTLY one page (live: 60 of ~2000
-  // schools), so an equality read is the partial case, not a complete list that happens to fit.
   // ALWAYS set both: a later call refines an earlier one (the raw list first, then the
   // neighbourhood of what we wanted), and a leftover from the first call would show the
   // operator a STALE option set in review.
-  if (list.length >= ATS_OPTION_CAP) {
-    rec.captured_options = list.slice(0, ATS_OPTION_CAP);
+  if (partial === true || list.length > ATS_OPTION_STORE_MAX) {
+    rec.captured_options = list.slice(0, ATS_OPTION_STORE_MAX);
     rec.options = null;
-    rec.widgetType = "typeahead"; // review-rendering only; replay/audit read the LIVE widget
+    rec.widgetType = "typeahead"; // review renders a filter-or-type editor + an honest partial note
     rec.optionsPartial = true;
-  } else {
-    rec.options = list;
-    rec.captured_options = null;
+    return;
   }
+  rec.options = list;
+  rec.captured_options = null;
 }
 
 const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_type vocabulary
@@ -910,6 +1177,16 @@ async function atsReadBackSettled(act, ats, inputSel, widgetType, ms) {
 }
 
 function atsDialStrip(optText) { return String(optText || "").replace(/\s*\+\d[\d\s-]*$/, "").trim(); }
+
+// A NUMBERED option ("1. United States of America") carries display scaffolding, not a different
+// answer — and the numbering defeats every tier we have: exact fails, containment is deliberately
+// OFF for dropdowns (picking a substring match is a guess), and fuzzy lands at 88.9% against the
+// 90 bar. Live 2026-08-05, GitLab "Where are you currently based?*": the profile holds exactly
+// "United States of America" and the REQUIRED field was left empty. Stripped for MATCHING only —
+// the commit still clicks the option's real text, so the form gets what it rendered. Narrow on
+// purpose: 1–2 digits then a dot or paren then whitespace, so "1 - 3 years" and "401(k)" are
+// untouched (neither has the separator+space shape).
+function atsEnumStrip(optText) { return String(optText || "").replace(/^\s*\d{1,2}\s*[.)]\s+/, "").trim(); }
 
 // A dial composite's options read "<Country> +<code>", but the profile stores the phone country
 // as a LONG-FORM name with the code in parentheses — "United States of America (+1)". Stripping
@@ -1159,12 +1436,85 @@ function atsPickApplyLink(links, isAts) {
   return null;
 }
 
+// A STATED demographic and the form's option can be the same answer in different words: the profile
+// holds "I am not a protected veteran" (the Workday/Greenhouse wording) while Lever's diversity survey
+// offers "I am not a U.S. veteran". Neither contains the other and fuzzy scores ~63%, so nothing
+// matched and a stated answer reached review (live 2026-08-06, gopuff).
+//
+// Bridge on the SELF-ASSERTION, exactly like the Yes/No polarity bridge and with the same guard: the
+// candidate must lead with a first-person assertion, the option must lead with the SAME polarity, and
+// exactly ONE option may qualify — 2+ refuse rather than guess a demographic. Positive never matches a
+// negative ("I identify as a veteran" cannot answer "I am not a veteran"). Flagged like any non-exact
+// tier, and only ever reached for a value the operator STATED (allowContainment), never an AI guess.
+const ATS_NEG_LEAD_RE = /^\s*i\s+(?:am|do|have)\s+not\b/i;
+const ATS_POS_LEAD_RE = /^\s*i\s+(?:am|do|have|identify)\b/i;
+function atsAssertionLead(candidate, texts) {
+  const c = String(candidate == null ? "" : candidate);
+  const neg = ATS_NEG_LEAD_RE.test(c);
+  const pos = !neg && ATS_POS_LEAD_RE.test(c);
+  if (!neg && !pos) return null;
+  const list = (texts || []).map((t) => String(t == null ? "" : t));
+  const hits = neg
+    ? list.filter((t) => ATS_NEG_LEAD_RE.test(t))
+    : list.filter((t) => ATS_POS_LEAD_RE.test(t) && !ATS_NEG_LEAD_RE.test(t));
+  return hits.length === 1 ? hits[0] : null;   // ambiguous ⇒ refuse
+}
+
+// DEGREE LEVEL is a small closed vocabulary, and forms model it at a different granularity than a
+// person states it: the profile says "Bachelor of Science" (and its ladder "Bachelors",
+// "Bachelor of Science (BS)"), while Discord's list offers "Bachelor's Degree". The apostrophe and the
+// "Degree" suffix put that out of reach of exact, of containment (off for dropdowns by design) and of
+// fuzzy (~56%), so a reconned 10-option list produced no match at all (live 2026-08-06).
+//
+// Match on the LEVEL both sides name, with the usual guard: exactly ONE option may carry that level —
+// a form listing "Bachelor of Science" AND "Bachelor of Arts" is a real choice and must reach the
+// human. Ordered most-specific first so a doctorate is never read as something else.
+const ATS_DEGREE_LEVELS = [
+  // ⚠ PROFESSIONAL DOCTORATES ARE SEPARATE LEVELS, not one "doctorate" bucket. A first cut collapsed
+  // them, so a PhD candidate matched "Doctor of Medicine (M.D.)" — the only doctorate on the list, so
+  // the exactly-one guard cheerfully committed a credential the applicant does not hold. Caught in
+  // testing, and it is the worst failure class this project has: a confident wrong value.
+  // Most-specific first, so "Doctor of Medicine" reads as md rather than a generic doctorate.
+  ["md", /\b(m\.?\s?d\.?|doctor of medicine)\b/i],
+  ["jd", /\b(j\.?\s?d\.?|juris doctor)\b/i],
+  ["edd", /\b(ed\.?\s?d\.?|doctor of education)\b/i],
+  ["phd", /\b(ph\.?\s?d|d\.?phil|doctor of philosophy|doctorate|doctoral)\b/i],
+  ["master", /\b(master|masters|m\.?\s?s\.?|m\.?\s?a\.?|m\.?b\.?a|m\.?eng|m\.?phil)\b/i],
+  ["bachelor", /\b(bachelor|bachelors|b\.?\s?s\.?|b\.?\s?a\.?|b\.?eng|b\.?tech|undergraduate)\b/i],
+  ["associate", /\b(associate|associates|a\.?\s?a\.?|a\.?\s?s\.?)\b/i],
+  ["high-school", /\b(high\s?school|secondary|ged)\b/i],
+];
+function atsDegreeLevel(text) {
+  const t = String(text == null ? "" : text).replace(/[\u2018\u2019']/g, "");
+  for (const [level, re] of ATS_DEGREE_LEVELS) if (re.test(t)) return level;
+  return null;
+}
+function atsDegreeMatch(candidates, options) {
+  const wanted = (candidates || []).map(atsDegreeLevel).find(Boolean);
+  if (!wanted) return null;
+  const hits = (options || []).filter((o) => atsDegreeLevel(o) === wanted);
+  return hits.length === 1 ? hits[0] : null;   // 2+ of the same level is a real choice — ask the human
+}
+
 // Is this label a demographic question? ORTHOGONAL to routing (2026-07-31, Zoox): a BUCKET
 // can route an EEO field before the label ladder's EEO rung runs, and the bucket carries no
 // containment — so "Asian" missed Zoox's "Asian (Not Hispanic or Latino)" even though the
 // stated-EEO relief exists. The relief keys off the LABEL, whatever tier produced the value.
 function atsIsEeoLabel(label) {
-  return /hispanic|latino|race|ethnicit|veteran|disabilit|gender|\bsex\b/i.test(String(label || ""));
+  // Widened 2026-08-06 to the wordings live boards actually use: Reddit asks about "military service"
+  // and about being transgender; gopuff's diversity survey asks pronouns, LGBTQ+ and an age RANGE.
+  // Every one is a protected-characteristic question, so an AI answer to any of them must carry the
+  // loud demographic badge — an ordinary "AI" badge under-warns on a field where a wrong answer is a
+  // legal misstatement. Deliberately NOT bare "age": an "are you over 18" question is a different,
+  // non-protected thing that legallyLoaded already covers.
+  // …and widened again 2026-08-07: a question can ask a protected characteristic WITHOUT naming the
+  // dimension. Chime words its gender question "I identify as:" — no "gender", no "sex" — so it read
+  // as an ordinary question, and an AI-guessed protected characteristic wore the ordinary `ai-choice`
+  // badge while the field right below it ("I identify my sexual orientation as:") got the loud one.
+  // The self-identification FRAME is the signal there. Over-flagging is the safe direction: the cost
+  // of a false positive is a louder badge on a question that did not need one.
+  return /hispanic|latino|race|ethnicit|veteran|military service|disabilit|gender|\bsex\b|sexual orientation|transgender|lgbt|pronoun|age range/i.test(String(label || "")) ||
+    /\bi identify (?:as|my)\b|how do you identify\b/i.test(String(label || ""));
 }
 
 async function atsAiChooseOption(act, f, options, profile, jobContext) {
@@ -1233,10 +1583,16 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
     if (b) {
       if (b.profile_path) {
         const raw = String(b.profile_path).split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
-        if (raw !== undefined && raw !== null && String(raw).trim() !== "") return { raw, path: b.profile_path, source: "bucket" };
+        if (raw !== undefined && raw !== null && String(raw).trim() !== "") {
+          // KEEP THE WIDGET SEMANTICS even though the VALUE came from a bucket: a location box wants
+          // the city typed and its suggestions matched by city, not an exact-string pick from a list
+          // it builds per keystroke.
+          const kind = ATS_LOCATION_LABEL_RE.test(String(f.label || "")) ? "location" : undefined;
+          return { raw, path: b.profile_path, source: "bucket", kind };
+        }
       }
       const vals = Array.isArray(b.value) ? b.value.filter((x) => typeof x === "string" && x.trim()) : (typeof b.value === "string" && b.value.trim() ? [b.value] : []);
-      if (vals.length) return { candidates: vals, source: "bucket" };
+      if (vals.length) return { candidates: vals, source: "bucket", kind: ATS_LOCATION_LABEL_RE.test(String(f.label || "")) ? "location" : undefined };
     }
   }
   const routed = atsRouteLabel(f.label, f, profile, defaults);
@@ -1288,7 +1644,70 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
 }
 
 // The per-field fill loop — extracted so the cascade pass runs the IDENTICAL ladder.
+// AI free-text answers are the DOMINANT cost on a form full of custom questions, and the cost is
+// serialization rather than any single slow call. Measured live 2026-08-05 on Shield AI (Lever): 7
+// calls of 1630/3241/3005/3098/5215/5227/4799ms = 26.2s of a 32.6s fill — 80%. Compare Ashby's 2
+// calls (1.4s, 7%): same code, different question count.
+//
+// The DECISION for a free-text field needs the label, the profile and the JD — no DOM at all — so
+// those calls can run CONCURRENTLY before the loop touches the page, and the loop then actuates with
+// answers already in hand. CHOICE fields are deliberately NOT prefetched: their prompt must carry the
+// widget's LIVE options, which means opening it first.
+//
+// Bounded concurrency, because a burst of N is how a free-tier key earns a 429 (which would be slower
+// than serial, not faster). Every safety property is untouched: the same answer goes through the same
+// commit + read-back + ALWAYS-flagged path; only the moment the call is issued changes. A prefetch
+// miss simply leaves the loop to make its own call.
+const ATS_AI_PREFETCH_CONCURRENCY = 4;
+// CHOICE questions can be prefetched too — when their options are already known WITHOUT touching the
+// page. Radio / yes-no / checkbox-group options come from the SCAN (only a combobox has to be opened
+// to be read), so their decisions need no DOM either. That is exactly the shape that dominated the
+// Lever measurement: all 7 slow calls were `cards[…]` RADIOS, and each waited for the one before it.
+// A combobox is deliberately left serial — its prompt must carry the widget's LIVE options.
+const ATS_PREFETCH_CHOICE_WIDGETS = ["radio", "yesno", "checkbox_group"];
+function atsPrefetchKind(f) {
+  if (!f) return null;
+  if (f.widgetType === "text" || f.widgetType === "textarea") return "text";
+  if (ATS_PREFETCH_CHOICE_WIDGETS.includes(f.widgetType) && (f.options || []).length) return "choice";
+  return null;
+}
+async function atsPrefetchAiText(act, ats, fields, profile, defaults, jc, bucketIndex) {
+  const out = new Map();
+  if (!act || !act.aiEnabled || !Array.isArray(fields)) return out;
+  const eligible = fields.filter((f) => {
+    if (!f || !f.isRequired) return false;
+    if (!atsPrefetchKind(f)) return false;
+    if (f.value != null && String(f.value).trim() !== "") return false; // already answered on the form
+    let route = null;
+    try { route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex); } catch (e) { return false; }
+    if (!route) return true;                       // nothing deterministic → the loop will ask the AI
+    if (route.kind) return false;                  // resume/skip/dial/location/employment — not AI text
+    const hasValue = route.value != null || route.raw !== undefined || (route.candidates && route.candidates.length);
+    return !hasValue;
+  });
+  if (!eligible.length) return out;
+  const kinds = eligible.reduce((m, f) => { const k = atsPrefetchKind(f); m[k] = (m[k] || 0) + 1; return m; }, {});
+  try { console.log(`[ApplyPilot][ATS-FILL] prefetching ${eligible.length} AI answer(s) concurrently (${ATS_AI_PREFETCH_CONCURRENCY} at a time) — ${kinds.text || 0} text, ${kinds.choice || 0} choice`); } catch (e) { /* log only */ }
+  let i = 0;
+  const worker = async () => {
+    for (;;) {
+      const f = eligible[i++];
+      if (!f) return;
+      try {
+        const ai = atsPrefetchKind(f) === "choice"
+          ? await atsAiChooseOption(act, f, f.options || [], profile, jc)
+          : await atsAiWriteText(act, f, profile, jc);
+        if (ai) out.set(f.fieldName, ai);
+      } catch (e) { /* the loop falls back to its own call */ }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(ATS_AI_PREFETCH_CONCURRENCY, eligible.length) }, worker));
+  return out;
+}
+
 async function atsFillFields(act, ats, scan, fields, results, profile, defaults, jc, bucketIndex, o) {
+  // fire the free-text AI calls now, concurrently, while the page is untouched (see atsPrefetchAiText)
+  const aiPre = o && o.valueFor ? new Map() : await atsPrefetchAiText(act, ats, fields, profile, defaults, jc, bucketIndex);
   for (const f of fields) {
     const rec = {
       fieldName: f.fieldName, label: f.label, widgetType: ATS_REVIEW_WIDGET[f.widgetType] || f.widgetType,
@@ -1296,14 +1715,56 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
     };
     const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
+    // show the operator what we are filling (see atsInjScrollIntoView) — best effort, never fatal
+    try { await act.eval(atsInjScrollIntoView, f.inputSel); } catch (e) { /* a field we cannot scroll to still fills */ }
+    // Per-field wall clock, so [ATS-TIME] can name what a slow fill actually spent its time on
+    // (the Workday [CDP-TIME] habit). A record is finalized at several `continue`s below, so the
+    // stamp is applied by `fin()` rather than at one exit.
+    const fieldT0 = Date.now();
+    const fin = () => {
+      rec.elapsedMs = Date.now() - fieldT0;
+      // LOG HERE, not at the end of the loop: several branches `continue` before that point, so the
+      // résumé attach — the single most variable field — produced no line at all and its cost could
+      // only be inferred from the [ATS-TIME] slowest list (which ignores anything under 1.5s).
+      try {
+        console.log(`[ApplyPilot][ATS-FILL] ${rec.fieldName} (${rec.widgetType}${rec.isRequired ? ", req" : ""}) → ${rec.status}${rec.matchTier ? " · " + rec.matchTier : ""}${rec.flag ? " · " + rec.flag : ""}${rec.after != null ? " · after=" + JSON.stringify(String(rec.after).slice(0, 60)) : ""} · ${rec.elapsedMs}ms${rec.detail ? " · " + rec.detail : ""}`);
+      } catch (e) { /* log only */ }
+      return rec;
+    };
     try {
       // Replay mode: the value comes from the APPROVED bundle, not the profile (the submit
       // run re-fills a blank form). Everything else — actuation + verify — is identical.
       let route = null;
       if (o.valueFor) {
         const v = o.valueFor(f);
-        if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(rec); continue; }
-        route = f.widgetType === "file_upload" ? { kind: "resume", source: "replay" } : { value: v, source: "replay" };
+        if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(fin()); continue; }
+        if (f.widgetType === "file_upload") {
+          // ⚠ NOT EVERY FILE FIELD IS THE RÉSUMÉ. Greenhouse renders the COVER LETTER as a file
+          // dropzone too, so attaching to every file field put the résumé in the cover-letter slot
+          // (operator watched it happen on a Discord rehearsal, 2026-08-04). On a real submit that
+          // files the wrong document to the employer, and NO gate catches it: the strict verify
+          // only re-checks approved VALUES, and a bundle never carries a file for a field we
+          // deliberately skipped. Route it through the same router the fill uses — which maps
+          // exactly one field to the résumé — and leave any other file field alone.
+          const fr = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
+          route = fr && fr.kind === "resume"
+            ? { kind: "resume", source: "replay" }
+            : { kind: "skip", detail: (fr && fr.detail) || "a file field that is not the résumé — left to the operator" };
+        } else {
+          route = { value: v, source: "replay" };
+          // KEEP THE KIND THE FILL USED. The replay routed every non-file field as a plain value,
+          // so Greenhouse's phone-dial composite (#country) was actuated as an ordinary select —
+          // the wrong widget shape, whose menu never mounts — and an approved dial value could
+          // never commit (live 2026-08-05: `skipped · the dropdown opened but listed no options`,
+          // which the strict verify then rightly refuses, blocking an otherwise-clean submit).
+          // Same lesson as the résumé slot: a replay that drops the fill's routing is a replay
+          // that cannot reproduce the fill.
+          // Read the KIND straight from the static map: it describes the widget's SHAPE, which is
+          // true regardless of whether the profile happens to hold a value for it (atsRouteField
+          // returns nothing when the mapped value is empty, and the shape would be lost with it).
+          const shape = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
+          if (shape && shape.kind === "dial") route.kind = "dial";
+        }
       } else {
         route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
       }
@@ -1313,10 +1774,10 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
         Object.assign(rec, att.ok
           ? { status: "filled", after: att.name || "resume attached", detail: att.detail || null, verified: !!att.verified }
           : { status: f.isRequired ? "needs_review" : "skipped", detail: "resume attach failed: " + (att.error || "unknown"), flag: "resume-attach-failed" });
-        results.push(rec); continue;
+        results.push(fin()); continue;
       }
-      if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(rec); continue; }
-      if (route && route.kind === "employment-blank") { rec.status = "needs_review"; rec.flag = route.flag || "employer-match"; rec.detail = route.detail; results.push(rec); continue; }
+      if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(fin()); continue; }
+      if (route && route.kind === "employment-blank") { rec.status = "needs_review"; rec.flag = route.flag || "employer-match"; rec.detail = route.detail; results.push(fin()); continue; }
       if (route && route.eeoUnstated) {
         // OPTIONAL: leave it blank — the operator's own choice, nothing blocks.
         // REQUIRED: blank blocks the submit, so take the form's OWN decline option when it
@@ -1340,13 +1801,13 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           rec.flag = "declined-no-basis";
           rec.detail = "this REQUIRED demographic isn't stated in your profile — chose the form's own " + JSON.stringify(dec) +
             " so it cannot block the submit; answer it here if you would rather" + (ok ? "" : " (commit failed)");
-          results.push(rec); continue;
+          results.push(fin()); continue;
         }
         rec.status = f.isRequired ? "needs_review" : "skipped";
         atsAttachOptions(rec, f.options || []);
         rec.detail = "demographic not stated in profile — left blank (never inferred)" +
           (f.isRequired ? ", and this form is REQUIRING it with no decline option — answer it here" : "");
-        rec.flag = "eeo_declined"; results.push(rec); continue;
+        rec.flag = "eeo_declined"; results.push(fin()); continue;
       }
 
       rec.mappedPath = (route && (route.path || null)) || null;
@@ -1377,13 +1838,13 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // containment relief for STATED values: the route may flag it (EEO rungs / static
       // maps), OR the label is demographic regardless of which tier produced the value
       // (a bucket routes before the EEO rung and carries no flag — the Zoox race miss).
-      const mopts = { containment: !!(route && route.containment) || (!!candidates && atsIsEeoLabel(f.label)) };
+      const mopts = { containment: !!(route && route.containment) || (!!candidates && atsIsEeoLabel(f.label)), replay: !!(o && o.valueFor) };
       const produced = await atsActuateField(act, ats, effF, ref, rec, candidates, textValue, jc, profile, mopts);
       if (!produced) {
         // Deterministic tiers produced nothing. AI fallback — REQUIRED fields only (the
         // operator rule: an optional blank costs nothing; a required blank blocks submit).
         if (f.isRequired && act.aiEnabled && ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "textarea", "text", "location", "date"].includes(f.widgetType)) {
-          await atsAiFallback(act, ats, f, ref, rec, jc, profile);
+          await atsAiFallback(act, ats, f, ref, rec, jc, profile, aiPre.get(f.fieldName) || null);
         } else if (rec.status == null) {
           // A STATED value that the form couldn't take is NOT "blank is fine" (live 2026-07-31,
           // Discord: the profile says "Bachelor of Science", the form offers "Bachelor's Degree",
@@ -1396,7 +1857,11 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
             rec.flag = rec.flag || "stated-value-unmatched";
             // A human sentence for the review page — the raw match diagnostic is kept after it
             // (it names the options), and rec.options already feeds the editor's picker.
-            rec.detail = "your profile answer (" + JSON.stringify(String(candidates[0])) + ") isn't one of this form's options — pick the right one here" +
+            rec.detail = (rec.listUnproven
+              // the list is paged, or its search never answered — say what we actually know
+              ? "this form's own list never answered our search for " + JSON.stringify(String(candidates[0])) +
+                " (it serves one page at a time), so we can't tell whether it's there — pick it here, or answer it in the tab"
+              : "your profile answer (" + JSON.stringify(String(candidates[0])) + ") isn't one of this form's options — pick the right one here") +
               (rec.detail ? " · " + rec.detail : "");
           } else {
             rec.detail = rec.detail || "no profile mapping for this question";
@@ -1411,8 +1876,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       rec.status = "error";
       rec.detail = String((e && e.message) || e);
     }
-    results.push(rec);
-    try { console.log(`[ApplyPilot][ATS-FILL] ${rec.fieldName} (${rec.widgetType}${rec.isRequired ? ", req" : ""}) → ${rec.status}${rec.matchTier ? " · " + rec.matchTier : ""}${rec.flag ? " · " + rec.flag : ""}${rec.after != null ? " · after=" + JSON.stringify(String(rec.after).slice(0, 60)) : ""}${rec.detail ? " · " + rec.detail : ""}`); } catch (e) { /* log only */ }
+    results.push(fin());
   }
 }
 
@@ -1434,7 +1898,15 @@ async function atsFinishFill(act, ats, scan, results) {
       // select renders "+1" for the committed "United States +1" — same accept rule as the
       // fill-time verify).
       const chipSubstring = liveV && recV.toLowerCase().includes(liveV.toLowerCase());
-      if (f.widgetType === "checkbox" ? String(!!live.value) !== String(rec.after === true || rec.after === "true") : !(atsFd.textValuesMatch(liveV, recV) || chipSubstring)) {
+      // …and the REVERSE, for a widget whose display is LONGER than the answer: Lever's EEO radios
+      // render the option's whole description inside the label, so the page reads
+      // "Asian (Not Hispanic or Latino)A person having origins in…" for a recorded
+      // "Asian (Not Hispanic or Latino)". That is the same value, more verbosely displayed — not a
+      // page that lost its value (live 2026-08-05). Anchored at the START and length-guarded, so a
+      // recorded value that merely appears somewhere inside an unrelated display is still a
+      // mismatch, and a 1-2 char recorded value can never "prefix-match" a paragraph.
+      const labelDescription = recV.length >= 3 && liveV.toLowerCase().startsWith(recV.toLowerCase());
+      if (f.widgetType === "checkbox" ? String(!!live.value) !== String(rec.after === true || rec.after === "true") : !(atsFd.textValuesMatch(liveV, recV) || chipSubstring || labelDescription)) {
         rec.status = "needs_review"; rec.flag = "audit-mismatch";
         rec.detail = (rec.detail ? rec.detail + "; " : "") + "audit: page now holds " + JSON.stringify(liveV);
         rec.after = liveV || null;
@@ -1443,7 +1915,16 @@ async function atsFinishFill(act, ats, scan, results) {
   }
 
   const counts = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
-  return { url: scan.url, title: scan.title, results, counts, needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
+  // DID THIS PAGE'S ASYNC WIDGETS EVER ANSWER? Greenhouse forms sometimes load in a state where their
+  // server-backed comboboxes (school / degree / discipline / location) never return anything — the
+  // operator's own workaround is to refresh the page, and by hand the same widget then answers in ~1s
+  // (2026-08-06). We could not tell that state apart from a slow one, so a fill would sit through the
+  // full budget on each such field and hand them all to review. This flag lets the RUN decide to
+  // reload once and try again, which is the same remedy a human applies.
+  const deadAsync = results.filter((r) => r.listUnproven || /never answered our search|suggestions never loaded/i.test(String(r.detail || "")));
+  return { url: scan.url, title: scan.title, results, counts,
+    deadAsync: deadAsync.map((r) => r.fieldName),
+    needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
 }
 
 // Actuate one field with the resolved candidates. Returns true when it produced an outcome
@@ -1517,9 +1998,17 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     //     the stale A-list)
     //   • absence is only believable AFTER asking for the value BY NAME
     const optsOf = (r) => ((r && r.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+    // Option text as the MATCH LADDER should see it: dial codes and list numbering are both
+    // rendering artifacts (see atsDialStrip / atsEnumStrip). The commit always uses the raw text.
+    const forMatch = (arr) => (wt === "dial" ? arr.map(atsDialStrip) : arr.map(atsEnumStrip));
+    // BOTH SIDES get the same treatment, or the ladder compares unlike things. A committed value
+    // is stored as the option's REAL text, so on a replay the approved answer arrives carrying the
+    // form's own numbering ("1. United States of America") while the live options are stripped for
+    // matching — no tier can bridge that (live 2026-08-05: the replay of a field the fill had just
+    // filled exact-normalized reported "isn't one of this form's options").
     const hasHit = (texts) => {
-      const mt = wt === "dial" ? texts.map(atsDialStrip) : texts;
-      const m0 = atsLib.matchCandidates(candidates, mt, { containment: allowContainment });
+      const mt = forMatch(texts);
+      const m0 = atsLib.matchCandidates(forMatch(candidates), mt, { containment: allowContainment });
       return !!(m0 && m0.targetIndex >= 0);
     };
     // CLEAR BEFORE TYPING, SW-paced (the Workday typeahead rule, earned again 2026-07-31 on
@@ -1527,6 +2016,23 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // value races the component's own render and React puts "" back — the query never reaches
     // the filter and the list looks empty. A clear + settle + type sticks ("Carnegie" → 1
     // option). The settle must be SW wall-clock; a page-side timer would be throttled hidden.
+    // Type with REAL keystrokes when the actuation offers them, falling back to the synthetic path.
+    // Greenhouse's async comboboxes (school / degree / discipline / location) only run their search
+    // for genuine key events: with a trusted CLICK alone the school box still sat `loading` for
+    // seconds and the location box showed nothing, while a real click + real typing answers in about
+    // a second (traced both ways, 2026-08-06). Everything else on these forms keeps filling
+    // synthetically, so this is the narrow exception, not a new default.
+    const typeTrusted = async (text) => {
+      if (!act.trustedType) return null;
+      try {
+        const ok = await act.trustedType(ref.inputSel, String(text));
+        if (!ok) return null;
+        await act.delay(120);
+        const st = await act.eval(atsInjReadComboInput, ref.inputSel);
+        const got = st && st.ok ? String(st.value || "") : "";
+        return { ok: true, got, stuck: atsLib.normalize(got) === atsLib.normalize(String(text)) };
+      } catch (e) { return null; }
+    };
     const typeInto = async (text) => {
       await act.eval(atsInjTypeInCombo, ref.inputSel, "");
       await act.delay(250);   // adaptive — the read-back below is the real gate
@@ -1541,8 +2047,23 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // gated by an interval-length-INDEPENDENT state check can shrink its interval safely, and
     // waiting BEFORE the first read charged every already-open menu a full beat. The DEADLINE
     // stays real wall-clock, so a genuinely slow widget still gets its full budget.
-    const pollFor = async (ms, want) => {           // want(texts) → done?
+    // ⚠ THE CEILING IS A PER-FIELD BUDGET, NOT PER POLL. Each poll used to get its own, so a
+    // by-name search plus its retry could spend it TWICE: live 2026-08-05 on a hidden tab,
+    // question_36707272002 took 44.6s of a 91.8s fill — one widget whose menu never renders, paying
+    // 20s + 20s + change. The widget still gets a real budget; it just cannot get it repeatedly.
+    const fieldPollT0 = Date.now();
+    const pollFor = async (ms, want, ceilMs) => {   // want(texts) → done?
       const deadline = Date.now() + ms;
+      // The CEILING is a loading allowance: while the widget itself reports that it is still
+      // fetching (atsInjReadOptions.loading), an empty menu is not an answer, so the soft
+      // deadline does not apply. Earned live 2026-08-04 — Discord's school list says
+      // "No options" at 4ms, "Loading..." at 24ms and answers at 4049ms, so NO flat budget
+      // under ~4s could ever have worked, and the retry that re-typed only restarted the clock.
+      // A widget that is not loading behaves exactly as it did before.
+      const hardDeadline = Math.min(
+        Date.now() + Math.max(ms, ceilMs || ms),
+        fieldPollT0 + ATS_POLL.fieldMaxMs,          // …and never past this field's whole allowance
+      );
       // Keep the most INFORMATIVE read, not merely the most recent. `r.options` is always an
       // array and [] is truthy, so `last` used to be overwritten by every sample INCLUDING empty
       // ones — and on a timeout we returned whatever the final sample happened to be. A widget
@@ -1553,12 +2074,83 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // Hidden tabs re-render more raggedly, which is why this surfaced there.
       // A stale non-empty list cannot cause a wrong commit: a HIT returns immediately above, and
       // the commit re-resolves the option BY TEXT against the live DOM and gates on a read-back.
-      let last = null, lastSeen = null;
+      const startedAt = Date.now();
+      let last = null, lastSeen = null, sawLoading = false, ticks = 0, sawEmptyMounted = false, sawMounted = false, lastReadMs = 0, quietIdleMs = null; let stopReason = "none";
       for (;;) {
+        const readAt = Date.now();
         const r = await act.eval(atsInjReadOptions, ref.inputSel);
+        lastReadMs = Date.now() - readAt;
+        ticks++;
+        // How long has this widget's subtree been still? Only asked once the soft deadline has
+        // passed with nothing rendered — the one place the answer changes what we do.
+        if (act.quietRead && Date.now() >= deadline && !sawMounted) {
+          try { const q = await act.quietRead(ref.inputSel); quietIdleMs = q && q.ok ? q.idleMs : null; }
+          catch (e) { quietIdleMs = null; }
+        }
         if (r && Array.isArray(r.options)) { lastSeen = r; if (r.options.length) last = r; }
-        if (r && want(optsOf(r))) return r;
-        if (Date.now() >= deadline) return last || lastSeen;
+        if (r && r.loading) sawLoading = true;
+        if (r && want(optsOf(r))) { r.waitedMs = Date.now() - startedAt; r.ticks = ticks; return r; }
+        const now = Date.now();
+        const loading = !!(r && r.loading);
+        // SETTLE, don't count clock. Two page states mean "not yet", not "nothing":
+        //   • the widget says it is LOADING (a server-backed list — see atsInjReadOptions)
+        //   • the menu node is not mounted at all, or it is mounted and reads empty for the FIRST
+        //     time — a react-select paints its list a beat after the open click, and treating that
+        //     beat as "no options" is what mis-routed a required field (2026-08-05). An empty read
+        //     is only believed once the SAME empty read repeats with the menu present.
+        const emptyNow = !!(r && Array.isArray(r.options) && !r.options.length);
+        const settledEmpty = emptyNow && !!(r && r.open) && sawEmptyMounted;
+        if (emptyNow && r && r.open) { sawEmptyMounted = true; sawMounted = true; }
+        else if (r && r.open) sawMounted = true;
+        // Not every kind of "nothing yet" is progress, and the difference is worth ms:
+        //   • LOADING — the widget says a fetch is in flight → the full ceiling is justified.
+        //   • MOUNTED but empty — one repeat read confirms it, then believe it.
+        //   • NEVER MOUNTED — we may not even be looking at the right widget (live 2026-08-05:
+        //     the replay reads Greenhouse's phone-dial composite as a plain select, whose menu
+        //     never appears, and a full-ceiling wait burned 20s to reach the same honest skip).
+        //     A brief grace, then stop: an absent menu is not evidence of anything to come.
+        let why = "soft";
+        const stop = (() => {
+          if (now < deadline) return false;
+          if (loading) { why = "loading-ceiling"; return now >= hardDeadline; }
+          if (emptyNow && r && r.open) { why = "empty-mounted"; return settledEmpty || now >= hardDeadline; }
+          if (emptyNow && !sawMounted) {
+            // A menu that has never mounted is only believable when the page is actually
+            // RESPONSIVE: our own read is a Runtime.evaluate, so when it takes ~1.4s the main
+            // thread is jammed and the widget cannot paint a menu OR answer us (live 2026-08-05:
+            // two reads spanning 2761ms declared three healthy dropdowns "never mounted" and
+            // skipped values that had filled fine minutes earlier). Slow reads ⇒ keep waiting.
+            // `quietIdleMs` is the operator's quiescence watch from the Workday branch
+            // (cdpInstallQuietWatch): the page stamps its last mutation and the SW does the
+            // waiting on real wall-clock. Read latency stays only as the fallback for when the
+            // watch is unavailable (a fake actuation, or an install that failed).
+            const busy = quietIdleMs != null
+              ? quietIdleMs < ATS_POLL.busyIdleMs
+              : lastReadMs > ATS_POLL.responsiveReadMs;
+            if (busy) { why = quietIdleMs != null ? "page-busy" : "page-jammed"; return now >= hardDeadline; }
+            why = "never-mounted";
+            return now >= Math.min(deadline + ATS_POLL.mountGrace, hardDeadline);
+          }
+          return true;
+        })();
+        if (stop) {
+          stopReason = why;
+          const out = last || lastSeen;
+          // Carry WHY we stopped, so a field that reaches review can name the real cause: a list
+          // that never finished loading is a different report from one that answered "nothing" —
+          // and so the recovery below knows whether a search was ever in flight to protect.
+          // waitedMs/ticks make the next occurrence self-diagnosing instead of a guess about
+          // whether the budget or the poll pressure was the problem.
+          if (out) { out.stillLoading = loading; out.sawLoading = sawLoading; out.waitedMs = now - startedAt; out.ticks = ticks; out.stopReason = stopReason; }
+          return out;
+        }
+        // BACK OFF WHILE IT IS FETCHING. Every tick is a Runtime.evaluate round trip, and this
+        // project has already measured that polling a react-select too hard STARVES the renderer
+        // so the menu never paints (2026-07-31: a 20ms interval took a GitLab fill from 4 review
+        // items to 11, all "listed no options"). While the widget says it is loading there is
+        // nothing to learn from a fast tick — the answer is bounded by its own fetch + render —
+        // so give the page room instead of hammering it.
+        if (loading) { await act.delayFull(ATS_POLL.loadingTick); continue; }
         // ⚠ REAL 150ms, not the adaptive delay. Adaptive collapses to ~20ms when timers measure
         // fast, and each poll tick is a Runtime.evaluate round trip — at that rate the polling
         // STARVES the renderer and the menu never paints. Live 2026-07-31: switching this one
@@ -1572,18 +2164,88 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
 
     let nearMatches = []; // what a by-name search turned up — the operator's real choices
     let didSearch = false; // a typed query leaves the menu FILTERED — see the commit below
+    // WHETHER WE EVER TYPED. That is the whole test for "is this the complete list": a menu read on
+    // OPEN is everything the widget has (244 countries, 72 disciplines — verified in the DOM), while
+    // anything we reached by typing is a view of it, and on a server-backed picker even the restored
+    // unfiltered list is just page one. Never cleared, deliberately — see the restore below.
+    let optionsFiltered = false;
+    let listPending = false; // the widget was STILL fetching when we ran out of budget
+    // Start the quiescence watch BEFORE the open click, so "has this subtree gone quiet?" has a
+    // baseline by the time the poll needs it. Best effort: without it the poll falls back to
+    // read latency.
+    if (act.quietInstall) { try { await act.quietInstall(ref.inputSel); } catch (e) { /* fallback */ } }
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
-    let read = await pollFor(1800, (t) => t.length > 0);
+    let read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
     // menu), so one forced click closes it and the next opens for real. Each attempt flips the
     // state, so two cover both "the click missed" and "it lied about being open".
     for (let attempt = 0; attempt < 2 && !optsOf(read).length; attempt++) {
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
-      read = await pollFor(1500, (t) => t.length > 0);
+      read = await pollFor(ATS_POLL.retry, (t) => t.length > 0, ATS_POLL.retryCeil);
     }
-    if (wt === "location") {
-      await typeInto(String(candidates[0]).split(",")[0]);
-      read = await pollFor(6000, (t) => t.length > 0); // places lookup — real network time
+    // THE LIVE WIDGET WINS OVER THE LABEL'S GUESS (the Workday widget-adaptive rule, earned again
+    // 2026-08-05). "Where are you currently based?" reads like a places question, but GitLab
+    // answers it with a THREE-option pick-one already rendered on open. Typing a city there waits
+    // out a suggestion service that will never respond and reports "places never loaded" on a
+    // field that was answerable all along. A short list that is already showing IS the option set.
+    const preOpts = optsOf(read);
+    const locIsPickOne = wt === "location" && preOpts.length > 0 && preOpts.length <= ATS_LOC_PICKONE_MAX && hasHit(preOpts);
+    // WHICH candidate the places list actually answered — the pick has to judge what we ASKED for.
+    // A country-shaped "Location" box answers the country tier, and judging those options against
+    // the city would find nothing and throw the answer away (see the fallback below).
+    let locCand = candidates && candidates.length ? String(candidates[0]) : "";
+    let locAlts = [];   // the non-city wordings offered to a country-shaped box (see below)
+    if (wt === "location" && !locIsPickOne) {
+      // ⚠ DO NOT GATE THIS ON google.maps. I added such a probe on 2026-08-05 ("don't wait for a
+      // service that cannot answer") on the strength of an older note calling this box places-backed.
+      // It is NOT: traced 2026-08-06 on Reddit, `google.maps` is absent and no maps script is ever
+      // requested, yet typing "Tallahassee" returns "Tallahassee, Florida, United States" from
+      // GREENHOUSE'S OWN service in react-select's normal listbox. The probe therefore skipped the wait
+      // on every Greenhouse location field and manufactured "suggestions never loaded" — a regression
+      // that read exactly like the environment problem the note described. The general poll already
+      // bounds this wait (loading gate + per-field budget), so it needs no special case.
+      // ⚠ WAKE IT WITH A REAL CLICK FIRST. This widget's suggestion service stays asleep for a
+      // synthetic open click: the fill typed "Tallahassee" and polled 22.7s for nothing, while by hand
+      // the same query answers in ~1s — and after ONE trusted click, SYNTHETIC typing drives it fine
+      // (traced both ways, 2026-08-06). So the trust is needed for the click, not the keystrokes.
+      const city = String(candidates[0]).split(",")[0];
+      if (!(await typeTrusted(city))) await typeInto(city);
+      read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
+      // A BOX LABELLED "Location" IS NOT ALWAYS A CITY BOX (2026-08-07). ElevenLabs labels one
+      // "Location" and describes it "Country you're currently residing in" — a COUNTRY list, where
+      // "Pittsburgh" matches nothing. We typed the city, read an empty menu, and reported "the form's
+      // places service didn't respond" for 15s on a field that was answerable the whole time. Same
+      // shape as the GitLab pick-one lesson above: the label's guess loses to the live widget.
+      //
+      // So when the city finds nothing, walk the REMAINING candidates — the location rung already
+      // tiers the country behind the city for exactly this — and add the profile's country when a
+      // BUCKET routed here (buckets carry their own single value and know nothing of the ladder,
+      // which is how this field arrived with only "Pittsburgh, PA"). Costs nothing on a real places
+      // box: it found its city and never reaches this.
+      if (!optsOf(read).length) {
+        const alts = candidates.slice(1).map(String);
+        const pi = (profile && profile.personal_info) || {};
+        const rawCountry = Array.isArray(pi.country) ? pi.country : [pi.country];
+        for (const c of rawCountry) {
+          if (typeof c === "string" && c.trim() && !alts.some((a) => atsLib.normalize(a) === atsLib.normalize(c))) alts.push(c.trim());
+        }
+        locAlts = alts;
+        for (const alt of alts) {
+          await typeInto(alt);
+          read = await pollFor(ATS_POLL.search, (t) => t.length > 0, ATS_POLL.searchCeil);
+          if (optsOf(read).length) { locCand = alt; break; }   // the PICK must judge what we asked for
+        }
+      }
+    } else if (!hasHit(optsOf(read)) && atsListIsComplete(read)) {
+      // THE WHOLE LIST IS ALREADY ON SCREEN — do not type. Traced live 2026-08-06 on Discord's degree
+      // box: opening it renders all 10 options, and typing the profile's own wording
+      // ("Bachelor of Science") filters that list to "No options", because the widget matches the
+      // TYPED TEXT while the form's vocabulary is "Bachelor's Degree". Searching a complete list can
+      // only ever hide the answer — and the operator's rule for these forms is the same: recon the
+      // small typeaheads (degree, discipline), search only the ones too large to enumerate (school,
+      // location). The bridges below (degree level, assertion lead, polarity) then run against the
+      // FULL list rather than a filtered-to-nothing one.
+      try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName}: ${optsOf(read).length} option(s) read on open — matching the whole list, not searching it`); } catch (e) { /* log only */ }
     } else if (!hasHit(optsOf(read))) {
       // SEARCH BY NAME: types each candidate (most-specific first) and polls FOR THE HIT.
       // ONE search attempt (the most-specific candidate). Two attempts doubled the worst-case
@@ -1594,35 +2256,88 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // more broadly, and a long async list answers it faster ("Carnegie Mellon" resolves
         // where the full "Carnegie Mellon University" can come back empty). The MATCH is still
         // exact against whatever the widget returns — a looser query never loosens the answer.
-        const query = String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand);
-        const typed = await typeInto(query); didSearch = true;
-        let found = await pollFor(2000, (t) => t.length > 0 && hasHit(t));
+        // A PLACES BOX IS SEARCHED WITH THE CITY, not the first two words: "Pittsburgh, PA" is a
+        // spelling a places service may never have heard of, while "Pittsburgh" is one they all
+        // know (see atsPlacePick, which keeps the PICK strict about the state). Everything else
+        // keeps the two-word prefix — it is what a human types, it matches more broadly, and a long
+        // async list answers it faster.
+        const query = (wt === "location" && !locIsPickOne && String(cand).includes(","))
+          ? String(cand).split(",")[0].trim()
+          : (String(cand).split(/\s+/).slice(0, 2).join(" ") || String(cand));
+        // Wake the widget with a REAL interaction before searching. Greenhouse's async comboboxes
+        // (school, degree, discipline, location) leave their fetch asleep — or firing but never
+        // resolving — when everything they have seen is synthetic: live 2026-08-06 the school box sat
+        // `loading` for 19.2s and the location box showed nothing for 21.6s, while by hand each
+        // answered in about a second. Once woken, ordinary synthetic typing drives them.
+        const typed = (await typeTrusted(query)) || (await typeInto(query)); didSearch = true; optionsFiltered = true;
+        const wantHit = (t) => t.length > 0 && hasHit(t);
+        let found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
         // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave
         // it CLOSED (two clicks = shut), and then the text lands in the input while the widget
         // shows nothing — live 2026-07-31 this read as "the value isn't in the list" with
         // stuck=true, got="Carnegie Mellon University", list(0). Re-open (no-op if already
         // open) and poll again before believing a query found nothing.
         if (!optsOf(found).length) {
-          // FORCE the click: aria-expanded lies (see atsInjOpenAndReadOptions), so a
-          // non-forced re-open no-ops on a phantom-expanded widget and the menu stays shut
-          // forever. Re-type afterwards — opening can reset the query the widget just took.
-          await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
-          await act.delay(250);
-          await typeInto(query);
-          found = await pollFor(1500, (t) => t.length > 0 && hasHit(t));
+          // ⚠ RECOVER ONLY FROM AN ACTUAL FAULT — a CLOSED menu, or a query the widget dropped.
+          // Re-typing restarts the widget's own debounce and DISCARDS the search already in
+          // flight, and force-clicking an OPEN menu SHUTS it (two clicks = closed), after which
+          // the text sits in a widget that shows nothing. Doing both unconditionally is how a
+          // healthy-but-slow list produced "the menu produced nothing across three polls"
+          // (#country, 2026-08-02) — the recovery was the thing breaking it. A widget that is
+          // open, still holding our query and merely slow is now simply waited out above.
+          const st = await act.eval(atsInjReadComboInput, ref.inputSel);
+          const closed = !(found && found.open);
+          const lostQuery = !(st && st.ok && String(st.value) === query);
+          const pending = !!(found && (found.sawLoading || found.stillLoading));
+          if (closed || lostQuery) {
+            // FORCE the click: aria-expanded lies (see atsInjOpenAndReadOptions), so a
+            // non-forced re-open no-ops on a phantom-expanded widget and the menu stays shut.
+            if (closed) { await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true); await act.delay(250); }
+            await typeInto(query);   // opening can reset the query the widget just took
+            found = await pollFor(ATS_POLL.retry, wantHit, ATS_POLL.searchCeil);
+          } else if (!pending) {
+            // Open, still holding our query, and it never reported a fetch: nothing is in flight,
+            // so ONE re-type is a free nudge for a local list that rendered raggedly. When the
+            // widget HAS been loading, this is exactly the wrong move — it would restart the
+            // debounce and discard the search — so that case is only ever waited out.
+            await typeInto(query);
+            found = await pollFor(ATS_POLL.retry, wantHit, ATS_POLL.retryCeil);
+          }
         }
         const seen = optsOf(found);
-        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
+        if (found && found.stillLoading) listPending = true;
+        try { console.log(`[ApplyPilot][ATS-FILL] ${f.fieldName} search ${JSON.stringify(query)} → ${hasHit(seen) ? "HIT" : "no hit"}; typed=${!!(typed && typed.ok)} stuck=${typed && typed.stuck} got=${JSON.stringify(String((typed && typed.got) || ""))}; open=${!!(found && found.open)} loading=${!!(found && found.stillLoading)} waited=${(found && found.waitedMs) || 0}ms/${(found && found.ticks) || 0} reads stop=${(found && found.stopReason) || "?"}; list(${seen.length}): ${JSON.stringify(seen.slice(0, 3))}`); } catch (e) { /* log only */ }
         if (seen.length) nearMatches = seen;
+        // ⚠ `read` IS ONLY REPLACED ON A HIT — and that is what makes a query safe to run against a
+        // COMPLETE list. Measured 2026-08-07 on Discord's `discipline--0`: 72 options on open, typing
+        // the profile's own wording ("Electrical and Computer Engineering", which that form words
+        // differently) filters the menu to ZERO, clearing it brings all 72 back. Because a search that
+        // found nothing never overwrites `read`, the on-open list survives regardless of whether the
+        // restore below comes back in time, and the bridges (degree-level, polarity, assertion-lead)
+        // run against the full list. Do not "simplify" this into an unconditional assignment.
         if (seen.length && hasHit(seen)) { read = found; break; }
       }
       if (!hasHit(optsOf(read))) { // nothing by name — restore the unfiltered list so the report names real options
         await act.eval(atsInjTypeInCombo, ref.inputSel, "");
-        const restored = await pollFor(1200, (t) => t.length > 0);
+        const restored = await pollFor(ATS_POLL.restore, (t) => t.length > 0, ATS_POLL.restoreCeil);
+        // ⚠ this does NOT make the list complete again. Clearing the query restores the whole list on a
+        // STATIC widget, but only PAGE ONE on a server-backed one (100 of ~3300 schools), and the two
+        // are indistinguishable from here — no loading flag, no count that separates 244 countries
+        // from 100 schools. Once we have typed, the safe reading is "a view of the list", forever.
         if (optsOf(restored).length) read = restored;
+
       }
     }
-    const options = (read && read.options) || [];
+    let options = (read && read.options) || [];
+    // DON'T THROW AWAY WHAT WE SAW. A by-name search can surface real suggestions and then lose them
+    // when the query is cleared (the widget rebuilds its list per keystroke), leaving this branch to
+    // report "listed no options" about a widget that had just offered five — and to hand review a field
+    // with NOTHING to pick (live 2026-08-06, Ashby/Cohere: the box offered "Pittsburgh, Pennsylvania,
+    // United States" and the record said it listed nothing). What the search saw IS the option set.
+    if (!options.length && nearMatches.length) {
+      options = nearMatches.map((t) => ({ text: t, disabled: false }));
+      read = Object.assign({}, read || {}, { options });
+    }
     if (!options.length) {
       rec.status = f.isRequired ? "needs_review" : "skipped";
       // A LOCATION box whose places service never answered still HOLDS what we typed, and that
@@ -1632,7 +2347,23 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // either). Still needs_review — the form may want a places selection we could not make.
       if (wt === "location" && candidates.length) {
         const typed = await typeInto(String(candidates[0]));
-        if (typed && typed.ok && typed.got) { rec.after = typed.got; rec.matchTier = "typed-unverified"; }
+        if (typed && typed.ok && typed.got) {
+          rec.after = typed.got; rec.matchTier = "typed-unverified";
+          // ON A REPLAY, AN APPROVED VALUE THAT IS ACTUALLY IN THE BOX IS COMMITTED. The human already
+          // approved this exact text, so refusing it would override an explicit approval and block the
+          // gate forever on a places service that never loads in this browser (a field a HUMAN cannot
+          // fill either — 2026-07-31). Still FLAGGED, never silent.
+          //
+          // ⚠ AND THIS DEFERS TO THE AUDIT, which is the part that matters. Live 2026-08-06 on Reddit
+          // the box did NOT retain the text — the M40 re-read found `page now holds ""` and correctly
+          // downgraded the field to needs_review, so the gate still refused. That is the right outcome:
+          // the required field really is empty. This grade only survives on a form that KEEPS what we
+          // typed; where the widget discards it, the audit overrules us.
+          if (mopts && mopts.replay && atsLib.normalize(String(typed.got)) === atsLib.normalize(String(candidates[0]))) {
+            rec.status = "filled_review";
+            rec.flag = rec.flag || "location-typed-unverified";
+          }
+        }
       }
       // GH location note (2026-07-31, Figma): the places lookup can hang on "Loading…" with ZERO
       // network — google.maps never loads in some browsers, so even a HUMAN typing gets no options.
@@ -1641,22 +2372,53 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         ? ("location suggestions never loaded (the form's places service didn't respond — it may be broken in this browser)"
            + (rec.after ? ' — the box now holds "' + rec.after + '" from your profile; confirm it, or answer it in the tab.' : " — answer it in the tab before submitting."))
         // distinguish "the control never opened" from "it opened but listed nothing" — they
-        // have different causes (an unrecognized widget vs an empty/server-backed list)
-        : ((opened && opened.ok) ? "the dropdown opened but listed no options" : "could not open the dropdown (control not found)");
+        // have different causes (an unrecognized widget vs an empty/server-backed list) — and
+        // from "its own search never came back", which is neither of those and is the operator's
+        // cue that the FORM is slow rather than the answer missing (2026-08-04).
+        : ((opened && opened.ok)
+          ? (listPending || (read && read.stillLoading)
+            ? "the form's own option list was still loading when we ran out of time — answer it in the tab, or re-run"
+            : "the dropdown opened but listed no options")
+          : "could not open the dropdown (control not found)");
+      // Tell the AI fallback not to pay this budget again: it re-opens the widget and re-polls the
+      // SAME list from scratch, so an unreadable menu cost its ceiling TWICE (live 2026-08-05, hidden:
+      // question_36707272002 16.1s, question_36749076002 13.5s — the two together were most of a 44s
+      // fill, and both still ended needs_review either way).
+      rec.optionsUnreadable = true;
       await act.eval(atsInjCloseCombo, ref.inputSel);
       return true;
     }
     const texts = options.filter((o) => !o.disabled).map((o) => o.text);
-    const matchTexts = wt === "dial" ? texts.map(atsDialStrip) : texts;
+    const matchTexts = forMatch(texts);
     let hit = null;
-    if (wt === "location") {
+    if (wt === "location" && !locIsPickOne) {
       // a places list: accept the first suggestion CONTAINING the city (they're all real
       // places for the typed query; flag anything that isn't an exact city+state read).
-      const city = String(candidates[0]).split(",")[0].trim().toLowerCase();
-      const idx = texts.findIndex((t) => t.toLowerCase().includes(city));
-      if (idx >= 0) hit = { index: idx, tier: texts[idx].toLowerCase().startsWith(city) ? "exact-normalized" : "containment" };
+      // A pick-one location widget skips this and goes through the ordinary match ladder, so its
+      // options are matched as options — not scanned for a city that was never going to be there.
+      const pick = atsPlacePick(locCand || candidates[0], texts);
+      if (pick) {
+        hit = { index: pick.index, tier: pick.tier };
+        if (pick.stateMismatch) {
+          rec.flag = rec.flag || "location-state-mismatch";
+          rec.detail = (rec.detail ? rec.detail + "; " : "") +
+            "this form offers no " + JSON.stringify(String(locCand || candidates[0])) + " — picked " +
+            JSON.stringify(String(texts[pick.index])) + "; confirm the state";
+        }
+      }
+      // A COUNTRY-SHAPED BOX IS MATCHED AS A LIST, NOT AS A PLACE. Its answer comes from the country
+      // tier, whose profile wording is routinely LONGER than the option — live: candidates led with
+      // "United States of America" while the widget offered "United States", and the city-containment
+      // pick above cannot see that at all (it asks whether the option contains the city). The ordinary
+      // ladder normalizes and has the tiers for exactly this, and the profile stores the country as a
+      // LADDER for exactly this reason, so every wording we were willing to answer with is offered —
+      // not just the one that happened to make the menu render.
+      if (!hit && locAlts.length) {
+        const m = atsLib.matchCandidates(forMatch(locAlts), matchTexts, { containment: false });
+        if (m && m.targetIndex >= 0) hit = { index: m.targetIndex, tier: m.matchTier };
+      }
     } else {
-      const m = atsLib.matchCandidates(candidates, matchTexts, { containment: allowContainment });
+      const m = atsLib.matchCandidates(forMatch(candidates), matchTexts, { containment: allowContainment });
       if (m && m.targetIndex >= 0) hit = { index: m.targetIndex, tier: m.matchTier };
       // stated Yes/No-leading value → the unique same-polarity option (the contraction
       // bridge — see the radio path; select twin for GH's EEO dropdowns).
@@ -1664,6 +2426,15 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         const lead = /^(yes|no)\b/i.exec(String(candidates[0] || ""));
         const pol = lead ? atsFd.optionForPolarity(matchTexts, lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null;
         if (pol) hit = { index: matchTexts.indexOf(pol), tier: "polarity-lead" };
+        if (!hit) {
+          const asrt = atsAssertionLead(candidates[0], matchTexts);
+          if (asrt) hit = { index: matchTexts.indexOf(asrt), tier: "assertion-lead" };
+        }
+      }
+      // …and the degree-level bridge, for a field that ASKS about a degree (see atsDegreeMatch)
+      if (!hit && /degree|education level/i.test(String(f.label || ""))) {
+        const deg = atsDegreeMatch(candidates, matchTexts);
+        if (deg) hit = { index: matchTexts.indexOf(deg), tier: "degree-level" };
       }
       // Dial composite: the ladder above compares NAMES that can never meet (see atsDialMatch).
       // Uses the RAW option texts — the codes are what it needs.
@@ -1678,7 +2449,21 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const near = client.length ? client : (nearMatches.length && nearMatches.length < texts.length ? nearMatches : texts);
       rec.detail = "no candidate matched " + texts.length + " option(s); candidates=" + JSON.stringify(candidates.slice(0, 4)) +
         (near !== texts ? "; closest on this form: " + JSON.stringify(near.slice(0, 4)) : " sample=" + JSON.stringify((wt === "dial" ? matchTexts : texts).slice(0, 3)));
-      atsAttachOptions(rec, near);
+      // …and if what we READ was only a page (or the search never answered), say so even after
+      // narrowing — otherwise the 20 near-matches masquerade as the whole option set.
+      // ABSENCE IS PROVABLE AGAINST A LIST WE READ IN FULL, however long it is. This used to treat
+      // any >= 60 read as one page, so a complete 244-option country menu was reported as a list that
+      // "serves one page at a time" — sending the operator to look for an option we had already
+      // proven absent. Now only a still-fetching widget, or a page-sized SEARCH result, is unproven.
+      const unproven = listPending || (optionsFiltered && texts.length >= ATS_OPTION_CAP);
+      // `near` is a narrowed neighbourhood when it differs from `texts` — partial by construction.
+      atsAttachOptions(rec, near, (unproven || optionsFiltered || near !== texts) ? true : undefined);
+      // ABSENCE IS ONLY PROVABLE AGAINST A LIST THAT ANSWERED, IN FULL. This form serves 100 of
+      // ~3300 schools per page and its search service is slow and erratic (2026-08-04: 390ms,
+      // 4.0s, 4.5s, then >20s for the same kind of query), so "not in what we read" is not
+      // "not on the form" — claiming otherwise sends the operator looking for a missing option
+      // that is really there, and buries the actual problem (the list never came back).
+      if (unproven) rec.listUnproven = true;
       return false;
     }
     const commitText = texts[hit.index];
@@ -1691,21 +2476,31 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     if (didSearch) {
       const norm1 = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase();
       const showing = (t) => t.some((o) => norm1(o) === norm1(commitText));
-      await act.eval(atsInjTypeInCombo, ref.inputSel, "");
-      let back = await pollFor(900, showing);
-      // A query that matches NOTHING closes the menu outright, and clearing the text does not
-      // bring it back — so re-open before giving up (live 2026-08-02: "could not click No —
-      // no-open-listbox"). Forcing is safe here: we have just established the menu is not
-      // showing our option, so a click can only improve matters.
+      // LOOK BEFORE CLEARING. On a long server-backed list the option we matched exists ONLY in
+      // the search result — Discord's 3300-school picker does not carry "Swarthmore College" on
+      // the unfiltered first page at all — so clearing the query throws away the very option we
+      // are about to click, and the commit then fails `option-not-found`. Clear only when the
+      // option genuinely is not on screen, which is the case the clear was written for (the
+      // 2026-08-02 polarity bridge: the match came from the unfiltered list while the query had
+      // filtered the menu to zero).
+      let back = await act.eval(atsInjReadOptions, ref.inputSel);
       if (!showing(optsOf(back))) {
-        await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
-        back = await pollFor(1200, showing);
+        await act.eval(atsInjTypeInCombo, ref.inputSel, "");
+        back = await pollFor(ATS_POLL.showing, showing, ATS_POLL.showingCeil);
+        // A query that matches NOTHING closes the menu outright, and clearing the text does not
+        // bring it back — so re-open before giving up (live 2026-08-02: "could not click No —
+        // no-open-listbox"). Forcing is safe here: we have just established the menu is not
+        // showing our option, so a click can only improve matters.
+        if (!showing(optsOf(back))) {
+          await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
+          back = await pollFor(ATS_POLL.retry, showing, ATS_POLL.showingCeil);
+        }
       }
     }
     const c = await act.eval(atsInjCommitOption, ref.inputSel, commitText);
     const back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
-    atsAttachOptions(rec, texts);
+    atsAttachOptions(rec, texts, (optionsFiltered || listPending) ? true : undefined);
     const backNorm = atsLib.normalize(String(rec.after == null ? "" : rec.after));
     const wantNorm = atsLib.normalize(commitText);
     // the dial composite renders "+1" (flag+code), not the option text — value-based accept:
@@ -1779,6 +2574,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const polKey = candidates[0] === "Yes" || candidates[0] === "No" ? candidates[0] : (allowContainment && lead ? (lead[1][0].toUpperCase() + lead[1].slice(1).toLowerCase()) : null);
       const pol = polKey ? atsFd.optionForPolarity(texts, polKey) : null;
       if (pol) { pick = pol; tier = "polarity-lead"; }
+      // …and the same bridge for a first-person assertion (see atsAssertionLead)
+      if (!pick && allowContainment) {
+        const asrt = atsAssertionLead(candidates[0], texts);
+        if (asrt) { pick = asrt; tier = "assertion-lead"; }
+      }
     }
     if (!pick) { rec.detail = "no candidate matched " + texts.length + " option(s)"; atsAttachOptions(rec, texts); return false; }
     const r = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
@@ -1791,6 +2591,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     const readNorm = atsLib.normalize(String(rec.after || ""));
     const okv = readNorm === atsLib.normalize(pick) || (!!(r && r.ok) && readNorm.includes(atsLib.normalize(pick).slice(0, 40)));
     rec.status = okv ? (tier === "exact-normalized" || tier === "label-exact" ? "filled" : "filled_review") : "needs_review";
+    // RECORD THE OPTION WE CHOSE, not the read-back display — the dial-chip rule, earned again on a
+    // radio. Lever's EEO options render their whole DESCRIPTION inside the label ("Asian (Not
+    // Hispanic or Latino)A person having origins in any of the original peoples of the Far East…"),
+    // while the option vocabulary the scan reports is the answer alone. Storing the display put a
+    // paragraph in the bundle that no live option could ever match, so the replay of a field the
+    // fill had verified came back `stated-value-unmatched` (live 2026-08-05, Shield AI).
+    // The read-back stays the VERIFY (above, which already tolerates the description); only what we
+    // persist changes. Single-choice only: a checkbox GROUP can hold several answers, and the
+    // read-back is the one thing that reports all of them.
+    if (okv && wt === "radio") rec.after = pick;
     rec.matchTier = tier; rec.verified = okv;
     if (!okv) rec.detail = "radio commit not reflected (read " + JSON.stringify(rec.after) + ")";
     return true;
@@ -1815,9 +2625,33 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   if (wt === "checkbox") {
     // Consent semantics — the Workday rule: REQUIRED → auto-check (silent); optional with a
     // mapped true → check; otherwise leave (blank optional is the correct resting state).
-    const explicitTrue = candidates && candidates.length && /^(yes|true)$/i.test(String(candidates[0]));
-    const explicitFalse = candidates && candidates.length && /^(no|false)$/i.test(String(candidates[0]));
-    if (!f.isRequired && !explicitTrue) { if (!explicitFalse) return false; rec.status = "skipped"; rec.detail = "profile refuses this optional checkbox — left unchecked"; return true; }
+    //
+    // A STATED ANSWER CARRIES ITS POLARITY IN ITS LEADING WORDS, not as a bare token (2026-08-07).
+    // Ashby/Sierra renders its diversity survey as SELECT ALL THAT APPLY: each identity is its own
+    // checkbox — "Person with disability", "Veteran", "Neurodiverse", "Parent" — so the LABEL is an
+    // option, not a question. The profile answers those dimensions in whole sentences ("No, I do not
+    // have a disability", "I am not a protected veteran"), which matched neither /^(yes|true)$/ nor
+    // /^(no|false)$/, so two questions the profile ALREADY ANSWERS fell through to "your profile
+    // answer isn't one of this form's options — pick the right one here". Nothing was unmatched:
+    // leaving the box unchecked IS that answer, completely. Negative is tested FIRST, because "I am
+    // not a protected veteran" satisfies the positive lead too.
+    const c0 = candidates && candidates.length ? String(candidates[0]) : "";
+    const explicitFalse = !!c0 && (/^(no|false)\b/i.test(c0) || ATS_NEG_LEAD_RE.test(c0));
+    // …and on such a list, an answer that NAMES this box is the affirmative. EXACT-normalized only,
+    // and deliberately NOT gated on atsIsEeoLabel: that detector knows DIMENSION names ("veteran",
+    // "disability"), while these labels are the VALUES ("Asian", "White") — which is the whole point
+    // of a select-all list. Exact equality stands on its own anyway: the profile literally says this
+    // label, on any checkbox. Containment must stay out — "East Asian" must not decide a box labelled
+    // "Asian" while an "East Asian" box may be sitting right below it.
+    const namesIt = !!c0 &&
+      candidates.some((c) => atsLib.normalize(String(c)) === atsLib.normalize(String(f.label)));
+    const explicitTrue = !!c0 && !explicitFalse && (/^(yes|true)\b/i.test(c0) || ATS_POS_LEAD_RE.test(c0) || namesIt);
+    if (!f.isRequired && !explicitTrue) {
+      if (!explicitFalse) return false;
+      rec.status = "skipped";
+      rec.detail = "your profile answers this (" + JSON.stringify(c0) + "), so the box stays unchecked";
+      return true;
+    }
     if (f.isRequired && explicitFalse) { rec.status = "needs_review"; rec.detail = "required checkbox the profile refuses — not auto-consenting"; return true; }
     rec.resolved = true;
     const r = await act.eval(atsInjSetChecked, ref.inputSel, true);
@@ -1847,11 +2681,12 @@ function atsInjSelectNative(inputSel, optionText) {
 
 // AI fallback for a REQUIRED field the deterministic tiers left empty. Same safety contract
 // as AI-1/AI-2: the choice must clear the match ladder vs live options; ALWAYS flagged.
-async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
+async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetched) {
   const wt = f.widgetType;
   try {
     if (wt === "textarea" || wt === "text" || wt === "date") {
-      const ai = await atsAiWriteText(act, f, profile, jobContext);
+      // use the concurrently-prefetched answer when there is one (atsPrefetchAiText); otherwise ask now
+      const ai = prefetched || await atsAiWriteText(act, f, profile, jobContext);
       if (!ai.ok || !ai.answer) {
         // REQUIRED text the AI can't ground: write "N/A" — a real, submittable answer that reads
         // correctly on the form (operator 2026-07-31: "never answer with AI declined, N/A would be
@@ -1879,16 +2714,26 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
     }
     // choice widgets: read live options (radio/yesno carry them on the scan; combobox opens).
     let texts = f.options || [];
+    if (rec.optionsUnreadable && !texts.length) {
+      // the deterministic pass just spent the full budget establishing there is nothing to read
+      rec.status = "needs_review";
+      rec.detail = rec.detail || "AI fallback: no live options to choose from";
+      return;
+    }
     if (wt === "select" || wt === "dial" || wt === "location" || wt === "dropdown_native") {
       if (wt !== "dropdown_native") {
         await act.eval(atsInjOpenAndReadOptions, ref.inputSel);
         // read-first, then poll adaptively (same rule as the deterministic path) — a one-shot
         // read after a flat wait both over-waits an open menu and under-waits a slow one
-        const optDeadline = Date.now() + 1800;
+        const optDeadline = Date.now() + ATS_POLL.open;
+        const optCeiling = Date.now() + ATS_POLL.openCeil;
         for (;;) {
           const read = await act.eval(atsInjReadOptions, ref.inputSel);
           texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
-          if (texts.length || Date.now() >= optDeadline) break;
+          const now = Date.now();
+          // …and an empty menu is not an answer while the widget is still FETCHING (2026-08-04);
+          // giving up here is what strands a required field with "no live options to choose from".
+          if (texts.length || now >= optCeiling || (now >= optDeadline && !(read && read.loading))) break;
           await act.delayFull(150); // real interval — see pollFor's note on starving the renderer
         }
       }
@@ -1918,7 +2763,11 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
       rec.detail = why + " — chose this form's own " + JSON.stringify(dec) + " so it cannot block the submit; change it here if you would rather answer" + (ok ? "" : " (commit failed)");
       return ok;
     };
-    const ai = await atsAiChooseOption(act, f, texts, profile, jobContext);
+    // a prefetched decision (atsPrefetchAiText) was made against the SAME options the scan reported,
+    // so it is only reused when the live read agrees with that list — otherwise ask again, because the
+    // AI must always choose from what the form is actually showing.
+    const preUsable = prefetched && Array.isArray(f.options) && f.options.length === texts.length;
+    const ai = preUsable ? prefetched : await atsAiChooseOption(act, f, texts, profile, jobContext);
     if (!ai.ok) { await declineFallback("no grounded answer for this REQUIRED question (" + ai.error + ")"); return; }
     const m = atsLib.matchCandidates([ai.choice], texts, { containment: true });
     if (!m || m.targetIndex < 0) {
@@ -1946,7 +2795,14 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
     rec.status = okv ? "filled_review" : "needs_review"; // AI is NEVER a silent fill
     rec.resolved = [ai.choice];
     rec.confidence = String(ai.confidence || "low").toLowerCase();
-    rec.flag = atsFd.legallyLoaded(f.label) ? "ai-choice-sensitive" : "ai-choice";
+    // A GUESSED DEMOGRAPHIC IS ITS OWN CATEGORY. The Workday path has flagged these `ai-eeo-guess`
+    // since AI-3 — "AI-GUESSED DEMOGRAPHIC — VERIFY", which the review editor renders loudest — but
+    // this path only had ai-choice / ai-choice-sensitive, so a model-inferred veteran or gender answer
+    // wore an ordinary AI badge (live 2026-08-06, Reddit: "No military service", and a transgender
+    // question answered from the profile's GENDER — a related but different fact).
+    rec.flag = atsIsEeoLabel(f.label)
+      ? "ai-eeo-guess"
+      : (atsFd.legallyLoaded(f.label) ? "ai-choice-sensitive" : "ai-choice");
     rec.detail = "AI: " + (ai.justification || "inferred") + (okv ? "" : " — commit failed");
     rec.maps_to = ai.maps_to || ""; rec.suggested_category = ai.suggested_category || "";
   } catch (e) {
@@ -1959,15 +2815,17 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
-    atsRouteLabel, atsRouteField, atsDialStrip, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, driveAtsPageFill, atsActuateField,
+    atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsDialMatch, atsDialCode, atsDialName,
+    atsIsEeoLabel,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
+    atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
-    atsInjClickYesNo, atsInjAttachFile, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
+    atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };
 }

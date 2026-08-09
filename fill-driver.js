@@ -36,7 +36,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       parseYearMonthDay: parseYearMonthDay, isCompensationQuestion: isCompensationQuestion,
       // replayField re-derives a SIGNATURE date to TODAY and uses this to skip the rewrite when the
       // approved value already IS today (so a same-day replay stays a zero-actuation no-op).
-      isSignatureDateQuestion: isSignatureDateQuestion, sameCalendarDate: sameCalendarDate,
+      isSignatureDateQuestion: isSignatureDateQuestion, signatureDateDemanded: signatureDateDemanded, signatureDateAskInText: signatureDateAskInText, isJobPostingGone: isJobPostingGone, sameCalendarDate: sameCalendarDate,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
@@ -7780,6 +7780,11 @@ function buildReviewBundle(results, meta) {
       cascade_revealed: !!rec.cascadeRevealed, // M6: this field appeared only AFTER an earlier value committed (cascade re-scan) → the viewer badges it + it FORCES a second review before submit
       options: Array.isArray(rec.options) ? rec.options : null,
       captured_options: Array.isArray(rec.captured_options) ? rec.captured_options : null,
+      // WHY the option list is partial travels with it, rather than being re-derived from its
+      // LENGTH on the far side (2026-08-07). The website inferred "partial" from
+      // captured_options.length > 2, so a server-backed field whose search returned one or two
+      // rows — the exact case that most needs explaining — got no explanation at all.
+      options_partial: rec.optionsPartial === true ? true : null,
       // A checkbox GROUP holds a SET; current_value is the joined display string and this is the
       // authoritative array. Absent for every other widget.
       selected_options: Array.isArray(rec.selected_options) ? rec.selected_options : null,
