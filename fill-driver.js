@@ -39,6 +39,10 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       isSignatureDateQuestion: isSignatureDateQuestion, sameCalendarDate: sameCalendarDate,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
+      // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
+      // search is already fuzzy, and wrong), and missingSkills is what keeps a re-fill idempotent.
+      skillBaseName: skillBaseName, matchSkillOption: matchSkillOption, missingSkills: missingSkills,
+      isSkillsFieldName: isSkillsFieldName, skillChipName: skillChipName,
       // The AI's option list must never include a menu's prompt row ("Select One").
       isPlaceholderOption: isPlaceholderOption, withoutPlaceholderOptions: withoutPlaceholderOptions };
 
@@ -302,6 +306,12 @@ const DEFAULT_BUDGETS = {
   openExpandWindowMs: 2000,
   reopenSettleMs: 400,
   taOpenRetries: 3,       // same race on the typeahead searchBox open/focus
+  // SKILLS is the one field whose cost scales with the PROFILE, not the form: each skill is its own
+  // clear→type→Enter→settle→click round trip (~2–4s), so 24 skills is a real slice of the page. The
+  // cap and the wall-clock budget bound that; whatever they drop is NAMED in the record, never
+  // silently trimmed. Raise them if a profile carries more skills than a page-time budget allows.
+  skillsMaxAdds: 40,
+  skillsBudgetMs: 180000,
   commitCeilingMs: 10000, // click/Enter → observable state change
   commitIntervalMs: 300,
   textReadDelayMs: 500,   // insertText → read-back (legacy; reactive poll below)
@@ -782,6 +792,13 @@ const fillTextCdp = async (act, loc, value, budgets, tag, opts) => {
       await act.delay(budgets.textReadIntervalMs);
     } while (Date.now() < deadline);
     if (textValuesMatch(after, value)) {
+      // COMMIT BY BLURRING, same as the date composite (operator, 2026-08-08). Workday rejected a page
+      // with "Invalid LinkedIn URL" on a field that visibly held a valid URL, and the operator's manual
+      // fix was to click into the box and back out. Several Workday inputs VALIDATE and hand their value
+      // to the form model on blur, so a field we typed and never left can read correct in the DOM and
+      // still be wrong (or unset) as far as Workday is concerned. Blurring is what a human does on the
+      // way to the next field; the read-back above already decided the value, so this only commits it.
+      if (act.blurActive) { try { await act.blurActive(); } catch (e) { /* best-effort */ } }
       let detail = before ? `overwrote "${before}"` : null;
       if (attempt > 1) detail = (detail ? detail + " | " : "") + `self-healed on attempt ${attempt}`;
       return { status: "filled", after, verified: true, detail };
@@ -2581,10 +2598,13 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
   // the type → the async blur landed in that gap → the then-live keptLowerTier re-commit strayed.
   // This puts the scrape entirely BEFORE the loop's single re-assert. (The re-commit itself was later
   // retired — keptLowerTier now Tab-closes in overwriteNoMatchResting, 2026-07-02.)
+  let scrapeMs = 0; // instrumentation (2026-08-08): scrape vs type vs settle, so a slow field names its own phase
   if (opts.onCapture) {
+    const _scT0 = Date.now();
     await act.openHier(loc);
     await awaitListStable(act, (l) => act.readHier(l), loc, budgets); // wait for the OPEN list to render+stabilize (shorter taOpenCeilingMs) before scraping — never a mid-render scrape
     capturedFull = await opts.onCapture();        // scroll-scrape → returns + records options (read-only); leaves the dropdown OPEN
+    scrapeMs = Date.now() - _scT0;
     // PRE-SCRAPE SHORT-CIRCUIT (operator, 2026-07-25). The start-scrape already enumerated the widget's
     // WHOLE option list, so typing a candidate just to learn it isn't offered is pure waste — live, FoS
     // burned ~540ms proving "Electrical and Computer Engineering" was absent before typing the one that
@@ -2678,6 +2698,7 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
     // a partial/unfocused box. (The settle above makes a mid-type drop rare; this makes the loop closed, not
     // just probabilistically safe.)
     let snap = null, snapSig = null, landed = false;
+    const _tyT0 = Date.now(); // clear + type + echo-verify — the phase the operator watched lag
     for (let attempt = 1; attempt <= budgets.taOpenRetries && !landed; attempt++) {
       if (attempt > 1 && !(await ensureSearchFocused())) break; // re-assert focus on retry (blur after a prior clear/type)
       await act.clearHierSearch();
@@ -2694,6 +2715,8 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
       await act.pressTab(); // BLUR before leaving: an armed row from a prior/partial filter must not survive to the next field
       return { status: "needs_review", after: null, verified: false, detail: "could not type the candidate into a focused search box (partial/unfocused) — not actuating Enter blind", settle_trace: trace };
     }
+    step.typeMs = Date.now() - _tyT0; // BEFORE the Enter, so it isolates clear+type+echo from the settle
+    if (scrapeMs) { step.scrapeMs = scrapeMs; scrapeMs = 0; } // charged once, to the first candidate
     await act.pressEnter(); // the filter-Enter (the ONLY filter trigger on this widget)
 
     // RENDER GATE (the core fix): block until the list reaches a CONFIRMED terminal render state — banner or
@@ -2936,6 +2959,344 @@ const fillTypeaheadCdp = async (act, loc, candidates, budgets, opts = {}) => {
 // + a few tests call fillSourceCdp(act, loc, candidates, budgets, opts) — signature-identical → the unified
 // filler. (debugStopAfterCategory is now a no-op; that debug dump lived in the removed tryInlineAiSource.)
 const fillSourceCdp = fillTypeaheadCdp;
+
+// Is this the SKILLS multiselect? Deliberately NARROW: the automation-id `skills` (Solar Turbines,
+// LiveRamp) or a label that is exactly "Skills" / "Type to Add Skills", AND a typeahead-family
+// widget. A plain TEXT box labelled "Skills" is a different question with a different answer shape
+// (free prose), and a language-proficiency field must never match — hence the anchored patterns
+// rather than a bare /skill/ test.
+// (The name/label test itself lives in lib.js as isSkillsFieldName, shared with the reconcile's
+// entry-level isSkillsEntry — one predicate, so the fill and the verify cannot disagree.)
+function isSkillsField(f) {
+  if (!f) return false;
+  const w = String(f.widgetType || "");
+  if (w !== "typeahead" && w !== "hierarchical") return false;
+  return apMatch.isSkillsFieldName(f.fieldName, f.label);
+}
+
+// ── SKILLS ("Type to Add Skills") — the MULTI-VALUE typeahead ────────────────────────────────────
+// Same Workday multiselect as cert/source, but it holds a SET, so fillTypeaheadCdp is the wrong
+// shape end to end: that filler commits ONE candidate, treats an existing chip as a pre-fill to
+// KEEP or OVERWRITE, and asserts a single chip on commit (`overwrite-residual-flagged`). Here every
+// commit ADDS, and existing chips are other people's answers, never something to replace.
+//
+// Everything below is keyed to the live trace (cat.wd5, 2026-08-07 — docs/dom-patterns.md):
+//   • It does NOT live-filter. ENTER is the only filter trigger, and the terminal is the
+//     "Search Results" / "No matches found" promptTitle banner — so awaitListTerminal applies as-is.
+//   • The list STAYS OPEN after a commit and the query stays in the box, so N skills go in on ONE
+//     open — no re-open, no re-focus dance between them.
+//   • ⚠ A ZERO-RESULT query + Enter makes Workday ADD THE TYPED TEXT as a brand-new skill. That is
+//     how a dirty box becomes a real wrong answer: mid-trace an uncleared box turned
+//     "Docker" + "CubeMars motor drivers" into the chip "DockerCubeMars motor drivers". So the
+//     clear is a HARD GATE here — unverified-empty means we do NOT press Enter, where every other
+//     typeahead could afford to treat a dirty box as merely a wasted candidate.
+//   • The server's own search is fuzzy and bad ("Yosys" → "Yodiz"), so matchSkillOption allows
+//     exact/qualified ONLY. A skill Workday doesn't know stays OFF the form — never a near-miss.
+// OPTIONAL field, so there is no AI rescue and no forced pick: what can't be matched is reported.
+const fillSkillsCdp = async (act, loc, skills, budgets, opts = {}) => {
+  const norm = apMatch.normalize;
+  const wanted = (Array.isArray(skills) ? skills : []).map((s) => String(s == null ? "" : s).trim()).filter(Boolean);
+  const pre = await act.readHier(loc);
+  if (!pre) return { status: "error", detail: "skills wrapper not found" };
+  // A résumé-parse chip reads back as "Digital Systems (Suggested)"; that annotation is Workday's own
+  // provenance marker and does NOT appear on its review page, so it is stripped everywhere a chip
+  // becomes a recorded/compared VALUE (see skillChipName).
+  const chipNames = (arr) => (Array.isArray(arr) ? arr : []).map(apMatch.skillChipName).filter(Boolean);
+  const priorChips = chipNames(pre.chips);
+  if (!wanted.length) {
+    return { status: "skipped", after: priorChips.length ? priorChips.join("; ") : null,
+      detail: "no skills in the profile" };
+  }
+  // Idempotency gate — and the reason it is not optional. Workday DROPS an already-selected skill
+  // from its own results, so re-searching a committed "Docker" offers only "Docker (Software)" /
+  // "Dockerfile". Without this the second pass would commit a near-duplicate of every skill it
+  // already added. Base-name comparison, so a qualified chip covers the bare profile name.
+  // ── RECOMMENDED-ONLY (the default) ──────────────────────────────────────────────────────────────
+  // Workday's "Autofill with Resume" parse seeds this field with its OWN suggested skills, and adding
+  // the profile's list on top is slow — every skill is a separate search round trip. So unless the
+  // operator opted in (`profile.fill_all_skills`, the "try to fill all skills" checkbox), we KEEP what
+  // the parse suggested, add nothing, and record it so the review page shows the list for adding or
+  // deleting by hand. Nothing is ever removed here.
+  if (!opts.fillAll) {
+    if (priorChips.length) {
+      return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "skills-suggested",
+        flag: "skills-suggested-kept", confidence: "high", skills_added: [], skills_not_offered: [],
+        detail: `kept the ${priorChips.length} skill(s) Workday suggested from the résumé — "try to fill all skills" is off, so none of the profile's ${wanted.length} were added. Edit the list on the review page.` };
+    }
+    // The parse suggested NOTHING, so "keep the suggestions" would ship an application with no skills at
+    // all. Observed live: the same résumé produced 15 suggestions on one posting, 1 on another and 0 here.
+    // The operator's rule is "leave it be, but record it so users can add or delete" — recording it as a
+    // silent skip would hide it, so an EMPTY field is a review item that names the profile skills waiting.
+    return { status: "needs_review", after: null, flag: "skills-none-suggested", confidence: "none",
+      detail: `Workday's résumé parse suggested no skills, and "try to fill all skills" is off — the field is EMPTY. Add some here, or turn the checkbox on to fill your ${wanted.length} profile skills automatically (slow: roughly 1.5–3s per skill).` };
+  }
+
+  const todo = apMatch.missingSkills(wanted, priorChips);
+  if (!todo.length) {
+    return { status: "filled", after: priorChips.join("; "), verified: true, matchTier: "pre-filled",
+      flag: "skills-already-present", confidence: "high",
+      detail: `all ${wanted.length} profile skill(s) are already on the form — kept (no actuation)` };
+  }
+  const cap = Math.max(1, Number(opts.maxAdds || budgets.skillsMaxAdds || 40));
+  const capped = todo.slice(0, cap);
+  const deadline = Date.now() + Number(budgets.skillsBudgetMs || 180000);
+
+  const added = [];      // [{ skill, option, tier }]
+  // notOffered vs failed is a REPORTING distinction that matters to the human: "Workday's taxonomy
+  // doesn't have this skill" is a fact they can act on (add it by hand / drop it), whereas "our typing
+  // or commit didn't land" means re-run. Lumping the second into the first would tell them a skill
+  // doesn't exist when it does.
+  const notOffered = []; // genuinely absent: a no-match banner, no exact/qualified row, or ambiguous
+  const failed = [];     // infra: could not type it, or the click never produced a chip
+  const unclearable = []; // skipped because the search box would not confirm empty (infra, NOT absence)
+  const strays = [];     // a chip we did not ask for — always surfaced
+  const trace = [];
+  const openDiags = [];  // why an open attempt missed — "could not focus" has several distinct causes
+  let stoppedEarly = null;
+
+  // Focus the search box, opening the widget if it is closed. The input only GAINS
+  // data-automation-id="searchBox" once opened (traced), so readHier reports no searchBox until
+  // the open click lands — same bounded open+focus retry the unified filler uses.
+  const ensureFocused = async () => {
+    // MORE attempts than the shared budget, ALTERNATING the two opener routes. Evidence for both:
+    // under trusted input the widget opened on attempt 1 in ~1.3s, while the faster synthetic run
+    // failed all three attempts — the difference being how recently the PRECEDING field committed, so
+    // the open is racing Workday's re-render rather than needing a particular event kind. One settle
+    // beat before the first attempt, then input-route / coordinate-route in turn (never both in one
+    // attempt — a second click toggles an opening multiselect shut).
+    const attempts = Math.max(4, budgets.taOpenRetries);
+    await act.delay(budgets.reopenSettleMs); // let the previous field's re-render land before we click
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      let st = await act.readHier(loc);
+      if (!st || !st.searchBox.present || !st.searchBox.visible) {
+        // ONE opener action per attempt, then POLL. Two routes exist because while closed the input has
+        // no `searchBox` automation-id, so readHier cannot see it: the widget's own input (page-side
+        // focus + click — no coordinates, no paint) and the coordinate click on its container. The input
+        // route goes first; a later attempt falls back to coordinates.
+        //
+        // ⚠ NEVER both in one attempt. The first cut did exactly that and a HIDDEN run then reported
+        // `focused:true, ok:true, openedNow:false` three times over with ZERO skills added: the input
+        // click opened the widget, the immediate coordinate click landed before the searchBox had
+        // mounted, and a second click on a multiselect TOGGLES IT SHUT — so the poll always found it
+        // closed. This is the same toggle-shut invariant the unified typeahead filler documents.
+        // Route A = page-side focus+click (no coordinates); route B = a TRUSTED coordinate click on the
+        // INPUT's own rect. Alternating them is what makes the open survive the re-render race, and a
+        // page-side click alone was NOT enough live (a run using only route A opened nothing).
+        //
+        // ⚠ Route B must target the INPUT, never the shared `openHier`, which clicks the CENTRE of
+        // `multiselectInputContainer`. On a multi-value widget that container GROWS with each chip, so its
+        // centre drifts onto a CHIP — and a chip's `DELETE_charm` is part of it. Live: `Git` was on the
+        // form after one run and GONE after the next, in a run that logged our own "the chip set changed"
+        // signal. Deleting a skill the operator listed is worse than any fill failure.
+        const routeA = (attempt % 2 === 1) && act.openHierInput;
+        if (routeA) openDiags.push(await act.openHierInput(loc)); // NOT `step` — that is per-skill, out of scope
+        else if (act.clickHierInputRect) { if (!(await act.clickHierInputRect(loc))) { await act.delay(budgets.reopenSettleMs); continue; } }
+        else if (!(await act.openHier(loc))) { await act.delay(budgets.reopenSettleMs); continue; }
+        const t0 = Date.now();
+        while (Date.now() - t0 < budgets.taOpenCeilingMs) {
+          await act.delay(budgets.taOpenIntervalMs);
+          st = await act.readHier(loc);
+          if (st && st.searchBox.visible) break;
+        }
+      }
+      if (st && st.searchBox.visible && !st.searchBox.focused) {
+        await act.focusHierSearch(loc);
+        st = await act.readHier(loc);
+      }
+      if (st && st.searchBox.focused) return st;
+      await act.delay(budgets.reopenSettleMs);
+    }
+    return null;
+  };
+
+  // NOTE for anyone debugging a hidden run: forcing TRUSTED input here was tried and is NOT needed.
+  // The hidden failure looked like a trusted-input problem (a hidden synthetic run opened nothing while
+  // the same run under forceTrustedInput opened fine), but an isolation probe — the opener fix below with
+  // the trusted scoping REMOVED — filled the field normally on a hidden synthetic tab. The real cause was
+  // the opener racing Workday's re-render, not the event kind. Don't re-add trusted input here; it roughly
+  // doubles the field's wall-clock and buys nothing.
+  let clearFails = 0;
+  for (const skill of capped) {
+    if (Date.now() > deadline) { stoppedEarly = "time budget"; break; }
+    // `candidate` (not `skill`) because the walk's settle-trace printer reads that key — with the
+    // wrong name every line logged `cand "undefined"`, which is how a readable trace becomes useless.
+    const step = { candidate: skill };
+    trace.push(step);
+    const t0 = Date.now();
+    // Chips BEFORE this skill — the add is verified as a GROWTH from here, so a commit that
+    // silently replaced instead of adding could never read as success.
+    const before = await act.readHier(loc);
+    const chipsBefore = chipNames(before && before.chips);
+    // Compare CLEANED against CLEANED — mixing raw "X (Suggested)" with a cleaned "X" would read as a
+    // brand-new chip on every poll and report a phantom autocommit.
+    const chipSetIsNew = (chips) => chipSetChanged(chipsBefore, chipNames(chips));
+
+    if (!(await ensureFocused())) {
+      // WHY it missed, per attempt — without this the log says only "could not focus", which has at
+      // least three causes (no wrapper / no input / opened but the searchBox id never appeared).
+      step.note = "could not focus the search box — not actuating blind"
+        + (openDiags.length ? " | open: " + JSON.stringify(openDiags.slice(-3)) : "");
+      stoppedEarly = "focus";
+      break;
+    }
+    // HARD CLEAR GATE (this widget only): an unverified-empty box + Enter can CREATE a junk skill out
+    // of the leftover text, so we never press Enter on a box we could not confirm empty.
+    //
+    // But a FAILED clear is not a reason to abandon the field. Live (cat.wd5, first run): the clear
+    // failed ONCE mid-list and the whole field stopped, adding 7 skills and silently giving up on the
+    // rest — Git, Docker, VS Code and Vivado were all still to come and all exist in the taxonomy.
+    // The clear is focus-blind (`cdpSelectAllDelete` types Ctrl+A/Delete at whatever holds focus) and a
+    // commit can move focus off the box, so a single failure is a transient. RETRY with a fresh focus
+    // assert; if it still won't empty, SKIP THIS SKILL (safe — skipping never presses Enter) and carry
+    // on. Only a SECOND consecutive failure ends the field, so a genuinely stuck box can't burn the
+    // whole budget one 6s poll at a time.
+    // The clear itself prefers the REACT-SAFE native-setter write (`clearHierInput`), which does not
+    // care where focus is. Trusted Ctrl+A/Delete is the fallback: on this widget Ctrl+A does not select
+    // the input's text (observed by hand, and live it cleared one skill then failed on the next two).
+    let boxEmpty = false;
+    for (let attempt = 1; attempt <= budgets.taOpenRetries && !boxEmpty; attempt++) {
+      if (attempt > 1 && !(await ensureFocused())) break;
+      if (act.clearHierInput) await act.clearHierInput(loc);
+      else await act.clearHierSearch();
+      boxEmpty = await pollSearchValue(act, () => act.readHier(loc), "", budgets);
+      if (!boxEmpty) { await act.clearHierSearch(); boxEmpty = await pollSearchValue(act, () => act.readHier(loc), "", budgets); }
+    }
+    if (!boxEmpty) {
+      clearFails++;
+      step.note = "search box did not read back EMPTY — skill SKIPPED, no Enter (a dirty box can create a junk skill)";
+      unclearable.push(skill);
+      if (clearFails >= 2) { stoppedEarly = "the search box would not clear"; break; }
+      continue;
+    }
+    clearFails = 0;
+    await act.typeInHier(skill);
+    if (!(await pollSearchValue(act, () => act.readHier(loc), skill, budgets))) {
+      step.note = "could not type the full skill into the box — skipped (no Enter on a partial query)";
+      failed.push(skill);
+      continue; // the NEXT skill re-clears + re-verifies, so a partial can't leak into it
+    }
+    await act.pressEnter(); // the ONLY filter trigger on this widget
+    const outcome = await awaitListTerminal(act, (l) => act.readHier(l), loc, budgets, chipSetIsNew);
+    step.outcome = outcome;
+    const s = await act.readHier(loc);
+    // The fields the walk's settle-trace printer reads, so each skill logs one readable line.
+    step.settleMs = Date.now() - t0;
+    step.count = s && s.pageWide ? s.pageWide.count : null;
+    step.banner = !!(s && s.banner);
+    step.open = !!(s && s.searchBox && s.searchBox.visible);
+    step.chips = chipNames(s && s.chips).join("; ") || null;
+
+    if (outcome === "autocommit") {
+      // Workday committed on its own. On THIS widget that means the query returned zero rows and it
+      // added the typed text verbatim — the one path by which a skill outside the taxonomy actually
+      // lands, so it is a success when the new chip is what we typed, and a stray when it is not.
+      const now = chipNames(s && s.chips);
+      const fresh = now.filter((c) => !chipsBefore.some((p) => norm(p) === norm(c)));
+      const mine = fresh.filter((c) => apMatch.skillBaseName(c) === apMatch.skillBaseName(skill));
+      if (mine.length) { added.push({ skill, option: mine[0], tier: "free-text" }); step.added = mine[0]; }
+      else if (fresh.length) { strays.push(...fresh); step.stray = fresh.join("; "); }
+      else {
+        // "autocommit" without a NEW chip. awaitListTerminal reports it when the chip SET differs from
+        // the one we snapshotted, which a re-render/re-order can also produce (live: `cand "C++" →
+        // autocommit, 0 options` while no C++ chip existed afterwards). Nothing was added and nothing
+        // strayed, so this belongs in a bucket rather than vanishing from the report.
+        failed.push(skill);
+        step.note = "the chip set changed but no new chip matched this skill — nothing added";
+      }
+      continue;
+    }
+    if (outcome !== "results") {
+      // A "No matches found" banner is Workday ANSWERING (the skill is absent); a timeout is us not
+      // knowing, which is a different thing to tell the human.
+      if (outcome === "nomatch") { notOffered.push(skill); step.note = "Workday reported no matches"; }
+      else { failed.push(skill); step.note = "no terminal list within budget (" + outcome + ")"; }
+      continue;
+    }
+    const texts = (s && s.pageWide && s.pageWide.texts) || [];
+    step.offered = texts.slice(0, 8);
+    const m = apMatch.matchSkillOption(skill, texts);
+    if (m.index === -1) {
+      // The results are Workday's FUZZY guesses, not candidates. Committing one would put a skill
+      // the applicant never claimed on the application, so this is a deliberate no-op.
+      notOffered.push(skill);
+      step.note = m.ambiguous
+        ? `${m.ambiguous} match was ambiguous (2+ options) — committed nothing`
+        : `no exact/qualified option (offered: ${texts.slice(0, 4).join(" | ") || "none"})`;
+      continue;
+    }
+    const option = texts[m.index];
+    step.matched = { option, tier: m.tier, alternatives: m.alternatives || null };
+    let ok = false;
+    if (await act.clickHierLeaf(loc, option)) {
+      const tCommit = Date.now(); // NOT t0 — that one times the whole skill, and shadowing it here invites a later bug
+      while (Date.now() - tCommit < budgets.commitCeilingMs) {
+        await act.delay(budgets.commitIntervalMs);
+        const after = await act.readHier(loc);
+        const chips = chipNames(after && after.chips);
+        // GROWTH + identity: the set gained a chip AND that chip is the option we clicked.
+        if (chips.length > chipsBefore.length && chips.some((c) => norm(c) === norm(option))) { ok = true; break; }
+      }
+    }
+    if (ok) { added.push({ skill, option, tier: m.tier, alternatives: m.alternatives || [] }); step.added = option; }
+    else { failed.push(skill); step.note = `matched "${option}" but the chip never appeared`; }
+  }
+
+  // Tab is the only clean exit: it blurs, clears the query and closes the list without committing
+  // (verified on this widget — the box read back empty with no stray chip).
+  const endChips = await tabBlurExit(act, loc, (l) => act.readHier(l));
+  const finalChips = endChips == null ? priorChips : chipNames(endChips);
+  const unexpected = finalChips.filter((c) =>
+    !priorChips.some((p) => norm(p) === norm(c)) && !added.some((a) => norm(a.option) === norm(c)));
+  if (unexpected.length) strays.push(...unexpected);
+
+  const dropped = todo.length - capped.length;
+  const bits = [];
+  // Name the mapping whenever the committed option is not literally the profile's wording — a qualified
+  // hit ("Python → Python (Programming Language)") and, louder, a WIDENED containment hit
+  // ("Vivado → Xilinx Vivado (broader)"), which is the one a human should actually eyeball.
+  const widened = added.filter((a) => a.tier === "containment");
+  if (added.length) bits.push(`added ${added.length}: ` + added.map((a) =>
+    a.tier === "containment"
+      ? `${a.skill} → ${a.option} (broader${(a.alternatives && a.alternatives.length) ? "; Workday also offered " + a.alternatives.join(" / ") : ""})`
+      : (norm(a.option) !== norm(a.skill) ? `${a.skill} → ${a.option}` : a.option)).join(", "));
+  if (priorChips.length) bits.push(`kept ${priorChips.length} already on the form`);
+  if (notOffered.length) bits.push(`NOT in Workday's skill list (add by hand if you want them): ${notOffered.join(", ")}`);
+  if (failed.length) bits.push(`could not be entered (typing/commit did not land — re-run): ${failed.join(", ")}`);
+  if (unclearable.length) bits.push(`skipped — the search box would not clear (retry the page): ${unclearable.join(", ")}`);
+  if (dropped > 0) bits.push(`${dropped} skill(s) not attempted — the ${cap}-skill cap`);
+  // Every skill lands in exactly one bucket, so what's left is genuinely untouched. Counting only
+  // added+notOffered here over-reported it as soon as a third bucket existed.
+  const untouched = capped.length - added.length - notOffered.length - failed.length - unclearable.length;
+  if (stoppedEarly) bits.push(`stopped early (${stoppedEarly}) with ${Math.max(0, untouched)} skill(s) unattempted`);
+  if (strays.length) bits.push(`UNEXPECTED chip(s): ${strays.join(", ")}`);
+
+  const after = finalChips.length ? finalChips.join("; ") : null;
+  const base = { after, verified: !strays.length, matchTier: "skills-multi-add",
+    detail: bits.join(" · ") || "nothing to add", skills_added: added.map((a) => a.option),
+    skills_not_offered: notOffered.slice(), skills_failed: failed.concat(unclearable),
+    skills_widened: widened.map((a) => `${a.skill} → ${a.option}`), settle_trace: trace };
+  if (strays.length) return { ...base, status: "needs_review", flag: "skills-stray", confidence: "none" };
+  // An INFRA bail (focus / an unclearable box) is not a clean outcome, even when the form already holds
+  // chips: skills the profile asked for were never attempted. Reporting a silent `filled` there hid a
+  // hidden-tab run that added NOTHING behind seven chips a previous run had put on. So it is surfaced —
+  // flagged when something was added, needs_review when nothing was.
+  if (stoppedEarly && stoppedEarly !== "time budget") {
+    return { ...base, status: added.length ? "filled_review" : "needs_review",
+      flag: "skills-incomplete", confidence: added.length ? "medium" : "none" };
+  }
+  if (!added.length) {
+    // The field is BLANK and the profile had values — that is the case the review gate exists for.
+    return { ...base, status: finalChips.length ? "filled" : "needs_review",
+      flag: finalChips.length ? null : "skills-none-matched", confidence: finalChips.length ? "high" : "none" };
+  }
+  // A WIDENED (containment) commit is a value the operator authorized us to infer, not one they wrote —
+  // so the field goes to review naming each widening, exactly as every other non-exact commit in this
+  // codebase does. Exact/qualified-only stays a silent `filled`.
+  if (widened.length) {
+    return { ...base, status: "filled_review", flag: "skills-containment", confidence: "medium" };
+  }
+  return { ...base, status: "filled", flag: null, confidence: "high" };
+};
 
 // ── AI typeahead fallback (the parked "AI picks from the captured list on a no-match") ───────────
 // When a FLAT typeahead exhausts its tiers and GENUINELY no-matches (genuineNoMatch — every candidate
@@ -3734,6 +4095,18 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           record.resolved = want;
           Object.assign(record, await fillCheckboxCdp(act, loc, want, budgets));
         }
+      } else if (isSkillsField(f)) {
+        // SKILLS holds a SET, so it is routed away from the single-value typeahead path before the
+        // unmapped skip that used to leave it empty. Not in FIELD_MAP because FIELD_MAP resolves ONE
+        // value through resolve(); here the whole `profile.skills` array is the answer.
+        record.mappedPath = "skills";
+        const list = (profile && Array.isArray(profile.skills)) ? profile.skills : [];
+        record.rawValue = list.length ? list.slice() : null;
+        record.resolved = list.slice();
+        // OPT-IN, because the cost scales with the profile (~1.5–3s per skill) while Workday's résumé
+        // parse has usually already suggested a reasonable set. Off ⇒ keep the suggestions and record
+        // them for review; on ⇒ add every profile skill the taxonomy will accept.
+        Object.assign(record, await fillSkillsCdp(act, loc, list, budgets, { fillAll: !!(profile && profile.fill_all_skills) }));
       } else if (!mappedPath) {
         record.status = "skipped";
         record.detail = "no mapping";
@@ -6050,6 +6423,17 @@ const fillDateCompositeCdp = async (act, loc, parsed, budgets) => {
     if (!r || !r.ok) allVerified = false;
   }
 
+  // ── COMMIT THE COMPOSITE BY BLURRING IT (operator, 2026-08-08) ─────────────────────────────────
+  // Workday rejected Save & Continue with "The field From is required and must have a value" on a page
+  // whose date segments visibly HELD those values — a phantom error. The operator's manual fix says what
+  // is missing: "all I did was click into and then click out of the box". Clicking out is a BLUR, and
+  // this filler never issued one: it typed each segment, read it back, and moved on. The DOM had the
+  // value; Workday's own model never received the commit.
+  //
+  // Same family as every other React-state lesson here (a native-setter write that no event follows).
+  // The read-back above is unchanged, so this can only ADD a commit — it never decides the value.
+  if (act.blurActive) { try { await act.blurActive(); } catch (e) { /* best-effort — the value is already typed */ } }
+
   const afterStr = ["Month", "Day", "Year"].filter((s) => after[s] != null).map((s) => after[s]).join("/");
   const detail = "segments " + JSON.stringify(trace);
   if (!allVerified) return { status: "needs_review", after: afterStr, verified: false, detail: "date read-back mismatch — " + detail };
@@ -6098,7 +6482,13 @@ function auditActualFromRaw(widgetType, raw) {
     // a GROUP can hold several — compare the whole set, or a two-answer field reads as a mismatch
     case "checkbox_group": { const ok = Array.isArray(raw) && raw.length > 0; const on = ok ? raw.filter((o) => o.checked).map((o) => o.labelText) : [];
       return { actual: on.length ? apMatch.joinGroupValue(on) : null, readable: ok }; }
-    case "typeahead": case "hierarchical": return { actual: raw && raw.chips ? raw.chips.join("; ") : null, readable: !!raw };
+    // Chips go through skillChipName so Workday's "(Suggested)" provenance marker is stripped on BOTH
+    // sides of the comparison. The fill records the bare name (that is what the review page prints), so
+    // without this the audit re-read the annotated chip and flagged a correctly-kept skills field as an
+    // audit-mismatch — observed the moment the stripping was introduced. A no-op for every other
+    // typeahead, whose chips carry no such marker.
+    case "typeahead": case "hierarchical":
+      return { actual: raw && raw.chips ? raw.chips.map(apMatch.skillChipName).join("; ") : null, readable: !!raw };
     case "date": {
       if (!Array.isArray(raw)) return { actual: null, readable: false };
       const parts = [];
@@ -6212,32 +6602,19 @@ async function replayField(act, entry, budgets) {
   const sel = deriveFlatWrapperSel(entry);
   if (!sel) return { status: "error", detail: "could not derive a selector from field_id " + JSON.stringify(entry.field_id) };
   const loc = { wrapperSel: sel };
-  // ── A SIGNATURE DATE IS "NOW", NOT A STORED ANSWER (2026-08-07) ──────────────────────────────────
-  // The self-ID attestation date is the day the form is COMPLETED, and the fill path already stamps it
-  // deterministically (aiFillDate → isSignatureDateQuestion) rather than treating it as a fact to look
-  // up. The replay, though, wrote back whatever the bundle held — so an approved bundle SIGNED
-  // YESTERDAY replays yesterday's date, and Workday rejects the page outright:
+  // ── THE REPLAY FOLLOWS THE REVIEW PAGE, INCLUDING FOR A SIGNATURE DATE (operator, 2026-08-08) ─────
+  // This used to re-derive a signature date to TODAY on every replay, to dodge Workday's
+  // "Error-Date / Enter today's date" on a bundle approved yesterday. That fixed a stale date and
+  // introduced a worse bug: it wrote a value the human had NOT approved — including onto a date they
+  // had left BLANK — and on the Self Identify page that write CASCADES, making Name and the disability
+  // group required. The rehearse then halted on two questions the human never saw, caused entirely by
+  // our own unapproved write.
   //
-  //   Error-Date  "Enter today's date"          (live, waystar.wd1: bundle approved 08/06,
-  //                                              replayed 08/07 — and it names no field, so
-  //                                              parseErrorFieldName can't route it either)
-  //
-  // That is also why the same page passed on analogdevices: its bundle was filled the SAME day, so the
-  // stored value happened to be today. A one-day-old approval is enough to break it.
-  //
-  // Re-deriving TODAY here does not weaken the approval contract: for this one question the human
-  // approved "the date I am signing", not a specific literal, and the only value this can ever produce
-  // is today's date — never an arbitrary one. Narrow by construction: isSignatureDateQuestion rejects
-  // any label naming a DIFFERENT event (start/birth/graduation/expiry/from/to), so a real date question
-  // still replays exactly what was approved.
-  let value = entry.current_value;
-  if ((widget === "date" || widget === "text") && apMatch.isSignatureDateQuestion(entry.question_label)) {
-    const t = new Date();
-    const fresh = `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`;
-    if (!apMatch.sameCalendarDate(String(value == null ? "" : value), fresh)) {
-      value = fresh;
-    }
-  }
+  // The rule is now the operator's: the replay always follows the review page. Today's date may only be
+  // written REACTIVELY — when Save & Continue actually comes back with "Enter today's date", the walk
+  // stamps it and re-clicks (see the signature-date remediation in runCdpReplayWalk). That keeps the
+  // approval contract intact and still clears the one error the proactive rewrite existed for.
+  const value = entry.current_value;
   // A checkbox GROUP's answer is a SET. `groupSelection` prefers the authoritative array the review
   // editor writes and falls back to splitting the joined string for a bundle written before it
   // existed — so the replay never has to re-derive the human's choice from a display string when the
@@ -6263,6 +6640,19 @@ async function replayField(act, entry, budgets) {
       return Object.assign({ replay: "cleared" }, await fillTextCdp(act, loc, "", b, tag));
     }
     return { status: "skipped", replay: "cleared", detail: "left blank (cleared in review; a fresh form defaults to blank)" };
+  }
+
+  // SKILLS: the approved value is a SET joined "A; B; C", so the single-candidate typeahead replay would
+  // hand Workday that whole string as one skill and fail every time. Split it back and run the additive
+  // filler, which is idempotent by construction (missingSkills skips what the form already holds, so a
+  // second rehearsal actuates nothing) — that is also why this sits ABOVE skip-if-correct: an ordering
+  // difference between the chips and the stored string must not read as a mismatch and trigger a re-add.
+  if (isSkillsField({ widgetType: widget, fieldName: replayEntryFieldName(entry), label: entry.question_label })) {
+    // fillAll:true regardless of the profile toggle — a replay is not making the policy choice, it is
+    // reproducing the list a human APPROVED. (On a rehearse the form re-entered via Continue already
+    // holds those skills, so missingSkills makes this a no-op; the flag only matters if one is absent.)
+    return Object.assign({ replay: "skills-multi" },
+      await fillSkillsCdp(act, loc, apMatch.splitGroupValue(value), b, { fillAll: true }));
   }
 
   // SKIP-IF-CORRECT (minimal-diff replay): read the field's LIVE value FIRST; if it already equals the
@@ -7347,5 +7737,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

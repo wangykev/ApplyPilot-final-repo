@@ -476,6 +476,11 @@ export function decideTeachPlan(
  *  ("First Name", "Postal Code", "Willing To Relocate") is specific enough to stand alone. */
 const GENERIC_FIELD_LABELS = new Set(["type", "name", "value", "other", "notes", "description", "url", "id", "status", "title"]);
 
+/** Profile keys that are RUN SETTINGS, not answers any form asks for. Without this, `fill_all_skills`
+ *  (the "try to fill all skills" checkbox) would be seeded as a Mode-A bucket whose answer is "Yes"/"No",
+ *  and a form question that normalized to "Fill All Skills" would fill from it. Nothing asks that. */
+const NON_ANSWER_FIELDS = new Set(["fill_all_skills"]);
+
 /** Only the PRIMARY entry of a repeating section gets a default wording — a flat tenant asks "School"
  *  once, and a bucket binds to ONE path (the education.0.* starter convention). "education.1.gpa" etc.
  *  are skipped. A non-indexed path always passes. */
@@ -526,6 +531,7 @@ export function ensureDefaultFieldWordings(buckets: Bucket[], profile: unknown):
   for (const r of rows) {
     const label = String(r.label || "").trim();
     if (!label || GENERIC_FIELD_LABELS.has(label.toLowerCase())) continue;
+    if (NON_ANSWER_FIELDS.has(String(r.path || "").trim())) continue; // a run setting, not a form answer
     if (!isPrimaryEntryPath(r.path)) continue;
     const path = r.path.trim();
     if (!path) continue;

@@ -1,0 +1,52 @@
+C
+C++
+Python
+SystemVerilog
+Java
+JavaScript
+HTML/CSS
+CAN
+Modbus
+Raspberry Pi
+ODrive
+CubeMars motor drivers
+ROS 2
+RViz
+rqt
+Linux
+Altium Designer
+Fusion 360
+PCB design
+Oscilloscope
+Logic analyzer
+Git
+Docker
+VS Code
+Vivado
+Yosys
+
+--- notes (2026-08-07) ---
+26 skills, in profile order, from data/profile.json.
+
+Oscilloscope and Logic analyzer are in data/profile.json ONLY. The website profile
+(app/profile), which is what syncs to the extension and drives the fill, lists the
+other 24 without them — so today they would never be offered to a form. Add them on
+the website profile if you want them filled.
+
+Of the 24 the extension currently sees, 18 land on Workday (cat.wd5, verified):
+  Altium Designer, C (Programming Language), Docker (Software), Fusion 360, Git,
+  Java (Programming Language), JavaScript, Linux, Modbus, PCB design,
+  Python (Programming Language), Raspberry Pi, ROS 2, RViz, SystemVerilog, Yosys,
+  rqt, Xilinx Vivado
+
+6 do not, because Workday's skill taxonomy has no matching row on that tenant — the
+rows it offers are different skills, so committing one would be a wrong answer:
+  C++        (offers C (Programming Language), C NMR, C-Arm)
+  HTML/CSS   (offers CSS HTML, XHTML CSS, Cshtml)
+  CAN        (offers CANopen, CANape, Can Openers)
+  ODrive     (offers Top Drive, Optical Disk Drives)
+  VS Code    (offers ISM Code, M-Code, Code V (Software))
+  CubeMars motor drivers  (offers Motor Drives, Motor Controllers)
+
+Which skills match varies by tenant and even between runs, since Workday returns a
+ranked top-7 for each query — this list is one tenant's result, not a fixed verdict.

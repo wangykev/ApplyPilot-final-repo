@@ -262,3 +262,46 @@ test("breaker: a SUCCESS clears it, so a recovered quota resumes full retrying",
   assert.ok(c2.length > 1, "full ladder again after the success");
   resetLlmRetryState();
 });
+
+// ── PER-ATTEMPT REQUEST TIMEOUT ─────────────────────────────────────────────
+// Live (cat.wd5, 2026-08-08): AI-4 remediation took ~182s to clear ONE field, and 148s of that was a
+// SINGLE hung call — `[LLM] ok in 148262ms` — while the identical retry right after it returned in
+// 2005ms and every other call in the run took 0.5-2s. fetch() has no timeout of its own, so one stuck
+// socket blocked the whole walk. Each attempt is now bounded; the abort throws, which callLLMOnce
+// already treats as a retryable transient.
+test("a request that never answers is ABORTED and retried, not waited on forever", async () => {
+  resetLlmRetryState();
+  let attempts = 0;
+  const fetchImpl = async (url, opts) => {
+    attempts++;
+    if (attempts === 1) {
+      return await new Promise((_resolve, reject) => {
+        if (opts && opts.signal) opts.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      }); // never resolves on its own — the live hang
+    }
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: "hi" }] } }] }) };
+  };
+  const r = await callLLM(
+    { provider: "gemini", model: LLM_DEFAULT_MODELS.gemini, apiKey: "k", user: "q", timeoutMs: 40 },
+    fetchImpl,
+    async () => {} // don't actually sleep the retry ladder
+  );
+  assert.equal(attempts, 2, "the hung attempt was abandoned and re-issued");
+  assert.equal(r.ok, true);
+  assert.equal(r.text, "hi");
+});
+
+test("a hang on EVERY attempt still returns a normalized error — callLLM never throws", async () => {
+  resetLlmRetryState();
+  const fetchImpl = async (url, opts) => new Promise((_res, rej) => {
+    if (opts && opts.signal) opts.signal.addEventListener("abort", () => rej(new Error("aborted")));
+  });
+  const r = await callLLM(
+    { provider: "gemini", model: LLM_DEFAULT_MODELS.gemini, apiKey: "k", user: "q", timeoutMs: 20 },
+    fetchImpl,
+    async () => {}
+  );
+  assert.equal(r.ok, false);
+  assert.match(String(r.error), /timed out after 20ms/, "the reason names the timeout, not a bare network error");
+  resetLlmRetryState();
+});

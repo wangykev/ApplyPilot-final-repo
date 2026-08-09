@@ -364,6 +364,11 @@ async function cdpEval(fn, ...args) {
 const FAST_FACTOR = 0.1;    // fast delays = 1/10 the full delays (rapidfire; raise if a fast fill races — all adaptive sites are gated, so a race retries/flags, never a silent wrong fill)
 const FAST_FLOOR_MS = 10;   // …but never below this (a too-short wait races even full-speed)
 const TYPE_FAST_FLOOR_MS = 15; // per-KEYSTROKE floor (Stage B) — higher than FAST_FLOOR_MS so keystroke-driven listeners still arm the typeahead highlight when typing fast (see cdpTypeChars)
+// One trusted keystroke costing this long means the input pipeline is frame-gated (the tab is not
+// painting), so the REST of the string would cost the same each — cdpTypeChars escalates to the
+// page-side write instead of spending it. Well above a healthy visible keystroke (~10-30ms) and well
+// below the ~1.2-1.5s stall, so a merely-busy page does not trip it.
+const TYPE_STALL_ESCALATE_MS = 250;
 const VIS_TTL_MS = 500;     // re-sample real visibility at most this often (amortize the chrome.tabs/windows round-trip)
 
 let _visCache = { visible: false, at: 0 };
@@ -963,11 +968,24 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
   // the big hidden win (a 35-char typeahead candidate = 70 frame-gated Input commands ≈ 40s → 1 eval).
   // REPLACE is correct at every call site: typing always follows a clear (typeInSearch) or a
   // select-all (dates — where replace ≡ what select+type achieved); the read-back/chip gates verify.
+  // WHICH PATH TYPED, and what it cost. Added 2026-08-08 chasing the field-of-study lag: the story
+  // "trusted per-char typing is the slow part" only holds if the trusted path RAN, and during a fill walk
+  // synthetic is enabled regardless of visibility — so the fall-through below is the interesting event,
+  // not the happy path. Logged only when it costs real time, so a healthy field stays quiet.
+  const _tcT0 = Date.now();
   if (await cdpSynthInput("text")) {
     try {
       const r = await cdpEval(cdpSynthSetValue, String(text), true);
-      if (r && r.ok) { inputLog("typeChars(synth)", JSON.stringify(String(text))); return; }
-    } catch (e) { /* fall through to trusted per-char */ }
+      if (r && r.ok) {
+        const ms = Date.now() - _tcT0;
+        if (ms > 800) console.log(`[ApplyPilot][CDP-TYPE] page-side write took ${ms}ms for ${String(text).length} chars — the eval itself was slow, not the keystrokes.`);
+        inputLog("typeChars(synth)", JSON.stringify(String(text)));
+        return;
+      }
+      console.log(`[ApplyPilot][CDP-TYPE] page-side write DECLINED (${(r && r.reason) || "no ok"}) — falling back to trusted per-char for ${String(text).length} chars.`);
+    } catch (e) {
+      console.log(`[ApplyPilot][CDP-TYPE] page-side write THREW (${String((e && e.message) || e).slice(0, 80)}) — falling back to trusted per-char for ${String(text).length} chars.`);
+    }
   }
   // Per-char gap is ADAPTIVE (Stage B): fast (fg / worker-fast) → scale by FAST_FACTOR but keep the
   // typing-specific TYPE_FAST_FLOOR_MS (> FAST_FLOOR_MS) so keystroke-driven listeners still arm the
@@ -977,13 +995,52 @@ async function cdpTypeChars(text, perCharDelayMs = 40) {
   // (chip/value read-back → needs_review), never a silent wrong fill.
   const fast = await cdpFast();
   const gap = fast ? Math.max(TYPE_FAST_FLOOR_MS, Math.round(perCharDelayMs * FAST_FACTOR)) : perCharDelayMs;
-  for (const ch of String(text)) {
+  // ── ESCALATE OFF A MEASURED STALL (operator, 2026-08-08) ────────────────────────────────────────
+  // Trusted input rides compositor-frame scheduling, so a tab that is NOT PAINTING stalls ~1.2-1.5s per
+  // event — and this loop spends TWO events per character. "Electrical and Computer Engineering" is 35
+  // chars ≈ 70 commands ≈ 90s. That is the field-of-study lag the operator watched: not the option
+  // scrape, but the typing right after it.
+  //
+  // Synthetic mode already avoids this, but it only engages when the tab reports HIDDEN — and an
+  // OCCLUSION (alt-tabbed behind another window) still reports `tab.active && !minimized`, so the label
+  // says visible while the compositor produces no frames. Rather than trust the label, MEASURE the first
+  // keystroke: if it comes back pathologically slow, the remaining characters would each cost the same,
+  // so finish the whole string with the page-side native-setter REPLACE (exactly what the hidden path
+  // above does). Same escalate-on-evidence shape as the dropdown commit's beat ladder.
+  //
+  // Safe because it changes only HOW the text lands, never whether it is verified: every call site
+  // follows a clear/select-all (so REPLACE ≡ what typing achieved) and gates on the echo/read-back poll,
+  // so a synthetic write that does not register still ends needs_review rather than a wrong value.
+  const chars = Array.from(String(text));
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
     const isLetter = /^[a-z]$/i.test(ch);
     const isDigit = /^[0-9]$/.test(ch);
     const code = isLetter ? "Key" + ch.toUpperCase() : isDigit ? "Digit" + ch : ch === " " ? "Space" : "";
     const vk = isLetter || isDigit ? ch.toUpperCase().charCodeAt(0) : ch === " " ? 32 : 0;
+    const t0 = Date.now();
     await cdpKeyTap({ key: ch, code, vk, text: ch });
+    const dt = Date.now() - t0;
+    if (i === 0 && dt >= TYPE_STALL_ESCALATE_MS && chars.length > 4) {
+      const projected = Math.round((dt * chars.length) / 1000);
+      try {
+        const r = await cdpEval(cdpSynthSetValue, String(text), true);
+        if (r && r.ok) {
+          console.log(`[ApplyPilot][CDP] typing STALLED (${dt}ms for one keystroke — the tab is not painting, so trusted input is frame-gated);`
+            + ` ${chars.length} chars would have taken ~${projected}s. Switched to the page-side write for this value.`);
+          inputLog("typeChars(escalated-synth)", JSON.stringify(String(text)));
+          return;
+        }
+      } catch (e) { /* page-side write unavailable — keep typing, slowly but correctly */ }
+    }
     await cdpDelay(gap);
+  }
+  // The trusted per-char path actually ran. Report what it cost per keystroke — that number is the whole
+  // argument: ~10-30ms is a painting tab, ~1.1-1.5s is a frame-gated one.
+  const _tcMs = Date.now() - _tcT0;
+  if (_tcMs > 1200) {
+    console.log(`[ApplyPilot][CDP-TYPE] TRUSTED per-char typing: ${chars.length} chars in ${_tcMs}ms`
+      + ` (~${Math.round(_tcMs / Math.max(1, chars.length))}ms/char, gap ${gap}ms) — ${await cdpPaintLabel()}.`);
   }
 }
 
@@ -1959,6 +2016,15 @@ function cdpOnboardScan() {
     adventureButton: present('[data-automation-id="adventureButton"]'),
     continueButton: present('[data-automation-id="continueButton"]'),
     applyManually: present('[data-automation-id="applyManually"]'),
+    // "Autofill with Resume" — the chooser option that makes Workday PARSE the résumé and pre-populate
+    // the application, including the Skills section with its own suggested skills (traced 2026-08-07 on
+    // cat.wd5). Preferred for a FIRST application; never used by a rehearse/submit run, which must not
+    // re-parse (see runCdpOnboard's preferResumeAutofill).
+    autofillWithResume: present('[data-automation-id="autofillWithResume"]'),
+    // The résumé-upload page that Autofill-with-Resume lands on BEFORE My Information: a page with the
+    // upload input and effectively no form fields. Same automation-ids attachResume already drives.
+    resumeUploadInput: present('input[type="file"][data-automation-id="file-upload-input-ref"]'),
+    resumeUploadSuccess: present('[data-automation-id="file-upload-successful"]'),
     useMyLastApplication: present('[data-automation-id="useMyLastApplication"]'),
     signInLink: present('[data-automation-id="signInLink"]'),
     createAccountLink: present('[data-automation-id="createAccountLink"]'),
@@ -2487,6 +2553,45 @@ function cdpFocusBySel(sel) {
   if (!el || !el.focus) return false;
   el.focus();
   return document.activeElement === el;
+}
+
+// Clear a multiselect's search input the REACT-SAFE, FOCUS-INDEPENDENT way: the native value setter
+// plus input/change (the standard React fill technique). The other typeaheads clear with trusted
+// Ctrl+A/Delete (cdpSelectAllDelete), but on the SKILLS widget Ctrl+A does NOT select the input's
+// text — observed by hand: the select-all went to the page, the next keystrokes APPENDED to the stale
+// query, and Enter turned "Docker" + "CubeMars motor drivers" into the chip
+// "DockerCubeMars motor drivers". On this widget a stale query can FABRICATE a skill, so the clear
+// must not depend on where focus happens to be. Live, a trusted-hidden run cleared fine for one skill
+// and then failed on the next two, which is exactly the flakiness a focus-blind primitive produces.
+function cdpClearInputNative(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, reason: "no input" };
+  const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
+  try { if (d && d.set) d.set.call(el, ""); else el.value = ""; } catch (e) { return { ok: false, reason: "set threw" }; }
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return { ok: true, value: el.value };
+}
+
+// Open a multiselect by acting on its OWN input, page-side — no coordinates, no paint required.
+// Why this exists (skills, traced 2026-08-07): the input gains data-automation-id="searchBox" only
+// ONCE OPEN, so while closed every searchBox-keyed selector misses it and opening has to go through
+// a COORDINATE click on the container. That click is what failed on a HIDDEN run which worked fine
+// visible — the field logged "could not focus the search box" and added zero skills. By hand, what
+// reliably opened the widget was focus() + click() on the input itself, which is what this does.
+// Returns a diagnostic (not a bare bool) so a failure says WHICH step missed; the caller still polls
+// readHier, because the searchBox id appears on a later React tick.
+function cdpOpenMultiselectInput(wrapperSel) {
+  const w = document.querySelector(wrapperSel);
+  if (!w) return { ok: false, reason: "no wrapper" };
+  const inp = w.querySelector("input");
+  if (!inp) return { ok: false, reason: "no input" };
+  if (inp.scrollIntoView) inp.scrollIntoView({ block: "center", behavior: "instant" });
+  try { inp.focus(); } catch (e) { /* keep going — the click may still open it */ }
+  const focused = document.activeElement === inp;
+  try { inp.click(); } catch (e) { return { ok: false, reason: "click threw", focused }; }
+  const sb = w.querySelector('input[data-automation-id="searchBox"]');
+  return { ok: true, focused, openedNow: !!sb };
 }
 
 // Same focus attempt, but it REPORTS what happened instead of a bare boolean — whether the node was
@@ -4190,6 +4295,37 @@ function makeCdpActuation(llmConfig) {
     focusHierSearch: (loc) => cdpEval(cdpFocusBySel, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
     // Diagnostic twin — same attempt, but returns WHY it failed (see cdpFocusDiag).
     focusHierSearchDiag: (loc) => cdpEval(cdpFocusDiag, loc.wrapperSel + ' input[data-automation-id="searchBox"]'),
+    // The multiselect's input carries data-automation-id="searchBox" ONLY ONCE OPEN (skills, traced
+    // 2026-08-07), so every searchBox-keyed selector above is unreachable while the widget is closed and
+    // opening otherwise has to go through a COORDINATE click. focus() + click() on the widget's own input
+    // needs no coordinates and no paint — the skills opener alternates the two routes. Returns a
+    // diagnostic (not a bool); the caller polls readHier, since the searchBox id appears a tick later.
+    openHierInput: (loc) => cdpEval(cdpOpenMultiselectInput, loc.wrapperSel),
+    // A TRUSTED coordinate click aimed at the widget's own INPUT rect. openHier's ladder resolves
+    // `multiselectInputContainer` first and clicks its CENTRE, which is fine for a single-value picker but
+    // wrong for a multi-value one: that container GROWS with each chip, so its centre drifts onto a CHIP,
+    // whose DELETE_charm is part of it (live: a skill present after one run was GONE after the next, in a
+    // run that logged our own "chip set changed" signal). The input is a distinct element from the chips,
+    // so a click at ITS centre opens the widget and cannot delete anything.
+    clickHierInputRect: async (loc) => {
+      const r = await cdpEvalRectReady(cdpRectOf, loc.wrapperSel + " input", true);
+      if (!r || r.w <= 0) return false;
+      await cdpClickAt(r.cx, r.cy);
+      return true;
+    },
+    // React-safe, focus-independent clear of the widget's search input (see cdpClearInputNative).
+    clearHierInput: (loc) => cdpEval(cdpClearInputNative, loc.wrapperSel + " input"),
+    // Blur whatever holds focus — the "click out of the box" half of a commit. Workday's date composite
+    // keeps a typed value in the DOM but does not hand it to its own model until the field is left, which
+    // surfaced as a phantom "The field From is required" on a page visibly showing the date.
+    blurActive: () => cdpEval(() => {
+      const el = document.activeElement;
+      if (!el || !el.blur || el === document.body) return { ok: false, reason: "nothing focused" };
+      const aid = (el.getAttribute && el.getAttribute("data-automation-id")) || el.id || el.tagName;
+      el.blur();
+      try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch (e) { /* blur alone may suffice */ }
+      return { ok: true, blurred: aid };
+    }),
     typeInHier: (text) => cdpTypeChars(text, 40),
     clearHierSearch: () => cdpSelectAllDelete(),
     probeHierLeaf: (label) => cdpEval(cdpSourceLeafProbe, label),

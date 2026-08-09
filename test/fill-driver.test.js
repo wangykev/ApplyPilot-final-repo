@@ -9651,20 +9651,35 @@ const sigEntry = (label, value) => ({
 });
 const sigField = () => ({ wrapperSel: '[data-automation-id="formField-dateSignedOn"]', fieldName: "dateSignedOn", widgetType: "text", value: "" });
 
-test("replayField: a STALE signature date is re-derived to TODAY", async () => {
+// RULE CHANGE (operator, 2026-08-08): the replay FOLLOWS THE REVIEW PAGE, including for a signature
+// date. Re-deriving it to today on every replay wrote a value the human had not approved — including
+// onto a date they left BLANK — and on the Self Identify page that write CASCADES (Name and the
+// disability group become required), so the rehearse halted on questions the human never saw. Today's
+// date is now written only REACTIVELY, when Workday answers Save & Continue with "Enter today's date"
+// (the stamp lives in runCdpReplayWalk, not here).
+test("replayField: a STALE signature date replays the APPROVED value, not today", async () => {
   const f = sigField();
   const r = await replayField(makeFakeAct([f]), sigEntry("Date*", SIG_YESTERDAY), T_BUDGETS);
   assert.strictEqual(r.status, "filled");
-  assert.strictEqual(f.value, SIG_TODAY, `expected today's date on the page, got ${JSON.stringify(f.value)}`);
-  assert.notStrictEqual(f.value, SIG_YESTERDAY, "yesterday's date is what Workday rejects");
+  assert.strictEqual(f.value, SIG_YESTERDAY, "the replay must not invent a value the review page did not approve");
+  assert.notStrictEqual(f.value, SIG_TODAY);
 });
 
-test("replayField: the explicit signature wordings are re-derived too", async () => {
+test("replayField: the explicit signature wordings are NOT re-derived either", async () => {
   for (const label of ["Date Signed", "Today's Date", "Signature Date", "Date of Completion"]) {
     const f = sigField();
     await replayField(makeFakeAct([f]), sigEntry(label, SIG_YESTERDAY), T_BUDGETS);
-    assert.strictEqual(f.value, SIG_TODAY, `${label} should stamp today`);
+    assert.strictEqual(f.value, SIG_YESTERDAY, `${label} must replay what was approved`);
   }
+});
+
+test("replayField: an UNAPPROVED (blank) signature date is left alone — the cascade bug", async () => {
+  // The specific live failure: the proactive rewrite stamped a date the human had left blank, which made
+  // Name and the disability checkbox group required, and the rehearse then halted on both.
+  const f = sigField();
+  const r = await replayField(makeFakeAct([f]), sigEntry("Date*", ""), T_BUDGETS);
+  assert.notStrictEqual(f.value, SIG_TODAY, "a blank approval must not become today's date");
+  assert.ok(r.status === "skipped" || f.value === "", `expected no write, got ${JSON.stringify(r)}`);
 });
 
 test("replayField: a signature date that is ALREADY today writes today (never yesterday)", async () => {

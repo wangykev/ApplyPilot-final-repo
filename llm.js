@@ -185,6 +185,34 @@ const LLM_RETRY_DELAYS_MS = [2000, 8000, 20000, 45000];
 // A 429 usually carries Retry-After (seconds, or an HTTP date). Obeying the server beats
 // guessing — but cap it, so a header asking for an hour can't hang a run.
 const LLM_RETRY_AFTER_CAP_MS = 60000;
+// ── PER-ATTEMPT REQUEST TIMEOUT (operator, 2026-08-08) ──────────────────────────────────────────
+// A request that never answers used to block the whole walk, because fetch() has no timeout of its
+// own. Live on cat.wd5: AI-4 remediation took ~182s to clear ONE field, and 148s of that was a single
+// hung call — `[LLM] ok in 148262ms` — while the IDENTICAL retry right after it returned in 2005ms and
+// every other call in the run took 0.5-2s. So the model was not slow; that one socket was stuck.
+//
+// Bounding each ATTEMPT turns a hang into the transient it actually is: an aborted fetch throws, which
+// this function already treats as retryable, so the existing ladder re-issues it (and key rotation can
+// move on). Generous against real latency — the LLM budget for a fill answer is small and the observed
+// spread is 0.5-2s — and tight against a hang. Overridable per call via cfg.timeoutMs.
+const LLM_REQUEST_TIMEOUT_MS = 30000;
+
+// fetch with a hard deadline. Falls back to a plain fetch where AbortController is unavailable (or the
+// timeout is disabled), so an injected test fetch keeps working untouched.
+async function fetchWithTimeout(fetchFn, url, opts, ms) {
+  if (!ms || typeof AbortController === "undefined") return fetchFn(url, opts);
+  const ac = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; try { ac.abort(); } catch (e) { /* already gone */ } }, ms);
+  try {
+    return await fetchFn(url, Object.assign({}, opts, { signal: ac.signal }));
+  } catch (e) {
+    if (timedOut) throw new Error("request timed out after " + ms + "ms");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 // CIRCUIT BREAKER. Retrying is right for a momentary spike and wrong for an EXHAUSTED quota:
 // with a full ladder per field, one dead quota would turn a 65-field form into a ~45-minute
 // stall. After this many calls exhaust their whole ladder back-to-back, stop retrying for a
@@ -239,7 +267,7 @@ async function callLLMOnce(req, fetchImpl, sleepImpl) {
   let res, attempt = 0, netErr = null;
   for (;;) {
     netErr = null;
-    try { res = await fetchFn(url, opts); }
+    try { res = await fetchWithTimeout(fetchFn, url, opts, cfg.timeoutMs === undefined ? LLM_REQUEST_TIMEOUT_MS : cfg.timeoutMs); }
     catch (e) { netErr = String((e && e.message) || e); res = null; }
     // A network throw is transient too (DNS blip, dropped socket) — it earns the same ladder.
     const retryable = netErr !== null || (res && !res.ok && LLM_RETRY_STATUS[res.status]);
@@ -503,6 +531,7 @@ const LLM_PRICING_URLS = {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
+    LLM_REQUEST_TIMEOUT_MS, fetchWithTimeout,
     GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS,
     llmCostUsd, GEMINI_STARTER_CHAIN, LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
     ANTHROPIC_THINKING_MIN_TOKENS, anthropicThinkingFor, ANTHROPIC_EFFORT_LEVELS,
