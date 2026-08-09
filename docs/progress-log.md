@@ -4306,3 +4306,27 @@ does not re-derive it.
 **What this rules in:** the fill is not losing its time to our pacing constants. It is losing it to the
 page thread being blocked for seconds at a stretch, during which every read, every input dispatch and
 every timer we own arrives late. Optimising our own waits cannot fix that, and can make it worse.
+
+**AND THE MEASUREMENT METHOD WAS WRONG TOO — recorded so it is not repeated.** Two corrections, both
+from the operator watching the screen rather than from the log:
+
+1. **"RENDERER BLOCKED" was an unfounded assertion.** Operator: "the page looked fine though. did not seem
+   like it was mid render. it rendered in a normal amount of time." Correct. The probe measures
+   TIME-TO-SERVICE, not renderer availability: CDP commands to a target are serviced in order, and
+   `cdpScrapeTaOptions` deliberately runs ENTIRELY in-page as one `awaitPromise` eval, holding a single
+   `Runtime.evaluate` open for its whole 1.8–5.3s. The 500ms heartbeat queues behind it and returns
+   multi-second latency on a page that is perfectly responsive. The label now says SLOW TO SERVICE and
+   names both causes instead of picking one. (Suspecting the heartbeat itself was then tested by turning
+   it OFF — that run was the SLOWEST of the day, so the instrument is not the cause either.)
+2. **Single-run A/B is invalid at this noise level.** The same page 2 measured 8.0s, 11.1s, 11.2s and
+   **173.3s** across four runs of the same tenant. On the 173s run EVERY primitive was 10–17s at once —
+   `delay(300)` took 15.24s, `typeText` 10.74s, `scanPage` 11.95s, `llm` 16.77s. A pure SW `setTimeout`,
+   a page eval, a DOM read and an input dispatch cannot all degrade 50× together for any reason internal
+   to this codebase; that is the whole machine starved. Contributing cause, owned: `npm test` (80s a run,
+   once as a 3× loop) was run CONCURRENTLY with live fills several times that day. **Do not run the suite
+   while a fill is in flight, and do not conclude from one run** — the skill already said the latter about
+   LLM variance and it applies far more broadly.
+
+**Net for the day:** the LLM fast-retry is real and verified; the gap instrumentation is real and found
+the operator's ~1s typeahead-close pause; the close-poll fix was measured at ~80ms and reverted; the
+event-firehose theory was refuted before being built. No pacing constant has been shown to be wrong.

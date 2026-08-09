@@ -211,12 +211,22 @@ function cdpLagBaseline() {
   return r.length ? cdpLagPct(r, 0.5) : null;
 }
 
-// The whole point of the subsystem: one attribution per slow command.
+// One attribution per slow command — and deliberately WEAKER than the first version, which asserted
+// something the probe cannot know.
+//
+// ⚠ The probe measures TIME-TO-SERVICE, not renderer availability. It said "RENDERER BLOCKED" whenever it
+// came back slow, and the operator refuted that from the screen: "the page looked fine though, did not
+// seem like it was mid render, it rendered in a normal amount of time." They were right. CDP commands to
+// a target are serviced in order, and `cdpScrapeTaOptions` deliberately runs ENTIRELY in-page as one
+// awaitPromise eval, holding a single Runtime.evaluate open for its whole 1.8-5.3s. Anything issued during
+// that — including this probe — queues behind it and reads as multi-second latency on a page that is
+// perfectly responsive. So a slow probe means "we could not get serviced", which has (at least) two very
+// different causes, and the honest label names both rather than picking one.
 function cdpLagBlame(ms, p) {
   if (p == null) return "no baseline yet";
-  if (p >= ms * 0.5) return `RENDERER BLOCKED — a trivial page eval also costs ~${p}ms right now, so the page's main thread is jammed; the [CDP-TIME] phase breakdown says whose work that is`;
-  if (p >= 200) return `MIXED — the page thread is already ~${p}ms behind, and this command added ~${ms - p}ms of its own`;
-  return `THIS COMMAND'S OWN WORK — a trivial page eval costs ~${p}ms right now, so the channel and the page thread are both free and ~${ms}ms is what this call genuinely took`;
+  if (p >= ms * 0.5) return `SLOW TO SERVICE — a trivial page eval also costs ~${p}ms right now. Either the page thread is busy OR this queued behind one of OUR OWN long in-page evals (an option scrape holds one Runtime.evaluate for its full duration). Check the [CDP-TIME] phases before blaming the tenant`;
+  if (p >= 200) return `MIXED — the channel is already ~${p}ms behind, and this command added ~${ms - p}ms of its own`;
+  return `THIS COMMAND'S OWN WORK — a trivial page eval costs ~${p}ms right now, so the channel is free and ~${ms}ms is what this call genuinely took`;
 }
 
 function cdpLagNote(method, ms, err) {
