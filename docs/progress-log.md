@@ -3787,3 +3787,77 @@ typecheck clean; the worktree's web VITEST cannot run at all (`Cannot find packa
 same broken `node_modules`), so the 4 web files are typecheck-verified only. NOT yet verified: the review
 page's rendering of the kept skills (the tracker push 401'd — the site session expired mid-session), and
 the rehearse path's manual/continue re-entry.
+
+## 2026-08-09 — live sweep: marvell + moog verified, four fixes
+
+Continued the live regression/expansion sweep. Every run a fill or a rehearsal
+(`arm:false`); nothing was ever submitted.
+
+**Verified live to SUBMIT GATE PASSED (rehearsed twice each, hidden):**
+- **marvell.wd1** — AGREE 31 · DISAGREE 0 · MISSING 1 (`Language*`, the known
+  informational case: Workday's summary doesn't render it).
+- **moog.wd5** — NEW tenant, clean first fill (5 pages, 65 fields, 8 flagged),
+  AGREE 44 · DISAGREE 0.
+
+**Not verified, with the reason:**
+- **sonos.wd1** — the requisition is GONE (Workday's not-found page). Not a code
+  failure; see fix 3.
+- **hp.wd5** — reaches sign-in and requires Gmail email verification, which timed
+  out (120s). Skipped per the operator's standing instruction.
+
+### Fixes
+
+1. **The apMatch lockstep guard did not scan background.js.** It pins that every
+   `apMatch.X` call is present in the SW's hand-written literal — the check Node
+   can never do, since it takes the `require()` branch. It only read
+   fill-driver.js, so background.js had exactly the hole the test exists to close:
+   a call to `apMatch.parseErrorFieldName` passed 1185/1185 and aborted the live
+   replay with "is not a function". Both callers scanned now; the message names
+   the offending file.
+
+2. **Workday has a second wording for "the signature date is required."** The
+   replay may write one unapproved value — today's date — and only when asked. The
+   ask was matched as the literal "Enter today's date"; marvell page 5 says "The
+   field Date is required and must have a value", so nothing fired and the
+   rehearsal halted `replay-blocked`.
+
+   The diagnostic is what mattered: the wrapper already held the value (`current
+   value is 8/9/2026`, React props AND fiber set). Workday re-renders the date from
+   its saved copy but has dropped it server-side — the same self-ID class as the
+   disability checkbox — so the page displays an answer the model does not have,
+   and `skipIfCorrect` reads the screen and actuates nothing. `signatureDateDemanded`
+   therefore does NOT require the field to be blank: blankness is the one piece of
+   evidence this failure destroys, and requiring it would have been the obvious
+   guard that missed every real occurrence. It requires instead that the field is a
+   signature-date question and that Workday named it.
+
+3. **A posting that no longer exists now says so.** sonos's job URL renders
+   Workday's not-found shell in 132 characters. Nothing is wrong with the extension
+   there, but with no Apply button the run walked on to the auth wait and halted
+   "the sign-in fields never appeared" — which reads as a sign-in bug on a tenant
+   that signs in fine, and cost exactly that detour. Now `job-posting-not-found`
+   in ~2s.
+
+4. **The social-login chooser is matched by text.** Some tenants put the email form
+   behind "Sign in with email" beside federated Apple/Google buttons; that shape was
+   handled but keyed to one automation-id, and sonos hashes it. Detector and click
+   fall back to the button's text (the click stamps an attribute, since clickTarget
+   takes a selector). Unit-pinned but NOT live-exercised — sonos's posting is dead
+   either way.
+
+5. **job_key: requisition ids that separate letters from digits.** A job must key
+   identically from its posting URL and its form URL, because the fill stores the
+   bundle under one and the submit run looks it up by the other. The form URL adds
+   an `en-US/` segment and percent-encodes the location, so the path fallback can't
+   do it. Moog's id is `R-26-18835` — a separator where both req tiers wanted a
+   digit — so every tier missed and the rehearsal REFUSED its own approved bundle.
+   HP's `_3167270-1` failed the numeric tier the same way. Both tiers allow one
+   separator now; existing keys are byte-identical (regression-pinned on marvell,
+   `_R438146`, `JR109393`). Lockstep with `web/lib/job-key.ts`.
+
+### Still open
+- The signature-date stamp is unit-pinned but has not been observed firing live —
+  the marvell block is intermittent and has not recurred since.
+- `web/` vitest fails to resolve its `@/lib/*` alias for 7 suites. Verified
+  identical with all changes stashed: pre-existing, unrelated.
+- Suite 1189/1189; web typecheck clean.
