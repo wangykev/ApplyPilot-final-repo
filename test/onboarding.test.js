@@ -5,7 +5,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage, parseErrorFieldName, phantomRequiredTargets,
-  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey, blankAuthPersists, BLANK_AUTH_MIN_READS } = require("../lib.js");
+  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey, blankAuthPersists, isJobPostingGone, BLANK_AUTH_MIN_READS } = require("../lib.js");
 
 // Fold the pure settle rule over a sequence of page reads → the 1-based read it accepts at (null = never).
 const settleAt = (reads) => {
@@ -549,4 +549,50 @@ test("classifyAuthOutcome: applyFlowPage with auth chrome STILL up is not succes
 });
 test("classifyAuthOutcome: a bare loading page is still unknown (no applyFlowPage, no fields)", () => {
   assert.strictEqual(classifyAuthOutcome({ bodyText: "loading…", formFieldCount: 0, hasAuthEl: false, markers: {} }), "unknown");
+});
+
+// ── the social-login chooser is recognized by TEXT, not just its automation-id (sonos.wd1 2026-08-09) ──
+// Some tenants put the email/password form behind a "Sign in with email" button next to federated
+// Apple/Google buttons. That shape was already handled, but keyed to
+// [data-automation-id="SignInWithEmailButton"] — and sonos.wd1 renders the same button with a HASHED
+// id. The page therefore had zero inputs, signInWithEmail read false, and the run halted
+// auth-form-not-rendered both visible and hidden, on a screen a human signs into fine.
+//
+// Both the detector (cdp.js) and the click (background.js) now fall back to the button's own text.
+// Pinned against the SHIPPED regex rather than a copy, so the two can't drift apart, and asserted to
+// reject the federated buttons sitting beside it — clicking one of those would be an SSO attempt.
+test("social-login chooser: 'Sign in with email' is matched by text, and SSO buttons are not", () => {
+  const fs = require("fs"), path = require("path");
+  const root = path.join(__dirname, "..");
+  const sources = { "cdp.js": null, "background.js": null };
+  for (const f of Object.keys(sources)) {
+    const src = fs.readFileSync(path.join(root, f), "utf8");
+    const LITERAL = "\\bsign[- ]?in\\s+with\\s+email\\b";
+    assert.ok(src.includes(LITERAL), `${f} should match the chooser button by text (the automation-id is not stable across tenants)`);
+    sources[f] = new RegExp(LITERAL, "i");
+  }
+  for (const re of Object.values(sources)) {
+    assert.ok(re.test("Sign in with email"), "the sonos/PANW button text must match");
+    assert.ok(re.test("SIGN IN WITH EMAIL"), "case must not matter");
+    assert.ok(re.test("Sign-in with email"), "the hyphenated spelling must match");
+    // never the federated buttons rendered beside it — we do not click those
+    assert.ok(!re.test("Sign in with Apple"));
+    assert.ok(!re.test("Sign in with Google"));
+    assert.ok(!re.test("Sign in with LinkedIn"));
+  }
+});
+
+// ── a posting that no longer exists says so, instead of blaming the sign-in form (sonos.wd1 2026-08-09) ──
+// The job URL rendered Workday's not-found shell in 132 characters. There is no Apply button on it, so
+// the run walked on to the auth wait and halted "auth-form-not-rendered — the sign-in fields never
+// appeared" — which reads as a sign-in bug on a tenant that signs in fine, and cost exactly that detour.
+test("job posting gone: Workday's not-found shell is recognized, and a real posting is not", () => {
+  assert.ok(isJobPostingGone("Skip to main content\nThe page you are looking for doesn't exist.\nSearch for Jobs"));
+  assert.ok(isJobPostingGone("The page you are looking for does not exist."));   // unabbreviated
+  assert.ok(isJobPostingGone("the page you   are looking\n for doesn't exist")); // wrapped + collapsed
+  // a real posting must never trip it, including one that talks about existing systems
+  assert.ok(!isJobPostingGone("Junior Embedded Software Development Engineer\nApply\nSonos"));
+  assert.ok(!isJobPostingGone("You will extend the existing platform and improve pages users are looking for."));
+  assert.ok(!isJobPostingGone(""));
+  assert.ok(!isJobPostingGone(null));
 });

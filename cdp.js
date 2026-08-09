@@ -2011,7 +2011,14 @@ function cdpOnboardScan() {
   const passwordInput = present('input[type="password"]') || present('[data-automation-id="password"]');
   // Social-login CHOOSER (e.g. Palo Alto Networks wd5): the email/password form is behind a
   // "Sign in with email" button, alongside federated Apple/Google/LinkedIn buttons we NEVER click.
-  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]');
+  //
+  // The automation-id is NOT stable across tenants (sonos.wd1, 2026-08-09): its chooser renders the
+  // same button with a HASHED id, so the page had zero inputs, this read false, and the run halted
+  // `auth-form-not-rendered` — visible AND hidden, on a screen a human signs into fine. Fall back to
+  // the button's own text, which is what a human reads. Safe against the federated buttons beside it:
+  // they say "Sign in with Apple" / "Sign in with Google", and neither contains "email".
+  const signInWithEmail = present('[data-automation-id="SignInWithEmailButton"]')
+    || clickables.some((b) => /\bsign[- ]?in\s+with\s+email\b/i.test((b.textContent || "").trim()));
   const markers = {
     adventureButton: present('[data-automation-id="adventureButton"]'),
     continueButton: present('[data-automation-id="continueButton"]'),

@@ -813,6 +813,21 @@ function errorLabelKey(s) {
 // the hand-written `apMatch` literal: every helper it calls has to be listed there, and one that is not
 // throws only in the browser (Node sees all of lib.js, so the suite stays green — live 2026-08-09,
 // `apMatch.parseErrorFieldName is not a function` aborted a replay that was otherwise fixed).
+// Workday's own 404 for a requisition that no longer exists — the posting was filled, pulled, or the
+// link went stale. Live (sonos.wd1 2026-08-09): the job URL rendered "The page you are looking for
+// doesn't exist." in 132 characters. Nothing is wrong with the extension on this page, but every
+// downstream stage reads it as its OWN failure: there is no Apply button to click, so the run walks
+// on to the auth wait and halts `auth-form-not-rendered — the sign-in fields never appeared`, which
+// sends whoever reads it hunting for a sign-in bug on a tenant that signs in fine. It cost exactly
+// that detour before the page was opened by hand.
+//
+// Text-based on purpose: this is Workday's generic not-found shell, with no automation-id of its own
+// and no posting markup to key off. Anchored on the full sentence so a job description that happens
+// to contain the word "exist" can't trip it, and paired by the caller with a genuinely empty page.
+const JOB_GONE_RE = /\bthe page you are looking for\s+(?:doesn'?t|does not)\s+exist\b/i;
+function isJobPostingGone(bodyText) {
+  return JOB_GONE_RE.test(String(bodyText == null ? "" : bodyText).replace(/\s+/g, " "));
+}
 function signatureDateAskInText(errorTexts) {
   return (errorTexts || []).some((t) => {
     const s = String(t == null ? "" : t);
@@ -2221,7 +2236,7 @@ function devLogSelect(ring, opts) {
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, sameCalendarDate,
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
   skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
   skillTokens, skillContainmentEligible, skillWholeWordIn,
   rejectedValueEntries,

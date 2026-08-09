@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "sigdate-demand-1";
+const AP_BUILD_MARKER = "posting-gone-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -343,6 +343,17 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           `[ApplyPilot][RUN] job page ${settle.settled ? "SETTLED" : "did NOT settle (" + settle.reason + ")"} after ${settle.waitedMs}ms — ${settle.chars} chars` +
           `${settle.hasPosting ? ", posting content present" : ", posting content NOT found (the scrape may be partial)"}`
         );
+
+        // The posting is GONE (filled, pulled, or a stale link). Stop here and SAY so: without this the
+        // run finds no Apply button, walks on to the auth wait and halts "the sign-in fields never
+        // appeared", which reads as a sign-in bug on a tenant that signs in fine (sonos.wd1 2026-08-09).
+        if (apMatch.isJobPostingGone(settle.bodyText || "")) {
+          console.log(`[ApplyPilot][RUN] ⛔ this posting no longer exists — Workday returned its not-found page for ${startUrl}`);
+          emitRunProgress("Stopped — this job posting no longer exists");
+          sendResponse({ ok: true, stopped: "job-posting-not-found", needs_operator: true,
+            detail: "Workday says this posting doesn't exist — it was probably filled or pulled. Nothing was filled; the link needs replacing." });
+          return;
+        }
 
         // Grab the job description BEFORE onboarding clicks Apply (which navigates away). Best-effort:
         // a failed/empty scrape never blocks the run. Plain scripting read — no debugger needed yet.
@@ -961,6 +972,9 @@ async function waitJobPageSettled(tabId, ceilingMs = 12000, intervalMs = 300) {
           // a stable byte count trustworthy rather than a pause mid-hydration.
           hasPosting: !!document.querySelector('[data-automation-id="jobPostingDescription"], [data-automation-id="jobPostingHeader"]'),
           ready: document.readyState,
+          // A bounded sample, only so the caller can tell Workday's "this posting doesn't exist" shell
+          // apart from a slow render. Capped because a real posting's body is large and this is polled.
+          text: ((document.body && document.body.innerText) || "").slice(0, 400),
         }),
       });
       s = (res && res[0] && res[0].result) || null;
@@ -971,10 +985,10 @@ async function waitJobPageSettled(tabId, ceilingMs = 12000, intervalMs = 300) {
     last = s;
     state = jobPageSettleStep(s, state);
     if (state.accept) {
-      return { settled: true, chars: s.len, hasPosting: !!s.hasPosting, ready: s.ready, waitedMs: Date.now() - t0 };
+      return { settled: true, chars: s.len, hasPosting: !!s.hasPosting, ready: s.ready, bodyText: s.text || "", waitedMs: Date.now() - t0 };
     }
   }
-  return { settled: false, reason: "ceiling", chars: last ? last.len : 0, hasPosting: !!(last && last.hasPosting), waitedMs: Date.now() - t0 };
+  return { settled: false, reason: "ceiling", chars: last ? last.len : 0, hasPosting: !!(last && last.hasPosting), bodyText: (last && last.text) || "", waitedMs: Date.now() - t0 };
 }
 
 function waitTabComplete(tabId, timeoutMs) {
@@ -7050,7 +7064,20 @@ async function runCdpOnboard(tabId, opts) {
       // check so the chooser isn't mistaken for a forced SSO redirect.
       if (!st.passwordInput && !st.emailInput && st.signInWithEmail) {
         LOG('auth is a social-login chooser — clicking "Sign in with email" to reveal the form.');
-        const c = await clickTarget(['[data-automation-id="SignInWithEmailButton"]'], "Sign in with email");
+        // The automation-id is not stable across tenants (sonos.wd1 hashes it), so fall back to the
+        // button's own text. clickTarget needs a CSS selector and there is no text selector, so STAMP
+        // the match with an attribute and click that — the same trick the Ashby scan uses for a combobox
+        // with no id. Text-matched against the federated buttons beside it is safe: "Sign in with Apple"
+        // and "Sign in with Google" do not contain "email", and we never click those.
+        await cdpEval(function () {
+          var els = Array.prototype.slice.call(document.querySelectorAll('button, a, [role="button"]'));
+          for (var i = 0; i < els.length; i++) {
+            var t = (els[i].textContent || "").trim();
+            if (/\bsign[- ]?in\s+with\s+email\b/i.test(t)) { els[i].setAttribute("data-ap-signin-email", "1"); return true; }
+          }
+          return false;
+        });
+        const c = await clickTarget(['[data-automation-id="SignInWithEmailButton"]', '[data-ap-signin-email="1"]'], "Sign in with email");
         if (!c.clicked) return haltNeedsOperator("signin-with-email-blocked", c.blockedBy || "could not click Sign in with email", st);
         await cdpWakePage();
         const w = await waitFor((s) => s.passwordInput || s.emailInput || s.markers.createAccountLink || s.markers.signInSubmit || isPastAuth(s), 15000, "email-sign-in-form");

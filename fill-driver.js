@@ -36,7 +36,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       parseYearMonthDay: parseYearMonthDay, isCompensationQuestion: isCompensationQuestion,
       // replayField re-derives a SIGNATURE date to TODAY and uses this to skip the rewrite when the
       // approved value already IS today (so a same-day replay stays a zero-actuation no-op).
-      isSignatureDateQuestion: isSignatureDateQuestion, signatureDateDemanded: signatureDateDemanded, signatureDateAskInText: signatureDateAskInText, sameCalendarDate: sameCalendarDate,
+      isSignatureDateQuestion: isSignatureDateQuestion, signatureDateDemanded: signatureDateDemanded, signatureDateAskInText: signatureDateAskInText, isJobPostingGone: isJobPostingGone, sameCalendarDate: sameCalendarDate,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
