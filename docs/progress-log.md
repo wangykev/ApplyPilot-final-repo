@@ -4144,3 +4144,48 @@ Continued the live regression/expansion sweep. Every run a fill or a rehearsal
 - `web/` vitest fails to resolve its `@/lib/*` alias for 7 suites. Verified
   identical with all changes stashed: pre-existing, unrelated.
 - Suite 1189/1189; web typecheck clean.
+
+## 2026-08-09 (b) — the non-Workday merge did NOT regress Workday
+
+Pulled the ATS branch (45 commits, `e84102e`) into the Workday worktree. It touches shared files —
+`cdp.js`, `background.js`, `lib.js`, `fill-driver.js` — so the Workday path needed re-verifying rather
+than assuming.
+
+**Suite 1234/1234** (was 1188; the merge brought 46 tests, none broken). All five of my sweep commits
+survived, and the merge extended the same `apMatch` lockstep guard to `ats.js`/`atsLib`/`atsFd` — the
+class the guard was widened for that morning.
+
+**The biggest risk turned out not to be live.** `5eec8a9` put a hidden tab under `Page.startScreencast`
+to force frames, which would have changed hidden-tab behaviour for every Workday run; `ac76366` then
+dropped it again, leaving only the comment explaining the measurement. `cdp.js`'s remaining changes are
+additive to the `act` interface (`trustedType`, `trustedFocus`, `painting`, `paintLabel`, `quietInstall`,
+`quietRead`), so nothing the Workday path already called changed shape.
+
+**Live, on the merged build (`post-ats-merge-1`), hidden, nothing submitted:**
+- **moog.wd5** — SUBMIT GATE PASSED, AGREE 44 · DISAGREE 0 · MISSING 1 · EXTRA 1 — byte-identical to
+  the pre-merge run.
+- **marvell.wd1** — SUBMIT GATE PASSED, AGREE 31 · DISAGREE 0 · MISSING 1 · EXTRA 1 — also identical.
+
+### The one failure, and why it isn't the merge
+
+Marvell's FIRST rehearsal on the merged build halted `replay-mismatch`:
+
+    • disabilityStatus [checkbox_group] needs_review — the form did not accept the approved selection
+      — asked for [No, I do not have a disability and have not had one in the past] and it holds []
+
+That run hit Workday's transient "Something went wrong / please refresh", so the replay reloaded and
+restarted from page 1 (the 2026-07-27 guard, working as designed). The immediate re-run, same code, had
+no soft error and passed with `0 FAILED` on page 5.
+
+This is the known disability-checkbox blocker, and the pairing sharpens it: **a reload+restart IS a
+re-entry**, and re-entry is precisely when Workday serves self-ID answers back empty (dom-patterns
+2026-08-04 (b)). So the suspect is the re-entry, not the click — which also explains why no
+settle-before-clicking gate ever helped. If it holds, the reload path needs its own self-ID re-assert on
+the way back through page 5, and the fix does NOT belong in `fillCheckboxGroupCdp`, whose click verified
+fine on both runs. ONE observation each way, so: a correlation to test, not a cause.
+
+The halt itself is correct behaviour — it refused to advance rather than submit an application whose
+approved disability answer had not taken.
+
+**Not re-verified by me:** the ATS path itself (Greenhouse/Lever/Ashby). That is the merged branch's own
+work and its commits claim all three reach the gate; this entry only covers Workday.
