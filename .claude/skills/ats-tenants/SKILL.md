@@ -227,3 +227,238 @@ const r = await fetch("/api/applications", { credentials: "include" }).then(x =>
 **Pick for form variety, not company.** The point of many tenants is many form shapes: an EEOC block,
 a school/degree pair, a places box, a consent list, a salary question, a long free-text. Two postings
 from one company usually exercise one shape twice.
+
+---
+
+# Reference — the mechanics
+
+Full trace detail: `docs/dom-patterns.md` 2026-07-31 onward; milestone: `docs/progress-log.md` 2026-07-31.
+
+## Routing and the run
+
+**`detectAts(url)` routes `AP_RUN_APPLICATION` / `AP_SUBMIT_APPLICATION`:**
+
+| ATS | posting host | form |
+|---|---|---|
+| greenhouse | `job-boards` / `boards.greenhouse.io` (incl. `.eu`) | same URL |
+| lever | `jobs(.eu)?.lever.co` | `/apply` |
+| ashby | `jobs.ashbyhq.com` | `/application` |
+
+Workday and anything unrecognized keep the existing onboard→walk path **byte-identical**.
+
+No auth stage — `runAtsApplicationRun` navigates, settles (`waitAtsFormReady`), scrapes the JD via
+`scrapeJobPosting`, fills, reports. All through CDP (`chrome.debugger` isn't host-gated) — **NO new host
+permissions.**
+
+⚠ The posting settle must be asked over **CDP** (`waitAtsPostingSettled`), because `waitJobPageSettled`
+reads through host-gated `chrome.scripting` and the ATS hosts are deliberately absent from
+`host_permissions` — it failed on its first read on every ATS run and logged a settle that never happened.
+
+**Actuation is page-side synthetic via `Runtime.evaluate`.** All three ATSs commit state from synthetic
+events (proven live; react-select opens/filters/commits fully synthetic), so visible and hidden runs are
+IDENTICAL: no `Input.*` pipeline, no focus emulation, no pacing regimes. The ONE trusted-input exception is
+the SUBMIT click (irreversible + captcha vendors score event trust — `cdpSetSyntheticInput(false)` +
+`cdpClickAt`).
+
+Every commit is read-back-verified; an M40-lite audit re-reads the page after the loop; AI fills are ALWAYS
+flagged. Records feed the UNCHANGED `buildReviewBundle` → the website review editor works as-is.
+
+## Value routing (`atsRouteField`, first hit wins)
+
+1. **Per-ATS static maps** — GH semantic ids incl. the EEOC block; Lever `name=` keys + `urls[*]`; Ashby
+   `_systemfield_*`.
+2. **Buckets** — exact wording (live: Ashby's "Phone Number" filled from the website's default
+   field-wording bucket).
+3. **Label recognizers** —
+   - work-auth / sponsorship ("US person" / export-control wordings BAIL to AI);
+   - links;
+   - salary / start-date, STATED-only;
+   - how-did-you-hear ladder — its label match allows ONE adverb in the middle ("How did you FIRST hear
+     about this role?" missed it and sent a REQUIRED question the profile answers exactly to the AI) and
+     requires the verb to be followed by about/of/this/us/our (the old wording ended at the verb, so "How
+     did you find working with your last team?" routed here);
+   - EEO stated-only;
+   - location.
+4. **`recognizeEmploymentQuestion` / `decideEmploymentStatus`** (live: "worked for Figma before?" →
+   deterministic clean-miss "No").
+5. **AI** — REQUIRED only, same `act.llm` gating; a choice must clear the ladder vs LIVE options; declined
+   required text gets the NEEDS-YOUR-ANSWER placeholder.
+6. **blank + review.**
+
+Booleans coerce through `resolve()`'s Yes/No ladders.
+
+## Match-ladder amendments earned live
+
+- **Stated-EEO routes pass `containment:true`** — each ATS words long-form demographics its own way, so a
+  unique prefix hit commits at the flagged containment tier.
+- **Plus the POLARITY BRIDGE** — a stated value LEADING with Yes/No maps to the unique same-polarity option
+  via `optionForPolarity` ("No, I do not have a disability" → Ashby's "No, I don't have…" — a contraction NO
+  string tier can bridge), flagged `polarity-lead`.
+- **Choice records store the COMMITTED OPTION TEXT, never the chip display** — the GH dial chip renders
+  "+1" for "United States +1", and a bundle holding "+1" can never replay. The audit + verify accept the
+  chip as a SUBSTRING of the recorded text.
+
+## GROUPED CONTROLS belong to the grouping pass, in EVERY branch (2026-08-07)
+
+Greenhouse's general element loop skipped only `hidden`, so each box of a checkbox group was pushed TWICE:
+once as a REQUIRED `text` field keyed on the box's own id, then again as the real `checkbox_group`. On
+Gusto's 12-box "select all that apply", every phantom inherited the group's required flag and bought its own
+LLM call answering `"N/A"` — **12 of that form's 21 review items.**
+
+Worse than noise: `atsInjSetText` on a checkbox writes its `.value`, the string that option would SUBMIT.
+
+Lever and Ashby always skipped both; source-pinned across all three branches in `test/ats.test.js` (verified
+to FAIL when the skip is removed).
+
+## A STATED ANSWER CARRIES ITS POLARITY IN ITS LEADING WORDS (2026-08-07)
+
+Ashby renders its diversity survey as SELECT ALL THAT APPLY — each identity its OWN checkbox, so the LABEL is
+an option, not a question. The profile answers in whole sentences (`"No, I do not have a disability"`), which
+matched neither `/^(yes|true)$/` nor `/^(no|false)$/`, so questions the profile ALREADY ANSWERS came back as
+"your profile answer isn't one of this form's options".
+
+Leaving the box unchecked IS that answer: polarity now reads the leading words (reusing the assertion-lead
+regexes; **negative is tested first**, since "I am not a protected veteran" satisfies the positive lead too),
+and an answer that NAMES the box is its affirmative — **exact-normalized only**, and deliberately NOT gated on
+`atsIsEeoLabel` (that detector knows dimension names, while these labels are the values). Containment stays
+out: `"East Asian"` must not decide a box labelled `"Asian"`.
+
+## LIST NUMBERING IS DISPLAY SCAFFOLDING, ON BOTH SIDES (2026-08-05)
+
+`"1. United States of America"` beats exact, containment (off for dropdowns by design) AND fuzzy (**88.9%**
+vs the 90 bar), so a REQUIRED field the profile answers perfectly went unfilled.
+
+`atsEnumStrip` removes it for MATCHING only — the click uses the option's real text — and it MUST be applied
+to CANDIDATES too: a commit stores the real text, so a replay's approved value arrives carrying the
+numbering, and stripping one side made the replay fail to match the value it had just produced. Narrow by
+construction: `1 - 3 years` and `401(k)` are untouched.
+
+## THE OPTION MENUS ARE NOT VIRTUALIZED — MEASURED (2026-08-07)
+
+Asked because Workday's picker IS windowed and this path has no scroll accumulator. Traced in the live DOM:
+GH `country` holds all **244** entries ("Zimbabwe+263" last) and `discipline--0` all **72**, unchanged after
+scrolling to the bottom; Ashby's location box opens with **0** and answers only what you type; Lever has no
+combobox at all.
+
+Plain react-select renders every option and CSS-clips it, so ONE `querySelectorAll` already reads the whole
+list — **do not port `cdpScrapeTaOptions` here.**
+
+The consequence: `atsAttachOptions` calling any list of ≥60 "partial" was discarding options already in hand
+(244 countries reached review as 60 + "not the full list"). **Partial is now PROVENANCE** — a menu read on
+OPEN is complete however long; anything reached by TYPING is a view of it — and the flag is **never
+cleared**, because clearing the query restores the whole list on a static widget but only page ONE on a
+server-backed one, and those are indistinguishable from inside the code (that is what keeps the paged-school
+guard: absence is only provable against a list that answered in full). Storage caps at 400 and a truncated
+list still says so.
+
+The WHY travels too: `optionsPartial` was set and never read, so the site re-derived it from
+`captured_options.length > 2` and a server-backed field returning 1–2 rows — the case that most needs
+explaining — got no explanation. It rides the bundle as `options_partial`.
+
+## THE 2.5s SETTLE FLOOR STAYS — MEASURED AND REFUTED (2026-08-08)
+
+`waitAtsFormReady` accepts on **three equal field counts AND ≥2500ms** (sections mount in BURSTS; two reads
+accepted Ashby at 9 of 16 fields). That floor is 2–4.5s of dead time on forms that mount in ~500ms.
+
+Replacing it was instrumented (an in-flight `fetch`/XHR counter installed with the page overrides, plus a
+page-side mount sampler from document start) and **the replacement was refuted, so the floor is unchanged**:
+
+- **DOM quiescence fails** because a form is genuinely still between bursts (Ashby/Sierra: `2040ms c=60 q=1`
+  — DOM quiet, request in flight, one more control to come).
+- **In-flight fails too, which is the decisive one**: GH/Discord read `280ms c=34 q=0` — stable count,
+  nothing in flight — and two more controls arrived **1.4s later** on requests that had not started yet.
+  `q==0` means "nothing in flight NOW", never "nothing more is coming"; the distinguishing event is in the
+  future, so no observable signal separates "finished" from "quiet before the next burst".
+
+Two traps this cost: wrapping `fetch` must `.bind(window)` or a bare call throws `Illegal invocation` and the
+form never mounts; a backtick in a `buildOverrideSrc` comment terminates its template literal. Numbers in
+dom-patterns 2026-08-08.
+
+**⚠ Do not re-run this experiment without a slow-form counter-example.**
+
+## A LABEL'S GUESS LOSES TO THE LIVE WIDGET — the "Location" instance (2026-08-07)
+
+Third instance, after GitLab's three-option pick-one and Discord's already-rendered degree list: ElevenLabs
+labels a field "Location" and describes it *"Country you're currently residing in"*. We typed the city, read
+an empty menu, and blamed the places service for 15s.
+
+Now the city falls through to the REMAINING candidates (the location rung already tiers the country behind
+the city; a **bucket** routes first and carries one value, which is how that field arrived holding only
+`"Pittsburgh, PA"`, so the profile's country is appended), and those alternatives are matched through the
+**ordinary ladder** — the country tier's wording is routinely LONGER than the option (`"United States of
+America"` vs `"United States"`), which the city-containment pick cannot see.
+
+The places pick itself got STRICTER (`atsPlacePick`): the query is the **city alone**, because a service that
+never heard of `"Pittsburgh, PA"` answers `"Pittsburgh"` instantly, so the strictness moves to the pick —
+prefer the row agreeing on the **state in either spelling** (`REGION_ABBREV`, Canadian provinces included),
+because "first row containing the city" silently files against the wrong Pittsburgh; a state we hold that no
+row offers still answers, at the flagged tier.
+
+⚠ `personal_info.country` may itself be a LADDER ARRAY, which must be flattened into candidates or the match
+ladder throws `s.toLowerCase is not a function` mid-fill.
+
+## A CLOSED POSTING IS NOT A BROKEN PIPELINE (2026-08-07)
+
+Twilio and Binance both halted `form-not-rendered … open the tab and check`, sending the operator to debug a
+fill on a job that no longer exists. Both said so first: **Lever** serves a removed posting the title `Not
+found`; **Greenhouse REDIRECTS to the board index** (`Current openings at <Company>`) dropping the job id
+from the URL.
+
+`atsPostingGone(jd, requestedUrl, landedUrl)` reads both — the URL rule is the general one, the titles
+corroborate — and returns a REASON, **null when there is no evidence** (a missing JD must never read as a
+dead job). Halt is `posting-gone`.
+
+## `runAtsSubmitRun` gates
+
+All must pass before the one trusted click:
+
+1. bundle blockers (`bundleSubmitBlockers`);
+2. **STRICT live verify** — every approved non-blank value committed on the fresh form; an approved field
+   ABSENT from the live form FAILS;
+3. **no VISIBLE captcha challenge**;
+4. `arm===true` (absent ⇒ full dry rehearsal logging "WOULD CLICK SUBMIT").
+
+**AI is OFF for submit runs regardless of the toggle** — `valueFor` covers every approved field; anything
+else is deliberately blank.
+
+⚠ Lever's DORMANT invisible-hCaptcha container is a FULL-VIEWPORT `visibility:hidden` iframe — the challenge
+detector reads COMPUTED styles + sane challenge dimensions (<700px), never size alone. A VISIBLE challenge
+halts `needs_operator` — **the bot never solves or bypasses a captcha.**
+
+Post-click: poll for confirmation text / validation errors / a challenge, 30s, then "verify in the tab"
+honestly.
+
+Verified as DRY REHEARSALS on all three (GH · Lever · Ashby → would-submit; NOTHING submitted).
+
+## Two environment traps that read as code bugs
+
+**⚠ THE DEV SERVER MAY NOT BE THIS WORKTREE'S (2026-08-07).** Two web-side fixes read as broken for an hour
+because **port 3000 was served by a DIFFERENT worktree**; the extension is loaded unpacked from HERE, so
+extension changes took effect and only the web ones seemed inert — a badly confusing signature. This
+worktree runs on **3200** (`NEXT_PUBLIC_SITE_URL`, gitignored `.env.local`). Check
+`Get-NetTCPConnection -LocalPort <port>` before believing a web change did nothing.
+
+Also: `AP_SET_SESSION` logs the HOST it will report to (never the key), because a stale ingest credential is
+the most common way a healthy fill misses the tracker and it was silent. And the run opens a TAB PER RUN
+that nothing closed — 33 accumulated and wedged the browser; use `AP_DEV_CLOSE_TABS {urlContains}` after each
+run, **never while one is in flight**.
+
+**REPORT THE REPORT HONESTLY (2026-08-07).** `reportApplication` returned nothing, so the ATS run printed
+`"Reported to the website."` one line under the ⛔ saying the tracker had rejected it. It returns
+`{ok, reason, status}` now (including the quiet `not-connected` / `no-bundle` paths) and the caller says
+which happened.
+
+Related, website-side: **a run refreshes the extension's ingest credential before it starts** (`getSession` +
+`AP_SET_SESSION` on Run / Background fill / Rehearse / Submit) — minting a key DELETES the prior ones, so any
+later sync silently invalidates what the extension holds, surfacing as a fill that never reaches the tracker
+or a submit run that 401s and REFUSES.
+
+## Known limits
+
+- GH `candidate-location`'s places service can hang on "Loading…" with zero network in this browser (even
+  HUMAN typing) → honest `needs_review` naming the cause. **⚠ Do NOT reach for that explanation FIRST:** the
+  same report was produced twice by our own bugs (the mid-life overrides, and a country-shaped box searched
+  with a city), and it reads exactly like an environment problem.
+- Visible-hCaptcha Lever forms halt `captcha-challenge`.
+- GH `cover_letter` deliberately operator-supplied.
+- Ashby date questions fill as text + `date-format-unverified` flag.

@@ -6313,7 +6313,7 @@ async function driveRepeatingSectionCdp(act, section, budgetsIn) {
     // block Next. filled_review is a containment/fuzzy match (e.g. an abbreviated cert "CPP" →
     // "Certified Payroll Professional (CPP)…") — surfaced for human review, NOT silently deleted.
     // Phase 2 (delete-with-memory) — per-entry disposition, per the LOCKED decision tree
-    // (docs/plan-repeating-ai-and-delete-remember.md). A required field is RESOLVED iff it committed a
+    // (docs/archive/plan-repeating-ai-and-delete-remember.md). A required field is RESOLVED iff it committed a
     // value (filled / filled_review) AND — if that value came from the AI — the AI was CONFIDENT
     // (ai-choice, high/medium). A PROBLEM field is a required field that is NOT resolved: unfilled, OR
     // filled only by an UNCONFIDENT AI pick (low-confidence / ai-closest-forced / "Other" fallback /

@@ -2,6 +2,39 @@
 
 Moved out of `CLAUDE.md` on 2026-07-02 to keep the auto-loaded context lean (the pre-slim CLAUDE.md is preserved verbatim in git history at commit `4992b82`). This file is the full milestone-by-milestone build history — one entry per verified milestone, one commit each, so the project stays bisectable. **Append new milestone entries here** (same style: what/why/how-verified); `CLAUDE.md` keeps only standing rules + a short "Current state & open items" section. DOM observations live in `docs/dom-patterns.md`.
 
+## How to use this file
+
+**Do not read it whole (~492KB).** Find your topic below, then grep the entry's heading text verbatim
+(headings are stable; the file is append-only, so nothing above your match moves) and read from there.
+
+For *what is true now*, read `CLAUDE.md` + the matching skill — not this file. This is **history**: it says
+what changed, when, and how it was verified. Entries are dated `## YYYY-MM-DD — title`. ⚠ The tail is **not
+strictly chronological** — the Workday, multi-ATS and discovery tracks were appended in parallel during
+2026-07/08, and several entries name the branch they landed on.
+
+For current state and open work, see **`docs/status.md`**.
+
+### By subsystem — where to start (most recent / most complete entry first)
+
+| Topic | Grep for |
+|---|---|
+| **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — MULTI-ATS: Greenhouse / Lever / Ashby end-to-end` (the landing milestone), then `2026-07-31 (b)`…`(f)`, `2026-08-04 — the async combobox`, `2026-08-05 — multi-ATS end to end`, `2026-08-07 — the dead first fill` |
+| **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
+| **Onboarding / auth / already-applied** | `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
+| **Autofill with résumé** | `2026-08-08 — Autofill-with-Resume end to end`, `2026-08-07 (e) — the flow a first application should take` |
+| **SKILLS field** | `2026-08-07 (d) — SKILLS: the multi-value typeahead` |
+| **Replay walk / submit gate** | `2026-07-28 — The replay walk never settled the page`, `2026-07-28 — Submit gate relaxed`, `2026-07-28 — Background submit runs`, `2026-07-27 — Page-5 replay`, `2026-07-26 — Per-application LOGIN on the backend` |
+| **Review page reconcile / false disagrees** | `2026-07-28 — Three FALSE disagrees blocked a clean run`, `2026-07-28 — The review-page scrape had no settle either` |
+| **Cascade-revealed / became-required** | `2026-07-27 — Cascade-revealed required fields go back to REVIEW`, `2026-07-27 — Cascade review polish` |
+| **Phantom duplicate entries** | `2026-07-27 — The REPLAY adapts to Workday's phantom duplicate-entry error`, `2026-07-27 — Phantom duplicate-entry fix generalized`, `2026-07-27 — Why the phantom-duplicate fix deleted 0/2` |
+| **The phantom "required" error (self-ID)** | `2026-07-28 (later)`, `2026-07-28 (round 2)`, `2026-07-28 (round 3)`, `2026-08-07 (later) — the self-ID disability blocker was a COLON`, `2026-08-07 (later still) — waystar's self-ID variant` |
+| **Employment-status recognizer** | `2026-07-24 — Employment-status screening radios`, `2026-07-24 — Employment-status hardening`, `2026-07-24 — Employment-status: ALL widget types` |
+| **Answer buckets / teach flow** | `2026-07-31 (d) — TEACH verified end-to-end`, `2026-07-26 — Website URLs require ` |
+| **AI batching / stray clicks** | `2026-08-06 — one AI call per page, and the stray click that was blamed on Workday` |
+| **Résumé attach** | `2026-07-29 (later) - ` (the `role="alert"` status-channel fix) |
+| **Service-worker breakage (the two Node-invisible classes)** | `2026-07-28 — Dead service worker: two files declaring one name`, `2026-07-28 — The replay walk never settled the page` |
+| **Latest live sweeps** | `2026-08-09 — live sweep: marvell + moog verified`, `2026-08-09 (b) — the non-Workday merge did NOT regress Workday` |
+
 ## Progress log
 
 Incremental: each milestone is one focused change, verified on a real page, one git commit (so we can bisect). Detail lives in git history + the topical sections above; this is the index.
