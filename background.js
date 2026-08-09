@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "gaptrace-1";
+const AP_BUILD_MARKER = "eventcount-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -581,13 +581,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // how a run is tailed without re-reading the whole buffer. `pattern` is a case-insensitive regex over
   // the line text (e.g. "CDP-TIME|HALT"), `limit` caps the reply (newest kept, `truncated` says so), and
   // `clear` empties the buffer after replying. Allowed DURING a run — watching a live walk is the point.
-  if (type === "AP_DEV_FLAG") {
-    // dev-only: flip a chrome.storage.local debug flag (forceWorkerTimersOff, forceTrustedInput)
-    const key = String(message.key || "");
-    if (!/^(forceWorkerTimersOff|forceTrustedInput)$/.test(key)) { sendResponse({ ok: false, error: "unknown flag" }); return true; }
-    chrome.storage.local.set({ [key]: !!message.value }, () => sendResponse({ ok: true, key, value: !!message.value }));
-    return true;
-  }
+  // NOTE (2026-08-09): a SECOND, narrower AP_DEV_FLAG handler used to sit here, accepting only
+  // forceWorkerTimersOff/forceTrustedInput. Because it matched first it SHADOWED the full handler below,
+  // so every other documented flag — debugPageTrace, debugClobber, debugAiPrompts, skipPreSaveReverify,
+  // debugGroupWatch, disableAiBatch, debugLagTrace — answered "unknown flag" and could not be turned on
+  // at all. Removed rather than merged: both of its keys are already in the ALLOWED list below, and that
+  // handler is a strict superset (it also supports value:null to CLEAR a flag, and a keyless read-all).
   if (type === "AP_DEV_LOGS") {
     const sel = devLogSelect(apDevLog, { since: message.since, pattern: message.pattern, limit: message.limit });
     sendResponse({
@@ -3079,7 +3078,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
-    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
   } finally {
     if (_selfId) {
       cdpSetTrustedText(false);                        // never leave the next page paying for this one

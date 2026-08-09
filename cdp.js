@@ -175,7 +175,26 @@ const CDP_LAG_BEAT_MS = 500;      // heartbeat interval — fine enough to catch
 const CDP_LAG_SLOW_CMD_MS = 400;  // stream a line for any SINGLE command at/over this, with its blame
 const CDP_LAG_DRIFT_MS = 400;     // stream a line when the SW loop itself stalls this long
 
-function cdpLagFresh() { return { t0: Date.now(), cmds: new Map(), beats: [] }; }
+function cdpLagFresh() { return { t0: Date.now(), cmds: new Map(), beats: [], events: new Map(), eventN: 0 }; }
+
+// ── CDP EVENT FIREHOSE COUNTER (2026-08-09) ──────────────────────────────────────────────────────
+// Why this exists: a `delayFull(150)` came back in 2459ms on a live run — our own service-worker timer,
+// 16× late. The leading suspect is that we `Runtime.enable` + `DOM.enable` at attach while registering
+// NO onEvent listener anywhere, so Chrome streams console/executionContext/DOM-mutation events at a
+// worker that never reads them. On a React app mid-fill that could be thousands of dispatches, and a
+// saturated event loop defers timers. This counts what actually arrives so the fix is aimed at a
+// measured cause rather than a plausible story. Counting only happens while the lag trace is on.
+try {
+  if (typeof chrome !== "undefined" && chrome.debugger && chrome.debugger.onEvent) {
+    chrome.debugger.onEvent.addListener((source, method) => {
+      if (!cdpLagOn) return;
+      const w = cdpLagWin;
+      if (!w) return;
+      w.eventN++;
+      w.events.set(method, (w.events.get(method) || 0) + 1);
+    });
+  }
+} catch (e) { /* not in a SW context (Node tests) — counter simply absent */ }
 
 function cdpLagPct(arr, p) {
   if (!arr || !arr.length) return null;
@@ -276,6 +295,10 @@ function cdpLagReport(label) {
     + ` · PAGE-thread probe p50 ${n(cdpLagPct(rtts, 0.5))} p95 ${n(cdpLagPct(rtts, 0.95))} max ${n(rtts.length ? Math.max(...rtts) : null)}`
     + ` · SW drift p95 ${n(cdpLagPct(drifts, 0.95))} max ${n(drifts.length ? Math.max(...drifts) : null)}`
     + ` · worker age ${Math.round((Date.now() - AP_DEV_WORKER_START) / 1000)}s, attach age ${cdpAttachedAt ? Math.round((Date.now() - cdpAttachedAt) / 1000) + "s" : "–"}`
+    // Unread CDP events pushed at this worker. If the timer lateness tracks THIS, the fix is to stop
+    // enabling domains nothing consumes — not to tune a single wait.
+    + ` · UNREAD CDP EVENTS ${w.eventN}`
+    + (w.eventN ? ` [${[...w.events.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([m, n]) => m + " ×" + n).join(", ")}]` : "")
     + (top.length ? ` · top: ${top.join(" | ")}` : "");
 }
 
