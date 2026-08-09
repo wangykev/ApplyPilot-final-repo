@@ -4228,3 +4228,29 @@ So: correct, just expensive. Worth considering whether the post-reload pass can 
 value already equals what we would write (the replay's `skipIfCorrect`, which the FILL walk does not have).
 
 **Also seen:** moog soft-errors often right now — 3 of the last 5 runs, on both fill and replay.
+
+## 2026-08-09 (d) — the résumé junk page: fixed, unit-guarded, NOT yet live-exercised
+
+Cause found by reading the log rather than the code: the run never printed
+`"reached the application form."` — it printed `sign-in outcome: success.` and went straight to the walk.
+`runCdpOnboard` has TWO post-auth "reached the form" exits and only one consumed Workday's résumé-upload
+page. The Autofill-with-Resume → bounced-to-SIGN-IN path lands on the other one (background.js:7508),
+which returned `reached_form: true` immediately.
+
+So onboarding announced the form while sitting on the upload page, the walk took that page as page 1, and
+wrote a bundle page keyed on an EMPTY field set (`".../apply/autofillWithResume|": +1 field(s)`) — the one
+bare `formField-` wrapper `isPastAuth` excludes for exactly this reason. The résumé uploaded fine and the
+run completed, so the damage is bundle pollution, not a failed attach.
+
+The fix mirrors the sibling exit verbatim, including the bounce case (`needsAuth` re-enters the auth loop
+rather than announcing a form we are not on), and returns `resume_autofilled`, which this exit dropped.
+
+**Guarded structurally, not behaviourally** — "two exits and one of them forgets" is precisely the bug a
+test on either exit alone passes. Every post-auth `reached_form` exit must have an `onResumeUploadPage`
+consult above it; verified to FAIL before the fix, naming `background.js:7508`. Suite 1236/1236.
+
+⚠ **NOT live-exercised.** The post-fix hidden run on moog took `"Continue Application (returning user)"` —
+the account is now signed in and the application exists, so Workday offers Continue instead of the Apply
+chooser, and the Autofill path never ran. Its clean bundle (first page `apply|addressLine1,…,source`,
+19 fields, no junk page) is therefore consistent with the fix but proves nothing about it. Exercising it
+needs a FRESH posting on a signed-OUT session, which is the state that produced the bug.
