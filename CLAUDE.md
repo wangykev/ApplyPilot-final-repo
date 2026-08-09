@@ -353,6 +353,14 @@ Rank of per-page cost, from those runs: **LLM (0.5–30s, random)** › `capture
 OURS but deterministic — it scales with the option-list size) › everything else. The debugger channel is
 NOT a factor: the no-op page probe's p50 is 1ms across ~1500 commands.
 
+**`captureChoiceOptions` SKIPS skills (2026-08-09) — page 2 fill 15.6s → 8.0s.** Every other widget it
+re-opens has a FIXED vocabulary, so one read-only scrape hands the review editor a real picker. Skills is
+answered by a server-side RANKED search, so an empty-filter open is one page of a huge taxonomy that
+varies run to run — it can never BE the picker, and it cost 8.6s of page 2's 15.6s. Review renders skills
+as its recorded `"A; B; C"` text instead, which is exactly what `replayField` splits apart and re-adds.
+This is also what the operator saw as the walk "hovering" over skills mid-run: capture scrolling a
+virtualised list highlights rows, and it is READ-ONLY (that run's M40 audit re-read 27 fields, all matched).
+
 **MITIGATION — the fast-retry (`LLM_FAST_RETRY_RULES`, llm.js).** For a matching model (today: gemini 3.1
 only), the first two attempts are capped at **2s** and a call still running at that point is abandoned and
 re-issued on a fresh socket after 150ms. At a p50 of ~650ms, a call still running at 2s is a stuck socket,

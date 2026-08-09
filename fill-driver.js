@@ -7325,6 +7325,16 @@ async function captureChoiceOptions(act, results, budgets) {
     if (!rec || !rec.auditLoc) continue;
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
     let key, scrape;
+    // SKILLS is deliberately NOT captured (operator, 2026-08-09). Every other choice widget here has a
+    // FIXED vocabulary, so one scrape gives review a real picker. Skills does not: Workday answers it from
+    // a SERVER-SIDE search that returns a ranked top-N, so what an empty-filter open shows is one page of
+    // a taxonomy with thousands of entries — a snapshot that cannot be the picker anyway, and which varies
+    // run to run (dom-patterns 2026-08-07: the same query matched Yosys/RViz on one run and not the next).
+    // It was also the widget the operator watched flash a highlighted "Raspberry Pi" row mid-run, because
+    // scrolling a virtualised list highlights whatever it passes. Review still edits the field — it just
+    // renders the recorded "A; B; C" chip list as text, which is exactly what replayField splits back
+    // apart and re-adds. Nothing about the FILL changes: skills is filled and verified before this pass.
+    if (isSkillsField(rec)) continue;
     if (rec.widgetType === "typeahead" && act.scrapeTaOptions) {
       // Repeating-section FoS typeaheads AND flat page-1 typeaheads kept without actuation
       // (prefilled-kept, e.g. countryPhoneCode): a tier-0 keep never opened the widget so nothing was

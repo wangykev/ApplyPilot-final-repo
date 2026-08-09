@@ -4330,3 +4330,32 @@ from the operator watching the screen rather than from the log:
 **Net for the day:** the LLM fast-retry is real and verified; the gap instrumentation is real and found
 the operator's ~1s typeahead-close pause; the close-poll fix was measured at ~80ms and reverted; the
 event-firehose theory was refuted before being built. No pacing constant has been shown to be wrong.
+
+## 2026-08-09 — skip the option CAPTURE for skills: page 2 fill 15.6s → 8.0s
+
+**How it was found.** The operator watched a run and reported the walk "hovering over the skills section",
+briefly highlighting a `Raspberry Pi` row, then returning to education — and asked whether it was secretly
+filling the rest of the form during that pause. It was not, and the log answered both halves: page 2 runs
+flat loop (0.2s) → sections (3.5s) → **CAPTURE (8.6s)**, so everything was filled BEFORE the pause. The
+pause is `captureChoiceOptions`, the end-of-page pass that re-opens each choice widget READ-ONLY purely to
+scrape its option list for the review editor; scrolling a virtualised list highlights whatever row it
+passes. Nothing was committed — `audit: re-read 27 filled field(s) post-settle — all matched the report`.
+
+**The change.** `captureChoiceOptions` now skips skills. Every other widget it captures has a FIXED
+vocabulary, so one scrape genuinely hands review a picker. Skills does not: Workday answers it from a
+server-side RANKED search, so an empty-filter open shows one page of a taxonomy with thousands of entries
+— a snapshot that cannot be the picker and that varies run to run (dom-patterns 2026-08-07: the same query
+matched `Yosys`/`RViz` on one run and not the next).
+
+**Measured, same tenant, quiet machine:** `CAPTURE done` 8.63s → **3.67s**; page 2 fill 15.6s → **8.0s**;
+whole-run fill ~28.5s → **~19.6s**. Correctness unchanged: skills still `[skills-suggested-kept]` with its
+15 résumé suggestions, the M40 audit re-read 27 fields with no mismatch, REVIEW reached in 5 pages.
+
+**Consequence, accepted by the operator:** the review page renders skills as its recorded `"A; B; C"` text
+rather than a picker. Still editable, and it is exactly the format `replayField` splits apart and re-adds,
+so submit is unaffected. The FILL is untouched — skills is filled and verified long before this pass runs.
+
+**Why the earlier close-poll attempt bought only ~80ms, now explained:** `delayRender` is ADAPTIVE and
+scales its request down ~10× on a visible tab, so the 400ms close tick that looked worth fixing was
+already running at ~40ms. The real cost in CAPTURE was never the interval — it was re-opening a widget
+that had nothing worth scraping.

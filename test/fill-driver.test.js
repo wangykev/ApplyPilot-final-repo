@@ -7382,6 +7382,21 @@ test("choice-capture: an untagged (flat, prefilled-kept) typeahead is NOW captur
   assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1); // only the flat filled one scraped
 });
 
+test("choice-capture: SKILLS is skipped — no re-open, no scrape (operator, 2026-08-09)", async () => {
+  // Skills is answered by a SERVER-SIDE ranked search, so an empty-filter open shows one page of a
+  // huge taxonomy — a snapshot that cannot serve as review's picker and that varies run to run. It was
+  // also 8.6s of page 2's 15.6s and the widget seen flashing a highlighted row mid-run.
+  const recs = [
+    taggedRec({ fieldName: "skills", label: "Type to Add Skills", captureKey: "skills", auditLoc: "[w-skills]" }),
+    taggedRec({ auditLoc: "[w-fos]" }), // a normal typeahead alongside it still IS captured
+  ];
+  const { act, calls } = makeCaptureAct();
+  await captureChoiceOptions(act, recs, CAP_BUDGETS);
+  assert.strictEqual(recs[0].options, undefined, "skills carries no scraped options");
+  assert.deepStrictEqual(recs[1].options, FOS_OPTS, "a fixed-vocabulary typeahead is unaffected");
+  assert.strictEqual(calls.filter((c) => c[0] === "scrapeTaOptions").length, 1, "exactly one scrape — skills was never opened");
+});
+
 test("choice-capture: distinct captureKeys each get their own scrape", async () => {
   const recs = [taggedRec({ auditLoc: "[w-fos]", captureKey: "fieldOfStudy" }), taggedRec({ auditLoc: "[w-cert]", captureKey: "certification", fieldName: "cert" })];
   const { act, calls } = makeCaptureAct();
