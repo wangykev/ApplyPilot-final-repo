@@ -338,6 +338,17 @@ Rank of per-page cost, from those runs: **LLM (0.5–30s, random)** › `capture
 OURS but deterministic — it scales with the option-list size) › everything else. The debugger channel is
 NOT a factor: the no-op page probe's p50 is 1ms across ~1500 commands.
 
+**MITIGATION — the fast-retry (`LLM_FAST_RETRY_RULES`, llm.js).** For a matching model (today: gemini 3.1
+only), the first two attempts are capped at **2s** and a call still running at that point is abandoned and
+re-issued on a fresh socket after 150ms. At a p50 of ~650ms, a call still running at 2s is a stuck socket,
+not a slow model. **Two invariants make it safe, both unit-pinned:** (1) once the fast tries are spent the
+next attempt gets the FULL budget, so a genuinely slow provider is never FAILED by the cap — a failed AI
+call blanks a required field and halts the walk, which is far worse than one slow page; and (2) the
+fast-try budget is INDEPENDENT of the error ladder, because rotation probes every key with `noRetry:true`
+— gating it on the ladder made it silently never fire whenever 2+ keys were configured (caught live, not
+by tests). A fast abort is never a key fault: it does not consume a rotation slot or get a key marked bad.
+Adding another model is one line in the rule table; `fastRetry:false` opts a call out.
+
 **`debugLagTrace`** (`AP_DEV_FLAG`) is the tool that settles it, and it exists because a duration alone
 never could: it times every CDP command at the `cdpSend` choke point, runs a 500ms no-op page probe, and
 measures the service worker's own timer drift — three clocks that fail independently, so each slow command

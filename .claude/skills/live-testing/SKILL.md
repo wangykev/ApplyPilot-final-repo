@@ -53,6 +53,14 @@ localStorage, run `switch_browser` and have the operator reconnect.
   rotation; it simply took that long, finishing 343ms inside the timeout. That ONE call was the whole
   difference between a 1.9s page and a 32s page. Before blaming a tenant or the fill code for a slow page,
   subtract the `[LLM]` line — the variance there dwarfs everything else on the page.
+  **Now mitigated** by the fast-retry (`LLM_FAST_RETRY_RULES`): a gemini 3.1 call still running at 2s is
+  abandoned and re-issued. You will see `[LLM] fast-retry: … abandoned it and re-issued on a new socket`
+  and, on the answer, `— after N fast-retry abort(s)`. Seeing those lines is the feature WORKING, not a
+  fault. **To live-test it deliberately, force the rule's `ms` down to ~50** — every call then takes the
+  path, which is the only reliable way to exercise it (a real hang happened once in ~8 calls). Verified
+  that way 2026-08-09: 2 aborts per call, then a full-budget attempt that succeeded (1668ms / 2423ms),
+  AI fields still filled, REVIEW reached. **Restore the real 2000 afterwards** — two unit tests assert it
+  and will fail while it is forced.
 - **Re-running one requisition.** Three runs on the same nvidia req produced a page-2 block naming four
   required-and-empty work-experience fields that the DOM plainly showed filled. A FRESH req sailed through
   with zero errors. Prefer a new requisition over re-running one; if you must re-run, expect Workday's

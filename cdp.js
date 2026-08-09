@@ -4892,7 +4892,10 @@ function makeCdpActuation(llmConfig) {
         }
         if (res.ok) {
           const ms = Date.now() - tAttempt;
-          console.log(`[LLM] ok in ${ms}ms` + (attempts.length > 1 ? ` (${Date.now() - t0All}ms total across ${attempts.indexOf(attempt) + 1} attempt(s))` : ""));
+          console.log(`[LLM] ok in ${ms}ms` + (attempts.length > 1 ? ` (${Date.now() - t0All}ms total across ${attempts.indexOf(attempt) + 1} attempt(s))` : "")
+            // Without this a fast-retry recovery is invisible: the elapsed time just looks normal, and
+            // the stuck socket it stepped over leaves no trace at all.
+            + (res.fastAborts ? ` — after ${res.fastAborts} fast-retry abort(s)` : ""));
           return res;
         }
         // A FAILED attempt names itself too — with several models configured as fallbacks, silence

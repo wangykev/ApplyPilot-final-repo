@@ -3836,3 +3836,42 @@ reaching the REVIEW page. Findings, in order of size:
 **Also corrected:** the live-testing skill claimed `LLM_REQUEST_TIMEOUT_MS` was 20s; it is 30000.
 
 Extension **1174/1175** (`db.test.js` still fails on the missing `fake-indexeddb`).
+
+## 2026-08-09 — gemini 3.1 fast-retry: abandon a stuck call at 2s instead of waiting 30
+
+**The ask,** straight after the lag trace found the cause: "build gemini 3.1 specific timers so any AI call
+for gemini 3.1 that takes longer than 2 seconds you automatically go and retry."
+
+**Why 2s is the right line.** Measured the same day: 486ms, 646ms, 796ms — and once 30657ms. The
+distribution has no middle, so a call still running at 2s is a stuck socket, not a slow model, and opening
+a new one is far cheaper than waiting behind it.
+
+**What it does.** `LLM_FAST_RETRY_RULES` (llm.js) caps the first `LLM_FAST_RETRY_ATTEMPTS` (2) attempts of
+a matching model at 2s; a call that hits the cap is abandoned and re-issued after 150ms — not the usual
+2000ms backoff, because the deadline was OURS and there is no server backpressure to respect. Scoped by
+provider AND model regex, so every other model is byte-identical. `fastRetry:false` opts a call out.
+
+**Two safety invariants, both unit-pinned:**
+- Once the fast tries are spent, the next attempt gets the **full** budget. A short cap on every attempt
+  would turn a genuinely slow minute at the provider into a FAILED required field — blank, Save & Continue
+  refused, walk halted. One slow page is much cheaper than a halted run. This can only make a call faster
+  to succeed, never less likely to.
+- The fast-try budget is **independent of the error ladder**.
+
+**That second invariant is a bug the live run caught and the unit tests could not.** The first cut gated
+the cap on `maxRetries`, reasoning "no ladder ⇒ no retry to fall back on ⇒ don't cap". But `callLLM`
+probes every key with `noRetry:true`, so on the normal MULTI-KEY path the ladder is length 0 — and the cap
+silently never applied. The probe run proved it: with the cap forced to 50ms, two calls still answered in
+677ms and 647ms with zero fast-retry lines. Seven passing unit tests had said it worked. The fix decouples
+the two, which also keeps a stuck socket from being misreported as a key fault (it must not consume a
+rotation slot or get a key parked).
+
+**Live-verified** by forcing the cap to 50ms so every call takes the path — the only reliable way to
+exercise it, since a real hang appeared once in ~8 calls. Result: 2 aborts per call, then a full-budget
+attempt that SUCCEEDED (`ok in 1668ms — after 2 fast-retry abort(s)`, `ok in 2423ms — after 2`), AI fields
+still filled (`[ai-choice]`, `[ai-eeo-guess]`), `✓✓ reached the REVIEW page after 5 page(s)`. Then restored
+to 2000 and re-confirmed normal calls are untouched. Nothing was submitted on any run.
+
+Also corrected: the docs claimed a 20s request timeout; it is 30000.
+
+Extension **1182/1183** (10 llm fast-retry pins; `db.test.js` still fails on the missing `fake-indexeddb`).

@@ -213,6 +213,44 @@ async function fetchWithTimeout(fetchFn, url, opts, ms) {
     clearTimeout(timer);
   }
 }
+// ── FAST-RETRY: abandon a STUCK call instead of waiting out the full budget (operator, 2026-08-09) ──
+// Measured on cat.wd5 across three back-to-back runs: gemini-3.1-flash-lite answered in 486ms, 646ms and
+// 796ms — and ONCE in 30657ms, on a single attempt that SUCCEEDED, so nothing ever retried it. That one
+// call was the whole difference between a 1.9s page and a 32s page. At that spread a call still running
+// at 2s is overwhelmingly a stuck socket rather than a slow model, and opening a new one is far cheaper
+// than waiting behind it. (Same shape as the 148s hang that motivated the per-attempt timeout above —
+// only that one was extreme enough to notice.)
+//
+// ⚠ SAFETY — why only the EARLY attempts are capped. Capping EVERY attempt would turn a genuinely slow
+// minute at the provider into a FAILED required field: the AI fill returns nothing, the field is left
+// blank, Workday refuses Save & Continue and the walk halts. One slow page is much cheaper than a halted
+// run, so the LAST attempt always gets the full budget. This can only ever make a call FASTER to succeed
+// or equally likely to succeed — never less likely.
+const LLM_FAST_RETRY_RULES = [
+  { provider: "gemini", model: /^gemini-3\.1/i, ms: 2000 },
+];
+const LLM_FAST_RETRY_ATTEMPTS = 2;    // attempts 0 and 1 run capped; attempt 2+ gets the full budget
+const LLM_FAST_RETRY_DELAY_MS = 150;  // WE chose to abandon it, so there is no server backpressure to respect
+
+// The fast-retry cap for this request, or null when no rule matches (or the caller opted out).
+function llmFastRetryMs(cfg) {
+  if (!cfg || cfg.fastRetry === false) return null;
+  const m = String(cfg.model || "");
+  const r = LLM_FAST_RETRY_RULES.find((x) => x.provider === cfg.provider && x.model.test(m));
+  return r ? r.ms : null;
+}
+
+// The deadline for ONE attempt: the short cap while a fast try remains, the full budget once they are
+// spent. Deliberately keyed on the fast-try budget and NOT on the error ladder — see the loop below for
+// why those two must stay separate (the first cut tied it to `maxRetries` and, with 2+ keys configured,
+// the cap then never applied at all; live-verified 2026-08-09).
+function llmAttemptTimeoutMs(cfg, fastLeft) {
+  const full = (cfg && cfg.timeoutMs) === undefined ? LLM_REQUEST_TIMEOUT_MS : cfg.timeoutMs;
+  const fast = llmFastRetryMs(cfg);
+  if (fast == null || !fastLeft || fastLeft <= 0) return full;
+  return Math.min(fast, full);
+}
+
 // CIRCUIT BREAKER. Retrying is right for a momentary spike and wrong for an EXHAUSTED quota:
 // with a full ladder per field, one dead quota would turn a 65-field form into a ~45-minute
 // stall. After this many calls exhaust their whole ladder back-to-back, stop retrying for a
@@ -264,11 +302,31 @@ async function callLLMOnce(req, fetchImpl, sleepImpl) {
   // remedy than waiting, so the ladder is saved for when every key has been tried.
   const cooling = Date.now() < llmRetryState.coolingUntil;
   const maxRetries = cfg.noRetry || cooling ? 0 : LLM_RETRY_DELAYS_MS.length;
-  let res, attempt = 0, netErr = null;
+  const fullTimeoutMs = cfg.timeoutMs === undefined ? LLM_REQUEST_TIMEOUT_MS : cfg.timeoutMs;
+  // The fast-try budget is SEPARATE from the error ladder, and available even on a `noRetry` rotation
+  // probe. That separation is the whole fix: a stuck socket is not a key fault, so it must not consume a
+  // rotation slot, must not get the key marked bad, and must not be reported upward as a failure. The
+  // first cut gated this on `maxRetries`, which is 0 on every rotation probe — so with 2+ keys the cap
+  // silently never applied, and a live run proved it (two calls answered in ~650ms under a 50ms cap).
+  let fastLeft = llmFastRetryMs(cfg) == null ? 0 : LLM_FAST_RETRY_ATTEMPTS;
+  let res, attempt = 0, netErr = null, fastAborts = 0;
   for (;;) {
     netErr = null;
-    try { res = await fetchWithTimeout(fetchFn, url, opts, cfg.timeoutMs === undefined ? LLM_REQUEST_TIMEOUT_MS : cfg.timeoutMs); }
+    const usingFast = fastLeft > 0;
+    const budgetMs = llmAttemptTimeoutMs(cfg, fastLeft);
+    try { res = await fetchWithTimeout(fetchFn, url, opts, budgetMs); }
     catch (e) { netErr = String((e && e.message) || e); res = null; }
+    // OUR short deadline fired (or the socket died fast) and a fast try remains ⇒ re-issue immediately on
+    // a fresh socket. `attempt` is deliberately NOT incremented: the error ladder is untouched, so a
+    // genuinely slow provider still gets its full budget below and can never be failed by the cap.
+    if (netErr !== null && usingFast) {
+      fastLeft--; fastAborts++;
+      try {
+        console.log(`[LLM] fast-retry: ${cfg.model} was still running at ${budgetMs}ms — abandoned it and re-issued on a new socket (observed answer time is well under 1s, so this is a stuck socket, not a slow model)`);
+      } catch (e) { /* log-only */ }
+      await sleep(LLM_FAST_RETRY_DELAY_MS); // our own deadline — no Retry-After to honour, nothing to back off from
+      continue;
+    }
     // A network throw is transient too (DNS blip, dropped socket) — it earns the same ladder.
     const retryable = netErr !== null || (res && !res.ok && LLM_RETRY_STATUS[res.status]);
     if (retryable && attempt < maxRetries) {
@@ -314,7 +372,10 @@ async function callLLMOnce(req, fetchImpl, sleepImpl) {
   // it there is nothing for a spend/quota tracker to record — the body is discarded.
   let usage = { input: 0, output: 0 };
   try { if (typeof prov.usage === "function") usage = prov.usage(data); } catch (e) { /* never fail a good answer over accounting */ }
-  return { ok: true, text: String(text).trim(), usage, model: cfg.model, provider: cfg.provider };
+  // fastAborts: how many stuck sockets the fast-retry cap threw away before this answer landed. Surfaced
+  // so the run log can say the recovery happened rather than just showing a suspiciously quick success.
+  return { ok: true, text: String(text).trim(), usage, model: cfg.model, provider: cfg.provider,
+    fastAborts: fastAborts || 0 };
 }
 
 // ─── Key rotation ───────────────────────────────────────────────────────────
@@ -532,6 +593,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     LLM_RETRY_AFTER_CAP_MS, LLM_BREAKER_TRIP_AFTER, LLM_BREAKER_COOLDOWN_MS, llmRetryAfterMs, resetLlmRetryState, llmRetryState, callLLM, callLLMOnce, LLM_PROVIDERS, LLM_MODELS, LLM_DEFAULT_MODELS, LLM_RETRY_STATUS, LLM_RETRY_DELAYS_MS,
     LLM_REQUEST_TIMEOUT_MS, fetchWithTimeout,
+    LLM_FAST_RETRY_RULES, LLM_FAST_RETRY_ATTEMPTS, LLM_FAST_RETRY_DELAY_MS, llmFastRetryMs, llmAttemptTimeoutMs,
     GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS,
     llmCostUsd, GEMINI_STARTER_CHAIN, LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,
     ANTHROPIC_THINKING_MIN_TOKENS, anthropicThinkingFor, ANTHROPIC_EFFORT_LEVELS,
