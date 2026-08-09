@@ -4189,3 +4189,42 @@ approved disability answer had not taken.
 
 **Not re-verified by me:** the ATS path itself (Greenhouse/Lever/Ashby). That is the merged branch's own
 work and its commits claim all three reach the gate; this entry only covers Workday.
+
+## 2026-08-09 (c) — hidden fill: the résumé junk page is real; the slowness is the overwrite ladder
+
+Operator: "try the runs hidden, I think sometimes the apply with resume doesn't work when hidden."
+Autofill-with-Resume is a FILL-run path only (`preferResumeAutofill` is set by `AP_RUN_APPLICATION`), so
+no rehearsal exercises it. One hidden `Background fill` on moog.wd5, merged build:
+
+**1. The résumé page is NOT being consumed by onboarding — CONFIRMED.** Workday sent the
+Autofill-with-Resume click to the SIGN IN screen; after auth the résumé page came back and the WALK
+processed it, writing the junk bundle page CLAUDE.md predicts:
+
+    Summary saved (accumulated) — page ".../apply/autofillWithResume|": +1 field(s)
+
+The key's field-set half is EMPTY (`|` with nothing after) — the one bare `formField-` wrapper that makes
+`isPastAuth` call the résumé page "the form". The résumé itself attached fine
+(`resume: attached "Kevin's Hardware Resume.pdf"`), and the run completed and reported, so this is bundle
+pollution rather than a failed upload. Not yet checked: whether that 1-field page survives into the
+approved bundle and what the replay does with it.
+
+**2. The 4-minute hidden run was NOT the résumé, the AI, or throttling.** Total 318s vs ~75s for the same
+job pre-merge. Exactly one gap, 236s, and `[CDP-TIME]` attributes it:
+
+    pacing hidden-fast (worker timers) | NOT painting | settle 4.2s | fill 236.1s (flat 225.7s)
+
+Ruled out by evidence rather than guess: pacing was hidden-FAST, so the worker-timer overrides were
+installed and this is not the ~1Hz path; `[AI-BATCH] 0 candidate(s) · NOT fired (needs 2+)` and the one
+LLM call returned in 4958ms; settle was 4.2s.
+
+The cause is the interaction of two existing behaviours. Workday soft-errored on page 2, so the walk
+reloaded and restarted from page 1 (the 2026-07-22 guard). On that second pass every field is ALREADY
+FILLED, so each commit is an OVERWRITE and pays the escalating beat ladder (120 → 700 → 5000ms with a
+re-open per tier) instead of the single fast commit an empty field gets — the first pass over the same
+page was `fill 0.7s`. ~12s/field × 19 fields. Hidden makes it worse because the option-click debounce is
+a PAINT thing (~700ms when not painting), which is why the ladder starts higher there.
+
+So: correct, just expensive. Worth considering whether the post-reload pass can skip fields whose live
+value already equals what we would write (the replay's `skipIfCorrect`, which the FILL walk does not have).
+
+**Also seen:** moog soft-errors often right now — 3 of the last 5 runs, on both fill and replay.
