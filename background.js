@@ -113,7 +113,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "2026-08-07-posting-gone";
+const AP_BUILD = "resume-page-consumed-1";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -7505,7 +7505,25 @@ async function runCdpOnboard(tabId, opts) {
             st
           );
         }
-        if (out === "success") return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified };
+        if (out === "success") {
+          // A successful sign-in can land on the RÉSUMÉ page rather than the form. "Autofill with
+          // Resume" bounces to SIGN IN on a session Workday does not trust, and afterwards it resumes
+          // the flow where it left off — at the upload page. The auth loop's OTHER success exit already
+          // consumes that page (see onResumeUploadPage there); this one returned straight out, so
+          // onboarding announced "reached the form" while sitting on the upload page. The walk then
+          // took it as page 1 and wrote a junk bundle page keyed on an EMPTY field set:
+          //     Summary saved (accumulated) — page ".../apply/autofillWithResume|": +1 field(s)
+          // Live on moog.wd5 2026-08-09. Same handling as the sibling exit, deliberately: a bounce back
+          // to auth re-enters the loop rather than announcing a form we are not on.
+          if (onResumeUploadPage(st)) {
+            const r = await consumeResumeUploadPage(st);
+            if (r.halt) return r.halt;
+            st = r.scan || st;
+            if (r.needsAuth) continue;
+            resumeAutofilled = true;
+          }
+          return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified, resume_autofilled: resumeAutofilled };
+        }
         if (out === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
         if (out === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
         if (isAlreadyApplied(st)) return alreadyAppliedResult(); // signed in successfully → Workday shows already-applied instead of the form
