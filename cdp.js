@@ -3063,6 +3063,24 @@ function cdpDevWrappers() {
         : cbs.length ? Array.from(cbs).map((c) => c.checked).join(",")
         : txt ? (txt.value || "") : null,
       required: !!(w.querySelector("abbr") || w.querySelector('[aria-required="true"]')),
+      // ── THE RAW EVIDENCE, not just our verdict (operator, 2026-08-09) ──────────────────────────────
+      // "you should be able to get this from the DOM, so the fact that you are asking is a problem."
+      // Exactly right: `required` above is a DERIVED boolean, and when a run halted on a required field
+      // the only way to sanity-check it was to re-read the same derivation and learn nothing — so the
+      // question got escalated to a human instead of answered from the page. Report WHICH marker fired,
+      // so "is this really required?" is settled by looking, every time.
+      requiredEvidence: (() => {
+        const ab = w.querySelector("abbr");
+        const lbl = w.querySelector("label,legend");
+        const lblText = lbl ? (lbl.textContent || "").replace(/\s+/g, " ").trim() : "";
+        return {
+          abbrTitle: ab ? (ab.getAttribute("title") || null) : null,   // Workday's <abbr title="required">
+          abbrText: ab ? (ab.textContent || "").trim() : null,         // or a bare <abbr>*</abbr>
+          ariaRequired: !!w.querySelector('[aria-required="true"]'),
+          labelEndsWithStar: /\*\s*$/.test(lblText),
+          label: lblText.slice(0, 60),
+        };
+      })(),
     };
   });
 }
