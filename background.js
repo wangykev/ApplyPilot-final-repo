@@ -4187,7 +4187,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // sitting in two widgets waiting out a ceiling — which is the only thing worth retuning.
     // The résumé is ALWAYS named, whatever it cost: it is the field whose time varies most between a
     // visible and a hidden run, so "it wasn't in the slowest list" is not the same as knowing.
-    const res = out.results.find((r) => /resume|cv/i.test(r.fieldName || "") || r.widgetType === "file_upload");
+    const res = out.results.find((r) => /resume|\bcv\b/i.test(r.fieldName || "") || r.widgetType === "file_upload");
     const resPart = res ? ` | resume ${((res.elapsedMs || 0) / 1000).toFixed(1)}s` : "";
     const slow = out.results
       .filter((r) => (r.elapsedMs || 0) >= 1500)

@@ -3422,3 +3422,62 @@ only on dimension names splits those two apart.
 **A removed posting is visible before you look for a form.** Lever serves the title `Not found`;
 Greenhouse 302s to the company board index (title `Current openings at <Company>`), dropping the job
 id from the URL.
+
+## 2026-08-08 — the 2.5s settle floor: measured, and it stays
+
+`waitAtsFormReady` accepts on three equal non-zero field counts **AND** `Date.now() - start >= 2500`.
+That floor is pure waiting on a form that rendered instantly — on the fast Lever forms it is longer
+than the fill — so it was worth trying to replace with a real signal. It was instrumented, measured
+on live forms, and **the replacement was refuted**. The floor stays. Do not re-run this without
+reading the numbers below.
+
+**What was instrumented (all reverted).** An in-flight request counter (`window.__apInflight`,
+wrapping `fetch`/`XHR` to count only) installed with the page overrides — the one place that runs
+before the document exists and so sees the form's own first requests — plus a 150ms page-side sampler
+recording `[t, form-control count, in-flight]` from document start, and a per-tick trace in the settle
+loop. The accept rule was left on the floor throughout; the run only observed.
+
+**The forms mount long before the settle loop looks.** Settle-relative traces:
+
+| form | count final at | accepted at |
+|---|---|---|
+| Ashby / Sierra (35 fields) | 496ms | 3500ms |
+| Ashby / Linear (12) | 530ms | 4906ms |
+| Ashby / OpenEvidence (13) | ≤1542ms (first read) | 2941ms |
+| GH / Discord (25) | 13ms (first read) | 2814ms |
+
+So the floor is typically 2–4.5s of dead time. That is the prize, and it is real.
+
+**Why DOM quiescence cannot claim it.** Ashby/Sierra, from document start:
+`159ms c=0 q=0 | 1351ms c=0 q=1 | 2040ms c=60 q=1 | 2110ms c=60 q=0 | 2266ms c=61 q=0`.
+At 2040ms the DOM has been still for a while — and a request is still in flight, with one more control
+to come. Quiescence would accept a form short of a field. This is the 2026-07-31 failure (Ashby
+accepted at 9 of 13 fields) reproduced in miniature.
+
+**Why in-flight cannot claim it either — the refutation.** GH/Discord, from document start:
+`280ms c=34 q=0 | 1716ms c=35 q=2 | 1807ms c=36 q=1 | 2250ms c=36 q=0`.
+At **280ms the count is stable AND nothing is in flight**, and two more controls arrive **1.4 seconds
+later** on requests that had not started yet. `q == 0` means "no request in flight right now", never
+"no more requests coming". A stable-count + zero-in-flight rule accepts a form missing two controls.
+
+Sierra adds a second, smaller objection: the count grew at 2266ms while `q` had already been 0 since
+2110ms — React renders a tick AFTER the fetch resolves, so even a correct drain needs a settle margin
+behind it.
+
+**Conclusion.** There is no observable signal that distinguishes "finished mounting" from "quiet before
+the next burst", because the distinguishing event is in the future. The floor is a crude but honest way
+of waiting long enough for the next burst to *start*. It is not tuned and it is not clever; it is the
+only thing measured that works.
+
+⚠ Two traps found while doing this, both worth keeping:
+- **Wrapping `fetch` must bind the receiver.** `_f.apply(this, …)` throws `Illegal invocation` for a
+  bare `fetch(url)` from a strict-mode bundle, and that alone stopped an Ashby form from mounting at
+  all — `form did not settle within 25000ms (last field count 0)`. Bind to `window`.
+- **A comment inside `buildOverrideSrc` cannot contain a backtick.** That function returns a template
+  literal, so a backtick in a comment terminates it and cdp.js stops parsing.
+
+**A follow-up that was considered and NOT taken:** measure the floor from DOCUMENT START rather than
+from settle start (the page has often already had its 2.5s by the time the loop begins). It is
+appealing and would reclaim most of the dead time, but it is strictly less conservative — on a page
+whose mounting finishes at 4s the loop could accept at 3s — and nothing measured here justifies that
+trade. If it is ever attempted, it needs a slow-form counter-example first, not a fast-form win.
