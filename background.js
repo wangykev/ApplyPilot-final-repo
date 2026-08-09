@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "merged-skills-1";
+const AP_BUILD_MARKER = "autofill-auth-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6290,9 +6290,22 @@ async function runCdpOnboard(tabId, opts) {
     // rather than attaching into a page that isn't ready — that races Workday's own parse setup, and the
     // clear-then-attach inside attachResume is exactly the wrong thing to do mid-flight.
     if (!(s.markers && s.markers.resumeUploadInput)) {
-      const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1,
+      // ── AUTH CAN INTERRUPT THIS (2026-08-09) ──────────────────────────────────────────────────────
+      // "Autofill with Resume" on a session Workday does not trust redirects to SIGN IN, and the wait
+      // below could never be satisfied there — so it burned its whole budget and halted
+      // `resume-upload-input-missing`, blaming an upload control on a page that was asking for a
+      // password. Live on nvidia.wd5: `still waiting at 4.1s — title "Sign In"`, repeated to 16s+.
+      // Landing on auth is a NORMAL branch of this flow (it is the first-run path for any signed-out
+      // user), so break out and let the auth stage do its job, exactly as the terminal-state exits
+      // inside waitFor already do for already-applied and maintenance pages.
+      const authNow = (sc) => !!(sc && (sc.hasAuthEl || sc.passwordInput || sc.emailInput || sc.signInWithEmail));
+      const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1 || authNow(sc),
         await renderBudget(12000, 25000), "resume-upload-input");
       s = w.scan || s;
+      if (authNow(s)) {
+        LOG("Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage (the résumé page comes after).");
+        return { scan: s, needsAuth: true };
+      }
       if ((s.formFieldCount || 0) > 1) { LOG("the résumé page moved on by itself — already past it."); return { scan: s }; }
       if (!(s.markers && s.markers.resumeUploadInput)) {
         return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-upload-input-missing",
@@ -6973,6 +6986,9 @@ async function runCdpOnboard(tabId, opts) {
           const r = await consumeResumeUploadPage(st);
           if (r.halt) return r.halt;
           st = r.scan || st;
+          // The résumé page can bounce to SIGN IN. Re-enter the auth loop rather than announcing a form
+          // we are not on — claiming reached-form here would hand the walk an auth screen to fill.
+          if (r.needsAuth) continue;
           resumeAutofilled = true;
         }
         LOG("reached the application form.");
@@ -7382,7 +7398,9 @@ async function runCdpOnboard(tabId, opts) {
         const r = await consumeResumeUploadPage(st);
         if (r.halt) return r.halt;
         st = r.scan || st;
-        resumeAutofilled = true;
+        // Bounced to sign-in: leave resumeAutofilled FALSE and fall through to Stage 3, which signs in
+        // and then consumes the résumé page on the other side (that path already exists above).
+        if (!r.needsAuth) resumeAutofilled = true;
       }
     } else if (st.markers.applyManually) {
       LOG('Stage 2 — clicking "Apply Manually".');
