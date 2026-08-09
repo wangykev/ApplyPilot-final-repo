@@ -5192,6 +5192,15 @@ async function runCdpReplayWalk(tabId, opts) {
       if (res.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after Save & Continue on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.timeout) {
+        // Workday's soft error after the Save click, same as the fill walk. cdpWaitNextPage surfaces it
+        // now, so it costs one branch — and without it the replay spends a re-click on a page that has
+        // no footer button before halting for a reason that has nothing to do with the bundle.
+        if (res.softError && softReloads < MAX_REPLAY_SOFT_RELOADS) {
+          softReloads++;
+          LOG(`⚠ Workday soft-error AFTER Save & Continue on page ${page} ("Something went wrong / please refresh") — reloading + restarting the replay (soft-reload ${softReloads}/${MAX_REPLAY_SOFT_RELOADS}).`);
+          await reloadAndSettle(LOG);
+          continue restartWalk;
+        }
         // CLEAN no-advance fallback first (operator ask): a swallowed Save & Continue re-clicks (up to 2x).
         // Self-guards on error/session-death, so a real validation block still HALTS (never masked).
         const reclick = await reclickNextWhenClean(act, prevSig, 2, LOG);
@@ -5631,6 +5640,13 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
     try { state = await cdpEval(cdpReadSessionState); } catch (e) { continue; }
     if (state && isWorkdayMaintenance(state)) return { advanced: false, maintenance: true, state }; // transient, retry-later — NOT dead (checked first)
     if (state && sessionLooksDead(state)) return { advanced: false, sessionDead: true, state };
+    // Workday's soft error ("Something went wrong / please refresh") is a TERMINAL answer to the click,
+    // exactly like the two above — the page we were waiting for is gone and no amount of waiting brings
+    // it back. Without this it fell through to the 15s ceiling, and only THEN did the caller start
+    // polling ~4s for error text that a soft-error page never has, plus a re-click that finds no footer
+    // button (operator: "it seems to take a long time in order for this to happen"). The flag is already
+    // in the state read on every poll, so detecting it costs nothing and lands within ~500ms.
+    if (state && state.softErrorPresent) return { advanced: false, softError: true, state };
     let scan = null;
     try { scan = await cdpEval(cdpPageScan); } catch (e) { continue; }
     if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; errSteady = 0; continue; } // not hydrated
@@ -5985,8 +6001,11 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         // `re-click refused (no-button)` — three symptoms of a page that is simply GONE.
         // Same bounded budget as the other two checks; a reload restarts the walk from page 1, and
         // skip-if-correct makes the already-filled pages cheap on the way back.
-        let softAfterSave = null;
-        try { softAfterSave = await cdpEval(cdpReadSessionState); } catch (e) { /* fall through to remediation */ }
+        // res.softError is the CHEAP path: cdpWaitNextPage now exits the moment it sees the error page,
+        // so this normally fires ~500ms after the click instead of after the 15s ceiling. The re-read is
+        // the fallback for a soft error that renders just after the wait returned.
+        let softAfterSave = res.softError ? res.state : null;
+        if (!softAfterSave) { try { softAfterSave = await cdpEval(cdpReadSessionState); } catch (e) { /* fall through to remediation */ } }
         if (softAfterSave && softAfterSave.softErrorPresent && softReloads < MAX_SOFT_RELOADS) {
           softReloads++;
           LOG(`⚠ Workday soft-error AFTER Save & Continue on page ${page} ("Something went wrong / please refresh") — reloading + restarting the walk (soft-reload ${softReloads}/${MAX_SOFT_RELOADS}).`);
