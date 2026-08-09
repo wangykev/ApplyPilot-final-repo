@@ -4232,3 +4232,77 @@ Continued the live regression/expansion sweep. Every run a fill or a rehearsal
 - `web/` vitest fails to resolve its `@/lib/*` alias for 7 suites. Verified
   identical with all changes stashed: pre-existing, unrelated.
 - Suite 1189/1189; web typecheck clean.
+
+## 2026-08-09 — the between-fields gap, measured: it is our own SW timer, and the firehose theory was wrong
+
+**The ask.** Operator: "sometimes it happens between two deterministic fields — they should fill instantly,
+but there is like a .75 second gap between their fills."
+
+**Nothing could see it.** `[CDP-TIME]` reports phase totals and `debugPageTrace` times actions; the window
+between one field FINISHING and the next STARTING belonged to neither and vanished from the accounting.
+Added under `debugLagTrace`: a delay that OVERRAN (a delay is the one action whose intended cost we know
+exactly, so anything past it is our own timer running late), DEAD AIR between two fields, and any field
+over 400ms named with the tier that answered it.
+
+**Measured, on a clean VISIBLE run** (6 pages, all `visible-fast | painting (visible)`, reached REVIEW):
+
+    page 1 · probe p95    2ms · drift p95    8ms · UNREAD CDP EVENTS 0
+    page 2 · probe p95 1470ms · drift p95 1778ms · UNREAD CDP EVENTS 2
+    page 3 · probe p95 2599ms · drift p95 2546ms · UNREAD CDP EVENTS 6
+    page 4 · probe p95   19ms · drift p95  173ms · UNREAD CDP EVENTS 0
+
+**Three findings, in order of how much they change what we do:**
+
+1. **The CDP event-firehose theory is REFUTED — do not re-open it.** We `Runtime.enable` + `DOM.enable` at
+   attach and register NO `onEvent` listener anywhere, so the obvious story was that Chrome streams
+   console/executionContext/DOM-mutation events at a worker that never reads them and saturates its event
+   loop. A counter says otherwise: the WORST-drifting pages (2446ms, 11663ms) had **zero** unread events.
+   The change was not made. This is why the counter was added before the fix.
+2. **`cdpDelay` is a bare SW `setTimeout`** — `(ms) => new Promise(r => setTimeout(r, ms))`, nothing
+   page-side. So `delayFull(150)` returning in 1782ms is genuinely our own timer, 1.6s late. You cannot
+   make `setTimeout` fire on time; what you can do is make sure nothing DEPENDS on it being punctual. The
+   one that overran here is a POLL INTERVAL (`entryReconcileIntervalMs`), and its loop exits on state, not
+   on iteration count — so the overrun cost one long tick and nothing else. The one-shot sleeps
+   (`auditSettleMs: 600`) delivered 610ms, on time.
+3. **SW drift and RENDERER jam move together, on every page, visible or hidden.** Probe p95 and drift p95
+   rise and fall as a pair (pages 2–3 high, 1/4/5/6 low). The likely mechanism: while the renderer is
+   jammed many evals are in flight, and when it frees up they all resolve at once, so the interval
+   callback queues behind the burst.
+
+**Where a visible run's time actually goes** (traced actions ≥120ms, whole run):
+`delayFull 12.1s · scrapeTaOptions 9.1s · scanPage 3.1s · pressTab 3.0s · repeatingScan 1.5s · llm 1.4s`.
+Of the 12.1s, ~3.6s is the per-page M40 audit settle (600ms × 6) behaving exactly as designed. ONE
+`pressTab` took 2.97s on a visible tab — a trusted input dispatch that should be milliseconds.
+
+**The honest caveat.** On a clean VISIBLE run the total measurable OVERRUN was ~1.6s across a ~33s fill.
+The dramatic 2.5s-and-up gaps were all recorded while the Chrome window was MINIMISED (renderer blocked
+12–15s at a stretch, `Runtime.evaluate` once 138998ms). So the severe form tracks the window not painting
+— which `act.visible` cannot detect (it reads `tab.active && !minimized`, and an occluded or alt-tabbed
+window still reports visible). A correction worth recording: `via exact-normalized` is the tier that
+mapped an ANSWER onto a live option and does NOT mean the field was deterministic — `disabilityForm` was
+read that way at first and is in fact an AI field (`llm() 0.67s` of its 1250ms).
+
+**Not fixed yet, deliberately:** the remaining levers all trade against documented invariants (the audit
+settle is `delayFull` precisely because it must run full) or are large (option-scrape caching, which the
+2026-08-06 no-cross-run-cache decision made on purpose). Those are the operator's call, not a silent tune.
+
+**FIX TRIED AND REVERTED the same day — the typeahead close poll.** The operator watched a run and gave
+the sharpest lead yet: "right after the country/territory phone code question, right after it recon'd
+everything, it waited a second before closing the typeahead and continuing." The trace agreed —
+`CAPTURE done 3.86s` against `scrapeTaOptions 3.08s`, so ~0.78s went on opening and closing the widget
+around a read-only scrape — and `awaitTypeaheadClosed` re-checks on `reopenSettleMs` (400ms), an
+OPEN-settle budget far too coarse for a close: a popup that unmounts in ~50ms still costs a full tick.
+Dropping it to a dedicated 75ms poll (deadline untouched, gate is `leafCount===0`, so no safety change)
+looked obviously right.
+
+**It moved the number it targets by ~80ms** (0.78s → 0.70s) — noise. And the operator's read of that run
+was "lagged in a lot of places elsewhere", which the log supports (page 3 renderer blocked 14.3s,
+`Runtime.evaluate 14332ms` while a trivial eval cost 8763ms). That is not attributable to a poll interval
+with confidence, but the MECHANISM is real and not worth risking: polling 5× more often issues 5× more
+`Runtime.evaluate` calls into the page thread that is ALREADY the bottleneck. Paying renderer contention
+for 80ms is the wrong trade, so it is reverted, with the reasoning left in the code so the next person
+does not re-derive it.
+
+**What this rules in:** the fill is not losing its time to our pacing constants. It is losing it to the
+page thread being blocked for seconds at a stretch, during which every read, every input dispatch and
+every timer we own arrives late. Optimising our own waits cannot fix that, and can make it worse.

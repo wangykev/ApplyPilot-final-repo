@@ -7224,6 +7224,18 @@ function applyAuditVerdicts(results, verdicts) {
 // (leaves unmounted → no clickable stray target). Adaptive → breaks the instant the popup empties (fast
 // happy path); bounded by iterations + a real deadline so a slow close (or an older substrate whose readHier
 // lacks leafCount) never hangs. Read-only (only readHier + a settle).
+// ⛔ TRIED AND REVERTED, 2026-08-09 — do not "optimise" this poll again without new evidence.
+// The operator watched a run and reported: "right after the country/territory phone code question, right
+// after it recon'd everything, it waited a second before closing the typeahead and continuing." This poll
+// re-checks on `reopenSettleMs` (400ms) — an OPEN-settle budget, coarse for a close — so a popup that
+// unmounts in ~50ms still costs a full tick, which looked like the obvious cause. Dropping the interval to
+// 75ms (deadline unchanged, so no safety change) was measured live and moved the capture's open+close
+// overhead 0.78s → 0.70s: ~80ms, i.e. noise. The same run was WORSE overall (page 3 renderer blocked
+// 14.3s), and there is a mechanism that makes that plausible rather than coincidental — polling 5× more
+// often issues 5× more Runtime.evaluate calls into a page thread that is ALREADY the bottleneck. Paying
+// renderer contention to save 80ms is the wrong trade.
+// The real cost here is not this interval: it is the page thread being blocked for seconds at a time (see
+// the 2026-08-09 progress-log entry), which no pacing tweak addresses.
 async function awaitTypeaheadClosed(act, loc, budgets) {
   if (!act || !act.readHier) return;
   const dr = act.delayRender || act.delayFull;
