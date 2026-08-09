@@ -5974,6 +5974,25 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
         // error (sessionLooksDead already excluded above). Attempt BOUNDED remediation before the
         // dirty halt: Tier-0 dup-language / Tier-1 deterministic re-fill → Tier-2 AI, capped + halt-on-no-progress.
         if (res.errorDetected) LOG(`page ${page} Save & Continue blocked — error markers detected fast (~1s).`);
+        // ── WORKDAY'S SOFT ERROR, AFTER the Save click (operator, 2026-08-08) ────────────────────────
+        // The walk already reloads on "Something went wrong / please refresh" at the TOP of a page and
+        // again BEFORE Save — but not here, and here is where it actually appeared: the click lands,
+        // Workday swaps the page for its error screen, the nav wait times out, and we fall into AI-4
+        // instead of reloading. The operator's report is precisely this asymmetry — "the apply manually
+        // run reloads no issues" (its soft errors surface at a point the existing checks cover) while
+        // the autofill run "does not refresh". Diagnosing it from the log is misleading too: the error
+        // screen has no form and no footer button, so the trace reads `0 error(s)`, `no error text` and
+        // `re-click refused (no-button)` — three symptoms of a page that is simply GONE.
+        // Same bounded budget as the other two checks; a reload restarts the walk from page 1, and
+        // skip-if-correct makes the already-filled pages cheap on the way back.
+        let softAfterSave = null;
+        try { softAfterSave = await cdpEval(cdpReadSessionState); } catch (e) { /* fall through to remediation */ }
+        if (softAfterSave && softAfterSave.softErrorPresent && softReloads < MAX_SOFT_RELOADS) {
+          softReloads++;
+          LOG(`⚠ Workday soft-error AFTER Save & Continue on page ${page} ("Something went wrong / please refresh") — reloading + restarting the walk (soft-reload ${softReloads}/${MAX_SOFT_RELOADS}).`);
+          await reloadAndSettle(LOG);
+          continue restartWalk;
+        }
         // OPERATOR RULE: with AI fill OFF, do NOT auto-remediate — the deterministic Tier-1/1.6 re-fill
         // is the unwanted "refill on error" (and, pre-M-overwrite, a duplicate-page vector). Skip
         // remediation entirely and HALT on any error the deterministic pass couldn't clear; only a
@@ -6216,8 +6235,20 @@ async function runCdpOnboard(tabId, opts) {
   // It reports ONE bare `formField-` wrapper, which is why isPastAuth excludes it above: otherwise
   // onboarding would announce "reached the form" and hand the walk a page with no real fields.
   // The automation-ids are the ones attachResume already drives, so the upload itself is reused as-is.
+  // The upload input is the POSITIVE signal, but it mounts a beat after the page does — and keying the
+  // decision on one read of it is how the résumé page got mistaken for the form (live 2026-08-08: the
+  // walk was handed a page whose only field was a file_upload, re-attached the résumé onto it, clicked
+  // Continue, and Workday answered with "Something went wrong"; by then the footer button was gone, so
+  // neither the re-click nor the reload could fire and it died as a bare nav-timeout on "page 1").
+  //
+  // So the URL carries the decision when the marker is late. `/apply/autofillWithResume` is the whole
+  // flow's path (My Information sits on it too), which is exactly why the field COUNT is the other half:
+  // the résumé page has one bare wrapper, the real form has fourteen. Neither signal alone is safe —
+  // together they are, and this is the check `isPastAuth` defers to.
   function onResumeUploadPage(s) {
-    return !!(s && s.markers && s.markers.resumeUploadInput) && (s.formFieldCount || 0) <= 1;
+    if (!s || (s.formFieldCount || 0) > 1) return false;
+    if (s.markers && s.markers.resumeUploadInput) return true;
+    return /\/apply\/autofillWithResume\b/i.test(String(s.url || "")) && !s.hasAuthEl;
   }
   // Upload the stored résumé (if it isn't already up) and click Continue. Returns {scan} on success or
   // {halt} with a self-explaining stop — never a bare false, since every failure here is operator-actionable.
@@ -6228,6 +6259,19 @@ async function runCdpOnboard(tabId, opts) {
       LOG("⛔ on Workday's résumé-upload page but NO résumé is stored — upload one on the website first.");
       return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-missing-for-autofill",
         detail: "Autofill with Resume needs the stored résumé and none is saved in the extension." } };
+    }
+    // The page can be recognised from the URL before its upload input has mounted, so WAIT for the input
+    // rather than attaching into a page that isn't ready — that races Workday's own parse setup, and the
+    // clear-then-attach inside attachResume is exactly the wrong thing to do mid-flight.
+    if (!(s.markers && s.markers.resumeUploadInput)) {
+      const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1,
+        await renderBudget(12000, 25000), "resume-upload-input");
+      s = w.scan || s;
+      if ((s.formFieldCount || 0) > 1) { LOG("the résumé page moved on by itself — already past it."); return { scan: s }; }
+      if (!(s.markers && s.markers.resumeUploadInput)) {
+        return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-upload-input-missing",
+          detail: "the Autofill-with-Resume page never rendered its upload control." } };
+      }
     }
     if (s.markers && s.markers.resumeUploadSuccess) LOG("the résumé is already uploaded on this page — continuing.");
     else {
