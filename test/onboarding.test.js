@@ -596,3 +596,37 @@ test("job posting gone: Workday's not-found shell is recognized, and a real post
   assert.ok(!isJobPostingGone(""));
   assert.ok(!isJobPostingGone(null));
 });
+
+// ── every post-auth "reached the form" exit must CONSUME the résumé page (moog.wd5 live 2026-08-09) ──
+// "Autofill with Resume" bounces to SIGN IN on a session Workday does not trust, and after a successful
+// sign-in Workday resumes the flow at the UPLOAD page, not the form. runCdpOnboard had two success
+// exits and only one consumed that page; the other returned reached_form straight out, so the walk took
+// the upload page as page 1 and wrote a junk bundle page keyed on an EMPTY field set:
+//
+//     Summary saved (accumulated) — page ".../apply/autofillWithResume|": +1 field(s)
+//
+// A structural check, because this is a "two exits, one of them forgets" bug — the kind a behavioural
+// test on either exit alone passes. Exits reached BEFORE auth are exempt: isPastAuth deliberately
+// excludes the résumé page, so they cannot fire on it.
+test("onboarding: no post-auth reached-form exit skips the résumé-upload page", () => {
+  const fs = require("fs"), path = require("path");
+  const src = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
+  const lines = src.split(/\r?\n/);
+
+  // The exits that carry sign-in state (account_created / verified) are the post-auth ones — the only
+  // place Workday can hand back the résumé page instead of the form.
+  const postAuth = [];
+  lines.forEach((ln, i) => {
+    if (/reached_form:\s*true/.test(ln) && /account_created|verified/.test(ln)) postAuth.push(i);
+  });
+  assert.ok(postAuth.length >= 2, `expected the post-auth reached-form exits, found ${postAuth.length}`);
+
+  const unguarded = postAuth.filter((i) => {
+    const before = lines.slice(Math.max(0, i - 25), i).join("\n");
+    return !/onResumeUploadPage\s*\(/.test(before);
+  }).map((i) => `background.js:${i + 1}`);
+
+  assert.deepStrictEqual(unguarded, [], "these post-auth exits announce reached_form without first " +
+    "consuming Workday's résumé-upload page, so the walk receives that page as page 1 and writes a " +
+    "one-field junk bundle page. Consume it (onResumeUploadPage + consumeResumeUploadPage) before returning.");
+});
