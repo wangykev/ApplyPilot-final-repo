@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "selfid-fill-1";
+const AP_BUILD_MARKER = "sigdate-demand-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -5273,13 +5273,15 @@ async function runCdpReplayWalk(tabId, opts) {
         // on two questions the human never saw, entirely because of our own unapproved write.
         // Here the value is only ever written after Workday demands it, it can only ever be today, and
         // the page is re-Saved once. Bounded per RUN.
-        if (dateStamps < 2 && samples.some((t) => /enter\s+today'?s\s+date/i.test(String(t)))) {
+        // Cheap TEXT-ONLY pre-check so a nav-timeout that has nothing to do with a date never pays for
+        // an extra page scan: either Workday spelled the ask out, or it named a field whose name reads
+        // like a signature date. The grounded decision is signatureDateDemanded, against the live DOM.
+        if (dateStamps < 2 && apMatch.signatureDateAskInText(samples)) {
           const today = (() => { const t = new Date(); return { month: String(t.getMonth() + 1), day: String(t.getDate()), year: String(t.getFullYear()) }; })();
           let stamped = null;
           try {
             const fscan = await cdpEval(cdpPageScan);
-            const df = ((fscan && fscan.fields) || []).find((f) => (f.widgetType === "date" || f.widgetType === "text")
-              && apMatch.isSignatureDateQuestion(f.label));
+            const df = apMatch.signatureDateDemanded(samples, (fscan && fscan.fields) || []);
             if (df) {
               const loc = { wrapperSel: df.wrapperSel };
               const r = df.widgetType === "date"

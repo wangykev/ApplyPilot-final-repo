@@ -786,6 +786,64 @@ function errorLabelKey(s) {
     .trim();
 }
 
+// Is Workday DEMANDING the signature date on this page? Returns the live field it means, or null.
+//
+// The replay may write exactly one value the review page did not approve — today's date — and only
+// because Workday ASKED. Recognizing the ask used to be a single wording, `"Enter today's date"`.
+// Live on marvell page 5 the ask reads "The field Date is required and must have a value", so nothing
+// fired and the rehearsal halted `replay-blocked` on a page that was one re-type from advancing.
+//
+// The load-bearing detail is WHY the field is rejected, because it changes what counts as evidence.
+// The trace showed the wrapper already holding the value: `Date* current value is 8/9/2026`. Workday
+// re-renders the date from its saved copy but has DROPPED it server-side (the same self-ID class as
+// the disability checkbox and hispanicOrLatino), so the page shows an answer the model does not have.
+// The replay then does nothing at all, because `skipIfCorrect` reads the screen, sees today's date and
+// takes the zero-actuation path — the value is correct in the DOM and absent where it counts.
+//
+// So this deliberately does NOT require the field to be blank. Blankness is the one piece of evidence
+// that is guaranteed absent in the failure it exists to catch. What it requires instead:
+//   • the field is a SIGNATURE-date question (isSignatureDateQuestion rejects start/birth/graduation/
+//     expiry/from/to — a wrong stamp there would be a wrong answer, not a missing one), and
+//   • Workday itself named it — either by spelling out the ask, or by naming that exact field in the
+//     error text. We never pick a date field Workday did not complain about.
+// The caller re-types with budgets that carry no `skipIfCorrect`, so the value is actuated for real
+// and handed to the model, which is the whole point.
+// TEXT-ONLY half of the check, so a nav-timeout with nothing to do with a date never pays for an extra
+// page scan. Kept here rather than inlined at the call site because background.js reaches lib.js through
+// the hand-written `apMatch` literal: every helper it calls has to be listed there, and one that is not
+// throws only in the browser (Node sees all of lib.js, so the suite stays green — live 2026-08-09,
+// `apMatch.parseErrorFieldName is not a function` aborted a replay that was otherwise fixed).
+function signatureDateAskInText(errorTexts) {
+  return (errorTexts || []).some((t) => {
+    const s = String(t == null ? "" : t);
+    if (/enter\s+today'?s\s+date/i.test(s)) return true;
+    const n = parseErrorFieldName(s);
+    return !!(n && isSignatureDateQuestion(n));
+  });
+}
+function signatureDateDemanded(errorTexts, liveFields) {
+  const texts = (errorTexts || []).map((t) => String(t == null ? "" : t)).filter(Boolean);
+  if (!texts.length) return null;
+  const sigFields = (liveFields || []).filter((f) => f
+    && (f.widgetType === "date" || f.widgetType === "text")
+    && isSignatureDateQuestion(f.label));
+  if (!sigFields.length) return null;
+
+  // (1) EXPLICIT ask — Workday spelled out what it wants, so any signature-date field on the page is it.
+  if (texts.some((t) => /enter\s+today'?s\s+date/i.test(t))) return sigFields[0];
+
+  // (2) GENERIC ask — Workday only says a field is required. Ground it on the NAME it used.
+  for (const t of texts) {
+    const named = parseErrorFieldName(t);
+    if (!named) continue;
+    const key = errorLabelKey(named);
+    if (!key) continue;
+    const hit = sigFields.find((f) => errorLabelKey(f.label) === key);
+    if (hit) return hit;
+  }
+  return null;
+}
+
 // AI-4 Tier-1 (DETERMINISTIC, no AI): the MAPPED fields an error set names. For each error →
 // parseErrorFieldName → match a scan field by label (equal OR bidirectional-containment after
 // normalizeLabel) → keep only fields with `fieldMap[fieldName]` truthy (deterministically
@@ -2163,7 +2221,7 @@ function devLogSelect(ring, opts) {
 // functions simply stay globals (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, sameCalendarDate,
+  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, sameCalendarDate,
   skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
   skillTokens, skillContainmentEligible, skillWholeWordIn,
   rejectedValueEntries,
