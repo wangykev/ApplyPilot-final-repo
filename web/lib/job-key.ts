@@ -23,11 +23,23 @@ export function canonicalJobUrl(u: string): string {
     // byte-identical — only URLs that had no key at all get one.
     const alt = (p.pathname.match(/_([A-Za-z]{1,4}\d[\w-]*?)(?=\/|$)/g) || []).pop();
     if (alt) return (dc || "wd") + ":" + alt.slice(1).toLowerCase();
+    // A purely NUMERIC requisition id (2026-08-09). Marvell posts `…-Engineer_2601615` — no "R", no
+    // letter prefix — so it matched neither tier above and fell through to the path fallback, which is
+    // ENCODING-SENSITIVE: Workday serves the location segment percent-encoded ("San-Diego%2C-CA") while
+    // a hand-typed or redirected URL may carry the bare comma. The two spellings produced two different
+    // keys for one job, so the submit run REFUSED its own approved bundle:
+    //   REFUSING: no approved bundle for job_key "…" (no-remote-bundle)
+    // Same failure the letters+digits tier was added for on 2026-08-03, one character narrower.
+    // Ordered AFTER both tiers above, so every existing key stays byte-identical; ≥4 digits so an
+    // ordinary path number can't be mistaken for a requisition.
+    const num = (p.pathname.match(/_(\d{4,})(?=\/|$)/g) || []).pop();
+    if (num) return (dc || "wd") + ":" + num.slice(1);
     // ⚠ An EMBED url carries its job identity ONLY in the query string: every employer's
     // Greenhouse embed is `job-boards.greenhouse.io/embed/job_app?for=<board>&token=<id>`, so
     // origin+pathname collapses ALL of them to one key (live 2026-08-02: a submit run pulled a
     // DIFFERENT company's approved bundle). Keep the job token when the path can't identify it.
-    const path = (p.origin + p.pathname)
+    const decoded = (() => { try { return decodeURIComponent(p.pathname); } catch { return p.pathname; } })();
+    const path = (p.origin + decoded)
       .toLowerCase()
       .replace(/\/apply(?:\/[^/]*)*\/?$/i, "")
       .replace(/\/application\/?$/i, "") // Ashby's form tab (2026-07-31) — lockstep with lib.js

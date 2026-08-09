@@ -1061,6 +1061,17 @@ function canonicalJobUrl(u) {
     // byte-identical — only URLs that had no key at all get one.
     const alt = (p.pathname.match(/_([A-Za-z]{1,4}\d[\w-]*?)(?=\/|$)/g) || []).pop();
     if (alt) return (dc || "wd") + ":" + alt.slice(1).toLowerCase();
+    // A purely NUMERIC requisition id (2026-08-09). Marvell posts `…-Engineer_2601615` — no "R", no
+    // letter prefix — so it matched neither tier above and fell through to the path fallback, which is
+    // ENCODING-SENSITIVE: Workday serves the location segment percent-encoded ("San-Diego%2C-CA") while
+    // a hand-typed or redirected URL may carry the bare comma. The two spellings produced two different
+    // keys for one job, so the submit run REFUSED its own approved bundle:
+    //   REFUSING: no approved bundle for job_key "…" (no-remote-bundle)
+    // Same failure the letters+digits tier was added for on 2026-08-03, one character narrower.
+    // Ordered AFTER both tiers above, so every existing key stays byte-identical; ≥4 digits so an
+    // ordinary path number can't be mistaken for a requisition.
+    const num = (p.pathname.match(/_(\d{4,})(?=\/|$)/g) || []).pop();
+    if (num) return (dc || "wd") + ":" + num.slice(1);
     // Strip the FORM-page tail so a posting URL and its form URL key identically:
     // /apply(…) (Workday + Lever) and /application (Ashby — 2026-07-31; without this a
     // submit run keyed on the posting could never find the fill's reported bundle).
@@ -1070,7 +1081,9 @@ function canonicalJobUrl(u) {
     // pull a DIFFERENT company's approved bundle — the review page showed 'all approved' while
     // the gate refused, naming a field from the other application. Keep the job token when the
     // path alone cannot identify the job.
-    const path = (p.origin + p.pathname).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
+    // decodeURI-ish: fold percent-escapes so "%2c" and "," cannot key differently (see the numeric tier).
+    const decoded = (() => { try { return decodeURIComponent(p.pathname); } catch (e) { return p.pathname; } })();
+    const path = (p.origin + decoded).toLowerCase().replace(/\/apply(?:\/[^/]*)*\/?$/i, "").replace(/\/application\/?$/i, "").replace(/\/+$/, "");
     const tok = p.searchParams.get("token") || p.searchParams.get("gh_jid");
     if (tok && /\/embed\/job_app$|\/embed\/job_board$/.test(path)) return path + "?token=" + String(tok).toLowerCase();
     return path;

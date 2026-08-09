@@ -812,3 +812,36 @@ test("commit read-back: polls until the value appears, instead of sampling once"
   assert.ok(/^filled/.test(String(rec.status)), "status was " + rec.status);
   assert.ok(reads >= 3, "it actually polled (reads=" + reads + ")");
 });
+
+// ── A purely NUMERIC requisition id, and percent-encoding (2026-08-09) ─────────────────────────────
+// Marvell posts `…-Engineer_2601615` — no "R", no letter prefix — so it matched neither requisition
+// tier and fell through to the origin+pathname fallback. That fallback is ENCODING-SENSITIVE: Workday
+// serves the location segment as "San-Diego%2C-CA" while a hand-typed or redirected URL carries the
+// bare comma, so ONE job produced TWO keys and the submit run refused its own approved bundle:
+//   REFUSING: no approved bundle for job_key "…" (no-remote-bundle)
+test("canonicalJobUrl: a numeric requisition keys the same from the posting and the form URL", () => {
+  const lib = require("../lib.js");
+  const posting = "https://marvell.wd1.myworkdayjobs.com/en-US/MarvellCareers/job/San-Diego-CA/Sr-Principal-SoC-Verification-Engineer_2601615";
+  const form = "https://marvell.wd1.myworkdayjobs.com/en-US/MarvellCareers/job/San-Diego%2C-CA/Sr-Principal-SoC-Verification-Engineer_2601615/apply";
+  assert.strictEqual(lib.canonicalJobUrl(posting), "wd1:2601615");
+  assert.strictEqual(lib.canonicalJobUrl(posting), lib.canonicalJobUrl(form), "the encoded comma must not fork the key");
+});
+test("canonicalJobUrl: percent-encoding never forks the FALLBACK key either", () => {
+  const lib = require("../lib.js");
+  const a = "https://example.com/en-US/board/job/San-Diego-CA/Some-Role";
+  const b = "https://example.com/en-US/board/job/San-Diego%2C-CA/Some-Role";
+  // Different spellings of the SAME segment agree; a genuinely different path still does not.
+  assert.strictEqual(lib.canonicalJobUrl(b), lib.canonicalJobUrl("https://example.com/en-US/board/job/San-Diego,-CA/Some-Role"));
+  assert.notStrictEqual(lib.canonicalJobUrl(a), lib.canonicalJobUrl("https://example.com/en-US/board/job/Austin-TX/Some-Role"));
+});
+test("canonicalJobUrl: the existing _R and letters+digits tiers are byte-identical", () => {
+  const lib = require("../lib.js");
+  assert.strictEqual(lib.canonicalJobUrl("https://waystar.wd1.myworkdayjobs.com/en-US/Waystar/job/Atlanta-GA/SWE_R3051"), "wd1:r3051");
+  assert.strictEqual(lib.canonicalJobUrl("https://copart.wd12.myworkdayjobs.com/en-US/copart/job/Dallas-TX/SWE_JR109441"), "wd12:jr109441");
+  assert.strictEqual(lib.canonicalJobUrl("https://cat.wd5.myworkdayjobs.com/en-US/solarturbines/job/X/Y_R0000381898"), "wd5:r0000381898");
+});
+test("canonicalJobUrl: a short path number is NOT mistaken for a requisition", () => {
+  const lib = require("../lib.js");
+  // ≥4 digits required, so an ordinary segment number keys by path as before.
+  assert.notStrictEqual(lib.canonicalJobUrl("https://x.wd1.myworkdayjobs.com/en-US/b/job/L/Role_12"), "wd1:12");
+});
