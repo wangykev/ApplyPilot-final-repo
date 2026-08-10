@@ -29,7 +29,6 @@ async function loadApplications(): Promise<Application[]> {
 
 const STAGES: { key: AppStatus; label: string; color: string }[] = [
   { key: "queued", label: "Queued", color: "#7E8C9E" },
-  { key: "filling", label: "Filling", color: "#FFB627" },
   { key: "needs_review", label: "Needs review", color: "#FFC85C" },
   { key: "submitted", label: "Submitted", color: "#36D6A0" },
   { key: "interviewing", label: "Interviewing", color: "#5BD2FF" },

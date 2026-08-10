@@ -3959,7 +3959,11 @@ async function reportApplication(bundle, jobContext, extra) {
       job_key: (bundle.jobKeyUrl || bundle.url) ? canonicalJobUrl(bundle.jobKeyUrl || bundle.url) : null,
       // A SUBMITTED application outranks the needs-review arithmetic: the flags describe what was
       // reviewed before filing, not the state of a filed application.
-      status: (extra && extra.status) || (needs > 0 ? "needs_review" : "filling"),
+      // A completed fill is ALWAYS "needs_review" — the human still checks and approves before a
+      // submit, whether or not anything got flagged. It used to fall back to "filling" when nothing
+      // was flagged, which is an in-progress state on a finished run: those rows then sat reading
+      // "Filling" forever, because only a report can move them and the report had already happened.
+      status: (extra && extra.status) || "needs_review",
       needs_review_count: needs,
       captured_at: bundle.captured_at || new Date().toISOString(),
       review_bundle: bundle

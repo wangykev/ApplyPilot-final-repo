@@ -10,7 +10,6 @@ import { clsx } from "@/lib/clsx";
 
 const COLOR: Record<AppStatus, string> = {
   queued: "#7E8C9E",
-  filling: "#FFB627",
   needs_review: "#FFB627",
   submitted: "#36D6A0",
   interviewing: "#5BD2FF",
@@ -19,7 +18,6 @@ const COLOR: Record<AppStatus, string> = {
 };
 const LABEL: Record<AppStatus, string> = {
   queued: "Queued",
-  filling: "Filling",
   needs_review: "Needs review",
   submitted: "Submitted",
   interviewing: "Interviewing",
