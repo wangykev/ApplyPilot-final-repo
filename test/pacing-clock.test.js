@@ -24,7 +24,7 @@ assert.ok(a > 0 && b > a, "pacing-clock markers not found in cdp.js — did they
 const block = src.slice(src.indexOf("\n", a) + 1, b);
 
 // Build the clock in a scope where its module-level dependencies are ours to control.
-function makeClock({ tabId = 1, workerTimers = true, sendRaw }) {
+function makeClock({ tabId = 1, workerTimers = true, pageClock = true, sendRaw }) {
   const logs = [];
   const factory = new Function(
     "deps",
@@ -33,12 +33,14 @@ function makeClock({ tabId = 1, workerTimers = true, sendRaw }) {
      const cdpSendRaw = deps.sendRaw;
      const console = { log: deps.log };
      ${block}
-     return { cdpDelay, cdpPageSleep, PAGE_SLEEP_SLACK_MS,
+     cdpSetPageClock(deps.pageClock);
+     return { cdpDelay, cdpPageSleep, cdpSetPageClock, PAGE_SLEEP_SLACK_MS,
               setTabId: (v) => { cdpTabId = v; },
               setWorkerTimers: (v) => { _workerTimersActive = v; } };`
   );
-  const api = factory({ tabId, workerTimers, sendRaw, log: (m) => logs.push(String(m)) });
-  return { ...api, logs };
+  const api = factory({ tabId, workerTimers, pageClock, sendRaw, log: (m) => logs.push(String(m)) });
+  // paceLogs() excludes the one-off "page-clock ENABLED" announcement.
+  return { ...api, paceLogs: () => logs.filter((m) => /\[PACE\]/.test(m)) };
 }
 
 /** A page-clock stand-in: resolves after `ms` of REAL time, and records the calls it received. */
@@ -131,13 +133,34 @@ test("a badly overrunning pace logs once, with no debug flag set", async () => {
   const slow = () => new Promise((r) => setTimeout(r, 1400));
   const c = makeClock({ sendRaw: slow });
   await c.cdpDelay(20);
-  assert.equal(c.logs.length, 1, "the whole point is that drift is visible WITHOUT a flag");
-  assert.match(c.logs[0], /\[PACE\]/);
-  assert.match(c.logs[0], /20ms pace took/);
+  assert.equal(c.paceLogs().length, 1, "the whole point is that drift is visible WITHOUT a flag");
+  assert.match(c.paceLogs()[0], /20ms pace took/);
 });
 
 test("a pace inside budget logs NOTHING (a healthy run must stay quiet)", async () => {
   const c = makeClock({ sendRaw: fakePageClock([]) });
   await c.cdpDelay(30);
-  assert.equal(c.logs.length, 0);
+  assert.equal(c.paceLogs().length, 0);
+});
+
+// ── the SCOPE gate — this is the regression that halted a live run ────────────────────────────────
+test("page clock OFF (onboarding/auth/recon) ⇒ SW timer, no page sleep attempted", async () => {
+  const calls = [];
+  const c = makeClock({ pageClock: false, sendRaw: fakePageClock(calls) });
+  const t0 = Date.now();
+  await c.cdpDelay(40);
+  assert.equal(calls.length, 0,
+    "onboarding paces MUST stay SW-timed: a navigating document's timer doesn't fire, which starves "
+    + "poll SAMPLES and halted a live run at waitFor(resume-upload-input) after only 21 polls in 25s");
+  assert.ok(Date.now() - t0 >= 35, "still actually waited");
+});
+
+test("page clock is OFF until explicitly enabled (per-run opt-in, reset at attach)", async () => {
+  const calls = [];
+  const c = makeClock({ pageClock: false, sendRaw: fakePageClock(calls) });
+  await c.cdpDelay(20);
+  assert.equal(calls.length, 0, "default must be the safe SW path");
+  c.cdpSetPageClock(true);
+  await c.cdpDelay(20);
+  assert.equal(calls.length, 1, "enabling it opts into the page clock");
 });

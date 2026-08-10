@@ -179,3 +179,103 @@ Per-page probe/drift for run 5 (the clearest single run):
   per-poll-iteration trace inside `readHier`.
 - Whether a **visible** run shows the same drift. Every run this round was hidden. ⚠ Polling the localhost
   tab with `javascript_tool` ACTIVATES it, so a foreground run must be fired and then left alone.
+
+---
+
+## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
+
+Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now
+sleeps on the PAGE's clock via `Runtime.evaluate` + `awaitPromise`, where `window.setTimeout` is the
+worker-backed polyfill, instead of the starved SW `setTimeout`.
+
+**Chosen over detect-and-skip (round 1's option 2) on two pieces of evidence:**
+1. **Drift clusters, but the FIRST overrun dominates.** Run 5's cluster was 17.3s, then 1.3s / 2.4s /
+   1.5s. Detect-and-skip always eats the head and refunds only the tail — ~3–5s of a ~22s loss.
+2. **30+ poll loops bound themselves on a WALL-CLOCK deadline while their INTERVAL rides `act.delay`**
+   (`background.js` `while (Date.now() < deadline)` at 1002, 1715, 4042, 4154, 4738, 4800, 5914 …, plus
+   `focusText` / `cdpEvalRectReady`'s ceilings). Drift there costs SAMPLES, not just time, and skipping a
+   later delay cannot refund a deadline already burned. Fixing the clock repairs all of them at once.
+
+### RESULT (cat.wd5 R0000386123, hidden, build `page-clock-2`)
+
+`✓✓ reached the REVIEW page after 5 page(s)` — and all five M40 audits read "all matched the report"
+(13 / 28 / 4 / 4 / 1 fields), so nothing was traded for the speed.
+
+| page 1 | run 1 | run 2 | run 3 | run 5 | **round 2** |
+|---|---|---|---|---|---|
+| fill | 154.6s | 29.8s | 19.8s | 43.9s | **6.4s** |
+| flat | 132.3s | 8.8s | 4.0s | 34.3s | **2.8s** |
+| `source` | — | 5.5s | — | 32.8s | **0.41s** |
+
+| whole run | run 1 | run 2 | run 3 | run 5 | **round 2** |
+|---|---|---|---|---|---|
+| sum of page fills | 194.5s | 82.0s | 72.1s | 80.5s | **30.4s** |
+| onboard→review | 501s | 211s | 135s | 263s | **122s** |
+
+Per-page fills round 2: 6.4 · 11.2 · 5.8 · 1.8 · 5.2s. Page 1's Save was NOT swallowed this run.
+
+### ⚠ THE REGRESSION THIS CAUSED FIRST — and why the gate exists
+
+The first live run of the fix **halted the application**, and it is the single most important thing on this
+page for anyone touching pacing:
+
+```
+waitFor(resume-upload-input) timed out after 25000ms — 21 read(s) OK / 0 failed  tab HIDDEN
+stopped: "resume-upload-input-missing"
+```
+
+4 of 5 paces logged `page-abandoned`, a 50ms pace taking 3.5–5.0s. Cause: **ONBOARDING pages are mid-
+NAVIGATION, and a navigating document's timer does not fire.** The poll's deadline is wall-clock but its
+interval is `act.delay`, so a slow clock cost it SAMPLES — 21 polls in 25s where the pre-change run
+satisfied the same wait in 7.0s (round 1's run 4 timeout managed 29). A missed transient reads as "the
+control never rendered". This is exactly the poll-starvation class described above, met from the other
+direction.
+
+**Fix: `cdpSetPageClock(on)` — scoped opt-in, mirroring `cdpSetSyntheticInput` exactly**, which exists for
+the same reason (the auth surface is where the clever fast path failed live). FILL and REPLAY enable it;
+**onboarding, auth and recon stay SW-timed**; reset to false at every `cdpAttach`. After gating:
+zero `[PACE]` warnings during onboarding, and the résumé-upload wait polled normally (2.5s / 4.5s / 6.9s).
+
+**Standing rule: never widen the page clock to onboarding/auth/recon.** A navigating document has no
+usable clock.
+
+### Guards, each mutation-checked (reverted, confirmed the test FAILS, restored)
+
+| guard | mutation | test result |
+|---|---|---|
+| page clock only when `_pageClockOn` | dropped the gate | 2 tests failed |
+| page clock only when `_workerTimersActive` | dropped the gate | 1 test failed |
+| race vs SW timer at `want+slack` | timer ignores slack | failed: `took 6031ms` |
+| thrown eval → REMAINDER only | re-wait full pace | failed: `took 672ms` (bound ~400ms) |
+
+⚠ The double-wait test's FIRST draft threw immediately, which makes "remainder" and "full want"
+indistinguishable — it passed both ways and would have read as coverage. It now throws PART WAY through
+(250ms into a 400ms pace). Check WHICH path a fixture exercises, not just its verdict.
+
+`test/pacing-clock.test.js` extracts the clock from source between its `PACING CLOCK START/END` markers
+(cdp.js can't be `require`d) — if those markers are renamed, the test fails loudly rather than silently
+skipping.
+
+### Known-remaining, bounded
+
+- **Page TRANSITIONS still hit the navigation case** — 5 `[PACE]` lines in the verified run
+  (`50→1765`, `30→1197`, `50→1347`, `200→4017`, `50→3595`, mostly `page-abandoned`), all clustered around
+  Save & Continue. Now BOUNDED by the race rather than open-ended, and ~1.5s each rather than 17s. The
+  clean follow-up is to SW-time the transition wait specifically, the same way onboarding is.
+- **⚠ The race's escape hatch is itself an SW timer**, so when the page arm hangs AND the worker is
+  starved, abandonment fires late (3970ms against a 1550ms ceiling was measured pre-gate). There is no
+  third clock; this is the accepted floor, and it is still strictly better than the old unbounded drift.
+- `scrapeTaOptions(countryPhoneCode)` caching (≈14s) and the swallowed-first-Save remain untouched —
+  separate commits by design.
+
+### Process notes worth keeping
+
+- **`AP_RELOAD` produced TWO worker starts ~700ms apart**, the first still running PRE-EDIT code. Reading
+  the marker too early showed the old build and nearly sent this round chasing a phantom. Re-read the
+  marker until it is STABLE before firing a run — and a run fired into that window dies with
+  `message channel closed before a response was received`.
+- **The connected Chrome silently changed mid-session** to one loading the `live-submit-runs` worktree
+  (marker `required-date-rescue-1`). `switch_browser` re-paired it. Always bump-and-re-read.
+- One full-suite failure (`dropdown tier-keep: a slow-closing list is RE-ESCAPED`) is **pre-existing
+  load-sensitive flakiness**, not this change: 675/675 in isolation, it uses `makeFakeAct` and never loads
+  cdp.js, and it counts retries against a wall-clock deadline while `node --test` parallelizes files.

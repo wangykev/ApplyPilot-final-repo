@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "page-clock-1";
+const AP_BUILD_MARKER = "page-clock-2";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4599,6 +4599,7 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so a hidden single-page fill behaves like the walk
     cdpSetSyntheticInput(true); // FILL entry point — hidden actuation dispatches page-side (the proven form-page repertoire); auth/onboarding/recon stay trusted
+    cdpSetPageClock(true);      // ditto for PACING: paces sleep on the page's worker-backed timer here (settled form). Onboarding stays SW-timed — a navigating doc's timer doesn't fire and starves poll SAMPLES.
     // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
     // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
     // throttle-immune), adapting LIVE as the operator minimizes/restores.
@@ -5014,6 +5015,7 @@ async function runCdpReplayWalk(tabId, opts) {
     // therefore ends as needs_review and halts — it can never become a wrong value. `forceTrustedInput`
     // in chrome.storage.local still overrides everything.
     cdpSetSyntheticInput(true);
+    cdpSetPageClock(true);      // REPLAY entry point — same as the fill walk: its pages are settled forms, so paces ride the page's worker-backed timer
     const _vis = await cdpVisible().catch(() => true);
     const _mode = _vis ? "VISIBLE (trusted input)" : "HIDDEN (synthetic input for fields; the submit click stays trusted)";
     LOG(authorize
@@ -6013,6 +6015,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so page-to-page advancement runs while backgrounded
     cdpSetSyntheticInput(true); // FILL entry point — hidden actuation dispatches page-side (the proven form-page repertoire); onboarding/auth ran trusted on its own attach
+    cdpSetPageClock(true);      // ditto for PACING (see runCdpFillPage): the walk's pages are settled forms; onboarding ran SW-timed on its own attach
     // Foreground fast-fill (M39): NO hidden-gate — fills immediately, visible=fast (watch the
     // whole walk) or minimize=slow/background, adapting live.
     LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");

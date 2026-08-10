@@ -91,6 +91,22 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 //     fallback arm is longer than `want`.
 //  3. On a THROWN eval (detached / context destroyed) fall back ONCE, for the REMAINDER only — never
 //     re-wait the full duration on top of time already spent.
+// SCOPED OPT-IN, exactly like cdpSetSyntheticInput — and for the same reason, learned the same way.
+// The page clock is only correct where the page is a SETTLED FORM. On ONBOARDING/AUTH the page is mid-
+// NAVIGATION, and a navigating document's timer does not fire: the first live run of this change logged
+// 4 of 5 paces as "page-abandoned" (a 50ms pace taking 3.5-5.0s) and then HALTED the run —
+// `waitFor(resume-upload-input)` timed out at its 25s wall-clock deadline having managed only 21 polls,
+// where the pre-change run satisfied the same wait in 7.0s. That is the poll-starvation class:
+// 30+ loops bound themselves on a wall-clock deadline while their INTERVAL rides act.delay, so a slow
+// clock silently costs SAMPLES, not just time — and a missed transient reads as "the control never
+// rendered". So: FILL/REPLAY enable it; onboarding, auth and recon stay on the SW timer. Reset to false
+// at every cdpAttach.
+let _pageClockOn = false;
+function cdpSetPageClock(on) {
+  _pageClockOn = !!on;
+  if (on) console.log("[ApplyPilot][CDP] page-clock pacing ENABLED for this run's fill — paces sleep on the page's worker-backed timer (throttle-immune) instead of the starved SW timer; onboarding/auth/recon stay SW-timed.");
+}
+
 const PAGE_SLEEP_SLACK_MS = 1500;   // race ceiling above the requested pace (guard 2)
 const PACE_OVERRUN_LOG_MS = 1000;   // log a pace this far over budget (permanent — no flag needed)
 
@@ -120,7 +136,7 @@ async function cdpDelay(ms) {
   const want = Math.max(0, Math.round(Number(ms) || 0));
   const t0 = Date.now();
   let via = "sw";
-  if (want > 0 && cdpTabId !== null && _workerTimersActive) {
+  if (want > 0 && _pageClockOn && cdpTabId !== null && _workerTimersActive) {
     via = "page";
     let timer = null;
     try {
@@ -160,6 +176,7 @@ function cdpAttach(tabId) {
       _visCache = { visible: false, at: 0 };   // fresh foreground sampling per run (adaptive pacing)
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
       _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
+      _pageClockOn = false;                    // page-clock pacing is per-run opt-in (FILL/REPLAY only) — onboarding/auth/recon stay SW-timed
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
