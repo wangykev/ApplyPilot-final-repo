@@ -182,6 +182,53 @@ Per-page probe/drift for run 5 (the clearest single run):
 
 ---
 
+## 2026-08-10 — round 4: "I press next and it waits 5s before filling" — WHERE THAT GAP GOES
+
+Operator: *"when I press next page, it waits 5 seconds before starting to fill, but I can see the page
+loaded in after 2 — what are the other 3 seconds doing?"* A single duration cannot answer that, so
+`cdpWaitNextPage` now splits it and the walk logs `[TRANSITION]`.
+
+**Measured (cat.wd5, hidden, fresh req):**
+
+| transition | Workday rendered the new page | WE then spent (steady-confirm) |
+|---|---|---|
+| page 1 → 2 | **2257ms** | **120ms** |
+| page 2 → 3 | **6859ms** | **66ms** |
+
+Then, per page, `settle` (`awaitFieldSetSettled`): **1.3s · 5.9s · 1.9s**.
+
+### The answer: the gap is overwhelmingly WORKDAY, plus one fixed 1.2s window of ours
+
+Our per-transition overhead is **66–120ms** — negligible, and far below the ~1s I predicted from reading
+the code. The prediction was wrong because `cdpAdaptiveDelay` already collapses that 500ms poll interval
+when the tab measures fast. ⚠ **Do not re-derive this from the code; the adaptive pacing hides it.**
+
+So the ~3 unaccounted seconds break down as roughly: **~0.1s** transition confirm (ours) + **~1.2–1.3s**
+settle (ours, a fixed window) + **the remainder is Workday still mounting fields after the page visually
+appeared**.
+
+**The load-bearing insight: "the page looks loaded" ≠ "the field set is complete."** Page 2's settle ran
+**5.9s** because fields were genuinely still arriving nearly six seconds after the page was on screen.
+That is exactly what the settle exists to catch, and it is why the eye disagrees with the engine.
+
+### The only real lever, and its cost
+
+`awaitFieldSetSettled` uses `NO_GROWTH_MS = 1200`: even when the field count is stable on the very first
+read, it waits a full 1.2s to prove it. On the stable pages (settle ≈1.3s) that 1.2s is pure proof-cost —
+about **1s per page**, so ~4–5s per run. On page 2 (settle 5.9s) it is doing real work and would not be
+touched.
+
+⚠ Shortening it is NOT free, and CLAUDE.md flags exactly this: settle polls must use `delayFull`, never
+the adaptive beat, because a collapsed window **makes a half-rendered page look stable**. Any change here
+trades a fixed ~1s/page against the risk of filling a page whose fields are still mounting — which is a
+correctness risk, not a speed one. A safer shape than simply lowering the constant: let the settle COUNT
+the stability the transition wait already witnessed, rather than restarting its window from zero.
+
+**Not yet done — deliberately.** The operator's constraint is "don't change behaviour, make existing
+behaviour faster", and lowering this window changes when we are willing to start filling.
+
+---
+
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
 
 Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now

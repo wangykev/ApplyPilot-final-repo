@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "page-clock-3";
+const AP_BUILD_MARKER = "transition-probe-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -5929,6 +5929,13 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
 async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
   const start = Date.now();
   let steady = -1, errSince = 0;
+  // TRANSITION BREAKDOWN (2026-08-10). Operator: "I press next, it waits 5s before filling, but I can see
+  // the page loaded after 2 — what are the other 3 seconds doing?" A single duration cannot answer that,
+  // so split it: `sawNewPageMs` is when Workday's new page FIRST showed up (their time), and the
+  // remainder up to the return is OURS — the second equal-count read this loop requires before it will
+  // call the page settled. Reported by the caller next to `settle`, which is a THIRD wait
+  // (awaitFieldSetSettled) that re-proves the same stability from scratch.
+  let sawNewPageAt = 0;
   while (Date.now() - start < timeoutMs) {
     await cdpAdaptiveDelay(intervalMs);
     // Keep a HIDDEN tab out of the frozen lifecycle so Workday's SPA transition can run — the
@@ -5969,7 +5976,10 @@ async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
       continue;
     }
     errSince = 0;
-    if (scan.fields.length === steady) return { advanced: true, sig };
+    if (!sawNewPageAt) sawNewPageAt = Date.now();   // first read on which the NEW page existed
+    if (scan.fields.length === steady) {
+      return { advanced: true, sig, sawNewPageMs: sawNewPageAt - start, confirmMs: Date.now() - sawNewPageAt, polls: Math.round((Date.now() - start) / intervalMs) };
+    }
     steady = scan.fields.length;
   }
   return { advanced: false, timeout: true };
@@ -6275,6 +6285,11 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
       // ── (f) Wait for the transition OR session-death OR a nav-timeout (dirty halt). ──
       const res = await cdpWaitNextPage(prevSig);
+      // Where the post-Save gap actually goes: WORKDAY's part (the new page appearing) vs OURS (this
+      // loop's second equal-count read). `settle` on the next [CDP-TIME] line is a THIRD wait on top.
+      if (res.advanced && res.sawNewPageMs != null) {
+        LOG(`[TRANSITION] page ${page} → ${page + 1}: Workday rendered the new page in ${res.sawNewPageMs}ms · we then spent ${res.confirmMs}ms confirming it was stable (${res.polls} poll(s) × ${500}ms) — settle on the next line is a further wait.`);
+      }
       if (res.maintenance) {
         LOG(`⛔ WORKDAY PLANNED MAINTENANCE after Save & Continue on page ${page} ("Workday is currently unavailable") — NOT a dead session. Retry after the maintenance window.`);
         return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_filled: pagesFilled.length, pages: pagesFilled };
