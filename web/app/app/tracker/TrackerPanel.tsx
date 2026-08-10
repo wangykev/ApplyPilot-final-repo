@@ -7,6 +7,7 @@ import { SectionCard } from "@/components/app/SectionCard";
 import { updateApplicationStatus, deleteApplication } from "./actions";
 import { APP_STATUSES, type Application, type AppStatus } from "./shared";
 import { clsx } from "@/lib/clsx";
+import { prettyCompany } from "@/lib/company-name";
 
 const COLOR: Record<AppStatus, string> = {
   queued: "#7E8C9E",
@@ -24,6 +25,13 @@ const LABEL: Record<AppStatus, string> = {
   offer: "Offer",
   rejected: "Rejected",
 };
+
+// The "N review" chip counts fields the FILL flagged for a human. Once the application has actually
+// been sent, that number is history — it isn't work you can still do, and showing it on a submitted row
+// reads as "17 things still need you". So the chip belongs only to the stages BEFORE submission.
+function showsReviewChip(status: AppStatus): boolean {
+  return status === "queued" || status === "needs_review";
+}
 
 function host(url: string | null): string {
   if (!url) return "—";
@@ -214,14 +222,14 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                 />
                 <Link href={`/app/tracker/${a.id}`} className="group min-w-0 flex-1">
                   <div className="truncate text-sm text-ink transition-colors group-hover:text-amber">
-                    {a.company || host(a.url)}
+                    {prettyCompany(a.company, a.url) || host(a.url)}
                   </div>
                   <div className="truncate font-mono text-[11px] text-ink-faint">
                     {a.role || host(a.url)}
                   </div>
                 </Link>
 
-                {a.needs_review_count > 0 && (
+                {a.needs_review_count > 0 && showsReviewChip(a.status) && (
                   <span className="shrink-0 rounded border border-amber/40 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-label text-amber">
                     {a.needs_review_count} review
                   </span>
@@ -233,7 +241,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
 
                 <select
                   name="application-status"
-                  aria-label={`Status for ${a.company || host(a.url)}`}
+                  aria-label={`Status for ${prettyCompany(a.company, a.url) || host(a.url)}`}
                   value={a.status}
                   onChange={(e) => setStatus(a.id, e.target.value as AppStatus)}
                   disabled={pending}

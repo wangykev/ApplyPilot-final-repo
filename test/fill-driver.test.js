@@ -9885,3 +9885,79 @@ test("pickLastResortOption: prefers a DECLINE option, then Other, then the first
   assert.strictEqual(pickLastResortOption([]), null);
   assert.strictEqual(pickLastResortOption(null), null);
 });
+
+// ── a REQUIRED date the profile cannot answer must still get filled (nvidia.wd5 live 2026-08-10) ──────
+// The rule is that a required field ALWAYS gets a value and the human fixes it at review — a blank one
+// blocks Save & Continue, so the walk halts and the operator gets NO review page at all. Live: profile
+// education[0].from_year was "", Education's "From" is required, and page 2 died on a nav-timeout naming
+// education[0].firstYearAttended. The dropdown and typeahead analogs inside repeating entries have been
+// covered since Phase 2b; the DATE widget was simply never added.
+//
+// The segment reduction is the load-bearing half. "From" is a YEAR-ONLY composite, and
+// fillDateCompositeCdp fills one segment per component PRESENT IN THE VALUE — so handing it a full
+// YYYY-MM-DD makes it hunt for Month and Day spinbuttons that do not exist on that widget, every one
+// fails, and the field it could have filled correctly comes back needs_review still blank.
+const { aiFillDate: _aiFillDate } = require("../fill-driver.js");
+
+function makeDateAct(segsPresent, aiReply) {
+  const store = {};      // "Month" | "Day" | "Year" -> typed value
+  const attempted = [];  // every segment the composite TRIED to focus
+  let focused = null;
+  return {
+    store, attempted,
+    aiEnabled: true,
+    llm: async () => (aiReply === undefined ? { ok: false } : { ok: true, text: aiReply }),
+    delay: async () => {}, delayFull: async () => {},
+    // A segment the widget does NOT render cannot be focused — which is exactly what the live
+    // year-only "From" does to a Month/Day write.
+    focusDateSegment: async (loc, seg) => {
+      attempted.push(seg);
+      if (!segsPresent.includes(seg)) { focused = null; return null; }
+      focused = seg; return "triple-click-display";
+    },
+    readDateSegment: async (loc, seg) => ({ value: store[seg] || "", focused: focused === seg }),
+    typeDigits: async (t) => { if (focused) store[focused] = String(t); },
+    typeText: async (t) => { if (focused) store[focused] = String(t); },
+  };
+}
+
+test("aiFillDate: a YEAR-ONLY widget gets ONLY the year — never a Month/Day it does not render", async () => {
+  const act = makeDateAct(["Year"], "2024-09-01");
+  const r = await _aiFillDate(act, { wrapperSel: "[w-from]" }, { label: "From", isRequired: true },
+    {}, {}, T_BUDGETS, { segments: ["year"] });
+
+  assert.strictEqual(act.store.Year, "2024", "the year is what lands on a year-only composite");
+  assert.deepStrictEqual(act.attempted, ["Year"], "Month/Day are never even attempted — they do not exist here");
+  assert.strictEqual(r.status, "filled_review", "a guessed date is committed so the page can advance…");
+  assert.strictEqual(r.flag, "ai-date-guess", "…and ALWAYS flagged — it is a guess, never silent");
+  assert.strictEqual(r.verified, true);
+  assert.ok(/2024/.test(String(r.detail)), "the operator is shown what we actually wrote: " + r.detail);
+  assert.ok(!/09|-01/.test(String(r.after)), "after reports the YEAR we wrote, not the model's full date");
+});
+
+test("aiFillDate: an M/D/Y widget still gets all three segments", async () => {
+  const act = makeDateAct(["Month", "Day", "Year"], "2024-09-01");
+  const r = await _aiFillDate(act, { wrapperSel: "[w-start]" }, { label: "Desired start date", isRequired: true },
+    {}, {}, T_BUDGETS, { segments: ["month", "day", "year"] });
+  assert.strictEqual(r.status, "filled_review");
+  assert.strictEqual(parseInt(act.store.Month, 10), 9);
+  assert.strictEqual(parseInt(act.store.Day, 10), 1);
+  assert.strictEqual(parseInt(act.store.Year, 10), 2024);
+});
+
+test("aiFillDate: NO segments passed keeps the old whole-value behaviour", async () => {
+  const act = makeDateAct(["Month", "Day", "Year"], "2024-09-01");
+  const r = await _aiFillDate(act, { wrapperSel: "[w-x]" }, { label: "Some date", isRequired: true },
+    {}, {}, T_BUDGETS);
+  assert.strictEqual(r.status, "filled_review");
+  assert.strictEqual(parseInt(act.store.Year, 10), 2024, "unchanged for every existing call site");
+});
+
+test("aiFillDate: no usable model reply → needs_review, never a fabricated date", async () => {
+  const act = makeDateAct(["Year"], "I don't know");
+  const r = await _aiFillDate(act, { wrapperSel: "[w-from]" }, { label: "From", isRequired: true },
+    {}, {}, T_BUDGETS, { segments: ["year"] });
+  assert.strictEqual(r.status, "needs_review");
+  assert.strictEqual(r.flag, "ai-date-no-basis");
+  assert.strictEqual(act.store.Year, undefined, "nothing was written");
+});

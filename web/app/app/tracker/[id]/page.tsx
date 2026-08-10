@@ -11,6 +11,7 @@ import {
 } from "@/components/app/SubmittedRecord";
 import { JobDescriptionButton } from "./JobDescriptionButton";
 import type { ReviewBundle } from "@/lib/review-summary";
+import { prettyCompany } from "@/lib/company-name";
 import type { Application } from "../shared";
 import { SAMPLE_APPS, SAMPLE_BUNDLE_BY_ID } from "../sample";
 
@@ -99,7 +100,7 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
           <div>
             <p className="eyebrow">Review summary</p>
             <h1 className="mt-2 font-display text-2xl font-semibold tracking-tight sm:text-3xl">
-              {app.company || "Application"}
+              {prettyCompany(app.company, app.url) || "Application"}
             </h1>
             {app.role && <p className="mt-1 text-sm text-ink-dim">{app.role}</p>}
             <LoginLine app={app} />

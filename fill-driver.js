@@ -1445,7 +1445,13 @@ const aiPlaceholderText = (reason) => AI_NEEDS_ANSWER_MARK_FD + " — AI decline
 // is to GUESS and FLAG (2026-08-02). Asks for a bare ISO date, parses it with the SAME pure parser the
 // mapped date fields use (so an unparseable reply can never reach the form), fills the composite, and
 // is ALWAYS filled_review — a guessed date is never a silent fill.
-const aiFillDate = async (act, loc, f, profile, jobContext, budgets) => {
+// opts.segments — the segments this widget ACTUALLY renders (["year"] / ["month","year"] / ["month","day","year"],
+// from apMatch.dateOrderOf). fillDateCompositeCdp fills one segment per component PRESENT IN THE VALUE, so handing a
+// full YYYY-MM-DD to a YEAR-ONLY composite (Education's "From", firstYearAttended) makes it hunt for Month and Day
+// spinbuttons that do not exist — every one fails, allVerified goes false, and a date it could have filled correctly
+// comes back needs_review with the field still blank. Reducing the value to the rendered segments is what makes the
+// year-only and MM/YYYY shapes work. Omitted ⇒ fill everything the value carries (the previous behaviour).
+const aiFillDate = async (act, loc, f, profile, jobContext, budgets, opts) => {
   // A SIGNATURE date is knowable exactly — it is the day the form is being completed. Fill it
   // deterministically and spend no LLM call: the self-ID attestation date is TODAY, and guessing it
   // produced 8/10/2026 live on Asuep — a future date on a form the applicant attests to now.
@@ -1479,11 +1485,18 @@ const aiFillDate = async (act, loc, f, profile, jobContext, budgets) => {
         (raw ? " (replied " + JSON.stringify(raw.slice(0, 40)) + ")" : "") + " — answer it here",
       auditLoc: loc.wrapperSel };
   }
-  const r = await fillDateCompositeCdp(act, loc, parsed, budgets);
+  const segs = opts && Array.isArray(opts.segments) && opts.segments.length ? opts.segments : null;
+  const value = segs
+    ? segs.reduce((acc, s) => (parsed[s] !== undefined ? Object.assign(acc, { [s]: parsed[s] }) : acc), {})
+    : parsed;
+  const r = await fillDateCompositeCdp(act, loc, value, budgets);
   const ok = r && r.verified === true;
-  return { status: ok ? "filled_review" : "needs_review", after: (r && r.after != null) ? r.after : iso,
+  // What the operator must verify is what we WROTE — on a year-only widget that is "2024", not the
+  // full date the model replied with.
+  const shown = segs ? segs.map((s) => value[s]).filter((v) => v !== undefined).join("-") || iso : iso;
+  return { status: ok ? "filled_review" : "needs_review", after: (r && r.after != null) ? r.after : shown,
     verified: ok, flag: "ai-date-guess", matchTier: "ai_inference", confidence: "low",
-    detail: "AI guessed this REQUIRED date (" + iso + ") so the page can advance — verify it" + (ok ? "" : " (commit not verified)"),
+    detail: "AI guessed this REQUIRED date (" + shown + ") so the page can advance — verify it" + (ok ? "" : " (commit not verified)"),
     auditLoc: loc.wrapperSel };
 };
 
@@ -4558,7 +4571,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           aiRes = (f.widgetType === "dropdown")
             ? await aiFillField(act, loc, f, profile, jobContext, budgets, preInfer)
             : (f.widgetType === "date")
-              ? await aiFillDate(act, loc, f, profile, jobContext, budgets)
+              ? await aiFillDate(act, loc, f, profile, jobContext, budgets,
+                  (() => { const s = apMatch.dateOrderOf(f.dateSegments || []); return s.length ? { segments: s } : undefined; })())
               : await aiFillText(act, loc, f, profile, jobContext, budgets);
           // EEO retraction: an AI-INFERRED demographic still gets the loud demographic badge. Only a
           // committed inference (filled_review); canonicalize keeps ai-canonicalized (maps a STATED value).
@@ -5771,6 +5785,28 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
           { onCapture: cap.onCapture, ai: { profile: aiCtx.profile, jobContext: aiCtx.jobContext, fieldName: rec.fieldName, label: rec.label, isRequired: true } }));
         const ro = cap.reviewOptions(); if (ro && ro.length) rec.options = ro;
       } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI required-empty typeahead error: " + String((e && e.message) || e); }
+    }
+    // Required-EMPTY DATE AI fill (section analog of the flat loop's aiFillDate, and the third member of the
+    // dropdown/typeahead family above). A REQUIRED date inside a repeating entry that the profile cannot answer is
+    // SKIPPED above and left BLANK — which BLOCKS Save & Continue, so the walk halts nav-timeout and the operator
+    // gets no review page at all. That is the wrong end state: the rule is that a required field always gets a
+    // value and the HUMAN corrects it at review, exactly as the sibling widgets already do.
+    //
+    // Live (nvidia.wd5 JR2022295, 2026-08-10): profile education[0].from_year was "", Education's "From" is
+    // required, and page 2 died on a nav-timeout naming education[0].firstYearAttended. Dropdown and typeahead
+    // had been covered since Phase 2b; date was simply never added.
+    //
+    // Passes the widget's OWN segments so a year-only "From" gets "2024", not a full YYYY-MM-DD (see aiFillDate).
+    // AI OFF ⇒ stays skipped, unchanged — this never invents a value silently: every commit is filled_review
+    // with the ai-date-guess flag, so it lands in the human's queue.
+    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && (f.widget === "year" || f.widget === "date")) {
+      try {
+        const f2 = { fieldName: rec.fieldName, label: rec.label, isRequired: true, widgetType: "date" };
+        const segments = apMatch.dateOrderOf((fd && fd.dateSegments) || []);
+        const aiRes = await aiFillDate(act, { wrapperSel: rec.auditLoc }, f2, aiCtx.profile, aiCtx.jobContext, budgets,
+          segments.length ? { segments } : undefined);
+        if (aiRes) Object.assign(rec, aiRes);
+      } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI required-empty date error: " + String((e && e.message) || e); }
     }
     rec.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME]
     recs.push(rec);
@@ -8066,5 +8102,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, deterministicTierFor, isSelfIdLanguageField, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, isSelfIdLanguageField, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiFillDate, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
