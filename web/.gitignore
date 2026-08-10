@@ -29,3 +29,6 @@ yarn-error.log*
 
 # vercel
 .vercel
+.next-3100/
+nextdev-3100.log
+run3100.cmd
