@@ -1,0 +1,181 @@
+# ApplyPilot — fill SPEED / timing log
+
+Everything about how fast a fill runs and why it sometimes doesn't: measurements, **refuted theories**,
+per-run data, the instrument's own distortions, and fix directions. **Append each new speed round here**
+(newest round at the bottom of its own dated section) rather than scattering timing notes across
+`CLAUDE.md` / `progress-log.md`.
+
+**Read this before investigating any slow fill.** Most of the obvious explanations have already been
+measured and killed; re-deriving them costs a session each.
+
+## How to use this file
+
+1. Read **"Standing conclusions"** below — that is what is true now.
+2. Then read **"Refuted — do not re-investigate"**, which is the expensive part.
+3. Only then measure. The tooling section says which flags to turn on and which of their numbers lie.
+
+---
+
+## Standing conclusions (what is true now)
+
+### 1. The lag is OUR OWN SERVICE-WORKER TIMERS — `act.delay` overruns 3–69×
+
+`CLAUDE.md`'s invariant is that **ALL pacing goes through `act.delay`** (SW wall-clock, never a page-side
+timer). That timer is a `setTimeout` inside an MV3 service worker, and Chrome starves it. So every drift
+spike is not a curiosity — it is fill time.
+
+The decisive measurement (2026-08-10, `cat.wd5` page 1, `debugPageTrace`):
+
+```
+FIELD "How Did You Hear About Us *" [source] hierarchical REQUIRED · holds "" · plan: AI or blank
+    · readHier(source) — ⏸ 13.55s
+    · delay(250)       — ⏸ 17.30s      ← a 250ms pace took 17.3 SECONDS (69×)
+    · readHier(source) — 0.13s
+[GAP +32.8s] ▪ "source" (hierarchical) took 32832ms to reach filled via click-commit
+  ⤷ filled "Other" [directed-exact] via click-commit
+```
+
+That single field was **32.8s of that page's 43.9s**. The same class appeared throughout the round:
+
+| pace requested | actual | over |
+|---|---|---|
+| `delay(250)` | 17.30s | 69× |
+| `delayFull(600)` | 3.16s | 5.3× |
+| `delayRender(300)` | 2.48s | 8.3× |
+| `delay(300)` | 1.49s | 5.0× |
+| `delayFull(150)` | 1.05s | 7.0× |
+
+### 2. ⚠ Do NOT read drift against the page-thread probe — that is what hid this
+
+This is the trap, and it is worth stating loudly because it inverted the conclusion mid-investigation.
+The `[LAG]` summary prints SW drift next to a no-op page probe, which invites reading them together. They
+are unrelated, and the **fastest pages had the worst drift**:
+
+| observation | probe p50 | SW drift p95 | page verdict |
+|---|---|---|---|
+| run 3 page 1 | 31ms | **8947ms** | fast (fill 19.8s) |
+| run 1 page 3 | 12ms | 2382ms | fast (fill 3.6s) |
+| run 1 page 1 | 3046ms | 2727ms | slow (fill 154.6s) |
+
+Drift vs the probe says "noise, ignore it". Drift vs the `[TRACE]` per-action timings says "a 250ms pace
+took 17.3s". **Always grade drift against `[TRACE]`, never against the probe.**
+
+### 3. The profile is "median fast, tail catastrophic"
+
+Which is exactly what "it lags sometimes" feels like from the outside. Page-thread median was healthy on
+nearly every page measured (probe p50 **1–42ms**); the p95 blew out to 19.7s. One widget stalls and owns
+the page. The same field varies ~6× run to run on identical code and tenant (`source`: 5.5s vs 32.8s).
+
+---
+
+## Refuted — do not re-investigate (each measured, not reasoned)
+
+| Theory | Verdict | Evidence |
+|---|---|---|
+| **CPU load / machine under load** | **NO** | 515 samples of `\Processor(_Total)\% Processor Time`: mean 13.3%, median 11.0%, max 67.3%, exactly ONE sample above 50%. In matched windows the **slow** page had *lower* CPU (154.6s page: mean 11.4% / max 31.4%) than the **fast** one (29.8s page: mean 13.1% / max 30.8%). |
+| **The unread-CDP-event firehose** | **NO** | `UNREAD CDP EVENTS 0` on all 19 page windows recorded. This was the leading suspect written into `cdp.js`'s own comments ("`Runtime.enable` + `DOM.enable` while registering NO onEvent listener … a saturated event loop defers timers"). The counter exists to settle it; it did. |
+| **`debugLagTrace` causing the slowness it measures** | **NO** | Suspected because run 1 (trace ON) spent 132.3s in `flat` vs run 2 (trace OFF) 8.8s. An **A/B/A** killed it: ON 501s → OFF 211s → **ON 135s** (the fastest run). Run 1 was the outlier, not the flag. |
+| **Attach age / a tab-level rot that worsens over a run** | **NO** | Run 1 page 3 was healthy (probe p50 12ms) at attach age 330s while page 1 was catastrophic at attach age 157s. Later = better. |
+| **The résumé-autofill parse leaving page 1 heavy** | **NOT sufficient** | Every run took `autofillWithResume`; page 1 fill ranged 19.8s → 154.6s across them. The parse is constant, the slowness is not. |
+| **Hidden-tab throttling (the tab not painting)** | **NOT the driver** | Every run was `pacing hidden-fast (worker timers) | NOT painting (chrome says hidden)`, including the 135s run. The page's worker-backed timers hold up; it is the SW's own timer that does not. |
+
+---
+
+## Tooling — and which of its numbers lie
+
+`debugLagTrace` and `debugPageTrace` are still the right instruments. `debugPageTrace` is the one that
+cracked this (it timed `delay(250)` at 17.30s). Three `debugLagTrace` readings must be discounted:
+
+1. **Probe p95/max is mostly OUR OWN long in-page polls.** The probe is an **unguarded**
+   `setInterval(500ms)` firing a `Runtime.evaluate` without awaiting the previous one (`cdp.js:254-272`),
+   and CDP commands to a target are serviced **in order**. Once servicing exceeds 500ms the probes queue
+   behind each other and behind anything of ours holding an eval open. Run 5 page 1 read p50 42ms / p95
+   19710ms — the p95 was `readHier` holding one eval. **Trust p50. Treat p95 as "something of ours held
+   the queue".**
+2. **An in-page wait abandoned at teardown is billed "THIS COMMAND'S OWN WORK" for its whole lifetime.**
+   At one teardown, four evals reported **166892ms / 132484ms / 66996ms / 13560ms all at the same
+   timestamp**, each with "the channel is free". They were long-lived polls settling together, not 166s of
+   work. `cdpSend` times issue→resolve and cannot tell waiting from working.
+3. **Drift is REAL** (see Standing conclusion 1). The old "possibly an artefact of timing with a timer
+   inside an MV3 worker" hedge is retired.
+
+**Measuring CPU without measuring your instrument:** a first sampler that enumerated `Get-Process` every
+tick made `powershell` itself the busiest process on the box. Sample total CPU only
+(`\Processor(_Total)\% Processor Time`), one counter, no process walk.
+
+**`AP_BUILD_MARKER` alone does NOT identify which folder Chrome loaded** — every worktree at the same
+commit carries the SAME string (the 2026-08-09 wrong-Chrome incident was diagnosed by
+`polarity-capture-1`, which is also main's value). Only **bump it, `AP_RELOAD`, and re-read** distinguishes
+them. Done for the 2026-08-10 round: `polarity-capture-1` → `fill-speed-probe-1`, re-read live.
+
+---
+
+## 2026-08-10 — round 1: five runs on one tenant
+
+**Method.** Five background (hidden) fill runs on `cat.wd5` / `CaterpillarCareers`, tenant held constant so
+run-to-run variance was the only variable, each on a **fresh requisition** (never re-running one form —
+that produces Workday's phantom state). CPU sampled continuously to a CSV alongside. Motivation: the
+operator's report that a fill "just seems to lag sometimes", and their CPU hypothesis.
+
+| run | trace | onboard→form | p1 fill | p2 | p3 | p4 | p5 | total | note |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 `R0000380424` | ON | 124s | **154.6s** (flat 132.3s) | 23.5s | 3.6s | 10.4s | 2.4s | 501s | Save swallowed (~105s); p1 probe p50 3046ms |
+| 2 `R0000380463` | OFF | 32s | 29.8s (flat 8.8s) | 32.2s | 15.6s | 4.4s | — | 211s | Save swallowed (~32s) |
+| 3 `R0000375720` | ON | 23s | 19.8s (flat 4.0s) | 40.2s | 3.2s | 1.9s | 7.0s | **135s** | clean |
+| 4 `R0000386123` | ON | — | — | — | — | — | — | halted 62s | `resume-upload-input-missing` |
+| 5 `R0000386660` | ON | 18s | 43.9s (flat 34.3s) | 19.7s | 5.0s | 9.7s | 2.2s | 263s | `source` 32.8s |
+
+Four of five reached `✓✓ reached the REVIEW page after 5 page(s)`; all four pushed their bundle to the
+tracker (`needs_review`). Nothing was ever submitted.
+
+Per-page probe/drift for run 5 (the clearest single run):
+
+| page | probe p50 | probe p95 | drift p95 | fill | slowest field |
+|---|---|---|---|---|---|
+| 1 | 42ms | 19710ms | 7642ms | 43.9s | `source` 32.8s |
+| 2 | 18ms | 549ms | 1386ms | 19.7s | `education[0].degree` 2.3s |
+| 3 | 29ms | 16657ms | 8770ms | 5.0s | — |
+| 4 | 208ms | 5550ms | 3209ms | 9.7s | `veteranStatus` 2.0s |
+| 5 | 4ms | 592ms | 2218ms | 2.2s | — |
+
+### Other costs measured this round (real, but not the root cause)
+
+- **`readHier(source)` 13.55s on the FIRST read, 0.13s on the second** — the hierarchical expand-walk.
+- **`scrapeTaOptions(countryPhoneCode)` 14.37s** (~249 options); `capture` ranged **4.7–21.1s** on page 1
+  across runs. Both `countryPhoneCode` and `country` are **fixed vocabularies** (Workday's own country
+  list), so they are cacheable across runs/tenants instead of re-scraped every page 1. `CLAUDE.md` already
+  skips `capture` for **skills** for the mirror-image reason — skills is a server-side RANKED search so it
+  can never BE the picker; these are fixed so they can be cached once.
+- **Page 1's first Save & Continue is SWALLOWED on 2 of 4 completed runs.** Signature: `page 1 blocked
+  with 0 error(s)` → `no error text on the page — nothing to anchor a remediation on` → `✓ page 1 →
+  advanced after re-clicking Save & Continue (1x — the first click was swallowed)`. Cost ~105s (run 1) and
+  ~32s (run 2). Largest intermittent cost after the timer drift.
+- **`waitFor(resume-upload-input)` timed out at its 25s budget on 1 of 5 runs** and halted the run
+  `needs_operator` / `resume-upload-input-missing`; the very next run satisfied the same wait in 7.0s. A
+  transient race, **not** accumulated Workday state — a longer budget beats a halt here.
+
+### Fix directions (measurement only — NONE implemented)
+
+1. **Pace off a throttle-immune clock (highest value).** The page already carries worker-backed timers
+   (`__apWorkerTimers`, installed for exactly this class of problem), so an in-page `Runtime.evaluate` +
+   `awaitPromise` sleep is paced by a clock Chrome does not starve, unlike the SW's `setTimeout`. Cost: it
+   holds one `Runtime.evaluate` open for the delay — which is what a pace wants anyway. ⚠ It also
+   serializes behind other commands on that target, so measure before/after with `debugPageTrace`, and
+   keep `act.delay`'s signature so the substrate/brain split is untouched.
+2. **Or measure-and-compensate.** `act.delay` records requested-vs-actual and, after a large overrun,
+   SKIPS the next delay — the settle it was buying has already elapsed. Cheap, no new mechanism, and it
+   cannot make a wait shorter than the condition it gates because every wait polls its own condition.
+3. **Cache the fixed option vocabularies** (`countryPhoneCode`, `country`) — ≈14s/run.
+4. **Give the swallowed-first-Save its own fix.**
+
+### Open questions for the next round
+
+- **What starves the SW timer?** Not unread CDP events (measured 0) and not CPU (measured). Remaining
+  suspects: Chrome deprioritising MV3 worker timers while the worker awaits many CDP promises; or the
+  worker's own message-processing queue. A targeted probe would time `setTimeout` drift with and without
+  concurrent CDP traffic on an otherwise idle worker.
+- **Is the widget tail (`source` 5.5s vs 32.8s) the same timer problem or a Workday XHR?** `readHier`'s
+  13.55s is genuine in-page work; the `delay(250)`→17.3s next to it is ours. Splitting those needs a
+  per-poll-iteration trace inside `readHier`.
+- Whether a **visible** run shows the same drift. Every run this round was hidden. ⚠ Polling the localhost
+  tab with `javascript_tool` ACTIVATES it, so a foreground run must be fired and then left alone.

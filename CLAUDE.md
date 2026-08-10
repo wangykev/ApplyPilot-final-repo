@@ -17,6 +17,7 @@ This file holds **standing rules, invariants and safety contracts only** — eve
 | `live-testing` skill | driving a real end-to-end run through Chrome |
 | `docs/dom-patterns.md` | the dated observed-DOM rulebook (every tenant + refutations). **Has a topic index at the top — use it; never read the file whole.** |
 | `docs/progress-log.md` | full extension milestone history. Append new entries here. **Has a topic index at the top; never read it whole.** |
+| `docs/fill-speed-log.md` | **fill SPEED / timing** — every measurement, refuted theory, per-run data and fix direction. Read before investigating any slow fill; append new speed rounds here |
 | `docs/status.md` | current state, NEXT items, operator TODOs, deferred work |
 | `WEBSITE.md` | the Next.js + Supabase companion site (`web/`) — design + the handoff contracts |
 | `docs/website-progress-log.md` | website milestone history. Append new website entries here. |
@@ -562,10 +563,10 @@ Adding another model is one line in the rule table; `fastRetry:false` opts a cal
 **`debugLagTrace`** (`AP_DEV_FLAG`) is the tool that settles it, and it exists because a duration alone
 never could: it times every CDP command at the `cdpSend` choke point, runs a 500ms no-op page probe, and
 measures the service worker's own timer drift — three clocks that fail independently, so each slow command
-prints whether it was the renderer, the channel, or that call's own work. OFF ⇒ pass-through, so it cannot
-distort what it measures. Detail + how to read it: the `live-testing` skill. **Unresolved:** SW timer drift
-spikes of 1–2.4s in every run, not yet tied to anything (and possibly an artefact of timing with a timer
-inside an MV3 worker) — do not treat drift alone as a problem until it is shown to track real slowness.
+prints whether it was the renderer, the channel, or that call's own work. OFF ⇒ pass-through. Detail + how
+to read it: the `live-testing` skill. **SW timer drift is the LAG itself, not an artefact (answered
+2026-08-10): `act.delay` overruns 3–69× in the MV3 worker — every speed measurement, refutation and fix
+direction lives in `docs/fill-speed-log.md`; read it before investigating any slow fill.**
 
 ## Working principles
 
