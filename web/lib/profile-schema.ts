@@ -14,8 +14,22 @@ import { z } from "zod";
 const str = z.string().default("");
 /** tri-state boolean: true / false / null (unanswered). For genuine yes/no QUESTIONS (work
  *  authorization, screening) where "unanswered" is meaningful — the tool leaves it blank rather
- *  than guess — and for languages[].fluent (null = auto-derive from reading∧speaking∧writing). */
-const triBool = z.boolean().nullable().default(null);
+ *  than guess — and for languages[].fluent (null = auto-derive from reading∧speaking∧writing).
+ *  TOLERANT of legacy string values ("yes"/"no"/"true"/"false"; anything else → null) — before
+ *  this, ONE string tri-bool anywhere failed the whole parse and coerceProfile silently returned
+ *  an EMPTY profile (hit live: the extension's data/profile.json carries string values here). */
+const triBool = z
+  .preprocess((v) => {
+    if (v === true || v === false || v === null) return v;
+    if (typeof v === "string") {
+      const t = v.trim().toLowerCase();
+      if (t === "true" || t === "yes" || t === "y") return true;
+      if (t === "false" || t === "no" || t === "n") return false;
+      return null; // "", "unknown", prose → unanswered
+    }
+    return null;
+  }, z.boolean().nullable())
+  .default(null);
 /** plain CHECKBOX boolean. A checkbox has no "unanswered" state on a form — it's checked or it isn't —
  *  so absent / null / legacy values coerce to false. Migrates old triBool nulls → false. */
 const bool = z
@@ -88,6 +102,7 @@ export const websiteSchema = z.object({
 
 export const educationSchema = z.object({
   school_or_university: str,
+  location: str, // resume-only ("Pittsburgh, PA")
   degree: tiered,
   field_of_study: tiered,
   minor: str,
@@ -97,6 +112,25 @@ export const educationSchema = z.object({
   to_year: str, // "YYYY"
   graduation_date: str, // "YYYY-MM"
   currently_enrolled: bool, // checkbox
+  // Resume-only: the "Relevant Coursework: …" line under this school. coerceProfile
+  // bridges the extension profile's application_questions.role_specific.coursework_relevant
+  // into entry 0 so an imported profile keeps its education section intact.
+  coursework: z.array(z.string()).default([]),
+});
+
+// Resume-only section (not on any Workday fill path) — LOCKSTEP with the extension's
+// data/profile.example.json projects shape. `bullets[]` stays an array here (unlike
+// work_experience's role_description textarea) because no editor renders it yet.
+export const projectSchema = z.object({
+  name: str,
+  role: str,
+  from: str, // "YYYY-MM"
+  to: str, // "YYYY-MM"
+  summary: str,
+  bullets: z.array(z.string()).default([]),
+  tech_stack: z.array(z.string()).default([]),
+  link: str,
+  github: str,
 });
 
 export const workExperienceSchema = z.object({
@@ -227,12 +261,19 @@ export const profileSchema = z.object({
   websites: z.array(websiteSchema).default([]),
   work_experience: z.array(workExperienceSchema).default([]),
   education: z.array(educationSchema).default([]),
+  projects: z.array(projectSchema).default([]),
   skills: z.array(z.string()).default([]),
   // Workday's "Autofill with Resume" already suggests a set of skills, and adding the whole profile list
   // on top costs a separate search round trip PER SKILL (~1.5–3s each — it is the slowest field on the
   // page). So it is OPT-IN: off ⇒ keep Workday's suggestions and record them for review; on ⇒ also add
   // every profile skill the taxonomy accepts. Default false, i.e. fast.
   fill_all_skills: z.boolean().default(false),
+  // Resume-only presentation grouping for the Technical Skills section (the
+  // resume's labeled lines: Languages / Tools / …). `skills` stays the FLAT
+  // canonical list the extension fills from; groups only shape the rendering.
+  skill_groups: z
+    .array(z.object({ name: str, skills: z.array(z.string()).default([]) }))
+    .default([]),
   languages: z.array(languageSchema).default([]),
   certifications: z.array(certificationSchema).default([]),
   work_authorization: workAuthSchema,
@@ -265,6 +306,7 @@ export type Profile = z.infer<typeof profileSchema>;
 export type Website = z.infer<typeof websiteSchema>;
 export type Education = z.infer<typeof educationSchema>;
 export type WorkExperience = z.infer<typeof workExperienceSchema>;
+export type Project = z.infer<typeof projectSchema>;
 export type Language = z.infer<typeof languageSchema>;
 export type Certification = z.infer<typeof certificationSchema>;
 export type FileRef = z.infer<typeof fileRefSchema>;
@@ -328,6 +370,18 @@ export function coerceProfile(raw: unknown): Profile {
   }
   obj.work_authorization = wa;
 
+  // Bridge the extension profile's global coursework list into education[0].coursework
+  // (the resume renders it as the "Relevant Coursework: …" line under the school).
+  const aq = obj.application_questions as Record<string, unknown> | undefined;
+  const rs = aq?.role_specific as Record<string, unknown> | undefined;
+  const coursework = rs?.coursework_relevant;
+  if (Array.isArray(coursework) && coursework.length && Array.isArray(obj.education) && obj.education[0] && typeof obj.education[0] === "object") {
+    const e0 = obj.education[0] as Record<string, unknown>;
+    if (!Array.isArray(e0.coursework) || !e0.coursework.length) {
+      obj.education = [{ ...e0, coursework: coursework.filter(Boolean).map(String) }, ...(obj.education as unknown[]).slice(1)];
+    }
+  }
+
   const parsed = profileSchema.safeParse(obj);
   return parsed.success ? parsed.data : emptyProfile();
 }
@@ -354,7 +408,9 @@ export function mergeProfile(base: Profile, incoming: Profile): Profile {
     "websites",
     "work_experience",
     "education",
+    "projects",
     "skills",
+    "skill_groups",
     "languages",
     "certifications",
     "employment_history_companies",
@@ -364,6 +420,19 @@ export function mergeProfile(base: Profile, incoming: Profile): Profile {
       (out as Record<string, unknown>)[k] = structuredClone(incoming[k]);
     }
   }
+
+  // education: when the base ALREADY has entries (so the whole-array take above
+  // skipped), still fill each entry's EMPTY fields from the index-matched parsed
+  // entry — this is how coursework/location/graduation_date reach a profile
+  // whose education predates those schema fields. Populated values never change.
+  out.education.forEach((e, i) => {
+    const inc = incoming.education[i];
+    if (!inc) return;
+    const rec = e as unknown as Record<string, unknown>;
+    for (const [k, v] of Object.entries(inc)) {
+      if (isEmpty(rec[k]) && !isEmpty(v)) rec[k] = structuredClone(v);
+    }
+  });
 
   return out;
 }
