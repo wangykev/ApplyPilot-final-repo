@@ -4448,3 +4448,26 @@ That is the SELF-ID page, and it is NOT the same fault. Two candidates, neither 
 So candidate 1 is the whole story: the self-ID page is failing to actuate, and the replay cannot match a
 page the fill largely errored out on. That is the thread to pull — same thread as the disability-checkbox
 blocker and the re-entry correlation from earlier in the day, which are worth attacking as ONE piece.
+
+### (g) resolved — kiongroup.wd3 reaches SUBMIT GATE PASSED
+
+Cleared summary → fresh fill → approve → rehearse, on `pagekey-settled-47b241c`.
+
+The refill was CLEAN, and it retires the "the self-ID page is failing to actuate" reading from the
+follow-up above. Per-page: page 1 `filled 12 · filled_review 1 · skipped 1`, page 2 `filled 27 ·
+skipped 3 · filled_review 1`, page 3 `filled_review 8 · needs_review 2`, page 4 `filled 1 ·
+filled_review 2`, page 5 **`filled_review 1 · skipped 4` — zero errors**, and `rectReady … gave up`
+appeared **0** times in the whole run (previous run: 28 errors and 6 give-ups on
+`formField-disabilityForm`). So that failure is INTERMITTENT on this tenant, not a standing fault —
+one run is not evidence of a broken widget, which is the same lesson as the marvell Date block.
+
+Bundle: 54 filled · 7 skipped · **0 error** · 15/15 flagged approved · Ready to submit.
+
+Rehearsal: every page matched an approved page, **AGREE 51 · DISAGREE 0 · MISSING 3 · EXTRA 1**,
+**SUBMIT GATE PASSED — WOULD CLICK SUBMIT (SIMULATE MODE: NOT clicking)**. Nothing submitted.
+
+So kiongroup.wd3 joins the verified list, and the field-less page key is fixed end to end: the fill
+records five distinct pages, the replay matches every one, and the gate passes.
+
+**Tenants verified end to end 2026-08-09** (all hidden, all `arm:false`, nothing ever submitted):
+moog.wd5 · cadence.wd1 · marvell.wd1 · kiongroup.wd3.
