@@ -300,6 +300,29 @@ export const profileSchema = z.object({
       }),
     )
     .default({}),
+  /**
+   * PARKED ladders, keyed by the same field path, each remembering the ANSWER it was written for.
+   *
+   * A ladder is hand-written work: the variants a tenant might phrase your answer as. It must never be
+   * destroyed by an import. When the answer at a path changes, that path's `values` ladder stops being
+   * about the current answer — so it is parked here rather than deleted, and restored verbatim if the
+   * answer comes back (operator 2026-08-10: "accidentally changes it to no, then changes it back to
+   * yes, that ladder should return").
+   *
+   * The per-polarity `yes`/`no` ladders are NOT parked on a flip: they are already answer-specific and
+   * both stay valid whichever way the field currently reads.
+   */
+  answer_ladders_archive: z
+    .record(
+      z.string(),
+      z.array(
+        z.object({
+          answer: z.string(),
+          values: z.array(z.string()).default([]),
+        }),
+      ),
+    )
+    .default({}),
 });
 
 export type Profile = z.infer<typeof profileSchema>;
@@ -569,12 +592,94 @@ export function replaceProfileSections(base: Profile, incoming: Profile): Replac
     if (!replaced.includes(section as ParsedSection)) continue;
     const len = (out[section] as unknown[] | undefined)?.length ?? 0;
     if (Number(m[2]) >= len) {
+      // PARK, don't delete (operator 2026-08-10). The entry this ladder described is gone from the
+      // new array, but the ladder is hand-written work: keep it under the answer it belonged to, so
+      // re-adding that entry brings it straight back.
+      parkLadder(out, key, answerKeyOf(readProfilePath(base, key)), out.answer_ladders[key]?.values ?? []);
       delete out.answer_ladders[key];
       droppedLadders.push(key);
     }
   }
 
   return { profile: out, replaced, droppedLadders };
+}
+
+// ── ANSWER LADDERS SURVIVE EVERYTHING ───────────────────────────────────────────────────────────
+// Operator rule (2026-08-10): a taught ladder is never destroyed by a profile write. If the answer it
+// was written for changes, the ladder is PARKED under that answer; if the answer comes back, the
+// ladder comes back with it. Deleting is reserved for the user deleting it.
+
+/** Read a dotted path ("education.0.gpa") out of a profile. */
+function readProfilePath(root: unknown, path: string): unknown {
+  let cur: unknown = root;
+  for (const seg of path.split(".")) {
+    if (cur == null || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+/** The comparable form of an answer. Tiered arrays compare by content; booleans by polarity. */
+export function answerKeyOf(v: unknown): string {
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean).join(" | ");
+  if (typeof v === "boolean") return v ? "true" : "false";
+  return String(v).trim();
+}
+
+/** Park a path's `values` ladder under `answer`, de-duped by answer. Never overwrites a different answer's park. */
+function parkLadder(p: Profile, path: string, answer: string, values: string[]): void {
+  if (!values.length) return;
+  const list = p.answer_ladders_archive[path] ?? [];
+  const at = list.findIndex((e) => e.answer === answer);
+  if (at >= 0) list[at] = { answer, values: values.slice() };
+  else list.push({ answer, values: values.slice() });
+  p.answer_ladders_archive[path] = list;
+}
+
+export type LadderReconcile = { profile: Profile; parked: string[]; restored: string[] };
+
+/**
+ * Re-point the answer ladders at a profile that just changed.
+ *
+ * - answer UNCHANGED → the ladder is left completely alone
+ * - answer CHANGED   → its `values` are parked under the OLD answer (yes/no ladders are kept as-is)
+ * - answer RETURNED  → the parked `values` for exactly that answer are restored
+ *
+ * Pure. Nothing is ever deleted.
+ */
+export function reconcileLaddersToProfile(before: Profile, after: Profile): LadderReconcile {
+  const out = structuredClone(after);
+  const parked: string[] = [];
+  const restored: string[] = [];
+  const paths = new Set([
+    ...Object.keys(out.answer_ladders),
+    ...Object.keys(out.answer_ladders_archive),
+  ]);
+
+  for (const path of paths) {
+    const wasKey = answerKeyOf(readProfilePath(before, path));
+    const nowKey = answerKeyOf(readProfilePath(out, path));
+    const live = out.answer_ladders[path];
+
+    if (wasKey !== nowKey && live && (live.values ?? []).length) {
+      parkLadder(out, path, wasKey, live.values ?? []);
+      out.answer_ladders[path] = { ...live, values: [] };
+      parked.push(path);
+    }
+
+    // Restore: an EXACT return of a parked answer brings its ladder back. A different answer is a
+    // different question — re-attaching those variants would be a silently wrong answer.
+    const park = (out.answer_ladders_archive[path] ?? []).find((e) => e.answer === nowKey);
+    if (park && park.values.length) {
+      const cur = out.answer_ladders[path] ?? { yes: [], no: [], values: [] };
+      if (!(cur.values ?? []).length) {
+        out.answer_ladders[path] = { ...cur, values: park.values.slice() };
+        restored.push(path);
+      }
+    }
+  }
+  return { profile: out, parked, restored };
 }
 
 function isEmpty(v: unknown): boolean {

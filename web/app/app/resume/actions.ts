@@ -7,11 +7,11 @@ import {
   coerceProfile,
   mergeProfile,
   replaceProfileSections,
+  reconcileLaddersToProfile,
   emptyProfile,
   type ParsedSection,
 } from "@/lib/profile-schema";
 import { validatePlan, applyReconcilePlan, type EntryDecision } from "@/lib/profile-reconcile";
-import { coerceBuckets, reconcileBucketsToProfile } from "@/lib/buckets";
 import { diffProfile, profileFingerprint, type ProfileDiff } from "@/lib/profile-diff";
 import { sanitizePdfName } from "@/lib/filenames";
 import type { Profile } from "@/lib/profile-schema";
@@ -65,33 +65,6 @@ const STALE =
   "Your profile changed since this preview was generated. Re-run the preview so you can see the current diff.";
 
 /**
- * Keep the taught answer buckets pointing at the right answers after a profile write.
- *
- * A Mode-A bucket's answer IS the profile value at its path, so overwriting the profile silently
- * empties it — which is what applying a rewritten resume did. Unchanged answers are left alone;
- * changed ones park their wordings (restored automatically if the answer comes back). Best-effort:
- * the profile write has already succeeded, and failing to re-point buckets must never surface as a
- * failed apply.
- */
-async function reconcileBucketsAfterWrite(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  userId: string,
-  before: Profile,
-  after: Profile,
-): Promise<void> {
-  try {
-    const { data } = await supabase.from("profiles").select("buckets_json").eq("id", userId).maybeSingle();
-    if (!data?.buckets_json) return;
-    const current = coerceBuckets(data.buckets_json);
-    const { buckets, archived, restored } = reconcileBucketsToProfile(current, before, after);
-    if (!archived.length && !restored.length) return;
-    await supabase.from("profiles").upsert({ id: userId, buckets_json: buckets }, { onConflict: "id" });
-  } catch {
-    /* best effort — never fail the apply over bookkeeping */
-  }
-}
-
-/**
  * What a mode WOULD do, computed by running that mode's real apply function against
  * a clone and diffing. Nothing is written.
  */
@@ -120,13 +93,12 @@ export async function applyParsedProfile(parsedRaw: unknown, expect?: string): P
     if (!loaded.ok) return { ok: false, error: loaded.error };
     if (expect && profileFingerprint(loaded.current) !== expect) return { ok: false, error: STALE };
 
-    const merged = mergeProfile(loaded.current, parsed.data);
+    const merged = reconcileLaddersToProfile(loaded.current, mergeProfile(loaded.current, parsed.data)).profile;
 
     const { error } = await loaded.supabase
       .from("profiles")
       .upsert({ id: loaded.userId, profile_json: merged }, { onConflict: "id" });
     if (error) return { ok: false, error: error.message };
-    await reconcileBucketsAfterWrite(loaded.supabase, loaded.userId, loaded.current, merged);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
@@ -151,13 +123,14 @@ export async function replaceParsedProfile(parsedRaw: unknown, expect?: string):
     if (!loaded.ok) return { ok: false, error: loaded.error };
     if (expect && profileFingerprint(loaded.current) !== expect) return { ok: false, error: STALE };
 
-    const { profile, replaced, droppedLadders } = replaceProfileSections(loaded.current, parsed.data);
+    const r = replaceProfileSections(loaded.current, parsed.data);
+    const { replaced, droppedLadders } = r;
+    const profile = reconcileLaddersToProfile(loaded.current, r.profile).profile;
 
     const { error } = await loaded.supabase
       .from("profiles")
       .upsert({ id: loaded.userId, profile_json: profile }, { onConflict: "id" });
     if (error) return { ok: false, error: error.message };
-    await reconcileBucketsAfterWrite(loaded.supabase, loaded.userId, loaded.current, profile);
     return { ok: true, replaced, droppedLadders };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
@@ -187,13 +160,14 @@ export async function applyReconcile(
     if (expect && profileFingerprint(loaded.current) !== expect) return { ok: false, error: STALE };
 
     const plan = validatePlan(loaded.current, parsed.data, decisionsRaw as EntryDecision[]);
-    const { profile, updated, added } = applyReconcilePlan(loaded.current, parsed.data, plan);
+    const rc = applyReconcilePlan(loaded.current, parsed.data, plan);
+    const { updated, added } = rc;
+    const profile = reconcileLaddersToProfile(loaded.current, rc.profile).profile;
 
     const { error } = await loaded.supabase
       .from("profiles")
       .upsert({ id: loaded.userId, profile_json: profile }, { onConflict: "id" });
     if (error) return { ok: false, error: error.message };
-    await reconcileBucketsAfterWrite(loaded.supabase, loaded.userId, loaded.current, profile);
     return { ok: true, updated, added };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };

@@ -3,7 +3,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, SITE_URL } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
-import { activeBuckets, coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS } from "@/lib/buckets";
+import { coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS } from "@/lib/buckets";
 import { ensureDefaultFieldWordings } from "@/lib/teach";
 import { coerceAiConfig, type AiConfig } from "@/lib/ai-config";
 import { coerceCredentials, coerceOnboardConfig, type Credentials, type OnboardConfig } from "@/lib/credentials";
@@ -56,11 +56,8 @@ function shapeProfileSlice(row: ProfileRow): ProfileSlice {
   // …plus each profile field's OWN NAME as a default wording ("First Name" in the first-name bucket),
   // so a form that labels its question the way the profile labels the field fills deterministically even
   // when the tenant's automation-id isn't in FIELD_MAP (operator, 2026-07-26). Non-destructive.
-  // ARCHIVED buckets are dormant: their answer changed under them, so their wordings are parked
-  // pending the answer coming back. Shipping them would let a retired wording keep answering with an
-  // answer the profile no longer holds — the exact silent-wrong-answer the archive exists to prevent.
   const buckets = ensureDefaultFieldWordings(
-    activeBuckets(ensureStarterBuckets(row?.buckets_json != null ? coerceBuckets(row.buckets_json) : STARTER_BUCKETS)),
+    ensureStarterBuckets(row?.buckets_json != null ? coerceBuckets(row.buckets_json) : STARTER_BUCKETS),
     profile,
   );
   const jc = row?.job_context_json as { company?: string } | null;
