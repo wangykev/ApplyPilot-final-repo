@@ -31,6 +31,15 @@ export const bucketSchema = z.object({
   questions: z.array(z.string()).default([]),
   /** Optional per-platform stable-selector accelerators (workday automation-ids, etc.). */
   selectors: z.record(z.array(z.string())).default({}),
+  /**
+   * ARCHIVED — the taught wordings are kept but dormant, because the profile answer this bucket points
+   * at changed out from under it. OPTIONAL rather than defaulted on purpose: every existing Bucket
+   * literal in the codebase (starters, teach.ts, tests) predates these fields, and making them required
+   * would force a churn edit through all of them for no behavioural gain. Absent === active.
+   */
+  archived: z.boolean().optional(),
+  /** The answer this bucket was taught AGAINST, recorded when archiving so it can be restored. */
+  archived_answer: z.string().optional(),
 });
 export type Bucket = z.infer<typeof bucketSchema>;
 
@@ -187,4 +196,88 @@ export function ensureStarterBuckets(buckets: Bucket[]): Bucket[] {
   const havePaths = new Set(buckets.map((b) => b.profile_path.trim()).filter(Boolean));
   const add = STARTER_BUCKETS.filter((s) => s.profile_path.trim() && !havePaths.has(s.profile_path.trim()));
   return add.length ? [...buckets, ...add] : buckets;
+}
+
+// ── BUCKETS vs a PROFILE THAT JUST CHANGED ──────────────────────────────────────────────────────
+// A Mode-A bucket stores only a `profile_path`: its ANSWER is whatever the profile holds there. So
+// nothing has to DELETE a bucket for it to look emptied — overwriting the profile value underneath it
+// is enough. Applying a rewritten resume does exactly that, and the operator watched buckets go blank
+// (2026-08-10). The resume-apply code had guarded the index-keyed `answer_ladders` against the same
+// hazard and missed buckets entirely, because they live in a different column it never loaded.
+//
+// The rule, operator-stated: an answer that did not change leaves its bucket alone; an answer that DID
+// change may retire the bucket, but the taught wordings are kept in the background and come back if the
+// answer returns. Teaching a wording is manual work — an import must be able to park it, never destroy it.
+//
+// Mode-B buckets carry their own `value` and are never touched here: no profile edit can invalidate them.
+
+/** Read a dotted path ("education.0.gpa") out of a profile-shaped object. */
+function readPath(root: unknown, path: string): unknown {
+  if (!path) return undefined;
+  let cur: unknown = root;
+  for (const seg of path.split(".")) {
+    if (cur == null || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+/** The comparable form of a bucket's answer. Tiered arrays compare by content, not identity. */
+function answerKey(v: unknown): string {
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean).join(" | ");
+  if (typeof v === "boolean") return v ? "true" : "false";
+  return String(v).trim();
+}
+
+export type BucketReconcile = {
+  buckets: Bucket[];
+  /** Wordings parked because their answer changed. */
+  archived: { path: string; from: string; to: string; questions: number }[];
+  /** Wordings brought back because their answer returned. */
+  restored: { path: string; answer: string; questions: number }[];
+};
+
+/**
+ * Re-point the bucket set at a profile that just changed. `before`/`after` are the profile on either
+ * side of the edit. Pure — the caller persists.
+ */
+export function reconcileBucketsToProfile(
+  buckets: Bucket[],
+  before: unknown,
+  after: unknown,
+): BucketReconcile {
+  const archived: BucketReconcile["archived"] = [];
+  const restored: BucketReconcile["restored"] = [];
+
+  const out = buckets.map((b) => {
+    const path = b.profile_path.trim();
+    if (!path) return b; // Mode B — its answer lives in the bucket itself
+    const nowKey = answerKey(readPath(after, path));
+
+    if (b.archived) {
+      // Only an EXACT return of the answer it was taught against restores it. A different answer is a
+      // different question, and re-attaching old wordings to it would be exactly the silent-wrong-answer
+      // failure buckets exist to prevent.
+      if (b.archived_answer && nowKey === b.archived_answer) {
+        restored.push({ path, answer: nowKey, questions: b.questions.length });
+        return { ...b, archived: false, archived_answer: "" };
+      }
+      return b;
+    }
+
+    const wasKey = answerKey(readPath(before, path));
+    if (wasKey === nowKey) return b; // unchanged → leave it completely alone
+    // An answer that went BLANK is still a change, and it is the common one here: an import that
+    // shortened work_experience leaves "work_experience.2.*" pointing at nothing.
+    archived.push({ path, from: wasKey, to: nowKey, questions: b.questions.length });
+    return { ...b, archived: true, archived_answer: wasKey };
+  });
+
+  return { buckets: out, archived, restored };
+}
+
+/** The buckets that answer questions at fill time. Archived ones are dormant, not deleted. */
+export function activeBuckets(buckets: Bucket[]): Bucket[] {
+  return buckets.filter((b) => !b.archived);
 }
