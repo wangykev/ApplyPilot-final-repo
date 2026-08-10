@@ -12,6 +12,7 @@ import {
   type ParsedSection,
 } from "@/lib/profile-schema";
 import { validatePlan, applyReconcilePlan, type EntryDecision } from "@/lib/profile-reconcile";
+import { putResume, currentResume, downloadResume, signedUrlFor, removeCurrentResume } from "@/lib/resume-store";
 import { diffProfile, profileFingerprint, type ProfileDiff } from "@/lib/profile-diff";
 import { sanitizePdfName } from "@/lib/filenames";
 import type { Profile } from "@/lib/profile-schema";
@@ -188,18 +189,13 @@ export async function getResumeSource(): Promise<SourceResult> {
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return { ok: true, source: null };
-    const { data } = await supabase
-      .from("resumes")
-      .select("filename, storage_path")
-      .eq("user_id", user.id)
-      .eq("kind", "source")
-      .maybeSingle();
-    if (!data) return { ok: true, source: null };
-    const kind = data.storage_path.endsWith(".tex") ? "tex" : "docx";
-    if (kind === "docx") return { ok: true, source: { kind, filename: data.filename } };
-    const { data: blob, error } = await supabase.storage.from("resumes").download(data.storage_path);
-    if (error || !blob) return { ok: true, source: { kind, filename: data.filename } };
-    return { ok: true, source: { kind, filename: data.filename, tex: await blob.text() } };
+    const row = await currentResume(supabase, user.id, "source");
+    if (!row) return { ok: true, source: null };
+    const kind = row.storage_path.endsWith(".tex") ? "tex" : "docx";
+    if (kind === "docx") return { ok: true, source: { kind, filename: row.filename } };
+    const buf = await downloadResume(supabase, row);
+    if (!buf) return { ok: true, source: { kind, filename: row.filename } };
+    return { ok: true, source: { kind, filename: row.filename, tex: buf.toString("utf8") } };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
   }
@@ -215,21 +211,13 @@ export async function saveResumeSourceTex({ filename, tex }: { filename: string;
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return { ok: false, error: "You're not signed in." };
-    const path = `${user.id}/source.tex`;
-    const { error: upErr } = await supabase.storage
-      .from("resumes")
-      .upload(path, new Blob([tex], { type: "application/x-tex" }), { upsert: true, contentType: "application/x-tex" });
-    if (upErr) return { ok: false, error: upErr.message };
-    await supabase.from("resumes").delete().eq("user_id", user.id).eq("kind", "source");
-    const { error: insErr } = await supabase.from("resumes").insert({
-      user_id: user.id,
-      kind: "source",
+    const res = await putResume(supabase, user.id, "source", {
       filename: filename || "resume.tex",
       mime: "application/x-tex",
-      size: tex.length,
-      storage_path: path,
+      bytes: Buffer.from(tex, "utf8"),
+      ext: "tex",
     });
-    if (insErr) return { ok: false, error: insErr.message };
+    if (!res.ok) return { ok: false, error: res.error };
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
@@ -252,21 +240,13 @@ export async function saveCompiledResume({ pdfBase64, pdfName }: { pdfBase64: st
     const bytes = Buffer.from(pdfBase64, "base64");
     if (!bytes.length || bytes.length > 10 * 1024 * 1024) return { ok: false, error: "Bad PDF payload." };
     const filename = sanitizePdfName(pdfName);
-    const path = `${user.id}/default-resume.pdf`;
-    const { error: upErr } = await supabase.storage
-      .from("resumes")
-      .upload(path, bytes, { upsert: true, contentType: "application/pdf" });
-    if (upErr) return { ok: false, error: upErr.message };
-    await supabase.from("resumes").delete().eq("user_id", user.id).eq("kind", "default");
-    const { error: insErr } = await supabase.from("resumes").insert({
-      user_id: user.id,
-      kind: "default",
+    const res = await putResume(supabase, user.id, "default", {
       filename,
       mime: "application/pdf",
-      size: bytes.length,
-      storage_path: path,
+      bytes,
+      ext: "pdf",
     });
-    if (insErr) return { ok: false, error: insErr.message };
+    if (!res.ok) return { ok: false, error: res.error };
     return { ok: true, filename, size: bytes.length };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
@@ -289,8 +269,10 @@ export async function convertDocxToPdf(): Promise<{ ok: true; pdfBase64: string 
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return { ok: false, error: "You're not signed in." };
-    const { data: blob, error } = await supabase.storage.from("resumes").download(`${user.id}/source.docx`);
-    if (error || !blob) return { ok: false, error: "No stored .docx source found." };
+    // By ROW, not a fixed path — source files are content-addressed now.
+    const row = await currentResume(supabase, user.id, "source");
+    const docx = row && row.storage_path.endsWith(".docx") ? await downloadResume(supabase, row) : null;
+    if (!docx) return { ok: false, error: "No stored .docx source found." };
 
     const { mkdtemp, writeFile, readFile, rm } = await import("node:fs/promises");
     const { tmpdir } = await import("node:os");
@@ -300,7 +282,7 @@ export async function convertDocxToPdf(): Promise<{ ok: true; pdfBase64: string 
     try {
       dir = await mkdtemp(join(tmpdir(), "ap-docx-"));
       const src = join(dir, "resume.docx");
-      await writeFile(src, Buffer.from(await blob.arrayBuffer()));
+      await writeFile(src, docx);
       const code = await new Promise<number>((resolve) =>
         execFile(soffice, ["--headless", "--convert-to", "pdf", "--outdir", dir, src], { timeout: 120000, windowsHide: true }, (e) =>
           resolve(e ? 1 : 0)
@@ -329,17 +311,21 @@ export async function getResumePreviewUrl(): Promise<PreviewUrlResult> {
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return { ok: false, error: "You're not signed in." };
-    const { data, error } = await supabase.storage
-      .from("resumes")
-      .createSignedUrl(`${user.id}/default-resume.pdf`, 600);
-    if (error || !data?.signedUrl) return { ok: false, error: error?.message ?? "No stored resume found." };
-    return { ok: true, url: data.signedUrl };
+    const row = await currentResume(supabase, user.id, "default");
+    if (!row) return { ok: false, error: "No stored resume found." };
+    const url = await signedUrlFor(supabase, row, 600);
+    if (!url) return { ok: false, error: "No stored resume found." };
+    return { ok: true, url };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
   }
 }
 
-/** Remove the stored default resume (Storage object + row). */
+/**
+ * Remove the stored default resume. SOFT: the row and its bytes stay, because applications already
+ * sent with this résumé still have to be able to show it. Removing it means "I have no current
+ * résumé", not "that document never existed".
+ */
 export async function removeResume(): Promise<ActionResult> {
   if (!isSupabaseConfigured()) return { ok: false, error: "Backend not connected." };
   try {
@@ -348,8 +334,7 @@ export async function removeResume(): Promise<ActionResult> {
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return { ok: false, error: "You're not signed in." };
-    await supabase.storage.from("resumes").remove([`${user.id}/default-resume.pdf`]);
-    await supabase.from("resumes").delete().eq("user_id", user.id).eq("kind", "default");
+    await removeCurrentResume(supabase, user.id, "default");
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };

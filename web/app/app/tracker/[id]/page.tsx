@@ -10,19 +10,21 @@ import {
   type WorkdayReviewPage,
 } from "@/components/app/SubmittedRecord";
 import { JobDescriptionButton } from "./JobDescriptionButton";
+import { ResumeButton } from "./ResumeButton";
 import type { ReviewBundle } from "@/lib/review-summary";
 import { prettyCompany } from "@/lib/company-name";
+import { resumeById } from "@/lib/resume-store";
 import type { Application } from "../shared";
 import { SAMPLE_APPS, SAMPLE_BUNDLE_BY_ID } from "../sample";
 
 export const dynamic = "force-dynamic";
 
 // persistable = the bundle came from a real DB row we can UPDATE (not a DEV_PREVIEW sample).
-type Loaded = { app: Application; bundle: ReviewBundle | null; persistable: boolean; jobDescription: string | null };
+type Loaded = { app: Application; bundle: ReviewBundle | null; persistable: boolean; jobDescription: string | null; resumeName: string | null };
 
 function sampleLookup(id: string): Loaded | null {
   const app = SAMPLE_APPS.find((a) => a.id === id);
-  return app ? { app, bundle: SAMPLE_BUNDLE_BY_ID[id] ?? null, persistable: false, jobDescription: null } : null;
+  return app ? { app, bundle: SAMPLE_BUNDLE_BY_ID[id] ?? null, persistable: false, jobDescription: null, resumeName: null } : null;
 }
 
 async function loadApp(id: string): Promise<Loaded | null> {
@@ -44,7 +46,24 @@ async function loadApp(id: string): Promise<Loaded | null> {
       review_bundle_json: ReviewBundle | null;
       job_description: string | null;
     };
-    return { app: app as Application, bundle: review_bundle_json ?? null, persistable: true, jobDescription: job_description ?? null };
+    // Which résumé went with this application — fetched SEPARATELY and allowed to fail. Showing the
+    // résumé is an extra; approving the review is the reason this page exists. Folding resume_id into
+    // the select above would mean that a database still missing the 0017 columns 404s the whole review
+    // page, which is a far worse outcome than a missing button.
+    // Just the NAME here — the signed URL is minted on click (it expires, so baking one into the page
+    // would hand out a dead link on any tab left open).
+    let resumeName: string | null = null;
+    try {
+      const { data: r } = await supabase.from("applications").select("resume_id").eq("id", id).eq("user_id", user.id).maybeSingle();
+      if (r?.resume_id) resumeName = (await resumeById(supabase, user.id, r.resume_id))?.filename ?? null;
+    } catch { /* feature not migrated yet — the page still works */ }
+    return {
+      app: app as Application,
+      bundle: review_bundle_json ?? null,
+      persistable: true,
+      jobDescription: job_description ?? null,
+      resumeName,
+    };
   } catch {
     return DEV_PREVIEW ? sampleLookup(id) : null;
   }
@@ -87,7 +106,7 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
   const { id } = await params;
   const loaded = await loadApp(id);
   if (!loaded) notFound();
-  const { app, bundle, persistable, jobDescription } = loaded;
+  const { app, bundle, persistable, jobDescription, resumeName } = loaded;
 
   return (
     <div className="space-y-8">
@@ -107,6 +126,7 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
           </div>
           <div className="flex shrink-0 items-center gap-3">
             <JobDescriptionButton text={jobDescription} />
+            <ResumeButton applicationId={app.id} filename={resumeName} />
             {app.url && (
               <a href={app.url} target="_blank" rel="noreferrer" className="btn-ghost">
                 Open posting
