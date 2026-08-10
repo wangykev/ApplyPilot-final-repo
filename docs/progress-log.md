@@ -4359,3 +4359,364 @@ so submit is unaffected. The FILL is untouched — skills is filled and verified
 scales its request down ~10× on a visible tab, so the 400ms close tick that looked worth fixing was
 already running at ~40ms. The real cost in CAPTURE was never the interval — it was re-opening a widget
 that had nothing worth scraping.
+
+## 2026-08-09 (b) — the non-Workday merge did NOT regress Workday
+
+Pulled the ATS branch (45 commits, `e84102e`) into the Workday worktree. It touches shared files —
+`cdp.js`, `background.js`, `lib.js`, `fill-driver.js` — so the Workday path needed re-verifying rather
+than assuming.
+
+**Suite 1234/1234** (was 1188; the merge brought 46 tests, none broken). All five of my sweep commits
+survived, and the merge extended the same `apMatch` lockstep guard to `ats.js`/`atsLib`/`atsFd` — the
+class the guard was widened for that morning.
+
+**The biggest risk turned out not to be live.** `5eec8a9` put a hidden tab under `Page.startScreencast`
+to force frames, which would have changed hidden-tab behaviour for every Workday run; `ac76366` then
+dropped it again, leaving only the comment explaining the measurement. `cdp.js`'s remaining changes are
+additive to the `act` interface (`trustedType`, `trustedFocus`, `painting`, `paintLabel`, `quietInstall`,
+`quietRead`), so nothing the Workday path already called changed shape.
+
+**Live, on the merged build (`post-ats-merge-1`), hidden, nothing submitted:**
+- **moog.wd5** — SUBMIT GATE PASSED, AGREE 44 · DISAGREE 0 · MISSING 1 · EXTRA 1 — byte-identical to
+  the pre-merge run.
+- **marvell.wd1** — SUBMIT GATE PASSED, AGREE 31 · DISAGREE 0 · MISSING 1 · EXTRA 1 — also identical.
+
+### The one failure, and why it isn't the merge
+
+Marvell's FIRST rehearsal on the merged build halted `replay-mismatch`:
+
+    • disabilityStatus [checkbox_group] needs_review — the form did not accept the approved selection
+      — asked for [No, I do not have a disability and have not had one in the past] and it holds []
+
+That run hit Workday's transient "Something went wrong / please refresh", so the replay reloaded and
+restarted from page 1 (the 2026-07-27 guard, working as designed). The immediate re-run, same code, had
+no soft error and passed with `0 FAILED` on page 5.
+
+This is the known disability-checkbox blocker, and the pairing sharpens it: **a reload+restart IS a
+re-entry**, and re-entry is precisely when Workday serves self-ID answers back empty (dom-patterns
+2026-08-04 (b)). So the suspect is the re-entry, not the click — which also explains why no
+settle-before-clicking gate ever helped. If it holds, the reload path needs its own self-ID re-assert on
+the way back through page 5, and the fix does NOT belong in `fillCheckboxGroupCdp`, whose click verified
+fine on both runs. ONE observation each way, so: a correlation to test, not a cause.
+
+The halt itself is correct behaviour — it refused to advance rather than submit an application whose
+approved disability answer had not taken.
+
+**Not re-verified by me:** the ATS path itself (Greenhouse/Lever/Ashby). That is the merged branch's own
+work and its commits claim all three reach the gate; this entry only covers Workday.
+
+## 2026-08-09 (c) — hidden fill: the résumé junk page is real; the slowness is the overwrite ladder
+
+Operator: "try the runs hidden, I think sometimes the apply with resume doesn't work when hidden."
+Autofill-with-Resume is a FILL-run path only (`preferResumeAutofill` is set by `AP_RUN_APPLICATION`), so
+no rehearsal exercises it. One hidden `Background fill` on moog.wd5, merged build:
+
+**1. The résumé page is NOT being consumed by onboarding — CONFIRMED.** Workday sent the
+Autofill-with-Resume click to the SIGN IN screen; after auth the résumé page came back and the WALK
+processed it, writing the junk bundle page CLAUDE.md predicts:
+
+    Summary saved (accumulated) — page ".../apply/autofillWithResume|": +1 field(s)
+
+The key's field-set half is EMPTY (`|` with nothing after) — the one bare `formField-` wrapper that makes
+`isPastAuth` call the résumé page "the form". The résumé itself attached fine
+(`resume: attached "Kevin's Hardware Resume.pdf"`), and the run completed and reported, so this is bundle
+pollution rather than a failed upload. Not yet checked: whether that 1-field page survives into the
+approved bundle and what the replay does with it.
+
+**2. The 4-minute hidden run was NOT the résumé, the AI, or throttling.** Total 318s vs ~75s for the same
+job pre-merge. Exactly one gap, 236s, and `[CDP-TIME]` attributes it:
+
+    pacing hidden-fast (worker timers) | NOT painting | settle 4.2s | fill 236.1s (flat 225.7s)
+
+Ruled out by evidence rather than guess: pacing was hidden-FAST, so the worker-timer overrides were
+installed and this is not the ~1Hz path; `[AI-BATCH] 0 candidate(s) · NOT fired (needs 2+)` and the one
+LLM call returned in 4958ms; settle was 4.2s.
+
+The cause is the interaction of two existing behaviours. Workday soft-errored on page 2, so the walk
+reloaded and restarted from page 1 (the 2026-07-22 guard). On that second pass every field is ALREADY
+FILLED, so each commit is an OVERWRITE and pays the escalating beat ladder (120 → 700 → 5000ms with a
+re-open per tier) instead of the single fast commit an empty field gets — the first pass over the same
+page was `fill 0.7s`. ~12s/field × 19 fields. Hidden makes it worse because the option-click debounce is
+a PAINT thing (~700ms when not painting), which is why the ladder starts higher there.
+
+So: correct, just expensive. Worth considering whether the post-reload pass can skip fields whose live
+value already equals what we would write (the replay's `skipIfCorrect`, which the FILL walk does not have).
+
+**Also seen:** moog soft-errors often right now — 3 of the last 5 runs, on both fill and replay.
+
+## 2026-08-09 (d) — the résumé junk page: fixed, unit-guarded, NOT yet live-exercised
+
+Cause found by reading the log rather than the code: the run never printed
+`"reached the application form."` — it printed `sign-in outcome: success.` and went straight to the walk.
+`runCdpOnboard` has TWO post-auth "reached the form" exits and only one consumed Workday's résumé-upload
+page. The Autofill-with-Resume → bounced-to-SIGN-IN path lands on the other one (background.js:7508),
+which returned `reached_form: true` immediately.
+
+So onboarding announced the form while sitting on the upload page, the walk took that page as page 1, and
+wrote a bundle page keyed on an EMPTY field set (`".../apply/autofillWithResume|": +1 field(s)`) — the one
+bare `formField-` wrapper `isPastAuth` excludes for exactly this reason. The résumé uploaded fine and the
+run completed, so the damage is bundle pollution, not a failed attach.
+
+The fix mirrors the sibling exit verbatim, including the bounce case (`needsAuth` re-enters the auth loop
+rather than announcing a form we are not on), and returns `resume_autofilled`, which this exit dropped.
+
+**Guarded structurally, not behaviourally** — "two exits and one of them forgets" is precisely the bug a
+test on either exit alone passes. Every post-auth `reached_form` exit must have an `onResumeUploadPage`
+consult above it; verified to FAIL before the fix, naming `background.js:7508`. Suite 1236/1236.
+
+**LIVE-VERIFIED on the signed-OUT path (moog.wd5, hidden).** The first post-fix run took
+`"Continue Application (returning user)"` — signed in, application already open — so the Autofill path
+never ran and its clean bundle proved nothing. The operator signed the account out, which is what puts
+Workday back on the Apply chooser; the re-run then exercised the exact broken branch:
+
+    Stage 2 — clicking "Autofill with Resume"
+    Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage
+    Stage 3 — auth screen detected                     [signs in]
+    uploading the résumé for Workday's autofill parse (Kevin's Hardware Resume.pdf)…   <- the fix
+    clicked "Continue (after the résumé upload)."                                       <- the fix
+    résumé page done — Workday parsed it; the next page has 2 field(s).
+    reached the form
+
+Result: **zero `autofillWithResume|` bundle pages**, the first saved page is the real form
+(`apply|addressLine1,…` +19), and page 2 came back `+34` fields INCLUDING `skills` — the résumé-parse
+benefit this path exists for. Ran through to the review page in 185s and reported 200; nothing submitted.
+
+**Technique worth keeping:** to re-test onboarding paths that only occur for a signed-OUT user, sign the
+tester account out of the tenant first. A signed-in session with an open application gets "Continue
+Application" instead of the Apply chooser, so the whole Autofill branch is unreachable — which is exactly
+why this bug survived a full day of testing.
+
+## 2026-08-09 (e) — cadence.wd1 verified end to end from a SIGNED-OUT start
+
+Continuing the signed-out sweep. A tenant never applied to is signed-out by construction, so it
+exercises the Autofill-with-Resume branch without any manual sign-out.
+
+**cadence.wd1 — VERIFIED, hidden, nothing submitted.** The fullest onboarding chain yet, all in one run:
+
+    Stage 1 — clicking "Apply (job listing)"
+    Stage 2 — clicking "Autofill with Resume"
+    Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage
+    Stage 3 — auth screen detected
+    [sign-in fails: no account] → creating a Workday account as wangykev+31@gmail.com…
+    uploading the résumé for Workday's autofill parse…
+    clicked "Continue (after the résumé upload)."
+    résumé page done — Workday parsed it; the next page has 8 field(s).
+    reached the application form.
+
+Fill: 5 pages, 57 filled · 8 skipped, 11 flagged, review page reached in 321s. Approved 11/11 on the
+tracker, then **two consecutive rehearsals, both SUBMIT GATE PASSED, AGREE 54 · DISAGREE 0 · MISSING 1 ·
+EXTRA 1** — identical across runs. Also exercised live: account CREATION on a fresh tenant, and the
+tenant-variable field ladder (`education[0].schoolName: tenant renders this as a typeahead (map says
+text) — filling as typeahead (live DOM wins)`).
+
+**A junk-page false alarm, worth writing down.** Grepping the bundle for `autofillWithResume|` reported a
+hit on cadence. It was not one: `/apply/autofillWithResume` is the whole FLOW's path on this tenant, so My
+Information sits on it too. The junk page is identified by an EMPTY field-set half (the key ENDS at the
+`|`), not by the path — cadence's key was `…|addressLine1,city,country,countryRegion,legalName--firstName,…`
+with 13 fields. Check `key.endsWith("|")`, never `key.includes("autofillWithResume|")`.
+
+**⚠ Workday's maintenance page also means "unknown site".** synopsys/lamresearch/teradyne/qualcomm site
+guesses all redirected to `community.workday.com/maintenance-page`; cadence loaded fine at the same
+moment, so it was four wrong site names, not an outage. Relevant to the recorded TODO for a
+start-of-fill maintenance gate: `isWorkdayMaintenance` cannot distinguish "Workday is down" from "that
+URL is wrong", so a gate keyed on it should say so rather than assert an outage.
+
+## 2026-08-09 (f) — discovery works; kiongroup.wd3 exposes a DEGENERATE PAGE KEY that merges two pages
+
+Used the Discover sweep instead of guessing tenant URLs (operator: "I have code for that"). It behaved
+exactly as designed: scanned simplify 14485 / linkedin 48, read 25 LinkedIn records with **a real employer
+link on 25 of 25, 0 board-only**, and resolved them to employer ATS URLs incl. Workday tenants. It queued
+0 only because every candidate scored **below the ranking threshold** (best 49%), each with its reasons
+logged — the gate working, not a failure. The resolved links are themselves the useful output.
+
+**kiongroup.wd3 — fill reached review; the REHEARSAL halted `replay-page-not-in-bundle`.**
+
+Verified live on the way in:
+- **The social-login chooser fix (2026-08-09) FIRED** — `auth is a social-login chooser — clicking "Sign
+  in with email" to reveal the form.` That fix was committed unit-pinned-only because sonos's posting was
+  dead; this is its first live exercise.
+- **The `job_key` separator widening (2026-08-09) FIRED** — `approved bundle loaded for job_key
+  "wd3:jr-0088855"`. A letters-DASH-digits requisition now keys correctly end to end.
+- The résumé page was consumed correctly (account created, uploaded, parsed, no junk page).
+- `pacing hidden-SLOW (worker throttled)` — the documented wd3 CSP case blocking the blob worker. Fill
+  66.8s vs ~13s on the fast path. Self-diagnosing from the pacing label, as intended.
+
+**THE BUG.** The fill's five page keys (`cdpPageKey` = pathname|field-set):
+
+    apply/autofillWithResume ||                                     <- EMPTY field set
+    apply/autofillWithResume ||                                     <- EMPTY field set
+    apply/autofillWithResume || 90b8915caea31001447e9f7107710000,…
+    apply/autofillWithResume || ethnicityMulti,gender,veteranStatus
+    apply/autofillWithResume || dateSignedOn,disabilityForm,employeeId,name
+
+Two pages produced an EMPTY field-set half, so both collapsed to the SAME key
+`…/apply/autofillWithResume|`. `accumulateBundle` merges on that key, so the second page's entries
+overwrote the first's. My Information's fields therefore appear NOWHERE in the 49-field bundle, and the
+replay correctly reports `page 1: NO matching page in the approved bundle (live flat fields: source,
+candidateIsPreviousWorker, country, legalName--firstName, …)` and halts.
+
+This is the M31 lesson recurring: the field-SET is what makes the key stable, so a page whose flat field
+list reads EMPTY has no identity at all — and a SECOND such page silently destroys the first. The halt is
+correct behaviour (it refuses to replay a bundle that doesn't describe the page), but the data loss
+happened back in the FILL, and nothing flagged it there.
+
+Not yet established: WHY those two pages scanned as zero flat fields. Candidates — a page whose fields
+all sit inside repeating containers (the flat list legitimately empties, e.g. My Experience), and the
+hidden-SLOW pacing letting the key be computed before the field set settled. The two cases want different
+fixes, so this needs the page-key computation traced on this tenant before anything is changed. A
+degenerate key should probably never be allowed to MERGE regardless — falling back to the page ordinal
+would preserve both pages even when the field set is genuinely empty.
+
+Tenants verified end to end today, all hidden, nothing submitted: **moog.wd5** (résumé fix), **cadence.wd1**
+(new tenant, account created, 2× SUBMIT GATE PASSED, AGREE 54 · DISAGREE 0), **marvell.wd1**, plus the
+post-merge regression pass.
+
+## 2026-08-09 (g) — the field-less page key: diagnosed properly, fixed, verified
+
+The kiongroup halt from (f), run to ground. Worth recording how the diagnosis went, because two of my
+readings were wrong before the right one:
+
+1. First read (from the LOG): "two pages both keyed EMPTY and collided." Right conclusion, weak evidence
+   — the ring truncates messages and I split the key on `indexOf("|")`, which can manufacture an empty
+   field-set half out of a truncated line.
+2. The operator refuted the premise: the résumé page and My Information have very different DOMs, so why
+   would both key empty? Fair, and it forced a real check.
+3. Second read (from the BUNDLE, via the tracker's RSC payload — authoritative, no truncation): 4 page
+   keys for 5 filled pages, one of them field-less holding 31 entries. I then read that as "they MERGED,
+   nothing was lost" — also wrong.
+4. Third read, listing the 31 entries: all `workExperience[*]`/`education[0]`/`language`/`website[*]` —
+   ONE page, My Experience. My Information's fields (`source`, `country`, `legalName--*`, `addressLine1`,
+   `city`) were in the bundle NOWHERE. So it WAS an overwrite, and a whole page of the application was
+   gone from the review.
+
+**Cause — two faults, both required.** (a) `fillAndPersistPage` computed the merge key ~40 lines BEFORE
+`awaitFieldSetSettled`, off a scan taken as the page was entered; kiongroup runs the wd3 CSP path (blob
+worker blocked, page timers ~1Hz), so My Information had not mounted its fields and keyed field-less.
+(b) A field-less page has no identity and the pathname is shared by the whole apply flow, so every
+field-less page keys byte-identically as `<path>|` — and My Experience is LEGITIMATELY field-less (all
+its fields sit in repeating sections, which the flat loop skips). `accumulateBundle` drops the prior
+entries for the same physical page, so My Experience overwrote My Information.
+
+Nothing complained at fill time. It surfaced only because `samePhysicalPage` deliberately refuses to
+match a field-less key to anything but itself, so the replay could not match live page 1 and halted
+`replay-page-not-in-bundle`. The halt was the only alarm on a silent data loss.
+
+**Fix.** The key is taken from a SETTLED scan (still pre-fill, so a cascade still cannot change it
+mid-page), and a genuinely field-less page falls back to the walk ordinal — `<path>|#2` overlaps itself
+and nothing else, which is exactly what `samePhysicalPage` needs for the re-fill overwrite. `preScan`'s
+other two consumers (the group-watch diagnostic and `isSelfIdPage`) now read settled data too, which
+quietly fixes `isSelfIdPage` having been able to miss the self-ID page on a slow tenant.
+
+Pinned two ways, both verified failing first: `cdpPageKey` must give two field-less pages distinct keys,
+and — structurally, since this was an ORDER bug that every unit test on `cdpPageKey` itself passed — the
+key must be computed after the settle.
+
+**LIVE-VERIFIED** on kiongroup.wd3, same job, build `pagekey-settled-47b241c`. Five pages now produce
+FIVE distinct keys:
+
+    addressLine1,candidateIsPreviousWorker,city,country,cou…   My Information  (was EMPTY)
+    #2                                                         My Experience   (field-less → ordinal)
+    90b8915caea31001447e9f7107710000,…                         Application Questions
+    ethnicityMulti,gender,veteranStatus                        Voluntary Disclosures
+    dateSignedOn,disabilityForm,disabilityStatus,employeeId    Self Identify
+
+Reported 200 with **42** needing review, up from 14 — because My Information's fields are now in the
+bundle instead of being overwritten. Suite 1237/1237.
+
+**Method note for next time:** read the BUNDLE, not the log, when the question is what the bundle holds.
+Two of the three wrong turns above came from parsing truncated log lines; the RSC payload on the tracker
+page answered it exactly.
+
+### (g) follow-up — the page-1 halt IS cleared; a SECOND halt remains, on the self-ID page
+
+Re-ran kiongroup approve → rehearse on `pagekey-settled-47b241c`. The original failure is gone:
+
+    page 1 → matched approved page "…/apply" (14 flat-field overlap; 14 approved entries)
+    page 2 → matched (3 flat-field overlap; 31 approved entries)
+    page 3 → matched (10 flat-field overlap; 10 approved entries)
+
+Page 1 previously reported `NO matching page in the approved bundle`, so the field-less-key fix is
+confirmed end to end, not just in the page keys.
+
+The run still stops, one page later: `⚠ page 4: NO matching page in the approved bundle (live flat
+fields: disabilityForm, name, employeeId, dateSignedOn, disabilityStatus…)` → `replay-page-not-in-bundle`.
+That is the SELF-ID page, and it is NOT the same fault. Two candidates, neither yet separated:
+
+1. **That page took all 28 fill errors.** Per-page counts for the re-fill were page 1 `filled 12 ·
+   filled_review 1 · skipped 1`, page 2 `filled 27 · skipped 3 · filled_review 1`, page 3
+   `filled_review 8 · needs_review 2`, page 4 `filled 1 · filled_review 2`, **page 5 `removed 5 ·
+   error 28 · skipped 2`** — with `rectReady` on `formField-disabilityForm`'s listbox button giving up
+   6 times (2.5s–11.3s). Pages 1–4 are healthy; the self-ID page alone is failing to actuate. This is
+   the known self-ID instability on this surface, on the slow wd3 path — NOT caused by the key fix
+   (page 5's preScan already held fields pre-fix, so self-ID detection and trusted-input forcing are
+   unchanged there).
+2. ~~The bundle is a MIXED-SCHEME hybrid.~~ **WRONG — retracted the same day.** I inferred from
+   49 → 88 fields that the re-fill had stacked stale pre-fix pages beside the new ones, and wrote that
+   any pre-fix application must be re-filled from a CLEARED summary. Checking the bundle refuted it:
+   **every** page key is under `/apply` (no `/apply/autofillWithResume` survivor), the envelope reads
+   `accumulated (5 pages)`, and 14+31+10+3+30 = 88 accounts for all of it. `runCdpWalk` already clears
+   `reviewSummary`+`reviewAudit` once at walk start, and a report REPLACES `review_bundle_json`
+   wholesale (`reportColumns` always writes it), so a hybrid was never possible. The count grew only
+   because the self-ID page contributed **30** entries this run (28 errors + 2 skipped) instead of 5.
+   No migration step is needed for pre-fix applications.
+
+So candidate 1 is the whole story: the self-ID page is failing to actuate, and the replay cannot match a
+page the fill largely errored out on. That is the thread to pull — same thread as the disability-checkbox
+blocker and the re-entry correlation from earlier in the day, which are worth attacking as ONE piece.
+
+### (g) resolved — kiongroup.wd3 reaches SUBMIT GATE PASSED
+
+Cleared summary → fresh fill → approve → rehearse, on `pagekey-settled-47b241c`.
+
+The refill was CLEAN, and it retires the "the self-ID page is failing to actuate" reading from the
+follow-up above. Per-page: page 1 `filled 12 · filled_review 1 · skipped 1`, page 2 `filled 27 ·
+skipped 3 · filled_review 1`, page 3 `filled_review 8 · needs_review 2`, page 4 `filled 1 ·
+filled_review 2`, page 5 **`filled_review 1 · skipped 4` — zero errors**, and `rectReady … gave up`
+appeared **0** times in the whole run (previous run: 28 errors and 6 give-ups on
+`formField-disabilityForm`). So that failure is INTERMITTENT on this tenant, not a standing fault —
+one run is not evidence of a broken widget, which is the same lesson as the marvell Date block.
+
+Bundle: 54 filled · 7 skipped · **0 error** · 15/15 flagged approved · Ready to submit.
+
+Rehearsal: every page matched an approved page, **AGREE 51 · DISAGREE 0 · MISSING 3 · EXTRA 1**,
+**SUBMIT GATE PASSED — WOULD CLICK SUBMIT (SIMULATE MODE: NOT clicking)**. Nothing submitted.
+
+So kiongroup.wd3 joins the verified list, and the field-less page key is fixed end to end: the fill
+records five distinct pages, the replay matches every one, and the gate passes.
+
+**Tenants verified end to end 2026-08-09** (all hidden, all `arm:false`, nothing ever submitted):
+moog.wd5 · cadence.wd1 · marvell.wd1 · kiongroup.wd3.
+
+## 2026-08-09 (h) — cat.wd5 verified end to end (the last outstanding tenant)
+
+Posting found via the CxS API (`/wday/cxs/cat/CaterpillarCareers/jobs`, 314 hits for "electrical
+engineer"); ran Griffin-Georgia `_R0000386586` hidden, signed out.
+
+Onboarding took the full chain cleanly: Apply → Autofill with Resume → bounced to SIGN IN → signed in
+(coordinate click missed, the focus+Enter fallback took it — that ladder earning its keep) → **résumé
+uploaded, parsed, page consumed** → reached the form. `job_key` resolved to `wd5:r0000386586`.
+
+Fill: 5 pages, 49 filled · 9 skipped · 3 error, 6 flagged, 300s. Approved 6/6, then **two consecutive
+rehearsals, both SUBMIT GATE PASSED, AGREE 46 · DISAGREE 0 · MISSING 2 · EXTRA 1** — identical across
+runs. Nothing submitted.
+
+**Incidental second confirmation of the page-key fix.** Onboarding handed off announcing "the next page
+has 5 field(s)", and the key computed after the settle recorded
+`addressLine1,candidateIsPreviousWorker,city,country,…` with 13 filled — i.e. the page had mounted its
+full field set by the time the key was taken. Pre-fix, that hand-off is exactly the shape that produced a
+field-less key. All five pages keyed distinctly.
+
+**TENANTS VERIFIED END TO END 2026-08-09** — all hidden, all `arm:false`, nothing ever submitted:
+**moog.wd5 · cadence.wd1 · marvell.wd1 · kiongroup.wd3 · cat.wd5**.
+
+Fixes landed today, each unit-pinned (every test verified failing first) and all but one live-exercised:
+1. the apMatch lockstep guard now scans background.js (the hole that let a live abort through),
+2. Workday's second wording for the signature-date demand,
+3. `job-posting-not-found` instead of blaming the sign-in form,
+4. the social-login chooser matched by TEXT (live on kiongroup),
+5. `job_key` for requisitions that separate letters from digits (live on kiongroup `jr-0088855`),
+6. the résumé page consumed at the OTHER post-auth exit (live on moog/cadence/kiongroup/cat),
+7. the field-less page key no longer overwrites the previous page (live on kiongroup, confirmed twice).
+
+Still open: the signature-date STAMP is unit-pinned but has never been observed firing (the marvell block
+has not recurred); the self-ID actuation failure on kiongroup is intermittent, seen once in ~4 runs.

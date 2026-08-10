@@ -371,11 +371,32 @@ function isWorkdayMaintenance(state) {
 // query/hash (url PATHNAME only) and combines it with the sorted field-name SET — stable
 // across re-runs AND distinct across pages even on a same-pathname SPA (the field-set is
 // the discriminator, the M31 lesson). `scan` = a cdpPageScan result ({ url, fields:[{fieldName}] }).
-function cdpPageKey(scan) {
+// `pageOrdinal` = the walk's 1..N page number, used ONLY when the flat field set is EMPTY.
+//
+// A page with no flat fields has NO identity in this scheme, and the pathname alone is shared by the
+// whole apply flow — so EVERY field-less page in a run produces the byte-identical key `<path>|`.
+// `accumulateBundle` treats identical keys as the same physical page and DROPS the prior entries, and
+// `samePhysicalPage` refuses to match a field-less key to anything but itself, so such a page can also
+// never be matched on a replay.
+//
+// Live on kiongroup.wd3 (2026-08-09), which cost a whole page of the application: My Experience is
+// legitimately field-less (every field sits inside a repeating section, which the flat loop skips) and
+// My Information scanned field-less only because the key was computed before its fields had mounted.
+// Both keyed `<path>|`, My Experience overwrote My Information, and the bundle went to review missing
+// name/address/country/source entirely — 4 pages recorded for 5 filled. The rehearsal then halted
+// `replay-page-not-in-bundle` on live page 1, which is the only reason anyone found out.
+//
+// The ordinal is stable across re-runs (same walk, same page order, and a soft-error reload restarts
+// at page 1 and re-walks identically), so it keys a field-less page uniquely without breaking the
+// re-fill overwrite: `<path>|#2` overlaps itself and nothing else, which is exactly the behaviour
+// samePhysicalPage wants. A single-page fill passes no ordinal and cannot collide with anything.
+function cdpPageKey(scan, pageOrdinal) {
   if (!scan || !Array.isArray(scan.fields)) return null;
   let path = scan.url || "";
   try { path = new URL(scan.url).pathname; } catch (e) { /* non-URL → keep raw (still stable) */ }
-  return path + "|" + scan.fields.map((f) => f.fieldName).sort().join(",");
+  const fieldSet = scan.fields.map((f) => f.fieldName).sort().join(",");
+  if (!fieldSet) return path + "|#" + (pageOrdinal != null ? pageOrdinal : "1");
+  return path + "|" + fieldSet;
 }
 
 // AI-2: a REQUIRED free-text field the AI declined is filled with a CONSPICUOUS placeholder so
