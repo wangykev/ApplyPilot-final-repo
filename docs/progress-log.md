@@ -4411,3 +4411,36 @@ bundle instead of being overwritten. Suite 1237/1237.
 **Method note for next time:** read the BUNDLE, not the log, when the question is what the bundle holds.
 Two of the three wrong turns above came from parsing truncated log lines; the RSC payload on the tracker
 page answered it exactly.
+
+### (g) follow-up — the page-1 halt IS cleared; a SECOND halt remains, on the self-ID page
+
+Re-ran kiongroup approve → rehearse on `pagekey-settled-47b241c`. The original failure is gone:
+
+    page 1 → matched approved page "…/apply" (14 flat-field overlap; 14 approved entries)
+    page 2 → matched (3 flat-field overlap; 31 approved entries)
+    page 3 → matched (10 flat-field overlap; 10 approved entries)
+
+Page 1 previously reported `NO matching page in the approved bundle`, so the field-less-key fix is
+confirmed end to end, not just in the page keys.
+
+The run still stops, one page later: `⚠ page 4: NO matching page in the approved bundle (live flat
+fields: disabilityForm, name, employeeId, dateSignedOn, disabilityStatus…)` → `replay-page-not-in-bundle`.
+That is the SELF-ID page, and it is NOT the same fault. Two candidates, neither yet separated:
+
+1. **That page took all 28 fill errors.** Per-page counts for the re-fill were page 1 `filled 12 ·
+   filled_review 1 · skipped 1`, page 2 `filled 27 · skipped 3 · filled_review 1`, page 3
+   `filled_review 8 · needs_review 2`, page 4 `filled 1 · filled_review 2`, **page 5 `removed 5 ·
+   error 28 · skipped 2`** — with `rectReady` on `formField-disabilityForm`'s listbox button giving up
+   6 times (2.5s–11.3s). Pages 1–4 are healthy; the self-ID page alone is failing to actuate. This is
+   the known self-ID instability on this surface, on the slow wd3 path — NOT caused by the key fix
+   (page 5's preScan already held fields pre-fix, so self-ID detection and trusted-input forcing are
+   unchanged there).
+2. **The bundle is a MIXED-SCHEME hybrid.** Because the new keys deliberately differ from the old
+   field-less ones, the re-fill did not overwrite the pre-fix pages — it ADDED to them: 49 → **88
+   fields**, with stale pages under `/apply/autofillWithResume` sitting beside the new ones under
+   `/apply`. That is the expected migration consequence of changing the key, and it means **any
+   application filled before this fix should be re-filled from a CLEARED summary**, not incrementally
+   re-filled. Worth doing before drawing any conclusion about the self-ID page.
+
+Next step: Clear summary → fresh fill → approve → rehearse, so the self-ID page is judged on a clean
+single-scheme bundle instead of a hybrid one.
