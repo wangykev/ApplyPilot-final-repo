@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "vocab-cache-1";
+const AP_BUILD_MARKER = "page-clock-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -2962,80 +2962,6 @@ let _pageAiAnswers = new Map();
 // `preamble` — the stretch between that advance and this page being recognised. Reset per run.
 let _replayLastAdvanceAt = 0;
 
-// ── CROSS-RUN OPTION-VOCABULARY CACHE (2026-08-10) ───────────────────────────────────────────────
-// `captureChoiceOptions` re-opens choice widgets purely to hand the review editor a real picker, and
-// scrapeTaOptions(countryPhoneCode) alone measured 14.37s for its ~249 options (capture ran 4.7-21.1s on
-// page 1 across runs) — the biggest DETERMINISTIC cost left after the pacing fix. Those vocabularies are
-// fixed, so this remembers them between runs. Engine computes / SW does I/O: the driver only mutates the
-// plain object handed to it; these three do the storage.
-//
-// SAFETY: rec.options feeds ONLY the review editor's picker — no fill or replay decision reads it
-// (replayField replays the approved VALUE through the live match ladder). So a stale entry can at worst
-// offer review an option the tenant no longer lists, and picking it fails the ladder into needs_review
-// rather than committing anything. Bounded further by a per-TENANT key (one tenant's custom list can
-// never leak into another's picker) and a TTL (an entry re-scrapes itself after 30 days).
-const OPTION_VOCAB_STORE = "optionVocab";
-const OPTION_VOCAB_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const OPTION_VOCAB_MAX_TENANTS = 12;   // LRU cap — a vocabulary is ~8KB, so this bounds the store at ~100KB
-
-// Scope key: brand + data-center, so cat.wd5 and cat.wd12 stay separate and a path-hosted
-// myworkdaysite host resolves to the same tenant as its myworkdayjobs posting (tenantCompanyFromUrl
-// handles both shapes). Read from the TAB url — no page round trip.
-async function cdpTenantKey() {
-  try {
-    if (typeof cdpTabId !== "number") return "unknown";
-    const tab = await new Promise((r) => chrome.tabs.get(cdpTabId, (t) => r(chrome.runtime.lastError ? null : t)));
-    const url = (tab && tab.url) || "";
-    if (!url) return "unknown";
-    const dc = ((new URL(url).hostname.match(/\bwd\d+\b/i) || [""])[0] || "wd").toLowerCase();
-    const brand = tenantCompanyFromUrl(url);
-    return (brand ? String(brand).toLowerCase().replace(/\s+/g, "-") : "unknown") + ":" + dc;
-  } catch (e) { return "unknown"; }
-}
-
-// → { key: options[] } for this tenant, expired entries dropped. Never throws: a miss costs one scrape.
-async function loadOptionVocab(tenantKey) {
-  try {
-    const all = await new Promise((r) => chrome.storage.local.get(OPTION_VOCAB_STORE, (v) => r((v && v[OPTION_VOCAB_STORE]) || {})));
-    const slice = all[tenantKey] || {};
-    const out = {};
-    const now = Date.now();
-    for (const k of Object.keys(slice)) {
-      const e = slice[k];
-      if (!e || !Array.isArray(e.options) || !e.options.length) continue;
-      if (!e.at || now - e.at > OPTION_VOCAB_TTL_MS) continue;   // stale → let this run re-scrape it
-      out[k] = e.options;
-    }
-    return out;
-  } catch (e) { return {}; }
-}
-
-// Persist the driver's (possibly grown) cache. Keeps each entry's ORIGINAL timestamp so a reused
-// vocabulary still expires on schedule instead of being renewed forever.
-async function saveOptionVocab(tenantKey, cache) {
-  try {
-    if (!tenantKey || !cache || !Object.keys(cache).length) return;
-    const all = await new Promise((r) => chrome.storage.local.get(OPTION_VOCAB_STORE, (v) => r((v && v[OPTION_VOCAB_STORE]) || {})));
-    const prev = all[tenantKey] || {};
-    const now = Date.now();
-    const next = {};
-    for (const k of Object.keys(cache)) {
-      const opts = cache[k];
-      if (!Array.isArray(opts) || !opts.length) continue;   // never persist a failed/empty scrape
-      next[k] = { at: (prev[k] && prev[k].at) || now, options: opts };
-    }
-    all[tenantKey] = next;
-    // LRU prune by each tenant's newest entry, so a long-lived profile can't grow this without bound.
-    const names = Object.keys(all);
-    if (names.length > OPTION_VOCAB_MAX_TENANTS) {
-      const freshness = (t) => Object.keys(all[t] || {}).reduce((m, k) => Math.max(m, (all[t][k] && all[t][k].at) || 0), 0);
-      names.sort((a, b) => freshness(b) - freshness(a));
-      for (const drop of names.slice(OPTION_VOCAB_MAX_TENANTS)) delete all[drop];
-    }
-    await new Promise((r) => chrome.storage.local.set({ [OPTION_VOCAB_STORE]: all }, r));
-  } catch (e) { /* best-effort — a failed save costs a re-scrape next run, never a run */ }
-}
-
 async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts) {
   // Accumulation merge key — the PRE-fill cdpPageKey (url PATHNAME [drops the volatile
   // query] + sorted field-set: STABLE per page across re-runs, DISTINCT across pages even
@@ -3065,14 +2991,6 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // Profile v2 — answer buckets (wording → answer). SW reads them from storage (engine computes /
   // SW does I/O) and hands them to the driver, which consults them before the AI pass.
   const buckets = await new Promise((resolve) => chrome.storage.local.get("buckets", (r) => resolve((r && Array.isArray(r.buckets)) ? r.buckets : [])));
-  // Cross-run OPTION-VOCABULARY cache (2026-08-10) — same "engine computes / SW does I/O" shape as
-  // buckets: loaded here, handed in as a plain object the driver mutates, persisted after the fill.
-  // `captureChoiceOptions` re-opens choice widgets purely to give the review editor a real picker, and
-  // scrapeTaOptions(countryPhoneCode) alone measured 14.37s for ~249 options. Those vocabularies are
-  // FIXED, so re-scraping them every run is waste (docs/fill-speed-log.md).
-  const _vocabTenant = await cdpTenantKey();
-  const optionCache = await loadOptionVocab(_vocabTenant);
-  let _vocabBefore = Object.keys(optionCache).length;
   // Let the flat field set finish rendering BEFORE the first fill pass. Workday form pages mount
   // their fields progressively; on page 1 the walk enters straight from onboarding (no
   // cdpWaitNextPage stabilization), so a premature scan makes drivePageFill's initial pass miss the
@@ -3177,7 +3095,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
-    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, optionCache, aiAnswers: _pageAiAnswers });
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
   } finally {
     if (_selfId) {
       cdpSetTrustedText(false);                        // never leave the next page paying for this one
@@ -3185,16 +3103,6 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     }
   }
   const fillMs = Date.now() - _fillT0;
-  // Persist any vocabulary this page newly learned (per page, so a walk that halts on page 4 still keeps
-  // pages 1-3's lists). Only on GROWTH — an unchanged cache is not worth a storage write per page.
-  {
-    const grew = Object.keys(optionCache).length - _vocabBefore;
-    if (grew > 0) {
-      await saveOptionVocab(_vocabTenant, optionCache);
-      LOG(`option vocabulary: remembered ${grew} new list(s) for ${_vocabTenant} — later runs reuse them instead of re-opening the widget (capture was the biggest deterministic cost left).`);
-      _vocabBefore = Object.keys(optionCache).length;
-    }
-  }
   if (_gwSel) {
     try {
       const gw = await cdpEval(cdpDrainGroupWatch);

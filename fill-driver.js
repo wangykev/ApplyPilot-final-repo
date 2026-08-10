@@ -4979,7 +4979,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   _phaseT0 = Date.now();
   { const _c0 = Date.now();
     trace("CAPTURE options for the review editor (read-only re-opens)");
-    if (!targeted) await captureChoiceOptions(act, results, budgets, opts && opts.optionCache, trace);
+    if (!targeted) await captureChoiceOptions(act, results, budgets);
     trace("CAPTURE done", Date.now() - _c0); }
   markPhase("capture", _phaseT0); _phaseT0 = Date.now();
   if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
@@ -7368,25 +7368,7 @@ async function captureDropdownOptions(act, loc, budgets) {
 // test runs measurably faster than a genuine first fill, which silently distorted timing comparisons.
 // The per-PAGE `cache` below stays — it dedupes same-vocabulary fields within one page (FoS across
 // education entries, proficiency dropdowns across language entries) and is real work avoided, now.
-// CROSS-RUN VOCABULARY CACHE (2026-08-10). `optionCache` is a plain { key → options[] } object the SW
-// loads from storage, hands in, and persists after the page — the driver only reads/mutates it in memory,
-// so the "engine computes / SW does I/O" boundary holds and this stays Node-testable.
-//
-// WHY it is safe to reuse a list scraped on an EARLIER run: `rec.options` exists ONLY to give the review
-// editor a real picker (see the "Summary editability" call site). It is NOT consulted by any fill or
-// replay decision — `replayField` replays the approved VALUE through the live match ladder and never reads
-// `entry.options`, and the web side only passes options into the UI model. So the worst a stale entry can
-// do is OFFER review a value the tenant no longer lists; picking it then fails the ladder into
-// needs_review rather than committing anything wrong. The SW bounds it further (per-tenant key + a TTL).
-//
-// WHY it is worth it: `scrapeTaOptions(countryPhoneCode)` measured **14.37s** for its ~249 options and
-// `capture` ran 4.7–21.1s on page 1 across runs — the largest DETERMINISTIC cost left after the pacing
-// fix (docs/fill-speed-log.md). The vocabularies here are fixed (skills is excluded precisely because
-// its list is a server-ranked search that varies run to run), so re-scraping them every run is pure waste.
-// `trace` is drivePageFill's LOCAL debugPageTrace helper — it must be passed in, not closed over (this is
-// a top-level function; referencing it directly throws "trace is not defined" and kills every fill).
-async function captureChoiceOptions(act, results, budgets, optionCache, trace) {
-  const tr = typeof trace === "function" ? trace : () => {};
+async function captureChoiceOptions(act, results, budgets) {
   if (!act) return;
   const cache = new Map(); // key → options[] | null (already attempted THIS page)
   for (const rec of results || []) {
@@ -7419,19 +7401,7 @@ async function captureChoiceOptions(act, results, budgets, optionCache, trace) {
     } else continue;
     if (Array.isArray(rec.options) && rec.options.length) continue; // committed dropdown / start-scraped typeahead already carries them
     if (!cache.has(key)) {
-      // A vocabulary this tenant already gave us on an earlier PAGE or RUN — reuse it and skip the re-open.
-      const remembered = optionCache && Array.isArray(optionCache[key]) && optionCache[key].length
-        ? optionCache[key] : null;
-      if (remembered) {
-        cache.set(key, remembered);
-        tr(`CAPTURE reused a remembered vocabulary for ${key} (${remembered.length} options) — no re-open`);
-      } else {
-        const got = await scrape();
-        cache.set(key, got);
-        // Persist only a REAL list: caching a null/empty (a transient render flake, a widget that never
-        // opened) would make one bad run poison every later run's picker with nothing.
-        if (optionCache && got && got.length) optionCache[key] = got.slice();
-      }
+      cache.set(key, await scrape());
     }
     const opts = cache.get(key);
     if (opts && opts.length) rec.options = opts.slice();
