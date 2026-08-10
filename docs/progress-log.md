@@ -4505,3 +4505,45 @@ Fixes landed today, each unit-pinned (every test verified failing first) and all
 
 Still open: the signature-date STAMP is unit-pinned but has never been observed firing (the marvell block
 has not recurred); the self-ID actuation failure on kiongroup is intermittent, seen once in ~4 runs.
+
+## 2026-08-09 (i) — a field the tenant doesn't render is gone from review (live-verified on cat.wd5)
+
+Operator, on finding three blank rows on the cat tracker: "if the repeating section has no gpa, it
+shouldn't show up in the review page."
+
+Those rows were `education[0].gpa` / `from_year` / `to_year`, each rendered as a bare "—" saying
+"ApplyPilot couldn't fill this — please fill it in yourself" on a form whose Education section is only
+School, Degree and Field of Study. No box to fill; and no label, because a label is READ OFF THE PAGE and
+there is no field on the page to read one from. They were `error` rather than `skipped` purely because the
+profile HAS a GPA and years — the old rule kept "a value with nowhere to go" loud.
+
+**The obvious fix was wrong and the suite proved it.** Three different things reach that branch and look
+identical there: (a) the tenant has no such box; (b) a field that REMOUNTS was absent when we looked (WE
+endDate); (c) a field that IS rendered but our labelRegex/id missed it (a Languages proficiency).
+Reclassifying all three would silently drop real fields — the data-loss class this file has spent weeks
+removing. Two existing tests caught it immediately.
+
+**The discriminator:** is there a rendered field in this entry that NO map entry claims? Leftover box ⇒ we
+failed to identify something that IS on the form, stay loud. Everything accounted for ⇒ the form has no
+home for this one, drop it as `removed` (the existing "drops from the summary, not an error" status, which
+`buildReviewBundle` filters) so it leaves the human's queue while the per-page `counts:` line still
+tallies it. This also makes repeating sections behave like FLAT fields, which were always silent here.
+Two guards err toward keeping a row visible: an entry that rendered NOTHING proves nothing, and the claim
+check excludes `labelFallback`. `waitForPresence` already polls to its ceiling BEFORE this branch, so (b)
+only reaches it after the field genuinely never appeared.
+
+The **languages labelRegex test passes UNCHANGED** — that is the proof the discriminator separates (c)
+from (a). The two tests whose expectations the decision changes were updated in place with the reasoning,
+not deleted; the endDate one still pins that `waitForPresence` is the difference between filling and not.
+
+**LIVE-VERIFIED, cat.wd5, build `omits-field-863c434`.** Page 2 counts went
+`{filled 27, skipped 3, error 3, needs_review 1}` → `{filled 27, skipped 3, removed 3}`; the report went
+from 6 needing review to **2**; and the review page now lists exactly
+`education[0].school_or_university / degree / field_of_study` with **zero** "couldn't fill this" rows and
+no error count in the header. Suite 1237/1237.
+
+**Process note (cost ~20 minutes):** the fix looked un-deployed because the WRONG CHROME was connected —
+its extension loads from the `workday-skills` worktree (marker `polarity-capture-1`) while the right one
+loads from `ApplyPilot-ext Debugger`. I misread that as a folder problem and went hunting checkouts; the
+operator diagnosed it in one line. **`AP_BUILD` disagreeing with the folder on disk means CHECK THE
+BROWSER before touching anything else** — `switch_browser` re-pairs in one call.
