@@ -58,9 +58,89 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   }
 });
 
-// SW-side wall-clock delay — the ONLY pacing primitive CDP fill code may use.
-// (Page-side setTimeout is throttled to ~1Hz hidden, then frozen; this isn't.)
-const cdpDelay = (ms) => new Promise((r) => setTimeout(r, ms));
+// ── PACING CLOCK START (test-extracted — test/pacing-clock.test.js slices between these markers) ──
+// The ONE pacing primitive CDP fill code may use. ALL of act.delay / delayFull / delayRender land here.
+//
+// WHY THIS IS NOT A BARE setTimeout ANY MORE (2026-08-10). It was, and that timer lives in an MV3
+// service worker, which Chrome starves: measured live on cat.wd5 page 1, `delay(250)` took **17.30s**
+// (69×) inside the `source` field — 32.8s of that page's 43.9s. Also delayFull(600)→3.16s,
+// delayRender(300)→2.48s. Since every pace routes through here, that drift was not a curiosity; it WAS
+// the "it lags sometimes" the operator reported. Full evidence: docs/fill-speed-log.md.
+//
+// The clock is now the PAGE's, because that is the correct clock on the merits, not just the faster one:
+// you pace at 250ms to let the page settle (React re-renders, fkit debounce), so the right timer is the
+// one in the same queue as the work being waited on. The reason it USED to be SW-side is real but
+// narrower than the old comment claimed — a hidden tab throttles page timers to ~1Hz then freezes — and
+// that is exactly what the worker-timers polyfill already fixes (WORKER_TIMERS_SRC replaces the page's
+// window.setTimeout with a blob-Worker-backed one, immune to the throttle). So the page clock is used
+// ONLY when that polyfill is live (`_workerTimersActive`); otherwise this is byte-identical to the old
+// behaviour, which is the documented "hidden-SLOW (no worker timers)" regime.
+//
+// Proof the substitute clock keeps time when the SW's does not: run 3 page 1 measured a CDP no-op probe
+// p50 of 31ms in the SAME window that the SW timer drifted 8947ms. The debugger round trip was healthy
+// while setTimeout starved — so an in-page sleep issued then would have returned on schedule.
+//
+// THREE guards, each earned:
+//  1. cdpSendRaw, NOT cdpSend — a pace must stay OUT of the lag trace's command stats. Through cdpSend
+//     every 600ms pace would print a "⏳ Runtime.evaluate 600ms" line (CDP_LAG_SLOW_CMD_MS is 400) and
+//     bury the signal the trace exists to surface.
+//  2. RACED against an SW timer at want+slack. The new failure mode is not the eval throwing (caught
+//     below) but the eval HANGING across a navigation — a destroyed execution context can leave
+//     awaitPromise pending. The race bounds the worst case at want+slack. A starved SW arm simply loses
+//     the race, and if BOTH starve we are no worse than the old code. It can never under-wait: the
+//     fallback arm is longer than `want`.
+//  3. On a THROWN eval (detached / context destroyed) fall back ONCE, for the REMAINDER only — never
+//     re-wait the full duration on top of time already spent.
+const PAGE_SLEEP_SLACK_MS = 1500;   // race ceiling above the requested pace (guard 2)
+const PACE_OVERRUN_LOG_MS = 1000;   // log a pace this far over budget (permanent — no flag needed)
+
+const cdpSwSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Sleep on the PAGE's clock. window.setTimeout is worker-backed when the polyfill installed, so this is
+// throttle-immune; awaitPromise makes the command itself resolve only when the page's timer fires.
+function cdpPageSleep(ms) {
+  return cdpSendRaw("Runtime.evaluate", {
+    expression: "new Promise(function(r){window.setTimeout(r," + ms + ");})",
+    awaitPromise: true
+  });
+}
+
+// Drift is now REPORTED, not merely survived: a pace that still overruns badly prints once, with no flag
+// required, so the next occurrence is visible in any run's log instead of needing debugLagTrace on.
+function cdpPaceNote(want, took, via) {
+  if (took - want < PACE_OVERRUN_LOG_MS) return;
+  try {
+    console.log(`[ApplyPilot][PACE] ⚠ a ${want}ms pace took ${took}ms (${via}) — the clock overran by `
+      + `${took - want}ms. SW-side starvation is the known cause (docs/fill-speed-log.md); `
+      + `"page" means even the page clock was late, which is new.`);
+  } catch (e) { /* log only */ }
+}
+
+async function cdpDelay(ms) {
+  const want = Math.max(0, Math.round(Number(ms) || 0));
+  const t0 = Date.now();
+  let via = "sw";
+  if (want > 0 && cdpTabId !== null && _workerTimersActive) {
+    via = "page";
+    let timer = null;
+    try {
+      await new Promise((resolve, reject) => {
+        timer = setTimeout(() => { via = "page-abandoned"; resolve(); }, want + PAGE_SLEEP_SLACK_MS);
+        cdpPageSleep(want).then(resolve, reject);
+      });
+    } catch (e) {
+      via = "sw-fallback";                       // detached / context destroyed mid-pace
+      const rem = want - (Date.now() - t0);
+      if (rem > 0) await cdpSwSleep(rem);        // remainder ONLY (guard 3)
+    } finally {
+      if (timer !== null) clearTimeout(timer);   // don't hold the worker awake on the losing arm
+    }
+  } else {
+    await cdpSwSleep(want);
+  }
+  cdpPaceNote(want, Date.now() - t0, via);
+}
+// ── PACING CLOCK END ──
 
 // Attach to `tabId` and enable the domains we use (Runtime for evaluate, DOM for
 // the DOM.focus fallback, Page for addScriptToEvaluateOnNewDocument — the hidden-
