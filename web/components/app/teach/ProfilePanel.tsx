@@ -112,10 +112,20 @@ export function ProfilePanel({
   }, [selectMode, onCancelSelect]);
   useEffect(() => {
     if (!highlightPath) return;
-    const el = scrollRef.current?.querySelector<HTMLElement>('[data-hot="1"]');
-    // block:"start" (+ the hot row's scroll-mt) lands the field near the TOP of the panel with a little
-    // breathing room, rather than dead-center — easier to see the field and the rows below it.
-    el?.scrollIntoView({ behavior: "smooth", block: "start" });
+    const box = scrollRef.current;
+    const el = box?.querySelector<HTMLElement>('[data-hot="1"]');
+    if (!box || !el) return;
+    // Scroll THIS PANEL, never the window. scrollIntoView walks every scrollable ancestor, so any
+    // re-render that recomputes the highlight — restoring a skipped item, most visibly — yanked the
+    // whole page upward under the operator (2026-08-10). Moving the panel's own scrollTop keeps the
+    // field-into-view behaviour and cannot move the document.
+    //
+    // Measured from live rects rather than offsetTop: the rows sit inside nested wrappers, so
+    // offsetParent is not reliably this box.
+    const delta = el.getBoundingClientRect().top - box.getBoundingClientRect().top;
+    if (Math.abs(delta) < 4) return; // already in place — don't animate a no-op
+    // A little breathing room above, so the field reads as "near the top" rather than flush against it.
+    box.scrollTo({ top: box.scrollTop + delta - 8, behavior: "smooth" });
   }, [highlightPath]);
 
   return (
