@@ -6,6 +6,48 @@ dated snapshot of one page — refutations of earlier assumptions are
 tracked explicitly so the classifier stays honest about which signals
 actually fire in the wild.
 
+## How to use this file
+
+**Do not read it whole (~314KB).** Find your topic below, then grep the entry's heading text verbatim
+(headings are stable; the file is append-only, so nothing above your match moves) and read from there.
+
+Entries are dated `## YYYY-MM-DD — title`, with `(b)`, `(c)`… suffixes for same-day entries. ⚠ The tail of
+the file is **not strictly chronological** — the Workday and multi-ATS tracks were appended in parallel
+during 2026-08, so a later date can appear above an earlier one.
+
+### By subsystem
+
+| Topic | Entries to grep |
+|---|---|
+| **Classifier / wrapper shapes** | `Classifier branches (current)`, `2026-05-27 — Comcast` |
+| **Typeahead + `source` picker** | `2026-06-01 — US Bank`, `2026-06-14 — Magna wd3, HIDDEN tab: source picker`, `2026-06-14 — Magna wd3, HIDDEN tab: populated-typeahead OVERWRITE`, `2026-06-26 — FoS typeahead stray RESOLVED`, `2026-06-26 — typeahead EXIT redesign`, `2026-06-29 — Cert + source MERGED`, `2026-07-06 — Typeahead option scrape` |
+| **Dropdowns + the commit race** | `2026-06-14 — Magna wd3, HIDDEN tab: dropdown commit must be TEXT-keyed`, `2026-07-06 — dup-language recon`, `2026-07-06 — Dropdown CLOSE race`, `2026-06-27 — Containment matching is AMBIGUITY-SAFE` |
+| **Dates / spinbutton composites** | `2026-06-17 — Magna wd3, HIDDEN: dates wired into Education`, `2026-08-05 — waystar.wd1 Self Identify` |
+| **Checkbox groups (OFCCP self-ID)** | `2026-07-25 — Caterpillar/Solar Turbines: the OFCCP disability self-ID`, `2026-08-03 (b) — the checkbox-group SET`, `2026-08-04 (b) — the self-ID checkbox group` |
+| **SKILLS (multi-value typeahead)** | `2026-08-07 — SKILLS ("Type to Add Skills")`, `2026-08-07 (b) — SKILLS live`, `2026-08-07 (c) — SKILLS: the CONTAINMENT tier` |
+| **Repeating sections + nested certs** | `2026-06-16 — Magna wd3, HIDDEN tab: repeating-section fill`, `2026-06-17 — Magna wd3, HIDDEN: Languages`, `2026-06-18 — Magna wd3, HIDDEN: nested cert Specialties`, `2026-06-18 — Magna wd3, HIDDEN: Work Experience`, `2026-07-01 — Magna wd3: nested specialty fkit node`, `2026-07-02 — Magna wd3: nested fields contaminate`, `2026-07-25 — Solar Turbines (cat.wd5): a section field's automation-id` |
+| **CDP substrate / hidden-tab speed / pacing** | `2026-06-12 — Magna wd3, HIDDEN tab: CDP off-loop actuation`, `2026-06-19 — Magna wd3: foreground fast-fill`, `2026-06-20 — Magna wd3: reactive read-backs`, `2026-07-04..06 — Hidden-tab SPEED`, `2026-08-05 (c) — making a HIDDEN tab render`, `2026-08-05 — page 2 is slow because of TRUSTED INPUT` |
+| **The M40 audit / false-verify class** | `2026-06-21 — Magna wd3: post-fill page AUDIT (M40)`, `2026-06-19 — Magna wd3: foreground fast-fill` |
+| **Multi-page walk + error banners** | `2026-06-15 — Magna wd3: VPS ≠ validation error`, `2026-06-21 — M38 Part 3: the N-page walk loop`, `2026-07-01 — Workday error banner CONCATENATES`, `2026-07-25 — Solar Turbines: a phone-triggered SMS-consent checkbox REFLOWS the footer` |
+| **Session death / maintenance page** | `2026-06-14 — Magna wd3: rect/focus retry`, `2026-06-14 — Magna wd3: session-expiry is NOT statically detectable`, `2026-06-27 — Workday PLANNED-MAINTENANCE page` |
+| **Auth / onboarding / consent** | `2026-07-25 — Caterpillar: create-account consent`, `2026-07-25 — Caterpillar: the auth widget can OPEN on the Create Account view`, `2026-08-02 (d) — the prompt row, the contaminated sign-in box`, `2026-08-07 (d) — AUTOFILL WITH RESUME` |
+| **Résumé attach** | `2026-06-03 — LiveRamp wd5 resume upload`, `2026-06-21 — Resume attach on the CDP path` |
+| **Review page / reconcile** | `2026-07-07 — Magna wd3 REVIEW page` |
+| **What Workday does NOT persist** | `2026-08-04 — waystar.wd1: what Workday does NOT persist`, `2026-08-04 (c) — HIDDEN runs: Workday rejects synthetic text/date` |
+| **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
+| **Input-lock** | `2026-06-22 — operator input-lock` |
+| **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
+| **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
+| **Host / URL shapes** | `2026-07-22 — logged-in host is` |
+
+### Tenants observed
+
+Comcast wd5 · Cambium Learning · US Bank wd1 · LiveRamp wd5 · **Magna wd3** (the CDP proving ground) ·
+Caterpillar / Solar Turbines (cat.wd5) · waystar.wd1 · marvell · moog — plus Greenhouse, Lever and Ashby
+across many employers.
+
+**Add an entry when you test a new tenant**, and add its row to the table above.
+
 ## Conventions
 
 - **Wrapper**: an element with `data-automation-id="formField-<name>"`.

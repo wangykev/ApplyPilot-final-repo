@@ -113,7 +113,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "pagekey-settled-47b241c";
+const AP_BUILD = "replay-time-2";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -2958,6 +2958,10 @@ async function awaitFieldSetSettled(act) {
 // A refill that remembers changes no values, and nothing remounts.
 let _pageAiAnswers = new Map();
 
+// [CDP-TIME] on the replay walk: when the PREVIOUS page finished advancing, so each page can report the
+// `preamble` — the stretch between that advance and this page being recognised. Reset per run.
+let _replayLastAdvanceAt = 0;
+
 async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts) {
   // Accumulation merge key — the PRE-fill cdpPageKey (url PATHNAME [drops the volatile
   // query] + sorted field-set: STABLE per page across re-runs, DISTINCT across pages even
@@ -4964,6 +4968,7 @@ async function diagnoseRequiredErrorFields(errorTexts, LOG) {
 
 async function runCdpReplayWalk(tabId, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-REPLAY-WALK]", ...a);
+  _replayLastAdvanceAt = 0; // per-run: page 1 has no preceding advance, so it reports preamble 0
   const refill = !!(opts && opts.refill); // REFILL mode: pages IN the approved bundle REPLAY (skip-if-correct, no re-recon); pages the first fill NEVER reached get a FRESH fill; walk continues to review. Always DRY (never submits).
   const authorize = !!(opts && opts.authorize) && !refill; // per-run submit token (M4). false ⇒ DRY (reach review + stop). REFILL is always DRY (never submits) regardless of the caller.
   const simulateSubmit = !!(opts && opts.simulateSubmit); // M5 SAFETY BRAKE: run the FULL gate + log "WOULD CLICK SUBMIT", but NEVER actually click (operator not ready for a real submit). Flip via the handler's simulateSubmit:false.
@@ -5168,6 +5173,13 @@ async function runCdpReplayWalk(tabId, opts) {
       }
 
       LOG(`──── REPLAY PAGE ${page} ────${reloadsUsed ? ` (walk restart ${reloadsUsed})` : ""}`);
+      // [CDP-TIME] for the REPLAY (2026-08-09). The fill walk has had a per-page phase breakdown for
+      // ages; the replay logged only its settle, so "it sits there for 5–10s after the page is visibly
+      // ready" (operator) could not be attributed — I had to reconstruct phases from log timestamps,
+      // which left a gap I could not account for between one page's advance and the next page's marker.
+      // Stamps are wall-clock and cost nothing.
+      const _rT = { pageStart: Date.now(), settle: 0, match: 0, replay: 0, preSave: 0, nav: 0 };
+      const _rMark = (k, t0) => { _rT[k] += Date.now() - t0; };
       await installInputLock(); // per page — navigation tears down the injected overlay; removed once in finally
       // SETTLE FIRST (2026-07-28) — the same wall-clock field-set wait the fill walk has always had.
       // Without it the replay scanned half-rendered pages, declared the unmounted fields absent, and
@@ -5175,8 +5187,10 @@ async function runCdpReplayWalk(tabId, opts) {
       // "advance", so the same physical page got processed twice.
       cdpSetTrustedText(false); // scope the self-ID override below to the ONE page that asks for it
       cdpSetSyntheticInput(true); // ditto for the CLICK override — restore the run-level mode each page
+      const _tSettle = Date.now();
       const rSettleMs = await awaitFieldSetSettled(act);
       const scan = await cdpEval(cdpPageScan);
+      _rMark("settle", _tSettle);
       LOG(`page ${page}: field set settled in ${rSettleMs}ms — ${((scan && scan.fields) || []).length} flat field(s) on the page.`);
       // ── SELF-ID INPUT POLICY, ON THE REPLAY TOO (2026-08-06) ──────────────────────────────────────
       // The per-KIND split (TRUSTED text/date, SYNTHETIC clicks) lived ONLY in fillAndPersistPage, which
@@ -5440,7 +5454,19 @@ async function runCdpReplayWalk(tabId, opts) {
       }
 
       // ── Wait for the transition OR session-death OR a nav-timeout (required field empty → HALT). ──
+      const _tNav = Date.now();
       const res = await cdpWaitNextPage(prevSig);
+      _rMark("nav", _tNav);
+      // Everything between the settle and the Save click — the field reads, skip-if-correct, the
+      // actuations and the pre-Save re-verify — as ONE bucket. `preamble` is the wait BEFORE this page
+      // was even recognised (the previous page's advance → this page's marker), which is the slice the
+      // reconstructed-from-timestamps numbers could not see at all.
+      const _work = Math.max(0, (_tNav - _rT.pageStart) - _rT.settle);
+      const _preamble = _replayLastAdvanceAt ? Math.max(0, _rT.pageStart - _replayLastAdvanceAt) : 0;
+      LOG(`page ${page} [CDP-TIME] ${await cdpPacingLabel()} | total ${((Date.now() - _rT.pageStart) / 1000).toFixed(1)}s`
+        + ` = preamble ${(_preamble / 1000).toFixed(1)}s + settle ${(_rT.settle / 1000).toFixed(1)}s`
+        + ` + work ${(_work / 1000).toFixed(1)}s + nav ${(_rT.nav / 1000).toFixed(1)}s`);
+      _replayLastAdvanceAt = Date.now();
       if (res.maintenance) { LOG(`⛔ WORKDAY MAINTENANCE after Save & Continue on page ${page}.`); return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.sessionDead) { LOG(`⚠⚠ SESSION EXPIRED after Save & Continue on page ${page} — refresh, log in, reopen, retry.`); return { ok: true, stopped: "session-expired", session_expired: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed }; }
       if (res.timeout) {

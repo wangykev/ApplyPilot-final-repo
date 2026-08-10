@@ -2,6 +2,39 @@
 
 Moved out of `CLAUDE.md` on 2026-07-02 to keep the auto-loaded context lean (the pre-slim CLAUDE.md is preserved verbatim in git history at commit `4992b82`). This file is the full milestone-by-milestone build history — one entry per verified milestone, one commit each, so the project stays bisectable. **Append new milestone entries here** (same style: what/why/how-verified); `CLAUDE.md` keeps only standing rules + a short "Current state & open items" section. DOM observations live in `docs/dom-patterns.md`.
 
+## How to use this file
+
+**Do not read it whole (~492KB).** Find your topic below, then grep the entry's heading text verbatim
+(headings are stable; the file is append-only, so nothing above your match moves) and read from there.
+
+For *what is true now*, read `CLAUDE.md` + the matching skill — not this file. This is **history**: it says
+what changed, when, and how it was verified. Entries are dated `## YYYY-MM-DD — title`. ⚠ The tail is **not
+strictly chronological** — the Workday, multi-ATS and discovery tracks were appended in parallel during
+2026-07/08, and several entries name the branch they landed on.
+
+For current state and open work, see **`docs/status.md`**.
+
+### By subsystem — where to start (most recent / most complete entry first)
+
+| Topic | Grep for |
+|---|---|
+| **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — MULTI-ATS: Greenhouse / Lever / Ashby end-to-end` (the landing milestone), then `2026-07-31 (b)`…`(f)`, `2026-08-04 — the async combobox`, `2026-08-05 — multi-ATS end to end`, `2026-08-07 — the dead first fill` |
+| **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
+| **Onboarding / auth / already-applied** | `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
+| **Autofill with résumé** | `2026-08-08 — Autofill-with-Resume end to end`, `2026-08-07 (e) — the flow a first application should take` |
+| **SKILLS field** | `2026-08-07 (d) — SKILLS: the multi-value typeahead` |
+| **Replay walk / submit gate** | `2026-07-28 — The replay walk never settled the page`, `2026-07-28 — Submit gate relaxed`, `2026-07-28 — Background submit runs`, `2026-07-27 — Page-5 replay`, `2026-07-26 — Per-application LOGIN on the backend` |
+| **Review page reconcile / false disagrees** | `2026-07-28 — Three FALSE disagrees blocked a clean run`, `2026-07-28 — The review-page scrape had no settle either` |
+| **Cascade-revealed / became-required** | `2026-07-27 — Cascade-revealed required fields go back to REVIEW`, `2026-07-27 — Cascade review polish` |
+| **Phantom duplicate entries** | `2026-07-27 — The REPLAY adapts to Workday's phantom duplicate-entry error`, `2026-07-27 — Phantom duplicate-entry fix generalized`, `2026-07-27 — Why the phantom-duplicate fix deleted 0/2` |
+| **The phantom "required" error (self-ID)** | `2026-07-28 (later)`, `2026-07-28 (round 2)`, `2026-07-28 (round 3)`, `2026-08-07 (later) — the self-ID disability blocker was a COLON`, `2026-08-07 (later still) — waystar's self-ID variant` |
+| **Employment-status recognizer** | `2026-07-24 — Employment-status screening radios`, `2026-07-24 — Employment-status hardening`, `2026-07-24 — Employment-status: ALL widget types` |
+| **Answer buckets / teach flow** | `2026-07-31 (d) — TEACH verified end-to-end`, `2026-07-26 — Website URLs require ` |
+| **AI batching / stray clicks** | `2026-08-06 — one AI call per page, and the stray click that was blamed on Workday` |
+| **Résumé attach** | `2026-07-29 (later) - ` (the `role="alert"` status-channel fix) |
+| **Service-worker breakage (the two Node-invisible classes)** | `2026-07-28 — Dead service worker: two files declaring one name`, `2026-07-28 — The replay walk never settled the page` |
+| **Latest live sweeps** | `2026-08-09 — live sweep: marvell + moog verified`, `2026-08-09 (b) — the non-Workday merge did NOT regress Workday` |
+
 ## Progress log
 
 Incremental: each milestone is one focused change, verified on a real page, one git commit (so we can bisect). Detail lives in git history + the topical sections above; this is the index.
@@ -4720,3 +4753,45 @@ Fixes landed today, each unit-pinned (every test verified failing first) and all
 
 Still open: the signature-date STAMP is unit-pinned but has never been observed firing (the marvell block
 has not recurred); the self-ID actuation failure on kiongroup is intermittent, seen once in ~4 runs.
+
+## 2026-08-09 (i) — a field the tenant doesn't render is gone from review (live-verified on cat.wd5)
+
+Operator, on finding three blank rows on the cat tracker: "if the repeating section has no gpa, it
+shouldn't show up in the review page."
+
+Those rows were `education[0].gpa` / `from_year` / `to_year`, each rendered as a bare "—" saying
+"ApplyPilot couldn't fill this — please fill it in yourself" on a form whose Education section is only
+School, Degree and Field of Study. No box to fill; and no label, because a label is READ OFF THE PAGE and
+there is no field on the page to read one from. They were `error` rather than `skipped` purely because the
+profile HAS a GPA and years — the old rule kept "a value with nowhere to go" loud.
+
+**The obvious fix was wrong and the suite proved it.** Three different things reach that branch and look
+identical there: (a) the tenant has no such box; (b) a field that REMOUNTS was absent when we looked (WE
+endDate); (c) a field that IS rendered but our labelRegex/id missed it (a Languages proficiency).
+Reclassifying all three would silently drop real fields — the data-loss class this file has spent weeks
+removing. Two existing tests caught it immediately.
+
+**The discriminator:** is there a rendered field in this entry that NO map entry claims? Leftover box ⇒ we
+failed to identify something that IS on the form, stay loud. Everything accounted for ⇒ the form has no
+home for this one, drop it as `removed` (the existing "drops from the summary, not an error" status, which
+`buildReviewBundle` filters) so it leaves the human's queue while the per-page `counts:` line still
+tallies it. This also makes repeating sections behave like FLAT fields, which were always silent here.
+Two guards err toward keeping a row visible: an entry that rendered NOTHING proves nothing, and the claim
+check excludes `labelFallback`. `waitForPresence` already polls to its ceiling BEFORE this branch, so (b)
+only reaches it after the field genuinely never appeared.
+
+The **languages labelRegex test passes UNCHANGED** — that is the proof the discriminator separates (c)
+from (a). The two tests whose expectations the decision changes were updated in place with the reasoning,
+not deleted; the endDate one still pins that `waitForPresence` is the difference between filling and not.
+
+**LIVE-VERIFIED, cat.wd5, build `omits-field-863c434`.** Page 2 counts went
+`{filled 27, skipped 3, error 3, needs_review 1}` → `{filled 27, skipped 3, removed 3}`; the report went
+from 6 needing review to **2**; and the review page now lists exactly
+`education[0].school_or_university / degree / field_of_study` with **zero** "couldn't fill this" rows and
+no error count in the header. Suite 1237/1237.
+
+**Process note (cost ~20 minutes):** the fix looked un-deployed because the WRONG CHROME was connected —
+its extension loads from the `workday-skills` worktree (marker `polarity-capture-1`) while the right one
+loads from `ApplyPilot-ext Debugger`. I misread that as a folder problem and went hunting checkouts; the
+operator diagnosed it in one line. **`AP_BUILD` disagreeing with the folder on disk means CHECK THE
+BROWSER before touching anything else** — `switch_browser` re-pairs in one call.
