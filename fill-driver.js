@@ -5396,11 +5396,12 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       return entry.fields.find((x) => f.labelFallback.test(x.label || "")
         && !fieldMap.some((m) => m !== f && fmMatchesFd(m, x, false))) || null; // never steal a field another entry names exactly
     };
-    const scanFd = async () => {
+    const scanEntry = async () => {
       const scan = await act.repeatingScan();
       const sec = scan && scan.sections ? scan.sections[prefix] : null;
-      return findFd(sec && sec.entries ? sec.entries[idx] : null);
+      return (sec && sec.entries) ? sec.entries[idx] : null;
     };
+    const scanFd = async () => findFd(await scanEntry());
     // M37 skipWhen: a conditional field (WE endDate when currentlyWorkHere is checked →
     // Workday removes the "To" box). It SHOULD vanish → record skipped. BUT a `todayIfStuckRequired`
     // field VERIFIES that: if the box did NOT get removed and is STILL required, a blank required
@@ -5465,14 +5466,56 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
       //     page 2 replay: 32 field(s) - 6 changed, 20 already-correct, 3 not-actuated, 3 FAILED
       //     education[0].gradeAverage / firstYearAttended / lastYearAttended - wrapper not found
       //
-      // A missing wrapper we DO have a value for stays an ERROR: that is an approved answer with
-      // nowhere to go, and it must still stop the run.
-      const v0 = item[f.key];
-      const nothingToFill = v0 === undefined || v0 === null || String(v0).trim() === "";
-      rec.status = nothingToFill ? "skipped" : "error";
-      rec.detail = nothingToFill
-        ? "this tenant does not render the field, and there is nothing to fill"
-        : "field wrapper not found in entry";
+      // ── "NOT ON THE FORM" vs "WE FAILED TO FIND IT" (operator, 2026-08-09) ────────────────────────
+      // Three different things land here and they look identical at this point:
+      //   (a) the tenant genuinely has no such box — cat.wd5's Education is School + Degree + Field
+      //       of Study, no GPA and no dates, while EDUCATION_MAP is the UNION of every observed shape;
+      //   (b) a field that REMOUNTS and was absent when we looked (WE endDate);
+      //   (c) a field that IS rendered but our labelRegex/id didn't match it (a Languages proficiency).
+      //
+      // (a) must vanish from review: it produced three rows on cat, each a bare "—" telling the
+      // operator to "fill it in yourself" on a form with no box to fill — and no label, because a
+      // label is READ OFF THE PAGE. Operator: "if the repeating section has no gpa, it shouldn't show
+      // up in the review page." (b) and (c) must NOT vanish: those are real fields, and dropping them
+      // silently is the data-loss class this file has spent weeks removing.
+      //
+      // THE DISCRIMINATOR: is there a rendered field in this entry that NO map entry claims? If yes,
+      // something is on the form we failed to identify — stay loud. If every rendered field is
+      // accounted for, the form simply has no home for this one — drop it. (b) is safe here because
+      // `waitForPresence` above has already polled to the ceiling, so reaching this line means the
+      // field never appeared at all, not that we were early.
+      //
+      // Deliberately asks `fmMatchesFd(…, false)` — no labelFallback — so a field claimable ONLY by a
+      // fallback regex still counts as unclaimed. That errs toward keeping a row visible.
+      let unclaimed = [];
+      try {
+        const ent = await scanEntry();
+        const rendered = (ent && ent.fields) || [];
+        // An entry that rendered NOTHING proves nothing: you cannot conclude "this form has no GPA
+        // box" from a row that showed no boxes at all. Treat it as our own failure and stay loud.
+        unclaimed = rendered.length
+          ? rendered.filter((x) => !fieldMap.some((m) => fmMatchesFd(m, x, false)))
+          : [{ emptyEntry: true }];
+      } catch (e) { unclaimed = [{ unknown: true }]; } // can't tell ⇒ assume our failure, stay loud
+      if (!unclaimed.length) {
+        // `removed` is the existing "drops from the summary, not an error" status (buildReviewBundle
+        // filters it), so it leaves the human's queue while the per-page `counts:` line still tallies
+        // it. This also makes repeating sections behave like FLAT fields, which were always silent
+        // here — an unrendered flat field is simply never scanned, so it never produced a row either.
+        rec.status = "removed";
+        rec.flag = "tenant-omits-field";
+        rec.detail = "this tenant's " + sectionName + " section does not render this field — dropped from review";
+      } else {
+        // A missing wrapper we DO have a value for stays an ERROR: that is an answer with nowhere to
+        // go, on a form that clearly has fields we could not identify.
+        const v0 = item[f.key];
+        const nothingToFill = v0 === undefined || v0 === null || String(v0).trim() === "";
+        rec.status = nothingToFill ? "skipped" : "error";
+        rec.detail = (nothingToFill
+          ? "this tenant does not render the field, and there is nothing to fill"
+          : "field wrapper not found in entry")
+          + " — " + unclaimed.length + " field(s) in this entry matched no map entry";
+      }
       recs.push(rec); await act.delay(budgets.interFieldMs); continue;
     }
     const loc = { wrapperSel: fd.wrapperSel };

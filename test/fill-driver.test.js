@@ -6318,8 +6318,14 @@ test("M37 WE: endDate REMOUNTS (absent then present) — waitForPresence POLLS u
     name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-",
     items: [item], fieldMap: [{ field: "endDate", widget: "date", key: "toParsed", path: "to" }], deleteOnNoMatch: false
   }, T_BUDGETS);
-  assert.strictEqual(noWait.results.find((r) => /endDate/.test(r.fieldName)).status, "error",
-    "without the poll, the not-yet-remounted endDate errors (field wrapper not found)");
+  // Without the poll the field is simply NOT FOUND. Since 2026-08-09 that no longer surfaces as an
+  // `error` when every field the entry rendered is claimed by the map — it is classified as "this
+  // tenant doesn't render the field" and dropped from review (see the discriminator in fillEntryCdp).
+  // The point of THIS test is unchanged and is asserted below: waitForPresence is what makes the
+  // difference between a field that fills and a field that doesn't. What this half pins is that
+  // without the poll it does NOT fill.
+  assert.notStrictEqual(noWait.results.find((r) => /endDate/.test(r.fieldName)).status, "filled",
+    "without the poll, the not-yet-remounted endDate is not filled");
   // WITH waitForPresence: the bounded poll re-scans until endDate remounts (scan 3), then fills.
   const withWait = await driveRepeatingSectionCdp(makeFakeRepeatAct(mk()), {
     name: "workExperience", headingRegex: "work experience", containerPrefix: "workExperience-",
@@ -9058,9 +9064,17 @@ test("education: a field this tenant does not render, with nothing to fill, is S
     "no hard errors: " + JSON.stringify(out.results.filter((r) => r.status === "error").map((r) => r.fieldName + ": " + r.detail)));
 });
 
-// The counterexample that keeps this honest: an approved value with nowhere to go is still an ERROR,
-// because that is a real place a value could silently vanish.
-test("education: a missing wrapper we DO have a value for is still an ERROR", async () => {
+// SUPERSEDED 2026-08-09 — this asserted that a value with nowhere to go stays an ERROR. Live on cat.wd5
+// that rule put three rows in the review queue (education gpa / from_year / to_year), each a bare "—"
+// telling the operator to "fill it in yourself" on a form whose Education section is only School, Degree
+// and Field of Study. No box to fill, and no label because a label is READ OFF THE PAGE. Operator: "if
+// the repeating section has no gpa, it shouldn't show up in the review page."
+//
+// It is now `removed` (the existing "drops from the summary, not an error" status) — but ONLY because
+// every field the entry rendered was claimed by the map. The counterexample that keeps THAT honest is
+// the languages labelRegex test below: when the entry renders a field no map entry claims, we failed to
+// identify something that IS on the form, and it stays an error.
+test("education: a field the tenant does not render NEVER reaches review, even when we hold a value", async () => {
   const fkit = "education-1--null";
   const domEntry = { fkit, fields: [
     { fieldName: "schoolName", label: "School or University*", widgetType: "text", isRequired: true, value: "" },
@@ -9073,8 +9087,16 @@ test("education: a missing wrapper we DO have a value for is still an ERROR", as
     fieldMap: EDUCATION_MAP, deleteOnNoMatch: false,
   }, T_BUDGETS);
   const deg = out.results.find((r) => r.fieldName === "education[0].degree");
-  assert.ok(deg, "a record was emitted for the unrendered degree");
-  assert.strictEqual(deg.status, "error", "an approved value with nowhere to go must still stop the run");
+  assert.ok(deg, "a record is still emitted, so the per-page counts can tally it");
+  assert.strictEqual(deg.status, "removed", "a field the tenant does not render is dropped, not an error");
+  assert.strictEqual(deg.flag, "tenant-omits-field");
+
+  // THE ASSERTION THAT MATTERS: it must be absent from the bundle the human reviews. buildReviewBundle
+  // drops `removed`, so this is what actually pins "it shouldn't show up in the review page".
+  const bundle = buildReviewBundle(out.results, { page: "P1", url: "https://x/apply", tenant: "x" });
+  assert.ok(!bundle.entries.some((e) => String(e.canonical_field || "") === "education[0].degree"),
+    "the unrendered field must NOT appear in the review bundle: " +
+    JSON.stringify(bundle.entries.map((e) => e.canonical_field)));
 });
 
 const apMatchLib = require("../lib.js");
