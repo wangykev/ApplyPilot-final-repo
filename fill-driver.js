@@ -65,6 +65,13 @@ const apMatch = (typeof module !== "undefined" && module.exports)
 // match quality lives in the NEW `confidence` field, provenance in the NEW `flag`.
 function flagTierCategory(matchTier) {
   if (matchTier === "exact-normalized") return "exact";
+  // POLARITY LEAD grades as EXACT (operator, 2026-08-09), and that is the whole point of the tier: for a
+  // yes/no question the polarity token IS the answer, so "No" → "No, I do not require sponsorship" is a
+  // deterministic profile match, not a guess, and must not nag for review or ask to be taught. It is only
+  // ever reached when EXACTLY ONE option leads with the polarity (see matchCandidates) — an ambiguous
+  // split never gets here. Without this line it would fall through to "none" ⇒ needs_review/stray, i.e.
+  // precisely the opposite of the intent.
+  if (matchTier === "polarity-lead") return "exact";
   if (matchTier === "containment") return "containment";
   if (typeof matchTier === "string" && matchTier.indexOf("fuzzy") === 0) return "fuzzy";
   return "none";

@@ -7996,6 +7996,21 @@ async function fillEngine(profile, defaults, jobContext) {
       const idx = optionTexts.findIndex((t) => normalize(t) === nc);
       if (idx !== -1) return { targetIndex: idx, matchTier: "exact-normalized", matchedCandidate: cand };
     }
+    // Tier 1.5: POLARITY LEAD — LOCKSTEP with lib.js (2026-08-09). For a yes/no question the polarity
+    // token IS the answer, so a stored "No" fills "No, I do not require sponsorship" deterministically.
+    // Narrow on purpose: the candidate must be a bare Yes/No/true/false, the match is anchored on a word
+    // boundary (^no\b never hits "November"), and EXACTLY ONE option may lead with it — a tenant that
+    // splits one polarity into two meanings ("No, I do not now or in the future" vs "No, I do not now BUT
+    // WILL") escalates to review instead of being guessed at.
+    const POLARITY_TOKENS = { yes: "yes", no: "no", true: "yes", false: "no" };
+    for (const cand of candidates) {
+      const want = POLARITY_TOKENS[String(cand == null ? "" : cand).trim().toLowerCase()];
+      if (!want) continue;
+      const re = new RegExp("^" + want + "\\b", "i");
+      const hits = [];
+      optionTexts.forEach((t, i) => { if (re.test(String(t == null ? "" : t).trim())) hits.push(i); });
+      if (hits.length === 1) return { targetIndex: hits[0], matchTier: "polarity-lead", matchedCandidate: cand };
+    }
     // Tier 2: containment — startsWith then includes, AMBIGUITY-SAFE (exactly one), skipped for
     // dropdown/radio (opts). Mid-string includes requires >= 3 chars (a 2-char abbrev is too promiscuous).
     if (allowContainment) {
