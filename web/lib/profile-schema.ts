@@ -437,6 +437,94 @@ export function mergeProfile(base: Profile, incoming: Profile): Profile {
   return out;
 }
 
+/**
+ * The ONLY sections an AI resume parse produces (see lib/resume-prompt.ts). Everything
+ * outside this list — work_authorization, how_did_you_hear, self_identification,
+ * screening, employment_history_companies, additional_files, answer_ladders — is
+ * NEVER written by either apply mode, because a resume cannot state it.
+ *
+ * `employment_history_companies` is deliberately absent: it is the safety-critical
+ * list behind the "have you worked here before?" auto-"No" (a non-empty list is
+ * treated as COMPLETE), and a resume parse is not a trustworthy source for it.
+ */
+export const PARSED_ARRAY_SECTIONS = [
+  "websites",
+  "work_experience",
+  "education",
+  "projects",
+  "skills",
+  "skill_groups",
+  "languages",
+  "certifications",
+] as const;
+
+export type ParsedSection = (typeof PARSED_ARRAY_SECTIONS)[number] | "personal_info";
+
+export type ReplaceResult = {
+  profile: Profile;
+  /** Sections actually overwritten (the parse found something for them). */
+  replaced: ParsedSection[];
+  /** answer_ladders keys dropped because they indexed past the new array length. */
+  droppedLadders: string[];
+};
+
+/**
+ * REPLACE apply: overwrite the sections the parse actually found, and leave every
+ * other section exactly as it was.
+ *
+ * Differs from `mergeProfile` in one way only — a populated section is no longer a
+ * reason to skip. The guard rails that remain, and why:
+ *
+ * - A section the parse did NOT find is never cleared. "The AI missed my
+ *   certifications" must not delete your certifications.
+ * - Only PARSED_ARRAY_SECTIONS + personal_info are eligible at all, so screening
+ *   answers, work authorization, self-ID and employment_history_companies survive
+ *   untouched no matter what the model returns.
+ * - `answer_ladders` are keyed by INDEXED path ("education.0.gpa"). Replacing an
+ *   array can leave a key pointing past the end of the new one, so those dangling
+ *   keys are dropped and REPORTED. In-range keys are kept: the slot still exists,
+ *   and silently discarding tuning the user hand-wrote would be worse.
+ */
+export function replaceProfileSections(base: Profile, incoming: Profile): ReplaceResult {
+  const out = structuredClone(base);
+  const replaced: ParsedSection[] = [];
+
+  // personal_info: overwrite per field, but only where the parse actually found something.
+  let personalTouched = false;
+  for (const [k, v] of Object.entries(incoming.personal_info)) {
+    if (isEmpty(v)) continue;
+    const cur = (out.personal_info as Record<string, unknown>)[k];
+    if (JSON.stringify(cur) === JSON.stringify(v)) continue;
+    (out.personal_info as Record<string, unknown>)[k] = structuredClone(v);
+    personalTouched = true;
+  }
+  if (personalTouched) replaced.push("personal_info");
+
+  for (const k of PARSED_ARRAY_SECTIONS) {
+    const inc = incoming[k] as unknown[];
+    if (inc.length === 0) continue; // parse found nothing → keep what the user has
+    const cur = out[k] as unknown[];
+    if (JSON.stringify(cur) === JSON.stringify(inc)) continue; // no-op, don't report it
+    (out as Record<string, unknown>)[k] = structuredClone(inc);
+    replaced.push(k);
+  }
+
+  const droppedLadders: string[] = [];
+  for (const key of Object.keys(out.answer_ladders)) {
+    const m = key.match(/^([a-z_]+)\.(\d+)\./);
+    if (!m) continue;
+    const section = m[1] as (typeof PARSED_ARRAY_SECTIONS)[number];
+    if (!replaced.includes(section as ParsedSection)) continue;
+    const len = (out[section] as unknown[] | undefined)?.length ?? 0;
+    if (Number(m[2]) >= len) {
+      delete out.answer_ladders[key];
+      droppedLadders.push(key);
+    }
+  }
+
+  return { profile: out, replaced, droppedLadders };
+}
+
 function isEmpty(v: unknown): boolean {
   if (v == null) return true;
   if (typeof v === "string") return v.trim() === "";

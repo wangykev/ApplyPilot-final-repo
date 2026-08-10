@@ -2,10 +2,26 @@
 
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
-import { profileSchema, coerceProfile, mergeProfile, emptyProfile } from "@/lib/profile-schema";
+import {
+  profileSchema,
+  coerceProfile,
+  mergeProfile,
+  replaceProfileSections,
+  emptyProfile,
+  type ParsedSection,
+} from "@/lib/profile-schema";
+import { validatePlan, applyReconcilePlan, type EntryDecision } from "@/lib/profile-reconcile";
 import { sanitizePdfName } from "@/lib/filenames";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
+
+export type ReplaceActionResult =
+  | { ok: true; replaced: ParsedSection[]; droppedLadders: string[] }
+  | { ok: false; error: string };
+
+export type ReconcileActionResult =
+  | { ok: true; updated: number; added: number }
+  | { ok: false; error: string };
 
 /** Merge an AI-parsed profile into the user's profile (fills blanks only). */
 export async function applyParsedProfile(parsedRaw: unknown): Promise<ActionResult> {
@@ -35,6 +51,90 @@ export async function applyParsedProfile(parsedRaw: unknown): Promise<ActionResu
       .upsert({ id: user.id, profile_json: merged }, { onConflict: "id" });
     if (error) return { ok: false, error: error.message };
     return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
+
+/**
+ * REPLACE the parsed sections instead of only filling blanks.
+ *
+ * Exists because "Apply" is a silent no-op on an already-populated profile: it
+ * fills blanks, and a user who rewrites their resume has no blanks left. Scope is
+ * still limited to what a resume can state (see `replaceProfileSections`), so
+ * screening answers, work authorization, self-ID and employment_history_companies
+ * are untouched.
+ */
+export async function replaceParsedProfile(parsedRaw: unknown): Promise<ReplaceActionResult> {
+  const parsed = profileSchema.safeParse(parsedRaw);
+  if (!parsed.success) return { ok: false, error: "Parsed profile didn't validate." };
+
+  if (!isSupabaseConfigured()) {
+    return { ok: false, error: "Backend not connected — set Supabase env vars to save (see WEBSITE.md)." };
+  }
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return { ok: false, error: "You're not signed in." };
+
+    const { data: row } = await supabase
+      .from("profiles")
+      .select("profile_json")
+      .eq("id", user.id)
+      .maybeSingle();
+    const current = row?.profile_json ? coerceProfile(row.profile_json) : emptyProfile();
+    const { profile, replaced, droppedLadders } = replaceProfileSections(current, parsed.data);
+
+    const { error } = await supabase
+      .from("profiles")
+      .upsert({ id: user.id, profile_json: profile }, { onConflict: "id" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, replaced, droppedLadders };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
+
+/**
+ * Commit a smart-merge plan the user has seen and confirmed.
+ *
+ * The plan arrives from the client, so it is RE-VALIDATED here against the profile
+ * as it stands right now — never applied as given. That closes the window where the
+ * profile changed in another tab between planning and confirming, and means a
+ * tampered plan can still only produce a legal update/append.
+ */
+export async function applyReconcile(parsedRaw: unknown, decisionsRaw: unknown): Promise<ReconcileActionResult> {
+  const parsed = profileSchema.safeParse(parsedRaw);
+  if (!parsed.success) return { ok: false, error: "Parsed profile didn't validate." };
+  if (!Array.isArray(decisionsRaw)) return { ok: false, error: "No merge plan supplied." };
+
+  if (!isSupabaseConfigured()) {
+    return { ok: false, error: "Backend not connected — set Supabase env vars to save (see WEBSITE.md)." };
+  }
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return { ok: false, error: "You're not signed in." };
+
+    const { data: row } = await supabase
+      .from("profiles")
+      .select("profile_json")
+      .eq("id", user.id)
+      .maybeSingle();
+    const current = row?.profile_json ? coerceProfile(row.profile_json) : emptyProfile();
+
+    const plan = validatePlan(current, parsed.data, decisionsRaw as EntryDecision[]);
+    const { profile, updated, added } = applyReconcilePlan(current, parsed.data, plan);
+
+    const { error } = await supabase
+      .from("profiles")
+      .upsert({ id: user.id, profile_json: profile }, { onConflict: "id" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, updated, added };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
   }

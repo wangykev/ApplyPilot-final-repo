@@ -6,6 +6,8 @@ import { FileText, Sparkles, Check, Trash2, ArrowRight, Eye, X, FileUp, FileChec
 import { SectionCard } from "@/components/app/SectionCard";
 import {
   applyParsedProfile,
+  replaceParsedProfile,
+  applyReconcile,
   removeResume,
   getResumePreviewUrl,
   saveResumeSourceTex,
@@ -20,6 +22,19 @@ import { clsx } from "@/lib/clsx";
 
 type Stored = { filename: string; size: number } | null;
 type Msg = { kind: "ok" | "err" | "info"; text: string; aiLink?: boolean } | null;
+
+/** What /api/reconcile-profile hands back: the decisions to commit, plus a readable preview. */
+type MergePlan = {
+  plan: { decisions: unknown[]; corrections: string[] };
+  preview: {
+    section: string;
+    action: "update" | "add";
+    label: string;
+    replaces: string | null;
+    reason: string;
+  }[];
+  untouched: string[];
+} | null;
 
 // Draft persistence: the editor survives navigating away and coming back, even
 // signed-out / before "Save as my resume". Also mirrored to the tailor page's
@@ -75,6 +90,8 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
   const [msg, setMsg] = useState<Msg>(null);
   const [parsed, setParsed] = useState<Profile | null>(null);
   const [parsing, setParsing] = useState(false);
+  const [planning, setPlanning] = useState(false);
+  const [plan, setPlan] = useState<MergePlan>(null);
   const [applying, startApply] = useTransition();
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -369,6 +386,75 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
           ? { kind: "ok", text: "Applied to your profile (filled blanks). Review it on the Profile page." }
           : { kind: "err", text: res.error }
       );
+    });
+  }
+
+  // Smart merge is two steps on purpose: PLAN (AI, read-only) then CONFIRM. An AI
+  // deciding to overwrite a job entry is exactly the kind of thing that should not
+  // happen without the user seeing it first.
+  async function planMerge() {
+    if (!parsed) return;
+    setPlanning(true);
+    setPlan(null);
+    setMsg(null);
+    try {
+      const r = await fetch("/api/reconcile-profile", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ parsed }),
+      });
+      const j = await r.json();
+      if (j.ok) {
+        setPlan(j);
+        if (j.preview.length === 0) setMsg({ kind: "info", text: "Nothing to merge — the resume adds no entries." });
+      } else {
+        setMsg({ kind: "err", text: j.error ?? "Could not plan the merge.", aiLink: typeof j.error === "string" && j.error.toLowerCase().includes("api key") });
+      }
+    } catch {
+      setMsg({ kind: "err", text: "Could not plan the merge — is the backend reachable?" });
+    } finally {
+      setPlanning(false);
+    }
+  }
+
+  function confirmMerge() {
+    if (!parsed || !plan) return;
+    startApply(async () => {
+      const res = await applyReconcile(parsed, plan.plan.decisions);
+      if (!res.ok) {
+        setMsg({ kind: "err", text: res.error });
+        return;
+      }
+      liveSync("profile");
+      setPlan(null);
+      setMsg({
+        kind: res.updated + res.added > 0 ? "ok" : "info",
+        text:
+          res.updated + res.added > 0
+            ? `Merged — ${res.updated} entr${res.updated === 1 ? "y" : "ies"} updated, ${res.added} added.`
+            : "Nothing changed.",
+      });
+    });
+  }
+
+  function replace() {
+    if (!parsed) return;
+    startApply(async () => {
+      const res = await replaceParsedProfile(parsed);
+      if (!res.ok) {
+        setMsg({ kind: "err", text: res.error });
+        return;
+      }
+      liveSync("profile");
+      // Name what changed. "Replaced 0 sections" is a real outcome (the resume said
+      // nothing new) and must not read as success-with-changes.
+      const what = res.replaced.length
+        ? `Replaced ${res.replaced.join(", ").replace(/_/g, " ")}.`
+        : "Nothing to replace — your profile already matches the parsed resume.";
+      const ladders = res.droppedLadders.length
+        ? ` Dropped ${res.droppedLadders.length} answer ladder${res.droppedLadders.length === 1 ? "" : "s"} that pointed past the new entries (${res.droppedLadders.join(", ")}).`
+        : "";
+      setMsg({ kind: res.replaced.length ? "ok" : "info", text: what + ladders });
     });
   }
 
@@ -691,15 +777,81 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
               </p>
             )}
             <div className="mt-5 flex flex-wrap items-center gap-3">
-              <button onClick={apply} disabled={applying} className="btn-primary">
-                {applying ? "Applying…" : "Apply to my profile"}
+              <button onClick={planMerge} disabled={applying || planning} className="btn-primary">
+                {planning ? "Working out what changed…" : "Smart merge"}
+              </button>
+              <button onClick={apply} disabled={applying || planning} className="btn-ghost">
+                {applying ? "Applying…" : "Fill blanks only"}
+              </button>
+              <button onClick={replace} disabled={applying || planning} className="btn-ghost">
+                {applying ? "Replacing…" : "Replace these sections"}
               </button>
               <Link href="/app/profile" className="inline-flex items-center gap-1.5 text-sm text-ink-dim hover:text-amber">
                 Open profile
                 <ArrowRight className="h-3.5 w-3.5" />
               </Link>
-              <span className="font-mono text-[11px] text-ink-faint">fills blank fields only — won&apos;t overwrite</span>
             </div>
+            <p className="mt-3 text-xs text-ink-faint">
+              <span className="font-mono">Smart merge</span> asks the AI, per entry, whether it&apos;s the same
+              job/degree you already have (updates it in place) or a new one (adds a section) — it shows you the
+              plan before anything is written, and never deletes.{" "}
+              <span className="font-mono">Fill blanks</span> never overwrites, so on a complete profile it
+              changes nothing.{" "}
+              <span className="font-mono">Replace</span> makes this resume the source of truth for the sections
+              above. All three leave work authorization, screening answers, self-identification and your
+              previous-employer list alone — a resume can&apos;t state those.
+            </p>
+
+            {plan && (
+              <div className="mt-5 rounded-lg border border-hairline bg-panel p-4">
+                <div className="font-mono text-[11px] uppercase tracking-label text-ink-dim">
+                  Proposed merge — nothing is saved yet
+                </div>
+                {plan.preview.length === 0 && (
+                  <p className="mt-3 text-sm text-ink-faint">No entries to merge.</p>
+                )}
+                <ul className="mt-3 space-y-2">
+                  {plan.preview.map((p, i) => (
+                    <li key={i} className="text-sm">
+                      <span
+                        className={clsx(
+                          "mr-2 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase",
+                          p.action === "update" ? "bg-amber/15 text-amber" : "bg-verified/15 text-verified",
+                        )}
+                      >
+                        {p.action === "update" ? "update" : "add"}
+                      </span>
+                      <span className="text-ink">{p.label}</span>
+                      {p.replaces && <span className="text-ink-faint"> — replaces “{p.replaces}”</span>}
+                      <span className="ml-1 font-mono text-[11px] text-ink-faint">
+                        {p.section.replace(/_/g, " ")}
+                      </span>
+                      {p.reason && <div className="ml-12 text-xs text-ink-faint">{p.reason}</div>}
+                    </li>
+                  ))}
+                </ul>
+                {plan.plan.corrections.length > 0 && (
+                  <div className="mt-4 rounded border border-amber/40 bg-amber/5 p-3">
+                    <div className="font-mono text-[11px] uppercase tracking-label text-amber">
+                      Overruled the model
+                    </div>
+                    <ul className="mt-2 space-y-1 text-xs text-ink-dim">
+                      {plan.plan.corrections.map((c, i) => (
+                        <li key={i}>{c}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <div className="mt-4 flex flex-wrap items-center gap-3">
+                  <button onClick={confirmMerge} disabled={applying || plan.preview.length === 0} className="btn-primary">
+                    {applying ? "Merging…" : "Apply this plan"}
+                  </button>
+                  <button onClick={() => setPlan(null)} disabled={applying} className="btn-ghost">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </SectionCard>
