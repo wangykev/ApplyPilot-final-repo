@@ -113,7 +113,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "replay-time-1928";
+const AP_BUILD = "replay-time-2";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -5455,7 +5455,7 @@ async function runCdpReplayWalk(tabId, opts) {
       // reconstructed-from-timestamps numbers could not see at all.
       const _work = Math.max(0, (_tNav - _rT.pageStart) - _rT.settle);
       const _preamble = _replayLastAdvanceAt ? Math.max(0, _rT.pageStart - _replayLastAdvanceAt) : 0;
-      LOG(`page ${page} [CDP-TIME] ${cdpPacingLabel()} | total ${((Date.now() - _rT.pageStart) / 1000).toFixed(1)}s`
+      LOG(`page ${page} [CDP-TIME] ${await cdpPacingLabel()} | total ${((Date.now() - _rT.pageStart) / 1000).toFixed(1)}s`
         + ` = preamble ${(_preamble / 1000).toFixed(1)}s + settle ${(_rT.settle / 1000).toFixed(1)}s`
         + ` + work ${(_work / 1000).toFixed(1)}s + nav ${(_rT.nav / 1000).toFixed(1)}s`);
       _replayLastAdvanceAt = Date.now();
