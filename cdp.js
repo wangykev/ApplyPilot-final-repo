@@ -101,11 +101,21 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // clock silently costs SAMPLES, not just time — and a missed transient reads as "the control never
 // rendered". So: FILL/REPLAY enable it; onboarding, auth and recon stay on the SW timer. Reset to false
 // at every cdpAttach.
+// ⚠ ALSO OFF for the PAGE-TRANSITION wait (cdpWaitNextPage), for the same reason as onboarding: a
+// transition IS a navigation. That poll is a 15s WALL-CLOCK deadline with a cdpAdaptiveDelay(500)
+// interval, so a page clock that hangs there buys ~7 polls instead of ~30 — and running out is a
+// nav-timeout HALT, not a slow page. It save/restores around itself rather than being globally off,
+// because the pages either side of the transition are settled forms where the page clock is correct.
 let _pageClockOn = false;
+let _pageClockAnnounced = false;   // announce once per attach — the transition save/restore re-enables per page
 function cdpSetPageClock(on) {
   _pageClockOn = !!on;
-  if (on) console.log("[ApplyPilot][CDP] page-clock pacing ENABLED for this run's fill — paces sleep on the page's worker-backed timer (throttle-immune) instead of the starved SW timer; onboarding/auth/recon stay SW-timed.");
+  if (on && !_pageClockAnnounced) {
+    _pageClockAnnounced = true;
+    console.log("[ApplyPilot][CDP] page-clock pacing ENABLED for this run's fill — paces sleep on the page's worker-backed timer (throttle-immune) instead of the starved SW timer; onboarding/auth/recon and the page-transition wait stay SW-timed.");
+  }
 }
+function cdpPageClockEnabled() { return _pageClockOn; } // so a caller can SAVE/RESTORE around a deliberately SW-timed step
 
 const PAGE_SLEEP_SLACK_MS = 1500;   // race ceiling above the requested pace (guard 2)
 const PACE_OVERRUN_LOG_MS = 1000;   // log a pace this far over budget (permanent — no flag needed)
@@ -177,6 +187,7 @@ function cdpAttach(tabId) {
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
       _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
       _pageClockOn = false;                    // page-clock pacing is per-run opt-in (FILL/REPLAY only) — onboarding/auth/recon stay SW-timed
+      _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});

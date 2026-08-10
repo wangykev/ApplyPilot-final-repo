@@ -279,3 +279,57 @@ skipping.
 - One full-suite failure (`dropdown tier-keep: a slow-closing list is RE-ESCAPED`) is **pre-existing
   load-sensitive flakiness**, not this change: 675/675 in isolation, it uses `makeFakeAct` and never loads
   cdp.js, and it counts retries against a wall-clock deadline while `node --test` parallelizes files.
+
+---
+
+## 2026-08-10 — round 3: the page-TRANSITION wait (a correctness argument, NOT a speed win)
+
+`cdpWaitNextPage` now save/restores the page clock OFF around its poll (`background.js`, build
+`page-clock-3`). It is a 15s WALL-CLOCK budget with a `cdpAdaptiveDelay(500)` interval, and running out is
+a **nav-timeout HALT**, so a starved interval there costs a failed run rather than a slow one.
+
+**Be honest about the size of this: it swaps one late clock for another.** Measured, page 2→3 transition:
+
+| transitions paced by | observed |
+|---|---|
+| page clock (round 2, `page-clock-2`) | `50→1765`, `200→4017`, `50→3595` — all `page-abandoned` |
+| SW clock (round 3, `page-clock-3`) | `50→1730 (sw)` |
+
+Better on median, but **not** a clear win on sample count: a 500ms interval is *bounded* at 2000ms under
+the page clock (interval + slack) while the SW clock was observed at **2694ms** for the same 500ms request.
+So for the 500ms transition interval specifically the two are close.
+
+**Why it still stands, on principle rather than on the timing:** during a navigation the page clock can
+hang indefinitely, and our abandon ceiling is ITSELF an SW timer — pre-gate it fired at 3970ms against a
+1550ms ceiling. So the page clock has no *reliable* bound during a navigation, whereas SW drift, though
+unbounded in theory, measured 1.7–2.7s against page-abandons of 3.5–4.0s. Same direction as the onboarding
+gate, smaller stakes.
+
+### ⚠ NEITHER CLOCK IS CLEAN DURING A NAVIGATION — the real remaining bug is the LOOP SHAPE
+
+Round 3's onboarding (SW-timed by design) logged `a 500ms pace took 2694ms (sw)` and
+`a 50ms pace took 2632ms (sw)`. So onboarding's poll loops are sample-starved too, just less severely than
+under the page clock. **Choosing a clock cannot fix this.** The systemic fix is the loop shape: a poll that
+must not give up early should bound itself by **ATTEMPTS as well as wall-clock**, or recompute its deadline
+from actual elapsed time, so a late clock costs latency instead of coverage. That is the next real piece of
+work in this area, and it is bigger than a clock swap — it touches ~30 loops.
+
+### Where the residual overruns actually are (build `page-clock-3`, one run, positioned)
+
+| when | pace | clock | position |
+|---|---|---|---|
+| 12s, 15s | 500→2694, 50→2632 | `sw` | onboarding |
+| 43s | 600→1815 | `page` | mid page-1 fill |
+| 47s | 150→3487, 200→3695 | `page-abandoned` | END of page-1 fill (post-fill audit / pre-Save) |
+| 78s | 50→1730 | `sw` | page 2→3 transition |
+
+So the page clock also hangs occasionally *inside* a fill, clustered at the page's end — plausibly while
+Workday runs its own post-field XHR/validation. Bounded, and small next to what round 2 removed.
+
+### Round 3 run (cat.wd5 R0000380424 — a DRAFT RE-ENTRY, not comparable to a fresh fill)
+
+⚠ This req had already reached review in round 1, so onboarding recovered into the saved draft and the
+pages arrived pre-filled (`dropdown-prefilled-kept`). Reported for completeness, NOT as a baseline:
+reached REVIEW after 5 pages, fills 7.1 · 7.3 · 4.1 · 8.8 · 5.8s (33.1s), all five M40 audits "all matched
+the report". **Use a genuinely unused requisition for any timing comparison** — this one is only evidence
+that the change is safe on the resume path.

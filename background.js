@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "page-clock-2";
+const AP_BUILD_MARKER = "page-clock-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -5911,6 +5911,22 @@ async function reclickNextWhenClean(act, prevSig, tries, LOG) {
 // window) still guards progressive field mounting after we return. Hidden+throttled (no worker
 // timers) keeps the full 500ms beat, byte-identical to the proven slow path.
 async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
+  // SW-TIME this poll (2026-08-10). A transition is a NAVIGATION, and a navigating document's timer
+  // does not fire — with the page clock on, each intervalMs pace was abandoned at interval+slack, so
+  // this 15s WALL-CLOCK budget bought ~7 polls instead of ~30. Running out is a nav-timeout HALT, so
+  // the cost of a starved interval here is a failed run, not a slow one. Same lesson as onboarding
+  // (docs/fill-speed-log.md); save/restore rather than global, because the pages either side of the
+  // transition ARE settled forms where the page clock is the correct clock.
+  const _wasPageClock = cdpPageClockEnabled();
+  cdpSetPageClock(false);
+  try {
+    return await cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs);
+  } finally {
+    cdpSetPageClock(_wasPageClock);
+  }
+}
+
+async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
   const start = Date.now();
   let steady = -1, errSince = 0;
   while (Date.now() - start < timeoutMs) {

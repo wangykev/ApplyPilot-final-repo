@@ -34,13 +34,16 @@ function makeClock({ tabId = 1, workerTimers = true, pageClock = true, sendRaw }
      const console = { log: deps.log };
      ${block}
      cdpSetPageClock(deps.pageClock);
-     return { cdpDelay, cdpPageSleep, cdpSetPageClock, PAGE_SLEEP_SLACK_MS,
+     return { cdpDelay, cdpPageSleep, cdpSetPageClock, cdpPageClockEnabled, PAGE_SLEEP_SLACK_MS,
               setTabId: (v) => { cdpTabId = v; },
               setWorkerTimers: (v) => { _workerTimersActive = v; } };`
   );
   const api = factory({ tabId, workerTimers, pageClock, sendRaw, log: (m) => logs.push(String(m)) });
-  // paceLogs() excludes the one-off "page-clock ENABLED" announcement.
-  return { ...api, paceLogs: () => logs.filter((m) => /\[PACE\]/.test(m)) };
+  return {
+    ...api,
+    paceLogs: () => logs.filter((m) => /\[PACE\]/.test(m)),
+    enableLogs: () => logs.filter((m) => /page-clock pacing ENABLED/.test(m)),
+  };
 }
 
 /** A page-clock stand-in: resolves after `ms` of REAL time, and records the calls it received. */
@@ -143,6 +146,22 @@ test("a pace inside budget logs NOTHING (a healthy run must stay quiet)", async 
   assert.equal(c.paceLogs().length, 0);
 });
 
+// ── the PAGE-TRANSITION wait must stay SW-timed ───────────────────────────────────────────────────
+// Source-level (background.js can't be require()d — it expects chrome.* at load), the idiom from
+// test/onboarding.test.js. This guards a HALT: cdpWaitNextPage is a 15s wall-clock budget with a
+// cdpAdaptiveDelay(500) interval, so a page clock hanging mid-navigation buys ~7 polls instead of ~30
+// and the walk nav-timeouts on a page that was merely slow to transition.
+test("cdpWaitNextPage disables the page clock around its poll, and restores it", () => {
+  const bg = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
+  const at = bg.indexOf("async function cdpWaitNextPage(");
+  assert.ok(at > 0, "cdpWaitNextPage not found — renamed?");
+  const head = bg.slice(at, bg.indexOf("async function cdpWaitNextPageInner", at));
+  assert.match(head, /cdpPageClockEnabled\(\)/, "must SAVE the current page-clock state");
+  assert.match(head, /cdpSetPageClock\(false\)/, "must SW-time the transition poll");
+  assert.match(head, /finally\s*\{[\s\S]*cdpSetPageClock\(_wasPageClock\)/,
+    "must RESTORE in a finally — the poll has many early returns (session-dead, maintenance, softError, advanced)");
+});
+
 // ── the SCOPE gate — this is the regression that halted a live run ────────────────────────────────
 test("page clock OFF (onboarding/auth/recon) ⇒ SW timer, no page sleep attempted", async () => {
   const calls = [];
@@ -163,4 +182,27 @@ test("page clock is OFF until explicitly enabled (per-run opt-in, reset at attac
   c.cdpSetPageClock(true);
   await c.cdpDelay(20);
   assert.equal(calls.length, 1, "enabling it opts into the page clock");
+});
+
+test("cdpPageClockEnabled reports the state, so a step can SAVE/RESTORE around itself", async () => {
+  const calls = [];
+  const c = makeClock({ sendRaw: fakePageClock(calls) });
+  assert.equal(c.cdpPageClockEnabled(), true);
+  // What cdpWaitNextPage does around the transition poll.
+  const saved = c.cdpPageClockEnabled();
+  c.cdpSetPageClock(false);
+  assert.equal(c.cdpPageClockEnabled(), false);
+  await c.cdpDelay(20);
+  assert.equal(calls.length, 0, "the SW-timed window really is SW-timed");
+  c.cdpSetPageClock(saved);
+  await c.cdpDelay(20);
+  assert.equal(calls.length, 1, "and the page clock comes back afterwards");
+});
+
+test("enabling is announced ONCE, not once per page transition (save/restore must not spam the log)", () => {
+  const c = makeClock({ pageClock: false, sendRaw: fakePageClock([]) });
+  // cdpWaitNextPage flips this off/on around EVERY transition; a 5-page walk would print 5 lines.
+  for (let i = 0; i < 4; i++) { c.cdpSetPageClock(true); c.cdpSetPageClock(false); }
+  c.cdpSetPageClock(true);
+  assert.equal(c.enableLogs().length, 1, `announced once per run, saw ${c.enableLogs().length}`);
 });
