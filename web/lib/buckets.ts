@@ -129,6 +129,47 @@ export const STARTER_BUCKETS: Bucket[] = [
     ],
     selectors: {},
   },
+  // SPONSORSHIP — the other half of the work-authorization pair, and one of the most common screening
+  // questions there is. It had no binding, so the question resolved to no profile path, got no
+  // candidates, and never reached the polarity-lead rule that exists to answer exactly this shape
+  // ("No" → "No, I do not require sponsorship."). It fell to the AI instead and came back flagged
+  // sensitive — a legally-loaded question the profile answers outright.
+  //
+  // Split deliberately by TENSE, because the answers can differ and the difference is legally
+  // material (an F-1 on OPT needs nothing now and sponsorship later):
+  //   • "now or in the future" is TRUE if either is true → bound to requires_sponsorship_FUTURE, the
+  //     broader claim. Binding it to `now` would answer "No" for that student — a false statement.
+  //   • present-tense-only wordings bind to requires_sponsorship_now.
+  {
+    id: "sponsorship_future",
+    profile_path: "work_authorization.requires_sponsorship_future",
+    value: [],
+    category: "",
+    widget_hint: "dropdown",
+    questions: [
+      "Do you now or in the future require visa sponsorship for employment status in the United States?",
+      "Will you now or in the future require sponsorship for employment visa status?",
+      "Will you now or in the future require sponsorship for employment visa status (e.g., H-1B visa status)?",
+      "Do you now or will you in the future require sponsorship for employment visa status?",
+      "Will you require sponsorship for employment visa status now or in the future?",
+      "Will you now, or in the future, require immigration sponsorship for work authorization?",
+    ],
+    selectors: {},
+  },
+  {
+    id: "sponsorship_now",
+    profile_path: "work_authorization.requires_sponsorship_now",
+    value: [],
+    category: "",
+    widget_hint: "dropdown",
+    questions: [
+      "Do you currently require sponsorship for employment visa status?",
+      "Do you require sponsorship to work in the United States?",
+      "Do you require visa sponsorship?",
+      "Are you currently in need of sponsorship for an employment visa?",
+    ],
+    selectors: {},
+  },
   {
     id: "over_18",
     profile_path: "screening.at_least_18_years_old",
