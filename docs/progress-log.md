@@ -4355,3 +4355,59 @@ would preserve both pages even when the field set is genuinely empty.
 Tenants verified end to end today, all hidden, nothing submitted: **moog.wd5** (résumé fix), **cadence.wd1**
 (new tenant, account created, 2× SUBMIT GATE PASSED, AGREE 54 · DISAGREE 0), **marvell.wd1**, plus the
 post-merge regression pass.
+
+## 2026-08-09 (g) — the field-less page key: diagnosed properly, fixed, verified
+
+The kiongroup halt from (f), run to ground. Worth recording how the diagnosis went, because two of my
+readings were wrong before the right one:
+
+1. First read (from the LOG): "two pages both keyed EMPTY and collided." Right conclusion, weak evidence
+   — the ring truncates messages and I split the key on `indexOf("|")`, which can manufacture an empty
+   field-set half out of a truncated line.
+2. The operator refuted the premise: the résumé page and My Information have very different DOMs, so why
+   would both key empty? Fair, and it forced a real check.
+3. Second read (from the BUNDLE, via the tracker's RSC payload — authoritative, no truncation): 4 page
+   keys for 5 filled pages, one of them field-less holding 31 entries. I then read that as "they MERGED,
+   nothing was lost" — also wrong.
+4. Third read, listing the 31 entries: all `workExperience[*]`/`education[0]`/`language`/`website[*]` —
+   ONE page, My Experience. My Information's fields (`source`, `country`, `legalName--*`, `addressLine1`,
+   `city`) were in the bundle NOWHERE. So it WAS an overwrite, and a whole page of the application was
+   gone from the review.
+
+**Cause — two faults, both required.** (a) `fillAndPersistPage` computed the merge key ~40 lines BEFORE
+`awaitFieldSetSettled`, off a scan taken as the page was entered; kiongroup runs the wd3 CSP path (blob
+worker blocked, page timers ~1Hz), so My Information had not mounted its fields and keyed field-less.
+(b) A field-less page has no identity and the pathname is shared by the whole apply flow, so every
+field-less page keys byte-identically as `<path>|` — and My Experience is LEGITIMATELY field-less (all
+its fields sit in repeating sections, which the flat loop skips). `accumulateBundle` drops the prior
+entries for the same physical page, so My Experience overwrote My Information.
+
+Nothing complained at fill time. It surfaced only because `samePhysicalPage` deliberately refuses to
+match a field-less key to anything but itself, so the replay could not match live page 1 and halted
+`replay-page-not-in-bundle`. The halt was the only alarm on a silent data loss.
+
+**Fix.** The key is taken from a SETTLED scan (still pre-fill, so a cascade still cannot change it
+mid-page), and a genuinely field-less page falls back to the walk ordinal — `<path>|#2` overlaps itself
+and nothing else, which is exactly what `samePhysicalPage` needs for the re-fill overwrite. `preScan`'s
+other two consumers (the group-watch diagnostic and `isSelfIdPage`) now read settled data too, which
+quietly fixes `isSelfIdPage` having been able to miss the self-ID page on a slow tenant.
+
+Pinned two ways, both verified failing first: `cdpPageKey` must give two field-less pages distinct keys,
+and — structurally, since this was an ORDER bug that every unit test on `cdpPageKey` itself passed — the
+key must be computed after the settle.
+
+**LIVE-VERIFIED** on kiongroup.wd3, same job, build `pagekey-settled-47b241c`. Five pages now produce
+FIVE distinct keys:
+
+    addressLine1,candidateIsPreviousWorker,city,country,cou…   My Information  (was EMPTY)
+    #2                                                         My Experience   (field-less → ordinal)
+    90b8915caea31001447e9f7107710000,…                         Application Questions
+    ethnicityMulti,gender,veteranStatus                        Voluntary Disclosures
+    dateSignedOn,disabilityForm,disabilityStatus,employeeId    Self Identify
+
+Reported 200 with **42** needing review, up from 14 — because My Information's fields are now in the
+bundle instead of being overwritten. Suite 1237/1237.
+
+**Method note for next time:** read the BUNDLE, not the log, when the question is what the bundle holds.
+Two of the three wrong turns above came from parsing truncated log lines; the RSC payload on the tracker
+page answered it exactly.
