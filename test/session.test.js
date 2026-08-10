@@ -118,3 +118,44 @@ test("cdpPageKey: field ORDER doesn't matter (sorted) + null on missing data", (
   assert.strictEqual(cdpPageKey(null), null);
   assert.strictEqual(cdpPageKey({ url }), null); // no fields
 });
+
+// ── a FIELD-LESS page must still get a UNIQUE key (kiongroup.wd3 live 2026-08-09) ──
+// A page with no flat fields has no identity in this scheme, and the pathname alone is shared by the
+// whole apply flow — so every field-less page produced the byte-identical key "<path>|".
+// accumulateBundle treats identical keys as the same physical page and DROPS the prior entries, so on
+// kiongroup My Experience (legitimately field-less: every field is inside a repeating section) landed
+// on the same key as My Information and OVERWROTE it. The bundle reached review with no
+// name/address/country/source at all — 4 pages recorded for 5 filled — and the rehearsal halted
+// `replay-page-not-in-bundle`, which is the only reason it was noticed.
+test("cdpPageKey: two FIELD-LESS pages get DISTINCT keys (the walk ordinal breaks the tie)", () => {
+  const url = "https://kiongroup.wd3.myworkdayjobs.com/en-US/KION_SCS/job/X/apply/autofillWithResume";
+  const p1 = cdpPageKey({ url, fields: [] }, 1);
+  const p2 = cdpPageKey({ url, fields: [] }, 2);
+  assert.notStrictEqual(p1, p2, "two field-less pages must NOT share a key — the second overwrites the first");
+  // stable across re-runs: the same page, same ordinal, same key (so a re-fill OVERWRITES, not duplicates)
+  assert.strictEqual(cdpPageKey({ url, fields: [] }, 2), p2);
+  // a page WITH fields is unaffected — the key stays the field-set, byte-identical to before
+  const withFields = cdpPageKey({ url, fields: [{ fieldName: "country" }, { fieldName: "addressLine1" }] }, 1);
+  assert.strictEqual(withFields, new URL(url).pathname + "|addressLine1,country");
+  // and a field-less key can never collide with a real one
+  assert.notStrictEqual(p1, withFields);
+});
+
+// The ordering that CAUSED it: the key was computed off a scan taken as the page was entered, BEFORE
+// awaitFieldSetSettled, so on a slow tenant a page whose fields had not mounted read as field-less.
+// Structural, because this is an ORDER bug — every unit test on cdpPageKey itself passed while the
+// caller handed it an empty scan. Both lines live in fillAndPersistPage.
+test("fillAndPersistPage computes the page key AFTER the field set has settled", () => {
+  const fs = require("fs"), path = require("path");
+  const src = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
+  const start = src.indexOf("async function fillAndPersistPage");
+  assert.ok(start > 0, "could not find fillAndPersistPage");
+  const body = src.slice(start, start + 12000);
+  const settleAt = body.indexOf("await awaitFieldSetSettled(");
+  const keyAt = body.indexOf("cdpPageKey(preScan");
+  assert.ok(settleAt > 0, "fillAndPersistPage should settle the field set");
+  assert.ok(keyAt > 0, "fillAndPersistPage should compute the page key from a scan");
+  assert.ok(keyAt > settleAt,
+    "the page key is computed BEFORE awaitFieldSetSettled, so a page whose fields have not mounted yet " +
+    "keys as field-less and gets overwritten by the next field-less page (kiongroup.wd3, 2026-08-09)");
+});
