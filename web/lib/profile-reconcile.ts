@@ -19,7 +19,7 @@
  *    silently dropped
  *  - existing entries nobody targeted are KEPT untouched; smart merge never deletes
  */
-import type { Profile } from "./profile-schema";
+import { collectTechStack, unionSkills, type Profile } from "./profile-schema";
 
 /** Repeating sections a resume can describe as discrete, matchable entries. */
 export const RECONCILE_SECTIONS = [
@@ -250,17 +250,12 @@ export function applyReconcilePlan(
   }
 
   // Skills are a flat vocabulary, not matchable entries: UNION them so a new resume
-  // contributes without dropping skills the user added by hand. Case-insensitive
-  // de-dupe, first spelling wins.
-  if (parsed.skills.length) {
-    const seen = new Set(out.skills.map((s) => s.toLowerCase()));
-    for (const s of parsed.skills) {
-      if (!seen.has(s.toLowerCase())) {
-        out.skills.push(s);
-        seen.add(s.toLowerCase());
-      }
-    }
-  }
+  // contributes without dropping skills the user added by hand. The resume's per-role
+  // tech_stack lines join the same union — the extension only fills from this flat
+  // list, so a tool named under a job but not in the Skills section would otherwise
+  // never reach a skills picker. Read off `out`, so it includes the entries this merge
+  // just added. Case-insensitive; the existing spelling wins.
+  out.skills = unionSkills(out.skills, parsed.skills.concat(collectTechStack(out))).skills;
   // Presentation-only grouping: take the resume's if it has one.
   if (parsed.skill_groups.length) out.skill_groups = structuredClone(parsed.skill_groups);
 

@@ -8,10 +8,12 @@ import {
   buildReconcilePrompt,
   parseReconcileReply,
   validatePlan,
+  applyReconcilePlan,
   entryLabel,
   RECONCILE_SECTIONS,
   type ReconcileSection,
 } from "@/lib/profile-reconcile";
+import { diffProfile, profileFingerprint } from "@/lib/profile-diff";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -56,6 +58,10 @@ export async function POST(req: Request) {
   if (!raw) return bad("The model's reply wasn't valid JSON. Try again.", 502);
 
   const plan = validatePlan(current, parsedIn.data, raw);
+  // The same before/after the other two modes show, produced by running the REAL apply
+  // against a clone — the preview cannot describe something the commit won't do.
+  const after = applyReconcilePlan(current, parsedIn.data, plan).profile;
+  const diff = diffProfile(current, after);
 
   // Render the plan against real labels so the UI shows what a human can check.
   const preview = plan.decisions.map((d) => {
@@ -80,6 +86,8 @@ export async function POST(req: Request) {
     ok: true,
     plan,
     preview,
+    diff,
+    fingerprint: profileFingerprint(current),
     // Sections the resume said nothing about — untouched either way, worth stating.
     untouched: RECONCILE_SECTIONS.filter((s) => ((parsedIn.data[s] ?? []) as unknown[]).length === 0),
   });

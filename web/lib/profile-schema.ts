@@ -460,6 +460,48 @@ export const PARSED_ARRAY_SECTIONS = [
 
 export type ParsedSection = (typeof PARSED_ARRAY_SECTIONS)[number] | "personal_info";
 
+/**
+ * Every `tech_stack` entry across work experience and projects, de-duped.
+ *
+ * The resume states these as per-role technology lines, but the extension only ever
+ * fills from the FLAT `skills` list — so a tool you listed under a job but not in your
+ * skills section would never reach a Workday skills picker. Order preserved, first
+ * spelling wins.
+ */
+export function collectTechStack(p: Profile): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: unknown) => {
+    if (typeof raw !== "string") return;
+    const t = raw.trim();
+    if (!t) return;
+    const k = t.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(t);
+  };
+  for (const w of p.work_experience) (w.tech_stack ?? []).forEach(push);
+  for (const pr of p.projects) (pr.tech_stack ?? []).forEach(push);
+  return out;
+}
+
+/** Case-insensitive union; the existing spelling wins so the user's casing survives. */
+export function unionSkills(into: string[], add: string[]): { skills: string[]; added: string[] } {
+  const skills = into.slice();
+  const seen = new Set(skills.map((s) => s.toLowerCase()));
+  const added: string[] = [];
+  for (const s of add) {
+    const t = typeof s === "string" ? s.trim() : "";
+    if (!t) continue;
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    skills.push(t);
+    added.push(t);
+  }
+  return { skills, added };
+}
+
 export type ReplaceResult = {
   profile: Profile;
   /** Sections actually overwritten (the parse found something for them). */
@@ -507,6 +549,16 @@ export function replaceProfileSections(base: Profile, incoming: Profile): Replac
     if (JSON.stringify(cur) === JSON.stringify(inc)) continue; // no-op, don't report it
     (out as Record<string, unknown>)[k] = structuredClone(inc);
     replaced.push(k);
+  }
+
+  // Fold the resume's per-role tech_stack into the flat skills list. Done AFTER the
+  // section replace so it reads off the entries that actually landed. Additive only —
+  // it can promote a skill the resume's own Skills line omitted, never remove one.
+  const tech = collectTechStack({ ...out, work_experience: out.work_experience, projects: out.projects });
+  const union = unionSkills(out.skills, tech);
+  if (union.added.length) {
+    out.skills = union.skills;
+    if (!replaced.includes("skills")) replaced.push("skills");
   }
 
   const droppedLadders: string[] = [];
