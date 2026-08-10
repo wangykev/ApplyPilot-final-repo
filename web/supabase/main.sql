@@ -13,6 +13,14 @@
 -- older schema.sql snapshot.
 --
 -- Generated from migrations/ 0001-0016. If you add a migration later, append it here too.
+--
+-- VERIFIED by execution (2026-08-10), not by reading it: run against a real Postgres (PGlite) with
+-- Supabase's auth/storage objects stubbed —
+--   * fresh database        -> succeeds; 7 tables, every applications column, RLS policies present
+--   * run a SECOND time     -> succeeds (idempotent)
+--   * over a database already holding 'filling' rows under the old constraint -> succeeds, and the
+--     rows re-home by bundle presence (bundle -> needs_review, none -> queued) with nothing else
+--     touched and no row lost
 
 
 -- ==========================================================================
