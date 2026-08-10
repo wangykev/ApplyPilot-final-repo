@@ -115,6 +115,26 @@ test("parking is idempotent — re-parking the same answer does not duplicate", 
   assert.equal(park.filter((e) => e.answer === "true").length, 1);
 });
 
+test("RE-READING the resume and merging keeps the ladder when the answer is the same", () => {
+  // The operator's case: the resume gets parsed again and smart-merged. An entry is rewritten
+  // (description, dates), but the field the ladder is bound to still holds the same answer — so the
+  // ladder must not so much as flinch.
+  const base = coerceProfile({
+    work_experience: [{ job_title: "FW Intern", company: "Acme", role_description: "old text" }],
+    answer_ladders: { "work_experience.0.company": { yes: [], no: [], values: ["Acme Corp", "Acme Inc."] } },
+  });
+  const afterMerge = structuredClone(base);
+  afterMerge.work_experience[0].role_description = "rewritten by the new resume";
+  afterMerge.work_experience[0].job_title = "Firmware Intern";
+
+  const r = reconcileLaddersToProfile(base, afterMerge);
+  assert.deepEqual(r.parked, [], "same company ⇒ nothing parked");
+  assert.deepEqual(
+    r.profile.answer_ladders["work_experience.0.company"].values,
+    ["Acme Corp", "Acme Inc."],
+  );
+});
+
 test("a profile with no ladders is untouched", () => {
   const p = coerceProfile({ screening: { at_least_18_years_old: true } });
   const r = reconcileLaddersToProfile(p, setAge(p, false));

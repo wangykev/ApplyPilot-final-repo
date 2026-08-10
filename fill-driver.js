@@ -1225,6 +1225,25 @@ function bucketWouldAnswer(bucket, profile, widgetType) {
 //
 // Under-including is safe by construction: the batch is a cache, not a gate, so a field wrongly skipped
 // here simply makes its own per-field call exactly as it does today. Wrongly INCLUDING is what costs.
+/**
+ * The self-ID form's DISPLAY-LANGUAGE dropdown — page chrome, not an application answer.
+ *
+ * Deliberately narrow, because the dangerous direction is hijacking a REAL question: a tenant's
+ * language-PROFICIENCY section also labels a field "Language", and answering that from page chrome
+ * would be a wrong answer on the application. Three conditions together:
+ *   • the label is exactly "language" (not "languages", not "language proficiency")
+ *   • it is a dropdown
+ *   • the page carries the self-ID signature — the same tell isSelfIdPage uses
+ * The proficiency section lives on its own page and inside repeating containers (which the flat loop
+ * skips anyway), so it can never satisfy the third condition.
+ */
+function isSelfIdLanguageField(f, scanFields) {
+  if (!f || f.widgetType !== "dropdown") return false;
+  if (apMatch.normalizeLabel(String(f.label || "")) !== "language") return false;
+  const names = new Set((Array.isArray(scanFields) ? scanFields : []).map((x) => x && x.fieldName).filter(Boolean));
+  return names.has("disabilityStatus") || names.has("disabilityForm") || (names.has("dateSignedOn") && names.has("name"));
+}
+
 function deterministicTierFor(f, profile, bucketIndex, empCompany) {
   const mappedPath = FIELD_MAP[f.fieldName] || null;
   if (mappedPath) {
@@ -4318,6 +4337,59 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     // review-flagged there). Unrecognized / unevaluable / polarity-unmappable / commit-failed → the
     // AI/blank fallback (a commit-fail sets `resolved`, so producedNothing stays false and the AI can
     // never override a made decision).
+    // ── SELF-ID PAGE LANGUAGE SELECTOR — page chrome, not an answer (operator 2026-08-10) ──────────
+    // Workday's self-identification form carries a "Language" dropdown that picks which language the
+    // DISCLOSURE FORM renders in. It says nothing about the applicant. But it is REQUIRED, and because
+    // it sits on the EEO page the AI pass classified it as a demographic and stamped it with the loud
+    // "AI-GUESSED DEMOGRAPHIC — VERIFY" badge — the single noisiest flag we have, on a field that is
+    // not even a question. Fill it deterministically and record it plainly: it belongs in the bundle
+    // (we did set it) but never in the review pile.
+    if (f.widgetType === "dropdown" && record.resolved == null && record.status !== "filled"
+        && record.status !== "filled_review" && isSelfIdLanguageField(f, scan.fields)) {
+      try {
+        const norm = apMatch.normalize;
+        const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+        const enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+        // Keep whatever the page already shows — that IS the language it is rendering in. Otherwise
+        // take English, and if the tenant does not offer it, leave the page's own default alone rather
+        // than picking a language at random.
+        const target = hasLiveValue(before)
+          ? enabledTexts.find((t) => norm(t) === norm(before)) || null
+          : enabledTexts.find((t) => norm(t) === "english") || null;
+        record.mappedPath = "(self-id-page-language)";
+        record.options = enabledTexts;
+        if (!target) {
+          const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+          record.status = "skipped";
+          record.after = cz.after != null ? cz.after : before;
+          record.detail = "the self-ID form's display-language selector — left as the page had it (not an application answer)";
+        } else if (hasLiveValue(before) && norm(before) === norm(target)) {
+          const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+          record.status = "filled"; record.verified = true; record.matchTier = "label-exact";
+          record.resolved = [target];
+          record.after = cz.after != null ? cz.after : target;
+          record.detail = "the self-ID form's display language — already set; kept (not an application answer)";
+        } else {
+          await act.clickDropdownOptionByText(loc, target);
+          const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets,
+            (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+          try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort */ }
+          record.resolved = [target];
+          record.after = cr.after;
+          record.verified = !!cr.ok;
+          record.matchTier = "label-exact";
+          // NO review flag either way: an unverified display-language pick is not worth a human's time,
+          // and flagging it is exactly the noise this branch exists to remove.
+          record.status = cr.ok ? "filled" : "skipped";
+          record.detail = cr.ok
+            ? "the self-ID form's display language (not an application answer)"
+            : "the self-ID form's display-language selector — commit not confirmed; harmless, not an application answer";
+        }
+      } catch (e) {
+        record.detail = "self-ID display-language selector: " + String((e && e.message) || e);
+      }
+    }
+
     if ((f.widgetType === "radio" || f.widgetType === "dropdown" || f.widgetType === "text"
          || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
         && record.status !== "filled" && record.status !== "filled_review") {
@@ -7994,5 +8066,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, isSelfIdLanguageField, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
