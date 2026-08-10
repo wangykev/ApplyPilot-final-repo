@@ -1,19 +1,31 @@
--- ApplyPilot Web — CONSOLIDATED schema snapshot.
+-- ApplyPilot Web — main.sql
 --
--- This is every file in migrations/ concatenated IN ORDER, for a one-paste setup in the
--- Supabase SQL editor. All statements are idempotent (create ... if not exists / drop ...+create
--- for policies & triggers / add column if not exists / on conflict do nothing), so running this
--- on a FRESH database sets everything up, and re-running it on an EXISTING one is a safe no-op
--- that brings it up to date.
+-- THE WHOLE DATABASE IN ONE FILE. Every migration, in order, in a form that is safe to run more
+-- than once: create ... if not exists, add column if not exists, drop+create for policies and
+-- triggers, drop constraint if exists before add.
 --
--- SOURCE OF TRUTH is still the numbered migrations/ files. After adding a new migration,
--- regenerate this file with:
---     cat web/supabase/migrations/0*.sql > web/supabase/schema.sql   (then re-add this header)
--- Do NOT put this file inside migrations/ (a runner would try to apply it out of order).
+-- So this sets up a FRESH database, and running it again on a LIVE one brings it up to date
+-- WITHOUT touching your data: there is no drop table, no delete, and no truncate anywhere in this
+-- file. The single statement that writes to existing rows is in 0016, which re-homes applications
+-- that were left on the retired 'filling' status.
+--
+-- Paste into the Supabase SQL editor and run. Replaces the numbered files in migrations/ and the
+-- older schema.sql snapshot.
+--
+-- Generated from migrations/ 0001-0016. If you add a migration later, append it here too.
+--
+-- VERIFIED by execution (2026-08-10), not by reading it: run against a real Postgres (PGlite) with
+-- Supabase's auth/storage objects stubbed —
+--   * fresh database        -> succeeds; 7 tables, every applications column, RLS policies present
+--   * run a SECOND time     -> succeeds (idempotent)
+--   * over a database already holding 'filling' rows under the old constraint -> succeeds, and the
+--     rows re-home by bundle presence (bundle -> needs_review, none -> queued) with nothing else
+--     touched and no row lost
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0001_init.sql
--- ============================================================================
+-- ==========================================================================
 -- ApplyPilot Web — initial schema.
 -- Run in the Supabase SQL editor (or `supabase db push`). RLS is keyed to
 -- auth.uid(); every table is private to its owner.
@@ -26,7 +38,7 @@ create table if not exists public.profiles (
   profile_json      jsonb not null default '{}'::jsonb,
   defaults_json     jsonb not null default '{}'::jsonb,
   job_context_json  jsonb not null default '{}'::jsonb,
-  ai_config         jsonb not null default '{}'::jsonb,  -- v2: + keys{} routes{} fallbacks[] preferFreeFirst thinking effort (WEBSITE.md); apiKey kept as a legacy mirror
+  ai_config         jsonb not null default '{}'::jsonb,  -- {provider,model,apiKey,enabled}
   created_at        timestamptz not null default now(),
   updated_at        timestamptz not null default now()
 );
@@ -57,7 +69,7 @@ create trigger on_auth_user_created
 create table if not exists public.resumes (
   id            uuid primary key default gen_random_uuid(),
   user_id       uuid not null references auth.users (id) on delete cascade,
-  kind          text not null default 'default' check (kind in ('default','variant','source')),
+  kind          text not null default 'default' check (kind in ('default','variant')),
   job_id        uuid,
   filename      text not null,
   mime          text not null default 'application/pdf',
@@ -101,30 +113,13 @@ create table if not exists public.queue_items (
   status      text not null default 'pending'
                 check (status in ('pending','active','done','error')),
   position    integer not null default 0,
-  created_at  timestamptz not null default now(),
-  -- Job-discovery columns (0010). A pasted row leaves these null; a discovered row
-  -- carries its board, posted date, and the description the extension scraped by
-  -- opening the posting. job_key is the dedup identity (lockstep with
-  -- web/lib/discover.ts) and matches applications.job_key for Workday postings.
-  job_key         text,
-  company         text,
-  role            text,
-  source          text,
-  location        text,
-  posted_at       timestamptz,
-  job_description text
+  created_at  timestamptz not null default now()
 );
 
 alter table public.queue_items enable row level security;
 drop policy if exists "queue owner" on public.queue_items;
 create policy "queue owner" on public.queue_items
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
-
-create unique index if not exists queue_items_user_job_key_uidx
-  on public.queue_items (user_id, job_key)
-  where job_key is not null;
-create index if not exists queue_items_user_created_idx
-  on public.queue_items (user_id, created_at desc);
 
 -- --------------------------------------------------------------- reminders
 create table if not exists public.reminders (
@@ -202,9 +197,10 @@ drop policy if exists "resume objects owner delete" on storage.objects;
 create policy "resume objects owner delete" on storage.objects
   for delete using (bucket_id = 'resumes' and (storage.foldername(name))[1] = auth.uid()::text);
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0002_buckets.sql
--- ============================================================================
+-- ==========================================================================
 -- Profile v2 — answer buckets.
 -- One jsonb array of buckets per user (see web/lib/buckets.ts + docs/profile-v2-plan.md).
 -- NULL  = never provisioned  → the app seeds STARTER_BUCKETS on first load.
@@ -214,9 +210,10 @@ create policy "resume objects owner delete" on storage.objects
 alter table public.profiles
   add column if not exists buckets_json jsonb;
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0003_attachments.sql
--- ============================================================================
+-- ==========================================================================
 -- Profile v2 — attachments (per-specialty files + general additional documents).
 -- Private Storage bucket; objects are namespaced under the user id:
 --   attachments/<auth.uid()>/<file>
@@ -244,9 +241,10 @@ drop policy if exists "attachment objects owner delete" on storage.objects;
 create policy "attachment objects owner delete" on storage.objects
   for delete using (bucket_id = 'attachments' and (storage.foldername(name))[1] = auth.uid()::text);
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0004_teach_dismissed.sql
--- ============================================================================
+-- ==========================================================================
 -- Teach flow — persistently-dismissed cards.
 -- A jsonb array of normalized question keys the user SKIPPED on /app/teach, so a skipped card
 -- never reappears (teachableCards excludes them). NULL / absent = nothing dismissed yet.
@@ -255,9 +253,10 @@ create policy "attachment objects owner delete" on storage.objects
 alter table public.profiles
   add column if not exists teach_dismissed_json jsonb;
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0005_applications_soft_delete.sql
--- ============================================================================
+-- ==========================================================================
 -- Soft-delete for applications: deleting a fill on the tracker HIDES it from the tracker but KEEPS the
 -- row (and its review_bundle_json) so any answers the operator APPROVED still surface on the teach page.
 -- The tracker/applications queries filter `deleted_at is null`; the teach queries read all bundles.
@@ -271,9 +270,10 @@ create index if not exists applications_user_live_idx
   on public.applications (user_id, created_at desc)
   where deleted_at is null;
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0006_job_description.sql
--- ============================================================================
+-- ==========================================================================
 -- Store the scraped job-description text on the application row. The Run flow
 -- (website "Run" button → extension) scrapes the JD from the posting before it
 -- clicks Apply, then persists it here so the tracker can show it and the
@@ -282,9 +282,10 @@ create index if not exists applications_user_live_idx
 alter table public.applications
   add column if not exists job_description text;
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0007_credentials.sql
--- ============================================================================
+-- ==========================================================================
 -- Workday account sign-in credentials + the Gmail auto-verify toggle, stored on
 -- the profile row so they sync to the connected extension like the AI key does.
 -- credentials_json = { email, password } (mirrors chrome.storage.local.credentials);
@@ -295,9 +296,10 @@ alter table public.profiles
   add column if not exists credentials_json jsonb not null default '{}'::jsonb,
   add column if not exists onboard_config   jsonb not null default '{}'::jsonb;
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0008_job_key.sql
--- ============================================================================
+-- ==========================================================================
 -- Stable per-job dedup key for tracker rows. A Workday application URL changes every run (after
 -- login the form is on <tenant>.wdN.myworkdaysite.com with a per-application-instance path), so
 -- keying the row by url piled up a new row per run. job_key = "<tenant.wdN>:r<reqid>" (see
@@ -310,9 +312,10 @@ alter table public.applications
 create index if not exists applications_user_job_key_idx
   on public.applications (user_id, job_key);
 
--- ============================================================================
+
+-- ==========================================================================
 -- 0009_teach_deleted.sql
--- ============================================================================
+-- ==========================================================================
 -- Teach flow — permanently-discarded skipped cards.
 -- A jsonb array of normalized question keys the user DELETED from the /app/teach "Skipped" list.
 -- These keys are a SUBSET of teach_dismissed_json (still out of the active queue), and are ALSO
@@ -325,9 +328,44 @@ alter table public.profiles
   add column if not exists teach_deleted_json jsonb;
 
 
--- ============================================================================
+-- ==========================================================================
+-- 0010_queue_discovery.sql
+-- ==========================================================================
+-- Job discovery (the Discover button on /app/run) writes into the SAME queue the
+-- operator pastes links into, so the queue row has to carry what a discovered job
+-- knows: where it came from, when it was posted, and the description the extension
+-- scraped by opening the posting. A pasted row simply leaves these null — nothing
+-- about the existing paste flow changes.
+--
+-- job_key is the dedup identity, LOCKSTEP with web/lib/discover.ts discoveryJobKey
+-- and the extension's discover.js. It extends the tracker's canonicalJobUrl with
+-- the board ids (linkedin:<id>, handshake:<id>, greenhouse:<co>:<id>, …), and for a
+-- Workday posting it produces the SAME key applications.job_key holds — that is what
+-- makes "jobs I have not already applied to" work across the two tables.
+alter table public.queue_items
+  add column if not exists job_key         text,
+  add column if not exists company         text,
+  add column if not exists role            text,
+  add column if not exists source          text,
+  add column if not exists location        text,
+  add column if not exists posted_at       timestamptz,
+  add column if not exists job_description text;
+
+-- One row per job per user. PARTIAL so the pre-existing pasted rows (job_key null)
+-- are untouched and a future paste without a key can still be inserted — Postgres
+-- would treat multiple nulls as distinct anyway, but being explicit documents it.
+create unique index if not exists queue_items_user_job_key_uidx
+  on public.queue_items (user_id, job_key)
+  where job_key is not null;
+
+-- The discovery dedup reads every existing key for the user on each sweep.
+create index if not exists queue_items_user_created_idx
+  on public.queue_items (user_id, created_at desc);
+
+
+-- ==========================================================================
 -- 0011_application_login.sql
--- ============================================================================
+-- ==========================================================================
 -- WHICH Workday account each application was filed with (operator ask 2026-07-26).
 --
 -- Workday accounts are per-tenant, so "what did I sign in as on this one?" is a real question weeks
@@ -356,3 +394,156 @@ alter table public.applications
 -- "Which applications went through this account?" — the lookup this column exists to answer.
 create index if not exists applications_user_login_email_idx
   on public.applications (user_id, login_email);
+
+
+-- ==========================================================================
+-- 0012_queue_job_details.sql
+-- ==========================================================================
+-- 0012 — the details worth seeing in the queue BEFORE opening a posting.
+--
+-- Operator 2026-07-30: "on the queue, give more information like the pay, start
+-- date/end date if they have and other important information."
+--
+-- Discovery already reads all of this out of each board's own job record — it was
+-- simply being thrown away at the queue boundary, so a row showed only company /
+-- role / location / age. One JSONB column rather than eight scalars because the set
+-- is board-dependent and still settling: Handshake publishes pay and a term,
+-- LinkedIn publishes neither (its `salaryInsights` is a link to its salary tool, not
+-- a number), and a nullable jsonb absorbs the next field without another migration.
+--
+-- Nothing here is required. A pasted row, or a row written before this migration,
+-- leaves it NULL and the queue renders exactly as it did.
+--
+-- Shape (all optional, see web/lib/discover.ts → toQueueRow):
+--   {
+--     pay:        "$20-30/hr",        -- as the BOARD words it; absent ⇒ not stated
+--     start_date: "2026-08-14",       -- the term, when the board gives one
+--     end_date:   "2026-12-14",
+--     apply_by:   "2026-08-26",       -- the board's own application deadline
+--     workplace:  "Remote",           -- Remote | Hybrid | On-site
+--     employment_type: "Internship",
+--     applicants: 6,                  -- read + displayed, but NOT ranked on
+--     match_percent: 84,              -- why this row was queued
+--     match_reasons: ["title matches embedded, software", "posted 3h ago"],
+--     reposted:   true,               -- the board's date was a BUMP…
+--     original_posted_at: "2026-05-27T19:15:00Z",  -- …this is the real one
+--     apply_note: "apply using the external link only"
+--   }
+alter table public.queue_items
+  add column if not exists details jsonb;
+
+comment on column public.queue_items.details is
+  'Optional per-posting extras from discovery: pay, term dates, apply-by deadline, workplace, applicant count, match score + reasons, and the ORIGINAL posted date when the board was showing a repost. Null for pasted rows.';
+
+
+-- ==========================================================================
+-- 0013_llm_calls.sql
+-- ==========================================================================
+-- One row per model call, for the AI usage tracker (/app/usage).
+--
+-- WHY A LEDGER AND NOT A COUNTER: the two questions worth answering pull in opposite
+-- directions. "What am I spending?" is a sum over paid calls. "How much of my free Gemini
+-- allowance is left today?" is a COUNT per model per day against a 500/day cap — and that
+-- cap is per MODEL, which is exactly why the fallback chain exists. A pair of running
+-- totals can answer neither once you slice by day, model, action or key. Rows are small and
+-- one application produces tens of them, not thousands.
+--
+-- cost_usd is NULLABLE ON PURPOSE, and null does not mean free:
+--   0     a free-tier Gemini call — genuinely costs nothing
+--   n     a priced model, computed from LLM_PRICING at call time
+--   null  the rate is not known (Gemini paid, OpenAI). Storing 0 there would silently
+--         under-report spend, so the page shows those calls as "unpriced" instead of
+--         folding them into a total as if they were free.
+-- Cost is frozen at call time rather than derived later: rates change, and a historical row
+-- should keep what it actually cost.
+create table if not exists public.llm_calls (
+  id            bigserial primary key,
+  user_id       uuid not null references auth.users (id) on delete cascade,
+
+  -- What ran. `action` is the routable id (fill / essay / resume_parse / cover_letter) so
+  -- the page can answer "which job is burning my quota?" — the whole point of per-action
+  -- routing. Kept as text, not an enum: the action list evolves (teach became an alias of
+  -- fill), and a migration to add an enum value for every new capability is friction with
+  -- no benefit here.
+  provider      text not null,
+  model         text not null,
+  action        text not null,
+
+  -- Which key served it, and on which tier. After a rotation the key that answered is not
+  -- the one first tried, so this is the only record of who actually paid. `key_id` is the
+  -- operator's own key id from llmConfig — never the secret itself.
+  key_id        text,
+  key_tier      text,
+
+  tokens_in     integer not null default 0,
+  tokens_out    integer not null default 0,
+  cost_usd      numeric(12, 6),
+
+  -- ok=false rows are kept deliberately: a run of rate_limit/quota failures is the signal
+  -- that a key is spent, and dropping them would hide exactly the pattern the tracker
+  -- exists to surface. `error_code` is the classifyLlmFailure code (auth / quota /
+  -- rate_limit / provider_down / bad_request / not_found / unknown).
+  ok            boolean not null default true,
+  error_code    text,
+
+  -- Where the call came from: 'extension' (the form fill) or 'web' (resume parse, cover
+  -- letter). Worth separating because the extension is by far the higher-volume caller and
+  -- reaches the DB through the ingest route rather than directly.
+  source        text not null default 'web',
+
+  created_at    timestamptz not null default now()
+);
+
+alter table public.llm_calls enable row level security;
+
+-- drop+create (not a bare create): every other policy in this schema is written this way so the
+-- whole set can be re-run on a live database without erroring on "policy already exists".
+drop policy if exists "llm_calls owner" on public.llm_calls;
+create policy "llm_calls owner" on public.llm_calls
+  for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- The tracker's own query: this user's calls, newest first, windowed by day.
+create index if not exists llm_calls_user_created_idx
+  on public.llm_calls (user_id, created_at desc);
+
+-- The free-tier quota question: how many calls has THIS model made today? Per-model because
+-- requests-per-day is metered per model, not per key.
+create index if not exists llm_calls_user_model_created_idx
+  on public.llm_calls (user_id, model, created_at desc);
+
+
+-- ==========================================================================
+-- 0015_resume_source.sql
+-- ==========================================================================
+-- Resume SOURCE files (.tex / .docx): the editable document the PDF is generated
+-- from. One source per user (replaced on upload), stored in the same private
+-- `resumes` bucket at <uid>/source.<ext>; the compiled/converted PDF still lands
+-- on the `default` row (whose filename is the user-chosen attachment name).
+alter table public.resumes drop constraint if exists resumes_kind_check;
+alter table public.resumes
+  add constraint resumes_kind_check check (kind in ('default', 'variant', 'source'));
+
+
+-- ==========================================================================
+-- 0016_drop_filling_status.sql
+-- ==========================================================================
+-- Retire the "filling" application status.
+--
+-- It was an IN-PROGRESS state on a row that only a report can move: a run created the row as
+-- 'filling', and a run that errored never reported, so the row sat reading "Filling" forever. A
+-- completed fill with nothing flagged also landed there, because the report fell back to it. Neither
+-- is a state the tracker can act on.
+--
+-- Rows are re-homed by what is actually true of them, not blanket-set:
+--   • has a review bundle  -> 'needs_review' (the fill finished; a human still approves before submit)
+--   • no bundle            -> 'queued'       (nothing was ever captured for it)
+update public.applications
+   set status = case when review_bundle_json is not null then 'needs_review' else 'queued' end
+ where status = 'filling';
+
+-- …then take it out of the allowed set so nothing can write it again.
+alter table public.applications drop constraint if exists applications_status_check;
+alter table public.applications
+  add constraint applications_status_check
+  check (status in ('queued', 'needs_review', 'submitted', 'interviewing', 'offer', 'rejected'));
+

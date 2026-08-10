@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "polarity-capture-1";
+const AP_BUILD_MARKER = "selfid-language-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -113,7 +113,12 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "replay-time-2";
+// ONE build string, two readers: the service-worker start line (above) and AP_PING's `build`.
+// These used to be two independent constants and they DRIFTED — the start line said
+// "worktree-live-submit-1" while AP_PING still answered "replay-time-2", which reads exactly like
+// "the extension is running stale code from another profile" and cost a full round of archaeology
+// (2026-08-10). Alias, never re-declare a literal here: bump AP_BUILD_MARKER only.
+const AP_BUILD = AP_BUILD_MARKER;
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -913,6 +918,28 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           submit.submitted ? "Submitted" : submit.would_submit ? "Rehearsal complete — every gate passed" : "Stopped before submitting",
           submit.stopped || ""
         );
+        // PERSIST THE RUN'S RECORD. Until now a submit run told nobody but the console: the tracker row
+        // still read "needs_review" after a real submission, and Workday's review page — the only proof
+        // of what was actually filed — died with the tab. Report it, so the tracker can show what was
+        // submitted and when. Rehearsals report their snapshot too (status unchanged), which is what
+        // makes it possible to inspect the review page WITHOUT submitting.
+        try {
+          await reportApplication(pull.bundle, store.jobContext || null, {
+            status: submit.submitted ? "submitted" : undefined,
+            reviewPage: submit.review_page || null,
+            submission: {
+              at: new Date().toISOString(),
+              armed: arm,
+              submitted: !!submit.submitted,
+              confirmed: !!submit.confirmed,
+              would_submit: !!submit.would_submit,
+              stopped: submit.stopped || null,
+              blockers: submit.blockers || [],
+              login: runLogin || null,
+              confirmation: submit.confirmation || null,
+            },
+          });
+        } catch (e) { LOG(`could not report the submit run (${String((e && e.message) || e)}) — the run itself is unaffected.`); }
         sendResponse({ ...onb, replayed: true, submit, armed: arm, job_key: jobKey, application_id: pull.application_id || null, login: runLogin, tabId, startUrl });
       } catch (e) {
         sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
@@ -3900,9 +3927,18 @@ async function getRunLoginFor(bundleUrl) {
 // website isn't connected (no apSession) it's a silent no-op. status is NEVER
 // "submitted" (the human submits — the engine only ever fills to review; the WEBSITE
 // writes that status when the operator authorizes a submit from its Run page).
-async function reportApplication(bundle, jobContext) {
+// `extra` (optional) carries the SUBMIT run's own record: Workday's review page as displayed, the
+// confirmation page, and the status the run earned. It rides INSIDE review_bundle rather than as new
+// columns — review_bundle_json is already the JSONB blob the tracker reads, so documenting a submission
+// needs no migration and no change to the ingest contract.
+async function reportApplication(bundle, jobContext, extra) {
   try {
     if (!bundle) return { ok: false, reason: "no-bundle", status: 0 };
+    if (extra && (extra.reviewPage || extra.submission)) {
+      bundle = { ...bundle };
+      if (extra.reviewPage) bundle.workday_review_page = extra.reviewPage;
+      if (extra.submission) bundle.submission = extra.submission;
+    }
     const { apSession } = await new Promise((res) => chrome.storage.local.get("apSession", res));
     if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return;
     const needs = bundle.needs_review_count || 0;
@@ -3921,7 +3957,13 @@ async function reportApplication(bundle, jobContext) {
       // Key on the link the run STARTED from when we have it, so a re-fill updates the SAME row
       // even though a landing hop moved the form URL. Older bundles fall back to the form URL.
       job_key: (bundle.jobKeyUrl || bundle.url) ? canonicalJobUrl(bundle.jobKeyUrl || bundle.url) : null,
-      status: needs > 0 ? "needs_review" : "filling",
+      // A SUBMITTED application outranks the needs-review arithmetic: the flags describe what was
+      // reviewed before filing, not the state of a filed application.
+      // A completed fill is ALWAYS "needs_review" — the human still checks and approves before a
+      // submit, whether or not anything got flagged. It used to fall back to "filling" when nothing
+      // was flagged, which is an in-progress state on a finished run: those rows then sat reading
+      // "Filling" forever, because only a report can move them and the report had already happened.
+      status: (extra && extra.status) || "needs_review",
       needs_review_count: needs,
       captured_at: bundle.captured_at || new Date().toISOString(),
       review_bundle: bundle
@@ -5079,6 +5121,12 @@ async function runCdpReplayWalk(tabId, opts) {
         //    FAILURE (can't confirm) each becomes a HARD gate blocker. extra-on-page is logged, not
         //    blocked (review boilerplate is noisy). Runs even DRY — the operator sees the diff preview. ──
         const reviewDiff = { disagree: [], missing: [], scrapeFailed: false };
+        // WORKDAY'S OWN REVIEW PAGE, kept for the record (operator 2026-08-10: "make sure the review
+        // page before the submission is documented … on the tracker"). This is the read-only text of
+        // what was actually on the application at the moment of submitting — the authority the
+        // reconcile already trusts over our own scan, and the only artefact that survives the tab
+        // closing. Captured whether or not the run is armed, so a rehearsal documents itself too.
+        let reviewSnapshot = null;
         try {
           const hints = bundle.entries
             .filter((e) => e && e.current_value != null && String(e.current_value).trim() !== "" && !isAiPlaceholder(e.current_value))
@@ -5089,6 +5137,15 @@ async function runCdpReplayWalk(tabId, opts) {
           LOG(`review page settled in ${settled.ms}ms — ${settled.records} displayed value(s).`);
           const dump = settled.dump;
           if (dump && dump.ok && Array.isArray(dump.items)) {
+            reviewSnapshot = {
+              captured_at: new Date().toISOString(),
+              url: (nav && nav.url) || null,
+              // Cap the payload: a review page is tens of rows, but a pathological one must not
+              // blow up the report body. Truncation is RECORDED, never silent.
+              items: dump.items.slice(0, 400).map((it) => ({ label: it.label ?? null, value: it.value ?? null, section: it.section ?? null })),
+              truncated: dump.items.length > 400,
+              total_items: dump.items.length,
+            };
             const rec = reconcileReviewPage(dump.items, bundle.entries, { accountEmails: await getAccountEmails() });
             const c = rec.counts;
             reviewDiff.disagree = rec.disagree || [];
@@ -5141,7 +5198,7 @@ async function runCdpReplayWalk(tabId, opts) {
           LOG(`submit gate: ${gate.blockers.length} blocker(s) — NOT submitting:`);
           gate.blockers.forEach((b) => LOG(`    ✗ ${b}`));
           if (!authorize) LOG(`(DRY run — reached review + stopped. When every blocker above is cleared, the armed Submit button will submit once.)`);
-          return { ok: true, stopped: authorize ? "submit-blocked" : "reached-review", reached_review: true, submit_blocked: authorize || undefined, blockers: gate.blockers, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+          return { ok: true, stopped: authorize ? "submit-blocked" : "reached-review", reached_review: true, submit_blocked: authorize || undefined, blockers: gate.blockers, pages_replayed: pagesReplayed.length, pages: pagesReplayed, review_page: reviewSnapshot };
         }
         // GATE PASSED + authorized. ── M5 SAFETY BRAKE ── While simulateSubmit is on, LOG what WOULD
         // happen and DO NOT click — no run submits yet (operator's explicit choice). act.clickSubmit is
@@ -5150,7 +5207,7 @@ async function runCdpReplayWalk(tabId, opts) {
         if (simulateSubmit) {
           submitFired = true; // single-fire (mirrors the real path)
           LOG(`✅✅✅ SUBMIT GATE PASSED — ▶▶ WOULD CLICK SUBMIT NOW ◀◀ (SIMULATE MODE: NOT clicking). Every precondition is satisfied, so an armed run (simulateSubmit:false) would submit the application here.`);
-          return { ok: true, stopped: "would-submit", would_submit: true, simulated: true, reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+          return { ok: true, stopped: "would-submit", would_submit: true, simulated: true, reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed, review_page: reviewSnapshot };
         }
         // (real path — not reached while simulateSubmit is on) → the ONE irreversible click.
         // FORCE TRUSTED for it, even hidden: this is the single action that cannot be undone, so it uses
@@ -5169,7 +5226,30 @@ async function runCdpReplayWalk(tabId, opts) {
         const res = await cdpWaitNextPage(subSig);
         const confirmed = !!(res.advanced && !res.sessionDead && !res.maintenance);
         LOG(confirmed ? `✓✓✓ SUBMITTED — the review page advanced (confirmation). Application submitted.` : `clickSubmit fired but no confirmed advance yet (${JSON.stringify(res)}) — VERIFY on the page.`);
-        return { ok: true, stopped: "submitted", submitted: true, confirmed, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        // READ THE CONFIRMATION PAGE (operator 2026-08-10: "document the confirmation page after
+        // pressing submit"). Best-effort and non-fatal — the submit already happened, so a failure to
+        // read the page must never turn a successful submission into an error. Text only, no clicks.
+        // POLL, don't snapshot. The first live armed submit (2026-08-10) read this the instant the nav
+        // settled and got url-only: title "" and text "" — a confirmation record with no content, which
+        // documents nothing. Workday routes to /jobTasks/completed/application and paints a beat later,
+        // so wait for actual TEXT, keeping the last non-empty read. Bounded and non-fatal: the submit has
+        // already happened, and failing to read the page must never be reported as a failed submission.
+        let confirmation = null;
+        try {
+          for (let i = 0; i < 10; i++) {
+            const c = await cdpEval(() => ({
+              url: location.href,
+              title: document.title,
+              heading: (document.querySelector("h1,h2,[role=heading]") || {}).innerText || null,
+              text: ((document.body && document.body.innerText) || "").replace(/\s+/g, " ").trim().slice(0, 1200),
+            }));
+            if (c) confirmation = c;
+            if (c && (c.text || "").length > 40) break;
+            await cdpDelay(1000);
+          }
+          if (confirmation) LOG(`confirmation page: "${confirmation.title}" — ${String(confirmation.heading || confirmation.text || "(no text read)").slice(0, 140)}`);
+        } catch (e) { LOG(`could not read the confirmation page (${String((e && e.message) || e)}) — the submit still went through.`); }
+        return { ok: true, stopped: "submitted", submitted: true, confirmed, pages_replayed: pagesReplayed.length, pages: pagesReplayed, review_page: reviewSnapshot, confirmation };
       }
 
       LOG(`──── REPLAY PAGE ${page} ────${reloadsUsed ? ` (walk restart ${reloadsUsed})` : ""}`);
@@ -6446,6 +6526,8 @@ async function runCdpOnboard(tabId, opts) {
   const relock = async () => { try { await installInputLock(); } catch (e) { /* best-effort */ } };
   await relock();
   let accountCreated = false, verified = false, softReloads = 0;
+  // AUTH LOOP GUARD (operator 2026-08-10). See the wrong_credentials branch in the auth loop.
+  let wrongCredCount = 0, accountKnownToExist = false;
   // Workday sometimes returns an EMPTY shell after the sign-in submit — recoverable by a reload
   // (see isBlankAuthPage). RUN-level budget: if refreshing twice doesn't restore a real page, it's
   // not a hiccup any more and the operator gets a self-explaining halt.
@@ -7572,7 +7654,41 @@ async function runCdpOnboard(tabId, opts) {
           return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified, resume_autofilled: resumeAutofilled };
         }
         if (out === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
-        if (out === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
+        // wrong_credentials → the account may simply not exist yet, so the FIRST rejection earns one
+        // create-account attempt. Past that it is a LOOP, and looping here is actively harmful.
+        //
+        // Live 2026-08-10 (analogdevices.wd1, a plain gmail address with a pre-existing account): sign-in
+        // was rejected → create-account → Workday said the email was taken → back to sign-in → rejected →
+        // … eight attempts, until the run died on an unrelated detach. Nothing about that sequence could
+        // ever have succeeded: creating an account cannot fix a wrong password, and re-submitting a bad
+        // password is precisely what makes a tenant LOCK the account. The operator's read was "my account
+        // may be locked" — the machine should have said that on attempt 2 instead of hammering it.
+        //
+        // So: halt with the specific reason. `accountKnownToExist` (Workday itself said "already exists")
+        // gives the confident message; otherwise report the repeat honestly without asserting a cause we
+        // did not observe — the same discipline as the signin-no-outcome branch below.
+        if (out === "wrong_credentials") {
+          wrongCredCount++;
+          if (accountKnownToExist) {
+            return haltNeedsOperator(
+              "auth-password-rejected",
+              `Workday says an account already exists for ${creds.email}, but the stored password was rejected. Update the password on the Sign-in page (or use a different email). Stopping rather than retrying — repeated failed sign-ins are what lock a Workday account.`,
+              st,
+            );
+          }
+          if (wrongCredCount >= 2) {
+            return haltNeedsOperator(
+              "auth-credentials-rejected",
+              `Sign-in as ${creds.email} was rejected ${wrongCredCount}× and creating an account did not resolve it. Check the email/password on the Sign-in page; the account may also be locked. Stopping rather than retrying.`,
+              st,
+            );
+          }
+          const cr = await doCreateAccount(st);
+          if (!cr.ok) return { ...cr, ok: true };
+          if (cr.alreadyExists) accountKnownToExist = true;
+          accountCreated = true;
+          continue;
+        }
         if (isAlreadyApplied(st)) return alreadyAppliedResult(); // signed in successfully → Workday shows already-applied instead of the form
         // Sign-in never resolved and the form is STILL up → a block (most likely the breach dialog) is up
         // and Enter didn't clear it. Halt SPECIFICALLY (not a vague auth-unknown) so the operator can act.
@@ -7585,9 +7701,12 @@ async function runCdpOnboard(tabId, opts) {
         return haltNeedsOperator("auth-unknown", `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}`, st);
       }
 
-      // No sign-in form but a create-account affordance → create directly.
+      // No sign-in form but a create-account affordance → create directly. Records "already exists"
+      // the same way the wrong_credentials branch does, so arriving here first still arms the loop guard.
       if (st.markers.createAccountLink || st.markers.createAccountSubmit || st.markers.verifyPassword) {
-        const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue;
+        const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true };
+        if (cr.alreadyExists) accountKnownToExist = true;
+        accountCreated = true; continue;
       }
 
       return haltNeedsOperator("auth-unrecognized", st.title, st);

@@ -4,6 +4,11 @@ import { ArrowLeft, ExternalLink, KeyRound } from "lucide-react";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, DEV_PREVIEW } from "@/lib/env";
 import { ReviewEditor } from "@/components/app/review/ReviewEditor";
+import {
+  SubmittedRecord,
+  type SubmissionRecord,
+  type WorkdayReviewPage,
+} from "@/components/app/SubmittedRecord";
 import { JobDescriptionButton } from "./JobDescriptionButton";
 import type { ReviewBundle } from "@/lib/review-summary";
 import type { Application } from "../shared";
@@ -110,6 +115,13 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
           </div>
         </div>
       </div>
+
+      {/* The submit run's own record sits ABOVE the editor: once an application is filed, "what was
+          actually submitted" is the question you come back for, not "what should I approve". */}
+      <SubmittedRecord
+        submission={(bundle as unknown as { submission?: SubmissionRecord })?.submission ?? null}
+        reviewPage={(bundle as unknown as { workday_review_page?: WorkdayReviewPage })?.workday_review_page ?? null}
+      />
 
       {bundle ? (
         <ReviewEditor appId={id} initialBundle={bundle} canPersist={persistable} />

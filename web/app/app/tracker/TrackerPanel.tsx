@@ -10,7 +10,6 @@ import { clsx } from "@/lib/clsx";
 
 const COLOR: Record<AppStatus, string> = {
   queued: "#7E8C9E",
-  filling: "#FFB627",
   needs_review: "#FFB627",
   submitted: "#36D6A0",
   interviewing: "#5BD2FF",
@@ -19,7 +18,6 @@ const COLOR: Record<AppStatus, string> = {
 };
 const LABEL: Record<AppStatus, string> = {
   queued: "Queued",
-  filling: "Filling",
   needs_review: "Needs review",
   submitted: "Submitted",
   interviewing: "Interviewing",
@@ -106,12 +104,16 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
       else setErr(r.error);
     });
 
-  const stats = [
-    { label: "Total", value: apps.length, color: "#E6EDF5" },
-    { label: "Needs review", value: counts.needs_review, color: "#FFB627" },
-    { label: "Submitted", value: counts.submitted, color: "#36D6A0" },
-    { label: "Interviewing", value: counts.interviewing, color: "#5BD2FF" },
-    { label: "Offers", value: counts.offer, color: "#36D6A0" },
+  // Each tile IS the filter for its stage — the number you just read and the list you want to see are
+  // the same thing, so making them separate controls just asks you to find the matching chip. "Total"
+  // clears the filter. `stage` is what a click selects; it drives the active styling too, so the strip
+  // always shows which stage the list below is currently showing.
+  const stats: { label: string; value: number; color: string; stage: AppStatus | "all" }[] = [
+    { label: "Total", value: apps.length, color: "#E6EDF5", stage: "all" },
+    { label: "Needs review", value: counts.needs_review, color: "#FFB627", stage: "needs_review" },
+    { label: "Submitted", value: counts.submitted, color: "#36D6A0", stage: "submitted" },
+    { label: "Interviewing", value: counts.interviewing, color: "#5BD2FF", stage: "interviewing" },
+    { label: "Offers", value: counts.offer, color: "#36D6A0", stage: "offer" },
   ];
 
   const chips: (AppStatus | "all")[] = [
@@ -123,16 +125,46 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
     <div className="space-y-6">
       {/* stats strip */}
       <div className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-hairline bg-hairline sm:grid-cols-5">
-        {stats.map((s) => (
-          <div key={s.label} className="bg-panel px-4 py-4">
-            <div className="font-display text-3xl font-semibold" style={{ color: s.color }}>
-              {s.value}
-            </div>
-            <div className="mt-1 font-mono text-[10px] uppercase tracking-label text-ink-dim">
-              {s.label}
-            </div>
-          </div>
-        ))}
+        {stats.map((s) => {
+          const active = filter === s.stage;
+          // A stage with nothing in it would filter to an empty list and strand you there, so it stays
+          // inert rather than becoming a dead end. "Total" is always live — it is how you get back.
+          const clickable = s.stage === "all" || s.value > 0;
+          return (
+            <button
+              key={s.label}
+              type="button"
+              onClick={() => clickable && setFilter(s.stage)}
+              disabled={!clickable}
+              aria-pressed={active}
+              title={clickable ? (s.stage === "all" ? "Show all applications" : `Show only ${s.label.toLowerCase()}`) : `No applications ${s.label.toLowerCase()}`}
+              className={clsx(
+                "bg-panel px-4 py-4 text-left transition-colors",
+                clickable && "cursor-pointer hover:bg-panel-raised",
+                !clickable && "cursor-default",
+                active && "bg-panel-raised",
+              )}
+            >
+              <div className="font-display text-3xl font-semibold" style={{ color: s.color }}>
+                {s.value}
+              </div>
+              <div
+                className={clsx(
+                  "mt-1 font-mono text-[10px] uppercase tracking-label",
+                  active ? "text-ink" : "text-ink-dim",
+                )}
+              >
+                {s.label}
+              </div>
+              {/* The active stage gets an underline in its own colour, so the strip reads as the
+                  current selection rather than five identical tiles. */}
+              <div
+                className="mt-2 h-0.5 rounded-full transition-opacity"
+                style={{ background: s.color, opacity: active ? 1 : 0 }}
+              />
+            </button>
+          );
+        })}
       </div>
 
       <SectionCard

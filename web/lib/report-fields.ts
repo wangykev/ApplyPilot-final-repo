@@ -22,7 +22,6 @@ export type ReportBody = Record<string, unknown>;
 
 export const APP_STATUSES = [
   "queued",
-  "filling",
   "needs_review",
   "submitted",
   "interviewing",

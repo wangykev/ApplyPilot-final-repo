@@ -2,39 +2,173 @@
 
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
-import { profileSchema, coerceProfile, mergeProfile, emptyProfile } from "@/lib/profile-schema";
+import {
+  profileSchema,
+  coerceProfile,
+  mergeProfile,
+  replaceProfileSections,
+  reconcileLaddersToProfile,
+  emptyProfile,
+  type ParsedSection,
+} from "@/lib/profile-schema";
+import { validatePlan, applyReconcilePlan, type EntryDecision } from "@/lib/profile-reconcile";
+import { diffProfile, profileFingerprint, type ProfileDiff } from "@/lib/profile-diff";
 import { sanitizePdfName } from "@/lib/filenames";
+import type { Profile } from "@/lib/profile-schema";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
-/** Merge an AI-parsed profile into the user's profile (fills blanks only). */
-export async function applyParsedProfile(parsedRaw: unknown): Promise<ActionResult> {
-  const parsed = profileSchema.safeParse(parsedRaw);
-  if (!parsed.success) return { ok: false, error: "Parsed profile didn't validate." };
+export type ReplaceActionResult =
+  | { ok: true; replaced: ParsedSection[]; droppedLadders: string[] }
+  | { ok: false; error: string };
 
+export type ReconcileActionResult =
+  | { ok: true; updated: number; added: number }
+  | { ok: false; error: string };
+
+export type ApplyMode = "fill" | "replace";
+
+export type PreviewResult =
+  | { ok: true; diff: ProfileDiff; fingerprint: string }
+  | { ok: false; error: string };
+
+/** Shared load: the signed-in user's current profile, or a typed failure. */
+async function loadCurrentProfile(): Promise<
+  { ok: true; supabase: Awaited<ReturnType<typeof createClient>>; userId: string; current: Profile } | { ok: false; error: string }
+> {
   if (!isSupabaseConfigured()) {
     return { ok: false, error: "Backend not connected — set Supabase env vars to save (see WEBSITE.md)." };
   }
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) return { ok: false, error: "You're not signed in." };
+  const { data: row } = await supabase
+    .from("profiles")
+    .select("profile_json")
+    .eq("id", user.id)
+    .maybeSingle();
+  return {
+    ok: true,
+    supabase,
+    userId: user.id,
+    current: row?.profile_json ? coerceProfile(row.profile_json) : emptyProfile(),
+  };
+}
+
+/**
+ * The profile changed between preview and confirm. Refusing beats writing something
+ * the user never saw — they re-preview and look again.
+ */
+const STALE =
+  "Your profile changed since this preview was generated. Re-run the preview so you can see the current diff.";
+
+/**
+ * What a mode WOULD do, computed by running that mode's real apply function against
+ * a clone and diffing. Nothing is written.
+ */
+export async function previewProfileApply(parsedRaw: unknown, mode: ApplyMode): Promise<PreviewResult> {
+  const parsed = profileSchema.safeParse(parsedRaw);
+  if (!parsed.success) return { ok: false, error: "Parsed profile didn't validate." };
+
+  const loaded = await loadCurrentProfile();
+  if (!loaded.ok) return { ok: false, error: loaded.error };
+
+  const after =
+    mode === "replace"
+      ? replaceProfileSections(loaded.current, parsed.data).profile
+      : mergeProfile(loaded.current, parsed.data);
+
+  return { ok: true, diff: diffProfile(loaded.current, after), fingerprint: profileFingerprint(loaded.current) };
+}
+
+/** Merge an AI-parsed profile into the user's profile (fills blanks only). */
+export async function applyParsedProfile(parsedRaw: unknown, expect?: string): Promise<ActionResult> {
+  const parsed = profileSchema.safeParse(parsedRaw);
+  if (!parsed.success) return { ok: false, error: "Parsed profile didn't validate." };
+
   try {
-    const supabase = await createClient();
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) return { ok: false, error: "You're not signed in." };
+    const loaded = await loadCurrentProfile();
+    if (!loaded.ok) return { ok: false, error: loaded.error };
+    if (expect && profileFingerprint(loaded.current) !== expect) return { ok: false, error: STALE };
 
-    const { data: row } = await supabase
-      .from("profiles")
-      .select("profile_json")
-      .eq("id", user.id)
-      .maybeSingle();
-    const current = row?.profile_json ? coerceProfile(row.profile_json) : emptyProfile();
-    const merged = mergeProfile(current, parsed.data);
+    const merged = reconcileLaddersToProfile(loaded.current, mergeProfile(loaded.current, parsed.data)).profile;
 
-    const { error } = await supabase
+    const { error } = await loaded.supabase
       .from("profiles")
-      .upsert({ id: user.id, profile_json: merged }, { onConflict: "id" });
+      .upsert({ id: loaded.userId, profile_json: merged }, { onConflict: "id" });
     if (error) return { ok: false, error: error.message };
     return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
+
+/**
+ * REPLACE the parsed sections instead of only filling blanks.
+ *
+ * Exists because "Apply" is a silent no-op on an already-populated profile: it
+ * fills blanks, and a user who rewrites their resume has no blanks left. Scope is
+ * still limited to what a resume can state (see `replaceProfileSections`), so
+ * screening answers, work authorization, self-ID and employment_history_companies
+ * are untouched.
+ */
+export async function replaceParsedProfile(parsedRaw: unknown, expect?: string): Promise<ReplaceActionResult> {
+  const parsed = profileSchema.safeParse(parsedRaw);
+  if (!parsed.success) return { ok: false, error: "Parsed profile didn't validate." };
+
+  try {
+    const loaded = await loadCurrentProfile();
+    if (!loaded.ok) return { ok: false, error: loaded.error };
+    if (expect && profileFingerprint(loaded.current) !== expect) return { ok: false, error: STALE };
+
+    const r = replaceProfileSections(loaded.current, parsed.data);
+    const { replaced, droppedLadders } = r;
+    const profile = reconcileLaddersToProfile(loaded.current, r.profile).profile;
+
+    const { error } = await loaded.supabase
+      .from("profiles")
+      .upsert({ id: loaded.userId, profile_json: profile }, { onConflict: "id" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, replaced, droppedLadders };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
+  }
+}
+
+/**
+ * Commit a smart-merge plan the user has seen and confirmed.
+ *
+ * The plan arrives from the client, so it is RE-VALIDATED here against the profile
+ * as it stands right now — never applied as given. That closes the window where the
+ * profile changed in another tab between planning and confirming, and means a
+ * tampered plan can still only produce a legal update/append.
+ */
+export async function applyReconcile(
+  parsedRaw: unknown,
+  decisionsRaw: unknown,
+  expect?: string,
+): Promise<ReconcileActionResult> {
+  const parsed = profileSchema.safeParse(parsedRaw);
+  if (!parsed.success) return { ok: false, error: "Parsed profile didn't validate." };
+  if (!Array.isArray(decisionsRaw)) return { ok: false, error: "No merge plan supplied." };
+
+  try {
+    const loaded = await loadCurrentProfile();
+    if (!loaded.ok) return { ok: false, error: loaded.error };
+    if (expect && profileFingerprint(loaded.current) !== expect) return { ok: false, error: STALE };
+
+    const plan = validatePlan(loaded.current, parsed.data, decisionsRaw as EntryDecision[]);
+    const rc = applyReconcilePlan(loaded.current, parsed.data, plan);
+    const { updated, added } = rc;
+    const profile = reconcileLaddersToProfile(loaded.current, rc.profile).profile;
+
+    const { error } = await loaded.supabase
+      .from("profiles")
+      .upsert({ id: loaded.userId, profile_json: profile }, { onConflict: "id" });
+    if (error) return { ok: false, error: error.message };
+    return { ok: true, updated, added };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : "Could not reach the backend." };
   }

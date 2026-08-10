@@ -393,7 +393,7 @@ copy its ID, paste it on `/app/connect`, then **Sync to extension**.
 
 ### Supabase setup (one-time)
 1. Create a Supabase project. Project Settings → API → copy the URL + anon key + service-role key into `web/.env.local`.
-2. Run **every** migration in `web/supabase/migrations/` **in numeric order** (`0001_init.sql` tables + RLS + private `resumes` bucket → `0002_buckets.sql` → `0003_attachments.sql` → … → `0011_application_login.sql`). `web/supabase/schema.sql` is a consolidated one-paste snapshot of the same thing for a fresh project; on an EXISTING project run the new migrations only.
+2. Run **`web/supabase/main.sql`** — every migration concatenated in order, and safe to run more than once. It sets up a fresh project AND brings an existing one up to date: no `drop table`, `delete` or `truncate` appears in it, policies/triggers are drop+create, columns are `add ... if not exists`, and constraints drop-if-exists before being added. The numbered files in `web/supabase/migrations/` remain the source of truth; after adding one, append it to `main.sql` too.
 3. Auth → Providers → enable **Email** and **Google** (set the Google OAuth client + the `…/auth/callback` redirect).
 4. Remove `NEXT_PUBLIC_DEV_PREVIEW` from `.env.local` to enforce real auth.
 

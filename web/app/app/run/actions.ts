@@ -109,7 +109,11 @@ export async function saveRunJob(input: {
 
     const { data: ins, error } = await supabase
       .from("applications")
-      .insert({ user_id: user.id, status: "filling", ...patch })
+      // "queued", not "filling": a row created here has no bundle yet, and a run that ERRORS never
+      // reports, so an in-progress status is a state nothing ever clears — that is how rows got stuck
+      // reading "Filling" forever. The run's live progress is shown by the run itself; the row only
+      // needs to say what is durably true.
+      .insert({ user_id: user.id, status: "queued", ...patch })
       .select("id")
       .maybeSingle();
     if (error) return { ok: false, error: error.message };
