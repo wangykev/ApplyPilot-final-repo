@@ -87,7 +87,24 @@ export async function loadBuckets(): Promise<Bucket[]> {
       // + each field's own name as a default wording (non-destructive, deduped) so the bucket editor
       // shows the same coverage the fill uses.
       const prof = data.profile_json != null ? coerceProfile(data.profile_json) : null;
-      const withStarters = ensureStarterBuckets(coerceBuckets(data.buckets_json));
+      const cleaned = coerceBuckets(data.buckets_json);
+      // ONE-SHOT REWRITE. coerceBuckets normalizes stored wordings (drops the trailing required
+      // marker, collapses the duplicates that creates). That is otherwise LAZY: reads look right while
+      // the stored JSON keeps "Language*" until some unrelated save happens to rewrite it. Persist the
+      // difference once, here, so storage and display agree.
+      //
+      // Compared against the RAW row, not against a re-parse, so this settles after the first load and
+      // does not write on every visit. Fire-and-forget: a failed cleanup must never break loading your
+      // buckets — the next load simply tries again.
+      if (JSON.stringify(data.buckets_json) !== JSON.stringify(cleaned)) {
+        // AWAITED, not fire-and-forget: a server action's response ends the request, and a detached
+        // write can be cut off before it lands — which would leave this "one-shot" pass re-firing on
+        // every single load. Swallowed on failure; the next load retries.
+        try {
+          await supabase.from("profiles").upsert({ id: user.id, buckets_json: cleaned }, { onConflict: "id" });
+        } catch { /* cleanup is best-effort — never block loading your buckets */ }
+      }
+      const withStarters = ensureStarterBuckets(cleaned);
       return prof ? ensureDefaultFieldWordings(withStarters, prof) : withStarters;
     }
 
