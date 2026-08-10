@@ -14,6 +14,35 @@ import { z } from "zod";
  * the AI pass, match-ladder-gated (never a blind commit).
  */
 
+/**
+ * A wording as STORED: the tenant's own text minus the trailing required marker.
+ *
+ * "Language*" and "Language" are the same question — Workday's asterisk means "required", not part of
+ * what is being asked. Matching already ignored it (normalizeQuestion strips it), so this changes only
+ * what the user reads and edits: an asterisk in a saved wording was pure noise, and two tenants writing
+ * the same question with and without one produced two entries for one question.
+ *
+ * Deliberately trailing-only — an asterisk elsewhere is real text, not a marker.
+ */
+export function cleanWording(label: string): string {
+  return String(label || "").replace(/[\s*]+$/u, "").trim();
+}
+
+/** Clean a wording list and drop the duplicates cleaning creates, keeping the first spelling. */
+export function cleanWordings(list: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of list) {
+    const w = cleanWording(raw);
+    if (!w) continue;
+    const key = w.toLowerCase().replace(/\s+/g, " ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(w);
+  }
+  return out;
+}
+
 export const bucketSchema = z.object({
   id: z.string(),
   /** Mode A: dotted profile path (e.g. "work_authorization.authorized_to_work_in_us"). "" ⇒ Mode B. */
@@ -27,8 +56,12 @@ export const bucketSchema = z.object({
   category: z.string().default(""),
   /** text | dropdown | radio | typeahead | checkbox (essays/files are never bucketed). */
   widget_hint: z.string().default(""),
-  /** The question wordings (raw, human-readable) that resolve to this answer. */
-  questions: z.array(z.string()).default([]),
+  /**
+   * The question wordings (human-readable) that resolve to this answer, stored WITHOUT the required
+   * marker — see cleanWordings. Normalized in the schema so it applies on every load and every save:
+   * existing buckets clean themselves the next time they are read, and nothing new can reintroduce it.
+   */
+  questions: z.array(z.string()).default([]).transform(cleanWordings),
   /** Optional per-platform stable-selector accelerators (workday automation-ids, etc.). */
   selectors: z.record(z.array(z.string())).default({}),
 });
