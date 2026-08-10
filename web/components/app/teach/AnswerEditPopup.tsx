@@ -38,6 +38,8 @@ export function ProfileFieldEditor({
   countryForState,
   onChange,
   highlight,
+  ladder,
+  onLadderChange,
 }: {
   path: string;
   label: string;
@@ -47,11 +49,17 @@ export function ProfileFieldEditor({
   /** For list widgets (candidate / tiered / taglist): the entry to ring in amber (the teach popup's
    *  "adding this one"). Ignored by scalar widgets. */
   highlight?: string;
+  /** YES/NO answer ladder for a tribool, and its persist handler. TriBool only opens its ladder popup
+   *  when a handler is wired, so without these the teach page could select Yes/No but never edit the
+   *  wordings behind them — which the profile page has always allowed (operator, 2026-08-09). */
+  ladder?: { yes: string[]; no: string[] };
+  onLadderChange?: (next: { yes: string[]; no: string[] }) => void;
 }) {
   const meta = profileFieldMeta(path, value);
   if (meta.widget === "dropdown")
     return <SelectField label={label} value={strv(value)} options={opt(meta.options || [])} onChange={(v) => onChange(v)} />;
-  if (meta.widget === "tribool") return <TriBoolField label={label} value={triv(value)} onChange={(v) => onChange(v)} />;
+  if (meta.widget === "tribool")
+    return <TriBoolField label={label} value={triv(value)} onChange={(v) => onChange(v)} ladder={ladder} onLadderChange={onLadderChange} />;
   if (meta.widget === "checkbox") return <CheckboxField label={label} checked={value === true} onChange={(v) => onChange(v)} />;
   if (meta.widget === "date")
     return <DateField label={label} granularity={meta.granularity || "month-day-year"} value={strv(value)} onChange={(v) => onChange(v)} />;
@@ -99,6 +107,11 @@ export function AnswerEditPopup({
   const meta = profileFieldMeta(path, raw);
   const scalarLadder = meta.widget === "text" || meta.widget === "dropdown" || meta.widget === "state";
   const variants = (profile.answer_ladders as Record<string, { values?: string[] }> | undefined)?.[path]?.values ?? [];
+  // The yes/no polarity ladders live under the SAME answer_ladders[path] key as `values`, in `yes`/`no`.
+  // Read as a whole so the spread above cannot drop a sibling (e.g. a `values` list set earlier).
+  const boolLadder = (profile.answer_ladders as Record<string, { yes?: string[]; no?: string[] }> | undefined)?.[path] as
+    | { yes: string[]; no: string[] }
+    | undefined;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
@@ -116,6 +129,17 @@ export function AnswerEditPopup({
           value={raw}
           countryForState={arrv(getAtPath(profile, "personal_info.country"))}
           onChange={(v) => set(v)}
+          // A yes/no answer gets the SAME editable ladder the profile page has always offered: click the
+          // already-selected Yes or No again to open its wordings. Without a persist handler TriBool
+          // deliberately keeps the popup shut, which is why teach could pick a polarity but never edit
+          // what it fills as. Same shape and same storage key as ProfileEditor, so the two stay in sync.
+          ladder={boolLadder}
+          onLadderChange={(next) =>
+            onChange({
+              ...(profile as object),
+              answer_ladders: { ...(profile.answer_ladders ?? {}), [path]: { ...(boolLadder ?? {}), ...next } },
+            } as Profile)
+          }
         />
 
         {scalarLadder && (
