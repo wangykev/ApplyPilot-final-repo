@@ -113,7 +113,7 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "resume-page-consumed-1";
+const AP_BUILD = "pagekey-settled-47b241c";
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -2964,8 +2964,6 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // query] + sorted field-set: STABLE per page across re-runs, DISTINCT across pages even
   // on a same-pathname SPA). Computed BEFORE the fill (a field-revealing fill could change
   // the field-set). NOT cdpPageSig (full url incl. query).
-  const preScan = await cdpEval(cdpPageScan);
-  const pageKey = cdpPageKey(preScan);
   // Plan 2: the walk passes its 1..N ordinal so the bundle carries a stable page_number (display
   // order) + a friendly page_label; single-page fills (no ordinal) leave them null (viewer derives).
   const pageNumber = (opts && opts.pageNumber != null) ? opts.pageNumber : null;
@@ -3009,6 +3007,21 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // reads. Genuine value-triggered cascades still appear only AFTER a commit → they remain the cascade
   // re-scan's job; this settles the INITIAL load only.
   const settleMs = await awaitFieldSetSettled(act);
+  // Accumulation merge key — the pathname (the volatile query is dropped) + the sorted field-set.
+  // Stable per page across re-runs, distinct across pages even on a same-pathname SPA.
+  //
+  // ⚠ COMPUTED AFTER THE SETTLE ABOVE, and that ordering is the whole point (2026-08-09). It used to
+  // run ~40 lines earlier, off a scan taken the moment the page was entered — so on a slow tenant it
+  // read a page whose fields had not mounted yet, produced the field-less key `<path>|`, and My
+  // Experience (legitimately field-less) then overwrote it. Live on kiongroup.wd3: My Information was
+  // silently dropped from the bundle and the rehearsal halted `replay-page-not-in-bundle`.
+  //
+  // Still PRE-FILL, which was the original reason for computing it early: a value-revealing cascade
+  // must not be able to change the key mid-page. Settling only waits for the page's own initial
+  // render, so the key is taken from the complete set of fields the page loaded with, before we
+  // actuate anything. The ordinal is the tiebreak for a page that is genuinely field-less.
+  const preScan = await cdpEval(cdpPageScan);
+  const pageKey = cdpPageKey(preScan, pageNumber);
   // (The cross-run option-list cache was REMOVED 2026-08-06 — see captureChoiceOptions. In the real flow
   // a form is filled ONCE, reviewed, then submitted, so a cross-run cache is always cold in production:
   // it bought nothing real and it quietly made repeat test runs faster than a genuine first fill, which
@@ -5676,7 +5689,7 @@ async function runCdpReplayWalk(tabId, opts) {
           const titles = samples.map((t) => parseErrorFieldName(t)).filter(Boolean);
           const gaps = newlyRequiredGaps(liveFields, bundle.entries, sel.pageKey, titles);
           if (gaps.length) {
-            const pageKey = sel.pageKey || (freshScan ? cdpPageKey(freshScan) : null);
+            const pageKey = sel.pageKey || (freshScan ? cdpPageKey(freshScan, page) : null);
             const added = [];
             for (let gi = 0; gi < gaps.length; gi++) {
               const fresh = cascadeEntryFor(gaps[gi], pageKey, page, bundle.entries.length + gi);
