@@ -113,7 +113,12 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "replay-time-2";
+// ONE build string, two readers: the service-worker start line (above) and AP_PING's `build`.
+// These used to be two independent constants and they DRIFTED — the start line said
+// "worktree-live-submit-1" while AP_PING still answered "replay-time-2", which reads exactly like
+// "the extension is running stale code from another profile" and cost a full round of archaeology
+// (2026-08-10). Alias, never re-declare a literal here: bump AP_BUILD_MARKER only.
+const AP_BUILD = AP_BUILD_MARKER;
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
