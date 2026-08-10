@@ -4471,3 +4471,37 @@ records five distinct pages, the replay matches every one, and the gate passes.
 
 **Tenants verified end to end 2026-08-09** (all hidden, all `arm:false`, nothing ever submitted):
 moog.wd5 · cadence.wd1 · marvell.wd1 · kiongroup.wd3.
+
+## 2026-08-09 (h) — cat.wd5 verified end to end (the last outstanding tenant)
+
+Posting found via the CxS API (`/wday/cxs/cat/CaterpillarCareers/jobs`, 314 hits for "electrical
+engineer"); ran Griffin-Georgia `_R0000386586` hidden, signed out.
+
+Onboarding took the full chain cleanly: Apply → Autofill with Resume → bounced to SIGN IN → signed in
+(coordinate click missed, the focus+Enter fallback took it — that ladder earning its keep) → **résumé
+uploaded, parsed, page consumed** → reached the form. `job_key` resolved to `wd5:r0000386586`.
+
+Fill: 5 pages, 49 filled · 9 skipped · 3 error, 6 flagged, 300s. Approved 6/6, then **two consecutive
+rehearsals, both SUBMIT GATE PASSED, AGREE 46 · DISAGREE 0 · MISSING 2 · EXTRA 1** — identical across
+runs. Nothing submitted.
+
+**Incidental second confirmation of the page-key fix.** Onboarding handed off announcing "the next page
+has 5 field(s)", and the key computed after the settle recorded
+`addressLine1,candidateIsPreviousWorker,city,country,…` with 13 filled — i.e. the page had mounted its
+full field set by the time the key was taken. Pre-fix, that hand-off is exactly the shape that produced a
+field-less key. All five pages keyed distinctly.
+
+**TENANTS VERIFIED END TO END 2026-08-09** — all hidden, all `arm:false`, nothing ever submitted:
+**moog.wd5 · cadence.wd1 · marvell.wd1 · kiongroup.wd3 · cat.wd5**.
+
+Fixes landed today, each unit-pinned (every test verified failing first) and all but one live-exercised:
+1. the apMatch lockstep guard now scans background.js (the hole that let a live abort through),
+2. Workday's second wording for the signature-date demand,
+3. `job-posting-not-found` instead of blaming the sign-in form,
+4. the social-login chooser matched by TEXT (live on kiongroup),
+5. `job_key` for requisitions that separate letters from digits (live on kiongroup `jr-0088855`),
+6. the résumé page consumed at the OTHER post-auth exit (live on moog/cadence/kiongroup/cat),
+7. the field-less page key no longer overwrites the previous page (live on kiongroup, confirmed twice).
+
+Still open: the signature-date STAMP is unit-pinned but has never been observed firing (the marvell block
+has not recurred); the self-ID actuation failure on kiongroup is intermittent, seen once in ~4 runs.
