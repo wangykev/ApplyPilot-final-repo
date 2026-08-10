@@ -4435,12 +4435,16 @@ That is the SELF-ID page, and it is NOT the same fault. Two candidates, neither 
    the known self-ID instability on this surface, on the slow wd3 path — NOT caused by the key fix
    (page 5's preScan already held fields pre-fix, so self-ID detection and trusted-input forcing are
    unchanged there).
-2. **The bundle is a MIXED-SCHEME hybrid.** Because the new keys deliberately differ from the old
-   field-less ones, the re-fill did not overwrite the pre-fix pages — it ADDED to them: 49 → **88
-   fields**, with stale pages under `/apply/autofillWithResume` sitting beside the new ones under
-   `/apply`. That is the expected migration consequence of changing the key, and it means **any
-   application filled before this fix should be re-filled from a CLEARED summary**, not incrementally
-   re-filled. Worth doing before drawing any conclusion about the self-ID page.
+2. ~~The bundle is a MIXED-SCHEME hybrid.~~ **WRONG — retracted the same day.** I inferred from
+   49 → 88 fields that the re-fill had stacked stale pre-fix pages beside the new ones, and wrote that
+   any pre-fix application must be re-filled from a CLEARED summary. Checking the bundle refuted it:
+   **every** page key is under `/apply` (no `/apply/autofillWithResume` survivor), the envelope reads
+   `accumulated (5 pages)`, and 14+31+10+3+30 = 88 accounts for all of it. `runCdpWalk` already clears
+   `reviewSummary`+`reviewAudit` once at walk start, and a report REPLACES `review_bundle_json`
+   wholesale (`reportColumns` always writes it), so a hybrid was never possible. The count grew only
+   because the self-ID page contributed **30** entries this run (28 errors + 2 skipped) instead of 5.
+   No migration step is needed for pre-fix applications.
 
-Next step: Clear summary → fresh fill → approve → rehearse, so the self-ID page is judged on a clean
-single-scheme bundle instead of a hybrid one.
+So candidate 1 is the whole story: the self-ID page is failing to actuate, and the replay cannot match a
+page the fill largely errored out on. That is the thread to pull — same thread as the disability-checkbox
+blocker and the re-entry correlation from earlier in the day, which are worth attacking as ONE piece.
