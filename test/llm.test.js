@@ -5,11 +5,16 @@
 // adapter would crash a fill).
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { callLLM, LLM_DEFAULT_MODELS, LLM_MODELS, LLM_RETRY_DELAYS_MS ,
+const { callLLM, callLLMOnce, LLM_DEFAULT_MODELS, LLM_MODELS, LLM_RETRY_DELAYS_MS ,
   resetLlmRetryState,
   llmRetryAfterMs,
   LLM_BREAKER_TRIP_AFTER,
   LLM_RETRY_AFTER_CAP_MS,
+  LLM_REQUEST_TIMEOUT_MS,
+  LLM_FAST_RETRY_ATTEMPTS,
+  LLM_FAST_RETRY_DELAY_MS,
+  llmFastRetryMs,
+  llmAttemptTimeoutMs,
 } = require("../llm.js");
 
 // A fake fetch that captures the request + returns a canned JSON body.
@@ -303,5 +308,138 @@ test("a hang on EVERY attempt still returns a normalized error — callLLM never
   );
   assert.equal(r.ok, false);
   assert.match(String(r.error), /timed out after 20ms/, "the reason names the timeout, not a bare network error");
+  resetLlmRetryState();
+});
+
+// ── FAST-RETRY for gemini 3.1 (2026-08-09) ────────────────────────────────────────────────────────
+// Live evidence: gemini-3.1-flash-lite answers in 486/646/796ms, and once took 30657ms on a single
+// SUCCEEDING attempt that nothing retried — one call turning a 1.9s page into a 32s page. So an early
+// attempt is capped short and re-issued; the LAST attempt keeps the full budget, because a short cap
+// everywhere would fail a required field on a genuinely slow minute and halt the walk.
+
+test("fast-retry: a gemini 3.1 model gets the short cap while fast tries remain", () => {
+  const cfg = { provider: "gemini", model: "gemini-3.1-flash-lite" };
+  assert.equal(llmFastRetryMs(cfg), 2000, "the rule matches gemini 3.1");
+  assert.equal(llmAttemptTimeoutMs(cfg, LLM_FAST_RETRY_ATTEMPTS), 2000, "capped while tries remain");
+  assert.equal(llmAttemptTimeoutMs(cfg, 1), 2000);
+});
+
+test("fast-retry SAFETY: once the fast tries are spent the call gets the FULL budget", () => {
+  const cfg = { provider: "gemini", model: "gemini-3.1-flash-lite" };
+  assert.equal(llmAttemptTimeoutMs(cfg, 0), LLM_REQUEST_TIMEOUT_MS,
+    "a slow provider must never be FAILED by the cap — that would blank a required field and halt the walk");
+});
+
+test("fast-retry is SCOPED: other gemini models and other providers are untouched", () => {
+  assert.equal(llmFastRetryMs({ provider: "gemini", model: "gemini-2.5-flash-lite" }), null);
+  assert.equal(llmFastRetryMs({ provider: "gemini", model: "gemini-3.5-flash-lite" }), null);
+  assert.equal(llmFastRetryMs({ provider: "anthropic", model: "gemini-3.1-flash-lite" }), null, "provider must match too");
+  assert.equal(llmAttemptTimeoutMs({ provider: "gemini", model: "gemini-3.5-flash-lite" }, 2), LLM_REQUEST_TIMEOUT_MS);
+});
+
+test("fast-retry honours an explicit per-call timeout as the ceiling", () => {
+  const cfg = { provider: "gemini", model: "gemini-3.1-flash-lite", timeoutMs: 500 };
+  assert.equal(llmAttemptTimeoutMs(cfg, 2), 500, "never LENGTHEN a caller's own tighter deadline");
+  assert.equal(llmAttemptTimeoutMs({ provider: "gemini", model: "gemini-3.1-flash-lite", fastRetry: false }, 2),
+    LLM_REQUEST_TIMEOUT_MS, "callers can opt out");
+});
+
+// THE REGRESSION THIS EXISTS FOR. Rotation probes every key with `noRetry:true`, so the ladder length is
+// 0 on the normal multi-key path. The first cut gated the cap on that ladder, so with 2+ keys configured
+// it silently never fired — a live run with the cap forced to 50ms still answered in ~650ms. The fast-try
+// budget is therefore independent of `noRetry`.
+test("fast-retry fires on a noRetry ROTATION PROBE — the multi-key path, where it silently did not", async () => {
+  resetLlmRetryState();
+  let attempts = 0;
+  const fetchImpl = async (url, opts) => {
+    attempts++;
+    if (attempts === 1) {
+      return await new Promise((_r, rej) => {
+        if (opts && opts.signal) opts.signal.addEventListener("abort", () => rej(new Error("aborted")));
+      });
+    }
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: "hi" }] } }] }) };
+  };
+  const r = await callLLMOnce(
+    { provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "k", user: "q", noRetry: true },
+    fetchImpl,
+    async () => {}
+  );
+  assert.equal(r.ok, true, "the stuck probe recovered instead of reporting the key as failed");
+  assert.equal(attempts, 2);
+  assert.equal(r.fastAborts, 1);
+  resetLlmRetryState();
+});
+
+test("fast-retry EXHAUSTED: a permanently stuck socket still gets one FULL-budget attempt", async () => {
+  resetLlmRetryState();
+  const budgets = [];
+  const fetchImpl = async (url, opts) => {
+    // Record the deadline each attempt was given, then hang until aborted.
+    return await new Promise((_r, rej) => {
+      if (opts && opts.signal) opts.signal.addEventListener("abort", () => rej(new Error("aborted")));
+    });
+  };
+  const wrapped = async (url, opts) => { budgets.push(Date.now()); return fetchImpl(url, opts); };
+  const r = await callLLMOnce(
+    { provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "k", user: "q", noRetry: true, timeoutMs: 40 },
+    wrapped,
+    async () => {}
+  );
+  assert.equal(r.ok, false, "it still fails honestly rather than hanging forever");
+  assert.equal(budgets.length, LLM_FAST_RETRY_ATTEMPTS + 1,
+    "two fast tries, then ONE final attempt on the full budget — the safety net");
+  resetLlmRetryState();
+});
+
+test("fast-retry: a gemini 3.1 call stuck past the cap is abandoned, re-issued, and SUCCEEDS", async () => {
+  resetLlmRetryState();
+  let attempts = 0;
+  const slept = [];
+  const fetchImpl = async (url, opts) => {
+    attempts++;
+    if (attempts === 1) {
+      // the stuck socket: never resolves on its own, only the abort ends it
+      return await new Promise((_r, rej) => {
+        if (opts && opts.signal) opts.signal.addEventListener("abort", () => rej(new Error("aborted")));
+      });
+    }
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: "hi" }] } }] }) };
+  };
+  const r = await callLLM(
+    { provider: "gemini", model: "gemini-3.1-flash-lite", apiKey: "k", user: "q" },
+    fetchImpl,
+    async (ms) => { slept.push(ms); }
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.text, "hi");
+  assert.equal(attempts, 2, "the stuck call was abandoned and re-issued");
+  assert.equal(r.fastAborts, 1, "the recovery is reported, so it is not silent in the log");
+  assert.equal(slept[0], LLM_FAST_RETRY_DELAY_MS,
+    "a self-inflicted abort re-issues almost immediately — waiting the normal 2s backoff would defeat the cap");
+  resetLlmRetryState();
+});
+
+test("fast-retry: a NON-matching model still waits the full budget and the normal backoff", async () => {
+  resetLlmRetryState();
+  let attempts = 0;
+  const slept = [];
+  const fetchImpl = async (url, opts) => {
+    attempts++;
+    if (attempts === 1) {
+      return await new Promise((_r, rej) => {
+        if (opts && opts.signal) opts.signal.addEventListener("abort", () => rej(new Error("aborted")));
+      });
+    }
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: "ok" }] } }] }) };
+  };
+  const r = await callLLM(
+    { provider: "gemini", model: "gemini-2.5-flash-lite", apiKey: "k", user: "q", timeoutMs: 30 },
+    fetchImpl,
+    async (ms) => { slept.push(ms); }
+  );
+  assert.equal(r.ok, true);
+  assert.equal(r.fastAborts, 0, "no fast abort — this model is not in the rule table");
+  assert.equal(slept[0], LLM_RETRY_DELAYS_MS[0], "it took the ordinary backoff, not the fast one");
   resetLlmRetryState();
 });

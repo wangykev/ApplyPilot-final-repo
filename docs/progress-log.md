@@ -4104,6 +4104,94 @@ same broken `node_modules`), so the 4 web files are typecheck-verified only. NOT
 page's rendering of the kept skills (the tracker push 401'd — the site session expired mid-session), and
 the rehearse path's manual/continue re-entry.
 
+## 2026-08-09 — `debugLagTrace`: attributing a pause to Workday, the channel, or us
+
+**The ask.** Operator: "sometimes random things lag and it is not always the render of a dropdown — a lot
+of times it just randomly will start filling slower, and I want to debug to see if it really is a workday
+thing or if it is some type of bug in my code."
+
+**Why the existing logs could not answer it.** `[CDP-TIME]` says WHERE a page's time went (settle / flat /
+capture / audit) and `debugPageTrace` times every action ≥120ms — but both report DURATIONS, and a duration
+is equally consistent with Workday thinking, the debugger channel being slow, and our own service worker
+being blocked. Nothing distinguished them, which is how earlier rounds ended up blaming Workday for what
+turned out to be ours (the 2026-08-06 relocation bug).
+
+**What was built.** A `debugLagTrace` flag, instrumenting the ONE choke point every CDP command already
+flows through (`cdpSend`, split into a recording wrapper over `cdpSendRaw`). Three clocks that fail
+independently: the service worker's own 500ms timer DRIFT (only we can cause it), a no-op
+`Runtime.evaluate("1")` page probe, and every command timed by method. Each slow command prints its own
+verdict; each page prints a `[LAG]` summary with probe p50/p95, drift, command counts, and worker/attach
+age. Flag OFF ⇒ `cdpSend` is a straight pass-through, so the instrumentation cannot distort what it
+measures.
+
+**A design error, caught by the data and fixed.** The first cut labelled a slow no-op "TRANSPORT". That is
+backwards: `Runtime.evaluate` is scheduled ON the page's main thread, so it cannot separate a jammed
+renderer from a slow channel. A browser-process probe (`Browser.getVersion`) was added to split them and
+then REMOVED — browser-domain commands are not served on a tab-scoped attach, so it reported `–` on every
+beat of two runs while still costing a failing round trip each time. It was also unnecessary: the page
+probe's round trip cannot be faster than the channel, so its **p50 of 1ms across ~1500 commands is itself
+the proof the channel is not a lag source**.
+
+**Three back-to-back runs, cat.wd5/solarturbines, three virgin reqs** (different reqs on purpose, so
+Workday's draft state could not confound the timings), all `visible-fast | painting (visible)`, all
+reaching the REVIEW page. Findings, in order of size:
+
+1. **The LLM provider is the dominant random variable.** `gemini-3.1-flash-lite` answered in 486ms, 646ms
+   and 796ms — and once, same model, same config, same session, in **30657ms**: one attempt, no retry, no
+   key rotation, finishing 343ms inside `LLM_REQUEST_TIMEOUT_MS`. That single call is the entire difference
+   between run 3's 1.9s page 5 and run 2's **32s** page 5 (`flat 31.3s`, `slowest: disabilityForm 31s`).
+   Not Workday, not the fill code.
+2. **`capture` / `scrapeTaOptions` is the largest cost we own — but it is deterministic, not random.**
+   2.0–3.3s per scraped list, scaling with list size; run 1's page 3 spent **16.3s of its 20.5s** there.
+   Worth optimising, but it is not the "randomly slower" the operator is seeing.
+3. **SW timer drift spikes of 1–2.4s appear in all three runs and are NOT yet explained.** Deliberately
+   recorded as unresolved: it is measured with a timer inside an MV3 worker, so part of it may be Chrome
+   deprioritising worker timers rather than a stall that delays the fill. It did not track `capture` time
+   (run 2 page 2: 9s capture, probe p95 16ms), so the obvious hypothesis is already refuted.
+
+**Also corrected:** the live-testing skill claimed `LLM_REQUEST_TIMEOUT_MS` was 20s; it is 30000.
+
+Extension **1174/1175** (`db.test.js` still fails on the missing `fake-indexeddb`).
+
+## 2026-08-09 — gemini 3.1 fast-retry: abandon a stuck call at 2s instead of waiting 30
+
+**The ask,** straight after the lag trace found the cause: "build gemini 3.1 specific timers so any AI call
+for gemini 3.1 that takes longer than 2 seconds you automatically go and retry."
+
+**Why 2s is the right line.** Measured the same day: 486ms, 646ms, 796ms — and once 30657ms. The
+distribution has no middle, so a call still running at 2s is a stuck socket, not a slow model, and opening
+a new one is far cheaper than waiting behind it.
+
+**What it does.** `LLM_FAST_RETRY_RULES` (llm.js) caps the first `LLM_FAST_RETRY_ATTEMPTS` (2) attempts of
+a matching model at 2s; a call that hits the cap is abandoned and re-issued after 150ms — not the usual
+2000ms backoff, because the deadline was OURS and there is no server backpressure to respect. Scoped by
+provider AND model regex, so every other model is byte-identical. `fastRetry:false` opts a call out.
+
+**Two safety invariants, both unit-pinned:**
+- Once the fast tries are spent, the next attempt gets the **full** budget. A short cap on every attempt
+  would turn a genuinely slow minute at the provider into a FAILED required field — blank, Save & Continue
+  refused, walk halted. One slow page is much cheaper than a halted run. This can only make a call faster
+  to succeed, never less likely to.
+- The fast-try budget is **independent of the error ladder**.
+
+**That second invariant is a bug the live run caught and the unit tests could not.** The first cut gated
+the cap on `maxRetries`, reasoning "no ladder ⇒ no retry to fall back on ⇒ don't cap". But `callLLM`
+probes every key with `noRetry:true`, so on the normal MULTI-KEY path the ladder is length 0 — and the cap
+silently never applied. The probe run proved it: with the cap forced to 50ms, two calls still answered in
+677ms and 647ms with zero fast-retry lines. Seven passing unit tests had said it worked. The fix decouples
+the two, which also keeps a stuck socket from being misreported as a key fault (it must not consume a
+rotation slot or get a key parked).
+
+**Live-verified** by forcing the cap to 50ms so every call takes the path — the only reliable way to
+exercise it, since a real hang appeared once in ~8 calls. Result: 2 aborts per call, then a full-budget
+attempt that SUCCEEDED (`ok in 1668ms — after 2 fast-retry abort(s)`, `ok in 2423ms — after 2`), AI fields
+still filled (`[ai-choice]`, `[ai-eeo-guess]`), `✓✓ reached the REVIEW page after 5 page(s)`. Then restored
+to 2000 and re-confirmed normal calls are untouched. Nothing was submitted on any run.
+
+Also corrected: the docs claimed a 20s request timeout; it is 30000.
+
+Extension **1182/1183** (10 llm fast-retry pins; `db.test.js` still fails on the missing `fake-indexeddb`).
+
 ## 2026-08-09 — live sweep: marvell + moog verified, four fixes
 
 Continued the live regression/expansion sweep. Every run a fill or a rehearsal
@@ -4177,6 +4265,133 @@ Continued the live regression/expansion sweep. Every run a fill or a rehearsal
 - `web/` vitest fails to resolve its `@/lib/*` alias for 7 suites. Verified
   identical with all changes stashed: pre-existing, unrelated.
 - Suite 1189/1189; web typecheck clean.
+
+## 2026-08-09 — the between-fields gap, measured: it is our own SW timer, and the firehose theory was wrong
+
+**The ask.** Operator: "sometimes it happens between two deterministic fields — they should fill instantly,
+but there is like a .75 second gap between their fills."
+
+**Nothing could see it.** `[CDP-TIME]` reports phase totals and `debugPageTrace` times actions; the window
+between one field FINISHING and the next STARTING belonged to neither and vanished from the accounting.
+Added under `debugLagTrace`: a delay that OVERRAN (a delay is the one action whose intended cost we know
+exactly, so anything past it is our own timer running late), DEAD AIR between two fields, and any field
+over 400ms named with the tier that answered it.
+
+**Measured, on a clean VISIBLE run** (6 pages, all `visible-fast | painting (visible)`, reached REVIEW):
+
+    page 1 · probe p95    2ms · drift p95    8ms · UNREAD CDP EVENTS 0
+    page 2 · probe p95 1470ms · drift p95 1778ms · UNREAD CDP EVENTS 2
+    page 3 · probe p95 2599ms · drift p95 2546ms · UNREAD CDP EVENTS 6
+    page 4 · probe p95   19ms · drift p95  173ms · UNREAD CDP EVENTS 0
+
+**Three findings, in order of how much they change what we do:**
+
+1. **The CDP event-firehose theory is REFUTED — do not re-open it.** We `Runtime.enable` + `DOM.enable` at
+   attach and register NO `onEvent` listener anywhere, so the obvious story was that Chrome streams
+   console/executionContext/DOM-mutation events at a worker that never reads them and saturates its event
+   loop. A counter says otherwise: the WORST-drifting pages (2446ms, 11663ms) had **zero** unread events.
+   The change was not made. This is why the counter was added before the fix.
+2. **`cdpDelay` is a bare SW `setTimeout`** — `(ms) => new Promise(r => setTimeout(r, ms))`, nothing
+   page-side. So `delayFull(150)` returning in 1782ms is genuinely our own timer, 1.6s late. You cannot
+   make `setTimeout` fire on time; what you can do is make sure nothing DEPENDS on it being punctual. The
+   one that overran here is a POLL INTERVAL (`entryReconcileIntervalMs`), and its loop exits on state, not
+   on iteration count — so the overrun cost one long tick and nothing else. The one-shot sleeps
+   (`auditSettleMs: 600`) delivered 610ms, on time.
+3. **SW drift and RENDERER jam move together, on every page, visible or hidden.** Probe p95 and drift p95
+   rise and fall as a pair (pages 2–3 high, 1/4/5/6 low). The likely mechanism: while the renderer is
+   jammed many evals are in flight, and when it frees up they all resolve at once, so the interval
+   callback queues behind the burst.
+
+**Where a visible run's time actually goes** (traced actions ≥120ms, whole run):
+`delayFull 12.1s · scrapeTaOptions 9.1s · scanPage 3.1s · pressTab 3.0s · repeatingScan 1.5s · llm 1.4s`.
+Of the 12.1s, ~3.6s is the per-page M40 audit settle (600ms × 6) behaving exactly as designed. ONE
+`pressTab` took 2.97s on a visible tab — a trusted input dispatch that should be milliseconds.
+
+**The honest caveat.** On a clean VISIBLE run the total measurable OVERRUN was ~1.6s across a ~33s fill.
+The dramatic 2.5s-and-up gaps were all recorded while the Chrome window was MINIMISED (renderer blocked
+12–15s at a stretch, `Runtime.evaluate` once 138998ms). So the severe form tracks the window not painting
+— which `act.visible` cannot detect (it reads `tab.active && !minimized`, and an occluded or alt-tabbed
+window still reports visible). A correction worth recording: `via exact-normalized` is the tier that
+mapped an ANSWER onto a live option and does NOT mean the field was deterministic — `disabilityForm` was
+read that way at first and is in fact an AI field (`llm() 0.67s` of its 1250ms).
+
+**Not fixed yet, deliberately:** the remaining levers all trade against documented invariants (the audit
+settle is `delayFull` precisely because it must run full) or are large (option-scrape caching, which the
+2026-08-06 no-cross-run-cache decision made on purpose). Those are the operator's call, not a silent tune.
+
+**FIX TRIED AND REVERTED the same day — the typeahead close poll.** The operator watched a run and gave
+the sharpest lead yet: "right after the country/territory phone code question, right after it recon'd
+everything, it waited a second before closing the typeahead and continuing." The trace agreed —
+`CAPTURE done 3.86s` against `scrapeTaOptions 3.08s`, so ~0.78s went on opening and closing the widget
+around a read-only scrape — and `awaitTypeaheadClosed` re-checks on `reopenSettleMs` (400ms), an
+OPEN-settle budget far too coarse for a close: a popup that unmounts in ~50ms still costs a full tick.
+Dropping it to a dedicated 75ms poll (deadline untouched, gate is `leafCount===0`, so no safety change)
+looked obviously right.
+
+**It moved the number it targets by ~80ms** (0.78s → 0.70s) — noise. And the operator's read of that run
+was "lagged in a lot of places elsewhere", which the log supports (page 3 renderer blocked 14.3s,
+`Runtime.evaluate 14332ms` while a trivial eval cost 8763ms). That is not attributable to a poll interval
+with confidence, but the MECHANISM is real and not worth risking: polling 5× more often issues 5× more
+`Runtime.evaluate` calls into the page thread that is ALREADY the bottleneck. Paying renderer contention
+for 80ms is the wrong trade, so it is reverted, with the reasoning left in the code so the next person
+does not re-derive it.
+
+**What this rules in:** the fill is not losing its time to our pacing constants. It is losing it to the
+page thread being blocked for seconds at a stretch, during which every read, every input dispatch and
+every timer we own arrives late. Optimising our own waits cannot fix that, and can make it worse.
+
+**AND THE MEASUREMENT METHOD WAS WRONG TOO — recorded so it is not repeated.** Two corrections, both
+from the operator watching the screen rather than from the log:
+
+1. **"RENDERER BLOCKED" was an unfounded assertion.** Operator: "the page looked fine though. did not seem
+   like it was mid render. it rendered in a normal amount of time." Correct. The probe measures
+   TIME-TO-SERVICE, not renderer availability: CDP commands to a target are serviced in order, and
+   `cdpScrapeTaOptions` deliberately runs ENTIRELY in-page as one `awaitPromise` eval, holding a single
+   `Runtime.evaluate` open for its whole 1.8–5.3s. The 500ms heartbeat queues behind it and returns
+   multi-second latency on a page that is perfectly responsive. The label now says SLOW TO SERVICE and
+   names both causes instead of picking one. (Suspecting the heartbeat itself was then tested by turning
+   it OFF — that run was the SLOWEST of the day, so the instrument is not the cause either.)
+2. **Single-run A/B is invalid at this noise level.** The same page 2 measured 8.0s, 11.1s, 11.2s and
+   **173.3s** across four runs of the same tenant. On the 173s run EVERY primitive was 10–17s at once —
+   `delay(300)` took 15.24s, `typeText` 10.74s, `scanPage` 11.95s, `llm` 16.77s. A pure SW `setTimeout`,
+   a page eval, a DOM read and an input dispatch cannot all degrade 50× together for any reason internal
+   to this codebase; that is the whole machine starved. Contributing cause, owned: `npm test` (80s a run,
+   once as a 3× loop) was run CONCURRENTLY with live fills several times that day. **Do not run the suite
+   while a fill is in flight, and do not conclude from one run** — the skill already said the latter about
+   LLM variance and it applies far more broadly.
+
+**Net for the day:** the LLM fast-retry is real and verified; the gap instrumentation is real and found
+the operator's ~1s typeahead-close pause; the close-poll fix was measured at ~80ms and reverted; the
+event-firehose theory was refuted before being built. No pacing constant has been shown to be wrong.
+
+## 2026-08-09 — skip the option CAPTURE for skills: page 2 fill 15.6s → 8.0s
+
+**How it was found.** The operator watched a run and reported the walk "hovering over the skills section",
+briefly highlighting a `Raspberry Pi` row, then returning to education — and asked whether it was secretly
+filling the rest of the form during that pause. It was not, and the log answered both halves: page 2 runs
+flat loop (0.2s) → sections (3.5s) → **CAPTURE (8.6s)**, so everything was filled BEFORE the pause. The
+pause is `captureChoiceOptions`, the end-of-page pass that re-opens each choice widget READ-ONLY purely to
+scrape its option list for the review editor; scrolling a virtualised list highlights whatever row it
+passes. Nothing was committed — `audit: re-read 27 filled field(s) post-settle — all matched the report`.
+
+**The change.** `captureChoiceOptions` now skips skills. Every other widget it captures has a FIXED
+vocabulary, so one scrape genuinely hands review a picker. Skills does not: Workday answers it from a
+server-side RANKED search, so an empty-filter open shows one page of a taxonomy with thousands of entries
+— a snapshot that cannot be the picker and that varies run to run (dom-patterns 2026-08-07: the same query
+matched `Yosys`/`RViz` on one run and not the next).
+
+**Measured, same tenant, quiet machine:** `CAPTURE done` 8.63s → **3.67s**; page 2 fill 15.6s → **8.0s**;
+whole-run fill ~28.5s → **~19.6s**. Correctness unchanged: skills still `[skills-suggested-kept]` with its
+15 résumé suggestions, the M40 audit re-read 27 fields with no mismatch, REVIEW reached in 5 pages.
+
+**Consequence, accepted by the operator:** the review page renders skills as its recorded `"A; B; C"` text
+rather than a picker. Still editable, and it is exactly the format `replayField` splits apart and re-adds,
+so submit is unaffected. The FILL is untouched — skills is filled and verified long before this pass runs.
+
+**Why the earlier close-poll attempt bought only ~80ms, now explained:** `delayRender` is ADAPTIVE and
+scales its request down ~10× on a visible tab, so the 400ms close tick that looked worth fixing was
+already running at ~40ms. The real cost in CAPTURE was never the interval — it was re-opening a widget
+that had nothing worth scraping.
 
 ## 2026-08-09 (b) — the non-Workday merge did NOT regress Workday
 

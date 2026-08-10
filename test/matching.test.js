@@ -3,7 +3,51 @@
 // versions; these tests pin the shared behavior both must keep).
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { normalize, fuzzyRatio, matchCandidates } = require("../lib.js");
+const { normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex } = require("../lib.js");
+
+// ── Tier 1.5: POLARITY LEAD (operator, 2026-08-09) ───────────────────────────────────────────────
+// "if the answer begins with the answer I have in my ladder, it is correct ... it doesn't matter how it
+// elaborates if it begins with no and that is my answer." Deterministic: no review, no teach.
+
+test("polarity-lead: a stored 'No' fills a verbose 'No, I do not require sponsorship'", () => {
+  const opts = ["Yes, I will require sponsorship now or in the future", "No, I do not require sponsorship"];
+  const r = matchCandidates(["No"], opts, { containment: false }); // dropdown ⇒ containment OFF; this tier still fires
+  assert.strictEqual(r.targetIndex, 1);
+  assert.strictEqual(r.matchTier, "polarity-lead");
+});
+
+test("polarity-lead REFUSES when two options lead with the same polarity — the dangerous split", () => {
+  // These lead identically and mean opposite things to the employer; guessing either is unacceptable.
+  const opts = [
+    "No, I do not now or in the future require sponsorship",
+    "No, I do not now, but I will in the future require sponsorship",
+    "Yes",
+  ];
+  const r = matchCandidates(["No"], opts, { containment: false });
+  assert.strictEqual(r.targetIndex, -1, "ambiguous polarity must escalate to review, never pick the first");
+});
+
+test("polarity-lead is word-anchored — 'No' does not lead-match 'November'", () => {
+  const r = matchCandidates(["No"], ["November", "December"], { containment: false });
+  assert.strictEqual(r.targetIndex, -1);
+});
+
+test("polarity-lead only applies to BARE yes/no answers, never an arbitrary value", () => {
+  // Allowing any string would let "Bachelor" silently claim the longer degree — the exact guess the
+  // containment rule exists to refuse.
+  const r = matchCandidates(["Bachelor"], ["Bachelor of Science in Underwater Basket Weaving"], { containment: false });
+  assert.strictEqual(r.targetIndex, -1);
+  assert.strictEqual(isPolarityToken("Bachelor"), false);
+  assert.strictEqual(isPolarityToken("no"), true);
+  assert.strictEqual(isPolarityToken("TRUE"), true);
+});
+
+test("polarity-lead: booleans coerce, and EXACT still wins over the lead tier", () => {
+  assert.strictEqual(polarityLeadIndex(["Yes, always", "No, never"], "false"), 1);
+  const r = matchCandidates(["No"], ["No", "No, with conditions"], { containment: false });
+  assert.strictEqual(r.matchTier, "exact-normalized", "a bare exact option is preferred over a verbose lead");
+  assert.strictEqual(r.targetIndex, 0);
+});
 
 test("normalize lowercases, strips a trailing (+digits), collapses whitespace", () => {
   assert.strictEqual(normalize("United States of America (+1)"), "united states of america");

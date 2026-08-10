@@ -2,7 +2,7 @@
 
 import { useState, useEffect } from "react";
 import { X, Trash2 } from "lucide-react";
-import { SelectField, CheckboxField, CandidateField, TagListField, FieldLabel } from "@/components/form/fields";
+import { SelectField, CheckboxField, CandidateField, TagListField, FieldLabel, AdvancedChoices } from "@/components/form/fields";
 import { type Bucket } from "@/lib/buckets";
 import { clsx } from "@/lib/clsx";
 
@@ -57,18 +57,34 @@ export function ConfirmDeleteButton({ onDelete, withLabel }: { onDelete: () => v
 /** A Yes/No toggle for a remembered answer (stores ["Yes"] / ["No"] / []). Label is optional — omit it
  *  when the question is already shown elsewhere (e.g. on the row header). */
 export function RememberedToggle({ label, value, onChange }: { label?: string; value: string[]; onChange: (v: string[]) => void }) {
+  // Click the ALREADY-SELECTED option again to open its advanced ladder — the same gesture the profile
+  // page's TriBool has always had, asked for here by the operator (2026-08-09): a text answer could reach
+  // the ladder through CandidateField's `›` arrow, but a Yes/No one had no route to it at all.
+  //
+  // A remembered answer's `value` IS the candidate list, so the ladder edits that array directly: ["No"]
+  // becomes ["No","Nope","Negative"] and the extension tries them in order. value[0] stays the option the
+  // toggle shows as selected.
+  const [advanced, setAdvanced] = useState(false);
   const cur = value[0] || "";
   return (
     <div>
-      {label && <FieldLabel>{label}</FieldLabel>}
-      <div className={clsx("flex max-w-[14rem] overflow-hidden rounded-lg border border-hairline", label && "mt-1.5")}>
+      {label && <FieldLabel hint={cur ? "Esc clears" : undefined}>{label}</FieldLabel>}
+      <div
+        className={clsx("flex max-w-[14rem] overflow-hidden rounded-lg border border-hairline", label && "mt-1.5")}
+        // Clicking the active option now OPENS the ladder instead of clearing, so Escape takes over the
+        // clear — exactly the split TriBool uses, rather than leaving no way to unset the answer.
+        onKeyDown={(e) => {
+          if (e.key === "Escape" && cur) { e.preventDefault(); onChange([]); setAdvanced(false); }
+        }}
+      >
         {["Yes", "No"].map((o, idx) => {
           const active = cur.toLowerCase() === o.toLowerCase();
           return (
             <button
               key={o}
               type="button"
-              onClick={() => onChange(active ? [] : [o])}
+              title={active ? "Click again for the full answer ladder" : undefined}
+              onClick={() => (active ? setAdvanced((v) => !v) : onChange([o]))}
               className={clsx(
                 "flex-1 py-1.5 text-sm transition-colors",
                 idx === 0 && "border-r border-hairline",
@@ -80,6 +96,14 @@ export function RememberedToggle({ label, value, onChange }: { label?: string; v
           );
         })}
       </div>
+      {advanced && (
+        <AdvancedChoices
+          label={label || "Answer"}
+          value={value}
+          onChange={onChange}
+          onClose={() => setAdvanced(false)}
+        />
+      )}
     </div>
   );
 }

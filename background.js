@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "post-ats-merge-1";
+const AP_BUILD_MARKER = "polarity-capture-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -581,13 +581,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // how a run is tailed without re-reading the whole buffer. `pattern` is a case-insensitive regex over
   // the line text (e.g. "CDP-TIME|HALT"), `limit` caps the reply (newest kept, `truncated` says so), and
   // `clear` empties the buffer after replying. Allowed DURING a run — watching a live walk is the point.
-  if (type === "AP_DEV_FLAG") {
-    // dev-only: flip a chrome.storage.local debug flag (forceWorkerTimersOff, forceTrustedInput)
-    const key = String(message.key || "");
-    if (!/^(forceWorkerTimersOff|forceTrustedInput)$/.test(key)) { sendResponse({ ok: false, error: "unknown flag" }); return true; }
-    chrome.storage.local.set({ [key]: !!message.value }, () => sendResponse({ ok: true, key, value: !!message.value }));
-    return true;
-  }
+  // NOTE (2026-08-09): a SECOND, narrower AP_DEV_FLAG handler used to sit here, accepting only
+  // forceWorkerTimersOff/forceTrustedInput. Because it matched first it SHADOWED the full handler below,
+  // so every other documented flag — debugPageTrace, debugClobber, debugAiPrompts, skipPreSaveReverify,
+  // debugGroupWatch, disableAiBatch, debugLagTrace — answered "unknown flag" and could not be turned on
+  // at all. Removed rather than merged: both of its keys are already in the ALLOWED list below, and that
+  // handler is a strict superset (it also supports value:null to CLEAR a flag, and a keyless read-all).
   if (type === "AP_DEV_LOGS") {
     const sel = devLogSelect(apDevLog, { since: message.since, pattern: message.pattern, limit: message.limit });
     sendResponse({
@@ -614,7 +613,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -3088,11 +3087,15 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     const _aiBatch = !(await new Promise((r) => chrome.storage.local.get("disableAiBatch", (v) => r(!!(v && v.disableAiBatch)))));
     const _dbgClobber = await new Promise((r) => chrome.storage.local.get("debugClobber", (v) => r(!!(v && v.debugClobber))));
     const _dbgTrace = await new Promise((r) => chrome.storage.local.get("debugPageTrace", (v) => r(!!(v && v.debugPageTrace))));
+    // Lag trace: start the heartbeat as early as possible so the pre-fill settle is inside the window
+    // too — a page that "starts slow" is often already slow before the first field is touched.
+    const _dbgLag = await new Promise((r) => chrome.storage.local.get("debugLagTrace", (v) => r(!!(v && v.debugLagTrace))));
+    if (_dbgLag) { cdpLagStart(); LOG(`debugLagTrace ON — timing every CDP command, plus a ${500}ms no-op probe and the SW's own scheduling drift, so a pause can be blamed on Workday / the transport / us.`); }
     if (_dbgTrace) LOG(`debugPageTrace ON — streaming a [TRACE] line for every field decision and every wait on page ${(opts && opts.pageNumber) || "?"}.`);
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
-    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
   } finally {
     if (_selfId) {
       cdpSetTrustedText(false);                        // never leave the next page paying for this one
@@ -3224,6 +3227,11 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     let paint = "?"; try { paint = await cdpPaintLabel(); } catch (e) { /* label only */ }
     pacing = pacing + " | " + paint;
     LOG(`[CDP-TIME] pacing ${pacing} | settle ${s(settleMs)} | fill ${s(fillMs)} (flat ${s(ph.flat)} · sections ${s(ph.sections)} · stubs ${s(ph.stubs)} · cascade ${s(ph.cascade)}+${s(ph["cascade-late"])} · capture ${s(ph.capture)} · audit ${s(ph.audit)} · sweep ${s(ph.sweep)}) | resume ${s(attachMs)}${slow ? ` | slowest: ${slow}` : ""}`);
+    // The lag decomposition for the SAME page, drained and reset here so consecutive pages of one run
+    // are directly comparable. A run that "randomly gets slower" shows up as the no-op rtt and/or the
+    // SW drift climbing while the command COUNT stays flat — that is the tell that the extra seconds
+    // are not Workday doing more work.
+    try { const lag = cdpLagReport(`page ${(opts && opts.pageNumber) || "?"}`); if (lag) LOG(lag); } catch (e) { /* log-only */ }
   }
 
   // M40 post-fill audit: the inline audit already ran inside drivePageFill (its mismatches
@@ -8044,6 +8052,21 @@ async function fillEngine(profile, defaults, jobContext) {
       const nc = normalize(cand);
       const idx = optionTexts.findIndex((t) => normalize(t) === nc);
       if (idx !== -1) return { targetIndex: idx, matchTier: "exact-normalized", matchedCandidate: cand };
+    }
+    // Tier 1.5: POLARITY LEAD — LOCKSTEP with lib.js (2026-08-09). For a yes/no question the polarity
+    // token IS the answer, so a stored "No" fills "No, I do not require sponsorship" deterministically.
+    // Narrow on purpose: the candidate must be a bare Yes/No/true/false, the match is anchored on a word
+    // boundary (^no\b never hits "November"), and EXACTLY ONE option may lead with it — a tenant that
+    // splits one polarity into two meanings ("No, I do not now or in the future" vs "No, I do not now BUT
+    // WILL") escalates to review instead of being guessed at.
+    const POLARITY_TOKENS = { yes: "yes", no: "no", true: "yes", false: "no" };
+    for (const cand of candidates) {
+      const want = POLARITY_TOKENS[String(cand == null ? "" : cand).trim().toLowerCase()];
+      if (!want) continue;
+      const re = new RegExp("^" + want + "\\b", "i");
+      const hits = [];
+      optionTexts.forEach((t, i) => { if (re.test(String(t == null ? "" : t).trim())) hits.push(i); });
+      if (hits.length === 1) return { targetIndex: hits[0], matchTier: "polarity-lead", matchedCandidate: cand };
     }
     // Tier 2: containment — startsWith then includes, AMBIGUITY-SAFE (exactly one), skipped for
     // dropdown/radio (opts). Mid-string includes requires >= 3 chars (a 2-char abbrev is too promiscuous).

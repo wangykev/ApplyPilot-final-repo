@@ -238,6 +238,25 @@ function fuzzyRatio(a, b) {
   return Math.round((1 - dist / Math.max(m, n)) * 100);
 }
 
+// Is this candidate a bare YES/NO answer? Only these earn the polarity-lead tier — see matchCandidates.
+// Kept deliberately tiny: "yes"/"no" and the booleans resolve() coerces them from. Anything with more
+// words is a real value, not a polarity, and must go through the ordinary tiers.
+const POLARITY_TOKENS = { yes: "yes", no: "no", true: "yes", false: "no" };
+function isPolarityToken(s) {
+  return Object.prototype.hasOwnProperty.call(POLARITY_TOKENS, String(s == null ? "" : s).trim().toLowerCase());
+}
+// Index of the ONE option that leads with this polarity, or -1 when none or several do. Word-anchored so
+// "No" cannot lead-match "November", and ambiguity-refusing so a tenant that splits a polarity into two
+// different meanings escalates instead of being guessed at.
+function polarityLeadIndex(optionTexts, cand) {
+  const want = POLARITY_TOKENS[String(cand == null ? "" : cand).trim().toLowerCase()];
+  if (!want) return -1;
+  const re = new RegExp("^" + want + "\\b", "i");
+  const hits = [];
+  (optionTexts || []).forEach((t, i) => { if (re.test(String(t == null ? "" : t).trim())) hits.push(i); });
+  return hits.length === 1 ? hits[0] : -1;
+}
+
 // Ordered-candidate match ladder (shared by dropdown + typeahead). Candidates
 // are tried most-specific first; NO low-threshold fuzzy — a loose bar silently
 // selects a WRONG value. Returns { targetIndex, matchTier, matchedCandidate };
@@ -259,6 +278,26 @@ function matchCandidates(candidates, optionTexts, opts) {
     const nc = normalize(cand);
     const idx = optionTexts.findIndex((t) => normalize(t) === nc);
     if (idx !== -1) return { targetIndex: idx, matchTier: "exact-normalized", matchedCandidate: cand };
+  }
+  // Tier 1.5: POLARITY LEAD (operator, 2026-08-09). For a YES/NO question the polarity token IS the whole
+  // answer — everything after it is the tenant's own phrasing, not something we are inferring. Operator:
+  // "if the answer begins with the answer I have in my ladder, it is correct... it doesn't matter how it
+  // elaborates if it begins with no and that is my answer." So a stored "No" fills
+  // "No, I do not require sponsorship" DETERMINISTICALLY — no review, no teach.
+  //
+  // This is NOT the containment tier and is deliberately far narrower, because containment is a guess and
+  // this is not. Three limits, and each one is load-bearing:
+  //   1. The CANDIDATE must be a bare polarity token. Allowing any string would let "Bachelor" claim
+  //      "Bachelor of Science in …", which is exactly the guess the containment rule exists to refuse.
+  //   2. The match is ANCHORED at the start on a WORD boundary (^no\b) — "No" must not hit "November".
+  //   3. EXACTLY ONE option may lead with it. The dangerous shape is a tenant splitting one polarity into
+  //      two meanings — "No, I do not now or in the future require sponsorship" vs "No, I do not now, BUT
+  //      WILL in the future" — which lead identically and mean opposite things. 0 or 2+ ⇒ fall through and
+  //      let the ladder escalate to review. That guard is what makes the rest safe.
+  for (const cand of candidates) {
+    if (!isPolarityToken(cand)) continue;
+    const hit = polarityLeadIndex(optionTexts, cand);
+    if (hit !== -1) return { targetIndex: hit, matchTier: "polarity-lead", matchedCandidate: cand };
   }
   // Tier 2: containment — startsWith, then includes. AMBIGUITY-SAFE: a candidate contained in 2+ options
   // is NOT a confident match → skip it, never silently pick the first. Commit ONLY when EXACTLY ONE option
@@ -2294,5 +2333,5 @@ if (typeof module !== "undefined" && module.exports) {
   skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

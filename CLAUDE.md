@@ -187,6 +187,20 @@ Lives in `matchCandidates` (lib.js + the inline `fillEngine` copy in `background
 
 ## Answer buckets (website-driven; Profile v2)
 
+How a choice widget picks an option. Architectural decision, with rationale:
+- **Value is an ordered candidate list, most-specific first**, supplied by the profile (`resolve()` coerces per widget type; an array passes through as a ready-made tiered list). The handler tries candidates in order. **A BOOLEAN profile value coerces to the tiered list `["Yes","True"]` / `["No","False"]` for dropdown/typeahead AND radio** (2026-07-23) — so a checkbox, a true/false dropdown, a yes/no dropdown, and yes/no radios all fill DETERMINISTICALLY from a stored boolean. *Why it matters:* a bare `"true"`/`"false"` string matched no "Yes"/"No" option and leaked required boolean questions (e.g. "Are you over 18?*") to the AI post-pass — flagged LEGALLY-LOADED on every fill despite the profile answering it. Both `resolve()` copies (lib.js/fill-driver.js + the background.js engine) are lockstep; regression-pinned.
+- **Match ladder (per candidate, stop at first hit):** (1) **Exact** after `normalize()`; (2) **Containment — WIDGET-DEPENDENT, AMBIGUITY-SAFE + short-guarded** (`matchCandidates(cands, opts, {containment})`, default ON) — `startsWith` then `includes`, committed ONLY when **exactly one** option contains the candidate (a candidate in **2+ options is NOT a confident match** → skip), AND mid-string `includes` requires the candidate to be **≥ 3 chars** (a 2-char abbrev is a substring of too many unrelated options); (3) **Fuzzy ≥ 90** Levenshtein — **TYPO TOLERANCE ONLY**; (4) **Escalate** → `needs_review` (a REQUIRED field then goes to the AI rescue; optional → blank).
+- **Containment is a GUESS unless Workday made it (2026-07-16). ApplyPilot never PICKS a containment match itself:**
+  - **Dropdowns + radios (select from a full list)** pass `{containment:false}` → exact → typo → escalate. *Why:* a substring match on a shown list is a wrong guess (the `"PA"` → **"Armed Forces Pacific"** bug — `"pa"` ⊂ "pa**cific**", the ONLY option containing it, so the ambiguity guard couldn't help; it committed at `filled` with NO review flag). (`fillRadioCdp` was already exact-label-only, so this only changed `fillDropdownCdp`.)
+  - **Typeahead / cert / source DIRECTED picks** (Workday showed a filtered list and did NOT autocommit, and we would click the one containing option) ALSO pass `{containment:false}` — same reasoning: us picking is a guess.
+  - **Typeahead / cert / source AUTOCOMMIT recognition** KEEPS containment (default) — when *Workday itself* drops in a completed chip after you type (e.g. `"Training Instructor - AEVO"` → `"…AEVO - Multiple Recognized Providers"`), "the chip contains what I typed" is how we RECOGNIZE Workday's completion (vs a genuine stray like a `"Canada"` chip for a US query). That's trusting Workday, not guessing; still `filled_review` (flagged). The AI anti-hallucination belts keep containment too (the AI's choice → a real option; the AI rescue must succeed for required fields).
+  - **ONE authorized exception — SKILLS (operator, 2026-08-07).** `matchSkillOption` has a **containment tier** so a skill Workday only lists under a broader name still lands (`Vivado` → `Xilinx Vivado`). It is safe only because of three guards, all earned on one live run: **WHOLE-WORD** containment (raw `includes` puts `Git` inside "Di**git**al" and `CAN` inside "**Can**adian"), a **distinctiveness gate** (a lone token must be ≥5 chars — on that run `CAN` was offered "**Can Openers**", a real whole-word hit the gate refused), and a **ranking tie-break** (several containing rows → Workday's own first result, alternatives named in the review). Every widened commit is `filled_review` + `skills-containment`, never silent. This does NOT relax the rule anywhere else.
+  - **POLARITY LEAD — a yes/no answer matches an option that LEADS with it (operator, 2026-08-09).** Tier 1.5, right after exact: a stored `"No"` fills `"No, I do not require sponsorship"` **DETERMINISTICALLY** — `filled`, high confidence, no review, no teach. Operator's reasoning: for a yes/no question the polarity token IS the answer; everything after it is the tenant's phrasing, not something we inferred. This is NOT containment and is far narrower — three guards, each load-bearing: the CANDIDATE must be a bare `Yes/No/true/false` (any-string prefixing would let `"Bachelor"` claim `"Bachelor of Science in …"`, the exact guess containment exists to refuse); the match is **word-anchored** (`^no\b` never hits "November"); and **EXACTLY ONE** option may lead with it — a tenant splitting one polarity into two meanings (`"No, I do not now or in the future…"` vs `"No, I do not now, BUT WILL…"`) escalates to review instead of being guessed. `flagTierCategory` grades it **exact** (without that line it falls to `"none"` ⇒ `needs_review`/stray — the opposite of the intent). Lives in `matchCandidates` (lib.js + the inline `fillEngine` copy — LOCKSTEP), so dropdown/radio get it even though they pass `{containment:false}`.
+  - **Net rule:** ApplyPilot accepts only an **exact** match, a **leading-polarity yes/no** (above), a **typo** (fuzzy ≥ 90), or a value **Workday autocommitted** — plus, for SKILLS only, a guarded **whole-word containment** (above). Everything else escalates → the operator picks it on the website review editor / teaches an answer bucket (→ an exact match next time), or the AI rescue fills a required field. **Lives in `matchCandidates` (lib.js + the inline `fillEngine` copy in `background.js` — LOCKSTEP); dropdown/radio + directed-typeahead call sites pass `{containment:false}`.**
+- **Why not low-threshold fuzzy:** a 60% bar matches near-gibberish and silently selects a WRONG value, corrupting the application — the worst failure for an accuracy tool, worse than leaving a field unfilled. Fuzzy is typo-tolerance at 90+, not a general matcher.
+- **`normalize()`** lowercases, strips a trailing `(+digits)`, collapses whitespace — lets "United States of America" exact-match the rendered "United States of America (+1)" with no fuzzy step. A tiered profile array (e.g. `["United States of America (+1)", "United States"]`) makes the exact-normalized hit land at **high** confidence instead of containment (medium).
+- **needs-review / fuzzy connection:** a fuzzy/no match is not a confident answer — it's exactly the category that belongs in the human-review pile.
+- **Parked (opt-in per field, never global):** dial-code-suffix matching ("any `(+1)` is acceptable for a US phone"). Global would silently accept a wrong country whose dial code happened to match.
 Mechanism, Mode A/B, answer ladders, repeating-entry filling, starter/default wordings:
 **`answers-and-ai` skill.** The standing rules:
 
@@ -511,6 +525,47 @@ required, which is what blocked Save.
 6. Watch the service-worker console. `npm test` runs the unit suite (`node:test`).
 
 For a real end-to-end run driven through Chrome, load the **`live-testing`** skill.
+
+## A SLOW page is the LLM until proven otherwise (measured 2026-08-09)
+
+**Subtract the `[LLM]` line before blaming a tenant, the DOM, or the fill code for a slow page.** Provider
+latency is the biggest random variable in the whole pipeline and it dwarfs everything else on the page:
+across three back-to-back cat.wd5 runs `gemini-3.1-flash-lite` answered in 486ms, 646ms and 796ms — and
+once, same model, same config, same session, in **30657ms** (one attempt, no retry, no key rotation,
+finishing 343ms inside the 30s `LLM_REQUEST_TIMEOUT_MS`). That single call was the entire difference
+between a 1.9s page and a **32s** page. A page that "randomly filled slower" is this until the log says
+otherwise.
+
+Rank of per-page cost, from those runs: **LLM (0.5–30s, random)** › `capture`/`scrapeTaOptions` (2–16s,
+OURS but deterministic — it scales with the option-list size) › everything else. The debugger channel is
+NOT a factor: the no-op page probe's p50 is 1ms across ~1500 commands.
+
+**`captureChoiceOptions` SKIPS skills (2026-08-09) — page 2 fill 15.6s → 8.0s.** Every other widget it
+re-opens has a FIXED vocabulary, so one read-only scrape hands the review editor a real picker. Skills is
+answered by a server-side RANKED search, so an empty-filter open is one page of a huge taxonomy that
+varies run to run — it can never BE the picker, and it cost 8.6s of page 2's 15.6s. Review renders skills
+as its recorded `"A; B; C"` text instead, which is exactly what `replayField` splits apart and re-adds.
+This is also what the operator saw as the walk "hovering" over skills mid-run: capture scrolling a
+virtualised list highlights rows, and it is READ-ONLY (that run's M40 audit re-read 27 fields, all matched).
+
+**MITIGATION — the fast-retry (`LLM_FAST_RETRY_RULES`, llm.js).** For a matching model (today: gemini 3.1
+only), the first two attempts are capped at **2s** and a call still running at that point is abandoned and
+re-issued on a fresh socket after 150ms. At a p50 of ~650ms, a call still running at 2s is a stuck socket,
+not a slow model. **Two invariants make it safe, both unit-pinned:** (1) once the fast tries are spent the
+next attempt gets the FULL budget, so a genuinely slow provider is never FAILED by the cap — a failed AI
+call blanks a required field and halts the walk, which is far worse than one slow page; and (2) the
+fast-try budget is INDEPENDENT of the error ladder, because rotation probes every key with `noRetry:true`
+— gating it on the ladder made it silently never fire whenever 2+ keys were configured (caught live, not
+by tests). A fast abort is never a key fault: it does not consume a rotation slot or get a key marked bad.
+Adding another model is one line in the rule table; `fastRetry:false` opts a call out.
+
+**`debugLagTrace`** (`AP_DEV_FLAG`) is the tool that settles it, and it exists because a duration alone
+never could: it times every CDP command at the `cdpSend` choke point, runs a 500ms no-op page probe, and
+measures the service worker's own timer drift — three clocks that fail independently, so each slow command
+prints whether it was the renderer, the channel, or that call's own work. OFF ⇒ pass-through, so it cannot
+distort what it measures. Detail + how to read it: the `live-testing` skill. **Unresolved:** SW timer drift
+spikes of 1–2.4s in every run, not yet tied to anything (and possibly an artefact of timing with a timer
+inside an MV3 worker) — do not treat drift alone as a problem until it is shown to track real slowness.
 
 ## Working principles
 

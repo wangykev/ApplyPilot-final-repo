@@ -65,6 +65,13 @@ const apMatch = (typeof module !== "undefined" && module.exports)
 // match quality lives in the NEW `confidence` field, provenance in the NEW `flag`.
 function flagTierCategory(matchTier) {
   if (matchTier === "exact-normalized") return "exact";
+  // POLARITY LEAD grades as EXACT (operator, 2026-08-09), and that is the whole point of the tier: for a
+  // yes/no question the polarity token IS the answer, so "No" → "No, I do not require sponsorship" is a
+  // deterministic profile match, not a guess, and must not nag for review or ask to be taught. It is only
+  // ever reached when EXACTLY ONE option leads with the polarity (see matchCandidates) — an ambiguous
+  // split never gets here. Without this line it would fall through to "none" ⇒ needs_review/stray, i.e.
+  // precisely the opposite of the intent.
+  if (matchTier === "polarity-lead") return "exact";
   if (matchTier === "containment") return "containment";
   if (typeof matchTier === "string" && matchTier.indexOf("fuzzy") === 0) return "fuzzy";
   return "none";
@@ -3932,6 +3939,27 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     const took = ms == null ? "" : ` — ${ms >= 1000 ? "⏸ " : ""}${(ms / 1000).toFixed(2)}s`;
     console.log(`[ApplyPilot][TRACE +${at}s] ${msg}${took}`);
   };
+  // ── GAP TRACE (2026-08-09, budgets.debugLagTrace) ────────────────────────────────────────────────
+  // Operator: "sometimes it happens between two deterministic fields — they should fill instantly, but
+  // there is like a .75 second gap between their fills." The existing traces cannot show that: they time
+  // ACTIONS and per-FIELD duration, so time spent between one field finishing and the next starting is
+  // attributed to NEITHER and simply vanishes from the accounting.
+  //
+  // Two suspects, and these lines tell them apart without guessing:
+  //   · a DELAY that overran — we asked act.delay for 300ms and the service worker gave us back 1050ms.
+  //     That is our own timer being late (the SW drift the lag trace already measures), NOT Workday. It
+  //     was visible once as `delayRender(300) — ⏸ 1.33s` and is the leading hypothesis for the 0.75s.
+  //   · genuine dead time BETWEEN fields — the loop's own bookkeeping between the last action of field N
+  //     and the first action of field N+1 (resolve, bucket lookup, the deterministic recognizers).
+  const _gapOn = !!budgets.debugLagTrace;
+  const GAP_DELAY_OVERRUN_MS = 150;  // a delay that came back this much later than asked
+  const GAP_BETWEEN_FIELDS_MS = 150; // dead air between two fields
+  let _prevFieldEnd = 0, _prevFieldName = null;
+  const gap = (msg) => {
+    if (!_gapOn) return;
+    const at = ((Date.now() - _t0page) / 1000).toFixed(1);
+    console.log(`[ApplyPilot][GAP +${at}s] ${msg}`);
+  };
   // Per-ACTION timing (operator: "include the time it takes each action to run"). Wraps a CURATED list
   // of async I/O primitives rather than proxying the whole object — some members are plain values or
   // sync, and turning those into promises would break their callers. Only actions at or over the
@@ -3939,7 +3967,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // every real pause shows up. This is where the invisible time actually goes: opening a widget, waiting
   // for options to settle, the commit beats, and the wall-clock delays.
   const TRACE_ACTION_MS = 120;
-  if (_traceOn) {
+  // The wrapper serves BOTH traces now: debugPageTrace prints every slow action, debugLagTrace uses it to
+  // catch delays that overran. Either flag installs it.
+  if (_traceOn || _gapOn) {
     const timed = ["scanPage", "openDropdown", "readDropdownState", "clickDropdownOptionByText", "closeDropdown",
       "focusInput", "typeText", "typeDigits", "clearText", "pressEnter", "pressTab", "pressEscape", "pressSpace",
       "clickRadioLabel", "readRadioState", "readCheckboxGroup", "awaitQuiet", "installQuietWatch", "selExists",
@@ -3958,12 +3988,24 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       if (typeof fn !== "function" || fn.__apTimed) continue;   // act is reused across pages AND the
       // cascade recurses into drivePageFill, so without this guard each pass wrapped the wrapper: one
       // call printed several times under different page clocks, and the overhead grew every page.
+      const isDelay = name === "delay" || name === "delayFull" || name === "delayRender";
       const wrapped = async (...args) => {
         const s0 = Date.now();
         try { return await fn.apply(act, args); }
         finally {
           const ms = Date.now() - s0;
           if (ms >= TRACE_ACTION_MS) trace(`    · ${name}(${args.map(shown).filter(Boolean).slice(0, 2).join(", ")})`, ms);
+          // A DELAY is the one action whose intended cost we know exactly, which makes it the cleanest
+          // probe in the whole fill: anything beyond what we asked for is the service worker's timer
+          // running late, and nothing to do with the page or the tenant. `delay`/`delayRender` are
+          // ADAPTIVE — they scale the request internally — so an overrun is only meaningful when the
+          // wait came back LONGER than the unscaled request, never shorter.
+          if (_gapOn && isDelay && typeof args[0] === "number") {
+            const over = ms - args[0];
+            if (over >= GAP_DELAY_OVERRUN_MS) {
+              gap(`⏱ ${name}(${args[0]}ms) actually took ${ms}ms — ${over}ms OVERRUN. We asked for the wait; the extra is the SERVICE WORKER's timer running late, not Workday.`);
+            }
+          }
         }
       };
       wrapped.__apTimed = true;
@@ -4060,6 +4102,15 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   for (const f of (onlySec ? [] : scan.fields)) { // section re-fill → flat loop skipped entirely
     if (only && !only.has(f.fieldName)) continue; // AI-4: re-fill only the targeted field(s)
     const _fieldT0 = Date.now();
+    // Dead air between the previous field finishing and this one starting. Nothing in the per-field or
+    // per-action accounting covers this window, so a stall here is invisible in [CDP-TIME] — it inflates
+    // the phase total with no field to blame.
+    if (_gapOn && _prevFieldEnd) {
+      const between = _fieldT0 - _prevFieldEnd;
+      if (between >= GAP_BETWEEN_FIELDS_MS) {
+        gap(`⇢ ${between}ms of DEAD AIR between "${_prevFieldName}" finishing and "${f.fieldName}" starting — no field owns this time; it is the loop's own between-field work.`);
+      }
+    }
     const loc = { wrapperSel: f.wrapperSel };
     const mappedPath = FIELD_MAP[f.fieldName] || null;
     // WHAT IT IS ABOUT TO DO, and on what evidence. deterministicTierFor is the same predicate the
@@ -4559,6 +4610,15 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       if (ord.length) record.date_order = ord;
     }
     record.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME] per-field wall-clock (log-only — the SW surfaces the slowest fields)
+    // Close the window for the between-fields measurement at the top of the next iteration. Stamped here
+    // rather than after results.push so the push itself cannot be mistaken for dead air.
+    _prevFieldEnd = Date.now(); _prevFieldName = f.fieldName;
+    // A field that did NOTHING should cost nothing. When one that the deterministic pass answered still
+    // burns real time, say so per field — that is the "two deterministic fields with a gap between them"
+    // case, and it is otherwise buried in a phase total.
+    if (_gapOn && record.elapsedMs >= 400) {
+      gap(`▪ "${f.fieldName}" (${f.widgetType}) took ${record.elapsedMs}ms to reach ${record.status}${record.matchTier ? " via " + record.matchTier : ""} — the ⏱/· lines above this one account for it.`);
+    }
     if (_traceOn) {
       trace(`  ⤷ ${record.status}${record.after != null && record.after !== "" ? ' "' + String(record.after).slice(0, 40) + '"' : ""}`
         + `${record.flag ? " [" + record.flag + "]" : ""}${record.matchTier ? " via " + record.matchTier : ""}`
@@ -7214,6 +7274,18 @@ function applyAuditVerdicts(results, verdicts) {
 // (leaves unmounted → no clickable stray target). Adaptive → breaks the instant the popup empties (fast
 // happy path); bounded by iterations + a real deadline so a slow close (or an older substrate whose readHier
 // lacks leafCount) never hangs. Read-only (only readHier + a settle).
+// ⛔ TRIED AND REVERTED, 2026-08-09 — do not "optimise" this poll again without new evidence.
+// The operator watched a run and reported: "right after the country/territory phone code question, right
+// after it recon'd everything, it waited a second before closing the typeahead and continuing." This poll
+// re-checks on `reopenSettleMs` (400ms) — an OPEN-settle budget, coarse for a close — so a popup that
+// unmounts in ~50ms still costs a full tick, which looked like the obvious cause. Dropping the interval to
+// 75ms (deadline unchanged, so no safety change) was measured live and moved the capture's open+close
+// overhead 0.78s → 0.70s: ~80ms, i.e. noise. The same run was WORSE overall (page 3 renderer blocked
+// 14.3s), and there is a mechanism that makes that plausible rather than coincidental — polling 5× more
+// often issues 5× more Runtime.evaluate calls into a page thread that is ALREADY the bottleneck. Paying
+// renderer contention to save 80ms is the wrong trade.
+// The real cost here is not this interval: it is the page thread being blocked for seconds at a time (see
+// the 2026-08-09 progress-log entry), which no pacing tweak addresses.
 async function awaitTypeaheadClosed(act, loc, budgets) {
   if (!act || !act.readHier) return;
   const dr = act.delayRender || act.delayFull;
@@ -7303,6 +7375,16 @@ async function captureChoiceOptions(act, results, budgets) {
     if (!rec || !rec.auditLoc) continue;
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
     let key, scrape;
+    // SKILLS is deliberately NOT captured (operator, 2026-08-09). Every other choice widget here has a
+    // FIXED vocabulary, so one scrape gives review a real picker. Skills does not: Workday answers it from
+    // a SERVER-SIDE search that returns a ranked top-N, so what an empty-filter open shows is one page of
+    // a taxonomy with thousands of entries — a snapshot that cannot be the picker anyway, and which varies
+    // run to run (dom-patterns 2026-08-07: the same query matched Yosys/RViz on one run and not the next).
+    // It was also the widget the operator watched flash a highlighted "Raspberry Pi" row mid-run, because
+    // scrolling a virtualised list highlights whatever it passes. Review still edits the field — it just
+    // renders the recorded "A; B; C" chip list as text, which is exactly what replayField splits back
+    // apart and re-adds. Nothing about the FILL changes: skills is filled and verified before this pass.
+    if (isSkillsField(rec)) continue;
     if (rec.widgetType === "typeahead" && act.scrapeTaOptions) {
       // Repeating-section FoS typeaheads AND flat page-1 typeaheads kept without actuation
       // (prefilled-kept, e.g. countryPhoneCode): a tier-0 keep never opened the widget so nothing was
