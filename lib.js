@@ -2346,6 +2346,344 @@ function devLogSelect(ring, opts) {
   return { lines, matched, truncated, patternError };
 }
 
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// MANUAL ASSIST (2026-08-10) — the extension's own surface: a JD match card + two fill buttons.
+//
+// The full end-to-end run stays WEBSITE-driven. The extension is the hands-on tool you reach for while
+// you are looking at a posting yourself: it scores the job against your background, and it fills what is
+// in front of you. Everything below is PURE so it is testable without a page, a tab or a provider —
+// the service worker does the I/O (scrape, call, store), exactly as the fill engine already splits.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── JD MATCH SCORING ────────────────────────────────────────────────────────────────────────────────
+// TODO(dup) LOCKSTEP with web/lib/score.ts — the SAME rubric, ported to plain JS so the popup can score
+// a posting without the website being reachable. Enforced by web/test/score-lockstep.test.ts, which
+// cross-loads THIS file and fails on drift. Change one ⇒ change both.
+//
+// Why score in the extension at all: the card has to appear the moment you open the popup on a posting,
+// which means one call and a cache — a round trip through the site would put the network on the path of
+// every popup open, and the site may not even be running.
+
+/** Below this a JD is almost certainly empty / a placeholder — not worth scoring. */
+const MATCH_MIN_JD_CHARS = 40;
+
+/** Code-side source of truth for the strong/moderate/weak bucket (never trust a model-emitted
+ *  verdict). Conservative about "strong". */
+function verdictForScore(score) {
+  if (typeof score !== "number" || !Number.isFinite(score)) return null;
+  if (score >= 8) return "strong";
+  if (score >= 5) return "moderate";
+  return "weak";
+}
+
+/** A tiered candidate array (degree, field_of_study, tech_stack) → readable text. */
+function scoreFirstText(v) {
+  if (Array.isArray(v)) return v.filter((x) => x != null && String(x).trim() !== "").join(", ");
+  return v == null ? "" : String(v).trim();
+}
+
+/**
+ * Distill the profile into a compact plain-text block for scoring. Includes ONLY resume-relevant
+ * sections (education, work, skills, certifications). Deliberately EXCLUDES personal_info /
+ * work_authorization / self_identification / screening — no PII or demographic data enters the prompt.
+ * Tolerant of an empty profile.
+ */
+function buildCandidateSummary(profile) {
+  const p = profile || {};
+  const lines = [];
+
+  const eduLines = (p.education || [])
+    .map((e) => {
+      const parts = [
+        scoreFirstText(e.degree),
+        scoreFirstText(e.field_of_study),
+        e.school_or_university,
+        e.gpa ? `GPA ${e.gpa}${e.gpa_scale ? "/" + e.gpa_scale : ""}` : "",
+        e.graduation_date && e.graduation_date !== "YYYY-MM" ? `grad ${e.graduation_date}` : "",
+      ]
+        .map((x) => String(x == null ? "" : x).trim())
+        .filter(Boolean);
+      return parts.length ? "- " + parts.join(", ") : "";
+    })
+    .filter(Boolean);
+  if (eduLines.length) lines.push("EDUCATION:", ...eduLines, "");
+
+  const workLines = [];
+  for (const w of p.work_experience || []) {
+    const head = [w.job_title, w.company].map((x) => String(x || "").trim()).filter(Boolean).join(" @ ");
+    const dates = [w.from, w.to].filter((d) => d && d !== "YYYY-MM").join("-");
+    if (head || dates) workLines.push("- " + [head, dates ? `(${dates})` : ""].filter(Boolean).join(" "));
+    const rd = (w.role_description || "").trim();
+    if (rd) {
+      for (const ln of rd.split("\n")) {
+        const t = ln.replace(/^[-*]\s*/, "").trim();
+        if (t) workLines.push("  * " + t);
+      }
+    }
+    const tech = scoreFirstText(w.tech_stack);
+    if (tech) workLines.push("  tech: " + tech);
+  }
+  if (workLines.length) lines.push("WORK EXPERIENCE:", ...workLines, "");
+
+  const skills = (p.skills || []).filter((s) => s && String(s).trim());
+  if (skills.length) lines.push("SKILLS: " + skills.join(", "), "");
+
+  const certs = (p.certifications || []).map((c) => scoreFirstText(c.certification)).filter(Boolean);
+  if (certs.length) lines.push("CERTIFICATIONS: " + certs.join(", "), "");
+
+  return lines.join("\n").trim();
+}
+
+const SCORE_SYSTEM = [
+  "You are a job-fit evaluator. Given a candidate's background and a job description,",
+  "score how well the candidate fits the role on a 1-10 scale.",
+  "",
+  "SCORING CRITERIA:",
+  "- 9-10: Perfect match. Direct experience in nearly all required skills and qualifications.",
+  "- 7-8: Strong match. Most required skills; minor gaps easily bridged.",
+  "- 5-6: Moderate match. Some relevant skills but missing key requirements.",
+  "- 3-4: Weak match. Significant skill gaps; substantial ramp-up needed.",
+  "- 1-2: Poor match. Completely different field or experience level.",
+  "",
+  "WEIGHTING:",
+  "- Weight technical skills heavily (languages, frameworks, tools).",
+  "- Credit transferable experience (automation, scripting, API / hardware / firmware / research work).",
+  "- Factor in project experience, not just employment.",
+  "- Judge against the ROLE'S actual seniority bar: for an internship or new-grad role, do NOT",
+  "  penalize a candidate for lacking senior/industry years; for a senior role, do.",
+  "",
+  "Respond with ONLY a JSON object — no prose, no markdown code fence:",
+  "{",
+  '  "score": <integer 1-10>,',
+  '  "matched_requirements": [<short strings: JD requirements the candidate clearly meets>],',
+  '  "gaps": [<short strings: JD requirements the candidate misses or only partially meets>],',
+  '  "keywords": [<ATS keywords from the JD that match, or could match, the candidate>],',
+  '  "reasoning": "<2-3 sentences explaining the score>"',
+  "}",
+].join("\n");
+
+function buildScorePrompt(profile, jd) {
+  const summary = buildCandidateSummary(profile);
+  const user = [
+    "CANDIDATE BACKGROUND:",
+    summary || "(no background provided)",
+    "",
+    "---",
+    "",
+    "JOB DESCRIPTION:",
+    String(jd || "").trim().slice(0, 6000),
+    "",
+    "Return the JSON object described in the instructions.",
+  ].join("\n");
+  return { system: SCORE_SYSTEM, user };
+}
+
+/** Tolerant JSON extraction: strip a ```json fence, try JSON.parse, else the first {...} block.
+ *  Returns the object or null — never throws. */
+function extractScoreJson(text) {
+  const t = String(text == null ? "" : text)
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  try {
+    const o = JSON.parse(t);
+    if (o && typeof o === "object" && !Array.isArray(o)) return o;
+  } catch (e) { /* fall through */ }
+  const m = t.match(/\{[\s\S]*\}/);
+  if (m) {
+    try {
+      const o = JSON.parse(m[0]);
+      if (o && typeof o === "object" && !Array.isArray(o)) return o;
+    } catch (e) { /* ignore */ }
+  }
+  return null;
+}
+
+function asScoreStringArray(v) {
+  if (!Array.isArray(v)) return [];
+  return v.map((x) => (x == null ? "" : String(x).trim())).filter(Boolean);
+}
+
+/** Parse an LLM reply into a score result. Never throws; a bad reply yields { score:null, error }
+ *  with the raw text kept for debugging. */
+function parseScoreReply(text) {
+  const empty = { score: null, verdict: null, matched_requirements: [], gaps: [], keywords: [], rationale: "" };
+  const obj = extractScoreJson(text);
+  if (!obj) return Object.assign({}, empty, { error: "parse-failed", raw: String(text).slice(0, 400) });
+
+  const score = Number(obj.score);
+  if (!Number.isFinite(score)) return Object.assign({}, empty, { error: "no score in reply", raw: String(text).slice(0, 400) });
+  const clamped = Math.max(1, Math.min(10, Math.round(score)));
+
+  return {
+    score: clamped,
+    verdict: verdictForScore(clamped),
+    matched_requirements: asScoreStringArray(obj.matched_requirements),
+    gaps: asScoreStringArray(obj.gaps),
+    keywords: asScoreStringArray(obj.keywords),
+    rationale: obj.reasoning == null ? "" : String(obj.reasoning).trim(),
+  };
+}
+
+/**
+ * "Skills missing from your resume" — DERIVED, not asked for.
+ *
+ * The model already returns `keywords` ("ATS keywords from the JD that match, OR COULD MATCH, the
+ * candidate") and `gaps`. Which of those you actually HAVE is a fact about your own profile, so it is
+ * answered by a whole-word string check against the candidate summary rather than by a second model
+ * question — a model asked "what is missing from their resume?" will happily list something the resume
+ * says on line one, and this is the headline number on the card.
+ *
+ * Whole-word (never bare `includes`) for the reason the skills matcher learned it live: "Git" sits
+ * inside "Digital" and "CAN" inside "Canadian", which would silently mark a real gap as covered — and
+ * the safe direction here is to over-report a gap, never to hide one.
+ */
+function missingResumeSkills(result, profile, limit) {
+  const r = result || {};
+  const haystack = " " + buildCandidateSummary(profile).toLowerCase().replace(/[^a-z0-9+#.]+/g, " ") + " ";
+  const have = (term) => {
+    const t = String(term || "").toLowerCase().trim();
+    if (!t) return true; // nothing to miss
+    // Escape the regex metacharacters real skills carry (C++, C#, .NET, Node.js).
+    const esc = t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp("(^|[^a-z0-9])" + esc + "($|[^a-z0-9])", "i").test(haystack);
+  };
+  const out = [];
+  const seen = new Set();
+  const push = (term) => {
+    const t = String(term || "").trim();
+    const k = t.toLowerCase();
+    if (!t || seen.has(k) || have(t)) return;
+    seen.add(k);
+    out.push(t);
+  };
+  // Keywords first — they are the short, resume-shaped nouns ("Kubernetes", "gRPC"). Gaps second:
+  // they are phrased as requirements ("3+ years of Go"), so they read as context under the list.
+  for (const k of asScoreStringArray(r.keywords)) push(k);
+  for (const g of asScoreStringArray(r.gaps)) push(g);
+  const n = Number(limit) > 0 ? Number(limit) : 8;
+  return out.slice(0, n);
+}
+
+// ── WHICH PAGE AM I LOOKING AT? ─────────────────────────────────────────────────────────────────────
+// Drives which of the two buttons the popup offers, so the operator is never shown a control that
+// cannot work here. URL-only by default (the popup asks before it has permission to read anything);
+// `markers` — when the service worker has already probed the page — always WINS, because a form is a
+// form whatever its URL says. Kinds:
+//   job       a posting you could apply to           → "Fill form"
+//   form      an application page with fields on it  → "Fill page"
+//   review    Workday's final review page            → neither (you are about to submit by hand)
+//   other     anything else
+function classifyPageContext(url, markers) {
+  const m = markers || {};
+  let u = null;
+  try { u = new URL(String(url || "")); } catch (e) { /* not a URL — fall through to markers */ }
+  const host = u ? u.hostname.toLowerCase() : "";
+  const path = u ? u.pathname : "";
+  const ats = !host ? null
+    : /(^|\.)myworkday(jobs|site)\.com$/i.test(host) ? "workday"
+      : /(^|\.)greenhouse\.io$/i.test(host) ? "greenhouse"
+        : /(^|\.)lever\.co$/i.test(host) ? "lever"
+          : /(^|\.)ashbyhq\.com$/i.test(host) ? "ashby"
+            : /(^|\.)linkedin\.com$/i.test(host) ? "linkedin"
+              : null;
+
+  // A PROBED page outranks its URL. Order matters: the review page also carries form fields on some
+  // tenants, and "you are on review" is the one state where neither button may fire.
+  if (m.reviewMarker) return { kind: "review", ats, host };
+  if (m.submitted) return { kind: "submitted", ats, host };
+
+  if (ats === "workday") {
+    // The apply flow lives under /apply (…/job/<slug>/apply/applyManually, /autofillWithResume, …).
+    if (/\/apply(\/|$)/i.test(path)) return { kind: "form", ats, host };
+    // …and the URL WINS over a field count on a posting page. A Workday career site can render its own
+    // `formField-*` wrappers (the search/filter panel beside the posting), and reading those as "an
+    // application form" would offer Fill page on a page with no application on it.
+    if (/\/job\//i.test(path)) return { kind: "job", ats, host };
+    if (m.formFieldCount > 0) return { kind: "form", ats, host };
+    return { kind: "other", ats, host };
+  }
+  if (m.formFieldCount > 0) return { kind: "form", ats, host };
+  if (ats === "greenhouse") {
+    // A Greenhouse posting IS its application form (one page, no login) — so it is BOTH, and the
+    // useful button is the one that fills what is in front of you.
+    if (/\/jobs?\//i.test(path)) return { kind: "job", ats, host, formIsHere: true };
+    return { kind: "other", ats, host };
+  }
+  if (ats === "lever") {
+    if (/\/apply(\/|$)/i.test(path)) return { kind: "form", ats, host };
+    if (/^\/[^/]+\/[0-9a-f-]{8,}/i.test(path)) return { kind: "job", ats, host };
+    return { kind: "other", ats, host };
+  }
+  if (ats === "ashby") {
+    if (/\/application(\/|$)/i.test(path)) return { kind: "form", ats, host };
+    if (/^\/[^/]+\/[0-9a-f-]{8,}/i.test(path)) return { kind: "job", ats, host };
+    return { kind: "other", ats, host };
+  }
+  if (ats === "linkedin") {
+    // Read-only for us: LinkedIn is where you FIND a job, never where we fill one.
+    if (/\/jobs\/(view|collections|search)/i.test(path)) return { kind: "job", ats, host, readOnly: true };
+    return { kind: "other", ats, host };
+  }
+  // An employer's own careers page. A posting-shaped URL is worth scoring; we cannot promise a fill.
+  if (host && /\b(job|jobs|career|careers|position|opening|vacanc)/i.test(path)) return { kind: "job", ats: null, host };
+  return { kind: "other", ats: null, host };
+}
+
+// ── IS THERE A FORM ON THIS PAGE? (the "Fill page" rule) ───────────────────────────────────────────
+// Which of the two buttons can fire depends on this, and the answer is NOT the same question per
+// pipeline: `formFieldCount` counts Workday's `formField-*` wrappers, and a Greenhouse, Lever or Ashby
+// form has exactly none of them. So the other three fall back to the generic count of visible, enabled
+// inputs — an application form always carries several (name, email, résumé, questions) while a posting
+// page has a search box at most.
+//
+// A HINT, not a verdict. The run function re-checks with the pipeline's own scan before touching
+// anything (Workday: the page scan; ATS: waitAtsFormReady → atsLooksLikeApplicationForm), so an
+// over-eager button costs one honest "this isn't an application form" message and never a wrong fill.
+// That is why a coarse threshold is acceptable here and would not be at the actuation layer.
+const ATS_FORM_MIN_FIELDS = 4;
+
+function formIsOnPage(ctx, probe) {
+  const c = ctx || {};
+  const p = probe || {};
+  if (c.kind === "review" || c.kind === "submitted") return false; // nothing to fill on either
+  if (c.kind === "form") return true;                              // the URL already said so
+  if (c.ats === "workday") return Number(p.formFieldCount) > 0;
+  // A Greenhouse posting IS its own application form; the others put it one hop away, so only a real
+  // field count says the form is on THIS page.
+  if (c.formIsHere) return true;
+  return Number(p.atsFieldCount) >= ATS_FORM_MIN_FIELDS;
+}
+
+// ── DID THEY JUST SUBMIT IT? ────────────────────────────────────────────────────────────────────────
+// After a manual fill the operator finishes and submits BY HAND, so the tracker row can only come from
+// noticing the confirmation. PURE, and deliberately EVIDENCE-BASED: the tracker must never grow a
+// "submitted" row because someone closed a tab or clicked back.
+//
+// TEXT is the strong signal (a confirmation page says so in words, on every ATS). URL is the backup for
+// the hosts we have no permission to READ — there we see the address and nothing else, which is why
+// only the few unambiguous confirmation paths count. Structure ALONE (the review marker went away)
+// is deliberately NOT evidence: navigating off the review page looks identical.
+const SUBMIT_CONFIRM_RX = /\byou have (?:successfully )?submitted\b|\bthank(?:s| you) for (?:applying|your (?:application|interest))\b|\byour application (?:was|has been) (?:submitted|received)\b|\bapplication (?:was|has been) (?:submitted|received)\b|\bwe(?:'ve| have) received your application\b|\bapplication submitted\b/i;
+const SUBMIT_CONFIRM_URL_RX = /\/thanks(?:[/?#]|$)|\/application[_-]confirmation|\/application[_-]submitted|\/confirmation(?:[/?#]|$)|[?&]submitted=true\b/i;
+
+function submitEvidenceVerdict(evidence) {
+  const e = evidence || {};
+  const text = String(e.bodyText || "");
+  const url = String(e.url || "");
+  // A form that still has fields on it has not been submitted, whatever a stray line of boilerplate
+  // says ("Thank you for your interest" appears in the footer of plenty of live application pages).
+  const stillOnForm = Number(e.formFieldCount) > 0 || e.reviewMarker === true;
+  if (text && SUBMIT_CONFIRM_RX.test(text) && !stillOnForm) {
+    return { submitted: true, confidence: "high", reason: "confirmation-text" };
+  }
+  if (SUBMIT_CONFIRM_URL_RX.test(url) && !stillOnForm) {
+    return { submitted: true, confidence: e.bodyText ? "high" : "medium", reason: "confirmation-url" };
+  }
+  return { submitted: false, confidence: null, reason: stillOnForm ? "still-on-form" : "no-evidence" };
+}
+
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so the
 // functions simply stay globals (from importScripts).
 
@@ -2376,6 +2714,8 @@ if (typeof module !== "undefined" && module.exports) {
   groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
   skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
   skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
+  MATCH_MIN_JD_CHARS, verdictForScore, buildCandidateSummary, SCORE_SYSTEM, buildScorePrompt, parseScoreReply, missingResumeSkills,
+  classifyPageContext, formIsOnPage, ATS_FORM_MIN_FIELDS, submitEvidenceVerdict, SUBMIT_CONFIRM_RX, SUBMIT_CONFIRM_URL_RX,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
   isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthRefusal, BLANK_PAGE_BOILERPLATE_MAX, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };

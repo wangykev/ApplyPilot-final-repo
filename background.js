@@ -1276,6 +1276,38 @@ function scrapeJobDescription() {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  // ── MANUAL ASSIST (the popup's two buttons + the match card) ─────────────────────────────────────
+  // Every one of these runs on the tab the operator is LOOKING at. Resolved here, once: the popup sends
+  // the tabId it rendered for, so a state read and the fill it authorizes can never land on different
+  // tabs (the operator can switch tabs while the popup is open).
+  if (message.type === "ASSIST_STATE" || message.type === "ASSIST_MATCH" ||
+      message.type === "ASSIST_FILL_PAGE" || message.type === "ASSIST_FILL_FORM") {
+    (async () => {
+      let tabId = message.tabId;
+      if (tabId == null) {
+        const tabs = await new Promise((r) => chrome.tabs.query({ active: true, currentWindow: true }, r));
+        tabId = tabs && tabs[0] && tabs[0].id;
+      }
+      if (tabId == null) { sendResponse({ ok: false, error: "no-tab" }); return; }
+      try {
+        if (message.type === "ASSIST_STATE") { sendResponse(await getAssistState(tabId)); return; }
+        if (message.type === "ASSIST_MATCH") { sendResponse(await runMatchScore(tabId, { force: message.force === true })); return; }
+        // A fill outlives the popup (clicking the page closes it), and its sendResponse then goes
+        // nowhere. Stash the outcome so re-opening the popup still tells the operator what happened
+        // instead of looking like nothing ever ran.
+        const isPage = message.type === "ASSIST_FILL_PAGE";
+        const result = isPage ? await runManualFillPage(tabId) : await runManualFillForm(tabId);
+        try {
+          await new Promise((r) => chrome.storage.local.set({ assistLast: { at: Date.now(), tabId, kind: isPage ? "page" : "form", result } }, r));
+        } catch (e) { /* the result still went back to a popup that is probably still open */ }
+        sendResponse(result);
+      } catch (e) {
+        sendResponse({ ok: false, error: "exception", detail: String((e && e.message) || e) });
+      }
+    })();
+    return true; // async sendResponse
+  }
+
   // CDP RECON (Step 1 of the CDP actuation port): empirically pin down what
   // chrome.debugger INPUT can do to a HIDDEN tab — insertText vs per-char keys,
   // mouse vs keyboard commits, rect validity while hidden, commit latencies —
@@ -3305,7 +3337,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
-    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers, manual: !!(opts && opts.manual) });
     // POST-fill sample, so the probe BRACKETS the fill instead of only sniffing the calm before it.
     // Live (2026-08-10, cat.wd5, 5 pages): every pre-fill sample read both clocks on time (+6..+23ms)
     // while the SAME run logged `delayFull(600ms) actually took 1312ms` mid-fill. One sample at the
@@ -3456,11 +3488,20 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // fill — the audit is about the CURRENT live page, not accumulated.
   const auditFlags = out.results.filter((r) => r.flag === "audit-mismatch" || r.flag === "audit-unverifiable");
   LOG(`audit: re-read ${(out.audit || []).length} filled field(s) post-settle —`, auditFlags.length ? `${auditFlags.length} FLAGGED (${auditFlags.map((r) => r.fieldName + ":" + r.flag).join(", ")})` : "all matched the report");
-  await new Promise((resolve) => chrome.storage.local.set({ reviewAudit: { pageKey, savedAt: new Date().toISOString(), entries: out.audit || [] } }, resolve));
 
   // M38 Part 2: build the review-summary bundle from the results + accumulate (write-per-page).
   const tenant = (() => { try { return new URL(out.url).hostname; } catch (e) { return null; } })();
   const bundle = buildReviewBundle(out.results, { page: pageKey, pageNumber, pageLabel, url: out.url, tenant, capturedAt: new Date().toISOString(), sectionShapes: out.sectionShapes });
+  // MANUAL ASSIST — a single-page "Fill page" writes NOTHING to storage. It has no downstream reader
+  // (no review, no replay, no report), and the accumulated bundle it would overwrite belongs to whatever
+  // application was filled last: clobbering that with one page of an unrelated form is how a later
+  // dry-replay ends up replaying the wrong job's values. The bundle is still BUILT and returned, so the
+  // caller can count what happened. (The manual WALK does persist — its own pages read it back.)
+  if (opts && opts.manual && !opts.accumulate) {
+    LOG("manual assist — page filled, nothing persisted (no review bundle, no report; the page in front of you is the record).");
+    return { out, bundle, auditFlags, pageKey };
+  }
+  await new Promise((resolve) => chrome.storage.local.set({ reviewAudit: { pageKey, savedAt: new Date().toISOString(), entries: out.audit || [] } }, resolve));
   await persistAccumulated(bundle);
   return { out, bundle, auditFlags, pageKey };
 }
@@ -4493,7 +4534,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // re-enters this function on a tab it just navigated) skips this and keeps its own document.
     {
       const at = await cdpEval(function () { return location.href; }).catch(() => null);
-      if (!at || at === "about:blank" || at.startsWith("chrome://")) {
+      // MANUAL ASSIST reloads DELIBERATELY (opts0.forceReload). The operator is already sitting on the
+      // form, so there is no blank tab for the overrides to precede — and landing them on a running
+      // document is precisely what kills react-select (see the block above). A reload is the documented
+      // alternative ("would have worked too, rejected for being a second page load"), and here the second
+      // load is the whole point: it is the only way to fill the page they are looking at without breaking
+      // its widgets. The popup says so on the button, because it discards anything already typed.
+      if (opts0.forceReload || !at || at === "about:blank" || at.startsWith("chrome://")) {
         LOG(`opening the posting under our page overrides: ${startUrl}`);
         await cdpNavigate(startUrl);
         await waitTabComplete(tabId, 20000);
@@ -4682,8 +4729,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // (live 2026-08-01). The fill already KNOWS the answer, so it writes it down.
     bundle.ats = ats;
     bundle.jobKeyUrl = originUrl; // stable identity across landing hops (see the top of this fn)
-    await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
-    const reported = await reportApplication(bundle, jobContext);
+    // MANUAL ASSIST: fill only. No bundle written (it would clobber whatever application the local slot
+    // holds), no push to the site — the operator reviews the form itself and the tracker row is written
+    // only if they actually submit. Same reasoning as the Workday manual walk.
+    const manualRun = !!opts0.manual;
+    if (!manualRun) await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
+    const reported = manualRun ? { ok: true, manual: true } : await reportApplication(bundle, jobContext);
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
     // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
     const fillMs = Date.now() - fillT0;
@@ -4707,9 +4758,11 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // Say what ACTUALLY happened to the report. reportApplication used to return nothing, so this
     // line claimed "Reported to the website." even when the line directly above it was the ⛔ saying
     // the tracker had rejected it.
-    const landed = reported && reported.ok
-      ? "Reported to the website."
-      : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
+    const landed = manualRun
+      ? "Manual assist — not reported (submit it yourself and the tracker records it as filled manually)."
+      : reported && reported.ok
+        ? "Reported to the website."
+        : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. ${landed}`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
     return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok), walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
@@ -4910,6 +4963,686 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
     await removeInputLock(); // BEFORE detach (needs the attach) — stuck-lock is the worst operator failure
     await cdpDetach();
   }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+// MANUAL ASSIST — the extension's own surface (2026-08-10)
+//
+// The hands-off, end-to-end run stays WEBSITE-driven. The EXTENSION is the tool you reach for while you
+// are looking at a posting yourself, and it does exactly two things:
+//
+//   "Fill form"  on a posting → get into the application and fill it through to the review page, where
+//                it stops (the never-submit guards are the walk's own, untouched). AI-GATED: with AI off
+//                the screening questions cannot be answered, so the walk would halt on the first page
+//                that has one — the button refuses up front instead of failing three pages in.
+//   "Fill page"  on an application page → fill THIS page and stop. No option capture, no already-filled
+//                sweep (both exist only to feed the website review editor), no Next. You read it, you
+//                click Save & Continue.
+//
+// Neither pushes a review bundle to the website. A manual fill is not work awaiting review — the operator
+// is on the page. The tracker only learns about the application if they SUBMIT it, and then it is
+// recorded as filled manually (see armManualSubmitWatch).
+//
+// PERMISSIONS: everything here reads the ACTIVE tab through `activeTab`, which the operator's own click
+// on the toolbar icon grants — that is what lets the match card work on an arbitrary employer careers
+// page without this extension ever asking for <all_urls>. The one background reader (the submit watcher)
+// is limited to the hosts already in the manifest, and simply records less when it cannot read a page.
+// ══════════════════════════════════════════════════════════════════════════════════════════════════
+
+// One read-only look at whatever page is open. Self-contained (it is serialized into the page) and
+// deliberately cheap: counts, two markers, and a slice of text. Never clicks, never writes.
+function assistProbePage() {
+  const visible = (el) => {
+    try { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; } catch (e) { return false; }
+  };
+  let atsFieldCount = 0;
+  try {
+    atsFieldCount = Array.prototype.slice.call(document.querySelectorAll("input, select, textarea"))
+      .filter((el) => el.type !== "hidden" && !el.disabled && visible(el)).length;
+  } catch (e) { /* count is a nice-to-have */ }
+  let bodyText = "";
+  try { bodyText = ((document.body && document.body.innerText) || "").slice(0, 4000); } catch (e) { /* ditto */ }
+  return {
+    url: location.href,
+    title: document.title || "",
+    // The Workday form signal. NOT a generic input count: "is there an application form here" and "are
+    // there boxes on this page" are different questions, and the second one is true of every search bar.
+    formFieldCount: document.querySelectorAll('[data-automation-id^="formField-"]').length,
+    atsFieldCount,
+    reviewMarker: !!document.querySelector('[data-automation-id="applyFlowReviewPage"]'),
+    bodyText,
+  };
+}
+
+// The ATSs a fill can actually be driven on. LinkedIn is classified (it is where postings are FOUND, and
+// the match card works there) but is deliberately NOT in here: discovery only ever READS LinkedIn, and
+// routing it into the ATS filler would drive a pipeline at a page that has no application on it. Checked
+// in the run functions themselves, not just where the buttons are enabled — an enabled button is a UI
+// fact, and these are the functions that touch a live page.
+const ASSIST_FILLABLE_ATS = ["workday", "greenhouse", "lever", "ashby"];
+
+// executeScript on the active tab, normalized. NEVER throws: a chrome:// page, a PDF viewer, a host we
+// have no permission for and a tab mid-navigation all simply yield null, and every caller treats null as
+// "I could not look" rather than as a fact about the page.
+async function assistProbe(tabId) {
+  try {
+    const r = await chrome.scripting.executeScript({ target: { tabId }, func: assistProbePage });
+    return (r && r[0] && r[0].result) || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// The job posting on the page, as the tracker/scoring want it. Reuses the run pipeline's own scraper so
+// a manually-assisted application is identified exactly like a website-driven one.
+async function assistScrapeJd(tabId) {
+  try {
+    const r = await chrome.scripting.executeScript({ target: { tabId }, func: scrapeJobDescription });
+    const jd = (r && r[0] && r[0].result) || null;
+    if (jd && !jd.company) {
+      // An employer careers page has no Workday tenant to read a company from — the host is the next best
+      // thing and is right far more often than it is wrong ("careers.stripe.com" → "Stripe").
+      try {
+        const h = new URL(jd.url).hostname.replace(/^(www|jobs|careers|boards|apply|job-boards)\./i, "").split(".")[0];
+        if (h) jd.company = h.charAt(0).toUpperCase() + h.slice(1);
+      } catch (e) { /* leave it blank */ }
+    }
+    return jd;
+  } catch (e) {
+    return null;
+  }
+}
+
+// What page is this, and what may we do on it? One answer, shared by the popup's render and by every
+// entry point below — so a button can never fire on a page the popup would not have offered it on.
+async function assistContext(tabId) {
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch (e) { /* gone */ }
+  const probe = await assistProbe(tabId);
+  const url = (probe && probe.url) || (tab && tab.url) || "";
+  const title = (probe && probe.title) || (tab && tab.title) || "";
+  const evidence = probe ? submitEvidenceVerdict(probe) : { submitted: false };
+  const ctx = classifyPageContext(url, probe ? {
+    reviewMarker: probe.reviewMarker,
+    formFieldCount: probe.formFieldCount,
+    submitted: evidence.submitted,
+  } : null);
+  return { tab, probe, url, title, ctx, submitted: evidence };
+}
+
+// ── "Fill page" on a Greenhouse / Lever / Ashby form ───────────────────────────────────────────────
+// The page in front of the operator, filled where it stands: NO navigation, NO reload, and none of the
+// landing work `runAtsApplicationRun` does (posting-gone checks, apply-link chase, redirect hops). That
+// work exists to FIND an application from a link; here the operator has already found it.
+//
+// ⚠ AND IT DOES NOT INSTALL THE PAGE OVERRIDES — which is what makes filling in place safe at all.
+// The standing rule is that landing them on an already-running document leaves it half-native and
+// react-select never resolves again; that is why a website-driven run opens its tab BLANK and navigates.
+// The rule is about the OVERRIDES, not about filling in place, and the reason it cannot bite here is
+// that they are not needed: they replace setTimeout/setInterval/rAF so a HIDDEN tab's timers escape
+// Chrome's throttle, and a manual fill is by definition on the tab the operator is looking at. Native
+// timers on a visible tab are already fast. So: no overrides, no half-native document, no reload — and
+// nothing the operator has already typed is destroyed.
+//
+// `cdpSetFocusEmulation` is kept: it is a CDP-level flag (Emulation.setFocusEmulationEnabled), not a
+// script evaluated into the page, so it cannot half-native anything.
+async function runManualAtsFillPage(tabId, ats, store, jd, LOG) {
+  const attached = await cdpAttach(tabId);
+  if (!attached.ok) {
+    LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+    return { ok: false, error: "attach-failed", detail: "Couldn't attach to the tab — close its DevTools and try again." };
+  }
+  try {
+    await cdpSetFocusEmulation(true).catch(() => {});
+    // Not recon — a readiness check. It answers two things before anything is touched: are the fields
+    // actually mounted, and is this an application form at all (atsLooksLikeApplicationForm). A shorter
+    // ceiling than a run's, because the operator is looking at a page that has already loaded.
+    const ready = await waitAtsFormReady(ats, LOG, 12000);
+    if (!ready.ready) {
+      return {
+        ok: false, error: "not-a-form",
+        detail: ready.notAForm
+          ? `This doesn't look like an application form — ${ready.why}.`
+          : `No ${ats} form fields rendered here. Open the application page and try again.`,
+      };
+    }
+    LOG(`form ready — ${ready.fields} field(s). Filling in place: no reload, no page overrides, no Next.`);
+
+    const jobContext = Object.assign({}, store.jobContext || {});
+    if (jd && jd.company) jobContext.company = jd.company;
+    if (!jobContext.company) jobContext.company = atsCompanyFromUrl((jd && jd.url) || "");
+    if (jd && jd.title) jobContext.title = jd.title;
+    // The JD text grounds any AI answer (an essay written blind to the posting invents a company theme).
+    // On an ATS the posting and the form are usually the same page, so this is the text already scraped.
+    const jdText = jd && (jd.description || jd.text);
+    if (jdText) jobContext.description = String(jdText).slice(0, 4000);
+
+    const cfg = await getLlmConfig();
+    const act = makeAtsActuation(cfg);
+    const prepared = prepareProfile(store.profile);
+    const out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+    if ((out.deadAsync || []).length) {
+      LOG(`the form's own async widget(s) never answered: ${out.deadAsync.join(", ")} — left for you rather than retried`);
+    }
+    // Nothing persisted, nothing reported — see the manual-assist header. The page is the record.
+    const results = out.results || [];
+    const left = results.filter((r) => r.status === "needs_review" || r.status === "error" || r.status === "skipped");
+    return {
+      ok: true, mode: "ats", ats,
+      filled: results.filter((r) => r.status === "filled" || r.status === "filled_review").length,
+      needs_review: left.length,
+      left_for_you: left.map((r) => r.label || r.fieldName).filter(Boolean).slice(0, 12),
+      ai_on: !!(cfg && cfg.enabled),
+    };
+  } finally {
+    await cdpDetach();
+  }
+}
+
+// ── The match card ─────────────────────────────────────────────────────────────────────────────────
+// One LLM call per posting, then cached. The cache is keyed on the job (canonicalJobUrl — the same
+// stable key the tracker de-dupes on, so re-opening the popup on a re-rendered Workday URL is still a
+// hit) AND on a fingerprint of the profile that was scored: edit your skills and every stale score
+// re-computes, because a match score is a claim about a specific résumé.
+const MATCH_CACHE_MAX = 60;
+
+function matchProfileFingerprint(profile) {
+  const s = buildCandidateSummary(profile);
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = (((h << 5) + h) ^ s.charCodeAt(i)) >>> 0;
+  return s.length + ":" + h.toString(36);
+}
+
+function matchCacheKeyFor(url) {
+  try { return canonicalJobUrl(url) || url; } catch (e) { return url; }
+}
+
+async function readMatchCache(key) {
+  const { matchCache } = await new Promise((r) => chrome.storage.local.get("matchCache", r));
+  return (matchCache && matchCache[key]) || null;
+}
+
+async function writeMatchCache(key, entry) {
+  const { matchCache } = await new Promise((r) => chrome.storage.local.get("matchCache", r));
+  const next = Object.assign({}, matchCache || {});
+  next[key] = entry;
+  // Bounded, oldest-out. A score is cheap to recompute and worthless when stale, so there is no reason
+  // to let this grow without limit in a quota-limited store.
+  const keys = Object.keys(next);
+  if (keys.length > MATCH_CACHE_MAX) {
+    keys.sort((a, b) => (next[a].at || 0) - (next[b].at || 0));
+    for (const k of keys.slice(0, keys.length - MATCH_CACHE_MAX)) delete next[k];
+  }
+  await new Promise((r) => chrome.storage.local.set({ matchCache: next }, r));
+}
+
+// Score THIS posting against the stored profile. Returns the card the popup renders.
+// AI OFF ⇒ no call, no spend — same rule the fill obeys, and the AI toggle lives on the website.
+async function runMatchScore(tabId, opts) {
+  const LOG = (...a) => console.log("[ApplyPilot][MATCH]", ...a);
+  const force = !!(opts && opts.force);
+  const { profile } = await new Promise((r) => chrome.storage.local.get("profile", r));
+  if (!profile) return { ok: false, error: "no-profile", detail: "Sync your profile from the website first." };
+
+  const jd = await assistScrapeJd(tabId);
+  const text = (jd && jd.text) || "";
+  if (text.length < MATCH_MIN_JD_CHARS) {
+    return { ok: false, error: "no-jd", detail: "I couldn't read a job description on this page." };
+  }
+  const key = matchCacheKeyFor(jd.url || "");
+  const fp = matchProfileFingerprint(profile);
+  if (!force) {
+    const hit = await readMatchCache(key);
+    if (hit && hit.fp === fp && hit.result && hit.result.score != null) {
+      LOG(`cache hit for ${key} — no provider call.`);
+      return { ok: true, cached: true, job: { title: jd.title, company: jd.company, url: jd.url }, ...hit };
+    }
+  }
+
+  const cfg = await getLlmConfig();
+  if (!cfg || !cfg.enabled) {
+    return { ok: false, error: "ai-off", detail: "Turn AI on (website → AI) to score a job.", job: { title: jd.title, company: jd.company, url: jd.url } };
+  }
+  const { system, user } = buildScorePrompt(profile, text);
+  const t0 = Date.now();
+  // ONE call, through the SAME seam every other AI call uses. `makeCdpActuation` builds closures only —
+  // no attach, no tab — and its `llm` owns everything the routing has grown: the action route and its
+  // fallback chain, in-call expansion of an "auto" slot into one attempt per candidate, per-slot key
+  // pinning, key rotation and cooldowns, the fast-retry, and usage accounting.
+  //
+  // This deliberately does NOT hand-roll that loop. It did, briefly, and the copy was stale within a day:
+  // `auto` slots arrived and a duplicated loop would have sent the literal model name "auto" to the
+  // provider. One implementation means the match card inherits every future fix for free.
+  const act = makeCdpActuation(cfg);
+  const res = await act.llm({ system, user, maxTokens: 700, action: "match" });
+  if (!res || !res.ok) {
+    LOG("scoring failed:", (res && res.error) || "no reply");
+    return { ok: false, error: "llm-failed", detail: (res && res.error) || "The AI provider didn't answer." };
+  }
+  const result = parseScoreReply(res.text);
+  if (result.score == null) {
+    LOG("unparseable reply:", result.error, result.raw);
+    return { ok: false, error: "unparseable", detail: "The model's reply wasn't a score." };
+  }
+  const missing = missingResumeSkills(result, profile);
+  const entry = { at: Date.now(), fp, result, missing, ms: Date.now() - t0 };
+  await writeMatchCache(key, entry);
+  LOG(`${jd.company || "?"} — ${jd.title || "?"}: ${result.score}/10 ${result.verdict}, ${missing.length} skill gap(s), ${entry.ms}ms`);
+  return { ok: true, cached: false, job: { title: jd.title, company: jd.company, url: jd.url }, ...entry };
+}
+
+// ── "Fill page" ────────────────────────────────────────────────────────────────────────────────────
+// Fill the page in front of the operator, then stop. No Next, no report, nothing persisted.
+async function runManualFillPage(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][ASSIST-PAGE]", ...a);
+  if (runInFlight || discoverInFlight) return { ok: false, error: "busy", detail: "Another ApplyPilot run is using the tab. Wait for it to finish." };
+  const store = await new Promise((r) => chrome.storage.local.get(["profile", "defaults", "jobContext", "buckets"], r));
+  if (!store.profile) return { ok: false, error: "no-profile", detail: "Sync your profile from the website first." };
+
+  const { ctx, probe, url } = await assistContext(tabId);
+  if (ctx.kind === "review") {
+    return { ok: false, error: "review-page", detail: "This is the review page — nothing to fill. Check it and submit; I'll record it." };
+  }
+  if (ctx.ats && ASSIST_FILLABLE_ATS.indexOf(ctx.ats) === -1) {
+    return { ok: false, error: "not-fillable", detail: `Nothing to fill on ${ctx.host} — open the employer's own application page.` };
+  }
+  const jd = await assistScrapeJd(tabId);
+  const jobContext = Object.assign({}, store.jobContext || {});
+  if (jd && jd.company) jobContext.company = jd.company;
+
+  runInFlight = true;
+  try {
+    // NON-WORKDAY ATS: fill the form where it stands — no navigation, no reload, no landing work.
+    // (runManualAtsFillPage explains why filling in place is safe without the page overrides.)
+    if (ctx.ats && ctx.ats !== "workday") {
+      const res = await runManualAtsFillPage(tabId, ctx.ats, store, jd, LOG);
+      if (res && res.ok) await armManualSubmitWatch(tabId, { url, jd, ats: ctx.ats });
+      return res;
+    }
+    if (ctx.kind !== "form" && !(probe && probe.formFieldCount > 0)) {
+      return { ok: false, error: "not-a-form", detail: "I don't see an application form on this page." };
+    }
+
+    const attached = await cdpAttach(tabId);
+    if (!attached.ok) {
+      LOG("attach FAILED —", attached.error, "(page DevTools open on the tab? It is a second client.)");
+      return { ok: false, error: "attach-failed", detail: "Couldn't attach to the tab — close its DevTools and try again." };
+    }
+    await cdpInstallPageOverrides();
+    cdpSetSyntheticInput(true); // a FILL entry point, like the others
+    const cfg = await getLlmConfig();
+    LOG(`filling THIS page only — no Next, no review push. AI is ${cfg && cfg.enabled ? "ON (it will answer what the profile can't)" : "OFF (questions it would have answered stay blank)"}.`);
+    const prepared = prepareProfile(store.profile);
+    const act = makeCdpActuation(cfg);
+    const { out } = await fillAndPersistPage(act, prepared, store.defaults || {}, jobContext, LOG, { manual: true });
+    await armManualSubmitWatch(tabId, { url, jd, ats: "workday" });
+    const leftForYou = (out.needsReview || []).map((r) => r.label || r.fieldName).filter(Boolean);
+    return {
+      ok: true, mode: "workday", counts: out.counts,
+      filled: (out.counts && out.counts.filled) || 0,
+      needs_review: (out.needsReview || []).length,
+      left_for_you: leftForYou.slice(0, 12),
+      ai_on: !!(cfg && cfg.enabled),
+      session_warning: out.sessionWarning || null,
+    };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("fill aborted:", msg);
+    return { ok: false, error: "exception", detail: msg };
+  } finally {
+    runInFlight = false;
+    await removeInputLock(); // BEFORE detach (needs the attach) — a stuck lock is the worst thing to leave behind
+    await cdpDetach();
+  }
+}
+
+// ── "Fill form" ────────────────────────────────────────────────────────────────────────────────────
+// From a posting: get in (Apply → sign in → verify) and fill every page through to the review page,
+// where the walk stops. NEVER submits — the same double guard as every other walk.
+//
+// AI-GATED (operator, 2026-08-10). With AI off, any page carrying a screening question the profile does
+// not answer leaves a REQUIRED field empty, Workday refuses to advance, and the walk halts nav-timeout
+// several pages in. Refusing here turns that into one honest sentence before anything is touched.
+async function runManualFillForm(tabId) {
+  const LOG = (...a) => console.log("[ApplyPilot][ASSIST-FORM]", ...a);
+  if (runInFlight || discoverInFlight) return { ok: false, error: "busy", detail: "Another ApplyPilot run is using the tab. Wait for it to finish." };
+  const cfg = await getLlmConfig();
+  // Re-checked HERE, never trusted from the popup: the button being enabled is a UI state, and this is
+  // the thing that actually advances a live application.
+  if (!cfg || !cfg.enabled) {
+    return { ok: false, error: "ai-off", detail: "Turn AI on from the website's AI page to fill a whole form — the screening questions need it. \"Fill page\" still works." };
+  }
+  const store = await new Promise((r) => chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets"], r));
+  if (!store.profile) return { ok: false, error: "no-profile", detail: "Sync your profile from the website first." };
+
+  const { ctx, url } = await assistContext(tabId);
+  if (ctx.ats && ASSIST_FILLABLE_ATS.indexOf(ctx.ats) === -1) {
+    return { ok: false, error: "not-fillable", detail: `I can't apply from ${ctx.host} — open the employer's own application page.` };
+  }
+  const jd = await assistScrapeJd(tabId);
+  const jobContext = Object.assign({}, store.jobContext || {});
+  if (jd && jd.company) jobContext.company = jd.company;
+
+  runInFlight = true;
+  try {
+    if (ctx.ats && ctx.ats !== "workday") {
+      // These are single-page forms, so "the whole form" is one page — but unlike "Fill page", this is
+      // the GET-ME-IN button: from a Lever/Ashby posting the application lives one hop away, and the
+      // landing work (apply link, apply button, redirect chase, embedded frame) is exactly what finds
+      // it. That path navigates, so the page overrides land on a fresh document as the ATS invariant
+      // requires. It reloads what is open, which is why the popup labels this one as reloading — on a
+      // form you have already typed into, "Fill page" is the button that leaves your work alone.
+      LOG(`${ctx.ats} — finding and filling the application (never submits). This reloads the page.`);
+      const res = await runAtsApplicationRun(tabId, ctx.ats, store, url, { manual: true, forceReload: true, originUrl: url });
+      if (res && res.ok) await armManualSubmitWatch(tabId, { url, jd, ats: ctx.ats });
+      return Object.assign({ mode: "ats" }, res);
+    }
+
+    let onb = null;
+    if (ctx.kind === "job") {
+      const oc = store.onboardConfig || {};
+      LOG("posting page — applying, signing in if needed, then filling the form (never submits).");
+      onb = await runCdpOnboard(tabId, {
+        credentials: store.credentials || null,
+        gmailEnabled: oc.gmailEnabled !== false,
+        startUrl: null,
+        preferResumeAutofill: true, // a FILL run takes "Autofill with Resume" — it seeds Workday's own skill suggestions
+      });
+      await removeInputLock(); // onboarding locks across the login flow; the walk re-installs per page
+      if (onb && onb.embeddedAts && onb.embeddedUrl) {
+        await cdpDetach();
+        const res = await runAtsApplicationRun(tabId, onb.embeddedAts, store, onb.embeddedUrl, { manual: true, applyHops: 1, originUrl: url });
+        if (res && res.ok) await armManualSubmitWatch(tabId, { url, jd, ats: onb.embeddedAts });
+        return Object.assign({ mode: "ats" }, res);
+      }
+      if (!onb.ok || !onb.reached_form) {
+        return Object.assign({ ok: true, mode: "workday", walked: false, stopped: onb.stopped || "did-not-reach-form" }, onb);
+      }
+      await recordRunLogin({
+        email: (store.credentials && store.credentials.email) || "",
+        url, tenant: jobContext.company || null,
+        created: !!onb.account_created, verified: !!onb.verified,
+      });
+    } else if (ctx.kind === "review") {
+      return { ok: false, error: "review-page", detail: "You're already at the review page — check it and submit; I'll record it." };
+    } else if (ctx.kind !== "form") {
+      return { ok: false, error: "not-a-job", detail: "Open a job posting or an application page first." };
+    }
+
+    LOG("filling every page through to the review page — it stops there and never submits.");
+    const walk = await runCdpWalk(tabId, store.profile, store.defaults || {}, jobContext, { manual: true });
+    await armManualSubmitWatch(tabId, { url, jd, ats: "workday" });
+    return { ok: true, mode: "workday", walked: true, walk, onboard: onb ? { reached_form: !!onb.reached_form, account_created: !!onb.account_created } : null };
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    LOG("fill aborted:", msg);
+    return { ok: false, error: "exception", detail: msg };
+  } finally {
+    runInFlight = false;
+  }
+}
+
+// ── "Did they submit it?" — the tracker row for a manual application ───────────────────────────────
+// After an assisted fill the operator finishes by hand, so the ONLY honest way to record the
+// application is to notice the confirmation. The watch is armed by a fill, survives a service-worker
+// restart (it lives in storage), and reports at most once per tab.
+//
+// What it can see depends on the host, and it never pretends otherwise:
+//   · a Workday host is in the manifest ⇒ it reads the page, so it can snapshot the REVIEW page on the
+//     way past and confirm the submission from the confirmation text;
+//   · anywhere else ⇒ it sees the URL and nothing more, so only an unambiguous confirmation path counts
+//     and the row simply says the application was filled manually.
+const MANUAL_WATCH_TTL_MS = 12 * 60 * 60 * 1000; // a browser tab left open overnight is not a pending submit
+
+// The watch map lives in STORAGE (it has to survive a service-worker restart — the submit can happen
+// long after the fill), with an in-memory mirror so the tabs.onUpdated listener is free for the
+// overwhelmingly common case of no watch armed. Every write goes through writeManualWatch, so the
+// mirror cannot go stale: nothing else touches this key.
+let manualWatchCache = null;
+
+async function readManualWatch() {
+  if (manualWatchCache) return manualWatchCache;
+  const { manualWatch } = await new Promise((r) => chrome.storage.local.get("manualWatch", r));
+  manualWatchCache = (manualWatch && typeof manualWatch === "object") ? manualWatch : {};
+  return manualWatchCache;
+}
+
+async function writeManualWatch(map) {
+  manualWatchCache = map;
+  await new Promise((r) => chrome.storage.local.set({ manualWatch: map }, r));
+}
+
+async function armManualSubmitWatch(tabId, info) {
+  try {
+    const map = await readManualWatch();
+    const now = Date.now();
+    for (const k of Object.keys(map)) if (now - (map[k].startedAt || 0) > MANUAL_WATCH_TTL_MS) delete map[k];
+    const jd = info.jd || null;
+    const prev = map[String(tabId)] || {};
+    map[String(tabId)] = {
+      url: info.url || prev.url || "",
+      jobKeyUrl: prev.jobKeyUrl || info.url || "",
+      company: (jd && jd.company) || prev.company || null,
+      role: (jd && jd.title) || prev.role || null,
+      ats: info.ats || prev.ats || null,
+      startedAt: prev.startedAt || now,
+      filledAt: now,
+      reviewSnapshot: prev.reviewSnapshot || null,
+      reported: false,
+    };
+    await writeManualWatch(map);
+    console.log(`[ApplyPilot][ASSIST-WATCH] watching tab ${tabId} for a submit — if you send this application it lands on the tracker as filled manually.`);
+  } catch (e) { /* the watch is a convenience; a fill must never fail because of it */ }
+}
+
+// Read-only look at a watched tab. Runs on tab updates only (no polling, no alarms): a submit navigates,
+// and a navigation is exactly what wakes this.
+async function manualWatchTick(tabId, tabUrl) {
+  const map = await readManualWatch();
+  const rec = map[String(tabId)];
+  if (!rec || rec.reported) return;
+  if (Date.now() - (rec.startedAt || 0) > MANUAL_WATCH_TTL_MS) { delete map[String(tabId)]; await writeManualWatch(map); return; }
+
+  const probe = await assistProbe(tabId); // null on a host we may not read — URL-only from here
+  const url = (probe && probe.url) || tabUrl || rec.url;
+
+  // On the way past the review page, take the snapshot. This is the ONLY moment the final values exist
+  // as text; after the submit they are gone. Read-only, no debugger attach (so no "ApplyPilot is
+  // debugging this browser" bar while the operator is reading their own application).
+  if (probe && probe.reviewMarker && !rec.reviewSnapshot) {
+    try {
+      const r = await chrome.scripting.executeScript({ target: { tabId }, func: cdpReadReviewPage, args: [null] });
+      const scan = (r && r[0] && r[0].result) || null;
+      if (scan && scan.ok) {
+        // EXACTLY the shape a submit run records (see reviewSnapshot in runCdpReplayWalk) — same field
+        // names, same 400-item cap, same recorded truncation — because the website already has a
+        // renderer for it (`SubmittedRecord`, fed from `bundle.workday_review_page`). Inventing a second
+        // shape here would have stored the scan somewhere nothing displays it, which is the same as not
+        // capturing it at all.
+        const items = Array.isArray(scan.items) ? scan.items : [];
+        rec.reviewSnapshot = {
+          captured_at: new Date().toISOString(),
+          url: scan.url || null,
+          items: items.slice(0, 400).map((it) => ({ label: it.label ?? null, value: it.value ?? null, section: it.section ?? null })),
+          truncated: items.length > 400,
+          total_items: items.length,
+        };
+        map[String(tabId)] = rec;
+        await writeManualWatch(map);
+        console.log(`[ApplyPilot][ASSIST-WATCH] review page captured (${(scan.items || []).length} value(s)) — if you submit, this goes on the tracker row.`);
+      }
+    } catch (e) { /* no permission / not readable → the row will just say "filled manually" */ }
+  }
+
+  const verdict = submitEvidenceVerdict({
+    url,
+    bodyText: probe ? probe.bodyText : "",
+    formFieldCount: probe ? probe.formFieldCount : 0,
+    reviewMarker: probe ? probe.reviewMarker : false,
+  });
+  if (!verdict.submitted) {
+    // ⚠ THE ONE PAGE THIS PROJECT HAS NEVER SEEN. Nothing has ever been submitted through it, so
+    // Workday's post-submit page is the only surface in the whole pipeline whose DOM is UNOBSERVED —
+    // and the standing rule is to trace the real DOM before writing a handler, not to guess it. The
+    // confirmation regex is therefore built from wording that is common across ATSs, and this line
+    // exists so the FIRST real submit hands over the evidence to tighten it with: a readable page that
+    // is no longer a form and does not look like a confirmation gets its heading printed, once.
+    const sameHost = (() => {
+      try { return new URL(url).host === new URL(rec.url).host; } catch (e) { return false; }
+    })();
+    if (probe && sameHost && !probe.formFieldCount && !probe.reviewMarker && url !== rec.lastUnknownUrl) {
+      rec.lastUnknownUrl = url; // once per URL — a diagnostic, not a log flood
+      map[String(tabId)] = rec;
+      await writeManualWatch(map);
+      const firstLines = String(probe.bodyText || "").split("\n").map((s) => s.trim()).filter(Boolean).slice(0, 3).join(" / ").slice(0, 240);
+      console.log(`[ApplyPilot][ASSIST-WATCH] this tab left the application for a page I don't recognise as a confirmation — ${url}\n    it says: ${firstLines}\n    If you DID just submit, paste that line: it is exactly the wording the detector is missing.`);
+    }
+    return;
+  }
+
+  rec.reported = true; // set BEFORE the network call — a slow report must not let a second event double-post
+  map[String(tabId)] = rec;
+  await writeManualWatch(map);
+  const out = await reportManualApplication(rec);
+  console.log(`[ApplyPilot][ASSIST-WATCH] ✓ submit detected (${verdict.reason}, ${verdict.confidence}) — tracker row ${out.ok ? "written as FILLED MANUALLY" : "NOT written (" + out.reason + ")"}.`);
+  const done = await readManualWatch();
+  delete done[String(tabId)];
+  await writeManualWatch(done);
+}
+
+// The tracker row for an application the operator submitted themselves. Deliberately NOT a review
+// bundle: `review_bundle` stays null so the row can never appear on the website's review or teach
+// surfaces — there is nothing to approve, it is already sent. The review-page snapshot (when we could
+// take one) rides in its own column as a record of what was actually submitted.
+async function reportManualApplication(rec) {
+  try {
+    const { apSession } = await new Promise((r) => chrome.storage.local.get("apSession", r));
+    if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return { ok: false, reason: "not-connected" };
+    const url = rec.jobKeyUrl || rec.url || "";
+    // The bundle carries NO ENTRIES, and that is the whole mechanism: `teachableCards` iterates
+    // `bundle.entries || []` and the review editor renders per entry, so an empty one produces zero
+    // teach cards and zero review work — a manual application is already sent, there is nothing to
+    // approve. What it DOES carry is the pair the website already knows how to display
+    // (`workday_review_page` + `submission` → components/app/SubmittedRecord), so the review page we
+    // scraped on the way past is visible on the tracker detail instead of being stored where nothing
+    // reads it. `manual: true` marks the shape for anything that later wants to tell the two apart.
+    const bundle = {
+      manual: true,
+      entries: [],
+      total: 0,
+      needs_review_count: 0,
+      url: url || null,
+      tenant: rec.company || null,
+      captured_at: new Date().toISOString(),
+      submission: {
+        at: new Date().toISOString(),
+        armed: false,          // nothing here was armed — the OPERATOR clicked submit
+        submitted: true,
+        confirmed: true,       // we only ever write this row on positive confirmation evidence
+        by: "operator",
+      },
+    };
+    if (rec.reviewSnapshot) bundle.workday_review_page = rec.reviewSnapshot;
+    const payload = {
+      company: rec.company || null,
+      role: rec.role || null,
+      url: url || null,
+      job_key: url ? canonicalJobUrl(url) : null,
+      status: "submitted",
+      needs_review_count: 0,
+      captured_at: new Date().toISOString(),
+      review_bundle: bundle,
+      fill_mode: "manual",
+      login: await getRunLoginFor(url || null),
+    };
+    const res = await fetch(apSession.ingestUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": "Bearer " + apSession.ingestKey },
+      body: JSON.stringify(payload),
+    });
+    const outcome = reportOutcome(res && res.status);
+    if (!outcome.ok) console.log("[ApplyPilot][ASSIST-WATCH] ⛔⛔ " + outcome.message);
+    return { ok: !!outcome.ok, reason: outcome.reason || null, status: (res && res.status) || 0 };
+  } catch (e) {
+    return { ok: false, reason: "exception:" + String((e && e.message) || e) };
+  }
+}
+
+// Registered at top level so a restarted service worker still has them (MV3 wakes on the event, and an
+// event with no listener is simply lost). Both are cheap no-ops for any tab that is not being watched.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo.url && changeInfo.status !== "complete") return;
+  manualWatchTick(tabId, changeInfo.url || (tab && tab.url) || "").catch(() => { /* watching never breaks browsing */ });
+});
+chrome.tabs.onRemoved.addListener((tabId) => {
+  (async () => {
+    const map = await readManualWatch();
+    if (!map[String(tabId)]) return;
+    delete map[String(tabId)];
+    await writeManualWatch(map);
+  })().catch(() => { /* best effort */ });
+});
+
+// Everything the popup needs for one render, in one round trip: what page this is, what the operator has
+// configured, whether each button may fire (and if not, WHY — a disabled button with no reason is worse
+// than no button), and the cached score if this posting already has one.
+async function getAssistState(tabId) {
+  const [{ profile, apSession, credentials }, cfg] = await Promise.all([
+    new Promise((r) => chrome.storage.local.get(["profile", "apSession", "credentials"], r)),
+    getLlmConfig(),
+  ]);
+  let hasResume = false;
+  try { hasResume = !!(await getResume()); } catch (e) { /* ignore */ }
+  const { ctx, probe, url, title } = await assistContext(tabId);
+  const aiOn = !!(cfg && cfg.enabled);
+  const hasProfile = !!profile;
+
+  // A SECOND chance at the review snapshot. The watcher normally catches the review page from a tab
+  // update, but a Workday page transition is an SPA render and does not always announce itself as one —
+  // whereas opening the popup is a certainty. Same read-only tick, so it can only ever do less.
+  manualWatchTick(tabId, url).catch(() => { /* the state read must not depend on the watcher */ });
+
+  // A posting we could score, and (Workday/ATS) start an application from. Scoring is host-agnostic —
+  // it only needs text — so an employer's own careers page and a LinkedIn posting both get the card even
+  // though neither can be filled.
+  const scorable = ctx.kind === "job" || ctx.kind === "form";
+  const fillable = !!ctx.ats && ASSIST_FILLABLE_ATS.indexOf(ctx.ats) !== -1;
+  // Whether a form is actually here is a per-pipeline question with a unit-pinned answer — see
+  // formIsOnPage (lib.js), which is also where the reasoning for its threshold lives.
+  const canFillPage = hasProfile && fillable && formIsOnPage(ctx, probe);
+  const canFillForm = hasProfile && aiOn && fillable && (ctx.kind === "job" || ctx.kind === "form");
+
+  const why = {
+    fillPage: !hasProfile ? "Sync your profile from the website first."
+      : ctx.kind === "review" ? "You're on the review page — check it and submit."
+        : !fillable ? "I can fill Workday, Greenhouse, Lever and Ashby forms."
+          : !canFillPage ? "Open the application form to fill a page." : null,
+    fillForm: !hasProfile ? "Sync your profile from the website first."
+      : !aiOn ? "AI is off — a whole form needs it for the screening questions. Turn it on from the website."
+        : ctx.kind === "review" ? "You're on the review page — check it and submit."
+          : !fillable ? "I can fill Workday, Greenhouse, Lever and Ashby forms."
+            : !canFillForm ? "Open a job posting or an application page." : null,
+  };
+
+  // Name the job in the header BEFORE any scoring happens — the scrape is a local read, so the card can
+  // say "Comcast · Software Engineering Intern" instantly and the score can arrive a second later.
+  let job = null;
+  let score = null;
+  if (scorable) {
+    const jd = await assistScrapeJd(tabId);
+    if (jd) job = { title: jd.title || null, company: jd.company || null, chars: (jd.text || "").length };
+    const hit = await readMatchCache(matchCacheKeyFor(url));
+    if (hit && profile && hit.fp === matchProfileFingerprint(profile)) score = hit;
+  }
+  return {
+    ok: true, tabId, url, title, job,
+    kind: ctx.kind, ats: ctx.ats, host: ctx.host,
+    formFields: probe ? probe.formFieldCount : null,
+    readable: !!probe,
+    ai: { on: aiOn, provider: (cfg && cfg.provider) || null, model: (cfg && cfg.model) || null },
+    have: { profile: hasProfile, resume: hasResume, credentials: !!(credentials && credentials.email), connected: !!(apSession && apSession.ingestKey) },
+    canFillPage, canFillForm, why, scorable, score,
+  };
 }
 
 // ── M3 (strict-replay SUBMIT — dry harness) ─────────────────────────────────
@@ -6344,8 +7077,17 @@ async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
 
 const WALK_MAX_PAGES = 8; // generous cap; the review/terminal/session checks are the REAL stops — this only bounds a detection bug from looping forever.
 
-async function runCdpWalk(tabId, profile, defaults, jobContext) {
+async function runCdpWalk(tabId, profile, defaults, jobContext, walkOpts) {
   const LOG = (...a) => console.log("[ApplyPilot][CDP-WALK]", ...a);
+  // MANUAL ASSIST (2026-08-10): the operator pressed "Fill form" in the popup rather than Run on the
+  // website. Identical walk — same fills, same never-submit guards — with ONE difference: it does not
+  // PUSH the bundle to the site. A manual fill is not a fill awaiting review; the operator is sitting on
+  // the page and will review it there, so putting it in the website's review/teach pile would be asking
+  // them to approve work they are already looking at. The tracker row for a manual application is
+  // written when (and only when) a SUBMIT is actually detected — see armManualSubmitWatch.
+  // The local accumulation is untouched: the walk reads its own prior-page bundle for section shapes and
+  // page keying, so suppressing that would change how the walk behaves, not just what it reports.
+  const manualWalk = !!(walkOpts && walkOpts.manual);
 
   // Walk-status capture for the website review page (WHY a fill didn't reach the end): the review
   // terminal sets reachedReview, the loop tracks walkPage, reportPageErrors stashes lastDiag. Stamped
@@ -6466,7 +7208,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // the settle counts it instead of re-proving it from zero. Consumed once (cleared below) — it is
       // only valid for the page that transition landed on, and page 1 (entered from onboarding, no
       // transition) correctly has none.
-      const { out, pageKey, bundle } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page, settleSeed: _settleSeed });
+      // accumulate:true even in manual mode — the walk itself reads back the bundle it writes (section
+      // shapes, page keying), so a manual walk persists LOCALLY and simply never pushes (see manualWalk).
+      const { out, pageKey, bundle } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page, settleSeed: _settleSeed, manual: manualWalk, accumulate: true });
       _settleSeed = null;
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
@@ -6782,7 +7526,8 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
           cancelled: !!(store.lastRunAbort && store.lastRunAbort.reason === "operator-cancelled"),
         };
         await new Promise((r) => chrome.storage.local.set({ reviewSummary }, r));
-        await reportApplication(reviewSummary, jobContext);
+        if (manualWalk) LOG("manual assist — NOT pushing this bundle to the website (you are reviewing it on the page; the tracker row is written if you submit).");
+        else await reportApplication(reviewSummary, jobContext);
       }
     } catch (e) { /* reporting NEVER affects the walk result */ }
   }

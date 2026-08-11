@@ -49,6 +49,34 @@ delete.
 
 ## Built, live-verify pending
 
+### MANUAL ASSIST — the popup's own surface — BUILT 2026-08-10
+
+Branch `manual-assist-ui` (rebased onto main 2026-08-12); see the progress-log entry
+`2026-08-10 — MANUAL ASSIST` and the CLAUDE.md section. The popup is now a **match card + two buttons**
+("Fill form" → walk to review, AI-gated; "Fill page" → this page only), with the whole old dev console
+folded behind `Developer tools`. **Both buttons work on Workday AND on Greenhouse / Lever / Ashby**, and
+the ATS "Fill page" fills IN PLACE — no reload, no page overrides, no landing work. Neither button pushes
+a review bundle; a tracker row is written only when a SUBMIT is actually detected, as `fill_mode:'manual'`
+with an EMPTY-entries bundle carrying the review-page scan. Extension suite **1416/1416**, website
+**279/279** + typecheck clean, both popup states rendered and eyeballed.
+
+**Remaining — three things, in this order:**
+
+1. **Re-run `web/supabase/main.sql`** (its new section 0019 adds `applications.fill_mode`; the file is
+   idempotent, so re-running it touches nothing else). Until it runs, the row still lands — the report
+   route drops the unknown column and retries — but it arrives WITHOUT the `manual` label.
+2. **Live-verify the two buttons.** Workday: "Fill page" on an application page (expect a fast fill, no
+   dropdown re-opens, nothing on the website's review page), then "Fill form" from a JD page (expect it
+   to reach review and stop). **Non-Workday:** open a Greenhouse/Lever/Ashby application and press
+   "Fill page" — expect it to fill WITHOUT reloading and without touching anything already typed. That
+   last point is the one to watch: it fills a live React document without installing the page overrides,
+   which is the whole reason it is safe (see the ATS section of CLAUDE.md). If a combobox misbehaves,
+   that is the first place to look.
+3. **The submit detector is waiting on its first real submit.** Workday's post-submit page has never been
+   observed. When you do submit one by hand, check the SW console: either `✓ submit detected` (done), or
+   an `ASSIST-WATCH … page I don't recognise as a confirmation` line quoting the page — paste that line
+   and `SUBMIT_CONFIRM_RX` (lib.js) gets the real wording.
+
 ### Website SUBMIT button + per-application LOGIN tracking — BUILT 2026-07-26
 
 This branch; see progress-log and the `workday-walk` / `review-and-submit` skills. `/app/run` gains

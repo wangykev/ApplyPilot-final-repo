@@ -288,6 +288,18 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                   </button>
                 )}
 
+                {/* Filled with the extension's own buttons and submitted by hand. Worth saying on the
+                    row: it explains why there is nothing to review here, and it is the only place the
+                    distinction is visible. */}
+                {a.fill_mode === "manual" && (
+                  <span
+                    className="shrink-0 rounded border border-hairline px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-label text-ink-faint"
+                    title="You filled and submitted this one yourself, with the extension assisting."
+                  >
+                    manual
+                  </span>
+                )}
+
                 <span className="shrink-0 font-mono text-[11px] text-ink-faint">
                   {fmtDate(a.applied_at || a.created_at)}
                 </span>

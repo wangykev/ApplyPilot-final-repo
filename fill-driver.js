@@ -4073,6 +4073,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   const only = opts && opts.onlyFieldNames ? opts.onlyFieldNames : null; // AI-4 targeted re-fill
   const onlySec = opts && opts.onlySections ? opts.onlySections : null;  // AI-4 Tier-1.5 section re-fill
   const targeted = !!(only || onlySec); // either targeted mode → skip the full-fill-only passes below
+  // MANUAL ASSIST: the operator pressed "Fill page" and is watching the page. There is no review
+  // bundle downstream, so the two review-only passes (option capture, already-filled sweep) are pure
+  // cost — see their call sites. Everything that protects the VALUE (per-commit read-back, the M40
+  // audit's repair pass) is untouched: manual means no review surface, never less verification.
+  const manual = !!(opts && opts.manual);
   const bucketIndex = buildBucketIndex(opts && opts.buckets); // Profile v2: wording → answer buckets (consulted before AI)
   const scan = await act.scanPage();
   // Employment-question anchor (the company you're applying to): prefer the scraped jobContext.company,
@@ -5297,10 +5302,16 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // Summary editability: scrape the full option list for choice fields that lack one (tagged FoS
   // typeaheads + prefilled-kept dropdowns) into the records — at END OF PAGE (fields settled/closed →
   // reliable fresh re-open) and BEFORE the M40 audit (which re-reads each value + backstops any stray).
+  //
+  // MANUAL ASSIST (2026-08-10) skips it outright. The capture exists to hand the WEBSITE review editor a
+  // real picker, and a manual fill never produces a review bundle — the operator is looking at the page
+  // itself. It is also the single most expensive read-only pass on the page (8.6s of page 2's 15.6s on
+  // cat.wd5), and re-opening every list is exactly the "hovering over the fields" the operator sees.
+  // So in manual mode: no capture, no sweep — the page just fills.
   _phaseT0 = Date.now();
   { const _c0 = Date.now();
     trace("CAPTURE options for the review editor (read-only re-opens)");
-    if (!targeted) await captureChoiceOptions(act, results, budgets);
+    if (!targeted && !manual) await captureChoiceOptions(act, results, budgets);
     trace("CAPTURE done", Date.now() - _c0); }
   markPhase("capture", _phaseT0); _phaseT0 = Date.now();
   if (!targeted) { const auditVerdicts = await reconcileAudit(act, auditEntries, budgets, { refillOnMismatch: true }); applyAuditVerdicts(results, auditVerdicts); }
@@ -5324,7 +5335,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // passes touch disjoint records (audit = bot-filled only; both already-filled flags audit-excluded,
   // so nothing here is ever re-actuated: the fluent-checkbox lesson). Skipped in BOTH targeted
   // modes (onlyFieldNames / onlySections) — a remediation re-fill never re-inventories the page.
-  if (!targeted) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
+  // (Manual assist skips it for the same reason it skips the capture: the inventory exists to make the
+  //  review bundle complete, and a manual fill produces no bundle.)
+  if (!targeted && !manual) { try { await sweepAlreadyFilled(act, results); } catch (e) { /* completeness pass — never abort the page */ } }
   markPhase("sweep", _phaseT0);
 
   // REVIEW ORDER (operator, 2026-07-25): sort the records into the FORM's own top-to-bottom order, so

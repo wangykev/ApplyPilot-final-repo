@@ -33,7 +33,7 @@ export type LlmAction = (typeof LLM_ACTIONS)[number];
  * `teach` classifies a question the same way the fill does, so a separate model would be a
  * knob with no real decision behind it — it follows `fill`, including fill's fallbacks.
  */
-export const LLM_ACTION_ALIASES: Record<string, LlmAction> = { teach: "fill" };
+export const LLM_ACTION_ALIASES: Record<string, LlmAction> = { teach: "fill", match: "fill" };
 /** What a caller may ask for: a routable action, or an alias of one. */
 export type LlmActionInput = LlmAction | keyof typeof LLM_ACTION_ALIASES;
 

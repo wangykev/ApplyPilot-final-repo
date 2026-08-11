@@ -12,7 +12,8 @@
 -- Paste into the Supabase SQL editor and run. Replaces the numbered files in migrations/ and the
 -- older schema.sql snapshot.
 --
--- Generated from migrations/ 0001-0016. If you add a migration later, append it here too.
+-- Generated from migrations/ 0001-0016, then extended in place: 0017-0019 exist ONLY here, because
+-- this file is the source of truth now. If you add a migration later, append it here too.
 --
 -- VERIFIED by execution (2026-08-10), not by reading it: run against a real Postgres (PGlite) with
 -- Supabase's auth/storage objects stubbed —
@@ -602,3 +603,34 @@ create index if not exists resumes_current_idx
 -- approved, and a value records when. Status is deliberately NOT touched — the enum is written by the
 -- extension, and approval is a different axis from where the application sits in the pipeline.
 alter table public.applications add column if not exists approved_at timestamptz;
+
+
+-- ==========================================================================
+-- 0019_manual_fill.sql
+-- ==========================================================================
+-- HOW this application was filled (operator ask 2026-08-10, the extension's manual-assist surface).
+--
+-- The extension has two buttons of its own ("Fill form" / "Fill page") for applications the operator
+-- drives themselves, and the extension watches the tab afterwards: if it sees the submission confirmed,
+-- it writes the tracker row itself, because nothing else ever would.
+--
+--   fill_mode  'manual' = the operator submitted this by hand with the extension assisting.
+--              NULL (the default, and every existing row) = the ordinary website-driven pipeline.
+--              Deliberately nullable rather than defaulted to 'auto': a backfilled guess about how an
+--              old row was filled would be a fact nobody ever observed.
+--
+-- ONE column, not two. The obvious second one — somewhere to put Workday's review page, scraped
+-- read-only on the way past — turned out to be unnecessary: that record already has a home and a
+-- renderer (`review_bundle_json.workday_review_page` → components/app/SubmittedRecord), so the manual
+-- row reports a bundle with an EMPTY `entries` array carrying it. Empty entries is what keeps such a row
+-- off the review and teach surfaces (both derive their work per entry), and reusing the existing shape
+-- means the scan is actually VISIBLE rather than stored in a column nothing reads.
+alter table public.applications
+  add column if not exists fill_mode text;
+
+-- Idempotent like every other constraint in this file: drop before add, so a re-run cannot fail on an
+-- already-present constraint (and a future value can be added by editing this one place).
+alter table public.applications drop constraint if exists applications_fill_mode_check;
+alter table public.applications
+  add constraint applications_fill_mode_check
+  check (fill_mode is null or fill_mode in ('manual'));
