@@ -6,6 +6,9 @@ import { FileText, Sparkles, Check, Trash2, ArrowRight, Eye, X, FileUp, FileChec
 import { SectionCard } from "@/components/app/SectionCard";
 import {
   applyParsedProfile,
+  replaceParsedProfile,
+  applyReconcile,
+  previewProfileApply,
   removeResume,
   getResumePreviewUrl,
   saveResumeSourceTex,
@@ -16,10 +19,25 @@ import {
 import { compileLatexPdf } from "@/app/app/tailor/actions";
 import { liveSync } from "@/lib/extension-sync";
 import type { Profile } from "@/lib/profile-schema";
+import type { ProfileDiff } from "@/lib/profile-diff";
 import { clsx } from "@/lib/clsx";
 
 type Stored = { filename: string; size: number } | null;
 type Msg = { kind: "ok" | "err" | "info"; text: string; aiLink?: boolean } | null;
+
+/**
+ * One shape for all three modes. Every mode is preview-then-confirm: `diff` is the
+ * computed before/after, `fingerprint` pins the profile the diff was taken against,
+ * and `decisions` is present only for smart merge (what the AI proposed).
+ */
+type Pending = {
+  mode: "smart" | "fill" | "replace";
+  diff: ProfileDiff;
+  fingerprint: string;
+  decisions?: unknown[];
+  corrections?: string[];
+  aiPlan?: { section: string; action: "update" | "add"; label: string; replaces: string | null; reason: string }[];
+} | null;
 
 // Draft persistence: the editor survives navigating away and coming back, even
 // signed-out / before "Save as my resume". Also mirrored to the tailor page's
@@ -70,11 +88,29 @@ function summarize(p: Profile): { label: string; n: number }[] {
   ].filter((x) => x.n > 0);
 }
 
+/**
+ * How many individual edits a diff represents. Drives both the counter and the
+ * disabled state of Apply — a preview with zero changes must not offer a button that
+ * writes an identical profile back and reports success.
+ */
+function changeCount(d: ProfileDiff): number {
+  return d.sections.reduce(
+    (n, s) =>
+      n +
+      (s.fields?.length ?? 0) +
+      (s.entries?.length ?? 0) +
+      (s.values ? s.values.added.length + s.values.removed.length : 0),
+    0,
+  );
+}
+
 export function ResumePanel({ initialStored, initialSource }: { initialStored: Stored; initialSource: ResumeSource | null }) {
   const [stored, setStored] = useState<Stored>(initialStored);
   const [msg, setMsg] = useState<Msg>(null);
   const [parsed, setParsed] = useState<Profile | null>(null);
   const [parsing, setParsing] = useState(false);
+  const [planning, setPlanning] = useState<null | "smart" | "fill" | "replace">(null);
+  const [pending, setPending] = useState<Pending>(null);
   const [applying, startApply] = useTransition();
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -359,16 +395,91 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
     }
   }
 
-  function apply() {
+  // EVERY mode is preview-then-confirm. Nothing writes on the first click — the diff
+  // below is computed by running that mode's real apply against a clone, so what you
+  // read is what you get.
+  async function preview(mode: "smart" | "fill" | "replace") {
     if (!parsed) return;
+    setPlanning(mode);
+    setPending(null);
+    setMsg(null);
+    try {
+      if (mode === "smart") {
+        const r = await fetch("/api/reconcile-profile", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ parsed }),
+        });
+        const j = await r.json();
+        if (!j.ok) {
+          setMsg({
+            kind: "err",
+            text: j.error ?? "Could not plan the merge.",
+            aiLink: typeof j.error === "string" && j.error.toLowerCase().includes("api key"),
+          });
+          return;
+        }
+        setPending({
+          mode,
+          diff: j.diff,
+          fingerprint: j.fingerprint,
+          decisions: j.plan.decisions,
+          corrections: j.plan.corrections,
+          aiPlan: j.preview,
+        });
+      } else {
+        const res = await previewProfileApply(parsed, mode);
+        if (!res.ok) {
+          setMsg({ kind: "err", text: res.error });
+          return;
+        }
+        setPending({ mode, diff: res.diff, fingerprint: res.fingerprint });
+      }
+    } catch {
+      setMsg({ kind: "err", text: "Could not build the preview — is the backend reachable?" });
+    } finally {
+      setPlanning(null);
+    }
+  }
+
+  function confirm() {
+    if (!parsed || !pending) return;
+    const p = pending;
     startApply(async () => {
-      const res = await applyParsedProfile(parsed);
-      if (res.ok) liveSync("profile");
-      setMsg(
-        res.ok
-          ? { kind: "ok", text: "Applied to your profile (filled blanks). Review it on the Profile page." }
-          : { kind: "err", text: res.error }
-      );
+      if (p.mode === "smart") {
+        const res = await applyReconcile(parsed, p.decisions ?? [], p.fingerprint);
+        if (!res.ok) return setMsg({ kind: "err", text: res.error });
+        liveSync("profile");
+        setPending(null);
+        return setMsg({
+          kind: res.updated + res.added > 0 ? "ok" : "info",
+          text:
+            res.updated + res.added > 0
+              ? `Merged — ${res.updated} entr${res.updated === 1 ? "y" : "ies"} updated, ${res.added} added.`
+              : "Nothing changed.",
+        });
+      }
+      if (p.mode === "replace") {
+        const res = await replaceParsedProfile(parsed, p.fingerprint);
+        if (!res.ok) return setMsg({ kind: "err", text: res.error });
+        liveSync("profile");
+        setPending(null);
+        const ladders = res.droppedLadders.length
+          ? ` Dropped ${res.droppedLadders.length} dangling answer ladder${res.droppedLadders.length === 1 ? "" : "s"}.`
+          : "";
+        return setMsg({
+          kind: res.replaced.length ? "ok" : "info",
+          text:
+            (res.replaced.length
+              ? `Replaced ${res.replaced.join(", ").replace(/_/g, " ")}.`
+              : "Nothing to replace — your profile already matches the resume.") + ladders,
+        });
+      }
+      const res = await applyParsedProfile(parsed, p.fingerprint);
+      if (!res.ok) return setMsg({ kind: "err", text: res.error });
+      liveSync("profile");
+      setPending(null);
+      setMsg({ kind: "ok", text: "Applied — blank fields filled." });
     });
   }
 
@@ -691,15 +802,159 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
               </p>
             )}
             <div className="mt-5 flex flex-wrap items-center gap-3">
-              <button onClick={apply} disabled={applying} className="btn-primary">
-                {applying ? "Applying…" : "Apply to my profile"}
+              <button onClick={() => preview("smart")} disabled={applying || !!planning} className="btn-primary">
+                {planning === "smart" ? "Asking the AI…" : "Preview smart merge"}
+              </button>
+              <button onClick={() => preview("fill")} disabled={applying || !!planning} className="btn-ghost">
+                Preview fill blanks
+              </button>
+              <button onClick={() => preview("replace")} disabled={applying || !!planning} className="btn-ghost">
+                Preview replace
               </button>
               <Link href="/app/profile" className="inline-flex items-center gap-1.5 text-sm text-ink-dim hover:text-amber">
                 Open profile
                 <ArrowRight className="h-3.5 w-3.5" />
               </Link>
-              <span className="font-mono text-[11px] text-ink-faint">fills blank fields only — won&apos;t overwrite</span>
             </div>
+            <p className="mt-3 text-xs text-ink-faint">
+              Every mode shows you the exact before/after first — nothing is saved until you confirm.{" "}
+              <span className="font-mono">Smart merge</span> asks the AI, per entry, whether it&apos;s the same
+              job/degree you already have (updates it in place) or a new one (adds an entry); it never deletes.{" "}
+              <span className="font-mono">Fill blanks</span> never overwrites, so on a complete profile it
+              changes nothing.{" "}
+              <span className="font-mono">Replace</span> makes this resume the source of truth for the sections
+              above. All three leave work authorization, screening answers, self-identification and your
+              previous-employer list alone — a resume can&apos;t state those. Smart merge and Replace also fold
+              each role&apos;s tech stack into your skills list.
+            </p>
+
+            {pending && (
+              <div className="mt-5 rounded-lg border border-hairline bg-panel p-4">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-mono text-[11px] uppercase tracking-label text-ink-dim">
+                    {pending.mode === "smart" ? "Smart merge" : pending.mode === "replace" ? "Replace" : "Fill blanks"}
+                    {" — nothing is saved yet"}
+                  </span>
+                  <span className="font-mono text-[10px] text-ink-faint">{changeCount(pending.diff)} change(s)</span>
+                </div>
+
+                {pending.aiPlan && pending.aiPlan.length > 0 && (
+                  <ul className="mt-3 space-y-2 border-b border-hairline pb-3">
+                    {pending.aiPlan.map((p, i) => (
+                      <li key={i} className="text-sm">
+                        <span
+                          className={clsx(
+                            "mr-2 rounded px-1.5 py-0.5 font-mono text-[10px] uppercase",
+                            p.action === "update" ? "bg-amber/15 text-amber" : "bg-verified/15 text-verified",
+                          )}
+                        >
+                          {p.action}
+                        </span>
+                        <span className="text-ink">{p.label}</span>
+                        {p.replaces && <span className="text-ink-faint"> — replaces “{p.replaces}”</span>}
+                        {p.reason && <div className="ml-12 text-xs text-ink-faint">{p.reason}</div>}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+
+                {changeCount(pending.diff) === 0 && (
+                  <p className="mt-3 text-sm text-ink-faint">
+                    This mode would change nothing.
+                    {pending.mode === "fill" && " Your profile has no blanks the resume can fill."}
+                  </p>
+                )}
+
+                <div className="mt-3 space-y-4">
+                  {pending.diff.sections.map((s) => (
+                    <div key={s.section}>
+                      <div className="font-mono text-[11px] uppercase tracking-label text-amber">
+                        {s.section.replace(/_/g, " ")}
+                      </div>
+                      {s.fields && (
+                        <ul className="mt-1.5 space-y-1 text-sm">
+                          {s.fields.map((f) => (
+                            <li key={f.field}>
+                              <span className="font-mono text-[11px] text-ink-faint">{f.field}</span>{" "}
+                              <span className="text-ink-faint line-through">{f.before}</span>{" "}
+                              <span className="text-ink-faint">→</span> <span className="text-ink">{f.after}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {s.entries && (
+                        <ul className="mt-1.5 space-y-1 text-sm">
+                          {s.entries.map((e, i) => (
+                            <li key={i}>
+                              {e.kind === "add" && (
+                                <>
+                                  <span className="mr-2 font-mono text-[10px] uppercase text-verified">add</span>
+                                  <span className="text-ink">{e.label}</span>
+                                </>
+                              )}
+                              {e.kind === "remove" && (
+                                <>
+                                  <span className="mr-2 font-mono text-[10px] uppercase text-signal">remove</span>
+                                  <span className="text-ink-faint line-through">{e.label}</span>
+                                </>
+                              )}
+                              {e.kind === "change" && (
+                                <>
+                                  <span className="mr-2 font-mono text-[10px] uppercase text-amber">
+                                    entry {e.index + 1}
+                                  </span>
+                                  <span className="text-ink-faint line-through">{e.before}</span>{" "}
+                                  <span className="text-ink-faint">→</span>{" "}
+                                  <span className="text-ink">{e.after}</span>
+                                  <div className="ml-12 font-mono text-[11px] text-ink-faint">
+                                    {e.fields.join(", ")}
+                                  </div>
+                                </>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                      {s.values && (
+                        <div className="mt-1.5 text-sm">
+                          {s.values.added.length > 0 && (
+                            <div>
+                              <span className="mr-2 font-mono text-[10px] uppercase text-verified">add</span>
+                              <span className="text-ink">{s.values.added.join(", ")}</span>
+                            </div>
+                          )}
+                          {s.values.removed.length > 0 && (
+                            <div>
+                              <span className="mr-2 font-mono text-[10px] uppercase text-signal">remove</span>
+                              <span className="text-ink-faint line-through">{s.values.removed.join(", ")}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+
+                {(pending.diff.warnings.length > 0 || (pending.corrections?.length ?? 0) > 0) && (
+                  <div className="mt-4 rounded border border-amber/40 bg-amber/5 p-3">
+                    <div className="font-mono text-[11px] uppercase tracking-label text-amber">Heads up</div>
+                    <ul className="mt-2 space-y-1 text-xs text-ink-dim">
+                      {pending.corrections?.map((c, i) => <li key={"c" + i}>Overruled the model: {c}</li>)}
+                      {pending.diff.warnings.map((w, i) => <li key={"w" + i}>{w}</li>)}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="mt-4 flex flex-wrap items-center gap-3">
+                  <button onClick={confirm} disabled={applying || changeCount(pending.diff) === 0} className="btn-primary">
+                    {applying ? "Saving…" : "Apply these changes"}
+                  </button>
+                  <button onClick={() => setPending(null)} disabled={applying} className="btn-ghost">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </SectionCard>

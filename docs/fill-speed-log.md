@@ -325,6 +325,19 @@ upload widget, then parses a résumé). Siblings on the same hidden tab already 
 **45s**. The failure direction decides it: too short halts a HEALTHY run and needs an operator; too long
 costs seconds on a genuinely broken page before reaching the same halt.
 
+> ⚠ **SUPERSEDED 2026-08-11 — the 45s change was DROPPED when this branch merged `main`.** `main`'s
+> `98b99df` had independently fixed the same halt, better: the wait now runs up to **three** budgets and
+> **hard-reloads once** in between, and — the deciding difference — a `stillBlank` test stops
+> IMMEDIATELY on a page that rendered *something other than* the upload control, so a genuinely wrong
+> page no longer pays the full budget at all. A single long budget always paid full freight. Three
+> budgets plus the reload also exceed 45s, and the reload covers a wedged SPA bundle that no amount of
+> waiting can fix.
+>
+> **The measurement above still stands and is why the merge kept `main`'s side rather than splitting the
+> difference:** the halts were not a sampling problem (existence is monotone — a sparse poll notices
+> late, it cannot miss), so an attempts floor was never the lever, and the remaining question was only
+> *how* to buy more time. `main` answered that better.
+
 ### DONE (`onboard-clock-1`) — the scoped onboarding clock, LIVE-VERIFIED
 
 `waitFor`'s poll loop now arms the page clock for the interval FOLLOWING a successful in-page `scan()`,
@@ -419,7 +432,7 @@ Re-derived only where there is a concrete failing run to test against, per the s
 
 | wait | timeouts on record | verdict |
 |---|---|---|
-| `waitFor(resume-upload-input)` | 3 runs, all at exactly 25000ms | **raised 25s → 45s** (round 5). Class A ⇒ budget was the only correct lever. |
+| `waitFor(resume-upload-input)` | 3 runs, all at exactly 25000ms | **SUPERSEDED — see below.** Round 5 raised the single budget 25s → 45s; the merge with `main` dropped that for a better fix. |
 | `cdpWaitNextPage` (15s) | 2 exhaustions | **unchanged — both were TRUE NEGATIVES** (swallowed Save clicks, recovered by re-clicking). The wait answered correctly; there is nothing here to widen. An attempts floor was rejected separately: 30 polls × 2694ms = **81s per transition** on the walk's most frequent wait. |
 
 ### Fixed in passing

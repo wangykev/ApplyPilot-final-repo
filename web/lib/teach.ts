@@ -202,6 +202,45 @@ export function bucketCoversAnswer(buckets: Bucket[], profile: unknown, question
   return false;
 }
 
+/** Common corporate suffixes, stripped so "Analog Devices Inc." still matches "Analog Devices". */
+const COMPANY_SUFFIX_RX = /\b(inc|inc\.|incorporated|corp|corp\.|corporation|llc|l\.l\.c\.|ltd|ltd\.|limited|plc|gmbh|s\.a\.|nv|ag|co|co\.|company|group|holdings|technologies|technology|labs|laboratories)\b/gi;
+
+function companyTokens(company: string | null | undefined): string[] {
+  const cleaned = String(company || "")
+    .replace(COMPANY_SUFFIX_RX, " ")
+    .replace(/[^\p{L}\p{N}\s&-]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return [];
+  // The whole cleaned name is the reliable signal. Single tokens are only used when they are
+  // distinctive enough not to appear in ordinary prose — "Analog" and "Devices" each fail that bar,
+  // "Nvidia" passes — so a multi-word name matches as a PHRASE, not word-by-word.
+  const words = cleaned.split(" ").filter(Boolean);
+  const out = [cleaned];
+  if (words.length === 1 && words[0].length >= 4) return out;
+  return out;
+}
+
+/**
+ * Does this question wording name the employer?
+ *
+ * Such a wording is tenant-specific by construction: every company asks "…employment with <us>?",
+ * so a taught bucket for one of them can never match another. Deliberately conservative — it only
+ * fires on the company we actually know for that application, matched as a whole phrase on word
+ * boundaries, so an ordinary question is never withheld from teaching by accident.
+ */
+export function questionNamesCompany(question: string, company: string | null | undefined): boolean {
+  const q = String(question || "").toLowerCase();
+  if (!q) return false;
+  for (const t of companyTokens(company)) {
+    const needle = t.toLowerCase();
+    if (needle.length < 3) continue;
+    const rx = new RegExp(`(^|[^\\p{L}\\p{N}])${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}([^\\p{L}\\p{N}]|$)`, "u");
+    if (rx.test(q)) return true;
+  }
+  return false;
+}
+
 /** Teachable cards across the user's reviewed applications — deduped by question, excluding
  *  anything already covered by a bucket OR explicitly dismissed (skipped). Most-recent application
  *  wins a duplicate. */
@@ -227,6 +266,13 @@ export function teachableCards(
       // (the stored bundle keeps its ai-* flag forever, so plain coverage never hid it → it resurfaced on
       // every re-approve/reload). A non-AI (deterministic/bucket) fill uses plain coverage, unchanged.
       // skip (dismissed) + dedup (seen) still always apply.
+      // A wording that NAMES THE EMPLOYER cannot generalize (operator 2026-08-10). "Do you have any
+      // commitments to another organization that might affect your employment with Analog Devices?"
+      // is the same question everywhere, but no other tenant writes it that way — teaching it stores
+      // a wording that will never match again, and it clutters the teach queue with one card per
+      // employer for what is really one question. Skipped as a teach CARD only; the answer is still
+      // filled, reviewed and submitted exactly as before.
+      if (questionNamesCompany(e.question_label as string, app.company)) continue;
       const aiFilled = typeof e.flag === "string" && /^ai/i.test(e.flag);
       const isCovered = aiFilled
         ? bucketCoversAnswer(buckets, profile, key, String(e.current_value))

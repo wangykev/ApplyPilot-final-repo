@@ -3,7 +3,6 @@
 
 export const APP_STATUSES = [
   "queued",
-  "filling",
   "needs_review",
   "submitted",
   "interviewing",
@@ -21,6 +20,9 @@ export type Application = {
   needs_review_count: number;
   applied_at: string | null;
   created_at: string;
+  // WHEN every flagged field was approved (null = not approved). Mirrors the bundle's submit_ready
+  // roll-up onto a cheap column, because the LIST never loads review_bundle_json.
+  approved_at?: string | null;
   // The Workday account this application was filed with (migration 0011). Optional because the
   // tracker LIST doesn't select them — only the detail page, which is where you need them (Workday
   // accounts are per-tenant, so weeks later "what did I sign in as here?" is a real question).

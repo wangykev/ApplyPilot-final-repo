@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "submit-ready-1";
+const AP_BUILD_MARKER = "merge-speed-onboard-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -113,7 +113,12 @@ chrome.runtime.onConnectExternal.addListener((port) => {
   if (runInFlight && lastRunProgress) { try { port.postMessage(lastRunProgress); } catch (e) { /* closed */ } }
   port.onDisconnect.addListener(() => { if (runProgressPort === port) runProgressPort = null; });
 });
-const AP_BUILD = "replay-time-2";
+// ONE build string, two readers: the service-worker start line (above) and AP_PING's `build`.
+// These used to be two independent constants and they DRIFTED — the start line said
+// "worktree-live-submit-1" while AP_PING still answered "replay-time-2", which reads exactly like
+// "the extension is running stale code from another profile" and cost a full round of archaeology
+// (2026-08-10). Alias, never re-declare a literal here: bump AP_BUILD_MARKER only.
+const AP_BUILD = AP_BUILD_MARKER;
 
 function emitRunProgress(phase, detail) {
   lastRunProgress = { type: "AP_RUN_PROGRESS", phase: String(phase || ""), detail: String(detail || ""), at: Date.now() };
@@ -948,6 +953,28 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           submit.submitted ? "Submitted" : submit.would_submit ? "Rehearsal complete — every gate passed" : "Stopped before submitting",
           submit.stopped || ""
         );
+        // PERSIST THE RUN'S RECORD. Until now a submit run told nobody but the console: the tracker row
+        // still read "needs_review" after a real submission, and Workday's review page — the only proof
+        // of what was actually filed — died with the tab. Report it, so the tracker can show what was
+        // submitted and when. Rehearsals report their snapshot too (status unchanged), which is what
+        // makes it possible to inspect the review page WITHOUT submitting.
+        try {
+          await reportApplication(pull.bundle, store.jobContext || null, {
+            status: submit.submitted ? "submitted" : undefined,
+            reviewPage: submit.review_page || null,
+            submission: {
+              at: new Date().toISOString(),
+              armed: arm,
+              submitted: !!submit.submitted,
+              confirmed: !!submit.confirmed,
+              would_submit: !!submit.would_submit,
+              stopped: submit.stopped || null,
+              blockers: submit.blockers || [],
+              login: runLogin || null,
+              confirmation: submit.confirmation || null,
+            },
+          });
+        } catch (e) { LOG(`could not report the submit run (${String((e && e.message) || e)}) — the run itself is unaffected.`); }
         sendResponse({ ...onb, replayed: true, submit, armed: arm, job_key: jobKey, application_id: pull.application_id || null, login: runLogin, tabId, startUrl });
       } catch (e) {
         sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
@@ -3971,9 +3998,18 @@ async function getRunLoginFor(bundleUrl) {
 // website isn't connected (no apSession) it's a silent no-op. status is NEVER
 // "submitted" (the human submits — the engine only ever fills to review; the WEBSITE
 // writes that status when the operator authorizes a submit from its Run page).
-async function reportApplication(bundle, jobContext) {
+// `extra` (optional) carries the SUBMIT run's own record: Workday's review page as displayed, the
+// confirmation page, and the status the run earned. It rides INSIDE review_bundle rather than as new
+// columns — review_bundle_json is already the JSONB blob the tracker reads, so documenting a submission
+// needs no migration and no change to the ingest contract.
+async function reportApplication(bundle, jobContext, extra) {
   try {
     if (!bundle) return { ok: false, reason: "no-bundle", status: 0 };
+    if (extra && (extra.reviewPage || extra.submission)) {
+      bundle = { ...bundle };
+      if (extra.reviewPage) bundle.workday_review_page = extra.reviewPage;
+      if (extra.submission) bundle.submission = extra.submission;
+    }
     const { apSession } = await new Promise((res) => chrome.storage.local.get("apSession", res));
     if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return;
     const needs = bundle.needs_review_count || 0;
@@ -3992,7 +4028,13 @@ async function reportApplication(bundle, jobContext) {
       // Key on the link the run STARTED from when we have it, so a re-fill updates the SAME row
       // even though a landing hop moved the form URL. Older bundles fall back to the form URL.
       job_key: (bundle.jobKeyUrl || bundle.url) ? canonicalJobUrl(bundle.jobKeyUrl || bundle.url) : null,
-      status: needs > 0 ? "needs_review" : "filling",
+      // A SUBMITTED application outranks the needs-review arithmetic: the flags describe what was
+      // reviewed before filing, not the state of a filed application.
+      // A completed fill is ALWAYS "needs_review" — the human still checks and approves before a
+      // submit, whether or not anything got flagged. It used to fall back to "filling" when nothing
+      // was flagged, which is an in-progress state on a finished run: those rows then sat reading
+      // "Filling" forever, because only a report can move them and the report had already happened.
+      status: (extra && extra.status) || "needs_review",
       needs_review_count: needs,
       captured_at: bundle.captured_at || new Date().toISOString(),
       review_bundle: bundle
@@ -5207,6 +5249,12 @@ async function runCdpReplayWalk(tabId, opts) {
         //    FAILURE (can't confirm) each becomes a HARD gate blocker. extra-on-page is logged, not
         //    blocked (review boilerplate is noisy). Runs even DRY — the operator sees the diff preview. ──
         const reviewDiff = { disagree: [], missing: [], scrapeFailed: false };
+        // WORKDAY'S OWN REVIEW PAGE, kept for the record (operator 2026-08-10: "make sure the review
+        // page before the submission is documented … on the tracker"). This is the read-only text of
+        // what was actually on the application at the moment of submitting — the authority the
+        // reconcile already trusts over our own scan, and the only artefact that survives the tab
+        // closing. Captured whether or not the run is armed, so a rehearsal documents itself too.
+        let reviewSnapshot = null;
         try {
           const hints = bundle.entries
             .filter((e) => e && e.current_value != null && String(e.current_value).trim() !== "" && !isAiPlaceholder(e.current_value))
@@ -5217,6 +5265,15 @@ async function runCdpReplayWalk(tabId, opts) {
           LOG(`review page settled in ${settled.ms}ms — ${settled.records} displayed value(s).`);
           const dump = settled.dump;
           if (dump && dump.ok && Array.isArray(dump.items)) {
+            reviewSnapshot = {
+              captured_at: new Date().toISOString(),
+              url: (nav && nav.url) || null,
+              // Cap the payload: a review page is tens of rows, but a pathological one must not
+              // blow up the report body. Truncation is RECORDED, never silent.
+              items: dump.items.slice(0, 400).map((it) => ({ label: it.label ?? null, value: it.value ?? null, section: it.section ?? null })),
+              truncated: dump.items.length > 400,
+              total_items: dump.items.length,
+            };
             const rec = reconcileReviewPage(dump.items, bundle.entries, { accountEmails: await getAccountEmails() });
             const c = rec.counts;
             reviewDiff.disagree = rec.disagree || [];
@@ -5269,7 +5326,7 @@ async function runCdpReplayWalk(tabId, opts) {
           LOG(`submit gate: ${gate.blockers.length} blocker(s) — NOT submitting:`);
           gate.blockers.forEach((b) => LOG(`    ✗ ${b}`));
           if (!authorize) LOG(`(DRY run — reached review + stopped. When every blocker above is cleared, the armed Submit button will submit once.)`);
-          return { ok: true, stopped: authorize ? "submit-blocked" : "reached-review", reached_review: true, submit_blocked: authorize || undefined, blockers: gate.blockers, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+          return { ok: true, stopped: authorize ? "submit-blocked" : "reached-review", reached_review: true, submit_blocked: authorize || undefined, blockers: gate.blockers, pages_replayed: pagesReplayed.length, pages: pagesReplayed, review_page: reviewSnapshot };
         }
         // GATE PASSED + authorized. ── M5 SAFETY BRAKE ── While simulateSubmit is on, LOG what WOULD
         // happen and DO NOT click — no run submits yet (operator's explicit choice). act.clickSubmit is
@@ -5278,7 +5335,7 @@ async function runCdpReplayWalk(tabId, opts) {
         if (simulateSubmit) {
           submitFired = true; // single-fire (mirrors the real path)
           LOG(`✅✅✅ SUBMIT GATE PASSED — ▶▶ WOULD CLICK SUBMIT NOW ◀◀ (SIMULATE MODE: NOT clicking). Every precondition is satisfied, so an armed run (simulateSubmit:false) would submit the application here.`);
-          return { ok: true, stopped: "would-submit", would_submit: true, simulated: true, reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+          return { ok: true, stopped: "would-submit", would_submit: true, simulated: true, reached_review: true, pages_replayed: pagesReplayed.length, pages: pagesReplayed, review_page: reviewSnapshot };
         }
         // (real path — not reached while simulateSubmit is on) → the ONE irreversible click.
         // FORCE TRUSTED for it, even hidden: this is the single action that cannot be undone, so it uses
@@ -5297,7 +5354,30 @@ async function runCdpReplayWalk(tabId, opts) {
         const res = await cdpWaitNextPage(subSig);
         const confirmed = !!(res.advanced && !res.sessionDead && !res.maintenance);
         LOG(confirmed ? `✓✓✓ SUBMITTED — the review page advanced (confirmation). Application submitted.` : `clickSubmit fired but no confirmed advance yet (${JSON.stringify(res)}) — VERIFY on the page.`);
-        return { ok: true, stopped: "submitted", submitted: true, confirmed, pages_replayed: pagesReplayed.length, pages: pagesReplayed };
+        // READ THE CONFIRMATION PAGE (operator 2026-08-10: "document the confirmation page after
+        // pressing submit"). Best-effort and non-fatal — the submit already happened, so a failure to
+        // read the page must never turn a successful submission into an error. Text only, no clicks.
+        // POLL, don't snapshot. The first live armed submit (2026-08-10) read this the instant the nav
+        // settled and got url-only: title "" and text "" — a confirmation record with no content, which
+        // documents nothing. Workday routes to /jobTasks/completed/application and paints a beat later,
+        // so wait for actual TEXT, keeping the last non-empty read. Bounded and non-fatal: the submit has
+        // already happened, and failing to read the page must never be reported as a failed submission.
+        let confirmation = null;
+        try {
+          for (let i = 0; i < 10; i++) {
+            const c = await cdpEval(() => ({
+              url: location.href,
+              title: document.title,
+              heading: (document.querySelector("h1,h2,[role=heading]") || {}).innerText || null,
+              text: ((document.body && document.body.innerText) || "").replace(/\s+/g, " ").trim().slice(0, 1200),
+            }));
+            if (c) confirmation = c;
+            if (c && (c.text || "").length > 40) break;
+            await cdpDelay(1000);
+          }
+          if (confirmation) LOG(`confirmation page: "${confirmation.title}" — ${String(confirmation.heading || confirmation.text || "(no text read)").slice(0, 140)}`);
+        } catch (e) { LOG(`could not read the confirmation page (${String((e && e.message) || e)}) — the submit still went through.`); }
+        return { ok: true, stopped: "submitted", submitted: true, confirmed, pages_replayed: pagesReplayed.length, pages: pagesReplayed, review_page: reviewSnapshot, confirmation };
       }
 
       LOG(`──── REPLAY PAGE ${page} ────${reloadsUsed ? ` (walk restart ${reloadsUsed})` : ""}`);
@@ -6647,6 +6727,8 @@ async function runCdpOnboard(tabId, opts) {
   const relock = async () => { try { await installInputLock(); } catch (e) { /* best-effort */ } };
   await relock();
   let accountCreated = false, verified = false, softReloads = 0;
+  // AUTH LOOP GUARD (operator 2026-08-10). See the wrong_credentials branch in the auth loop.
+  let wrongCredCount = 0, accountKnownToExist = false;
   // Workday sometimes returns an EMPTY shell after the sign-in submit — recoverable by a reload
   // (see isBlankAuthPage). RUN-level budget: if refreshing twice doesn't restore a real page, it's
   // not a hiccup any more and the operator gets a self-explaining halt.
@@ -6776,28 +6858,70 @@ async function runCdpOnboard(tabId, opts) {
       // user), so break out and let the auth stage do its job, exactly as the terminal-state exits
       // inside waitFor already do for already-applied and maintenance pages.
       const authNow = (sc) => !!(sc && (sc.hasAuthEl || sc.passwordInput || sc.emailInput || sc.signInWithEmail));
-      // ── HIDDEN BUDGET RAISED 25s → 45s (2026-08-10, measured) ─────────────────────────────────────
-      // This wait halted THREE runs in one session, every time at EXACTLY its 25000ms hidden budget,
-      // with 21-29 reads — so it was LOOKING often enough (~1.2s apart); the control simply had not
-      // rendered yet. It is not a sampling problem and an attempts floor would not have helped. The
-      // proof it is variance rather than a real failure: the very NEXT run satisfied this same wait in
-      // 7.0s on the same tenant. 25s was also the SMALLEST hidden budget in this flow, while its own
-      // siblings already allow far more on the same hidden tab — post-resume-upload(parse) 50s,
-      // post-continue-application 45s, sign-in-form-render 30s — and this page is heavier than most
-      // (Workday mounts an upload widget and then parses a résumé).
-      // The failure DIRECTION is what settles it: too short halts a HEALTHY run and needs an operator,
-      // while too long costs seconds on a page that is genuinely broken before reaching the same halt.
-      const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1 || authNow(sc),
-        await renderBudget(12000, 45000), "resume-upload-input");
-      s = w.scan || s;
+      const decisive = (sc) => !!(sc && ((sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1 || authNow(sc)));
+      // ── A BLANK PAGE IS NOT A NEGATIVE ANSWER (cat.wd5, 2026-08-10) ───────────────────────────────
+      // "No upload control" and "nothing has rendered yet" are different observations, and only the
+      // first is a reason to stop. This tenant renders the whole screen late: on the run that WORKED
+      // the identical wait read `title "Careers" · formFields 0 · markers [none]` at 6.4s and was
+      // satisfied at 10.1s; on the run that halted it read the SAME empty state at 4.7s, 13.7s, 17.5s
+      // and 28.8s and gave up at the 25s ceiling — then the operator looked at the tab and found the
+      // CREATE-ACCOUNT page, i.e. the click had gone exactly where it should and simply arrived late.
+      // The halt was a definitive claim ("never rendered its upload control") drawn from a page that
+      // had rendered nothing at all.
+      //
+      // Same principle the auth stage already applies to an empty page after a submit: absence of
+      // evidence during a navigation is not evidence of absence. So a still-BLANK page buys one more
+      // budget; a page that has rendered SOMETHING that isn't the upload control is a real negative
+      // and stops immediately, which keeps a genuinely wrong page from costing double.
+      const stillBlank = (sc) => !!sc && (sc.formFieldCount || 0) === 0 && !authNow(sc)
+        && !(sc.markers && Object.keys(sc.markers).some((k) => sc.markers[k]));
+      //
+      // MEASURED on cat.wd5 (2026-08-10), in a VISIBLE tab with a warm cache and no extension involved:
+      // TTFB 467ms · DOMContentLoaded 793ms · load event 1484ms · posting content on screen at ~13s.
+      // The document and its assets arrive in under two seconds and then the SPA spends another ~11s
+      // booting and fetching the posting through its own API before it renders anything. Hidden and
+      // cold, that comfortably clears 25s — so the budget was simply short for this tenant, not wrong
+      // about the page. Hence: wait, wait again, then hard-reload once (ignoreCache re-fetches a bundle
+      // that genuinely wedged) before admitting defeat.
+      let w = null;
+      const LABELS = ["resume-upload-input", "resume-upload-input(still blank)", "resume-upload-input(after reload)"];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        w = await waitFor(decisive, await renderBudget(12000, 25000), LABELS[attempt]);
+        s = w.scan || s;
+        if (decisive(s) || !stillBlank(s)) break;
+        if (attempt === 0) {
+          LOG("the résumé page is STILL BLANK — no fields, no auth chrome, no markers. That is a render in progress, not a missing control; waiting one more budget.");
+        } else if (attempt === 1) {
+          // Nothing has been typed on this page yet, so a reload costs only time — and a wedged SPA
+          // bundle is the one cause more waiting can never fix.
+          LOG("still blank after two full budgets — hard-reloading the page once and waiting again.");
+          try { await cdpReload(); } catch (e) { LOG("reload failed: " + String((e && e.message) || e)); }
+        }
+      }
+      // ── INDEPENDENT CORROBORATION, and why the fill-speed branch's own fix was DROPPED here ────────
+      // A separate investigation (docs/fill-speed-log.md, round 5) hit this same halt and raised the
+      // single hidden budget 25s → 45s. Its evidence agrees with the diagnosis above and is worth
+      // keeping: the wait halted THREE runs in one session at EXACTLY 25000ms having done 21-29 reads —
+      // so it was LOOKING often enough (~1.2s apart) and the control simply had not rendered; the very
+      // next run satisfied it in 7.0s on the same tenant. That also killed the "sampling problem"
+      // theory: this wait watches EXISTENCE, which is MONOTONE, so a sparse poll can only notice LATE,
+      // never miss — an attempts floor would have bought nothing.
+      // The 45s change is SUPERSEDED by the loop above and was dropped in the merge: three budgets plus
+      // a reload already exceed it, the reload covers a wedged SPA bundle that no amount of waiting can
+      // fix, and — the deciding difference — `stillBlank` stops IMMEDIATELY on a page that rendered
+      // something other than the control, where a single long budget always paid full freight.
       if (authNow(s)) {
         LOG("Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage (the résumé page comes after).");
         return { scan: s, needsAuth: true };
       }
       if ((s.formFieldCount || 0) > 1) { LOG("the résumé page moved on by itself — already past it."); return { scan: s }; }
       if (!(s.markers && s.markers.resumeUploadInput)) {
+        // Say which of the two it actually was — a page that stayed blank is a slow tenant, and telling
+        // the operator "the control is missing" sends them looking for the wrong thing.
         return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-upload-input-missing",
-          detail: "the Autofill-with-Resume page never rendered its upload control." } };
+          detail: stillBlank(s)
+            ? "the Autofill-with-Resume page never rendered ANYTHING (no fields, no auth chrome, no markers) across two render budgets AND a hard reload — that is the tenant failing to boot its SPA, not a missing control."
+            : "the Autofill-with-Resume page rendered, but without an upload control." } };
       }
     }
     if (s.markers && s.markers.resumeUploadSuccess) LOG("the résumé is already uploaded on this page — continuing.");
@@ -7856,7 +7980,41 @@ async function runCdpOnboard(tabId, opts) {
           return { ok: true, reached_form: true, stopped: "reached-form", account_created: accountCreated, verified, resume_autofilled: resumeAutofilled };
         }
         if (out === "verify") { const v = await doVerify(st); if (!v.ok) return { ...v, ok: true }; verified = true; continue; }
-        if (out === "wrong_credentials") { const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue; }
+        // wrong_credentials → the account may simply not exist yet, so the FIRST rejection earns one
+        // create-account attempt. Past that it is a LOOP, and looping here is actively harmful.
+        //
+        // Live 2026-08-10 (analogdevices.wd1, a plain gmail address with a pre-existing account): sign-in
+        // was rejected → create-account → Workday said the email was taken → back to sign-in → rejected →
+        // … eight attempts, until the run died on an unrelated detach. Nothing about that sequence could
+        // ever have succeeded: creating an account cannot fix a wrong password, and re-submitting a bad
+        // password is precisely what makes a tenant LOCK the account. The operator's read was "my account
+        // may be locked" — the machine should have said that on attempt 2 instead of hammering it.
+        //
+        // So: halt with the specific reason. `accountKnownToExist` (Workday itself said "already exists")
+        // gives the confident message; otherwise report the repeat honestly without asserting a cause we
+        // did not observe — the same discipline as the signin-no-outcome branch below.
+        if (out === "wrong_credentials") {
+          wrongCredCount++;
+          if (accountKnownToExist) {
+            return haltNeedsOperator(
+              "auth-password-rejected",
+              `Workday says an account already exists for ${creds.email}, but the stored password was rejected. Update the password on the Sign-in page (or use a different email). Stopping rather than retrying — repeated failed sign-ins are what lock a Workday account.`,
+              st,
+            );
+          }
+          if (wrongCredCount >= 2) {
+            return haltNeedsOperator(
+              "auth-credentials-rejected",
+              `Sign-in as ${creds.email} was rejected ${wrongCredCount}× and creating an account did not resolve it. Check the email/password on the Sign-in page; the account may also be locked. Stopping rather than retrying.`,
+              st,
+            );
+          }
+          const cr = await doCreateAccount(st);
+          if (!cr.ok) return { ...cr, ok: true };
+          if (cr.alreadyExists) accountKnownToExist = true;
+          accountCreated = true;
+          continue;
+        }
         if (isAlreadyApplied(st)) return alreadyAppliedResult(); // signed in successfully → Workday shows already-applied instead of the form
         // Sign-in never resolved and the form is STILL up → a block (most likely the breach dialog) is up
         // and Enter didn't clear it. Halt SPECIFICALLY (not a vague auth-unknown) so the operator can act.
@@ -7878,9 +8036,12 @@ async function runCdpOnboard(tabId, opts) {
         return haltNeedsOperator("auth-unknown", `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}`, st);
       }
 
-      // No sign-in form but a create-account affordance → create directly.
+      // No sign-in form but a create-account affordance → create directly. Records "already exists"
+      // the same way the wrong_credentials branch does, so arriving here first still arms the loop guard.
       if (st.markers.createAccountLink || st.markers.createAccountSubmit || st.markers.verifyPassword) {
-        const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true }; accountCreated = true; continue;
+        const cr = await doCreateAccount(st); if (!cr.ok) return { ...cr, ok: true };
+        if (cr.alreadyExists) accountKnownToExist = true;
+        accountCreated = true; continue;
       }
 
       return haltNeedsOperator("auth-unrecognized", st.title, st);

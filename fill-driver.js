@@ -400,6 +400,11 @@ const FIELD_MAP = {
   //   AI-inferred). `gender` live-recon'd on Magna (options Female/Male/Other/Undeclared);
   //   race/veteran/disability map the same way once their automation-ids are observed.
   "gender": "self_identification.gender",
+  // OBSERVED live on cat.wd5 (2026-08-10) — the OFCCP disability self-ID, rendered there as a
+  // checkbox_group ("Please check one of the boxes below:"). Its profile wording rarely matches the
+  // tenant's verbatim, so the value expands into a candidate ladder ending in the bare polarity
+  // token; see selfIdDisabilityCandidates.
+  "disabilityStatus": "self_identification.disability_status",
   // AI-3: agreements — legal consent checkbox; checked ONLY if the operator pre-set the
   //   boolean to true (fillCheckboxCdp reconciles to it). null/false → skipped → if REQUIRED
   //   the walk halts with a clean `consent-not-granted` message (never fabricates consent).
@@ -488,6 +493,79 @@ function appendFieldVariants(profile, path, cands) {
     if (s && !seen.has(s.toLowerCase())) { base.push(s); seen.add(s.toLowerCase()); }
   }
   return base;
+}
+
+// ── WORKDAY'S VOLUNTARY SELF-IDENTIFICATION PAGE (operator, 2026-08-10) ─────────────────────────
+// One structure across every tenant that has it: a disability question, a signature Name, a Date,
+// and sometimes a form-language picker / employee id. Only the WORDING of the options varies, and
+// only in its tail ("No, I do not have a disability" vs "No, I do not have a disability and have not
+// had one in the past"). The answers do not vary at all: the date is the day you fill the form, and
+// the disability answer is the one in your profile.
+//
+// WHY THEY ARE ANSWERED UNCONDITIONALLY, required or not. Several tenants render Date and the
+// disability pick as OPTIONAL — until Name is filled, at which point BOTH become REQUIRED. Live on
+// cat.wd5 page 6: we filled `name` from the profile, Save came back "The field Date is required" +
+// "The field Please check one of the boxes below: is required", and the walk halted on a page whose
+// answers we were holding the whole time. Filling them up front means the cascade has nothing left
+// to promote, so the failure cannot occur rather than being recovered from.
+const SELF_ID_DISABILITY_PATH = "self_identification.disability_status";
+
+// A signature/completion date — the day the form is being filled in. NOT a date with its own meaning
+// (start date, DOB, graduation): isSignatureDateQuestion is deliberately narrow and unit-pinned.
+function isSignatureDateField(f) {
+  if (!f || (f.widgetType !== "date" && f.widgetType !== "year")) return false;
+  if (String(f.fieldName || "") === "dateSignedOn") return true;
+  try { return !!apMatch.isSignatureDateQuestion(f.label); } catch (e) { return false; }
+}
+
+/**
+ * The self-ID SIGNATURE NAME — the applicant's own full name, typed under an attestation.
+ *
+ * It was being AI-filled (`ai-text`, medium confidence, flagged) on a page that sits beside a legal
+ * certification, while the profile held the answer all along. Worse than the wasted call: the model can
+ * word it differently run to run, and live it produced "Kevin Wang" where the deterministic bucket had
+ * written "Kevin" — the same field answered two ways on real applications.
+ *
+ * Scoped to the self-ID page by its SIBLINGS (the same shape-test isSelfIdLanguageField uses), because
+ * `name` is far too generic a field id to claim globally — a "Company Name" or "Reference Name" box must
+ * never be stamped with the applicant's name. Returns the value, or null to leave the field alone.
+ */
+function selfIdSignatureNameValue(f, scanFields, profile) {
+  if (!f || f.widgetType !== "text" || String(f.fieldName || "") !== "name") return null;
+  const names = new Set((Array.isArray(scanFields) ? scanFields : []).map((x) => x && x.fieldName).filter(Boolean));
+  const onSelfIdPage = names.has("disabilityStatus") || names.has("disabilityForm")
+    || (names.has("dateSignedOn") && names.has("name"));
+  if (!onSelfIdPage) return null;
+  const pi = (profile && profile.personal_info) || {};
+  const full = [pi.first_name, pi.last_name].map((s) => String(s == null ? "" : s).trim()).filter(Boolean).join(" ");
+  return full || null;
+}
+
+/**
+ * The disability answer as an ORDERED candidate list, most specific first.
+ *
+ * The profile stores one phrasing ("No, I do not have a disability"); Workday renders another ("No, I
+ * do not have a disability and have not had one in the past"). Exact match therefore misses, and
+ * containment is refused here on purpose — a substring match against a list of options is the guess
+ * this codebase does not make.
+ *
+ * The bare polarity token is what closes the gap, and it is not a guess: POLARITY LEAD commits a "No"
+ * only when EXACTLY ONE option leads with it, which is true of every OFCCP self-ID form (Yes… / No… /
+ * a decline line). A tenant that ever split "No" into two meanings would have two leading options and
+ * escalate to review instead of picking one.
+ */
+function selfIdDisabilityCandidates(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return [];
+  const low = s.toLowerCase();
+  const out = [s]; // the operator's own words first — an exact hit needs no inference at all
+  const declines = /prefer not|do not want|don'?t want|do not wish|don'?t wish|decline|not to answer/.test(low);
+  if (declines) {
+    for (const v of ["I do not want to answer", "I don't wish to answer", "I decline to answer", "Prefer not to answer"])
+      if (v.toLowerCase() !== low) out.push(v);
+  } else if (/^yes\b/.test(low)) out.push("Yes");
+  else if (/^(no|i do not|i don'?t)\b/.test(low)) out.push("No");
+  return out;
 }
 
 // ── "Previously employed here?" — company matcher (verbatim M12/M13.3 port).
@@ -1225,8 +1303,30 @@ function bucketWouldAnswer(bucket, profile, widgetType) {
 //
 // Under-including is safe by construction: the batch is a cache, not a gate, so a field wrongly skipped
 // here simply makes its own per-field call exactly as it does today. Wrongly INCLUDING is what costs.
+/**
+ * The self-ID form's DISPLAY-LANGUAGE dropdown — page chrome, not an application answer.
+ *
+ * Deliberately narrow, because the dangerous direction is hijacking a REAL question: a tenant's
+ * language-PROFICIENCY section also labels a field "Language", and answering that from page chrome
+ * would be a wrong answer on the application. Three conditions together:
+ *   • the label is exactly "language" (not "languages", not "language proficiency")
+ *   • it is a dropdown
+ *   • the page carries the self-ID signature — the same tell isSelfIdPage uses
+ * The proficiency section lives on its own page and inside repeating containers (which the flat loop
+ * skips anyway), so it can never satisfy the third condition.
+ */
+function isSelfIdLanguageField(f, scanFields) {
+  if (!f || f.widgetType !== "dropdown") return false;
+  if (apMatch.normalizeLabel(String(f.label || "")) !== "language") return false;
+  const names = new Set((Array.isArray(scanFields) ? scanFields : []).map((x) => x && x.fieldName).filter(Boolean));
+  return names.has("disabilityStatus") || names.has("disabilityForm") || (names.has("dateSignedOn") && names.has("name"));
+}
+
 function deterministicTierFor(f, profile, bucketIndex, empCompany) {
   const mappedPath = FIELD_MAP[f.fieldName] || null;
+  // A signature date is knowable exactly, so it is never an AI question — and saying so here keeps it
+  // out of the batch planner as well as the per-field call.
+  if (isSignatureDateField(f)) return "signature-date";
   if (mappedPath) {
     // resolve()'s CONTRACT is { candidates } | { skip } — NOT a bare value. Reading it as a scalar is what
     // produced the live `s.toLowerCase is not a function`.
@@ -1426,7 +1526,13 @@ const aiPlaceholderText = (reason) => AI_NEEDS_ANSWER_MARK_FD + " — AI decline
 // is to GUESS and FLAG (2026-08-02). Asks for a bare ISO date, parses it with the SAME pure parser the
 // mapped date fields use (so an unparseable reply can never reach the form), fills the composite, and
 // is ALWAYS filled_review — a guessed date is never a silent fill.
-const aiFillDate = async (act, loc, f, profile, jobContext, budgets) => {
+// opts.segments — the segments this widget ACTUALLY renders (["year"] / ["month","year"] / ["month","day","year"],
+// from apMatch.dateOrderOf). fillDateCompositeCdp fills one segment per component PRESENT IN THE VALUE, so handing a
+// full YYYY-MM-DD to a YEAR-ONLY composite (Education's "From", firstYearAttended) makes it hunt for Month and Day
+// spinbuttons that do not exist — every one fails, allVerified goes false, and a date it could have filled correctly
+// comes back needs_review with the field still blank. Reducing the value to the rendered segments is what makes the
+// year-only and MM/YYYY shapes work. Omitted ⇒ fill everything the value carries (the previous behaviour).
+const aiFillDate = async (act, loc, f, profile, jobContext, budgets, opts) => {
   // A SIGNATURE date is knowable exactly — it is the day the form is being completed. Fill it
   // deterministically and spend no LLM call: the self-ID attestation date is TODAY, and guessing it
   // produced 8/10/2026 live on Asuep — a future date on a form the applicant attests to now.
@@ -1460,11 +1566,18 @@ const aiFillDate = async (act, loc, f, profile, jobContext, budgets) => {
         (raw ? " (replied " + JSON.stringify(raw.slice(0, 40)) + ")" : "") + " — answer it here",
       auditLoc: loc.wrapperSel };
   }
-  const r = await fillDateCompositeCdp(act, loc, parsed, budgets);
+  const segs = opts && Array.isArray(opts.segments) && opts.segments.length ? opts.segments : null;
+  const value = segs
+    ? segs.reduce((acc, s) => (parsed[s] !== undefined ? Object.assign(acc, { [s]: parsed[s] }) : acc), {})
+    : parsed;
+  const r = await fillDateCompositeCdp(act, loc, value, budgets);
   const ok = r && r.verified === true;
-  return { status: ok ? "filled_review" : "needs_review", after: (r && r.after != null) ? r.after : iso,
+  // What the operator must verify is what we WROTE — on a year-only widget that is "2024", not the
+  // full date the model replied with.
+  const shown = segs ? segs.map((s) => value[s]).filter((v) => v !== undefined).join("-") || iso : iso;
+  return { status: ok ? "filled_review" : "needs_review", after: (r && r.after != null) ? r.after : shown,
     verified: ok, flag: "ai-date-guess", matchTier: "ai_inference", confidence: "low",
-    detail: "AI guessed this REQUIRED date (" + iso + ") so the page can advance — verify it" + (ok ? "" : " (commit not verified)"),
+    detail: "AI guessed this REQUIRED date (" + shown + ") so the page can advance — verify it" + (ok ? "" : " (commit not verified)"),
     auditLoc: loc.wrapperSel };
 };
 
@@ -2158,11 +2271,21 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   const checkedNow = () => opts.filter((o) => o.checked);
   const before = (checkedNow()[0] || {}).labelText || null;
 
-  let target = null;
-  for (const cand of candidates || []) {
-    const found = opts.find((o) => o.labelText.toLowerCase() === String(cand).toLowerCase());
-    if (found) { target = found; break; }
-  }
+  // THE SAME MATCH LADDER radio and dropdown use — not a raw lowercase equality, which is what this was
+  // and which cost a live halt (cat.wd5 page 6, 2026-08-10). The profile says "No, I do not have a
+  // disability"; Workday's box reads "No, I do not have a disability and have not had one in the past".
+  // A byte compare misses, so a REQUIRED self-ID field ended blank and Save was refused on a page whose
+  // answer we were holding.
+  //
+  // `containment: false` keeps the rule this codebase actually has: no substring guessing on a shown
+  // list. What lands it is POLARITY LEAD — a bare "No" commits ONLY when exactly one option leads with
+  // "No", which is true of every OFCCP form (Yes… / No… / decline) and false for any tenant that splits
+  // a polarity into two meanings, where it correctly escalates instead. Normalization and typo tolerance
+  // come along for free, and self-ID is exactly where a silently-wrong answer matters most.
+  const m = apMatch.matchCandidates(candidates || [], optionLabels, { containment: false });
+  // `let`, not `const`: the quiescence gate below RE-RESOLVES this after waiting, because waiting is
+  // exactly the window in which a rebuild re-issues the checkbox ids.
+  let target = m && m.targetIndex >= 0 ? opts[m.targetIndex] : null;
   if (!target) return { status: "needs_review", detail: "no candidate matched the checkbox-group labels", after: before, options: optionLabels };
 
   const readBack = async () => (await act.readCheckboxGroup(loc)) || [];
@@ -4246,6 +4369,32 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // parse has usually already suggested a reasonable set. Off ⇒ keep the suggestions and record
         // them for review; on ⇒ add every profile skill the taxonomy will accept.
         Object.assign(record, await fillSkillsCdp(act, loc, list, budgets, { fillAll: !!(profile && profile.fill_all_skills) }));
+      } else if (selfIdSignatureNameValue(f, scan.fields, profile)) {
+        // The applicant's own name, from the profile — never an AI guess (see selfIdSignatureNameValue).
+        const full = selfIdSignatureNameValue(f, scan.fields, profile);
+        record.resolved = full;
+        Object.assign(record, await fillTextCdp(act, loc, full, budgets));
+        if (record.verified === true) {
+          record.matchTier = "profile-name";
+          record.detail = "the signature name is the applicant's own name, taken from the profile";
+        }
+      } else if (isSignatureDateField(f)) {
+        // ALWAYS today, REQUIRED OR NOT (operator, 2026-08-10). A signature date is knowable exactly —
+        // it is the day the form is being completed — so there is nothing to infer and no reason to
+        // spend an LLM call. Filling it while it is still OPTIONAL is the point: on the self-ID page it
+        // is Name that promotes this field to required, and by then Save has already been refused.
+        // Deterministic ⇒ `filled`, no review flag, exactly like a mapped profile value.
+        const segs = apMatch.dateOrderOf(f.dateSegments || []);
+        const ymd = todayYMD();
+        record.resolved = ymd;
+        const value = segs.length
+          ? segs.reduce((acc, s) => (ymd[s] !== undefined ? Object.assign(acc, { [s]: ymd[s] }) : acc), {})
+          : ymd;
+        Object.assign(record, await fillDateCompositeCdp(act, loc, value, budgets));
+        if (record.verified === true) {
+          record.matchTier = "today";
+          record.detail = "a signature/completion date is the day the form is filled in — entered today's date";
+        }
       } else if (!mappedPath) {
         record.status = "skipped";
         record.detail = "no mapping";
@@ -4263,7 +4412,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead" || f.widgetType === "checkbox_group") {
             arg = typeof rawValue === "boolean"
               ? boolLadderCandidates(profile, mappedPath, rawValue)
-              : appendFieldVariants(profile, mappedPath, arg);
+              // The self-ID disability wording differs between the profile and the tenant in its TAIL,
+              // so the stored phrasing goes first and the bare polarity token last (POLARITY LEAD then
+              // commits it only if exactly one option leads with it).
+              : appendFieldVariants(profile, mappedPath,
+                  mappedPath === SELF_ID_DISABILITY_PATH ? selfIdDisabilityCandidates(rawValue) : arg);
           }
           record.resolved = arg;
           if (f.widgetType === "text") Object.assign(record, await fillTextCdp(act, loc, arg, budgets));
@@ -4318,6 +4471,59 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     // review-flagged there). Unrecognized / unevaluable / polarity-unmappable / commit-failed → the
     // AI/blank fallback (a commit-fail sets `resolved`, so producedNothing stays false and the AI can
     // never override a made decision).
+    // ── SELF-ID PAGE LANGUAGE SELECTOR — page chrome, not an answer (operator 2026-08-10) ──────────
+    // Workday's self-identification form carries a "Language" dropdown that picks which language the
+    // DISCLOSURE FORM renders in. It says nothing about the applicant. But it is REQUIRED, and because
+    // it sits on the EEO page the AI pass classified it as a demographic and stamped it with the loud
+    // "AI-GUESSED DEMOGRAPHIC — VERIFY" badge — the single noisiest flag we have, on a field that is
+    // not even a question. Fill it deterministically and record it plainly: it belongs in the bundle
+    // (we did set it) but never in the review pile.
+    if (f.widgetType === "dropdown" && record.resolved == null && record.status !== "filled"
+        && record.status !== "filled_review" && isSelfIdLanguageField(f, scan.fields)) {
+      try {
+        const norm = apMatch.normalize;
+        const { before, state, expanded } = await openAndReadDropdown(act, loc, budgets);
+        const enabledTexts = (expanded && state) ? state.options.filter((o) => !o.disabled).map((o) => o.text) : [];
+        // Keep whatever the page already shows — that IS the language it is rendering in. Otherwise
+        // take English, and if the tenant does not offer it, leave the page's own default alone rather
+        // than picking a language at random.
+        const target = hasLiveValue(before)
+          ? enabledTexts.find((t) => norm(t) === norm(before)) || null
+          : enabledTexts.find((t) => norm(t) === "english") || null;
+        record.mappedPath = "(self-id-page-language)";
+        record.options = enabledTexts;
+        if (!target) {
+          const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+          record.status = "skipped";
+          record.after = cz.after != null ? cz.after : before;
+          record.detail = "the self-ID form's display-language selector — left as the page had it (not an application answer)";
+        } else if (hasLiveValue(before) && norm(before) === norm(target)) {
+          const cz = await closeAndVerifyBlank(act, loc, before, budgets);
+          record.status = "filled"; record.verified = true; record.matchTier = "label-exact";
+          record.resolved = [target];
+          record.after = cz.after != null ? cz.after : target;
+          record.detail = "the self-ID form's display language — already set; kept (not an application answer)";
+        } else {
+          await act.clickDropdownOptionByText(loc, target);
+          const cr = await awaitDropdownCommit(act, loc, (t) => t != null && norm(t) === norm(target), budgets,
+            (ms) => (act.delayRender ? act.delayRender(ms) : act.delay(ms)));
+          try { await closeDropdownConfirmed(act, loc, budgets); } catch (e) { /* best-effort */ }
+          record.resolved = [target];
+          record.after = cr.after;
+          record.verified = !!cr.ok;
+          record.matchTier = "label-exact";
+          // NO review flag either way: an unverified display-language pick is not worth a human's time,
+          // and flagging it is exactly the noise this branch exists to remove.
+          record.status = cr.ok ? "filled" : "skipped";
+          record.detail = cr.ok
+            ? "the self-ID form's display language (not an application answer)"
+            : "the self-ID form's display-language selector — commit not confirmed; harmless, not an application answer";
+        }
+      } catch (e) {
+        record.detail = "self-ID display-language selector: " + String((e && e.message) || e);
+      }
+    }
+
     if ((f.widgetType === "radio" || f.widgetType === "dropdown" || f.widgetType === "text"
          || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
         && record.status !== "filled" && record.status !== "filled_review") {
@@ -4486,7 +4692,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           aiRes = (f.widgetType === "dropdown")
             ? await aiFillField(act, loc, f, profile, jobContext, budgets, preInfer)
             : (f.widgetType === "date")
-              ? await aiFillDate(act, loc, f, profile, jobContext, budgets)
+              ? await aiFillDate(act, loc, f, profile, jobContext, budgets,
+                  (() => { const s = apMatch.dateOrderOf(f.dateSegments || []); return s.length ? { segments: s } : undefined; })())
               : await aiFillText(act, loc, f, profile, jobContext, budgets);
           // EEO retraction: an AI-INFERRED demographic still gets the loud demographic badge. Only a
           // committed inference (filled_review); canonicalize keeps ai-canonicalized (maps a STATED value).
@@ -4878,7 +5085,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // Matching on the LABEL across a scan boundary is what makes it visible.
   const normLbl = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
   const labelOfSeen = new Map(scan.fields.map((f) => [f.fieldName, f.label]));
+  // Required-ness AS FIRST SCANNED. The cascade case is a field that was OPTIONAL here and is REQUIRED
+  // later; comparing against this is what keeps the re-fill below to that case, rather than making it a
+  // blanket retry of every required field the page left empty.
+  const requiredOfSeen = new Map(scan.fields.map((f) => [f.fieldName, !!f.isRequired]));
   const cascadeRecon = [];
+  const promotedTried = new Set(); // optional→REQUIRED re-fills, attempted once each (termination)
   const cascadePass = async () => {
     if (targeted) return;
     for (let round = 0; round < budgets.maxCascadeRounds; round++) {
@@ -4903,9 +5115,51 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       for (const n of vanished) {
         if (_traceOn && !revealed.some((f) => normLbl(f.label) === normLbl(labelOfSeen.get(n)))) cascadeRecon.push(`vanished r${round}: ${n} "${String(labelOfSeen.get(n) || "").slice(0, 40)}" (no same-label replacement — a genuine cascade-REMOVE)`);
       }
-      if (!revealed.length) break; // nothing new (the common case) → done, zero extra work
+      // ── PROMOTED: already seen, still here, now REQUIRED, still EMPTY (cat.wd5 live 2026-08-10) ─────
+      // A cascade does not only ADD fields — it can make an existing OPTIONAL field REQUIRED, and this
+      // pass used to look exclusively for appearance (`!cascadeSeen.has(...)`), so that case fell through
+      // every net and surfaced as a halt.
+      //
+      // Live: page 6's Date and disability box were OPTIONAL when scanned, so the fill correctly declined
+      // to spend an LLM call on them (operator rule: an optional field fills deterministically or stays
+      // blank). Filling `name` then promoted BOTH to required. Their AI fallbacks — aiEligible for the
+      // date, the dedicated checkbox-group pass for the disability — are each gated on `f.isRequired`,
+      // read from the PRE-FILL scan, so neither could ever fire. Save was refused on a page whose answers
+      // we were holding, and `cascade 0s+0s` in the timing line is this pass finding nothing to do.
+      //
+      // Re-filling them with a FRESH scan is what makes those gates true, so the existing fallbacks work
+      // as designed instead of being bypassed. Required-and-empty is exactly the pre-Save halt condition,
+      // so this only ever runs on fields that would otherwise stop the walk.
+      const promoted = reFields.filter((f) =>
+        cascadeSeen.has(f.fieldName)                       // we already processed it (so: not a reveal)
+        && f.isRequired && requiredOfSeen.get(f.fieldName) === false  // …and it was OPTIONAL when scanned
+        && !promotedTried.has(f.fieldName)                 // once only — termination
+        && String(f.currentValue == null ? "" : f.currentValue).trim() === "");
+      for (const f of promoted) {
+        promotedTried.add(f.fieldName);
+        cascadeRecon.push(`⇧ PROMOTED r${round}: ${f.fieldName} "${String(f.label || "").slice(0, 50)}" is now REQUIRED and still empty — re-filling so its AI fallback can fire.`);
+      }
+      if (!revealed.length && !promoted.length) break; // nothing new (the common case) → done, zero extra work
       const revealedNames = new Set(revealed.map((f) => f.fieldName));
+      const promotedNames = new Set(promoted.map((f) => f.fieldName));
       revealed.forEach((f) => cascadeSeen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
+      if (promotedNames.size) {
+        try {
+          const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: promotedNames, aiAnswers: aiAnswerByLabel });
+          for (const r of (sub && sub.results) || []) {
+            // REPLACE the earlier (empty) record rather than adding a second row for the same field —
+            // review must show one answer per question, not the blank we first left.
+            const at = results.findIndex((x) => x && x.fieldName === r.fieldName);
+            r.detail = (r.detail ? r.detail + " | " : "") + "was OPTIONAL when the page was scanned and became REQUIRED after an earlier field committed — re-filled";
+            // CARRY THE PROVENANCE OVER. A field that was cascade-REVEALED and is now also being re-filled
+            // is still cascade-revealed, and that flag is what forces a re-review at the submit gate —
+            // replacing the record wholesale silently dropped it.
+            if (at >= 0 && results[at] && results[at].cascadeRevealed) r.cascadeRevealed = true;
+            if (at >= 0) results[at] = r; else results.push(r);
+          }
+        } catch (e) { /* a promoted re-fill threw → leave the original record; the pre-Save guard still names it */ }
+      }
+      if (!revealed.length) continue;
       try {
         // Share the page's answer cache: a revealed/REMOUNTED field is usually a question we have
         // already answered, and it must get the SAME answer rather than a fresh (possibly different) one.
@@ -5699,6 +5953,28 @@ async function fillEntryCdp(act, prefix, idx, item, fieldMap, sectionName, budge
           { onCapture: cap.onCapture, ai: { profile: aiCtx.profile, jobContext: aiCtx.jobContext, fieldName: rec.fieldName, label: rec.label, isRequired: true } }));
         const ro = cap.reviewOptions(); if (ro && ro.length) rec.options = ro;
       } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI required-empty typeahead error: " + String((e && e.message) || e); }
+    }
+    // Required-EMPTY DATE AI fill (section analog of the flat loop's aiFillDate, and the third member of the
+    // dropdown/typeahead family above). A REQUIRED date inside a repeating entry that the profile cannot answer is
+    // SKIPPED above and left BLANK — which BLOCKS Save & Continue, so the walk halts nav-timeout and the operator
+    // gets no review page at all. That is the wrong end state: the rule is that a required field always gets a
+    // value and the HUMAN corrects it at review, exactly as the sibling widgets already do.
+    //
+    // Live (nvidia.wd5 JR2022295, 2026-08-10): profile education[0].from_year was "", Education's "From" is
+    // required, and page 2 died on a nav-timeout naming education[0].firstYearAttended. Dropdown and typeahead
+    // had been covered since Phase 2b; date was simply never added.
+    //
+    // Passes the widget's OWN segments so a year-only "From" gets "2024", not a full YYYY-MM-DD (see aiFillDate).
+    // AI OFF ⇒ stays skipped, unchanged — this never invents a value silently: every commit is filled_review
+    // with the ai-date-guess flag, so it lands in the human's queue.
+    if (aiCtx && act.aiEnabled && rec.isRequired && rec.status === "skipped" && (f.widget === "year" || f.widget === "date")) {
+      try {
+        const f2 = { fieldName: rec.fieldName, label: rec.label, isRequired: true, widgetType: "date" };
+        const segments = apMatch.dateOrderOf((fd && fd.dateSegments) || []);
+        const aiRes = await aiFillDate(act, { wrapperSel: rec.auditLoc }, f2, aiCtx.profile, aiCtx.jobContext, budgets,
+          segments.length ? { segments } : undefined);
+        if (aiRes) Object.assign(rec, aiRes);
+      } catch (e) { rec.status = "needs_review"; rec.flag = "ai-error"; rec.detail = "AI required-empty date error: " + String((e && e.message) || e); }
     }
     rec.elapsedMs = Date.now() - _fieldT0; // [CDP-TIME]
     recs.push(rec);
@@ -7994,5 +8270,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, deterministicTierFor, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, isSelfIdLanguageField, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiFillDate, aiCanonicalizeField, isSignatureDateField, selfIdDisabilityCandidates, selfIdSignatureNameValue, SELF_ID_DISABILITY_PATH, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

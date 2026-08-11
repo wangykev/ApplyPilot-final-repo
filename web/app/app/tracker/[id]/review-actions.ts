@@ -35,11 +35,24 @@ export async function saveReviewBundle(id: string, bundle: ReviewBundle): Promis
     const needs = live.filter((e) => e.needs_review && !e.is_approved).length;
     const toStore: ReviewBundle = { ...bundle, approval };
 
-    const { error } = await supabase
-      .from("applications")
-      .update({ review_bundle_json: toStore, needs_review_count: needs })
-      .eq("id", id)
-      .eq("user_id", user.id);
+    // The tracker LIST cannot see per-field approval (it never loads the bundle — a large jsonb), so the
+    // roll-up is mirrored onto its own column. Computed from the SAME server-side envelope, never from
+    // anything the client asserted.
+    //
+    // ⚠ It is CLEARED as readily as it is set. A value edit resets that field's approval, so a bundle
+    // that stops being submit_ready must stop reading "Approved" — a stale badge on a row that now has an
+    // unreviewed answer is exactly the wrong thing to show on the screen you decide from.
+    const approvedAt = approval.submit_ready ? new Date().toISOString() : null;
+
+    const save = (cols: Record<string, unknown>) =>
+      supabase.from("applications").update(cols).eq("id", id).eq("user_id", user.id);
+
+    let { error } = await save({ review_bundle_json: toStore, needs_review_count: needs, approved_at: approvedAt });
+    // Losing the operator's EDITS because an optional column is missing would be the worst trade here —
+    // those edits are hand-made and unrecoverable. Save the bundle without the badge.
+    if (error && /approved_at/.test(error.message || "")) {
+      ({ error } = await save({ review_bundle_json: toStore, needs_review_count: needs }));
+    }
     if (error) return { ok: false, error: error.message };
     revalidatePath(`/app/tracker/${id}`);
     revalidatePath("/app/tracker");

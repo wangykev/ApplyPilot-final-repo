@@ -22,7 +22,6 @@ export type ReportBody = Record<string, unknown>;
 
 export const APP_STATUSES = [
   "queued",
-  "filling",
   "needs_review",
   "submitted",
   "interviewing",
@@ -71,6 +70,10 @@ export function reportColumns(body: ReportBody, userId: string): Record<string, 
     status,
     needs_review_count: typeof body.needs_review_count === "number" ? body.needs_review_count : 0,
     review_bundle_json: body.review_bundle ?? null,
+    // A REPORT REPLACES THE BUNDLE, so any earlier approval is void — those approvals were given for
+    // answers that no longer exist. Leaving it set would show "Approved" over a freshly-filled,
+    // never-reviewed application, which is the one place a wrong badge could cost a real submission.
+    approved_at: null,
     ...loginFields(body.login),
   };
 

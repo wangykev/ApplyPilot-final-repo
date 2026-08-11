@@ -14,6 +14,35 @@ import { z } from "zod";
  * the AI pass, match-ladder-gated (never a blind commit).
  */
 
+/**
+ * A wording as STORED: the tenant's own text minus the trailing required marker.
+ *
+ * "Language*" and "Language" are the same question — Workday's asterisk means "required", not part of
+ * what is being asked. Matching already ignored it (normalizeQuestion strips it), so this changes only
+ * what the user reads and edits: an asterisk in a saved wording was pure noise, and two tenants writing
+ * the same question with and without one produced two entries for one question.
+ *
+ * Deliberately trailing-only — an asterisk elsewhere is real text, not a marker.
+ */
+export function cleanWording(label: string): string {
+  return String(label || "").replace(/[\s*]+$/u, "").trim();
+}
+
+/** Clean a wording list and drop the duplicates cleaning creates, keeping the first spelling. */
+export function cleanWordings(list: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of list) {
+    const w = cleanWording(raw);
+    if (!w) continue;
+    const key = w.toLowerCase().replace(/\s+/g, " ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(w);
+  }
+  return out;
+}
+
 export const bucketSchema = z.object({
   id: z.string(),
   /** Mode A: dotted profile path (e.g. "work_authorization.authorized_to_work_in_us"). "" ⇒ Mode B. */
@@ -27,8 +56,12 @@ export const bucketSchema = z.object({
   category: z.string().default(""),
   /** text | dropdown | radio | typeahead | checkbox (essays/files are never bucketed). */
   widget_hint: z.string().default(""),
-  /** The question wordings (raw, human-readable) that resolve to this answer. */
-  questions: z.array(z.string()).default([]),
+  /**
+   * The question wordings (human-readable) that resolve to this answer, stored WITHOUT the required
+   * marker — see cleanWordings. Normalized in the schema so it applies on every load and every save:
+   * existing buckets clean themselves the next time they are read, and nothing new can reintroduce it.
+   */
+  questions: z.array(z.string()).default([]).transform(cleanWordings),
   /** Optional per-platform stable-selector accelerators (workday automation-ids, etc.). */
   selectors: z.record(z.array(z.string())).default({}),
 });
@@ -93,6 +126,47 @@ export const STARTER_BUCKETS: Bucket[] = [
       "Are you legally authorized to work in the United States?",
       "Are you authorized to work in the US?",
       "Do you have the legal right to work in the United States?",
+    ],
+    selectors: {},
+  },
+  // SPONSORSHIP — the other half of the work-authorization pair, and one of the most common screening
+  // questions there is. It had no binding, so the question resolved to no profile path, got no
+  // candidates, and never reached the polarity-lead rule that exists to answer exactly this shape
+  // ("No" → "No, I do not require sponsorship."). It fell to the AI instead and came back flagged
+  // sensitive — a legally-loaded question the profile answers outright.
+  //
+  // Split deliberately by TENSE, because the answers can differ and the difference is legally
+  // material (an F-1 on OPT needs nothing now and sponsorship later):
+  //   • "now or in the future" is TRUE if either is true → bound to requires_sponsorship_FUTURE, the
+  //     broader claim. Binding it to `now` would answer "No" for that student — a false statement.
+  //   • present-tense-only wordings bind to requires_sponsorship_now.
+  {
+    id: "sponsorship_future",
+    profile_path: "work_authorization.requires_sponsorship_future",
+    value: [],
+    category: "",
+    widget_hint: "dropdown",
+    questions: [
+      "Do you now or in the future require visa sponsorship for employment status in the United States?",
+      "Will you now or in the future require sponsorship for employment visa status?",
+      "Will you now or in the future require sponsorship for employment visa status (e.g., H-1B visa status)?",
+      "Do you now or will you in the future require sponsorship for employment visa status?",
+      "Will you require sponsorship for employment visa status now or in the future?",
+      "Will you now, or in the future, require immigration sponsorship for work authorization?",
+    ],
+    selectors: {},
+  },
+  {
+    id: "sponsorship_now",
+    profile_path: "work_authorization.requires_sponsorship_now",
+    value: [],
+    category: "",
+    widget_hint: "dropdown",
+    questions: [
+      "Do you currently require sponsorship for employment visa status?",
+      "Do you require sponsorship to work in the United States?",
+      "Do you require visa sponsorship?",
+      "Are you currently in need of sponsorship for an employment visa?",
     ],
     selectors: {},
   },

@@ -55,6 +55,9 @@ create table if not exists public.llm_calls (
 
 alter table public.llm_calls enable row level security;
 
+-- drop+create (not a bare create): every other policy in this schema is written this way so the
+-- whole set can be re-run on a live database without erroring on "policy already exists".
+drop policy if exists "llm_calls owner" on public.llm_calls;
 create policy "llm_calls owner" on public.llm_calls
   for all using (auth.uid() = user_id) with check (auth.uid() = user_id);
 

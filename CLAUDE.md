@@ -76,9 +76,12 @@ See `docs/dom-patterns.md` for the full, dated rulebook. Short version:
 - `classifyField` derives the widget type from wrapper descendants, **first match wins**: hierarchical
   `source` → typeahead (`data-uxi-widget-type="multiselect"`) → radio (`input[type=radio]`) → dropdown
   (`button[aria-haspopup="listbox"]`) → checkbox (ONE) → **checkbox_group** (2+ checkboxes in one wrapper = a
-  pick-one set, e.g. the OFCCP disability self-ID; radio-like fill — label-EXACT, unchecks the current option
+  pick-one set, e.g. the OFCCP disability self-ID; radio-like fill — unchecks the current option
   first, verifies exactly one ends checked; options read from the DOM by the scan, so a field left BLANK
-  still reaches review as a picker) → **date** (a `dateSection*-input` composite — its spinbuttons carry no
+  still reaches review as a picker. ⚠ It matched on a RAW lowercase byte compare until 2026-08-10, which is
+  why the profile's `"No, I do not have a disability"` missed cat.wd5's `"No, I do not have a disability and
+  have not had one in the past"` and blocked Save; it now goes through **`matchCandidates` with
+  `containment:false`** like radio/dropdown, so POLARITY LEAD lands it) → **date** (a `dateSection*-input` composite — its spinbuttons carry no
   `type`, so 3 of them used to read as "not one text input" → `unknown` → a bare textbox in review; the scan
   carries `dateSegments` → `date_order`, so review renders the form's own MM/DD/YYYY vs MM/YYYY vs YYYY) →
   text → unknown.
@@ -243,6 +246,31 @@ safety contract, which is absolute:
   red "⚠ LEGALLY-LOADED — VERIFY" badge — a high-confidence reasoning-from-absence answer (e.g.
   criminal→"No") must NOT be the easiest to scroll past.
 - **Every AI commit path must call `closeDropdownConfirmed`** (see "Workday never rewrites…" below).
+
+## Workday's voluntary self-ID page — ALWAYS answerable (operator, 2026-08-10)
+
+One structure wherever it appears (disability pick + signature Name + Date, sometimes a form-language
+picker / employee id). Only the option **wording** varies, and only in its tail. So both answers are filled
+**UNCONDITIONALLY, required or not**:
+
+- **A signature date is TODAY** — deterministic, `filled`, no review flag, no LLM call. `dateSignedOn`, or
+  any date whose label `isSignatureDateQuestion` recognizes. That recognizer stays NARROW: "Date of Birth" /
+  "Graduation Date" / "Desired Start Date" are real questions and must never be stamped with today.
+- **Disability comes from `self_identification.disability_status`**, expanded by
+  `selfIdDisabilityCandidates` into the stored wording FIRST and the bare polarity token LAST — POLARITY
+  LEAD then commits it only when exactly one option leads with that polarity.
+
+**WHY unconditional is the point, not laziness:** these render OPTIONAL until `name` is filled, and filling
+`name` PROMOTES them to required. Answering them up front leaves the cascade nothing to promote, so the
+halt cannot happen rather than needing recovery (see the cascade-PROMOTE rule under review/submit).
+
+**DETERMINISTIC AND THE AI NET ARE LAYERED, NOT REDUNDANT** — measured 2026-08-10 by switching the
+deterministic fills OFF on a live cat.wd5 run. The AI net *does* rescue the page (it reached REVIEW, and
+picked the right disability box), but it is strictly worse as the primary: it flags the demographic
+`ai-eeo-guess` so the operator re-verifies an answer already in the profile (5 flagged vs 4), it can answer
+DIFFERENTLY run to run (`name` came back "Kevin Wang" via AI vs "Kevin" deterministically — same field, two
+answers on a real application), and the page cost ~3s → 33.2s. **Map what you know; let the net catch what
+you don't.**
 
 ## Employer match — "previously employed here?" (safety-critical)
 
@@ -412,6 +440,14 @@ The full schema, accumulation, the viewer/editor, replay re-verify and the revie
 - **Cascade-revealed REQUIRED fields go BACK TO REVIEW, not a blind halt** — `newlyRequiredGaps` creates an
   EMPTY, unapproved, `needs_review` entry and the walk halts `replay-needs-approval`. **It NEVER invents an
   answer.**
+- **A CASCADE CAN PROMOTE, NOT ONLY REVEAL (2026-08-10).** Filling one field can make an ALREADY-PRESENT
+  optional field REQUIRED. Every AI fallback is gated on `f.isRequired` read from the PRE-FILL scan, so a
+  promoted field's fallback can never fire — live on cat.wd5, filling `name` promoted the self-ID Date and
+  disability box and the walk halted with `cascade 0s+0s`, because `cascadePass` only looked for fields that
+  APPEARED. It now ALSO re-fills an already-seen field that was OPTIONAL when scanned, is REQUIRED now, and
+  is still EMPTY. **Keyed on required-ness AS FIRST SCANNED** — re-filling every required-and-empty field is
+  a second fill pass on every page, not a cascade fix (it broke 20 tests). Carry `cascadeRevealed` over when
+  replacing a record: it is what forces the re-review at the submit gate.
 - **An approved field ABSENT from the live page is REPORTED but NEVER FATAL** — that was wrong twice live.
   ⚠ WHY the scan misses such fields is UNSETTLED; `cdpPageScan.fields` is a convenience list, **not an
   inventory**. The authority is Workday's own review page.

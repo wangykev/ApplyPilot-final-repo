@@ -19,7 +19,9 @@ async function loadResume(): Promise<{ filename: string; size: number } | null> 
       .select("filename, size")
       .eq("user_id", user.id)
       .eq("kind", "default")
+      .is("deleted_at", null)
       .order("created_at", { ascending: false })
+      .limit(1) // versioned résumés: maybeSingle() ERRORS on multiple rows
       .maybeSingle();
     return data ? { filename: data.filename, size: data.size } : null;
   } catch {

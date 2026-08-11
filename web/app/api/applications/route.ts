@@ -21,12 +21,17 @@ export async function GET() {
       data: { user },
     } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ ok: false, reason: "not-signed-in" }, { status: 401 });
-    const { data, error } = await supabase
-      .from("applications")
-      .select("id, company, role, url, status, needs_review_count, applied_at, created_at")
-      .eq("user_id", user.id)
-      .is("deleted_at", null) // hide soft-deleted apps from the tracker (bundles still feed teach)
-      .order("created_at", { ascending: false });
+    // hide soft-deleted apps from the tracker (bundles still feed teach)
+    // Mirrors the tracker page: QUEUED rows are not tracker rows (they have never been filled), and the
+    // poller must agree with the server render or a queued row would flash back in on the next tick.
+    const query = (cols: string) =>
+      supabase.from("applications").select(cols).eq("user_id", user.id).is("deleted_at", null)
+        .neq("status", "queued")
+        .order("created_at", { ascending: false });
+    const BASE = "id, company, role, url, status, needs_review_count, applied_at, created_at";
+    // Same optional fetch as the server page: a database without 0018 must still poll its list.
+    let { data, error } = await query(BASE + ", approved_at");
+    if (error) ({ data, error } = await query(BASE));
     if (error) return NextResponse.json({ ok: false, reason: error.message }, { status: 500 });
     return NextResponse.json({ ok: true, applications: data ?? [] });
   } catch (e) {

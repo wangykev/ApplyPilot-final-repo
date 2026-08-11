@@ -9885,3 +9885,313 @@ test("pickLastResortOption: prefers a DECLINE option, then Other, then the first
   assert.strictEqual(pickLastResortOption([]), null);
   assert.strictEqual(pickLastResortOption(null), null);
 });
+
+// ── a REQUIRED date the profile cannot answer must still get filled (nvidia.wd5 live 2026-08-10) ──────
+// The rule is that a required field ALWAYS gets a value and the human fixes it at review — a blank one
+// blocks Save & Continue, so the walk halts and the operator gets NO review page at all. Live: profile
+// education[0].from_year was "", Education's "From" is required, and page 2 died on a nav-timeout naming
+// education[0].firstYearAttended. The dropdown and typeahead analogs inside repeating entries have been
+// covered since Phase 2b; the DATE widget was simply never added.
+//
+// The segment reduction is the load-bearing half. "From" is a YEAR-ONLY composite, and
+// fillDateCompositeCdp fills one segment per component PRESENT IN THE VALUE — so handing it a full
+// YYYY-MM-DD makes it hunt for Month and Day spinbuttons that do not exist on that widget, every one
+// fails, and the field it could have filled correctly comes back needs_review still blank.
+const { aiFillDate: _aiFillDate } = require("../fill-driver.js");
+
+function makeDateAct(segsPresent, aiReply) {
+  const store = {};      // "Month" | "Day" | "Year" -> typed value
+  const attempted = [];  // every segment the composite TRIED to focus
+  let focused = null;
+  return {
+    store, attempted,
+    aiEnabled: true,
+    llm: async () => (aiReply === undefined ? { ok: false } : { ok: true, text: aiReply }),
+    delay: async () => {}, delayFull: async () => {},
+    // A segment the widget does NOT render cannot be focused — which is exactly what the live
+    // year-only "From" does to a Month/Day write.
+    focusDateSegment: async (loc, seg) => {
+      attempted.push(seg);
+      if (!segsPresent.includes(seg)) { focused = null; return null; }
+      focused = seg; return "triple-click-display";
+    },
+    readDateSegment: async (loc, seg) => ({ value: store[seg] || "", focused: focused === seg }),
+    typeDigits: async (t) => { if (focused) store[focused] = String(t); },
+    typeText: async (t) => { if (focused) store[focused] = String(t); },
+  };
+}
+
+test("aiFillDate: a YEAR-ONLY widget gets ONLY the year — never a Month/Day it does not render", async () => {
+  const act = makeDateAct(["Year"], "2024-09-01");
+  const r = await _aiFillDate(act, { wrapperSel: "[w-from]" }, { label: "From", isRequired: true },
+    {}, {}, T_BUDGETS, { segments: ["year"] });
+
+  assert.strictEqual(act.store.Year, "2024", "the year is what lands on a year-only composite");
+  assert.deepStrictEqual(act.attempted, ["Year"], "Month/Day are never even attempted — they do not exist here");
+  assert.strictEqual(r.status, "filled_review", "a guessed date is committed so the page can advance…");
+  assert.strictEqual(r.flag, "ai-date-guess", "…and ALWAYS flagged — it is a guess, never silent");
+  assert.strictEqual(r.verified, true);
+  assert.ok(/2024/.test(String(r.detail)), "the operator is shown what we actually wrote: " + r.detail);
+  assert.ok(!/09|-01/.test(String(r.after)), "after reports the YEAR we wrote, not the model's full date");
+});
+
+test("aiFillDate: an M/D/Y widget still gets all three segments", async () => {
+  const act = makeDateAct(["Month", "Day", "Year"], "2024-09-01");
+  const r = await _aiFillDate(act, { wrapperSel: "[w-start]" }, { label: "Desired start date", isRequired: true },
+    {}, {}, T_BUDGETS, { segments: ["month", "day", "year"] });
+  assert.strictEqual(r.status, "filled_review");
+  assert.strictEqual(parseInt(act.store.Month, 10), 9);
+  assert.strictEqual(parseInt(act.store.Day, 10), 1);
+  assert.strictEqual(parseInt(act.store.Year, 10), 2024);
+});
+
+test("aiFillDate: NO segments passed keeps the old whole-value behaviour", async () => {
+  const act = makeDateAct(["Month", "Day", "Year"], "2024-09-01");
+  const r = await _aiFillDate(act, { wrapperSel: "[w-x]" }, { label: "Some date", isRequired: true },
+    {}, {}, T_BUDGETS);
+  assert.strictEqual(r.status, "filled_review");
+  assert.strictEqual(parseInt(act.store.Year, 10), 2024, "unchanged for every existing call site");
+});
+
+test("aiFillDate: no usable model reply → needs_review, never a fabricated date", async () => {
+  const act = makeDateAct(["Year"], "I don't know");
+  const r = await _aiFillDate(act, { wrapperSel: "[w-from]" }, { label: "From", isRequired: true },
+    {}, {}, T_BUDGETS, { segments: ["year"] });
+  assert.strictEqual(r.status, "needs_review");
+  assert.strictEqual(r.flag, "ai-date-no-basis");
+  assert.strictEqual(act.store.Year, undefined, "nothing was written");
+});
+
+// â”€â”€ WORKDAY SELF-ID: the answers are known, so the page must never block on them (cat.wd5 2026-08-10) â”€â”€
+// Page 6 halted with "The field Date is required" + "The field Please check one of the boxes below: is
+// required" on a page whose answers we were holding: the profile has disability_status, and a signature
+// date is simply today. Both fields render OPTIONAL until `name` is filled, and filling name promotes
+// them — so answering them up front removes the cascade rather than recovering from it.
+const { isSignatureDateField: _isSigDate, selfIdDisabilityCandidates: _disCands,
+        SELF_ID_DISABILITY_PATH: _DIS_PATH, FIELD_MAP: _FM, deterministicTierFor: _tierFor } = require("../fill-driver.js");
+
+test("self-ID: the disability field is MAPPED — 'no mapping' is what left it blank", () => {
+  assert.equal(_FM.disabilityStatus, _DIS_PATH, "cat.wd5's disabilityStatus must reach the profile value");
+});
+
+test("self-ID disability: the profile wording comes first, the bare polarity token last", () => {
+  const c = _disCands("No, I do not have a disability");
+  assert.equal(c[0], "No, I do not have a disability", "an exact hit needs no inference");
+  assert.equal(c[c.length - 1], "No", "…and the bare polarity token is the fallback POLARITY LEAD commits");
+  // This is the live gap: Workday's option is LONGER than the profile's phrasing, so exact match misses
+  // and containment is refused. Only the polarity token can land it.
+  assert.ok(!c.includes("No, I do not have a disability and have not had one in the past"));
+});
+
+test("self-ID disability: yes and decline map to their own ladders", () => {
+  assert.deepEqual(_disCands("Yes, I have a disability"), ["Yes, I have a disability", "Yes"]);
+  const d = _disCands("I do not want to answer");
+  assert.ok(d.some((x) => /decline|do not want|don't wish|prefer not/i.test(x)), "decline offers the common wordings");
+  assert.ok(!d.includes("No"), "declining is NOT a 'no' — it must never be answered as one");
+  assert.deepEqual(_disCands(""), [], "no stored answer means nothing to offer, never a guess");
+});
+
+test("signature date: recognised by field name AND by label, and only for date widgets", () => {
+  assert.ok(_isSigDate({ fieldName: "dateSignedOn", widgetType: "date", label: "Date" }));
+  assert.ok(_isSigDate({ fieldName: "whatever", widgetType: "date", label: "Today's Date" }));
+  // a date with its own meaning is NOT a signature date — stamping today there is a WRONG answer
+  assert.ok(!_isSigDate({ fieldName: "x", widgetType: "date", label: "Date of Birth" }));
+  assert.ok(!_isSigDate({ fieldName: "x", widgetType: "date", label: "Graduation Date" }));
+  // and it must be a date widget at all
+  assert.ok(!_isSigDate({ fieldName: "dateSignedOn", widgetType: "text", label: "Date" }));
+});
+
+test("signature date is DETERMINISTIC — never routed to the AI, required or not", () => {
+  const optional = { fieldName: "dateSignedOn", widgetType: "date", label: "Date", isRequired: false };
+  assert.equal(_tierFor(optional, {}, new Map(), null), "signature-date",
+    "OPTIONAL matters: this is the state the field is in BEFORE `name` promotes it");
+  assert.equal(_tierFor(Object.assign({}, optional, { isRequired: true }), {}, new Map(), null), "signature-date");
+});
+
+
+// ── the self-ID checkbox group must use the SAME ladder as radio/dropdown (cat.wd5 live 2026-08-10) ──
+// It used a raw lowercase byte compare, so the profile's "No, I do not have a disability" missed
+// Workday's "No, I do not have a disability and have not had one in the past", the REQUIRED field ended
+// blank, and Save was refused on a page whose answer we were holding. These are the REAL option labels
+// read off that page.
+const { fillCheckboxGroupCdp: _fillCbg, selfIdDisabilityCandidates: _cands } = require("../fill-driver.js");
+const CAT_DISABILITY_OPTIONS = [
+  "Yes, I have a disability, or have had one in the past",
+  "No, I do not have a disability and have not had one in the past",
+  "I do not want to answer",
+];
+
+function cbgAct(labels) {
+  const boxes = labels.map((labelText, i) => ({ id: "b" + i, labelText, checked: false }));
+  return {
+    clicks: [], boxes,
+    readCheckboxGroup: async () => boxes.map((b) => ({ ...b })),
+    clickRadioLabel: async (loc, id) => {
+      const b = boxes.find((x) => x.id === id);
+      if (b) b.checked = !b.checked;
+    },
+    readChecked: async (id) => !!(boxes.find((x) => x.id === id) || {}).checked,
+    installQuietWatch: async () => {},
+    awaitQuiet: async () => ({ quiet: true }),
+    delay: async () => {},
+  };
+}
+
+test("self-ID checkbox group: the profile's shorter wording lands via POLARITY LEAD", async () => {
+  const act = cbgAct(CAT_DISABILITY_OPTIONS);
+  const cands = _cands("No, I do not have a disability");
+  const r = await _fillCbg(act, { wrapperSel: "[w]" }, cands, T_BUDGETS);
+  assert.notEqual(r.status, "needs_review", "this is the live failure: " + r.detail);
+  const checked = act.boxes.filter((b) => b.checked).map((b) => b.labelText);
+  assert.deepEqual(checked, ["No, I do not have a disability and have not had one in the past"],
+    "exactly one box, and it is the NO one");
+});
+
+test("self-ID checkbox group: a decline answer never lands on 'No'", async () => {
+  const act = cbgAct(CAT_DISABILITY_OPTIONS);
+  const r = await _fillCbg(act, { wrapperSel: "[w]" }, _cands("I do not want to answer"), T_BUDGETS);
+  assert.notEqual(r.status, "needs_review", r.detail);
+  assert.deepEqual(act.boxes.filter((b) => b.checked).map((b) => b.labelText), ["I do not want to answer"]);
+});
+
+test("self-ID checkbox group: an AMBIGUOUS polarity escalates instead of guessing", async () => {
+  // A tenant splitting one polarity into two meanings is the shape POLARITY LEAD must refuse.
+  const act = cbgAct([
+    "No, I do not have a disability and have not had one in the past",
+    "No, but I have had one in the past",
+    "Yes, I have a disability",
+  ]);
+  const r = await _fillCbg(act, { wrapperSel: "[w]" }, ["No"], T_BUDGETS);
+  assert.equal(r.status, "needs_review", "two options lead with No — picking one would be a guess");
+  assert.deepEqual(act.boxes.filter((b) => b.checked), [], "and NOTHING is actuated");
+});
+
+test("self-ID checkbox group: containment is still refused", async () => {
+  const act = cbgAct(["Armed Forces Pacific", "Pennsylvania"]);
+  const r = await _fillCbg(act, { wrapperSel: "[w]" }, ["PA"], T_BUDGETS);
+  assert.equal(r.status, "needs_review", "'pa' inside 'Pacific' must never commit");
+  assert.deepEqual(act.boxes.filter((b) => b.checked), []);
+});
+
+
+// ── a cascade can PROMOTE an existing field to required, not only reveal a new one (cat.wd5 2026-08-10) ──
+// The live sequence: page 6's Date and disability box were OPTIONAL when scanned, so the fill correctly
+// declined to spend an LLM call on them (an optional field fills deterministically or stays blank).
+// Filling `name` promoted BOTH to required. Their AI fallbacks — aiEligible for the date, the dedicated
+// checkbox-group pass for the disability — are each gated on `f.isRequired` read from the PRE-FILL scan,
+// so NEITHER could fire, and Save was refused on a page whose answers we were holding.
+//
+// cascadePass looked only for fields that APPEARED (`!cascadeSeen.has(...)`), so it found nothing to do —
+// the page's timing line read `cascade 0s+0s`. It now also catches already-seen fields that are REQUIRED
+// and still EMPTY, and re-fills them against a FRESH scan, which is what makes those gates true.
+test("cascade: a field PROMOTED from optional to required is re-filled", async () => {
+  // The live shape: `alpha` fills, and THAT is what makes `beta` mandatory. beta was optional when the
+  // page was scanned, so the fill correctly spent nothing on it — and its AI fallback, gated on
+  // isRequired from that same scan, could never fire.
+  let alphaFilled = false;
+  const scanNow = () => ({ url: "u", fields: [
+    { fieldName: "alpha", label: "Alpha", widgetType: "text", isRequired: true,
+      currentValue: alphaFilled ? "done" : "", wrapperSel: "[w-a]" },
+    { fieldName: "beta", label: "Beta", widgetType: "text", isRequired: alphaFilled,
+      currentValue: "", wrapperSel: "[w-b]" },
+  ] });
+  const act = {
+    aiEnabled: false,
+    scanPage: async () => scanNow(),
+    repeatingScan: async () => ({ sections: {} }),
+    readText: async () => (alphaFilled ? "done" : ""),
+    focusField: async () => true,
+    clearText: async () => {},
+    insertText: async () => { alphaFilled = true; },
+    typeChars: async () => { alphaFilled = true; },
+    blurActive: async () => { alphaFilled = true; },
+    delay: async () => {}, delayFull: async () => {},
+    llm: async () => ({ ok: false }),
+  };
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const recon = (out && out.cascadeRecon) || [];
+  assert.ok(recon.some((l) => /PROMOTED/.test(l) && /beta/.test(l)),
+    "beta went optional -> REQUIRED and is still empty; recon was " + JSON.stringify(recon));
+  // ONCE only — promotedTried guarantees termination, so a field that still cannot be filled does not
+  // spin the cascade loop.
+  assert.equal(recon.filter((l) => /PROMOTED/.test(l) && /beta/.test(l)).length, 1, "re-tried exactly once");
+});
+
+test("cascade: a field REQUIRED FROM THE START is NOT re-filled (this is not a blanket retry)", async () => {
+  // Guard against what the first draft of this did: re-filling every required-and-empty field turned a
+  // targeted cascade fix into a second fill pass on every page, and broke 20 tests.
+  const fields = [
+    { fieldName: "gamma", label: "Gamma", widgetType: "text", isRequired: true, currentValue: "", wrapperSel: "[w-g]" },
+  ];
+  const act = {
+    aiEnabled: false,
+    scanPage: async () => ({ url: "u", fields }),
+    repeatingScan: async () => ({ sections: {} }),
+    readText: async () => "",
+    focusField: async () => true,
+    clearText: async () => {}, insertText: async () => {}, typeChars: async () => {},
+    blurActive: async () => {}, delay: async () => {}, delayFull: async () => {},
+    llm: async () => ({ ok: false }),
+  };
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  assert.ok(!((out && out.cascadeRecon) || []).some((l) => /PROMOTED/.test(l)),
+    "required all along — nothing was promoted, so nothing to redo");
+});
+
+test("cascade: a field that HOLDS a value is never re-filled", async () => {
+  const fields = [
+    { fieldName: "beta", label: "Beta", widgetType: "text", isRequired: true, currentValue: "already here", wrapperSel: "[w-b]" },
+  ];
+  const act = {
+    aiEnabled: false,
+    scanPage: async () => ({ url: "u", fields }),
+    repeatingScan: async () => ({ sections: {} }),
+    readText: async () => "already here",
+    focusField: async () => true,
+    clearText: async () => {}, insertText: async () => {}, typeChars: async () => {},
+    blurActive: async () => {}, delay: async () => {}, delayFull: async () => {},
+    llm: async () => ({ ok: false }),
+  };
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const recon = (out && out.cascadeRecon) || [];
+  assert.ok(!recon.some((l) => /PROMOTED/.test(l)), "nothing to recover — must not re-actuate a filled field");
+});
+
+// ── the self-ID signature NAME is the applicant's own name, never an AI guess (operator 2026-08-10) ──
+// It was filling `ai-text`, medium confidence, FLAGGED — on a page beside a legal attestation, while the
+// profile held the answer. And the model words it differently run to run: live it produced "Kevin Wang"
+// where the deterministic bucket had written "Kevin", i.e. the same field answered two ways on real
+// applications.
+const { selfIdSignatureNameValue: _sigName } = require("../fill-driver.js");
+
+const SELF_ID_PAGE = [
+  { fieldName: "disabilityForm" }, { fieldName: "name" }, { fieldName: "employeeId" },
+  { fieldName: "dateSignedOn" }, { fieldName: "disabilityStatus" },
+];
+const PROFILE = { personal_info: { first_name: "Kevin", last_name: "Wang" } };
+const nameField = { fieldName: "name", widgetType: "text", label: "Name" };
+
+test("self-ID name: composed from the profile on the self-ID page", () => {
+  assert.equal(_sigName(nameField, SELF_ID_PAGE, PROFILE), "Kevin Wang");
+});
+
+test("self-ID name: a generic `name` field elsewhere is LEFT ALONE", () => {
+  // `name` is far too generic an id to claim globally — a company/reference name box must never be
+  // stamped with the applicant's name, so the page SHAPE is what authorises this.
+  const otherPage = [{ fieldName: "name" }, { fieldName: "companyName" }, { fieldName: "phoneNumber" }];
+  assert.equal(_sigName(nameField, otherPage, PROFILE), null);
+});
+
+test("self-ID name: no name in the profile ⇒ null, never a guess", () => {
+  assert.equal(_sigName(nameField, SELF_ID_PAGE, { personal_info: {} }), null);
+  assert.equal(_sigName(nameField, SELF_ID_PAGE, {}), null);
+});
+
+test("self-ID name: only a TEXT widget, and only the `name` field", () => {
+  assert.equal(_sigName({ ...nameField, widgetType: "dropdown" }, SELF_ID_PAGE, PROFILE), null);
+  assert.equal(_sigName({ ...nameField, fieldName: "legalName--firstName" }, SELF_ID_PAGE, PROFILE), null);
+});
+
+test("self-ID name: a first name alone still answers it", () => {
+  assert.equal(_sigName(nameField, SELF_ID_PAGE, { personal_info: { first_name: "Kevin" } }), "Kevin");
+});

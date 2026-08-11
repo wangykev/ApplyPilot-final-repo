@@ -300,6 +300,29 @@ export const profileSchema = z.object({
       }),
     )
     .default({}),
+  /**
+   * PARKED ladders, keyed by the same field path, each remembering the ANSWER it was written for.
+   *
+   * A ladder is hand-written work: the variants a tenant might phrase your answer as. It must never be
+   * destroyed by an import. When the answer at a path changes, that path's `values` ladder stops being
+   * about the current answer — so it is parked here rather than deleted, and restored verbatim if the
+   * answer comes back (operator 2026-08-10: "accidentally changes it to no, then changes it back to
+   * yes, that ladder should return").
+   *
+   * The per-polarity `yes`/`no` ladders are NOT parked on a flip: they are already answer-specific and
+   * both stay valid whichever way the field currently reads.
+   */
+  answer_ladders_archive: z
+    .record(
+      z.string(),
+      z.array(
+        z.object({
+          answer: z.string(),
+          values: z.array(z.string()).default([]),
+        }),
+      ),
+    )
+    .default({}),
 });
 
 export type Profile = z.infer<typeof profileSchema>;
@@ -435,6 +458,228 @@ export function mergeProfile(base: Profile, incoming: Profile): Profile {
   });
 
   return out;
+}
+
+/**
+ * The ONLY sections an AI resume parse produces (see lib/resume-prompt.ts). Everything
+ * outside this list — work_authorization, how_did_you_hear, self_identification,
+ * screening, employment_history_companies, additional_files, answer_ladders — is
+ * NEVER written by either apply mode, because a resume cannot state it.
+ *
+ * `employment_history_companies` is deliberately absent: it is the safety-critical
+ * list behind the "have you worked here before?" auto-"No" (a non-empty list is
+ * treated as COMPLETE), and a resume parse is not a trustworthy source for it.
+ */
+export const PARSED_ARRAY_SECTIONS = [
+  "websites",
+  "work_experience",
+  "education",
+  "projects",
+  "skills",
+  "skill_groups",
+  "languages",
+  "certifications",
+] as const;
+
+export type ParsedSection = (typeof PARSED_ARRAY_SECTIONS)[number] | "personal_info";
+
+/**
+ * Every `tech_stack` entry across work experience and projects, de-duped.
+ *
+ * The resume states these as per-role technology lines, but the extension only ever
+ * fills from the FLAT `skills` list — so a tool you listed under a job but not in your
+ * skills section would never reach a Workday skills picker. Order preserved, first
+ * spelling wins.
+ */
+export function collectTechStack(p: Profile): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: unknown) => {
+    if (typeof raw !== "string") return;
+    const t = raw.trim();
+    if (!t) return;
+    const k = t.toLowerCase();
+    if (seen.has(k)) return;
+    seen.add(k);
+    out.push(t);
+  };
+  for (const w of p.work_experience) (w.tech_stack ?? []).forEach(push);
+  for (const pr of p.projects) (pr.tech_stack ?? []).forEach(push);
+  return out;
+}
+
+/** Case-insensitive union; the existing spelling wins so the user's casing survives. */
+export function unionSkills(into: string[], add: string[]): { skills: string[]; added: string[] } {
+  const skills = into.slice();
+  const seen = new Set(skills.map((s) => s.toLowerCase()));
+  const added: string[] = [];
+  for (const s of add) {
+    const t = typeof s === "string" ? s.trim() : "";
+    if (!t) continue;
+    const k = t.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    skills.push(t);
+    added.push(t);
+  }
+  return { skills, added };
+}
+
+export type ReplaceResult = {
+  profile: Profile;
+  /** Sections actually overwritten (the parse found something for them). */
+  replaced: ParsedSection[];
+  /** answer_ladders keys dropped because they indexed past the new array length. */
+  droppedLadders: string[];
+};
+
+/**
+ * REPLACE apply: overwrite the sections the parse actually found, and leave every
+ * other section exactly as it was.
+ *
+ * Differs from `mergeProfile` in one way only — a populated section is no longer a
+ * reason to skip. The guard rails that remain, and why:
+ *
+ * - A section the parse did NOT find is never cleared. "The AI missed my
+ *   certifications" must not delete your certifications.
+ * - Only PARSED_ARRAY_SECTIONS + personal_info are eligible at all, so screening
+ *   answers, work authorization, self-ID and employment_history_companies survive
+ *   untouched no matter what the model returns.
+ * - `answer_ladders` are keyed by INDEXED path ("education.0.gpa"). Replacing an
+ *   array can leave a key pointing past the end of the new one, so those dangling
+ *   keys are dropped and REPORTED. In-range keys are kept: the slot still exists,
+ *   and silently discarding tuning the user hand-wrote would be worse.
+ */
+export function replaceProfileSections(base: Profile, incoming: Profile): ReplaceResult {
+  const out = structuredClone(base);
+  const replaced: ParsedSection[] = [];
+
+  // personal_info: overwrite per field, but only where the parse actually found something.
+  let personalTouched = false;
+  for (const [k, v] of Object.entries(incoming.personal_info)) {
+    if (isEmpty(v)) continue;
+    const cur = (out.personal_info as Record<string, unknown>)[k];
+    if (JSON.stringify(cur) === JSON.stringify(v)) continue;
+    (out.personal_info as Record<string, unknown>)[k] = structuredClone(v);
+    personalTouched = true;
+  }
+  if (personalTouched) replaced.push("personal_info");
+
+  for (const k of PARSED_ARRAY_SECTIONS) {
+    const inc = incoming[k] as unknown[];
+    if (inc.length === 0) continue; // parse found nothing → keep what the user has
+    const cur = out[k] as unknown[];
+    if (JSON.stringify(cur) === JSON.stringify(inc)) continue; // no-op, don't report it
+    (out as Record<string, unknown>)[k] = structuredClone(inc);
+    replaced.push(k);
+  }
+
+  // Fold the resume's per-role tech_stack into the flat skills list. Done AFTER the
+  // section replace so it reads off the entries that actually landed. Additive only —
+  // it can promote a skill the resume's own Skills line omitted, never remove one.
+  const tech = collectTechStack({ ...out, work_experience: out.work_experience, projects: out.projects });
+  const union = unionSkills(out.skills, tech);
+  if (union.added.length) {
+    out.skills = union.skills;
+    if (!replaced.includes("skills")) replaced.push("skills");
+  }
+
+  const droppedLadders: string[] = [];
+  for (const key of Object.keys(out.answer_ladders)) {
+    const m = key.match(/^([a-z_]+)\.(\d+)\./);
+    if (!m) continue;
+    const section = m[1] as (typeof PARSED_ARRAY_SECTIONS)[number];
+    if (!replaced.includes(section as ParsedSection)) continue;
+    const len = (out[section] as unknown[] | undefined)?.length ?? 0;
+    if (Number(m[2]) >= len) {
+      // PARK, don't delete (operator 2026-08-10). The entry this ladder described is gone from the
+      // new array, but the ladder is hand-written work: keep it under the answer it belonged to, so
+      // re-adding that entry brings it straight back.
+      parkLadder(out, key, answerKeyOf(readProfilePath(base, key)), out.answer_ladders[key]?.values ?? []);
+      delete out.answer_ladders[key];
+      droppedLadders.push(key);
+    }
+  }
+
+  return { profile: out, replaced, droppedLadders };
+}
+
+// ── ANSWER LADDERS SURVIVE EVERYTHING ───────────────────────────────────────────────────────────
+// Operator rule (2026-08-10): a taught ladder is never destroyed by a profile write. If the answer it
+// was written for changes, the ladder is PARKED under that answer; if the answer comes back, the
+// ladder comes back with it. Deleting is reserved for the user deleting it.
+
+/** Read a dotted path ("education.0.gpa") out of a profile. */
+function readProfilePath(root: unknown, path: string): unknown {
+  let cur: unknown = root;
+  for (const seg of path.split(".")) {
+    if (cur == null || typeof cur !== "object") return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+/** The comparable form of an answer. Tiered arrays compare by content; booleans by polarity. */
+export function answerKeyOf(v: unknown): string {
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean).join(" | ");
+  if (typeof v === "boolean") return v ? "true" : "false";
+  return String(v).trim();
+}
+
+/** Park a path's `values` ladder under `answer`, de-duped by answer. Never overwrites a different answer's park. */
+function parkLadder(p: Profile, path: string, answer: string, values: string[]): void {
+  if (!values.length) return;
+  const list = p.answer_ladders_archive[path] ?? [];
+  const at = list.findIndex((e) => e.answer === answer);
+  if (at >= 0) list[at] = { answer, values: values.slice() };
+  else list.push({ answer, values: values.slice() });
+  p.answer_ladders_archive[path] = list;
+}
+
+export type LadderReconcile = { profile: Profile; parked: string[]; restored: string[] };
+
+/**
+ * Re-point the answer ladders at a profile that just changed.
+ *
+ * - answer UNCHANGED → the ladder is left completely alone
+ * - answer CHANGED   → its `values` are parked under the OLD answer (yes/no ladders are kept as-is)
+ * - answer RETURNED  → the parked `values` for exactly that answer are restored
+ *
+ * Pure. Nothing is ever deleted.
+ */
+export function reconcileLaddersToProfile(before: Profile, after: Profile): LadderReconcile {
+  const out = structuredClone(after);
+  const parked: string[] = [];
+  const restored: string[] = [];
+  const paths = new Set([
+    ...Object.keys(out.answer_ladders),
+    ...Object.keys(out.answer_ladders_archive),
+  ]);
+
+  for (const path of paths) {
+    const wasKey = answerKeyOf(readProfilePath(before, path));
+    const nowKey = answerKeyOf(readProfilePath(out, path));
+    const live = out.answer_ladders[path];
+
+    if (wasKey !== nowKey && live && (live.values ?? []).length) {
+      parkLadder(out, path, wasKey, live.values ?? []);
+      out.answer_ladders[path] = { ...live, values: [] };
+      parked.push(path);
+    }
+
+    // Restore: an EXACT return of a parked answer brings its ladder back. A different answer is a
+    // different question — re-attaching those variants would be a silently wrong answer.
+    const park = (out.answer_ladders_archive[path] ?? []).find((e) => e.answer === nowKey);
+    if (park && park.values.length) {
+      const cur = out.answer_ladders[path] ?? { yes: [], no: [], values: [] };
+      if (!(cur.values ?? []).length) {
+        out.answer_ladders[path] = { ...cur, values: park.values.slice() };
+        restored.push(path);
+      }
+    }
+  }
+  return { profile: out, parked, restored };
 }
 
 function isEmpty(v: unknown): boolean {
