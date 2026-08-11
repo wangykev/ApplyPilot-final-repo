@@ -4795,3 +4795,100 @@ its extension loads from the `workday-skills` worktree (marker `polarity-capture
 loads from `ApplyPilot-ext Debugger`. I misread that as a folder problem and went hunting checkouts; the
 operator diagnosed it in one line. **`AP_BUILD` disagreeing with the folder on disk means CHECK THE
 BROWSER before touching anything else** — `switch_browser` re-pairs in one call.
+
+
+## 2026-08-10 — Workday's self-ID page is always answerable, and a cascade can PROMOTE a field
+
+Four commits, one thread: cat.wd5's page 6 halted, and chasing *why the AI fallback did not save it*
+found three separate faults stacked on each other.
+
+**The symptom.** `⚠ nav-timeout on page 6`, with Workday naming two fields:
+
+```
+[FIELD-DIAG] disabilityForm "English"* · name "Kevin"* · employeeId "" · dateSignedOn ""* · disabilityStatus ""*
+Error-Date: The field Date is required and must have a value.
+Error: The field Please check one of the boxes below: is required and must have a value.
+disabilityStatus — no mapping
+```
+
+**The operator's diagnosis, which was right.** The profile has a name, so we filled `name` — and *that*
+is what promoted Date and the disability pick from optional to REQUIRED. The walk then halted on a page
+whose answers we were holding the whole time.
+
+### 1. The self-ID answers are known, so fill them unconditionally
+
+Workday's voluntary self-ID page has one structure wherever it appears; only the option WORDING varies,
+and only in its tail. So both fields are now answered whether or not they are currently required, which
+means the cascade has nothing left to promote — the failure cannot occur rather than being recovered from.
+
+* **Signature date → always today.** Deterministic (`filled`, no review flag, no LLM call): it is the day
+  the form is being completed. `isSignatureDateQuestion` stays narrow, so "Date of Birth" and "Graduation
+  Date" are never stamped with today. Filling it *while it is still optional* is the entire point.
+* **Disability → mapped.** `FIELD_MAP` had only `gender` for self-ID, with a note that the rest would be
+  added "once their automation-ids are observed". Observed now: `disabilityStatus`, `dateSignedOn`,
+  `name`, `disabilityForm`, `employeeId`.
+
+### 2. The checkbox group was not using the match ladder at all
+
+The real reason the disability box stayed blank even once mapped:
+
+```js
+opts.find((o) => o.labelText.toLowerCase() === String(cand).toLowerCase())   // a raw byte compare
+```
+
+Profile: `"No, I do not have a disability"`. Workday: `"No, I do not have a disability and have not had
+one in the past"`. It now goes through `matchCandidates` with `containment:false`, like radio and dropdown
+already do. **POLARITY LEAD** is what lands it, and it is not a guess: a bare "No" commits only when
+exactly one option leads with it — true of every OFCCP form (Yes… / No… / decline), and false for a tenant
+that splits a polarity into two meanings, where it correctly escalates. Normalisation and typo tolerance
+come along for free, on the one page where a silently-wrong answer matters most.
+
+### 3. Why the AI fallback never fired — the general bug
+
+Both fields *did* have a fallback (`aiEligible` includes `date`; the checkbox group has its own pass).
+Both are gated on `f.isRequired`, read from the scan taken BEFORE the fill, where both were optional —
+so the gates were correctly false, per the standing rule that an optional field never spends an LLM call.
+By the time they were required, the loop had passed them.
+
+`cascadePass` could not recover it either, because it looked only for fields that APPEARED:
+
+```js
+const revealed = reFields.filter((f) => !cascadeSeen.has(f.fieldName));
+```
+
+Both had been seen, so both were filtered out — which is why that page's timing line read `cascade 0s+0s`.
+**Required-ness was treated as a static property of the first scan, but our own fill can change it.** It
+now also catches an already-seen field that was OPTIONAL when scanned, is REQUIRED now, and is still
+EMPTY, and re-fills it against a fresh scan so the existing gates become true.
+
+Two mistakes on the way, both caught by the suite:
+* The first draft re-filled EVERY required-and-empty field — that is a second fill pass on every page,
+  not a cascade fix. 20 tests failed. Comparing against required-ness *as first scanned* makes it targeted.
+* Replacing the earlier record wholesale DROPPED `cascadeRevealed`, the flag that forces a re-review at
+  the submit gate. Provenance is now carried over.
+
+### 4. A blank page is not "the control is missing"
+
+Separately, onboarding halted `resume-upload-input-missing` claiming the Autofill-with-Resume page "never
+rendered its upload control", while the operator looked at the tab and found the CREATE-ACCOUNT page. The
+logs show the claim was drawn from nothing at all — same wait, same tenant:
+
+```
+run that WORKED — title "Careers" · formFields 0 · markers [none] at 6.4s -> satisfied at 10.1s
+run that HALTED — the SAME empty state at 4.7s, 13.7s, 17.5s, 28.8s -> gave up at the 25s ceiling
+```
+
+**Why it is slow, measured (visible tab, warm cache, no extension involved):** TTFB 467ms ·
+DOMContentLoaded 793ms · load event 1484ms · posting content on screen at **~13s**. The document arrives
+in under two seconds and the SPA then spends ~11s booting and fetching the posting through its own API.
+Hidden and cold that clears 25s easily. NOT our hidden-tab handling: a plain visible tab with no overrides
+read 0 chars / readyState "interactive" on the same load. So: wait, wait again, then hard-reload once
+(`ignoreCache`) before halting; a page that rendered SOMETHING that is not the control still stops
+immediately.
+
+### Verified
+
+cat.wd5 R0000380479, **four consecutive runs**: `✓✓ reached the REVIEW page after 6 page(s)`, reported 200.
+The bundle records `dateSignedOn "8/10/2026"` and `disabilityStatus "No, I do not have a disability and
+have not had one in the past"`. 1278 tests green; the POLARITY-LEAD test was confirmed to FAIL against the
+restored byte compare, so it pins real behaviour and not the fixture.

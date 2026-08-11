@@ -4025,3 +4025,48 @@ posting, **15** on another).
 **REHEARSE/SUBMIT deliberately does NOT come here.** It applies manually / continues, so the saved skills
 survive and Workday does not re-parse the résumé over them — `preferResumeAutofill` is set only by the
 FILL run (`AP_RUN_APPLICATION`).
+
+
+## 2026-08-10 — cat.wd5 self-ID page 6: the OFCCP disability group, verbatim
+
+The page (`.../apply` page 6), flat fields in DOM order, as the scan reads them:
+
+```
+disabilityForm  "English"*   (dropdown — options: English, Spanish)
+name            "Kevin"*     (text — the signature name)
+employeeId      ""           (text, optional)
+dateSignedOn    ""*          (date — dateSectionMonth/Day/Year spinbuttons, label "Date")
+disabilityStatus ""*         (checkbox_group — label "Please check one of the boxes below:")
+```
+
+**The disability options, verbatim** (this is the wording the match ladder has to hit):
+
+```
+Yes, I have a disability, or have had one in the past
+No, I do not have a disability and have not had one in the past
+I do not want to answer
+```
+
+Note the profile stores `"No, I do not have a disability"` — SHORTER than the rendered option. Exact
+match therefore misses, and containment is refused by policy, so the only thing that lands it is
+**POLARITY LEAD** (a bare `"No"`, committed because exactly one option leads with "No"). Any tenant that
+splits a polarity into two meanings would have two leading options and must escalate instead.
+
+**⚠ REQUIRED-NESS IS NOT STATIC ON THIS PAGE.** `dateSignedOn` and `disabilityStatus` render **optional**
+and become **required the moment `name` holds a value** — `name` precedes both in DOM order, so an
+ordinary top-to-bottom fill triggers it every time. The asterisks above are the POST-cascade reading;
+the pre-fill scan shows both without one. The errors Workday then returns:
+
+```
+Error-Date: The field Date is required and must have a value.
+Error-Please check one of the boxes below: The field Please check one of the boxes below: is required and must have a value.
+```
+
+The second error's field name carries a trailing colon, which is the same shape as the 2026-08-07
+`errorLabelKey` fix; in this run it still logged `UNMATCHED (not in the flat scan…)` during AI-4
+remediation, so error-name→field matching on this label is worth re-checking if it resurfaces.
+
+**Render timing (measured 2026-08-10, VISIBLE tab, warm cache, no extension):** TTFB 467ms ·
+DOMContentLoaded 793ms · load event 1484ms · posting content on screen **~13s**. cat.wd5 renders nothing
+until it renders everything, so a poll that samples early sees a completely empty page (`formFields 0 ·
+markers [none]`), not a partial one — do not read that as "the control is missing".
