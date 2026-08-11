@@ -22,6 +22,7 @@ This file holds **standing rules, invariants and safety contracts only** — eve
 | `WEBSITE.md` | the Next.js + Supabase companion site (`web/`) — design + the handoff contracts |
 | `docs/website-progress-log.md` | website milestone history. Append new website entries here. |
 | `docs/profile-v2-plan.md` | the design reference for Profile v2 / answer buckets / the teach flow — **still live**, cited from `fill-driver.js`, `web/lib/buckets.ts`, `web/lib/teach.ts` |
+| `docs/generic-filler-plan.md` | the **generic filler** design — the DOM∪AX scan ladder, identity/label/required rules, the widget-driver registry, and the flow blockers. Read before writing any non-Workday/non-GH/Lever/Ashby form support. Grounded in the 2026-08-11 seven-ATS recon. |
 | `docs/gmail-setup.md` | Gmail auto-verify OAuth setup |
 | `docs/archive/` | superseded plans, kept for reference only |
 

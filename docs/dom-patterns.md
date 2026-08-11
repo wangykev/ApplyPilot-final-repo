@@ -37,6 +37,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
+| **Generic filler / non-Workday ATS survey** | `2026-08-11 — SEVEN non-Workday ATSs` (Workable · Breezy · SmartRecruiters · Teamtailor · Rippling + the Greenhouse/Lever controls; the DOM-vs-AX-tree experiment, honeypots, validation mirrors, label pollution, consent + bot-detection walls) |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
 | **Host / URL shapes** | `2026-07-22 — logged-in host is` |
 
@@ -44,7 +45,8 @@ during 2026-08, so a later date can appear above an earlier one.
 
 Comcast wd5 · Cambium Learning · US Bank wd1 · LiveRamp wd5 · **Magna wd3** (the CDP proving ground) ·
 Caterpillar / Solar Turbines (cat.wd5) · waystar.wd1 · marvell · moog — plus Greenhouse, Lever and Ashby
-across many employers.
+across many employers. **Probed read-only (not driven):** Workable · Breezy · SmartRecruiters ·
+Teamtailor · Rippling (2026-08-11 generic-scanner survey).
 
 **Add an entry when you test a new tenant**, and add its row to the table above.
 
@@ -4070,3 +4072,104 @@ remediation, so error-name→field matching on this label is worth re-checking i
 DOMContentLoaded 793ms · load event 1484ms · posting content on screen **~13s**. cat.wd5 renders nothing
 until it renders everything, so a poll that samples early sees a completely empty page (`formFields 0 ·
 markers [none]`), not a partial one — do not read that as "the control is missing".
+
+## 2026-08-11 — SEVEN non-Workday ATSs: the generic scanner probe
+
+Read-only recon for the generic-filler design (`docs/generic-filler-plan.md`). One framework-agnostic
+scanner probe injected via CDP `Runtime.evaluate` against seven live ATSs. No clicks, no fills, no submits,
+no consent controls touched. **Greenhouse and Lever are CONTROLS** — `ats.js` already drives them
+correctly, so they measure the generic scanner rather than merely describing it.
+
+**Corpus:** Greenhouse (Anthropic) · Lever (Metabase) · Workable (TetraScience) · Breezy (Victory) ·
+SmartRecruiters (ServiceNow) · Teamtailor (UpCloud) · Rippling (×2).
+**Four of seven yielded a form.** The three failures were a consent wall, DataDome, and dead postings —
+**never a widget.**
+
+### Greenhouse — the phantom mirrors are generically detectable, and `required` lives on the mirror
+
+30 controls scanned where truth is 24. The extra 6 are react-select's hidden validation twins
+(`class="remix-css-…-requiredInput"`), one per select. Every one carries **all four** of
+`aria-hidden="true"`, `tabindex="-1"`, computed `opacity:0`, `pointer-events:none` — any single signal
+catches all six, no react-select knowledge needed. They are also **absent from Chrome's AX tree**.
+
+⚠ **The real control reads `required:false`; the hidden mirror carries `required:true`.** So required-ness
+must be recovered from the field UNIT (a `*` in the label/heading, an `[aria-required]`, a
+`[class*=required]` marker, or the AX node's flag) — never read off the visible control.
+
+⚠ **Size is not a filter, in both directions.** The real combobox input measures **3px × 20px**; the
+`intl-tel-input` search contaminant measures 0×0. `width>0 && height>0` is exactly right and cannot be
+raised. Label coverage was perfect: 24/24 (`aria-label` 12, `aria-labelledby` 11, `label[for]` 1).
+reCAPTCHA Enterprise anchor iframe present and visible (an anchor is not a challenge).
+
+### Lever — the exclusion rule kills the résumé input, and an error message bleeds into the label
+
+Identity 12/12 from `name`; label coverage 12/12. Two refutations:
+
+- ⚠ The `aria-hidden`/`tabindex=-1`/`opacity:0` exclusion rule **wrongly excluded `resume`**
+  (`class="application-file-input invisible"`) — the most important field on the form. **`type=file` must
+  be exempt from every visibility and exclusion test.**
+- ⚠ `location`'s label read `"Current location ✱No location found. Try entering a different…"` — an inline
+  **error message concatenated into the question**. Note the `✱` is mid-string, so an end-anchored `\*$`
+  required test fails here.
+
+Custom questions are keyed `cards[<uuid>][field0]` — stable per posting, opaque, label is the only
+human-meaningful key. hCaptcha present (2 visible iframes). One button: `Submit application`.
+
+### Workable — a per-render random id, and the option list bleeds into the label
+
+- ⚠ **`id` is not always durable.** The résumé input is `input_files_input_QQUpFBNbEVDkaqRr`, regenerated
+  per render — it cannot key a replay. The `isHashed` heuristic in `cdp.js` generalizes to exactly this.
+- ⚠ `phone`'s label read `"Phone (Optional)+1United States+1United Kingdom+44Canada+1Ge…"` — the **entire
+  country-code option list** swallowed into the question, because the `<label>` wraps the whole composite.
+  Together with Lever's error bleed: **label text must be a FILTERED read** that excludes descendant option
+  lists, error/help nodes and nested control text — never `textContent` of the wrapper.
+- The exclusion rule also removed `city` / `postcode` / `country` (`aria-hidden` + `tabindex=-1`),
+  plausibly address-autocomplete backing stores. All three `required:false`, so nothing is blocked — but
+  **unresolved** (see the plan's open questions). The telephone-country-code combobox has no `name`/`id` at
+  all (the Ashby "label is the only durable key" class). `address` arrived pre-filled from geolocation.
+
+### Breezy — a HONEYPOT, AngularJS, and group labels that are the first option's text
+
+Worst label quality in the corpus: **6/9 named — 3 unnamed, 4 placeholder-only.**
+
+- ⚠ **`hp_7f2b` is a honeypot** (caught by `tabindex=-1`). Filling it is an automated self-report to the
+  anti-bot layer. This is what earns the exclusion rule its place — the same rule that wrongly killed
+  Lever's résumé.
+- ⚠ **A radio group's label must never come from an option's own label.** `race_ethnicity` resolved to
+  `"White (not Hispanic or Latino)"` and `gender` to `"Male"` — the first option in each case. **Both are
+  REQUIRED**, so the LLM would have been asked a nonsense question and filled a demographic from it.
+- **AngularJS** (21 `ng-*` nodes) — a commit regime never tested here; every synthetic-input assumption in
+  the codebase was proven against React. Untested, not assumed.
+- Repeating sections exist outside Workday: `+ Add Position`, `+ Add Education`.
+
+### The decisive experiment: Chrome's AX tree vs the DOM probe (on Breezy)
+
+Split verdict — **neither source is sufficient alone, and that is the design.**
+
+| | AX tree | DOM probe |
+|---|---|---|
+| True question text | **wins** — `heading "Race or Ethnicity"` / `"Gender"` / `"Experience Summary"` | loses — returns the first option's label |
+| Honeypots / mirrors | **wins** — omitted entirely | loses — must be filtered |
+| `required` state | **wins** — exposed on the node | needs unit recovery |
+| **Durable identity** | **loses** — only snapshot uids (`uid=1_24`); no `name`/`id` | **wins** — the only source |
+| **Hidden-but-real controls** | **loses** — `input[name=cResume]` absent from the tree | **wins** — the only source |
+
+**Both missed** the SMS-consent checkbox (`uid=1_29 checkbox`, no accessible name) and the summary textarea
+(`uid=1_41 textbox multiline`, no name). Their questions live in an adjacent `StaticText` and a preceding
+heading — hence the two extra rungs in the plan's label ladder.
+
+### The three non-widget blockers
+
+- **SmartRecruiters — DataDome.** The one-click apply page (`/oneclick-ui/company/<co>/publication/<uuid>`)
+  returned **zero form controls** behind a `geo.captcha-delivery.com` interstitial. Never solve, never
+  bypass ⇒ `needs_operator`. ⚠ It fired on an **automated** browser; the operator's real Chrome may pass —
+  "verify in a real profile", not "impossible".
+- ⚠ **The apply CTA is not always "apply".** SmartRecruiters' reads **"I'm interested"**, and the form uuid
+  is **not derivable** from the JD slug — it must be READ from the page. Same lesson as Greenhouse embeds,
+  now on a second vendor: prefer structural href signals over CTA text, and never construct a form URL.
+- **Teamtailor — a hard consent wall.** No form exists in the DOM until consent is resolved
+  (`body{overflow:clip}`, 2 inputs page-wide, **0 `<form>` tags**). The extension never clicks an
+  affirmative consent control ⇒ operator halt.
+- **Posting-gone generalizes.** Both Rippling postings redirected to the board index; the expired
+  SmartRecruiters posting rendered `"Sorry, this job has expired"` with 0 forms. `atsPostingGone`'s existing
+  redirect-to-index signal covers the first case already.
