@@ -263,6 +263,14 @@ picker / employee id). Only the option **wording** varies, and only in its tail.
 `name` PROMOTES them to required. Answering them up front leaves the cascade nothing to promote, so the
 halt cannot happen rather than needing recovery (see the cascade-PROMOTE rule under review/submit).
 
+**DETERMINISTIC AND THE AI NET ARE LAYERED, NOT REDUNDANT** — measured 2026-08-10 by switching the
+deterministic fills OFF on a live cat.wd5 run. The AI net *does* rescue the page (it reached REVIEW, and
+picked the right disability box), but it is strictly worse as the primary: it flags the demographic
+`ai-eeo-guess` so the operator re-verifies an answer already in the profile (5 flagged vs 4), it can answer
+DIFFERENTLY run to run (`name` came back "Kevin Wang" via AI vs "Kevin" deterministically — same field, two
+answers on a real application), and the page cost ~3s → 33.2s. **Map what you know; let the net catch what
+you don't.**
+
 ## Employer match — "previously employed here?" (safety-critical)
 
 The recognizer, its bail patterns, per-widget commits and the tenant anchoring: **`answers-and-ai` skill.**

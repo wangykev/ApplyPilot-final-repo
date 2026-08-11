@@ -4892,3 +4892,42 @@ cat.wd5 R0000380479, **four consecutive runs**: `✓✓ reached the REVIEW page 
 The bundle records `dateSignedOn "8/10/2026"` and `disabilityStatus "No, I do not have a disability and
 have not had one in the past"`. 1278 tests green; the POLARITY-LEAD test was confirmed to FAIL against the
 restored byte compare, so it pins real behaviour and not the fixture.
+
+### 2026-08-10 (later) — the AI fallback PROVEN live, by switching the deterministic fill off
+
+The cascade-PROMOTE fix had a unit test but no live proof, because the deterministic self-ID fill MASKS
+it: answer the fields up front and nothing is ever promoted. Operator's call — turn the deterministic
+fills off temporarily and see whether the fallback really does save the page.
+
+Both were disabled behind one throwaway flag (`isSignatureDateField` forced false, `disabilityStatus`
+forced unmapped in BOTH the flat loop and `deterministicTierFor` so the AI-batch planner would not claim
+it either). cat.wd5, same requisition.
+
+**Result: it reached the REVIEW page.** All three fields were caught by the new pass —
+
+```
+⇧ PROMOTED r0: name "Name*" is now REQUIRED and still empty — re-filling so its AI fallback can fire.
+⇧ PROMOTED r0: dateSignedOn "Date*" …
+⇧ PROMOTED r0: disabilityStatus "Please check one of the boxes below:*" …
+```
+
+| field | value | how |
+|---|---|---|
+| `disabilityStatus` | "No, I do not have a disability and have not had one in the past" (correct) | `ai-eeo-guess`, high, "Matches the applicant's existing self-identification record" |
+| `dateSignedOn` | 8/10/2026 | tier `today` — NO llm call: `aiFillDate` checks `isSignatureDateQuestion` before it prompts |
+| `name` | "Kevin Wang" | `ai-text`, medium, flagged |
+
+So the net works, and before the cascade fix it could not have: every fallback is gated on `isRequired`
+and nothing re-evaluated it.
+
+**And it confirms the deterministic path should stay primary** — the two are LAYERED, not redundant:
+
+1. **Review burden.** The AI route flags the disability answer `ai-eeo-guess` (the loud "AI-GUESSED
+   DEMOGRAPHIC — VERIFY" badge), so the operator hand-verifies an answer already sitting in the profile.
+   5 flagged vs 4.
+2. **Stability.** The model can answer differently run to run, and DID: `name` came back "Kevin Wang" on
+   the AI path vs "Kevin" deterministically. Same field, two different answers on a real application.
+3. **Cost.** That page's fill went ~3s → **33.2s**, nearly all of it the re-fill plus LLM round trips.
+
+Reverted immediately (`git checkout -- fill-driver.js background.js`), suite re-run, and the extension
+reloaded so the running build matches the committed one — the experiment flag was never committed.
