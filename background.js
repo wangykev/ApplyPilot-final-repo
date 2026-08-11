@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "signin-rung-20s";
+const AP_BUILD_MARKER = "submit-ready-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -7191,7 +7191,20 @@ async function runCdpOnboard(tabId, opts) {
     // re-click actually happens, so a clean run stays quiet.
     let busyBefore = null;
     for (let t = 1; t <= n; t++) {
-      if (t === 1) { try { const s0 = await scan(); busyBefore = (s0 && s0.authBusy) || null; } catch (e) { /* diagnostic only */ } }
+      if (t === 1) {
+        try { const s0 = await scan(); busyBefore = (s0 && s0.authBusy) || null; } catch (e) { /* diagnostic only */ }
+        // READINESS, measured at the instant we are about to click. React handler attachment is the one
+        // real "is this button wired yet?" signal (see cdpAuthButtonReady). Logged ONLY when it says the
+        // button is NOT wired — a clean run stays silent, and a noisy one tells us the hydration window
+        // is real and worth GATING on rather than merely reporting.
+        try {
+          const rd = await cdpEval(cdpAuthButtonReady, selectors[0]);
+          if (rd && rd.present && !rd.reactWired) {
+            LOG(`   ⚠ [SUBMIT-READY] about to click "${label}" but React has NOT wired it yet (handlers: ${JSON.stringify(rd.handlers)}, laidOut=${rd.laidOut}). `
+              + `This is the ONE state that genuinely swallows a click — if this line shows up, poll for reactWired BEFORE clicking instead of relying on the retry ladder.`);
+          }
+        } catch (e) { /* measurement only — never block the click */ }
+      }
       const submitted = await clickTarget(selectors, t > 1 ? `${label} (retry ${t - 1})` : label);
       if (!submitted.clicked) return (t > 1) ? { scan: st } : { notFound: true, blockedBy: submitted.blockedBy };
       const wait = ladder ? ladder[t - 1] : timeoutMs;

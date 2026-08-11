@@ -748,6 +748,35 @@ function warnNoWorkerTimers(why) {
   } catch (e) { /* log only */ }
 }
 
+// IS THE SUBMIT BUTTON ACTUALLY WIRED YET? (2026-08-11, measurement — NOT a gate)
+//
+// Operator: "is there something we can poll for so the first click always works?" The DOM says nothing
+// useful (`disabled`/`aria-busy` are never set — measured), but REACT does: a button React has not
+// hydrated yet carries no `__reactProps$` handlers, and a click landing in that window is genuinely
+// swallowed. That is the one real failure the retry ladder exists for.
+//
+// ⚠ Traced live on cat.wd5's Sign In: the submit's React props are { onBlur, onFocus, onMouseDown } —
+// there is NO onClick, so the commit rides MOUSEDOWN. Worth knowing before anyone "fixes" a click here.
+//
+// Deliberately a MEASUREMENT first. Whether an unhydrated window actually occurs is UNPROVEN (zero
+// genuine swallowed clicks in 14 live cold sign-ins), and this codebase has just been burned once by
+// building on a signal sampled in only one state. So: report it, log only the interesting case, and
+// gate on it later if the data shows the window is real.
+function cdpAuthButtonReady(selector) {
+  const b = document.querySelector(selector);
+  if (!b) return { present: false };
+  const pk = Object.keys(b).find((k) => k.indexOf("__reactProps$") === 0);
+  const handlers = pk ? Object.keys(b[pk]).filter((k) => /^on[A-Z]/.test(k)) : [];
+  const r = b.getBoundingClientRect();
+  return {
+    present: true,
+    reactWired: !!pk && handlers.length > 0,
+    handlers,
+    laidOut: r.width > 0 && r.height > 0,
+    disabled: !!b.disabled || b.getAttribute("aria-disabled") === "true",
+  };
+}
+
 // Run a SELF-CONTAINED function in the page via Runtime.evaluate and return its
 // JSON value. Args must be JSON-serializable; fn must close over nothing (same
 // discipline as chrome.scripting injections). CDP-injected evaluation executes
