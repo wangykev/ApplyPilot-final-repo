@@ -625,25 +625,48 @@ worker-timers ON`, and the loud `warnNoWorkerTimers` banner never fired. So the 
 page timers ARE worker-backed — the Workday mechanism that makes hidden≈visible is working here and is
 still not enough.
 
-**Leading hypothesis (untested):** worker-timers fix TIMERS, not LAYOUT. A hidden tab does no layout or
-paint, and react-select positions and renders its menu off layout — so the option poll waits for a menu
-that never materialises and burns its ceiling. That fits the signature exactly (one combobox stuck at a
-ceiling, varying by run) and fits why Workday is unaffected (its widgets are plain portaled listboxes
-already handled by the settle-poll).
+### ✖✖ THE CAUSE IS THE LLM, NOT THE FORM — both hypotheses above were WRONG (same day)
 
-**Fix direction — and it is the one the skill deliberately parked.** `Page.startScreencast` keeps Chrome
-producing frames for a hidden tab. It was REMOVED as unnecessary once the mid-life-overrides bug was
-fixed, on a measurement (Discord 16.9s vs 17.2s under capture), and the skill's condition for bringing it
-back is explicit: **"Bring it back only with a measurement."** That condition is now met — 32.8s visible
-vs 77.5–86.1s dark, on the same posting and build. ⚠ Two constraints from that same note still apply: it
-is not free (at `everyNthFrame:1` the JPEG encoding starved the renderer it was meant to free), and you
-cannot measure it while your own automation holds the tab under capture — confirm the probe reports `NOT
-painting` first. All three hidden runs above DID report `NOT painting`, so they are valid dark readings.
+I proposed two fixes — a layout-independent option poll, then restoring `Page.startScreencast`. **Both
+were aimed at the wrong thing, and the field-level log said so immediately.** Recorded in full because
+the reasoning was plausible and someone will re-derive it.
 
-**Cheaper thing to try first:** the hang is one widget at its ceiling, so before adding capture, check
-whether the option poll can be satisfied without layout (read the menu's options from the DOM even when
-unpositioned) — the menus are NOT virtualized here (measured 2026-08-07), so the options may well be in
-the DOM already while merely unplaced.
+**1. The option poll is ALREADY layout-independent.** `atsInjReadOptions` (ats.js) is pure
+`querySelectorAll` + `textContent` — no `getBoundingClientRect`, no visibility test. "Read the
+unpositioned menu" is what it already does, so there was nothing to fix.
+
+**2. The hung field was never a widget.** The slowest field in the worst hidden run:
+
+```
+question_68143084 (dropdown, req) → filled_review · ai-choice · "Python 3" · 34113ms   ← hidden
+question_68143084 (dropdown, req) → filled_review · ai-choice · "Python 3" ·  2911ms   ← visible
+```
+
+`ai-choice` — an LLM call. On that same run `school--0` read `loading false · waited 417ms/2 reads ·
+1253ms`: the combobox was FAST. The per-call `[LLM]` numbers confirm it outright:
+
+| run | LLM per call | fill |
+|---|---|---|
+| early hidden | 831 · 1959 · 732 · 972ms | **23.9s** |
+| hidden ×3 | 7734 · 9332 · 11521 · 12223 · 13845 · 13976 · 14984 · **34006**ms | 77–86s |
+| visible | 1207 · 2853 · 5778 · 8102ms | **32.8s** |
+
+This form has ~4–5 `ai-choice` dropdowns, so +10–30s per call IS the whole gap. **The
+standing rule caught this and I nearly walked past it: subtract the `[LLM]` line before blaming a
+tenant, the DOM, or the fill code.** It applies to the ATS path verbatim.
+
+**⚠ What is still NOT established: that VISIBILITY causes it.** The 23.9s baseline was *also hidden*, with
+fast LLM calls — so "hidden ⇒ slow LLM" does not hold. Provider latency is the documented biggest random
+variable here (486ms → 30657ms on identical config, same model, same session). One visible run cannot
+separate a visibility effect from ordinary provider variance, and the visible run being the LATEST also
+argues against simple time-based degradation. **Do not "fix" hidden-tab ATS speed until this is settled.**
+
+**The controlled test that would settle it:** alternate hidden/visible several times on one posting and
+compare the `[LLM]` latency DISTRIBUTIONS, not the fill totals. If a visibility effect is real the
+mechanism must be MV3-worker starvation (the LLM call is issued from the service worker and never touches
+the tab), which the `[CLOCKS]` probe can corroborate — high SW drift during hidden runs, low during
+visible. If the distributions overlap, this is provider noise and the ATS path has no hidden penalty at
+all.
 
 ### Already refuted elsewhere — do not redo (see the `ats-tenants` skill)
 
