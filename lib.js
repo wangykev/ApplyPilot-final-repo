@@ -1769,7 +1769,22 @@ function jobPageSettleStep(read, state) {
 // EVERY actionable marker to be absent. A page with any field, any auth control, any apply button, or
 // real content is NOT blank. `readyState` is optional so an older scan (which didn't report it) simply
 // never matches — fail-closed.
-const BLANK_PAGE_BOILERPLATE_MAX = 700; // a genuinely empty shell is just the cookie/skip-link text
+// A genuinely empty shell is just the cookie/skip-link boilerplate — but that text is TENANT-CONTROLLED
+// and it is bigger than this constant originally assumed.
+//
+// MEASURED 2026-08-11 on cat.wd5: the cookie-consent notice ALONE is 574 chars, and with the
+// "Skip to main content" link, the stale title and the banner's buttons a blank shell lands around
+// 650-750. The old cap of 700 therefore sat *inside* the noise band, and a live run halted
+// `auth-unknown` on a page whose every other gate passed (readyState complete, formFields 0,
+// hasAuthEl false, markers [none]) — i.e. the recovery this function exists to authorize was refused
+// by a threshold, on exactly the page it was written for. For scale, a REAL content page on that
+// tenant measured 2306 chars, so there is a wide gap to sit in; 700 was simply the wrong side of it.
+//
+// 1500 clears boilerplate that could plausibly double (locale, an extra consent button) while staying
+// far below real content. ⚠ It is still a threshold: if a tenant's boilerplate ever exceeds it, the
+// same class of failure returns — which is why `blankAuthRefusal` now NAMES this gate in the halt log
+// instead of leaving the next person to deduce it.
+const BLANK_PAGE_BOILERPLATE_MAX = 1500;
 // ── IS THE BLANK PAGE PERSISTENT, OR JUST MID-NAVIGATION? (2026-08-07) ──────────────────────────────
 // `isBlankAuthPage` is a single-read test, and every condition it checks is ALSO satisfied by an SPA
 // mid-navigation: the old view torn down, the new one not yet mounted, `readyState` already "complete".
@@ -1803,6 +1818,36 @@ function isBlankAuthPage(state) {
   if (m.applyFlowReviewPage || m.alreadyAppliedPage || m.formField) return false;
   const text = String(s.bodyText || "").replace(/\s+/g, " ").trim();
   return text.length <= BLANK_PAGE_BOILERPLATE_MAX;        // real content ⇒ not an empty shell
+}
+
+// WHY did isBlankAuthPage refuse? (2026-08-11)
+//
+// This exists because working that out cost a full investigation. A live `auth-unknown` halt printed
+// every input to the decision — readyState, field count, credential flags, markers — and every one of
+// them PASSED, so the cause had to be deduced by elimination down to the one input the halt did not
+// print: the body-text length. That is precisely the failure mode this codebase already has a rule
+// about (the auth-render bug: "unactionable because every failure printed the same line").
+//
+// So: name the FIRST gate that refused, and always report the length, which is the gate most likely to
+// be wrong (it is a threshold against tenant-controlled text, where the others are structural facts).
+// PURE — returns null when the page IS blank, else a short human phrase. Used only for logging, so it
+// can never change a decision.
+function blankAuthRefusal(state) {
+  const s = state || {};
+  if (s.readyState !== "complete") return `readyState is "${s.readyState || "?"}", not complete (mid-navigation — absence proves nothing)`;
+  if ((s.formFieldCount || 0) > 0) return `the page has ${s.formFieldCount} form field(s) — not an empty shell`;
+  if (s.hasAuthEl || s.emailInput || s.passwordInput || s.signInWithEmail) return "auth controls are present — the page is drivable";
+  const m = s.markers || {};
+  const named = ["signInSubmit", "createAccountSubmit", "signInLink", "createAccountLink", "verifyPassword",
+    "adventureButton", "continueButton", "applyManually", "useMyLastApplication",
+    "applyFlowReviewPage", "alreadyAppliedPage", "formField"].filter((k) => m[k]);
+  if (named.length) return `actionable marker(s) present: ${named.join(", ")}`;
+  const len = String(s.bodyText || "").replace(/\s+/g, " ").trim().length;
+  if (len > BLANK_PAGE_BOILERPLATE_MAX) {
+    return `body text is ${len} chars, over the ${BLANK_PAGE_BOILERPLATE_MAX}-char boilerplate cap — so it reads as "real content" and the reload recovery was REFUSED. `
+      + `If the page really was an empty shell, this cap is too low for this tenant (see BLANK_PAGE_BOILERPLATE_MAX).`;
+  }
+  return null; // it IS blank — no refusal
 }
 
 // ── Workday's PHANTOM "required" error — filled, but reported empty (2026-07-28) ────────────────────
@@ -2333,5 +2378,5 @@ if (typeof module !== "undefined" && module.exports) {
   skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthRefusal, BLANK_PAGE_BOILERPLATE_MAX, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

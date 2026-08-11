@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "report-heal-1";
+const AP_BUILD_MARKER = "blank-shell-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -7815,6 +7815,15 @@ async function runCdpOnboard(tabId, opts) {
         // 2026-08-02: "this was not a password breach"). Report the fact, offer the dialog as ONE
         // possibility among the ordinary ones.
         if (st.markers.signInSubmit) return haltNeedsOperator("signin-no-outcome", "Sign-in didn't complete — the form is still up and Workday showed neither an error nor the next page. Look at the tab: something may be blocking the button (Chrome's data-breach password warning does this), or the credentials may have been rejected without a message.", st);
+        // ── SAY WHY THE EMPTY-SHELL RECOVERY DIDN'T RUN (2026-08-11) ────────────────────────────────
+        // A live halt here printed every input to that decision — readyState complete, formFields 0,
+        // hasAuthEl false, markers [none] — and every one of them PASSED isBlankAuthPage's gates, so
+        // the actual cause had to be deduced by elimination down to the ONE input the halt did not
+        // print: the body-text length (over the boilerplate cap, so a genuinely empty shell read as
+        // "real content" and the reload was refused). That deduction cost an investigation; the log
+        // should just say it. blankAuthRefusal is pure and logging-only — it cannot change the outcome.
+        const refusal = blankAuthRefusal(st);
+        if (refusal) LOG(`   why the empty-shell reload did NOT run: ${refusal}`);
         return haltNeedsOperator("auth-unknown", `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}`, st);
       }
 

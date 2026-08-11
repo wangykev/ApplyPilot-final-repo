@@ -5,7 +5,8 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage, parseErrorFieldName, phantomRequiredTargets,
-  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey, blankAuthPersists, isJobPostingGone, BLANK_AUTH_MIN_READS } = require("../lib.js");
+  classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey, blankAuthPersists, isJobPostingGone, BLANK_AUTH_MIN_READS,
+  blankAuthRefusal, BLANK_PAGE_BOILERPLATE_MAX } = require("../lib.js");
 
 // Fold the pure settle rule over a sequence of page reads → the 1-based read it accepts at (null = never).
 const settleAt = (reads) => {
@@ -162,6 +163,41 @@ test("isBlankAuthPage: ANY actionable page is never blank (never reload somethin
   assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, markers: { applyManually: true } }), false, "the apply chain");
   assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, markers: { alreadyAppliedPage: true } }), false, "already-applied is its own clean halt");
   assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, bodyText: "x".repeat(3000) }), false, "a page with real content");
+});
+
+// ── THE REGRESSION: real boilerplate is BIGGER than the cap assumed (live cat.wd5, 2026-08-11) ──────
+// A run halted `auth-unknown` on a page whose every structural gate passed — readyState complete,
+// formFields 0, hasAuthEl false, markers [none] — because its body text was over the old 700-char cap.
+// Measured on that tenant: the cookie notice ALONE is 574 chars, so a blank shell lands ~650-750 and
+// the cap sat inside the noise band. A REAL content page measured 2306, so the gap to aim for is wide.
+const CAT_SHELL_TEXT = "Create Account Skip to main content " + "This site uses cookies to create a better experience for you. ".repeat(11);
+test("isBlankAuthPage: the cat.wd5 shell (boilerplate BIGGER than the old 700 cap) is still blank", () => {
+  assert.ok(CAT_SHELL_TEXT.length > 700, `fixture must exceed the OLD cap to pin the regression (got ${CAT_SHELL_TEXT.length})`);
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, bodyText: CAT_SHELL_TEXT }), true,
+    "a genuinely empty shell must earn the reload — refusing it halts a recoverable run as auth-unknown");
+});
+test("isBlankAuthPage: the cap still refuses REAL content (2306 chars measured live)", () => {
+  assert.ok(BLANK_PAGE_BOILERPLATE_MAX < 2306,
+    "the cap must stay clear of a real content page, or the reload could fire on a drivable page");
+  assert.strictEqual(isBlankAuthPage({ ...BLANK_LIVE, bodyText: "y".repeat(2306) }), false);
+});
+
+// ── blankAuthRefusal — the halt must NAME the gate, not leave it to be deduced ──────────────────────
+// This exists because the body-text length was the ONE input the halt did not print, so the cause had
+// to be found by eliminating every other gate. Logging-only and pure: it can never change a decision.
+test("blankAuthRefusal: null when the page really is a blank shell", () => {
+  assert.strictEqual(blankAuthRefusal(BLANK_LIVE), null);
+});
+test("blankAuthRefusal: names the BODY-TEXT gate and reports the length (the one that cost an investigation)", () => {
+  const r = blankAuthRefusal({ ...BLANK_LIVE, bodyText: "z".repeat(BLANK_PAGE_BOILERPLATE_MAX + 42) });
+  assert.match(r, new RegExp(String(BLANK_PAGE_BOILERPLATE_MAX + 42)), "must state the ACTUAL length, not just that it was too long");
+  assert.match(r, /cap/i);
+});
+test("blankAuthRefusal: names the structural gates too", () => {
+  assert.match(blankAuthRefusal({ ...BLANK_LIVE, readyState: "loading" }), /readyState/);
+  assert.match(blankAuthRefusal({ ...BLANK_LIVE, formFieldCount: 3 }), /form field/);
+  assert.match(blankAuthRefusal({ ...BLANK_LIVE, hasAuthEl: true }), /auth controls/);
+  assert.match(blankAuthRefusal({ ...BLANK_LIVE, markers: { applyManually: true } }), /applyManually/);
 });
 
 test("isAlreadyApplied: the alreadyAppliedPage marker → true (Magna wd3 — title is a stale 'Create Account')", () => {
