@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "onboard-budget-1";
+const AP_BUILD_MARKER = "onboard-clock-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6769,10 +6769,31 @@ async function runCdpOnboard(tabId, opts) {
     // report the elapsed time when it finally matches. Silent on every fast wait, which is nearly all.
     const PROGRESS_AFTER_MS = 2000, PROGRESS_EVERY_MS = 2000;
     let lastProgressAt = 0;
+    // ── SCOPED PAGE CLOCK FOR THIS POLL LOOP (2026-08-10, measured) ──────────────────────────────────
+    // Onboarding runs on the SW timer, which fires ~2-2.5s late REGARDLESS of the requested pace
+    // (measured: 50ms→2482ms, 500ms→3290ms). That is most of onboarding's lag, and it also mistimes the
+    // retry ladders — `submitAndWait`'s deliberately-fast 500ms re-click rung measured 3290ms. The
+    // comment above this loop assumes "reads are fast (~62ms apart)"; on a hidden run they are ~1.2s.
+    //
+    // Onboarding is excluded from the page clock globally, and MUST stay excluded, because it NAVIGATES
+    // and a navigating document's timer never fires (the un-gated version halted a run). But THIS loop is
+    // a pure poll — it clicks nothing between iterations — and each iteration ends with an in-page
+    // `scan()`. A scan that RETURNED is positive evidence the document is alive and servicing evals, so
+    // the page clock is valid for the interval that FOLLOWS it. A scan that FAILED (mid-navigation,
+    // detached) drops straight back to the SW timer.
+    //
+    // Self-correcting by construction: navigation is exactly what makes `scan()` fail, so the one state
+    // where the page clock is unsafe is the one state that turns it off. It is re-armed only by another
+    // successful scan. Worst case if a navigation starts DURING a sleep, the race in cdpDelay abandons it
+    // (bounded), and this loop simply polls again — a slow poll costs latency here, never a wrong answer,
+    // and the budgets it runs inside are generous.
+    let lastScanOk = false;
     while (Date.now() - start < timeoutMs) {
-      await pace(500);
+      cdpSetPageClock(lastScanOk);                 // ON only after a scan proved the page responsive
+      try { await pace(500); } finally { cdpSetPageClock(false); }   // always leave onboarding SW-timed
       await cdpWakePage();
       st = await scan();
+      lastScanOk = !!st;
       if (st) last = st;
       const waited = Date.now() - start;
       if (st && waited >= PROGRESS_AFTER_MS && waited - lastProgressAt >= PROGRESS_EVERY_MS) {

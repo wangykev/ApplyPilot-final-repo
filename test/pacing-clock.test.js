@@ -151,6 +151,22 @@ test("a pace inside budget logs NOTHING (a healthy run must stay quiet)", async 
 // test/onboarding.test.js. This guards a HALT: cdpWaitNextPage is a 15s wall-clock budget with a
 // cdpAdaptiveDelay(500) interval, so a page clock hanging mid-navigation buys ~7 polls instead of ~30
 // and the walk nav-timeouts on a page that was merely slow to transition.
+// The onboarding poll loop may use the page clock ONLY for the interval following a SUCCESSFUL in-page
+// scan, and must leave onboarding SW-timed afterwards. Onboarding NAVIGATES, and a navigating document's
+// timer never fires — the un-gated version of this halted a live run at waitFor(resume-upload-input).
+test("onboarding waitFor arms the page clock ONLY after a successful scan, and always disarms", () => {
+  const bg = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
+  const at = bg.indexOf("const waitFor = async (pred, timeoutMs, label, opts) => {");
+  assert.ok(at > 0, "onboarding waitFor not found — renamed?");
+  const body = bg.slice(at, at + 6000);
+  assert.match(body, /cdpSetPageClock\(lastScanOk\)/,
+    "the page clock must be gated on the PREVIOUS scan having succeeded, never armed unconditionally");
+  assert.match(body, /finally\s*\{\s*cdpSetPageClock\(false\)/,
+    "must disarm in a finally — onboarding's default is the SW timer, and a thrown pace must not leak it on");
+  assert.match(body, /lastScanOk = !!st;/,
+    "a FAILED scan (mid-navigation / detached) must drop back to the SW timer");
+});
+
 test("cdpWaitNextPage disables the page clock around its poll, and restores it", () => {
   const bg = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
   const at = bg.indexOf("async function cdpWaitNextPage(");

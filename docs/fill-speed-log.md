@@ -283,7 +283,32 @@ upload widget, then parses a résumé). Siblings on the same hidden tab already 
 **45s**. The failure direction decides it: too short halts a HEALTHY run and needs an operator; too long
 costs seconds on a genuinely broken page before reaching the same halt.
 
-### Next (not done)
+### DONE (`onboard-clock-1`) — the scoped onboarding clock, LIVE-VERIFIED
+
+`waitFor`'s poll loop now arms the page clock for the interval FOLLOWING a successful in-page `scan()`,
+and disarms in a `finally`. Self-correcting by construction: navigation is exactly what makes `scan()`
+fail, so the one state where the page clock is unsafe is the one state that turns it off; only another
+successful scan re-arms it. Onboarding stays globally SW-timed — this is the one loop that opts in, and it
+clicks nothing between iterations.
+
+**Live result (cat.wd5, hidden, fresh req):**
+
+| | before | after |
+|---|---|---|
+| `[PACE]` overruns per run (onboarding) | 5–6, each **2.0–3.3s** | **0** |
+| onboarding poll density | ~1200ms/read | **~70ms/read** (57 reads in 4000ms) |
+| onboard→form | 18–124s across the session | 34s, no halt |
+| outcome | — | REVIEW, 5 pages, **all 5 M40 audits clean**, 1 re-click |
+
+The poll-density line is the load-bearing one: it is BOTH fixes at once. Waits notice their goal ~17×
+sooner (the lag), and every wall-clock-bounded budget now gets the sample count it was designed around
+(the flakiness, including the retry ladders that were being timed against a clock running ~2.5s late).
+
+⚠ Guarded by a source-level test: arming must be gated on `lastScanOk`, disarmed in a `finally`, and a
+failed scan must drop back to the SW timer. Mutation-checked — arming unconditionally (the version that
+HALTED a live run) fails the test.
+
+### Superseded shape (kept for the reasoning)
 
 Give onboarding a clock that keeps time. The safe shape is NOT "turn the page clock on for onboarding"
 (it hangs mid-navigation, which is why it is excluded) but something narrower: the `waitFor` poll loop
