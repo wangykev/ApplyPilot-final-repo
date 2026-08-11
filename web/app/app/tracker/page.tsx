@@ -2,6 +2,7 @@ import { PageHeader } from "@/components/app/PageHeader";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, DEV_PREVIEW } from "@/lib/env";
 import { TrackerPanel } from "./TrackerPanel";
+import { ReportHealthGuard } from "./ReportHealthGuard";
 import type { Application } from "./shared";
 import { SAMPLE_APPS } from "./sample";
 
@@ -37,6 +38,9 @@ export default async function TrackerPage() {
         title="Tracker"
         description="The extension reports each run here — company, role, status, and fields needing review. Move cards through your pipeline as you hear back."
       />
+      {/* Repairs a stale reporting link by itself and stays silent when it succeeds — the tracker is
+          where a user notices an application is missing, so it is where the repair belongs. */}
+      <ReportHealthGuard />
       <TrackerPanel applications={applications} />
     </div>
   );

@@ -117,6 +117,42 @@ Per-user API key avoids extension-side OAuth token refresh. **Both** the single-
 (`runCdpFillPage`) and the multi-page walk (`runCdpWalk`, on every exit) push the accumulated
 review bundle, so the website always has the latest to review.
 
+#### 2a. A REJECTED report SELF-HEALS — never lose a completed run (2026-08-11)
+
+`getSession` ROTATES the reporting key (it deletes the user's `api_keys` row and mints a new one), so any
+re-link — another browser, a second "Sync everything" — leaves the extension holding a credential the
+server no longer knows. Every completed fill then 401s. That used to be **silent data loss**: minutes of
+filling, a good bundle, and the only trace was a service-worker line plus an `apReportError` marker that
+**nothing ever read**. The user's natural check made it worse — `/app/connect` shows a green "connected"
+badge off a plain `AP_PING`, which succeeds regardless of whether the key works.
+
+The contract now:
+
+- **The extension PARKS the payload** on a rejected report (`apPendingReport`, ONE slot — a repair path,
+  not an outbox) alongside `apReportError`. A successful report clears both.
+- **`AP_REPORT_HEALTH`** (external message) answers the question `AP_PING` cannot: `{ healthy, connected,
+  reason, hasPending, pendingCompany }`. Read-only, and returns **no key and no bundle** — only the shape
+  of the problem, so the site can REPAIR it rather than describe it.
+- **`AP_SET_SESSION` flushes the parked report** (`flushPendingReport`) and returns `{ ok, recovered }`.
+  A fresh credential is the one event that can fix the failure, so the retry rides it. `recovered:true`
+  means the APPLICATION reached the tracker — not merely that a key was stored.
+- **`ReportHealthGuard`** (mounted on `/app/tracker`) checks health on load and, on a real rejection with
+  something parked, heals silently: `getSession` → `AP_SET_SESSION` → `router.refresh()`. The user sees
+  their application appear plus one quiet line; they are never shown "401" or "stale key".
+
+⚠ **Two guards, both load-bearing, both unit-pinned** (`test/report-recovery.test.js`):
+1. The guard heals with the **TRACKING-ONLY** link. It must NEVER call `AP_SYNC_PROFILE` /
+   `AP_SYNC_RESUME` / `AP_SET_CREDENTIALS` — silently overwriting the user's profile and résumé to fix a
+   reporting key would be far worse than the bug being fixed.
+2. Healing **rotates the key**, so it must never run speculatively: only on an actual rejection, at most
+   once per mount, and `flushPendingReport` must clear `apReportError` **and** `apPendingReport` together.
+   Leaving the error marker set would re-heal on every visit — a rotation loop, and two open tabs would
+   rotate each other's keys forever.
+
+**Live-verified 2026-08-11** (cat.wd5 `R0000386422`): a complete 5-page fill 401'd and was parked
+(`hasPending:true, pendingCompany:"Cat"`); opening the tracker took the list 9 → 10 with the run restored
+and health flipped to `healthy:true`, with zero user action; a revisit healed nothing and showed nothing.
+
 ### 3. Backend → Extension (PULL the approved review bundle) — the review round-trip
 
 The website is the **review surface** (edit + approve — see the review-editor section). Before a

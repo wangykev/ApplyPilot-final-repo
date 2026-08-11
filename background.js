@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "clock-probe-2";
+const AP_BUILD_MARKER = "report-heal-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -220,7 +220,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             reviewUrl: message.reviewUrl || "",
           },
         },
-        () => {
+        async () => {
           const err = chrome.runtime.lastError;
           // …and WHERE it will report. With more than one dev server around (or a localhost/prod mix)
           // "which tracker did this fill land in?" is a real question, and the host answers it. The key
@@ -230,9 +230,44 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           console.log(`[ApplyPilot] reporting credential ${err ? "FAILED to store: " + err.message
             : `stored — key ${newKey ? newKey.length + " chars" : "MISSING (empty!)"}, ${
               !oldKey ? "first one" : newKey === oldKey ? "UNCHANGED from the previous one" : "replaces the previous one"}, reporting to ${host}`}`);
-          sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+          if (err) { sendResponse({ ok: false, error: err.message }); return; }
+          // A fresh credential is the ONE event that can repair a rejected report, so retry it here
+          // rather than making the user re-run a fill they already sat through. Reported back so the
+          // caller can say "your application is here" instead of "reconnected" — the recovered RESULT
+          // is the thing a user cares about; the reconnect is plumbing.
+          const flush = await flushPendingReport();
+          sendResponse({ ok: true, recovered: !!flush.flushed });
         }
       );
+    });
+    return true;
+  }
+
+  // Is the reporting link actually WORKING? (2026-08-11)
+  //
+  // AP_PING deliberately does not answer this: it proves the extension is installed and reachable,
+  // which succeeds just as happily with a credential the server deleted. That gap is why a user could
+  // sit on /app/connect reading a green "connected" badge while every report 401'd. This is the
+  // question the site actually needs — "did your last report land, and is a run parked waiting for a
+  // working key?" — so the site can repair it instead of describing it.
+  //
+  // Read-only. Returns no key, no payload, nothing sensitive: just the shape of the problem.
+  if (type === "AP_REPORT_HEALTH") {
+    chrome.storage.local.get(["apReportError", "apPendingReport", "apSession"], (s) => {
+      const err = s && s.apReportError;
+      const pending = s && s.apPendingReport;
+      sendResponse({
+        ok: true,
+        healthy: !err,
+        connected: !!(s && s.apSession && s.apSession.ingestKey),
+        reason: err ? err.reason || null : null,
+        at: err ? err.at || null : null,
+        // What a recovery would actually restore — lets the site promise the RESULT, not the repair.
+        // `company` is the only human-recognisable field the payload reliably carries (`role` is
+        // always null on this path), so the site says "your Caterpillar application", not "a report".
+        pendingCompany: (pending && pending.payload && pending.payload.company) || null,
+        hasPending: !!(pending && pending.payload),
+      });
     });
     return true;
   }
@@ -3975,10 +4010,22 @@ async function reportApplication(bundle, jobContext) {
     console.log("[ApplyPilot] application reported —", res && res.status, `(${payload.status}, ${needs} need review)`);
     if (!outcome.ok) {
       console.log("[ApplyPilot] ⛔⛔ " + outcome.message);
-      try { await chrome.storage.local.set({ apReportError: { at: Date.now(), status: (res && res.status) || 0, reason: outcome.reason } }); } catch (e) { /* best effort */ }
+      // KEEP THE PAYLOAD, don't just record that it failed (2026-08-11). A rejected report used to be
+      // pure LOSS: a fill that took minutes produced a bundle that went nowhere, and the only trace was
+      // a console line and an `apReportError` marker that nothing ever read. The run's work is still
+      // perfectly good — the credential is what went stale — so park the exact payload and re-POST it
+      // the moment a fresh credential arrives (see flushPendingReport, called from AP_SET_SESSION).
+      // ONE slot, overwritten by the newest failure: this is a repair path, not an outbox, and an
+      // unbounded queue of full review bundles would be a storage-quota problem of its own.
+      try {
+        await chrome.storage.local.set({
+          apReportError: { at: Date.now(), status: (res && res.status) || 0, reason: outcome.reason },
+          apPendingReport: { at: Date.now(), payload },
+        });
+      } catch (e) { /* best effort */ }
       emitRunProgress("Report rejected", outcome.reason === "stale-key" ? "re-sync the extension on /app/connect (its key was rotated)" : outcome.message);
     } else {
-      try { await chrome.storage.local.remove("apReportError"); } catch (e) { /* best effort */ }
+      try { await chrome.storage.local.remove(["apReportError", "apPendingReport"]); } catch (e) { /* best effort */ }
     }
     // …and TELL THE CALLER. It used to return nothing, so the ATS run announced "Reported to the
     // website." unconditionally — printed one line under the ⛔ saying the tracker never got it
@@ -3988,6 +4035,49 @@ async function reportApplication(bundle, jobContext) {
   } catch (e) {
     console.log("[ApplyPilot] application report skipped:", String((e && e.message) || e));
     return { ok: false, reason: "exception", status: 0 };
+  }
+}
+
+// Re-POST a report that was REJECTED earlier, using whatever credential is stored NOW.
+//
+// This is the half that turns "your application vanished" into "your application is here": the fill
+// itself was fine, so once a working key lands the parked payload is still exactly what should have
+// been sent. Called from AP_SET_SESSION, i.e. the instant a fresh credential arrives — the user does
+// not ask for a retry and never learns one happened.
+//
+// Deliberately NOT a general retry loop: no timers, no backoff, no queue. It runs only on the one
+// event that can plausibly fix the failure (a new credential). A rejected report with no reconnect
+// simply stays parked, which is a recoverable state rather than a lost one.
+//
+// { flushed:false, reason } when there is nothing to do or it failed again — callers treat a failed
+// flush as "still broken", never as success.
+async function flushPendingReport() {
+  let pending, apSession;
+  try {
+    const store = await new Promise((r) => chrome.storage.local.get(["apPendingReport", "apSession"], r));
+    pending = store.apPendingReport; apSession = store.apSession;
+  } catch (e) { return { flushed: false, reason: "storage" }; }
+  if (!pending || !pending.payload) return { flushed: false, reason: "nothing-pending" };
+  if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return { flushed: false, reason: "not-connected" };
+  try {
+    const res = await fetch(apSession.ingestUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": "Bearer " + apSession.ingestKey },
+      body: JSON.stringify(pending.payload),
+    });
+    const outcome = reportOutcome(res && res.status);
+    if (!outcome.ok) {
+      console.log(`[ApplyPilot] pending report STILL rejected (${res && res.status}) — leaving it parked: ${outcome.message}`);
+      return { flushed: false, reason: outcome.reason || "rejected", status: (res && res.status) || 0 };
+    }
+    // Clear BOTH markers together: apReportError is what the site reads to decide whether to heal, so
+    // leaving it set after a successful flush would make the page heal again on the next visit —
+    // and every heal rotates the key (getSession deletes the old row), so that is a rotation loop.
+    await chrome.storage.local.remove(["apPendingReport", "apReportError"]);
+    console.log(`[ApplyPilot] ✓ recovered a previously rejected report — the application reached the tracker (parked ${Math.round((Date.now() - (pending.at || Date.now())) / 1000)}s).`);
+    return { flushed: true, status: res.status };
+  } catch (e) {
+    return { flushed: false, reason: "exception" };
   }
 }
 

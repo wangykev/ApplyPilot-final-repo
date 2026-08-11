@@ -54,6 +54,32 @@ export function pingExtension(extId: string): Promise<ExtResponse> {
   return sendToExtension(extId, { type: "AP_PING" });
 }
 
+export type ReportHealth = {
+  ok?: boolean;
+  healthy?: boolean;
+  connected?: boolean;
+  reason?: string | null;
+  hasPending?: boolean;
+  pendingCompany?: string | null;
+  error?: string;
+};
+
+/**
+ * Is the extension's REPORTING link actually working?
+ *
+ * Distinct from pingExtension on purpose. A ping proves the extension is installed and answering,
+ * which it does just as happily while holding a credential the server deleted — that gap is exactly
+ * how a user could read a green "connected" badge while every completed fill silently failed to
+ * reach their tracker. This asks the question that matters: did the last report land, and is a
+ * finished run parked waiting for a working key?
+ *
+ * Read-only, and returns nothing sensitive (no key, no bundle) — just the shape of the problem, so
+ * the caller can REPAIR it rather than describe it to the user.
+ */
+export function getReportHealth(extId: string): Promise<ReportHealth> {
+  return sendToExtension(extId, { type: "AP_REPORT_HEALTH" }) as Promise<ReportHealth>;
+}
+
 export type RunProgress = { phase: string; detail: string; at: number };
 
 /**
