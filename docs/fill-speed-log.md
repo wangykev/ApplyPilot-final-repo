@@ -227,6 +227,72 @@ the stability the transition wait already witnessed, rather than restarting its 
 **Not yet done — deliberately.** The operator's constraint is "don't change behaviour, make existing
 behaviour faster", and lowering this window changes when we are willing to start filling.
 
+**DONE 2026-08-10 (`settle-seed-1`), LIVE-VERIFIED.** `cdpWaitNextPage` now hands the settle the field-count
+stability it already observed (`{count, since}`) and the settle COUNTS it instead of re-proving it from
+zero. The bar is unchanged (still `NO_GROWTH_MS` of an unchanged count). Live: settles **1.2s · 0.5s**
+against the previous build's 1.3 · 5.9 · 1.9s, transition `1912ms/188ms`, all M40 audits clean. Four
+safety properties, each mutation-checked: a seed that DISAGREES resets the window in full; the credit is
+capped so ≥2 of the settle's own 150ms polls always land; the credit is clamped at 0 (unclamped, a
+clock-skewed `since` stalls to the 12s ceiling — measured 12096ms); `since` is never earlier than a real
+observation.
+
+---
+
+## 2026-08-10 — round 5: ONBOARDING flakiness (retry-heavy clicks + lag) — MEASURED
+
+Operator: *"a lot of buttons that we click need to be retried and maybe some lag during the whole
+onboarding situation."* The `[PACE]` instrumentation answers it directly.
+
+### Onboarding paces overrun 40–50× — and the overrun is CONSTANT, not proportional
+
+From one run's onboarding phase (`sw` = the SW timer, which onboarding still uses by design):
+
+| requested | actual | over |
+|---|---|---|
+| 50ms | **2482ms** | 50× |
+| 50ms | 2034ms | 41× |
+| 50ms | 2199ms | 44× |
+| 50ms | 2577ms | 52× |
+| 200ms | 2482ms | 12× |
+| 500ms | **3290ms** | 6.6× |
+
+⚠ **The overrun is ~2–2.5s REGARDLESS of what is requested.** That is the single most useful fact here:
+the MV3 timer simply fires ~2.5s late, so **lowering a requested pace cannot help** — only changing the
+clock can. Onboarding is the one stage still on the starved clock, deliberately: the fill/replay walks
+were moved to the page's worker-backed timer (round 2), but onboarding NAVIGATES, and a navigating
+document's timer does not fire (that exclusion exists because the un-gated version HALTED a run).
+
+**Why this reads as "buttons need retrying":** `submitAndWait` escalates on a `[500, 20000]` ladder,
+where the 500ms rung is a deliberately FAST re-click for a click that landed before Workday enabled the
+button. Measured, that rung is **3290ms**. The retry machinery is being timed against a clock that is not
+keeping time — the first click's pre-click settle (200ms) is really ~2.5s, and the "fast" recovery is not
+fast. `waitFor`'s own comment states the assumption this breaks: *"the reads are fast (~62ms apart —
+`pace(500)` scales down when the tab is fast)"*. On a hidden run they are ~1.2s apart.
+
+### The `resume-upload-input` halt: NOT a sampling problem — budget raised 25s → 45s
+
+This halted **three runs in one session**, every time at exactly its **25000ms** hidden budget. It is
+tempting (and I initially proposed) to fix it with an attempts floor. **The data refuses that:** those
+timeouts did **21–29 reads**, i.e. it looked every ~1.2s — plenty. The control had simply not rendered.
+Proof it is variance, not a real failure: the very NEXT run satisfied the same wait in **7.0s** on the
+same tenant.
+
+25s was also the SMALLEST hidden budget in the flow, on one of its heaviest pages (Workday mounts an
+upload widget, then parses a résumé). Siblings on the same hidden tab already allow far more:
+`post-resume-upload(parse)` 50s, `post-continue-application` 45s, `sign-in-form-render` 30s. Raised to
+**45s**. The failure direction decides it: too short halts a HEALTHY run and needs an operator; too long
+costs seconds on a genuinely broken page before reaching the same halt.
+
+### Next (not done)
+
+Give onboarding a clock that keeps time. The safe shape is NOT "turn the page clock on for onboarding"
+(it hangs mid-navigation, which is why it is excluded) but something narrower: the `waitFor` poll loop
+already performs a successful in-page `scan()` each iteration, which is positive evidence the document is
+alive and responsive — a page clock is valid for the interval that FOLLOWS such a scan, and the SW timer
+should be used everywhere else. ⚠ Verify live before trusting it: an onboarding click can navigate at any
+moment, and the abandon ceiling is itself SW-timed, so a mis-scoped page sleep there can be WORSE (~4s)
+than the 2.5s drift it replaces.
+
 ---
 
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED

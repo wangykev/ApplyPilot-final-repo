@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "settle-seed-1";
+const AP_BUILD_MARKER = "onboard-budget-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6656,8 +6656,19 @@ async function runCdpOnboard(tabId, opts) {
       // user), so break out and let the auth stage do its job, exactly as the terminal-state exits
       // inside waitFor already do for already-applied and maintenance pages.
       const authNow = (sc) => !!(sc && (sc.hasAuthEl || sc.passwordInput || sc.emailInput || sc.signInWithEmail));
+      // ── HIDDEN BUDGET RAISED 25s → 45s (2026-08-10, measured) ─────────────────────────────────────
+      // This wait halted THREE runs in one session, every time at EXACTLY its 25000ms hidden budget,
+      // with 21-29 reads — so it was LOOKING often enough (~1.2s apart); the control simply had not
+      // rendered yet. It is not a sampling problem and an attempts floor would not have helped. The
+      // proof it is variance rather than a real failure: the very NEXT run satisfied this same wait in
+      // 7.0s on the same tenant. 25s was also the SMALLEST hidden budget in this flow, while its own
+      // siblings already allow far more on the same hidden tab — post-resume-upload(parse) 50s,
+      // post-continue-application 45s, sign-in-form-render 30s — and this page is heavier than most
+      // (Workday mounts an upload widget and then parses a résumé).
+      // The failure DIRECTION is what settles it: too short halts a HEALTHY run and needs an operator,
+      // while too long costs seconds on a page that is genuinely broken before reaching the same halt.
       const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1 || authNow(sc),
-        await renderBudget(12000, 25000), "resume-upload-input");
+        await renderBudget(12000, 45000), "resume-upload-input");
       s = w.scan || s;
       if (authNow(s)) {
         LOG("Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage (the résumé page comes after).");
