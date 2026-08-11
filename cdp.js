@@ -230,14 +230,27 @@ async function cdpClockProbe(ms = 250, label = "") {
     swOverMs: swMs - want,
     pageOverMs: pageMs === null ? null : pageMs - want,
   };
+  // Print the VERDICT FOR THESE NUMBERS, not the legend. The first live run printed the full
+  // "SW late + PAGE on time ⇒ …" explanation on every line including the ones where NOTHING was late,
+  // which reads as an assertion that the worker was starved when the sample says the opposite.
+  // A diagnostic that states a conclusion it did not measure is worse than no diagnostic.
+  const LATE_MS = 400;
+  const swLate = out.swOverMs >= LATE_MS;
+  const pageLate = out.pageOverMs !== null && out.pageOverMs >= LATE_MS;
+  let verdict;
+  if (pageMs === null) verdict = `PAGE arm ${pageNote || "unavailable"} — no comparison possible this sample`;
+  else if (swLate && pageLate) verdict = "BOTH clocks late ⇒ the TAB really is throttled/frozen";
+  else if (swLate) verdict = "SW starved, TAB FINE ⇒ pace on the page clock (this is the known MV3 case)";
+  else if (pageLate) verdict = "PAGE late while the SW is on time ⇒ unusual — a busy renderer, not worker starvation";
+  else verdict = "both clocks ON TIME at this instant — ⚠ drift is BURSTY, so a quiet sample does NOT clear the run";
   try {
     const pageTxt = pageMs === null ? (pageNote || "n/a") : `${pageMs}ms (+${out.pageOverMs})`;
     const realTxt = realMs === null ? "n/a" : `${realMs}ms`;
     console.log(`[ApplyPilot][CLOCKS]${label ? " " + label + ":" : ""} want ${want}ms → SW ${swMs}ms (+${out.swOverMs}) · PAGE ${pageTxt} · page-perf ${realTxt}`
-      + ` · worker-timers ${_workerTimersActive ? "ON" : "OFF"}`
-      + ` — SW late + PAGE on time ⇒ the worker is starved and the tab is FINE (pace on the page clock);`
-      + ` BOTH late ⇒ the tab really is throttled/frozen. page-perf is real time, NOT a freeze signal (see cdp.js).`);
+      + ` · worker-timers ${_workerTimersActive ? "ON" : "OFF"} — ${verdict}.`
+      + ` (page-perf is REAL TIME, not a freeze signal — see cdp.js.)`);
   } catch (e) { /* log only */ }
+  out.verdict = verdict;
   return out;
 }
 // ── CLOCK PROBE END ──

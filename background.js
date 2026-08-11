@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "clock-probe-1";
+const AP_BUILD_MARKER = "clock-probe-2";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -3126,6 +3126,12 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
     out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
+    // POST-fill sample, so the probe BRACKETS the fill instead of only sniffing the calm before it.
+    // Live (2026-08-10, cat.wd5, 5 pages): every pre-fill sample read both clocks on time (+6..+23ms)
+    // while the SAME run logged `delayFull(600ms) actually took 1312ms` mid-fill. One sample at the
+    // quietest moment of the page cannot see a bursty stall — it just reports the quiet. Two samples
+    // still cannot prove absence, but they can CATCH one, which the single sample provably could not.
+    if (_dbgLag) { try { await cdpClockProbe(250, `page ${(opts && opts.pageNumber) || "?"} POST-fill`); } catch (e) { /* probe only */ } }
   } finally {
     if (_selfId) {
       cdpSetTrustedText(false);                        // never leave the next page paying for this one

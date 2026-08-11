@@ -114,11 +114,28 @@ cracked this (it timed `delay(250)` at 17.30s). Three `debugLagTrace` readings m
    inside an MV3 worker" hedge is retired.
 4. **`[TRANSITION]`'s poll count was an ARITHMETIC ESTIMATE, not a count** (fixed 2026-08-10). It read
    `Math.round(elapsed / intervalMs)` — i.e. it assumed the interval was honored, which is precisely
-   what drift breaks. Under drift it **OVERSTATES** the number of reads (a 500ms request measured at
-   2694ms prints ~5 polls for 1 actual read), so it reported best-case coverage exactly when coverage
-   was worst. Any claim resting on that field is unsupported. It is now a literal counter incremented
-   per iteration. The sibling numbers on that line (`sawNewPageMs` / `confirmMs`) were always real
-   `Date.now()` deltas and are unaffected.
+   what drift breaks. Now a literal counter. `sawNewPageMs` / `confirmMs` were always real `Date.now()`
+   deltas and are unaffected.
+
+   ⚠ **Measured live, the error runs the OPPOSITE way from the one predicted here** — worth keeping,
+   because the prediction was written confidently and was wrong. I expected it to OVERSTATE (a starved
+   500ms interval measured at 2694ms would print ~5 polls per real read). In a real 5-page run it
+   **UNDERSTATED, by up to 6×**, because `cdpAdaptiveDelay` collapses the interval FAR BELOW the
+   requested 500ms whenever the tab measures fast:
+
+   | transition | counted | actual mean | requested | old estimate would print |
+   |---|---|---|---|---|
+   | 1 → 2 | 12 | 551ms | 500ms | ~13 ✓ |
+   | 2 → 3 | **58** | 113ms | 500ms | ~13 ✗ (4.5× low) |
+   | 3 → 4 | 26 | 273ms | 500ms | ~14 ✗ |
+   | 4 → 5 | 18 | 77ms | 500ms | **~3** ✗ (6× low) |
+   | 5 → 6 | 21 | 117ms | 500ms | ~5 ✗ (4.2× low) |
+
+   The general lesson is the one that survives either direction: **the estimate is not a count, and it
+   errs whichever way the true interval deviates** — high when the clock is starved, low when adaptive
+   pacing collapses the beat. On a hidden run the collapse dominates. It also retires round 4's
+   "it sometimes exits in 1 poll": real counts are **12–58**, and the smallest number in that table is
+   an artefact of the estimate, not an observation.
 
 ⚠ **General rule this is an instance of: never print a poll count you did not COUNT.** A derived
 count is an assertion that the clock kept time — the one assumption every measurement on this page
@@ -432,6 +449,72 @@ Re-derived only where there is a concrete failing run to test against, per the s
   been observed on a Workday tenant**, yet waits keep getting hardened against it. Now it announces
   itself: banner absent ⇒ the regime is not in play and nothing needs to defend against it; banner
   present ⇒ a uniformly slow run is explained rather than mysterious.
+
+### LIVE VERIFICATION (cat.wd5 `R0000387234-1`, hidden, fresh req, build `clock-probe-1`)
+
+`✓✓ reached the REVIEW page after 5 page(s)`. All five `[CLOCKS]` and five `[TRANSITION]` lines
+produced. The tracker push 401'd (stale ingest key — a known, unrelated issue), which does not affect
+the measurements. One prior run halted `auth-unknown` at onboarding and a plain re-run signed straight
+in, exactly as the `live-testing` skill documents.
+
+**`[CLOCKS]`, all five pages, pre-fill:**
+
+| page | SW | PAGE | page-perf | worker-timers |
+|---|---|---|---|---|
+| 1 | 271ms (+21) | 271ms (+21) | 269ms | ON |
+| 2 | 260ms (+10) | 260ms (+10) | 259ms | ON |
+| 3 | 261ms (+11) | 262ms (+12) | 260ms | ON |
+| 4 | 270ms (+20) | 270ms (+20) | 263ms | ON |
+| 5 | 256ms (+6) | 273ms (+23) | 265ms | ON |
+
+`worker-timers ON` every page ⇒ **the `hidden-SLOW` banner correctly never fired**, which is the
+negative confirmation that regime is still not in play on this tenant.
+
+⚠ **But read what this does and does NOT establish — the first version of this instrument oversold
+itself twice, and both faults are now fixed:**
+
+1. **The probe sampled the calm, then reported the calm.** Every pre-fill sample read both clocks
+   healthy — while the SAME run logged `delayFull(600ms) actually took 1312ms — 712ms OVERRUN`
+   mid-fill. Pre-fill is the quietest instant on the page, so one sample there structurally cannot see
+   a bursty stall. **Fixed:** the probe now also fires POST-fill, bracketing the fill. Two samples
+   still cannot prove absence, but they can CATCH a burst, which one provably could not. So these five
+   rows are **not** evidence that the run was free of starvation — the `[PACE]` line proves it was not.
+2. **The log line printed the LEGEND, not the verdict.** Every line ended with the full
+   "SW late + PAGE on time ⇒ the worker is starved and the tab is FINE …" explanation — including the
+   lines where nothing was late, i.e. asserting a conclusion the sample contradicted. **Fixed:** the
+   line now computes the verdict from its own numbers, and the all-clear case says so explicitly,
+   including that drift is bursty so a quiet sample does not clear the run.
+
+**What the five samples DO establish:** at each page's pre-fill instant, page timers and the SW timer
+agreed to within 6–23ms of a 250ms request, and `page-perf` tracked both — so at those instants the
+tab was neither frozen nor throttled, and our SW-side `Date.now()` readings are honest. That is a real
+if narrow result, and it is consistent with the standing model (bursty SW starvation on an otherwise
+healthy tab), not a refutation or a confirmation of it.
+
+### Confirming run (cat.wd5 `R0000385755`, hidden, fresh req, build `clock-probe-2`)
+
+Both fixes verified live. `✓✓ reached the REVIEW page after 5 page(s)`, **10 `[CLOCKS]` samples**
+(5 pages × pre + POST), the verdict now computed per-sample, and the worker-timers banner still silent.
+
+**This run was genuinely quiet** — its two worst paces were `delayFull(150ms)` at 462ms and 327ms
+(both under the 400ms verdict threshold) and there were **zero `[PACE]` warnings**. So 10 all-clear
+samples here are the instrument being CORRECT, not blind. The blind spot is the one run 1 exposed and
+the POST-fill sample now addresses. Neither run has yet CAUGHT a burst in the act; that remains open,
+and the honest statement is "not yet observed by this probe", not "not happening".
+
+**The transition counts confirm the understatement finding, harder:**
+
+| transition | counted | actual mean | requested | old estimate |
+|---|---|---|---|---|
+| 1 → 2 | **76** | 84ms | 500ms | ~13 (**5.8× low**) |
+| 2 → 3 | 60 | 86ms | 500ms | ~10 |
+| 3 → 4 | 30 | 113ms | 500ms | ~7 |
+| 4 → 5 | 22 | 81ms | 500ms | ~4 |
+| 5 → 6 | 23 | 172ms | 500ms | ~8 |
+
+Across both runs the true interval was **77–551ms against a 500ms request** — i.e. `cdpAdaptiveDelay`
+usually collapses it to ~1/5 of nominal on a hidden tab. Coverage was never the problem it was
+theorised to be: these transitions take **22–76 reads**, not the ~3–14 the estimate implied.
 
 ---
 

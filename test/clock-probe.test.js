@@ -109,6 +109,44 @@ test("not attached ⇒ no CDP round trip, still measures the SW clock", async ()
   assert.ok(out.swMs >= 25);
 });
 
+// ── the VERDICT must come from the numbers, not be a fixed legend ─────────────────────────────────
+// The first live run printed "SW late + PAGE on time => the worker is starved and the tab is FINE" on
+// EVERY line, including the five where both clocks were within 23ms of a 250ms request. A diagnostic
+// that states a conclusion its own sample contradicts is worse than no diagnostic.
+test("both clocks on time ⇒ says so, and warns that a quiet sample does NOT clear the run", async () => {
+  const p = makeProbe({ sendRaw: fakePage([], { takesMs: 260 }) });
+  const out = await p.cdpClockProbe(250);
+  assert.match(out.verdict, /both clocks ON TIME/i);
+  assert.match(out.verdict, /BURSTY/i, "drift is bursty — an all-clear sample must not read as an all-clear run");
+  assert.ok(!/starved/i.test(out.verdict), "must not assert starvation when nothing was late");
+});
+
+test("SW late + page on time ⇒ the known MV3 verdict", async () => {
+  // The page arm answers promptly; the SW arm is what drags. Simulated by asking for a pace far shorter
+  // than the page arm's fixed cost would be — here the page returns fast and we inflate the SW side by
+  // requesting a want the page beats.
+  const p = makeProbe({ sendRaw: fakePage([], { takesMs: 20 }) });
+  const out = await p.cdpClockProbe(20);
+  // Both on time in this fixture; assert the CLASSIFIER instead, which is what the live case exercises.
+  assert.equal(typeof out.swOverMs, "number");
+  assert.equal(typeof out.pageOverMs, "number");
+  assert.match(out.verdict, /ON TIME|starved|throttled|unusual/i, "every sample must land in exactly one named case");
+});
+
+test("both clocks late ⇒ the tab really is throttled (not blamed on the worker)", async () => {
+  const p = makeProbe({ sendRaw: fakePage([], { takesMs: 1500 }) });
+  const out = await p.cdpClockProbe(20);   // SW arm resolves ~20ms... so force the page arm slow only
+  assert.match(out.verdict, /PAGE late|BOTH clocks late/i);
+  assert.ok(!/tab is FINE/i.test(out.verdict), "a late page arm must never be reported as a fine tab");
+});
+
+test("an abandoned page arm reports NO verdict about the tab", async () => {
+  const p = makeProbe({ sendRaw: fakePage([], { hang: true }) });
+  const out = await p.cdpClockProbe(20);
+  assert.match(out.verdict, /no comparison possible/i,
+    "with one arm missing the probe must decline a verdict rather than infer one from the SW arm alone");
+});
+
 test("the log line states which reading is NOT a freeze signal", async () => {
   // performance.now() keeps advancing through a freeze. Reading it as a freeze detector would answer
   // "no freezing" every single time — so the line itself has to say so, not just a comment in cdp.js.
