@@ -5053,7 +5053,12 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // Matching on the LABEL across a scan boundary is what makes it visible.
   const normLbl = (x) => String(x == null ? "" : x).replace(/\s+/g, " ").trim().toLowerCase().replace(/\*+$/, "").trim();
   const labelOfSeen = new Map(scan.fields.map((f) => [f.fieldName, f.label]));
+  // Required-ness AS FIRST SCANNED. The cascade case is a field that was OPTIONAL here and is REQUIRED
+  // later; comparing against this is what keeps the re-fill below to that case, rather than making it a
+  // blanket retry of every required field the page left empty.
+  const requiredOfSeen = new Map(scan.fields.map((f) => [f.fieldName, !!f.isRequired]));
   const cascadeRecon = [];
+  const promotedTried = new Set(); // optional→REQUIRED re-fills, attempted once each (termination)
   const cascadePass = async () => {
     if (targeted) return;
     for (let round = 0; round < budgets.maxCascadeRounds; round++) {
@@ -5078,9 +5083,51 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       for (const n of vanished) {
         if (_traceOn && !revealed.some((f) => normLbl(f.label) === normLbl(labelOfSeen.get(n)))) cascadeRecon.push(`vanished r${round}: ${n} "${String(labelOfSeen.get(n) || "").slice(0, 40)}" (no same-label replacement — a genuine cascade-REMOVE)`);
       }
-      if (!revealed.length) break; // nothing new (the common case) → done, zero extra work
+      // ── PROMOTED: already seen, still here, now REQUIRED, still EMPTY (cat.wd5 live 2026-08-10) ─────
+      // A cascade does not only ADD fields — it can make an existing OPTIONAL field REQUIRED, and this
+      // pass used to look exclusively for appearance (`!cascadeSeen.has(...)`), so that case fell through
+      // every net and surfaced as a halt.
+      //
+      // Live: page 6's Date and disability box were OPTIONAL when scanned, so the fill correctly declined
+      // to spend an LLM call on them (operator rule: an optional field fills deterministically or stays
+      // blank). Filling `name` then promoted BOTH to required. Their AI fallbacks — aiEligible for the
+      // date, the dedicated checkbox-group pass for the disability — are each gated on `f.isRequired`,
+      // read from the PRE-FILL scan, so neither could ever fire. Save was refused on a page whose answers
+      // we were holding, and `cascade 0s+0s` in the timing line is this pass finding nothing to do.
+      //
+      // Re-filling them with a FRESH scan is what makes those gates true, so the existing fallbacks work
+      // as designed instead of being bypassed. Required-and-empty is exactly the pre-Save halt condition,
+      // so this only ever runs on fields that would otherwise stop the walk.
+      const promoted = reFields.filter((f) =>
+        cascadeSeen.has(f.fieldName)                       // we already processed it (so: not a reveal)
+        && f.isRequired && requiredOfSeen.get(f.fieldName) === false  // …and it was OPTIONAL when scanned
+        && !promotedTried.has(f.fieldName)                 // once only — termination
+        && String(f.currentValue == null ? "" : f.currentValue).trim() === "");
+      for (const f of promoted) {
+        promotedTried.add(f.fieldName);
+        cascadeRecon.push(`⇧ PROMOTED r${round}: ${f.fieldName} "${String(f.label || "").slice(0, 50)}" is now REQUIRED and still empty — re-filling so its AI fallback can fire.`);
+      }
+      if (!revealed.length && !promoted.length) break; // nothing new (the common case) → done, zero extra work
       const revealedNames = new Set(revealed.map((f) => f.fieldName));
+      const promotedNames = new Set(promoted.map((f) => f.fieldName));
       revealed.forEach((f) => cascadeSeen.add(f.fieldName)); // mark BEFORE filling → a field is never re-triggered (termination is guaranteed: seen grows, the field set is finite)
+      if (promotedNames.size) {
+        try {
+          const sub = await drivePageFill(act, profile, defaults, jobContext, budgetsIn, { onlyFieldNames: promotedNames, aiAnswers: aiAnswerByLabel });
+          for (const r of (sub && sub.results) || []) {
+            // REPLACE the earlier (empty) record rather than adding a second row for the same field —
+            // review must show one answer per question, not the blank we first left.
+            const at = results.findIndex((x) => x && x.fieldName === r.fieldName);
+            r.detail = (r.detail ? r.detail + " | " : "") + "was OPTIONAL when the page was scanned and became REQUIRED after an earlier field committed — re-filled";
+            // CARRY THE PROVENANCE OVER. A field that was cascade-REVEALED and is now also being re-filled
+            // is still cascade-revealed, and that flag is what forces a re-review at the submit gate —
+            // replacing the record wholesale silently dropped it.
+            if (at >= 0 && results[at] && results[at].cascadeRevealed) r.cascadeRevealed = true;
+            if (at >= 0) results[at] = r; else results.push(r);
+          }
+        } catch (e) { /* a promoted re-fill threw → leave the original record; the pre-Save guard still names it */ }
+      }
+      if (!revealed.length) continue;
       try {
         // Share the page's answer cache: a revealed/REMOUNTED field is usually a question we have
         // already answered, and it must get the SAME answer rather than a fresh (possibly different) one.

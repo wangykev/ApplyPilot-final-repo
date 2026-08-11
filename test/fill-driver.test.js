@@ -10072,3 +10072,87 @@ test("self-ID checkbox group: containment is still refused", async () => {
   assert.equal(r.status, "needs_review", "'pa' inside 'Pacific' must never commit");
   assert.deepEqual(act.boxes.filter((b) => b.checked), []);
 });
+
+
+// ── a cascade can PROMOTE an existing field to required, not only reveal a new one (cat.wd5 2026-08-10) ──
+// The live sequence: page 6's Date and disability box were OPTIONAL when scanned, so the fill correctly
+// declined to spend an LLM call on them (an optional field fills deterministically or stays blank).
+// Filling `name` promoted BOTH to required. Their AI fallbacks — aiEligible for the date, the dedicated
+// checkbox-group pass for the disability — are each gated on `f.isRequired` read from the PRE-FILL scan,
+// so NEITHER could fire, and Save was refused on a page whose answers we were holding.
+//
+// cascadePass looked only for fields that APPEARED (`!cascadeSeen.has(...)`), so it found nothing to do —
+// the page's timing line read `cascade 0s+0s`. It now also catches already-seen fields that are REQUIRED
+// and still EMPTY, and re-fills them against a FRESH scan, which is what makes those gates true.
+test("cascade: a field PROMOTED from optional to required is re-filled", async () => {
+  // The live shape: `alpha` fills, and THAT is what makes `beta` mandatory. beta was optional when the
+  // page was scanned, so the fill correctly spent nothing on it — and its AI fallback, gated on
+  // isRequired from that same scan, could never fire.
+  let alphaFilled = false;
+  const scanNow = () => ({ url: "u", fields: [
+    { fieldName: "alpha", label: "Alpha", widgetType: "text", isRequired: true,
+      currentValue: alphaFilled ? "done" : "", wrapperSel: "[w-a]" },
+    { fieldName: "beta", label: "Beta", widgetType: "text", isRequired: alphaFilled,
+      currentValue: "", wrapperSel: "[w-b]" },
+  ] });
+  const act = {
+    aiEnabled: false,
+    scanPage: async () => scanNow(),
+    repeatingScan: async () => ({ sections: {} }),
+    readText: async () => (alphaFilled ? "done" : ""),
+    focusField: async () => true,
+    clearText: async () => {},
+    insertText: async () => { alphaFilled = true; },
+    typeChars: async () => { alphaFilled = true; },
+    blurActive: async () => { alphaFilled = true; },
+    delay: async () => {}, delayFull: async () => {},
+    llm: async () => ({ ok: false }),
+  };
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const recon = (out && out.cascadeRecon) || [];
+  assert.ok(recon.some((l) => /PROMOTED/.test(l) && /beta/.test(l)),
+    "beta went optional -> REQUIRED and is still empty; recon was " + JSON.stringify(recon));
+  // ONCE only — promotedTried guarantees termination, so a field that still cannot be filled does not
+  // spin the cascade loop.
+  assert.equal(recon.filter((l) => /PROMOTED/.test(l) && /beta/.test(l)).length, 1, "re-tried exactly once");
+});
+
+test("cascade: a field REQUIRED FROM THE START is NOT re-filled (this is not a blanket retry)", async () => {
+  // Guard against what the first draft of this did: re-filling every required-and-empty field turned a
+  // targeted cascade fix into a second fill pass on every page, and broke 20 tests.
+  const fields = [
+    { fieldName: "gamma", label: "Gamma", widgetType: "text", isRequired: true, currentValue: "", wrapperSel: "[w-g]" },
+  ];
+  const act = {
+    aiEnabled: false,
+    scanPage: async () => ({ url: "u", fields }),
+    repeatingScan: async () => ({ sections: {} }),
+    readText: async () => "",
+    focusField: async () => true,
+    clearText: async () => {}, insertText: async () => {}, typeChars: async () => {},
+    blurActive: async () => {}, delay: async () => {}, delayFull: async () => {},
+    llm: async () => ({ ok: false }),
+  };
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  assert.ok(!((out && out.cascadeRecon) || []).some((l) => /PROMOTED/.test(l)),
+    "required all along — nothing was promoted, so nothing to redo");
+});
+
+test("cascade: a field that HOLDS a value is never re-filled", async () => {
+  const fields = [
+    { fieldName: "beta", label: "Beta", widgetType: "text", isRequired: true, currentValue: "already here", wrapperSel: "[w-b]" },
+  ];
+  const act = {
+    aiEnabled: false,
+    scanPage: async () => ({ url: "u", fields }),
+    repeatingScan: async () => ({ sections: {} }),
+    readText: async () => "already here",
+    focusField: async () => true,
+    clearText: async () => {}, insertText: async () => {}, typeChars: async () => {},
+    blurActive: async () => {}, delay: async () => {}, delayFull: async () => {},
+    llm: async () => ({ ok: false }),
+  };
+  const out = await drivePageFill(act, {}, {}, {}, T_BUDGETS);
+  const recon = (out && out.cascadeRecon) || [];
+  assert.ok(!recon.some((l) => /PROMOTED/.test(l)), "nothing to recover — must not re-actuate a filled field");
+});
