@@ -50,6 +50,36 @@ with checks as (
          '0'
 
   union all
+  -- 0017: which résumé an application was sent with
+  select 'application resume columns',
+         (select count(*) from information_schema.columns
+           where table_schema = 'public' and table_name = 'applications'
+             and column_name in ('resume_id','resume_sha256','resume_delta'))::text,
+         '3'
+
+  union all
+  select 'resumes versioning columns',
+         (select count(*) from information_schema.columns
+           where table_schema = 'public' and table_name = 'resumes'
+             and column_name in ('sha256','deleted_at'))::text,
+         '2'
+
+  union all
+  -- Deleting a résumé must NULL the pointer, never cascade into deleting applications.
+  select 'resume_id on delete set null',
+         (select rc.delete_rule from information_schema.referential_constraints rc
+            join information_schema.key_column_usage k on k.constraint_name = rc.constraint_name
+           where k.table_name = 'applications' and k.column_name = 'resume_id'),
+         'SET NULL'
+
+  union all
+  -- 0018: the tracker's "approved" signal
+  select 'approved_at column',
+         (select count(*) from information_schema.columns
+           where table_schema = 'public' and table_name = 'applications' and column_name = 'approved_at')::text,
+         '1'
+
+  union all
   -- RLS on every owner-scoped table
   select 'RLS enabled',
          (select count(*) from pg_tables

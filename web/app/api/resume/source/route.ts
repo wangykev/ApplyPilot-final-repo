@@ -1,13 +1,14 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
+import { putResume } from "@/lib/resume-store";
 
 export const runtime = "nodejs";
 
 const MAX_BYTES = 5 * 1024 * 1024; // 5 MB — sources are small
 
-/** Upload the resume SOURCE (.tex or .docx) to Storage + record it. One source
- *  per user: uploading either kind replaces the previous source (both files). */
+/** Upload the resume SOURCE (.tex or .docx) to Storage + record it. The newest source row is the one
+ *  in force; earlier ones are KEPT so an application built from them can still be shown. */
 export async function POST(req: Request) {
   let form: FormData;
   try {
@@ -30,26 +31,16 @@ export async function POST(req: Request) {
   } = await supabase.auth.getUser();
   if (!user) return bad("You're not signed in.", 401);
 
-  const path = `${user.id}/source.${ext}`;
   const mime = ext === "tex" ? "application/x-tex" : "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-  const { error: upErr } = await supabase.storage
-    .from("resumes")
-    .upload(path, file, { upsert: true, contentType: mime });
-  if (upErr) return bad("Upload failed: " + upErr.message, 500);
-
-  // one source per user — remove the OTHER kind's file + the old row
-  const other = ext === "tex" ? `${user.id}/source.docx` : `${user.id}/source.tex`;
-  await supabase.storage.from("resumes").remove([other]);
-  await supabase.from("resumes").delete().eq("user_id", user.id).eq("kind", "source");
-  const { error: insErr } = await supabase.from("resumes").insert({
-    user_id: user.id,
-    kind: "source",
+  // The newest source row wins, so uploading a .tex over a .docx simply supersedes it — no need to
+  // delete the other file, and deleting it would strand any application built from it.
+  const res = await putResume(supabase, user.id, "source", {
     filename: file.name,
     mime,
-    size: file.size,
-    storage_path: path,
+    bytes: new Uint8Array(await file.arrayBuffer()),
+    ext,
   });
-  if (insErr) return bad("Saved the file but couldn't record it: " + insErr.message, 500);
+  if (!res.ok) return bad(res.error, 500);
 
   // .tex comes back as text so the editor can open it immediately
   let tex: string | undefined;

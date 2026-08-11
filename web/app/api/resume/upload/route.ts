@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
+import { putResume } from "@/lib/resume-store";
 
 export const runtime = "nodejs";
 
@@ -27,27 +28,19 @@ export async function POST(req: Request) {
   } = await supabase.auth.getUser();
   if (!user) return bad("You're not signed in.", 401);
 
-  const path = `${user.id}/default-resume.pdf`;
-  const { error: upErr } = await supabase.storage
-    .from("resumes")
-    .upload(path, file, { upsert: true, contentType: file.type || "application/pdf" });
-  if (upErr) return bad("Upload failed: " + upErr.message, 500);
-
-  // one default per user: replace the row
-  await supabase.from("resumes").delete().eq("user_id", user.id).eq("kind", "default");
-  const { error: insErr } = await supabase.from("resumes").insert({
-    user_id: user.id,
-    kind: "default",
+  // VERSIONED, not replaced (see lib/resume-store): the previous row and its bytes stay, so an
+  // application that recorded "sent with this résumé" still resolves to the document it really used.
+  const res = await putResume(supabase, user.id, "default", {
     filename: file.name,
     mime: file.type || "application/pdf",
-    size: file.size,
-    storage_path: path,
+    bytes: new Uint8Array(await file.arrayBuffer()),
+    ext: "pdf",
   });
-  if (insErr) return bad("Saved the file but couldn't record it: " + insErr.message, 500);
+  if (!res.ok) return bad(res.error, 500);
 
   return NextResponse.json({
     ok: true,
-    resume: { filename: file.name, size: file.size, storage_path: path },
+    resume: { filename: res.row.filename, size: res.row.size, storage_path: res.row.storage_path },
   });
 }
 

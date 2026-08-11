@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "selfid-language-1";
+const AP_BUILD_MARKER = "selfid-name-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6657,17 +6657,58 @@ async function runCdpOnboard(tabId, opts) {
       // user), so break out and let the auth stage do its job, exactly as the terminal-state exits
       // inside waitFor already do for already-applied and maintenance pages.
       const authNow = (sc) => !!(sc && (sc.hasAuthEl || sc.passwordInput || sc.emailInput || sc.signInWithEmail));
-      const w = await waitFor((sc) => !!(sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1 || authNow(sc),
-        await renderBudget(12000, 25000), "resume-upload-input");
-      s = w.scan || s;
+      const decisive = (sc) => !!(sc && ((sc.markers && sc.markers.resumeUploadInput) || (sc.formFieldCount || 0) > 1 || authNow(sc)));
+      // ── A BLANK PAGE IS NOT A NEGATIVE ANSWER (cat.wd5, 2026-08-10) ───────────────────────────────
+      // "No upload control" and "nothing has rendered yet" are different observations, and only the
+      // first is a reason to stop. This tenant renders the whole screen late: on the run that WORKED
+      // the identical wait read `title "Careers" · formFields 0 · markers [none]` at 6.4s and was
+      // satisfied at 10.1s; on the run that halted it read the SAME empty state at 4.7s, 13.7s, 17.5s
+      // and 28.8s and gave up at the 25s ceiling — then the operator looked at the tab and found the
+      // CREATE-ACCOUNT page, i.e. the click had gone exactly where it should and simply arrived late.
+      // The halt was a definitive claim ("never rendered its upload control") drawn from a page that
+      // had rendered nothing at all.
+      //
+      // Same principle the auth stage already applies to an empty page after a submit: absence of
+      // evidence during a navigation is not evidence of absence. So a still-BLANK page buys one more
+      // budget; a page that has rendered SOMETHING that isn't the upload control is a real negative
+      // and stops immediately, which keeps a genuinely wrong page from costing double.
+      const stillBlank = (sc) => !!sc && (sc.formFieldCount || 0) === 0 && !authNow(sc)
+        && !(sc.markers && Object.keys(sc.markers).some((k) => sc.markers[k]));
+      //
+      // MEASURED on cat.wd5 (2026-08-10), in a VISIBLE tab with a warm cache and no extension involved:
+      // TTFB 467ms · DOMContentLoaded 793ms · load event 1484ms · posting content on screen at ~13s.
+      // The document and its assets arrive in under two seconds and then the SPA spends another ~11s
+      // booting and fetching the posting through its own API before it renders anything. Hidden and
+      // cold, that comfortably clears 25s — so the budget was simply short for this tenant, not wrong
+      // about the page. Hence: wait, wait again, then hard-reload once (ignoreCache re-fetches a bundle
+      // that genuinely wedged) before admitting defeat.
+      let w = null;
+      const LABELS = ["resume-upload-input", "resume-upload-input(still blank)", "resume-upload-input(after reload)"];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        w = await waitFor(decisive, await renderBudget(12000, 25000), LABELS[attempt]);
+        s = w.scan || s;
+        if (decisive(s) || !stillBlank(s)) break;
+        if (attempt === 0) {
+          LOG("the résumé page is STILL BLANK — no fields, no auth chrome, no markers. That is a render in progress, not a missing control; waiting one more budget.");
+        } else if (attempt === 1) {
+          // Nothing has been typed on this page yet, so a reload costs only time — and a wedged SPA
+          // bundle is the one cause more waiting can never fix.
+          LOG("still blank after two full budgets — hard-reloading the page once and waiting again.");
+          try { await cdpReload(); } catch (e) { LOG("reload failed: " + String((e && e.message) || e)); }
+        }
+      }
       if (authNow(s)) {
         LOG("Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage (the résumé page comes after).");
         return { scan: s, needsAuth: true };
       }
       if ((s.formFieldCount || 0) > 1) { LOG("the résumé page moved on by itself — already past it."); return { scan: s }; }
       if (!(s.markers && s.markers.resumeUploadInput)) {
+        // Say which of the two it actually was — a page that stayed blank is a slow tenant, and telling
+        // the operator "the control is missing" sends them looking for the wrong thing.
         return { halt: { ok: true, reached_form: false, needs_operator: true, stopped: "resume-upload-input-missing",
-          detail: "the Autofill-with-Resume page never rendered its upload control." } };
+          detail: stillBlank(s)
+            ? "the Autofill-with-Resume page never rendered ANYTHING (no fields, no auth chrome, no markers) across two render budgets AND a hard reload — that is the tenant failing to boot its SPA, not a missing control."
+            : "the Autofill-with-Resume page rendered, but without an upload control." } };
       }
     }
     if (s.markers && s.markers.resumeUploadSuccess) LOG("the résumé is already uploaded on this page — continuing.");

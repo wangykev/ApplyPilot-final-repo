@@ -547,3 +547,58 @@ alter table public.applications
   add constraint applications_status_check
   check (status in ('queued', 'needs_review', 'submitted', 'interviewing', 'offer', 'rejected'));
 
+
+
+-- ==========================================================================
+-- 0017_application_resume.sql
+-- ==========================================================================
+-- WHICH RÉSUMÉ an application was sent with.
+--
+-- The tracker could show every answer on a submitted application except the document that went with
+-- it. These three columns close that, and they are shaped for the tailored-résumé future rather than
+-- only for today:
+--
+--   resume_id      -> the resumes row this application was built from
+--   resume_sha256  -> the hash of the bytes actually attached (the record of what was sent)
+--   resume_delta   -> NULL means "the base résumé, unmodified" — which is every application TODAY,
+--                     since one default PDF is attached to every run. When per-application AI
+--                     tailoring ships it holds the tailor's own edit records (tex-tailor.ts already
+--                     emits them, and fitTexToPages bakes its page-fit reverts INTO those records),
+--                     so replaying a tailored résumé is a pure spliceTexEdits — no LLM call, no
+--                     page-fit loop. Storing ~0.8KB of edits instead of a 30KB PDF per application is
+--                     what keeps this affordable across many users; measured on a real 9KB source
+--                     résumé with 21 bullets.
+--
+-- on delete set null: removing a résumé must never cascade into deleting applications.
+alter table public.applications
+  add column if not exists resume_id uuid references public.resumes (id) on delete set null;
+alter table public.applications add column if not exists resume_sha256 text;
+alter table public.applications add column if not exists resume_delta jsonb;
+
+-- ---------------------------------------------------------------- resumes: VERSIONED
+-- Upload used to DELETE the previous row and overwrite the bytes at a fixed path, so the moment you
+-- re-uploaded, every application pointing at "your résumé" silently resolved to a DIFFERENT document
+-- — the record broke exactly when you would want it. Rows are now kept and addressed by content
+-- hash; `deleted_at` is what "I removed my résumé" means, so history survives it.
+alter table public.resumes add column if not exists sha256 text;
+alter table public.resumes add column if not exists deleted_at timestamptz;
+
+-- The current résumé of a kind = the newest row that is not soft-deleted.
+create index if not exists resumes_current_idx
+  on public.resumes (user_id, kind, created_at desc)
+  where deleted_at is null;
+
+
+-- ==========================================================================
+-- 0018_application_approved_at.sql
+-- ==========================================================================
+-- WHEN the operator finished approving this application review.
+--
+-- Approval already exists per FIELD, inside review_bundle_json, and the tracker LIST deliberately does
+-- not load that column (it is a large jsonb). So a row whose every flagged field was approved still read
+-- "Needs review" in the list, and there was no way to see at a glance what was actually ready to submit.
+--
+-- A TIMESTAMP rather than a boolean, matching applied_at / deleted_at / login_at: null means not
+-- approved, and a value records when. Status is deliberately NOT touched — the enum is written by the
+-- extension, and approval is a different axis from where the application sits in the pipeline.
+alter table public.applications add column if not exists approved_at timestamptz;

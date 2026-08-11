@@ -92,7 +92,9 @@ async function downloadResume(
     .select("filename, mime, size, storage_path")
     .eq("user_id", userId)
     .eq("kind", "default")
+    .is("deleted_at", null)
     .order("created_at", { ascending: false })
+    .limit(1) // résumés are versioned now — without this, maybeSingle() ERRORS on a second upload
     .maybeSingle();
   if (!rrow?.storage_path) return null;
   const { data: blob } = await supabase.storage.from("resumes").download(rrow.storage_path);
