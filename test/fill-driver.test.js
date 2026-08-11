@@ -9961,3 +9961,114 @@ test("aiFillDate: no usable model reply → needs_review, never a fabricated dat
   assert.strictEqual(r.flag, "ai-date-no-basis");
   assert.strictEqual(act.store.Year, undefined, "nothing was written");
 });
+
+// â”€â”€ WORKDAY SELF-ID: the answers are known, so the page must never block on them (cat.wd5 2026-08-10) â”€â”€
+// Page 6 halted with "The field Date is required" + "The field Please check one of the boxes below: is
+// required" on a page whose answers we were holding: the profile has disability_status, and a signature
+// date is simply today. Both fields render OPTIONAL until `name` is filled, and filling name promotes
+// them — so answering them up front removes the cascade rather than recovering from it.
+const { isSignatureDateField: _isSigDate, selfIdDisabilityCandidates: _disCands,
+        SELF_ID_DISABILITY_PATH: _DIS_PATH, FIELD_MAP: _FM, deterministicTierFor: _tierFor } = require("../fill-driver.js");
+
+test("self-ID: the disability field is MAPPED — 'no mapping' is what left it blank", () => {
+  assert.equal(_FM.disabilityStatus, _DIS_PATH, "cat.wd5's disabilityStatus must reach the profile value");
+});
+
+test("self-ID disability: the profile wording comes first, the bare polarity token last", () => {
+  const c = _disCands("No, I do not have a disability");
+  assert.equal(c[0], "No, I do not have a disability", "an exact hit needs no inference");
+  assert.equal(c[c.length - 1], "No", "…and the bare polarity token is the fallback POLARITY LEAD commits");
+  // This is the live gap: Workday's option is LONGER than the profile's phrasing, so exact match misses
+  // and containment is refused. Only the polarity token can land it.
+  assert.ok(!c.includes("No, I do not have a disability and have not had one in the past"));
+});
+
+test("self-ID disability: yes and decline map to their own ladders", () => {
+  assert.deepEqual(_disCands("Yes, I have a disability"), ["Yes, I have a disability", "Yes"]);
+  const d = _disCands("I do not want to answer");
+  assert.ok(d.some((x) => /decline|do not want|don't wish|prefer not/i.test(x)), "decline offers the common wordings");
+  assert.ok(!d.includes("No"), "declining is NOT a 'no' — it must never be answered as one");
+  assert.deepEqual(_disCands(""), [], "no stored answer means nothing to offer, never a guess");
+});
+
+test("signature date: recognised by field name AND by label, and only for date widgets", () => {
+  assert.ok(_isSigDate({ fieldName: "dateSignedOn", widgetType: "date", label: "Date" }));
+  assert.ok(_isSigDate({ fieldName: "whatever", widgetType: "date", label: "Today's Date" }));
+  // a date with its own meaning is NOT a signature date — stamping today there is a WRONG answer
+  assert.ok(!_isSigDate({ fieldName: "x", widgetType: "date", label: "Date of Birth" }));
+  assert.ok(!_isSigDate({ fieldName: "x", widgetType: "date", label: "Graduation Date" }));
+  // and it must be a date widget at all
+  assert.ok(!_isSigDate({ fieldName: "dateSignedOn", widgetType: "text", label: "Date" }));
+});
+
+test("signature date is DETERMINISTIC — never routed to the AI, required or not", () => {
+  const optional = { fieldName: "dateSignedOn", widgetType: "date", label: "Date", isRequired: false };
+  assert.equal(_tierFor(optional, {}, new Map(), null), "signature-date",
+    "OPTIONAL matters: this is the state the field is in BEFORE `name` promotes it");
+  assert.equal(_tierFor(Object.assign({}, optional, { isRequired: true }), {}, new Map(), null), "signature-date");
+});
+
+
+// ── the self-ID checkbox group must use the SAME ladder as radio/dropdown (cat.wd5 live 2026-08-10) ──
+// It used a raw lowercase byte compare, so the profile's "No, I do not have a disability" missed
+// Workday's "No, I do not have a disability and have not had one in the past", the REQUIRED field ended
+// blank, and Save was refused on a page whose answer we were holding. These are the REAL option labels
+// read off that page.
+const { fillCheckboxGroupCdp: _fillCbg, selfIdDisabilityCandidates: _cands } = require("../fill-driver.js");
+const CAT_DISABILITY_OPTIONS = [
+  "Yes, I have a disability, or have had one in the past",
+  "No, I do not have a disability and have not had one in the past",
+  "I do not want to answer",
+];
+
+function cbgAct(labels) {
+  const boxes = labels.map((labelText, i) => ({ id: "b" + i, labelText, checked: false }));
+  return {
+    clicks: [], boxes,
+    readCheckboxGroup: async () => boxes.map((b) => ({ ...b })),
+    clickRadioLabel: async (loc, id) => {
+      const b = boxes.find((x) => x.id === id);
+      if (b) b.checked = !b.checked;
+    },
+    readChecked: async (id) => !!(boxes.find((x) => x.id === id) || {}).checked,
+    installQuietWatch: async () => {},
+    awaitQuiet: async () => ({ quiet: true }),
+    delay: async () => {},
+  };
+}
+
+test("self-ID checkbox group: the profile's shorter wording lands via POLARITY LEAD", async () => {
+  const act = cbgAct(CAT_DISABILITY_OPTIONS);
+  const cands = _cands("No, I do not have a disability");
+  const r = await _fillCbg(act, { wrapperSel: "[w]" }, cands, T_BUDGETS);
+  assert.notEqual(r.status, "needs_review", "this is the live failure: " + r.detail);
+  const checked = act.boxes.filter((b) => b.checked).map((b) => b.labelText);
+  assert.deepEqual(checked, ["No, I do not have a disability and have not had one in the past"],
+    "exactly one box, and it is the NO one");
+});
+
+test("self-ID checkbox group: a decline answer never lands on 'No'", async () => {
+  const act = cbgAct(CAT_DISABILITY_OPTIONS);
+  const r = await _fillCbg(act, { wrapperSel: "[w]" }, _cands("I do not want to answer"), T_BUDGETS);
+  assert.notEqual(r.status, "needs_review", r.detail);
+  assert.deepEqual(act.boxes.filter((b) => b.checked).map((b) => b.labelText), ["I do not want to answer"]);
+});
+
+test("self-ID checkbox group: an AMBIGUOUS polarity escalates instead of guessing", async () => {
+  // A tenant splitting one polarity into two meanings is the shape POLARITY LEAD must refuse.
+  const act = cbgAct([
+    "No, I do not have a disability and have not had one in the past",
+    "No, but I have had one in the past",
+    "Yes, I have a disability",
+  ]);
+  const r = await _fillCbg(act, { wrapperSel: "[w]" }, ["No"], T_BUDGETS);
+  assert.equal(r.status, "needs_review", "two options lead with No — picking one would be a guess");
+  assert.deepEqual(act.boxes.filter((b) => b.checked), [], "and NOTHING is actuated");
+});
+
+test("self-ID checkbox group: containment is still refused", async () => {
+  const act = cbgAct(["Armed Forces Pacific", "Pennsylvania"]);
+  const r = await _fillCbg(act, { wrapperSel: "[w]" }, ["PA"], T_BUDGETS);
+  assert.equal(r.status, "needs_review", "'pa' inside 'Pacific' must never commit");
+  assert.deepEqual(act.boxes.filter((b) => b.checked), []);
+});

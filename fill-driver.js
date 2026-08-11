@@ -400,6 +400,11 @@ const FIELD_MAP = {
   //   AI-inferred). `gender` live-recon'd on Magna (options Female/Male/Other/Undeclared);
   //   race/veteran/disability map the same way once their automation-ids are observed.
   "gender": "self_identification.gender",
+  // OBSERVED live on cat.wd5 (2026-08-10) — the OFCCP disability self-ID, rendered there as a
+  // checkbox_group ("Please check one of the boxes below:"). Its profile wording rarely matches the
+  // tenant's verbatim, so the value expands into a candidate ladder ending in the bare polarity
+  // token; see selfIdDisabilityCandidates.
+  "disabilityStatus": "self_identification.disability_status",
   // AI-3: agreements — legal consent checkbox; checked ONLY if the operator pre-set the
   //   boolean to true (fillCheckboxCdp reconciles to it). null/false → skipped → if REQUIRED
   //   the walk halts with a clean `consent-not-granted` message (never fabricates consent).
@@ -488,6 +493,56 @@ function appendFieldVariants(profile, path, cands) {
     if (s && !seen.has(s.toLowerCase())) { base.push(s); seen.add(s.toLowerCase()); }
   }
   return base;
+}
+
+// ── WORKDAY'S VOLUNTARY SELF-IDENTIFICATION PAGE (operator, 2026-08-10) ─────────────────────────
+// One structure across every tenant that has it: a disability question, a signature Name, a Date,
+// and sometimes a form-language picker / employee id. Only the WORDING of the options varies, and
+// only in its tail ("No, I do not have a disability" vs "No, I do not have a disability and have not
+// had one in the past"). The answers do not vary at all: the date is the day you fill the form, and
+// the disability answer is the one in your profile.
+//
+// WHY THEY ARE ANSWERED UNCONDITIONALLY, required or not. Several tenants render Date and the
+// disability pick as OPTIONAL — until Name is filled, at which point BOTH become REQUIRED. Live on
+// cat.wd5 page 6: we filled `name` from the profile, Save came back "The field Date is required" +
+// "The field Please check one of the boxes below: is required", and the walk halted on a page whose
+// answers we were holding the whole time. Filling them up front means the cascade has nothing left
+// to promote, so the failure cannot occur rather than being recovered from.
+const SELF_ID_DISABILITY_PATH = "self_identification.disability_status";
+
+// A signature/completion date — the day the form is being filled in. NOT a date with its own meaning
+// (start date, DOB, graduation): isSignatureDateQuestion is deliberately narrow and unit-pinned.
+function isSignatureDateField(f) {
+  if (!f || (f.widgetType !== "date" && f.widgetType !== "year")) return false;
+  if (String(f.fieldName || "") === "dateSignedOn") return true;
+  try { return !!apMatch.isSignatureDateQuestion(f.label); } catch (e) { return false; }
+}
+
+/**
+ * The disability answer as an ORDERED candidate list, most specific first.
+ *
+ * The profile stores one phrasing ("No, I do not have a disability"); Workday renders another ("No, I
+ * do not have a disability and have not had one in the past"). Exact match therefore misses, and
+ * containment is refused here on purpose — a substring match against a list of options is the guess
+ * this codebase does not make.
+ *
+ * The bare polarity token is what closes the gap, and it is not a guess: POLARITY LEAD commits a "No"
+ * only when EXACTLY ONE option leads with it, which is true of every OFCCP self-ID form (Yes… / No… /
+ * a decline line). A tenant that ever split "No" into two meanings would have two leading options and
+ * escalate to review instead of picking one.
+ */
+function selfIdDisabilityCandidates(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return [];
+  const low = s.toLowerCase();
+  const out = [s]; // the operator's own words first — an exact hit needs no inference at all
+  const declines = /prefer not|do not want|don'?t want|do not wish|don'?t wish|decline|not to answer/.test(low);
+  if (declines) {
+    for (const v of ["I do not want to answer", "I don't wish to answer", "I decline to answer", "Prefer not to answer"])
+      if (v.toLowerCase() !== low) out.push(v);
+  } else if (/^yes\b/.test(low)) out.push("Yes");
+  else if (/^(no|i do not|i don'?t)\b/.test(low)) out.push("No");
+  return out;
 }
 
 // ── "Previously employed here?" — company matcher (verbatim M12/M13.3 port).
@@ -1246,6 +1301,9 @@ function isSelfIdLanguageField(f, scanFields) {
 
 function deterministicTierFor(f, profile, bucketIndex, empCompany) {
   const mappedPath = FIELD_MAP[f.fieldName] || null;
+  // A signature date is knowable exactly, so it is never an AI question — and saying so here keeps it
+  // out of the batch planner as well as the per-field call.
+  if (isSignatureDateField(f)) return "signature-date";
   if (mappedPath) {
     // resolve()'s CONTRACT is { candidates } | { skip } — NOT a bare value. Reading it as a scalar is what
     // produced the live `s.toLowerCase is not a function`.
@@ -2190,11 +2248,21 @@ const fillCheckboxGroupCdp = async (act, loc, candidates, budgets) => {
   const checkedNow = () => opts.filter((o) => o.checked);
   const before = (checkedNow()[0] || {}).labelText || null;
 
-  let target = null;
-  for (const cand of candidates || []) {
-    const found = opts.find((o) => o.labelText.toLowerCase() === String(cand).toLowerCase());
-    if (found) { target = found; break; }
-  }
+  // THE SAME MATCH LADDER radio and dropdown use — not a raw lowercase equality, which is what this was
+  // and which cost a live halt (cat.wd5 page 6, 2026-08-10). The profile says "No, I do not have a
+  // disability"; Workday's box reads "No, I do not have a disability and have not had one in the past".
+  // A byte compare misses, so a REQUIRED self-ID field ended blank and Save was refused on a page whose
+  // answer we were holding.
+  //
+  // `containment: false` keeps the rule this codebase actually has: no substring guessing on a shown
+  // list. What lands it is POLARITY LEAD — a bare "No" commits ONLY when exactly one option leads with
+  // "No", which is true of every OFCCP form (Yes… / No… / decline) and false for any tenant that splits
+  // a polarity into two meanings, where it correctly escalates instead. Normalization and typo tolerance
+  // come along for free, and self-ID is exactly where a silently-wrong answer matters most.
+  const m = apMatch.matchCandidates(candidates || [], optionLabels, { containment: false });
+  // `let`, not `const`: the quiescence gate below RE-RESOLVES this after waiting, because waiting is
+  // exactly the window in which a rebuild re-issues the checkbox ids.
+  let target = m && m.targetIndex >= 0 ? opts[m.targetIndex] : null;
   if (!target) return { status: "needs_review", detail: "no candidate matched the checkbox-group labels", after: before, options: optionLabels };
 
   const readBack = async () => (await act.readCheckboxGroup(loc)) || [];
@@ -4278,6 +4346,23 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // parse has usually already suggested a reasonable set. Off ⇒ keep the suggestions and record
         // them for review; on ⇒ add every profile skill the taxonomy will accept.
         Object.assign(record, await fillSkillsCdp(act, loc, list, budgets, { fillAll: !!(profile && profile.fill_all_skills) }));
+      } else if (isSignatureDateField(f)) {
+        // ALWAYS today, REQUIRED OR NOT (operator, 2026-08-10). A signature date is knowable exactly —
+        // it is the day the form is being completed — so there is nothing to infer and no reason to
+        // spend an LLM call. Filling it while it is still OPTIONAL is the point: on the self-ID page it
+        // is Name that promotes this field to required, and by then Save has already been refused.
+        // Deterministic ⇒ `filled`, no review flag, exactly like a mapped profile value.
+        const segs = apMatch.dateOrderOf(f.dateSegments || []);
+        const ymd = todayYMD();
+        record.resolved = ymd;
+        const value = segs.length
+          ? segs.reduce((acc, s) => (ymd[s] !== undefined ? Object.assign(acc, { [s]: ymd[s] }) : acc), {})
+          : ymd;
+        Object.assign(record, await fillDateCompositeCdp(act, loc, value, budgets));
+        if (record.verified === true) {
+          record.matchTier = "today";
+          record.detail = "a signature/completion date is the day the form is filled in — entered today's date";
+        }
       } else if (!mappedPath) {
         record.status = "skipped";
         record.detail = "no mapping";
@@ -4295,7 +4380,11 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
           if (f.widgetType === "dropdown" || f.widgetType === "radio" || f.widgetType === "typeahead" || f.widgetType === "checkbox_group") {
             arg = typeof rawValue === "boolean"
               ? boolLadderCandidates(profile, mappedPath, rawValue)
-              : appendFieldVariants(profile, mappedPath, arg);
+              // The self-ID disability wording differs between the profile and the tenant in its TAIL,
+              // so the stored phrasing goes first and the bare polarity token last (POLARITY LEAD then
+              // commits it only if exactly one option leads with it).
+              : appendFieldVariants(profile, mappedPath,
+                  mappedPath === SELF_ID_DISABILITY_PATH ? selfIdDisabilityCandidates(rawValue) : arg);
           }
           record.resolved = arg;
           if (f.widgetType === "text") Object.assign(record, await fillTextCdp(act, loc, arg, budgets));
@@ -8102,5 +8191,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, deterministicTierFor, isSelfIdLanguageField, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiFillDate, aiCanonicalizeField, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, isSelfIdLanguageField, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiFillDate, aiCanonicalizeField, isSignatureDateField, selfIdDisabilityCandidates, SELF_ID_DISABILITY_PATH, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }
