@@ -60,7 +60,21 @@ are unrelated, and the **fastest pages had the worst drift**:
 Drift vs the probe says "noise, ignore it". Drift vs the `[TRACE]` per-action timings says "a 250ms pace
 took 17.3s". **Always grade drift against `[TRACE]`, never against the probe.**
 
-### 3. The profile is "median fast, tail catastrophic"
+### 3. Lateness is LATENCY, not lost coverage — classify the PREDICATE before "hardening" any wait
+
+The tempting inference from conclusion 1 is that a starved clock makes wall-clock-bounded poll loops
+*miss* things. **Audited across all 59 such loops (round 6): it does not.** Every one on a run path
+watches either a MONOTONE predicate (X appears / X is gone — a sparse poll notices late, it cannot miss)
+or a STABILITY predicate (N equal reads — where sparse reads are *stronger* evidence, so drift makes
+these SAFER and the adaptive FAST path is the weak regime). Only a **transient** predicate (true, then
+false again) can be starved, and there are none: where a real transient matters the code installs a
+page-side `MutationObserver` instead of sampling.
+
+**Consequences, both load-bearing:** a wait that timed out wants a bigger **BUDGET**, never an attempts
+floor — and "the poll didn't look often enough" is not an available explanation for a failed wait here.
+Full table + the sweep in round 6.
+
+### 4. The profile is "median fast, tail catastrophic"
 
 Which is exactly what "it lags sometimes" feels like from the outside. Page-thread median was healthy on
 nearly every page measured (probe p50 **1–42ms**); the p95 blew out to 19.7s. One widget stalls and owns
@@ -98,6 +112,17 @@ cracked this (it timed `delay(250)` at 17.30s). Three `debugLagTrace` readings m
    work. `cdpSend` times issue→resolve and cannot tell waiting from working.
 3. **Drift is REAL** (see Standing conclusion 1). The old "possibly an artefact of timing with a timer
    inside an MV3 worker" hedge is retired.
+4. **`[TRANSITION]`'s poll count was an ARITHMETIC ESTIMATE, not a count** (fixed 2026-08-10). It read
+   `Math.round(elapsed / intervalMs)` — i.e. it assumed the interval was honored, which is precisely
+   what drift breaks. Under drift it **OVERSTATES** the number of reads (a 500ms request measured at
+   2694ms prints ~5 polls for 1 actual read), so it reported best-case coverage exactly when coverage
+   was worst. Any claim resting on that field is unsupported. It is now a literal counter incremented
+   per iteration. The sibling numbers on that line (`sawNewPageMs` / `confirmMs`) were always real
+   `Date.now()` deltas and are unaffected.
+
+⚠ **General rule this is an instance of: never print a poll count you did not COUNT.** A derived
+count is an assertion that the clock kept time — the one assumption every measurement on this page
+exists to test.
 
 **Measuring CPU without measuring your instrument:** a first sampler that enumerated `Get-Process` every
 tick made `powershell` itself the busiest process on the box. Sample total CPU only
@@ -320,6 +345,96 @@ than the 2.5s drift it replaces.
 
 ---
 
+## 2026-08-10 — round 6: the poll-loop audit — THE ATTEMPTS-FLOOR BRANCH IS CLOSED
+
+Round 3 ended with "the systemic fix is the loop shape … it touches ~30 loops". This round actually
+enumerated and classified them. **The count was wrong (59, not ~30) and the conclusion is the opposite of
+the one round 3 pointed at: no run-path loop in this codebase needs an attempts floor.**
+
+### The criterion
+
+A wall-clock-bounded poll loop is only starved of COVERAGE by a slow clock if the thing it watches can
+stop being true. So classify by the PREDICATE, not by the loop:
+
+| class | predicate | what a sparse poll costs | correct fix |
+|---|---|---|---|
+| **A · rising monotone** | "wait until X exists / holds V" — element mounted, value committed, count grew, rect laid out, page advanced | notices LATE, by at most one interval. **Cannot miss.** | **BUDGET** (never an attempts floor) |
+| **B · falling monotone** | "wait until X is GONE" — `closeDropdownConfirmed`'s `optionCount === 0`, entry deleted | same: notices late only | **BUDGET** |
+| **C · stability** | "N equal reads" / "no growth for W ms" — every settle | ⚠ **the opposite** — see below | **a minimum wall-clock SPAN** |
+| **D · transient** | "true, then false again" | genuinely MISSES it | an attempts floor |
+
+### Result of the sweep: **class D is EMPTY on every run path**
+
+All 59 sites are A, B or C. The two the previous session guessed were transient are not:
+`cdpRectReady` / `cdpEvalRectReady` (cdp.js) wait for a rect to BECOME non-zero — a rising edge, class A.
+The one genuinely density-sensitive loop is `background.js:2181` in the **dropdown RECON probe**, and it
+is density-sensitive because it *samples a curve* (does the option list grow 36→38→40 or render
+atomically?) rather than waiting for a condition. It is a diagnostic, not a run path.
+
+**This is architectural, not luck.** Where a true transient matters — a DOM change that happens BETWEEN
+two reads — this codebase does not sample at all; it installs a page-side `MutationObserver`
+(`cdpInstallQuietWatch`, `cdpInstallGroupWatch` in cdp.js) and reads the accumulated record. That is the
+right answer to a transient and it is already in place, which is why no polling loop was ever left
+holding one.
+
+⚠ So: **do not add an attempts floor anywhere.** It buys nothing against a class A/B predicate (they
+cannot be missed), and against class C it is actively wrong — see below. This closes the item; it does
+not defer it.
+
+### The inversion: drift makes settle polls SAFER, and the FAST path is where they are weakest
+
+Class C is the one place sampling density changes an ANSWER rather than a latency — and it runs the
+other way from the intuition. A stability poll exits on agreement between reads, so **sparse reads make
+a false "settled" LESS likely** (two reads 2.7s apart are stronger evidence than two 40ms apart). The
+real hazard is the opposite regime: `cdpAdaptiveDelay` collapsing the interval to ~40ms on a fast tab,
+where two agreeing reads can both land inside one mounting pause.
+
+That is why CLAUDE.md's rule is "settle polls use `delayFull`, never `delayRender`" — and it is the same
+reasoning that already rejected "invalidate the stability pair on a pace overrun" (the field count grows
+monotonically during hydration, so a wider gap is *stronger* evidence). Both point at the same guard:
+**a minimum wall-clock SPAN, which is interval-independent.** `awaitFieldSetSettled`'s `NO_GROWTH_MS`
+(1200) and `cdpWaitNextPageInner`'s 600ms errors-must-persist window are both exactly this, and both are
+already correct.
+
+### Budgets: only one wait had a real timeout on record, and it is already fixed
+
+Re-derived only where there is a concrete failing run to test against, per the standing rule:
+
+| wait | timeouts on record | verdict |
+|---|---|---|
+| `waitFor(resume-upload-input)` | 3 runs, all at exactly 25000ms | **raised 25s → 45s** (round 5). Class A ⇒ budget was the only correct lever. |
+| `cdpWaitNextPage` (15s) | 2 exhaustions | **unchanged — both were TRUE NEGATIVES** (swallowed Save clicks, recovered by re-clicking). The wait answered correctly; there is nothing here to widen. An attempts floor was rejected separately: 30 polls × 2694ms = **81s per transition** on the walk's most frequent wait. |
+
+### Fixed in passing
+
+- **`background.js:5982` assigned `errSteady`** — an identifier that does not exist. background.js is
+  sloppy-mode (no `"use strict"`, and it cannot be strict: `importScripts` shares ONE global scope), so
+  it silently created a global and the flicker timer was **never reset on an un-hydrated read**. Effect:
+  an `errSince` set before a mid-transition un-hydrated gap survived it, so the 600ms
+  errors-must-persist guard could be satisfied by a timestamp from BEFORE the gap — the exact flicker
+  that guard exists to reject. Now `errSince = 0`.
+
+### New instruments
+
+- **`polls` is a literal counter** (see the tooling section) and `[TRANSITION]` now prints the ACTUAL
+  mean interval next to the requested one, so a starved clock is visible on the line itself.
+- **`cdpClockProbe` (`[CLOCKS]`, cdp.js)** — times the SW timer and the PAGE timer over the SAME
+  interval, both arms started together, since drift is bursty and two probes minutes apart prove
+  nothing. Runs once per page under `debugLagTrace`. Reading: **SW late + page on time ⇒ the worker is
+  starved and the tab is fine**; both late ⇒ the tab really is throttled.
+  ⚠ Its `page-perf` column is `performance.now()`, which is REAL TIME — it keeps advancing through a
+  freeze. It is **not** a freeze detector, and reading it as one would answer "no freezing" every time.
+  Freeze is callback LATENESS (the `PAGE` column). It does earn its place for two narrower things:
+  confirming our SW-side `Date.now()` readings are honest, and catching a document REPLACEMENT (a
+  navigation resets the time origin → a nonsense delta).
+- **`warnNoWorkerTimers` — a loud `console.warn` banner** when the worker-timers polyfill fails to
+  install. The `hidden-SLOW (no worker timers)` regime is a documented code path that has **never once
+  been observed on a Workday tenant**, yet waits keep getting hardened against it. Now it announces
+  itself: banner absent ⇒ the regime is not in play and nothing needs to defend against it; banner
+  present ⇒ a uniformly slow run is explained rather than mysterious.
+
+---
+
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
 
 Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now
@@ -363,11 +478,21 @@ stopped: "resume-upload-input-missing"
 ```
 
 4 of 5 paces logged `page-abandoned`, a 50ms pace taking 3.5–5.0s. Cause: **ONBOARDING pages are mid-
-NAVIGATION, and a navigating document's timer does not fire.** The poll's deadline is wall-clock but its
-interval is `act.delay`, so a slow clock cost it SAMPLES — 21 polls in 25s where the pre-change run
-satisfied the same wait in 7.0s (round 1's run 4 timeout managed 29). A missed transient reads as "the
-control never rendered". This is exactly the poll-starvation class described above, met from the other
-direction.
+NAVIGATION, and a navigating document's timer does not fire.**
+
+⚠ **The halt itself was NOT caused by lost samples. That framing was written here first, and it is
+WRONG — retired 2026-08-10.** `waitFor(resume-upload-input)` watches **existence**, and existence is
+**MONOTONE**: once Workday mounts the control it stays mounted. A sparse poll against a monotone
+condition can only notice LATE — by at most one interval — it cannot MISS the event. 21 reads across
+25000ms means the final read happened at ~25s and the control was still absent; it genuinely was not
+there. The control experiment is already on record: round 1's **run 4 timed out at the same 25s budget
+on the SW clock** with 29 reads. Same ~1-in-4 transient, page clock or not. Budget was the correct fix
+(round 5, 25s → 45s), and no attempts floor belongs anywhere on this wait.
+
+**The gate still stands, on the firmer argument:** during a navigation the page clock can hang
+INDEFINITELY, and our abandon ceiling is ITSELF an SW timer, so a pace there has no reliable bound —
+50ms requested, 3.5–5.0s observed. That is a bounding problem, not a coverage one, and it is the same
+reason round 3 SW-times the transition wait.
 
 **Fix: `cdpSetPageClock(on)` — scoped opt-in, mirroring `cdpSetSyntheticInput` exactly**, which exists for
 the same reason (the auth surface is where the clever fast path failed live). FILL and REPLAY enable it;
@@ -451,6 +576,13 @@ under the page clock. **Choosing a clock cannot fix this.** The systemic fix is 
 must not give up early should bound itself by **ATTEMPTS as well as wall-clock**, or recompute its deadline
 from actual elapsed time, so a late clock costs latency instead of coverage. That is the next real piece of
 work in this area, and it is bigger than a clock swap — it touches ~30 loops.
+
+> ⚠ **SUPERSEDED by round 6 — do not act on the paragraph above.** The audit it called for was done: there
+> are **59** such loops, not ~30, and **every one of them on a run path watches a MONOTONE or a STABILITY
+> predicate**, neither of which can be starved of coverage by a late clock. An attempts floor buys nothing
+> against the first and is actively wrong against the second (sparse reads make a false "settled" LESS
+> likely, not more). Onboarding's real cost here was LATENCY, and round 5's scoped page clock removed it
+> (~1200ms/read → ~70ms/read). The loop shape was not the bug.
 
 ### Where the residual overruns actually are (build `page-clock-3`, one run, positioned)
 

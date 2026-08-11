@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "onboard-clock-1";
+const AP_BUILD_MARKER = "clock-probe-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -3115,6 +3115,12 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     // too — a page that "starts slow" is often already slow before the first field is touched.
     const _dbgLag = await new Promise((r) => chrome.storage.local.get("debugLagTrace", (v) => r(!!(v && v.debugLagTrace))));
     if (_dbgLag) { cdpLagStart(); LOG(`debugLagTrace ON — timing every CDP command, plus a ${500}ms no-op probe and the SW's own scheduling drift, so a pause can be blamed on Workday / the transport / us.`); }
+    // PAIRED clock sample, once per page, ~250ms. Times the SW timer and the PAGE timer over the SAME
+    // interval, which is the only way the comparison means anything (drift is bursty — two probes taken
+    // minutes apart prove nothing). Answers the standing question empirically: SW late + page on time ⇒
+    // the tab is fine and only our worker is starved; both late ⇒ the tab really is throttled. See
+    // cdpClockProbe for why the page's performance.now() reading is NOT a freeze detector.
+    if (_dbgLag) { try { await cdpClockProbe(250, `page ${(opts && opts.pageNumber) || "?"} pre-fill`); } catch (e) { /* probe only — never block a fill */ } }
     if (_dbgTrace) LOG(`debugPageTrace ON — streaming a [TRACE] line for every field decision and every wait on page ${(opts && opts.pageNumber) || "?"}.`);
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
@@ -5961,8 +5967,15 @@ async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
   // (awaitFieldSetSettled) that re-proves the same stability from scratch.
   let sawNewPageAt = 0;
   let countFirstSeenAt = 0;   // when the CURRENT field count was first observed (the settle seed)
+  // LITERAL poll counter (2026-08-10). This was `Math.round(elapsed / intervalMs)` — an ESTIMATE that
+  // assumes the interval was honored, which is exactly what SW-timer drift breaks. Under drift it
+  // OVERSTATES the reads (a 500ms request measured at 2694ms printed ~5 polls for 1 real read), i.e. it
+  // claimed best-case coverage precisely when coverage was worst. Never print a poll count you did not
+  // count. sawNewPageMs/confirmMs were always real Date.now() deltas and are untouched.
+  let polls = 0;
   while (Date.now() - start < timeoutMs) {
     await cdpAdaptiveDelay(intervalMs);
+    polls++;
     // Keep a HIDDEN tab out of the frozen lifecycle so Workday's SPA transition can run — the
     // hidden page-2→3 stall (2026-07-03). No-op when visible/not-frozen. See cdpWakePage.
     await cdpWakePage();
@@ -5979,7 +5992,12 @@ async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
     if (state && state.softErrorPresent) return { advanced: false, softError: true, state };
     let scan = null;
     try { scan = await cdpEval(cdpPageScan); } catch (e) { continue; }
-    if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; errSteady = 0; continue; } // not hydrated
+    // `errSteady` here was a TYPO for errSince (no such variable; background.js is sloppy-mode, so it
+    // silently created a global and the flicker timer was NEVER reset on an un-hydrated read). Effect:
+    // an errSince set before a mid-transition un-hydrated gap stayed set, so the 600ms
+    // errors-must-persist guard could be satisfied by a timestamp from BEFORE the gap — the exact
+    // flicker this guard exists to reject. Fixed 2026-08-10.
+    if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; errSince = 0; continue; } // not hydrated
     const sig = cdpPageSig(scan);
     if (sig === prevSig) {
       steady = -1; // still page 1
@@ -6011,14 +6029,17 @@ async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
       return {
         advanced: true, sig,
         sawNewPageMs: sawNewPageAt - start, confirmMs: Date.now() - sawNewPageAt,
-        polls: Math.round((Date.now() - start) / intervalMs),
+        polls, pollMeanMs: Math.round((Date.now() - start) / Math.max(1, polls)), intervalMs,
         stableCount: steady, stableSince: countFirstSeenAt,
       };
     }
     steady = scan.fields.length;
     countFirstSeenAt = Date.now();   // this count is new → the unchanged-run starts now
   }
-  return { advanced: false, timeout: true };
+  // Carry the REAL read count into the nav-timeout halt: this is the one exit where coverage is the
+  // question ("did we look often enough, or did the page truly never advance?"), and it is where an
+  // estimated count would have been most misleading.
+  return { advanced: false, timeout: true, polls, pollMeanMs: Math.round((Date.now() - start) / Math.max(1, polls)), intervalMs };
 }
 
 const WALK_MAX_PAGES = 8; // generous cap; the review/terminal/session checks are the REAL stops — this only bounds a detection bug from looping forever.
@@ -6332,7 +6353,10 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // Where the post-Save gap actually goes: WORKDAY's part (the new page appearing) vs OURS (this
       // loop's second equal-count read). `settle` on the next [CDP-TIME] line is a THIRD wait on top.
       if (res.advanced && res.sawNewPageMs != null) {
-        LOG(`[TRANSITION] page ${page} → ${page + 1}: Workday rendered the new page in ${res.sawNewPageMs}ms · we then spent ${res.confirmMs}ms confirming it was stable (${res.polls} poll(s) × ${500}ms) — settle on the next line is a further wait.`);
+        // `polls` is a LITERAL count and `pollMeanMs` the ACTUAL mean interval — print the requested
+        // interval next to it so a starved clock is visible right here (500 asked / 2694 actual) rather
+        // than inferred later. Do not go back to elapsed/interval arithmetic: see docs/fill-speed-log.md.
+        LOG(`[TRANSITION] page ${page} → ${page + 1}: Workday rendered the new page in ${res.sawNewPageMs}ms · we then spent ${res.confirmMs}ms confirming it was stable (${res.polls} poll(s), mean ${res.pollMeanMs}ms vs ${res.intervalMs}ms requested) — settle on the next line is a further wait.`);
       }
       // Hand the observed stability to the next page's settle (see awaitFieldSetSettled's `seed`).
       _settleSeed = (res.advanced && res.stableCount > 0 && res.stableSince > 0)

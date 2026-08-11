@@ -566,7 +566,11 @@ measures the service worker's own timer drift — three clocks that fail indepen
 prints whether it was the renderer, the channel, or that call's own work. OFF ⇒ pass-through. Detail + how
 to read it: the `live-testing` skill. **SW timer drift is the LAG itself, not an artefact (answered
 2026-08-10): `act.delay` overruns 3–69× in the MV3 worker — every speed measurement, refutation and fix
-direction lives in `docs/fill-speed-log.md`; read it before investigating any slow fill.**
+direction lives in `docs/fill-speed-log.md`; read it before investigating any slow fill.** ⚠ Drift costs
+**LATENCY, not coverage**: all 59 wall-clock poll loops were audited and every run-path one watches a
+MONOTONE predicate (can only be noticed late, never missed) or a STABILITY one (where sparse reads are
+*stronger* evidence) — so **a wait that timed out wants a bigger BUDGET; never add an attempts floor**,
+and "the poll didn't look often enough" is not an available explanation for a failed wait.
 
 ## Working principles
 
