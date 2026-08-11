@@ -543,8 +543,28 @@ Three fixes, in order of how much they mattered:
 3. The first retry rung 500ms → 4000ms; 500ms timed out on 3/3 sign-ins whose clicks had all worked.
 
 For reference: filling starts **~135ms** after success is detected, so there is nothing to win after
-sign-in itself. And you cannot force a sign-in by clicking Sign Out — Workday's session self-restores from
-a persistent cookie. Clearing site cookies is the only reliable way.
+sign-in itself.
+
+**✔ SIGNING OUT WORKS — the old claim here ("you cannot force a sign-in by clicking Sign Out; Workday's
+session self-restores from a persistent cookie; clearing site cookies is the only reliable way") is WRONG
+and was corrected 2026-08-11 by the operator, then verified live on cat.wd5.** The UI sign-out lands on
+`/login`, and the very next run logged `Stage 3 — auth screen detected` + `sign-in attempt 1`. Do it from
+any tenant page in three JS clicks (coordinates drift; automation-ids don't):
+
+```js
+document.querySelector('[data-automation-id="hammyMenuIcon"]').click();          // top-right menu
+// wait ~1.8s
+document.querySelector('[data-automation-id="account-submenu-button"]').click(); // shows the account email
+// wait ~1.8s
+[...document.querySelectorAll('button,a,[role="button"],[role="menuitem"]')]
+  .find(e => /^sign\s*out$/i.test((e.innerText||"").trim())).click();
+```
+
+⚠ **This matters more than it looks: while the session is warm, EVERY run skips Stage 3 entirely.** Live,
+six consecutive runs produced ZERO sign-ins — so any onboarding auth bug (the re-click, the empty shell,
+create-account) is UNREACHABLE by re-running, and a clean result proves nothing about that code. Sign out
+before each auth test. The session cookie is HttpOnly (only `timezoneOffset` is JS-visible on cat.wd5), so
+the page cannot clear it — the UI sign-out is the lever. See the `signed-out-testing` memory.
 
 ### Fresh-account findings (2026-08-07) — read before starting one
 

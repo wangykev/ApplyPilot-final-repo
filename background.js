@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "selfid-name-1";
+const AP_BUILD_MARKER = "merge-speed-onboard-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -225,7 +225,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             reviewUrl: message.reviewUrl || "",
           },
         },
-        () => {
+        async () => {
           const err = chrome.runtime.lastError;
           // …and WHERE it will report. With more than one dev server around (or a localhost/prod mix)
           // "which tracker did this fill land in?" is a real question, and the host answers it. The key
@@ -235,9 +235,44 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           console.log(`[ApplyPilot] reporting credential ${err ? "FAILED to store: " + err.message
             : `stored — key ${newKey ? newKey.length + " chars" : "MISSING (empty!)"}, ${
               !oldKey ? "first one" : newKey === oldKey ? "UNCHANGED from the previous one" : "replaces the previous one"}, reporting to ${host}`}`);
-          sendResponse(err ? { ok: false, error: err.message } : { ok: true });
+          if (err) { sendResponse({ ok: false, error: err.message }); return; }
+          // A fresh credential is the ONE event that can repair a rejected report, so retry it here
+          // rather than making the user re-run a fill they already sat through. Reported back so the
+          // caller can say "your application is here" instead of "reconnected" — the recovered RESULT
+          // is the thing a user cares about; the reconnect is plumbing.
+          const flush = await flushPendingReport();
+          sendResponse({ ok: true, recovered: !!flush.flushed });
         }
       );
+    });
+    return true;
+  }
+
+  // Is the reporting link actually WORKING? (2026-08-11)
+  //
+  // AP_PING deliberately does not answer this: it proves the extension is installed and reachable,
+  // which succeeds just as happily with a credential the server deleted. That gap is why a user could
+  // sit on /app/connect reading a green "connected" badge while every report 401'd. This is the
+  // question the site actually needs — "did your last report land, and is a run parked waiting for a
+  // working key?" — so the site can repair it instead of describing it.
+  //
+  // Read-only. Returns no key, no payload, nothing sensitive: just the shape of the problem.
+  if (type === "AP_REPORT_HEALTH") {
+    chrome.storage.local.get(["apReportError", "apPendingReport", "apSession"], (s) => {
+      const err = s && s.apReportError;
+      const pending = s && s.apPendingReport;
+      sendResponse({
+        ok: true,
+        healthy: !err,
+        connected: !!(s && s.apSession && s.apSession.ingestKey),
+        reason: err ? err.reason || null : null,
+        at: err ? err.at || null : null,
+        // What a recovery would actually restore — lets the site promise the RESULT, not the repair.
+        // `company` is the only human-recognisable field the payload reliably carries (`role` is
+        // always null on this path), so the site says "your Caterpillar application", not "a report".
+        pendingCompany: (pending && pending.payload && pending.payload.company) || null,
+        hasPending: !!(pending && pending.payload),
+      });
     });
     return true;
   }
@@ -2957,10 +2992,34 @@ async function awaitReviewPageSettled(act, hints) {
   return { dump, records: last > 0 ? last : 0, ms: Date.now() - t0 };
 }
 
-async function awaitFieldSetSettled(act) {
+// `seed` (optional) = { count, since } — a field count the PAGE-TRANSITION wait already observed
+// unchanged, and the timestamp it was first seen. Purely an optimisation, and deliberately a narrow one:
+//
+//   • The BAR IS UNCHANGED. Breaking still requires the count to have been unchanged for NO_GROWTH_MS.
+//     The seed only stops us re-gathering, from zero, stability we already watched — cdpWaitNextPage
+//     returns ONLY after two reads with the same count, so that run is real evidence, not an assumption.
+//   • It CANNOT skip the wait on a page that is still mounting: if the first scan below reads a DIFFERENT
+//     count than the seed, the ordinary `n !== last` branch fires, lastChangeAt resets to now, and the
+//     page gets the FULL fresh window. Growth after the transition is therefore still caught in full.
+//   • It never claims stability earlier than an actual observation (`since` is the first read showing
+//     that count), so the credited interval is always time we were genuinely watching.
+//   • Honest limitation: the seeded interval was sampled at the transition loop's beat (~500ms) rather
+//     than this loop's 150ms, so its sample spacing is wider. That is a difference in resolution, not in
+//     kind — this loop is a sampler too — but it is why the seed is capped below.
+//
+// SEED_CREDIT_CEILING_MS caps how much of the window a seed may supply, so at least one poll of THIS
+// loop's own tighter cadence always contributes before we agree to start filling. Operator's framing,
+// and the right one: 1.2s is cheap next to a run that fails because it filled a half-rendered page.
+async function awaitFieldSetSettled(act, seed) {
   const t0 = Date.now();
   const NO_GROWTH_MS = 1200, ZERO_BAIL_MS = 1000, POLL_MS = 150, CEILING_MS = 12000;
+  const SEED_CREDIT_CEILING_MS = NO_GROWTH_MS - (2 * POLL_MS); // ≥2 of our own polls must still land
   let last = -1, lastChangeAt = 0, zeroSince = null;
+  if (seed && seed.count > 0 && seed.since > 0) {
+    const credit = Math.min(Math.max(0, t0 - seed.since), SEED_CREDIT_CEILING_MS);
+    last = seed.count;
+    lastChangeAt = t0 - credit;   // as if we had been watching this count for `credit` already
+  }
   while (Date.now() - t0 < CEILING_MS) {
     let n = 0;
     try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → counts as a zero read (keep polling) */ }
@@ -3036,7 +3095,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // 12s; a page with no flat fields (repeating-only, e.g. My Experience) bails after ~1s of all-zero
   // reads. Genuine value-triggered cascades still appear only AFTER a commit → they remain the cascade
   // re-scan's job; this settles the INITIAL load only.
-  const settleMs = await awaitFieldSetSettled(act);
+  const settleMs = await awaitFieldSetSettled(act, opts && opts.settleSeed);
   // Accumulation merge key — the pathname (the volatile query is dropped) + the sorted field-set.
   // Stable per page across re-runs, distinct across pages even on a same-pathname SPA.
   //
@@ -3118,11 +3177,23 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     // too — a page that "starts slow" is often already slow before the first field is touched.
     const _dbgLag = await new Promise((r) => chrome.storage.local.get("debugLagTrace", (v) => r(!!(v && v.debugLagTrace))));
     if (_dbgLag) { cdpLagStart(); LOG(`debugLagTrace ON — timing every CDP command, plus a ${500}ms no-op probe and the SW's own scheduling drift, so a pause can be blamed on Workday / the transport / us.`); }
+    // PAIRED clock sample, once per page, ~250ms. Times the SW timer and the PAGE timer over the SAME
+    // interval, which is the only way the comparison means anything (drift is bursty — two probes taken
+    // minutes apart prove nothing). Answers the standing question empirically: SW late + page on time ⇒
+    // the tab is fine and only our worker is starved; both late ⇒ the tab really is throttled. See
+    // cdpClockProbe for why the page's performance.now() reading is NOT a freeze detector.
+    if (_dbgLag) { try { await cdpClockProbe(250, `page ${(opts && opts.pageNumber) || "?"} pre-fill`); } catch (e) { /* probe only — never block a fill */ } }
     if (_dbgTrace) LOG(`debugPageTrace ON — streaming a [TRACE] line for every field decision and every wait on page ${(opts && opts.pageNumber) || "?"}.`);
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
     out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
+    // POST-fill sample, so the probe BRACKETS the fill instead of only sniffing the calm before it.
+    // Live (2026-08-10, cat.wd5, 5 pages): every pre-fill sample read both clocks on time (+6..+23ms)
+    // while the SAME run logged `delayFull(600ms) actually took 1312ms` mid-fill. One sample at the
+    // quietest moment of the page cannot see a bursty stall — it just reports the quiet. Two samples
+    // still cannot prove absence, but they can CATCH one, which the single sample provably could not.
+    if (_dbgLag) { try { await cdpClockProbe(250, `page ${(opts && opts.pageNumber) || "?"} POST-fill`); } catch (e) { /* probe only */ } }
   } finally {
     if (_selfId) {
       cdpSetTrustedText(false);                        // never leave the next page paying for this one
@@ -3981,10 +4052,22 @@ async function reportApplication(bundle, jobContext, extra) {
     console.log("[ApplyPilot] application reported —", res && res.status, `(${payload.status}, ${needs} need review)`);
     if (!outcome.ok) {
       console.log("[ApplyPilot] ⛔⛔ " + outcome.message);
-      try { await chrome.storage.local.set({ apReportError: { at: Date.now(), status: (res && res.status) || 0, reason: outcome.reason } }); } catch (e) { /* best effort */ }
+      // KEEP THE PAYLOAD, don't just record that it failed (2026-08-11). A rejected report used to be
+      // pure LOSS: a fill that took minutes produced a bundle that went nowhere, and the only trace was
+      // a console line and an `apReportError` marker that nothing ever read. The run's work is still
+      // perfectly good — the credential is what went stale — so park the exact payload and re-POST it
+      // the moment a fresh credential arrives (see flushPendingReport, called from AP_SET_SESSION).
+      // ONE slot, overwritten by the newest failure: this is a repair path, not an outbox, and an
+      // unbounded queue of full review bundles would be a storage-quota problem of its own.
+      try {
+        await chrome.storage.local.set({
+          apReportError: { at: Date.now(), status: (res && res.status) || 0, reason: outcome.reason },
+          apPendingReport: { at: Date.now(), payload },
+        });
+      } catch (e) { /* best effort */ }
       emitRunProgress("Report rejected", outcome.reason === "stale-key" ? "re-sync the extension on /app/connect (its key was rotated)" : outcome.message);
     } else {
-      try { await chrome.storage.local.remove("apReportError"); } catch (e) { /* best effort */ }
+      try { await chrome.storage.local.remove(["apReportError", "apPendingReport"]); } catch (e) { /* best effort */ }
     }
     // …and TELL THE CALLER. It used to return nothing, so the ATS run announced "Reported to the
     // website." unconditionally — printed one line under the ⛔ saying the tracker never got it
@@ -3994,6 +4077,49 @@ async function reportApplication(bundle, jobContext, extra) {
   } catch (e) {
     console.log("[ApplyPilot] application report skipped:", String((e && e.message) || e));
     return { ok: false, reason: "exception", status: 0 };
+  }
+}
+
+// Re-POST a report that was REJECTED earlier, using whatever credential is stored NOW.
+//
+// This is the half that turns "your application vanished" into "your application is here": the fill
+// itself was fine, so once a working key lands the parked payload is still exactly what should have
+// been sent. Called from AP_SET_SESSION, i.e. the instant a fresh credential arrives — the user does
+// not ask for a retry and never learns one happened.
+//
+// Deliberately NOT a general retry loop: no timers, no backoff, no queue. It runs only on the one
+// event that can plausibly fix the failure (a new credential). A rejected report with no reconnect
+// simply stays parked, which is a recoverable state rather than a lost one.
+//
+// { flushed:false, reason } when there is nothing to do or it failed again — callers treat a failed
+// flush as "still broken", never as success.
+async function flushPendingReport() {
+  let pending, apSession;
+  try {
+    const store = await new Promise((r) => chrome.storage.local.get(["apPendingReport", "apSession"], r));
+    pending = store.apPendingReport; apSession = store.apSession;
+  } catch (e) { return { flushed: false, reason: "storage" }; }
+  if (!pending || !pending.payload) return { flushed: false, reason: "nothing-pending" };
+  if (!apSession || !apSession.ingestUrl || !apSession.ingestKey) return { flushed: false, reason: "not-connected" };
+  try {
+    const res = await fetch(apSession.ingestUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": "Bearer " + apSession.ingestKey },
+      body: JSON.stringify(pending.payload),
+    });
+    const outcome = reportOutcome(res && res.status);
+    if (!outcome.ok) {
+      console.log(`[ApplyPilot] pending report STILL rejected (${res && res.status}) — leaving it parked: ${outcome.message}`);
+      return { flushed: false, reason: outcome.reason || "rejected", status: (res && res.status) || 0 };
+    }
+    // Clear BOTH markers together: apReportError is what the site reads to decide whether to heal, so
+    // leaving it set after a successful flush would make the page heal again on the next visit —
+    // and every heal rotates the key (getSession deletes the old row), so that is a rotation loop.
+    await chrome.storage.local.remove(["apPendingReport", "apReportError"]);
+    console.log(`[ApplyPilot] ✓ recovered a previously rejected report — the application reached the tracker (parked ${Math.round((Date.now() - (pending.at || Date.now())) / 1000)}s).`);
+    return { flushed: true, status: res.status };
+  } catch (e) {
+    return { flushed: false, reason: "exception" };
   }
 }
 
@@ -4641,6 +4767,7 @@ async function runCdpFillPage(tabId, profile, defaults, jobContext) {
     }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so a hidden single-page fill behaves like the walk
     cdpSetSyntheticInput(true); // FILL entry point — hidden actuation dispatches page-side (the proven form-page repertoire); auth/onboarding/recon stay trusted
+    cdpSetPageClock(true);      // ditto for PACING: paces sleep on the page's worker-backed timer here (settled form). Onboarding stays SW-timed — a navigating doc's timer doesn't fire and starves poll SAMPLES.
     // Foreground fast-fill: NO hidden-gate. The fill runs whether the tab is VISIBLE
     // (fast — act.delay scales down; watch it) or HIDDEN (slow/background — full delays,
     // throttle-immune), adapting LIVE as the operator minimizes/restores.
@@ -5056,6 +5183,7 @@ async function runCdpReplayWalk(tabId, opts) {
     // therefore ends as needs_review and halts — it can never become a wrong value. `forceTrustedInput`
     // in chrome.storage.local still overrides everything.
     cdpSetSyntheticInput(true);
+    cdpSetPageClock(true);      // REPLAY entry point — same as the fill walk: its pages are settled forms, so paces ride the page's worker-backed timer
     const _vis = await cdpVisible().catch(() => true);
     const _mode = _vis ? "VISIBLE (trusted input)" : "HIDDEN (synthetic input for fields; the submit click stays trusted)";
     LOG(authorize
@@ -5989,10 +6117,41 @@ async function reclickNextWhenClean(act, prevSig, tries, LOG) {
 // window) still guards progressive field mounting after we return. Hidden+throttled (no worker
 // timers) keeps the full 500ms beat, byte-identical to the proven slow path.
 async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
+  // SW-TIME this poll (2026-08-10). A transition is a NAVIGATION, and a navigating document's timer
+  // does not fire — with the page clock on, each intervalMs pace was abandoned at interval+slack, so
+  // this 15s WALL-CLOCK budget bought ~7 polls instead of ~30. Running out is a nav-timeout HALT, so
+  // the cost of a starved interval here is a failed run, not a slow one. Same lesson as onboarding
+  // (docs/fill-speed-log.md); save/restore rather than global, because the pages either side of the
+  // transition ARE settled forms where the page clock is the correct clock.
+  const _wasPageClock = cdpPageClockEnabled();
+  cdpSetPageClock(false);
+  try {
+    return await cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs);
+  } finally {
+    cdpSetPageClock(_wasPageClock);
+  }
+}
+
+async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
   const start = Date.now();
   let steady = -1, errSince = 0;
+  // TRANSITION BREAKDOWN (2026-08-10). Operator: "I press next, it waits 5s before filling, but I can see
+  // the page loaded after 2 — what are the other 3 seconds doing?" A single duration cannot answer that,
+  // so split it: `sawNewPageMs` is when Workday's new page FIRST showed up (their time), and the
+  // remainder up to the return is OURS — the second equal-count read this loop requires before it will
+  // call the page settled. Reported by the caller next to `settle`, which is a THIRD wait
+  // (awaitFieldSetSettled) that re-proves the same stability from scratch.
+  let sawNewPageAt = 0;
+  let countFirstSeenAt = 0;   // when the CURRENT field count was first observed (the settle seed)
+  // LITERAL poll counter (2026-08-10). This was `Math.round(elapsed / intervalMs)` — an ESTIMATE that
+  // assumes the interval was honored, which is exactly what SW-timer drift breaks. Under drift it
+  // OVERSTATES the reads (a 500ms request measured at 2694ms printed ~5 polls for 1 real read), i.e. it
+  // claimed best-case coverage precisely when coverage was worst. Never print a poll count you did not
+  // count. sawNewPageMs/confirmMs were always real Date.now() deltas and are untouched.
+  let polls = 0;
   while (Date.now() - start < timeoutMs) {
     await cdpAdaptiveDelay(intervalMs);
+    polls++;
     // Keep a HIDDEN tab out of the frozen lifecycle so Workday's SPA transition can run — the
     // hidden page-2→3 stall (2026-07-03). No-op when visible/not-frozen. See cdpWakePage.
     await cdpWakePage();
@@ -6009,7 +6168,12 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
     if (state && state.softErrorPresent) return { advanced: false, softError: true, state };
     let scan = null;
     try { scan = await cdpEval(cdpPageScan); } catch (e) { continue; }
-    if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; errSteady = 0; continue; } // not hydrated
+    // `errSteady` here was a TYPO for errSince (no such variable; background.js is sloppy-mode, so it
+    // silently created a global and the flicker timer was NEVER reset on an un-hydrated read). Effect:
+    // an errSince set before a mid-transition un-hydrated gap stayed set, so the 600ms
+    // errors-must-persist guard could be satisfied by a timestamp from BEFORE the gap — the exact
+    // flicker this guard exists to reject. Fixed 2026-08-10.
+    if (!scan || !scan.fields || scan.fields.length === 0) { steady = -1; errSince = 0; continue; } // not hydrated
     const sig = cdpPageSig(scan);
     if (sig === prevSig) {
       steady = -1; // still page 1
@@ -6031,10 +6195,27 @@ async function cdpWaitNextPage(prevSig, timeoutMs = 15000, intervalMs = 500) {
       continue;
     }
     errSince = 0;
-    if (scan.fields.length === steady) return { advanced: true, sig };
+    if (!sawNewPageAt) sawNewPageAt = Date.now();   // first read on which the NEW page existed
+    if (scan.fields.length === steady) {
+      // SETTLE SEED — the evidence this loop just gathered, handed to awaitFieldSetSettled so it does not
+      // re-gather it from zero. `stableSince` is when THIS count was FIRST observed (not when the page
+      // appeared): steady was assigned on the previous read, so that read is the start of the unchanged
+      // run, and this read confirms it. Deliberately conservative — never claim stability earlier than
+      // the first read that actually showed this count.
+      return {
+        advanced: true, sig,
+        sawNewPageMs: sawNewPageAt - start, confirmMs: Date.now() - sawNewPageAt,
+        polls, pollMeanMs: Math.round((Date.now() - start) / Math.max(1, polls)), intervalMs,
+        stableCount: steady, stableSince: countFirstSeenAt,
+      };
+    }
     steady = scan.fields.length;
+    countFirstSeenAt = Date.now();   // this count is new → the unchanged-run starts now
   }
-  return { advanced: false, timeout: true };
+  // Carry the REAL read count into the nav-timeout halt: this is the one exit where coverage is the
+  // question ("did we look often enough, or did the page truly never advance?"), and it is where an
+  // estimated count would have been most misleading.
+  return { advanced: false, timeout: true, polls, pollMeanMs: Math.round((Date.now() - start) / Math.max(1, polls)), intervalMs };
 }
 
 const WALK_MAX_PAGES = 8; // generous cap; the review/terminal/session checks are the REAL stops — this only bounds a detection bug from looping forever.
@@ -6046,6 +6227,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
   // terminal sets reachedReview, the loop tracks walkPage, reportPageErrors stashes lastDiag. Stamped
   // onto the bundle in the finally + reported → the website renders a loud halt banner + edit-profile link.
   let reachedReview = false, walkPage = 0, lastDiag = null;
+  // Field-count stability observed by the page-transition wait, carried to the NEXT page's settle.
+  // Null on page 1 (entered from onboarding, so no transition observed it) and after each use.
+  let _settleSeed = null;
 
   // M31.1: surface the EXACT page error text + the fields left EMPTY (no profile value —
   // the likely "required" validation cause) on a stop-with-errors. Takes the CURRENT page's
@@ -6093,6 +6277,7 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
     if (!attached.ok) { LOG("attach FAILED —", attached.error, "(page DevTools open on the tab?)"); return { ok: false, error: "attach-failed:" + attached.error }; }
     await cdpInstallPageOverrides(); // hidden-tab SPA-transition unblock (rAF→setTimeout): so page-to-page advancement runs while backgrounded
     cdpSetSyntheticInput(true); // FILL entry point — hidden actuation dispatches page-side (the proven form-page repertoire); onboarding/auth ran trusted on its own attach
+    cdpSetPageClock(true);      // ditto for PACING (see runCdpFillPage): the walk's pages are settled forms; onboarding ran SW-timed on its own attach
     // Foreground fast-fill (M39): NO hidden-gate — fills immediately, visible=fast (watch the
     // whole walk) or minimize=slow/background, adapting live.
     LOG("attached. Walk starting — keep the tab VISIBLE to watch (fast) or minimize (slow/background). Fills each page → guarded Save & Continue → repeats to the REVIEW page (NEVER submits).");
@@ -6153,7 +6338,12 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       emitRunProgress(`Filling page ${page}`);
-      const { out, pageKey, bundle } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
+      // settleSeed: the field-count stability the PREVIOUS page's transition wait already observed, so
+      // the settle counts it instead of re-proving it from zero. Consumed once (cleared below) — it is
+      // only valid for the page that transition landed on, and page 1 (entered from onboarding, no
+      // transition) correctly has none.
+      const { out, pageKey, bundle } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page, settleSeed: _settleSeed });
+      _settleSeed = null;
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
       //    field does NOT reload (those go to review as usual). Each page accumulate-replaces, so the
@@ -6336,6 +6526,17 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
 
       // ── (f) Wait for the transition OR session-death OR a nav-timeout (dirty halt). ──
       const res = await cdpWaitNextPage(prevSig);
+      // Where the post-Save gap actually goes: WORKDAY's part (the new page appearing) vs OURS (this
+      // loop's second equal-count read). `settle` on the next [CDP-TIME] line is a THIRD wait on top.
+      if (res.advanced && res.sawNewPageMs != null) {
+        // `polls` is a LITERAL count and `pollMeanMs` the ACTUAL mean interval — print the requested
+        // interval next to it so a starved clock is visible right here (500 asked / 2694 actual) rather
+        // than inferred later. Do not go back to elapsed/interval arithmetic: see docs/fill-speed-log.md.
+        LOG(`[TRANSITION] page ${page} → ${page + 1}: Workday rendered the new page in ${res.sawNewPageMs}ms · we then spent ${res.confirmMs}ms confirming it was stable (${res.polls} poll(s), mean ${res.pollMeanMs}ms vs ${res.intervalMs}ms requested) — settle on the next line is a further wait.`);
+      }
+      // Hand the observed stability to the next page's settle (see awaitFieldSetSettled's `seed`).
+      _settleSeed = (res.advanced && res.stableCount > 0 && res.stableSince > 0)
+        ? { count: res.stableCount, since: res.stableSince } : null;
       if (res.maintenance) {
         LOG(`⛔ WORKDAY PLANNED MAINTENANCE after Save & Continue on page ${page} ("Workday is currently unavailable") — NOT a dead session. Retry after the maintenance window.`);
         return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_filled: pagesFilled.length, pages: pagesFilled };
@@ -6587,6 +6788,12 @@ async function runCdpOnboard(tabId, opts) {
       `signInButtonText=${!!s.signInButtonPresent}`,
       `hasAuthEl=${!!s.hasAuthEl}`,
       `markers=[${on.join(",") || "none"}]`,
+      // BODY-TEXT LENGTH — the one input a halt never printed, and the omission cost a whole
+      // investigation (2026-08-11). An `auth-unknown` halt showed every OTHER gate passing
+      // (readyState complete · formFields 0 · hasAuthEl false · markers [none]), so the cause had to be
+      // deduced by ELIMINATION down to the body-text cap — and the log's excerpt is truncated at write
+      // time, so the actual number could not be recovered afterwards at all. It is one integer; print it.
+      `bodyLen=${String(s.bodyText || "").replace(/\s+/g, " ").trim().length}`,
       // The page's OWN stated reason, when it has one — turns "the form is still up" from a dead end
       // into something actionable (2026-08-07).
       ...((s.authErrors && s.authErrors.length) ? [`pageErrors=${JSON.stringify(s.authErrors)}`] : []),
@@ -6596,11 +6803,47 @@ async function runCdpOnboard(tabId, opts) {
     ].join(" · ");
   };
 
+  // ── FORENSICS FOR THE HALTS WE CANNOT REPRODUCE (2026-08-11) ──────────────────────────────────────
+  // These four are rare, intermittent and TERMINAL: the run is over, an operator is already involved,
+  // and the next occurrence may be days away on a machine nobody is watching. So the first occurrence
+  // has to be enough to fix it — there is no "run it again with more logging".
+  //
+  // Earned the hard way. An `auth-unknown` halt printed every input to the empty-shell decision except
+  // the one that decided it, so the cause had to be deduced by eliminating all the others, and the
+  // deciding number could not be recovered from the log at all. Verbosity is free here (a terminal
+  // stop, once), and the cost of being one field short is another whole investigation.
+  //
+  // Deliberately NOT applied to every halt: an ordinary `sso` or `no-credentials` stop is
+  // self-explaining and does not need a page dump.
+  const FORENSIC_HALTS = new Set(["auth-unknown", "blank-page-after-signin", "signin-no-outcome", "resume-upload-input-missing"]);
+  const haltForensics = (stopped, s) => {
+    if (!FORENSIC_HALTS.has(stopped) || !s) return;
+    try {
+      // ALL markers, true AND false. describeState prints only the truthy ones, which is right for a
+      // one-line summary and wrong here: "which markers were absent" is exactly what distinguishes a
+      // dead shell from a page we simply did not recognise.
+      const markers = s.markers || {};
+      const allMarkers = Object.keys(markers).sort().map((k) => `${k}=${!!markers[k]}`).join(" ");
+      const body = String(s.bodyText || "").replace(/\s+/g, " ").trim();
+      LOG(`    ┌─ [AUTH-FORENSIC] ${stopped} — everything the decision saw, so this occurrence is enough to fix it:`);
+      LOG(`    │ bodyText: ${body.length} chars`);
+      LOG(`    │ excerpt : ${JSON.stringify(body.slice(0, 600))}`);
+      LOG(`    │ markers : ${allMarkers || "(none reported by the scan)"}`);
+      LOG(`    │ submit  : ${JSON.stringify(s.authBusy || null)}`);
+      // WHY the empty-shell reload did not run. Null here means the page WAS blank and the recovery
+      // should have fired — which points at the reload budget or the persistence check instead.
+      const refusal = blankAuthRefusal(s);
+      LOG(`    │ blank?  : ${refusal ? "REFUSED — " + refusal : "YES, isBlankAuthPage said this page IS an empty shell (so the reload path is the suspect, not the gate)"}`);
+      LOG(`    └─ if the cause is still not obvious from the above, the missing field is the bug — add it.`);
+    } catch (e) { /* diagnostics must never mask the halt */ }
+  };
+
   // Every human-needed stop LOGS before it returns. These used to be silent returns, so the SW console
   // ended at "detached" and the reason existed only in the popup/website response.
   const haltNeedsOperator = (stopped, detail, s) => {
     LOG(`⛔ HALT (needs operator) — ${stopped}: ${detail}`);
     if (s !== undefined) LOG(`    page state at the halt: ${describeState(s)}`);
+    haltForensics(stopped, s);
     return { ok: true, reached_form: false, needs_operator: true, stopped, detail };
   };
 
@@ -6697,6 +6940,18 @@ async function runCdpOnboard(tabId, opts) {
           try { await cdpReload(); } catch (e) { LOG("reload failed: " + String((e && e.message) || e)); }
         }
       }
+      // ── INDEPENDENT CORROBORATION, and why the fill-speed branch's own fix was DROPPED here ────────
+      // A separate investigation (docs/fill-speed-log.md, round 5) hit this same halt and raised the
+      // single hidden budget 25s → 45s. Its evidence agrees with the diagnosis above and is worth
+      // keeping: the wait halted THREE runs in one session at EXACTLY 25000ms having done 21-29 reads —
+      // so it was LOOKING often enough (~1.2s apart) and the control simply had not rendered; the very
+      // next run satisfied it in 7.0s on the same tenant. That also killed the "sampling problem"
+      // theory: this wait watches EXISTENCE, which is MONOTONE, so a sparse poll can only notice LATE,
+      // never miss — an attempts floor would have bought nothing.
+      // The 45s change is SUPERSEDED by the loop above and was dropped in the merge: three budgets plus
+      // a reload already exceed it, the reload covers a wedged SPA bundle that no amount of waiting can
+      // fix, and — the deciding difference — `stillBlank` stops IMMEDIATELY on a page that rendered
+      // something other than the control, where a single long budget always paid full freight.
       if (authNow(s)) {
         LOG("Workday sent the Autofill-with-Resume click to the SIGN IN screen — handing back to the auth stage (the résumé page comes after).");
         return { scan: s, needsAuth: true };
@@ -6800,10 +7055,31 @@ async function runCdpOnboard(tabId, opts) {
     // report the elapsed time when it finally matches. Silent on every fast wait, which is nearly all.
     const PROGRESS_AFTER_MS = 2000, PROGRESS_EVERY_MS = 2000;
     let lastProgressAt = 0;
+    // ── SCOPED PAGE CLOCK FOR THIS POLL LOOP (2026-08-10, measured) ──────────────────────────────────
+    // Onboarding runs on the SW timer, which fires ~2-2.5s late REGARDLESS of the requested pace
+    // (measured: 50ms→2482ms, 500ms→3290ms). That is most of onboarding's lag, and it also mistimes the
+    // retry ladders — `submitAndWait`'s deliberately-fast 500ms re-click rung measured 3290ms. The
+    // comment above this loop assumes "reads are fast (~62ms apart)"; on a hidden run they are ~1.2s.
+    //
+    // Onboarding is excluded from the page clock globally, and MUST stay excluded, because it NAVIGATES
+    // and a navigating document's timer never fires (the un-gated version halted a run). But THIS loop is
+    // a pure poll — it clicks nothing between iterations — and each iteration ends with an in-page
+    // `scan()`. A scan that RETURNED is positive evidence the document is alive and servicing evals, so
+    // the page clock is valid for the interval that FOLLOWS it. A scan that FAILED (mid-navigation,
+    // detached) drops straight back to the SW timer.
+    //
+    // Self-correcting by construction: navigation is exactly what makes `scan()` fail, so the one state
+    // where the page clock is unsafe is the one state that turns it off. It is re-armed only by another
+    // successful scan. Worst case if a navigation starts DURING a sleep, the race in cdpDelay abandons it
+    // (bounded), and this loop simply polls again — a slow poll costs latency here, never a wrong answer,
+    // and the budgets it runs inside are generous.
+    let lastScanOk = false;
     while (Date.now() - start < timeoutMs) {
-      await pace(500);
+      cdpSetPageClock(lastScanOk);                 // ON only after a scan proved the page responsive
+      try { await pace(500); } finally { cdpSetPageClock(false); }   // always leave onboarding SW-timed
       await cdpWakePage();
       st = await scan();
+      lastScanOk = !!st;
       if (st) last = st;
       const waited = Date.now() - start;
       if (st && waited >= PROGRESS_AFTER_MS && waited - lastProgressAt >= PROGRESS_EVERY_MS) {
@@ -7069,7 +7345,32 @@ async function runCdpOnboard(tabId, opts) {
     const ladder = (timeouts && timeouts.length) ? timeouts : null;
     const n = ladder ? ladder.length : tries;
     let st = null;
+    // ── IS THE RE-CLICK EVER JUSTIFIED? A PAIRED MEASUREMENT (2026-08-11) ──────────────────────────
+    // Operator: "the first click always works manually." The ladder decides "my click did not register"
+    // from the form still being MOUNTED — which is ALSO what an in-flight submit looks like, so it can
+    // re-submit a form that is already working (the double submit is what produces the empty shell).
+    // cdpOnboardScan.authBusy was added to look for positive evidence of a no-op but nothing ever
+    // consumed it, and the only samples on record were taken DURING flight — with no idle baseline they
+    // prove nothing. So take the baseline: one scan before the first click, compared against the state
+    // at the timeout. A field that DIFFERS is a usable tell; one that reads the same on an idle form is
+    // not, however suggestive it looks. Costs one scan per onboarding submit and only prints when a
+    // re-click actually happens, so a clean run stays quiet.
+    let busyBefore = null;
     for (let t = 1; t <= n; t++) {
+      if (t === 1) {
+        try { const s0 = await scan(); busyBefore = (s0 && s0.authBusy) || null; } catch (e) { /* diagnostic only */ }
+        // READINESS, measured at the instant we are about to click. React handler attachment is the one
+        // real "is this button wired yet?" signal (see cdpAuthButtonReady). Logged ONLY when it says the
+        // button is NOT wired — a clean run stays silent, and a noisy one tells us the hydration window
+        // is real and worth GATING on rather than merely reporting.
+        try {
+          const rd = await cdpEval(cdpAuthButtonReady, selectors[0]);
+          if (rd && rd.present && !rd.reactWired) {
+            LOG(`   ⚠ [SUBMIT-READY] about to click "${label}" but React has NOT wired it yet (handlers: ${JSON.stringify(rd.handlers)}, laidOut=${rd.laidOut}). `
+              + `This is the ONE state that genuinely swallows a click — if this line shows up, poll for reactWired BEFORE clicking instead of relying on the retry ladder.`);
+          }
+        } catch (e) { /* measurement only — never block the click */ }
+      }
       const submitted = await clickTarget(selectors, t > 1 ? `${label} (retry ${t - 1})` : label);
       if (!submitted.clicked) return (t > 1) ? { scan: st } : { notFound: true, blockedBy: submitted.blockedBy };
       const wait = ladder ? ladder[t - 1] : timeoutMs;
@@ -7081,6 +7382,13 @@ async function runCdpOnboard(tabId, opts) {
       // doesn't match yet) → return and let the caller re-evaluate on the next loop iteration.
       if (t < n && st && formStillUp(st)) {
         LOG(`${label}: no outcome after ${wait >= 1000 ? Math.round(wait / 1000) + "s" : wait + "ms"} and the form is still up — re-clicking (raced/not-ready button or a throttled page).`);
+        // The paired sample, printed at the ONE moment it matters: we are about to re-submit a form that
+        // may already be working. Read it as: any field that CHANGED between these two is a candidate
+        // in-flight tell we could gate the re-click on; if they are identical, this form exposes no
+        // observable difference between "processing" and "idle", and no amount of tuning the ladder can
+        // tell a swallowed click from a slow one — the recovery is what has to be good.
+        LOG(`   [SUBMIT-BUSY] idle (pre-click): ${JSON.stringify(busyBefore)}`);
+        LOG(`   [SUBMIT-BUSY] now (form still up after ${wait}ms): ${JSON.stringify((st && st.authBusy) || null)}`);
         if (beforeRetry) { try { await beforeRetry(st); } catch (e) { /* best-effort — the re-click proceeds regardless */ } }
         continue;
       }
@@ -7578,9 +7886,28 @@ async function runCdpOnboard(tabId, opts) {
           // The reload is the 8-9s. So the short rung did not make the happy path fast, it manufactured a
           // double submit whose recovery costs a full page reload. A first rung that lets a normal auth
           // round trip finish removes that entirely; a click that GENUINELY did not register (real, and
-          // why this ladder exists — 2026-08-06) is still caught, just 4s later instead of 0.5s, which is
-          // far cheaper than the reload it replaces.
-          timeouts: [4000, 6000, 6000],
+          // why this ladder exists — 2026-08-06) is still caught, just later, which is far cheaper than
+          // the reload it replaces.
+          //
+          // ── 4000ms WAS STILL TOO SHORT — MEASURED, 2026-08-11 ─────────────────────────────────────
+          // Operator: "why do we need the re-click when manually it always works?" Because manually you
+          // wait for the page; this gave up at 4s. The distribution of how long Workday ACTUALLY takes to
+          // answer the auth POST, from live cold sign-ins:
+          //     satisfied 2200ms · satisfied 4800ms · satisfied 13700ms · (timed out at 4000 x2)
+          // i.e. 2.2s-13.7s, with 4000ms sitting IN THE MIDDLE of it — so roughly half of all cold
+          // sign-ins tripped a re-click (measured: 5 of 11) and EVERY one of those re-clicks was a FALSE
+          // POSITIVE: the first click had worked and each run still logged `sign-in outcome: success`.
+          //
+          // There is nothing to poll for instead: the form exposes NO in-flight signal (refuted on two
+          // paired idle-vs-in-flight samples — `disabled`/`aria-busy` never set, and 9 spinner nodes are
+          // mounted AND laid out on the IDLE form; see the workday-onboarding skill). So the only correct
+          // lever is to stop concluding failure from a deadline shorter than the operation. 20s clears the
+          // observed tail with margin.
+          //
+          // THE TRADE, stated plainly: a genuinely swallowed click now costs 20s before the first retry
+          // instead of 4s. That is the right direction — a FALSE re-click risks the empty shell, which is
+          // a needs_operator halt that ends the run, while a slow genuine recovery only costs seconds.
+          timeouts: [20000, 8000, 8000],
           beforeRetry: signInEscalate
         });
         if (r.notFound) return haltNeedsOperator("signin-submit-not-found", r.blockedBy || "no Sign In button", st);
@@ -7739,6 +8066,15 @@ async function runCdpOnboard(tabId, opts) {
         // 2026-08-02: "this was not a password breach"). Report the fact, offer the dialog as ONE
         // possibility among the ordinary ones.
         if (st.markers.signInSubmit) return haltNeedsOperator("signin-no-outcome", "Sign-in didn't complete — the form is still up and Workday showed neither an error nor the next page. Look at the tab: something may be blocking the button (Chrome's data-breach password warning does this), or the credentials may have been rejected without a message.", st);
+        // ── SAY WHY THE EMPTY-SHELL RECOVERY DIDN'T RUN (2026-08-11) ────────────────────────────────
+        // A live halt here printed every input to that decision — readyState complete, formFields 0,
+        // hasAuthEl false, markers [none] — and every one of them PASSED isBlankAuthPage's gates, so
+        // the actual cause had to be deduced by elimination down to the ONE input the halt did not
+        // print: the body-text length (over the boilerplate cap, so a genuinely empty shell read as
+        // "real content" and the reload was refused). That deduction cost an investigation; the log
+        // should just say it. blankAuthRefusal is pure and logging-only — it cannot change the outcome.
+        const refusal = blankAuthRefusal(st);
+        if (refusal) LOG(`   why the empty-shell reload did NOT run: ${refusal}`);
         return haltNeedsOperator("auth-unknown", `${st.title} — ${(st.bodyText || "").replace(/\s+/g, " ").slice(0, 160)}`, st);
       }
 

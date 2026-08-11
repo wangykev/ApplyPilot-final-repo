@@ -58,9 +58,202 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   }
 });
 
-// SW-side wall-clock delay — the ONLY pacing primitive CDP fill code may use.
-// (Page-side setTimeout is throttled to ~1Hz hidden, then frozen; this isn't.)
-const cdpDelay = (ms) => new Promise((r) => setTimeout(r, ms));
+// ── PACING CLOCK START (test-extracted — test/pacing-clock.test.js slices between these markers) ──
+// The ONE pacing primitive CDP fill code may use. ALL of act.delay / delayFull / delayRender land here.
+//
+// WHY THIS IS NOT A BARE setTimeout ANY MORE (2026-08-10). It was, and that timer lives in an MV3
+// service worker, which Chrome starves: measured live on cat.wd5 page 1, `delay(250)` took **17.30s**
+// (69×) inside the `source` field — 32.8s of that page's 43.9s. Also delayFull(600)→3.16s,
+// delayRender(300)→2.48s. Since every pace routes through here, that drift was not a curiosity; it WAS
+// the "it lags sometimes" the operator reported. Full evidence: docs/fill-speed-log.md.
+//
+// The clock is now the PAGE's, because that is the correct clock on the merits, not just the faster one:
+// you pace at 250ms to let the page settle (React re-renders, fkit debounce), so the right timer is the
+// one in the same queue as the work being waited on. The reason it USED to be SW-side is real but
+// narrower than the old comment claimed — a hidden tab throttles page timers to ~1Hz then freezes — and
+// that is exactly what the worker-timers polyfill already fixes (WORKER_TIMERS_SRC replaces the page's
+// window.setTimeout with a blob-Worker-backed one, immune to the throttle). So the page clock is used
+// ONLY when that polyfill is live (`_workerTimersActive`); otherwise this is byte-identical to the old
+// behaviour, which is the documented "hidden-SLOW (no worker timers)" regime.
+//
+// Proof the substitute clock keeps time when the SW's does not: run 3 page 1 measured a CDP no-op probe
+// p50 of 31ms in the SAME window that the SW timer drifted 8947ms. The debugger round trip was healthy
+// while setTimeout starved — so an in-page sleep issued then would have returned on schedule.
+//
+// THREE guards, each earned:
+//  1. cdpSendRaw, NOT cdpSend — a pace must stay OUT of the lag trace's command stats. Through cdpSend
+//     every 600ms pace would print a "⏳ Runtime.evaluate 600ms" line (CDP_LAG_SLOW_CMD_MS is 400) and
+//     bury the signal the trace exists to surface.
+//  2. RACED against an SW timer at want+slack. The new failure mode is not the eval throwing (caught
+//     below) but the eval HANGING across a navigation — a destroyed execution context can leave
+//     awaitPromise pending. The race bounds the worst case at want+slack. A starved SW arm simply loses
+//     the race, and if BOTH starve we are no worse than the old code. It can never under-wait: the
+//     fallback arm is longer than `want`.
+//  3. On a THROWN eval (detached / context destroyed) fall back ONCE, for the REMAINDER only — never
+//     re-wait the full duration on top of time already spent.
+// SCOPED OPT-IN, exactly like cdpSetSyntheticInput — and for the same reason, learned the same way.
+// The page clock is only correct where the page is a SETTLED FORM. On ONBOARDING/AUTH the page is mid-
+// NAVIGATION, and a navigating document's timer does not fire: the first live run of this change logged
+// 4 of 5 paces as "page-abandoned" — a 50ms pace taking 3.5-5.0s, i.e. UNBOUNDED in practice, because the
+// abandon ceiling is itself an SW timer. That is the reason, and it is a BOUNDING reason.
+// ⚠ It is NOT that a sparse poll missed something. The run that halted alongside this
+// (`waitFor(resume-upload-input)`, 21 polls / 25s) was written up as lost coverage; that was WRONG and is
+// retired (2026-08-10, docs/fill-speed-log.md). That wait watches EXISTENCE, which is MONOTONE — once the
+// control mounts it stays mounted — so sparse sampling can only notice LATE, never miss. The control
+// genuinely had not rendered; the same wait timed out at the same budget on the SW clock (round 1 run 4,
+// 29 reads), and a bigger BUDGET was the fix. Keep the distinction: a monotone wait wants budget, only a
+// TRANSIENT one (true-then-false) can be starved of coverage.
+// So: FILL/REPLAY enable it; onboarding, auth and recon stay on the SW timer. Reset to false
+// at every cdpAttach.
+// ⚠ ALSO OFF for the PAGE-TRANSITION wait (cdpWaitNextPage), for the same reason as onboarding: a
+// transition IS a navigation. That poll is a 15s WALL-CLOCK deadline with a cdpAdaptiveDelay(500)
+// interval, so a page clock that hangs there buys ~7 polls instead of ~30 — and running out is a
+// nav-timeout HALT, not a slow page. It save/restores around itself rather than being globally off,
+// because the pages either side of the transition are settled forms where the page clock is correct.
+let _pageClockOn = false;
+let _pageClockAnnounced = false;   // announce once per attach — the transition save/restore re-enables per page
+function cdpSetPageClock(on) {
+  _pageClockOn = !!on;
+  if (on && !_pageClockAnnounced) {
+    _pageClockAnnounced = true;
+    console.log("[ApplyPilot][CDP] page-clock pacing ENABLED for this run's fill — paces sleep on the page's worker-backed timer (throttle-immune) instead of the starved SW timer; onboarding/auth/recon and the page-transition wait stay SW-timed.");
+  }
+}
+function cdpPageClockEnabled() { return _pageClockOn; } // so a caller can SAVE/RESTORE around a deliberately SW-timed step
+
+const PAGE_SLEEP_SLACK_MS = 1500;   // race ceiling above the requested pace (guard 2)
+const PACE_OVERRUN_LOG_MS = 1000;   // log a pace this far over budget (permanent — no flag needed)
+
+const cdpSwSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Sleep on the PAGE's clock. window.setTimeout is worker-backed when the polyfill installed, so this is
+// throttle-immune; awaitPromise makes the command itself resolve only when the page's timer fires.
+function cdpPageSleep(ms) {
+  return cdpSendRaw("Runtime.evaluate", {
+    expression: "new Promise(function(r){window.setTimeout(r," + ms + ");})",
+    awaitPromise: true
+  });
+}
+
+// Drift is now REPORTED, not merely survived: a pace that still overruns badly prints once, with no flag
+// required, so the next occurrence is visible in any run's log instead of needing debugLagTrace on.
+function cdpPaceNote(want, took, via) {
+  if (took - want < PACE_OVERRUN_LOG_MS) return;
+  try {
+    console.log(`[ApplyPilot][PACE] ⚠ a ${want}ms pace took ${took}ms (${via}) — the clock overran by `
+      + `${took - want}ms. SW-side starvation is the known cause (docs/fill-speed-log.md); `
+      + `"page" means even the page clock was late, which is new.`);
+  } catch (e) { /* log only */ }
+}
+
+async function cdpDelay(ms) {
+  const want = Math.max(0, Math.round(Number(ms) || 0));
+  const t0 = Date.now();
+  let via = "sw";
+  if (want > 0 && _pageClockOn && cdpTabId !== null && _workerTimersActive) {
+    via = "page";
+    let timer = null;
+    try {
+      await new Promise((resolve, reject) => {
+        timer = setTimeout(() => { via = "page-abandoned"; resolve(); }, want + PAGE_SLEEP_SLACK_MS);
+        cdpPageSleep(want).then(resolve, reject);
+      });
+    } catch (e) {
+      via = "sw-fallback";                       // detached / context destroyed mid-pace
+      const rem = want - (Date.now() - t0);
+      if (rem > 0) await cdpSwSleep(rem);        // remainder ONLY (guard 3)
+    } finally {
+      if (timer !== null) clearTimeout(timer);   // don't hold the worker awake on the losing arm
+    }
+  } else {
+    await cdpSwSleep(want);
+  }
+  cdpPaceNote(want, Date.now() - t0, via);
+}
+// ── PACING CLOCK END ──
+
+// ── CLOCK PROBE (2026-08-10) ─────────────────────────────────────────────────────────────────────
+// Settles "is the PAGE frozen, or is it only OUR worker's timer that is late?" by MEASUREMENT rather
+// than argument. Both arms start together and are awaited together, so they time the SAME window —
+// which is the whole point, since drift is bursty and two probes taken minutes apart prove nothing:
+//
+//   sw   — an SW setTimeout(want): the starved clock every act.delay used to ride.
+//   page — an in-page setTimeout(want) via Runtime.evaluate + awaitPromise: the worker-backed polyfill.
+//          LATENESS HERE IS THE FREEZE/THROTTLE SIGNAL. A hidden tab on native timers quantizes to
+//          ~1Hz, so a 250ms request returning at ~1000ms is the throttled regime, visible directly.
+//   real — the page's OWN performance.now() delta across that same sleep.
+//
+// ⚠ WHAT `real` CANNOT TELL YOU, written down because misreading it is the obvious trap and it would
+// silently answer "no freezing" every single time: performance.now() is a REAL-TIME monotonic clock.
+// It keeps advancing while a tab is throttled, frozen, or not executing at all. So `real` tracking SW
+// wall-clock is NOT evidence the tab is running. It is evidence of exactly two narrower things, both
+// worth having: our SW-side Date.now() readings are honest (they are not themselves being serviced
+// late), and the document was not REPLACED underneath us (a navigation resets the time origin, which
+// shows up here as a nonsense delta). Freeze is measured by callback LATENESS (`page`), never by a
+// clock reading.
+// ── CLOCK PROBE START (extracted by test/clock-probe.test.js — do not rename these markers) ──
+const CLOCK_PROBE_CEILING_MS = 4000;  // bound the page arm — a navigating document's timer may never fire
+
+async function cdpClockProbe(ms = 250, label = "") {
+  const want = Math.max(1, Math.round(Number(ms) || 0));
+  const t0 = Date.now();
+  let pageMs = null, realMs = null, pageNote = null;
+
+  const swArm = cdpSwSleep(want).then(() => Date.now() - t0);
+
+  let pageArm = Promise.resolve();
+  if (cdpTabId !== null) {
+    // Bounded by a race, same shape and same accepted floor as cdpDelay guard 2: the escape hatch is
+    // itself an SW timer, so on a starved worker the ceiling lands late. That is fine for a probe —
+    // a late ceiling only inflates a number we are already reporting as "abandoned", never a wrong verdict.
+    let ceiling = null;
+    pageArm = new Promise((resolve) => {
+      ceiling = setTimeout(() => { pageNote = "page-abandoned"; resolve(); }, want + CLOCK_PROBE_CEILING_MS);
+      cdpSendRaw("Runtime.evaluate", {
+        expression: "new Promise(function(r){var p0=performance.now();window.setTimeout(function(){r(performance.now()-p0);}," + want + ");})",
+        awaitPromise: true, returnByValue: true,
+      }).then((res) => {
+        pageMs = Date.now() - t0;
+        const v = res && res.result ? res.result.value : null;
+        if (typeof v === "number" && isFinite(v)) realMs = Math.round(v);
+        resolve();
+      }, (e) => { pageNote = "page-threw: " + String((e && e.message) || e); resolve(); });
+    }).finally(() => { if (ceiling !== null) clearTimeout(ceiling); });
+  } else {
+    pageNote = "not-attached";
+  }
+
+  const [swMs] = await Promise.all([swArm, pageArm]);
+  const out = {
+    want, swMs, pageMs, realMs, note: pageNote,
+    workerTimers: _workerTimersActive,
+    swOverMs: swMs - want,
+    pageOverMs: pageMs === null ? null : pageMs - want,
+  };
+  // Print the VERDICT FOR THESE NUMBERS, not the legend. The first live run printed the full
+  // "SW late + PAGE on time ⇒ …" explanation on every line including the ones where NOTHING was late,
+  // which reads as an assertion that the worker was starved when the sample says the opposite.
+  // A diagnostic that states a conclusion it did not measure is worse than no diagnostic.
+  const LATE_MS = 400;
+  const swLate = out.swOverMs >= LATE_MS;
+  const pageLate = out.pageOverMs !== null && out.pageOverMs >= LATE_MS;
+  let verdict;
+  if (pageMs === null) verdict = `PAGE arm ${pageNote || "unavailable"} — no comparison possible this sample`;
+  else if (swLate && pageLate) verdict = "BOTH clocks late ⇒ the TAB really is throttled/frozen";
+  else if (swLate) verdict = "SW starved, TAB FINE ⇒ pace on the page clock (this is the known MV3 case)";
+  else if (pageLate) verdict = "PAGE late while the SW is on time ⇒ unusual — a busy renderer, not worker starvation";
+  else verdict = "both clocks ON TIME at this instant — ⚠ drift is BURSTY, so a quiet sample does NOT clear the run";
+  try {
+    const pageTxt = pageMs === null ? (pageNote || "n/a") : `${pageMs}ms (+${out.pageOverMs})`;
+    const realTxt = realMs === null ? "n/a" : `${realMs}ms`;
+    console.log(`[ApplyPilot][CLOCKS]${label ? " " + label + ":" : ""} want ${want}ms → SW ${swMs}ms (+${out.swOverMs}) · PAGE ${pageTxt} · page-perf ${realTxt}`
+      + ` · worker-timers ${_workerTimersActive ? "ON" : "OFF"} — ${verdict}.`
+      + ` (page-perf is REAL TIME, not a freeze signal — see cdp.js.)`);
+  } catch (e) { /* log only */ }
+  out.verdict = verdict;
+  return out;
+}
+// ── CLOCK PROBE END ──
 
 // Attach to `tabId` and enable the domains we use (Runtime for evaluate, DOM for
 // the DOM.focus fallback, Page for addScriptToEvaluateOnNewDocument — the hidden-
@@ -80,6 +273,8 @@ function cdpAttach(tabId) {
       _visCache = { visible: false, at: 0 };   // fresh foreground sampling per run (adaptive pacing)
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
       _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
+      _pageClockOn = false;                    // page-clock pacing is per-run opt-in (FILL/REPLAY only) — onboarding/auth/recon stay SW-timed
+      _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
@@ -521,10 +716,65 @@ async function cdpInstallPageOverrides() {
     }
     const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : (cspBypassed ? "OFF (blocked even with CSP bypass)" : "OFF (CSP?)"));
     console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; CSP bypass ${cspBypassed ? "ON" : "unavailable"}; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
+    if (!_workerTimersActive && !forceNoWorker) warnNoWorkerTimers(cspBypassed ? "blocked even with CSP bypass" : "install threw (CSP?)");
   } catch (e) {
     _workerTimersActive = false;
     console.log("[ApplyPilot][CDP] page-override install failed (best-effort, continuing):", String((e && e.message) || e));
+    if (!forceNoWorker) warnNoWorkerTimers("the whole override install failed: " + String((e && e.message) || e));
   }
+}
+
+// LOUD, UNMISSABLE (2026-08-10). The "hidden-SLOW (no worker timers)" regime is a documented code path
+// with a label that has never once been OBSERVED on a Workday tenant across the whole speed round — yet
+// several waits have been hardened, and more were proposed to be hardened, against the possibility of it.
+// Make the path ANNOUNCE ITSELF instead: if this banner never prints, the regime is not in play and
+// budgets do not need to defend against it; if it does print, everything downstream (every page-side
+// debounce, every render, and every pace, since cdpDelay refuses the page clock without the polyfill)
+// quantizes to the hidden ~1Hz throttle and a uniformly slow run is EXPLAINED, not mysterious.
+// Deliberately console.warn + banner rather than another info line among hundreds.
+function warnNoWorkerTimers(why) {
+  try {
+    console.warn(
+      "[ApplyPilot][CDP] ⛔⛔ WORKER-TIMERS POLYFILL DID NOT INSTALL — " + why + ".\n"
+      + "  ⇒ This tab is in the 'hidden-SLOW (no worker timers)' regime: the page's own setTimeout is\n"
+      + "    Chrome's throttled one (~1Hz while hidden), so every debounce/render the fill waits on is\n"
+      + "    quantized to ~1s, AND cdpDelay refuses the page clock (it requires the polyfill), so paces\n"
+      + "    fall back to the starved SW timer. Expect a uniformly slow run — this is the explanation.\n"
+      + "  ⇒ Fix direction: it is a CSP block on blob: workers. Page.setBypassCSP already ran; if that\n"
+      + "    was unavailable the browser/target refused it. Run VISIBLE as a workaround.\n"
+      + "  ⇒ If you are chasing slowness and this banner is ABSENT, the regime is NOT in play — do not\n"
+      + "    harden waits against it (docs/fill-speed-log.md)."
+    );
+  } catch (e) { /* log only */ }
+}
+
+// IS THE SUBMIT BUTTON ACTUALLY WIRED YET? (2026-08-11, measurement — NOT a gate)
+//
+// Operator: "is there something we can poll for so the first click always works?" The DOM says nothing
+// useful (`disabled`/`aria-busy` are never set — measured), but REACT does: a button React has not
+// hydrated yet carries no `__reactProps$` handlers, and a click landing in that window is genuinely
+// swallowed. That is the one real failure the retry ladder exists for.
+//
+// ⚠ Traced live on cat.wd5's Sign In: the submit's React props are { onBlur, onFocus, onMouseDown } —
+// there is NO onClick, so the commit rides MOUSEDOWN. Worth knowing before anyone "fixes" a click here.
+//
+// Deliberately a MEASUREMENT first. Whether an unhydrated window actually occurs is UNPROVEN (zero
+// genuine swallowed clicks in 14 live cold sign-ins), and this codebase has just been burned once by
+// building on a signal sampled in only one state. So: report it, log only the interesting case, and
+// gate on it later if the data shows the window is real.
+function cdpAuthButtonReady(selector) {
+  const b = document.querySelector(selector);
+  if (!b) return { present: false };
+  const pk = Object.keys(b).find((k) => k.indexOf("__reactProps$") === 0);
+  const handlers = pk ? Object.keys(b[pk]).filter((k) => /^on[A-Z]/.test(k)) : [];
+  const r = b.getBoundingClientRect();
+  return {
+    present: true,
+    reactWired: !!pk && handlers.length > 0,
+    handlers,
+    laidOut: r.width > 0 && r.height > 0,
+    disabled: !!b.disabled || b.getAttribute("aria-disabled") === "true",
+  };
 }
 
 // Run a SELF-CONTAINED function in the page via Runtime.evaluate and return its
@@ -2268,6 +2518,22 @@ function cdpOnboardScan() {
     // A spinner/progress node anywhere in the auth widget is the other likely tell.
     spinner: !!document.querySelector('[data-automation-id*="spinner" i],[data-automation-id*="progress" i],[role="progressbar"]'),
     pwFilled: !!(pwEl && pwEl.value),
+    // MEASURED 2026-08-11: at the moment the first Sign-In wait timed out, this object read
+    // {busy:false, disabled:false, pwFilled:true, spinner:true} — so `disabled`/`aria-busy` are NOT the
+    // in-flight tell (the button stays enabled while Workday processes). `spinner` was the only thing
+    // set, but a bare boolean over a DOCUMENT-WIDE selector cannot distinguish "a spinner is rendering"
+    // from "a spinner node is permanently mounted and hidden" — and Workday routinely keeps such nodes
+    // around. So report the COUNT and how many are actually laid out; a signal that reads identically on
+    // an idle form is not a discriminator, it just re-clicks with more confidence.
+    spinners: (function () { try { return document.querySelectorAll('[data-automation-id*="spinner" i],[data-automation-id*="progress" i],[role="progressbar"]').length; } catch (e) { return -1; } })(),
+    spinnersShown: (function () {
+      try {
+        return Array.prototype.filter.call(
+          document.querySelectorAll('[data-automation-id*="spinner" i],[data-automation-id*="progress" i],[role="progressbar"]'),
+          function (n) { const r = n.getBoundingClientRect(); return n.offsetParent !== null && r.width > 0 && r.height > 0; }
+        ).length;
+      } catch (e) { return -1; }
+    })(),
   } : null;
   // ── WHY the auth form refused (2026-08-07) ───────────────────────────────────────────────────────
   // A Sign In / Create Account that submits to nothing looked identical in the log to one that never
