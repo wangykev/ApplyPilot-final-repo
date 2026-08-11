@@ -4,6 +4,8 @@
 // classifier, the Workday soft-error (refresh) detector, and SSO detection.
 const { test } = require("node:test");
 const assert = require("node:assert");
+const fs = require("fs");
+const path = require("path");
 const { pickApplyTarget, classifyAuthOutcome, isWorkdaySoftError, looksLikeSso, isAlreadyApplied, jobPageSettleStep, isBlankAuthPage, parseErrorFieldName, phantomRequiredTargets,
   classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, errorLabelKey, blankAuthPersists, isJobPostingGone, BLANK_AUTH_MIN_READS,
   blankAuthRefusal, BLANK_PAGE_BOILERPLATE_MAX } = require("../lib.js");
@@ -198,6 +200,37 @@ test("blankAuthRefusal: names the structural gates too", () => {
   assert.match(blankAuthRefusal({ ...BLANK_LIVE, formFieldCount: 3 }), /form field/);
   assert.match(blankAuthRefusal({ ...BLANK_LIVE, hasAuthEl: true }), /auth controls/);
   assert.match(blankAuthRefusal({ ...BLANK_LIVE, markers: { applyManually: true } }), /applyManually/);
+});
+
+// ── FORENSICS for the halts that cannot be reproduced on demand ─────────────────────────────────────
+// Source-level (background.js can't be require()d). These halts are rare, intermittent and TERMINAL,
+// so the FIRST occurrence has to carry enough to diagnose it — there is no "re-run with more logging".
+// Pinned because the omission already cost one investigation: the deciding input (body-text length)
+// was the single field the halt did not print, and the log's excerpt is truncated at write time, so
+// the number could not be recovered afterwards at all.
+const BG_SRC = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
+
+test("describeState always prints bodyLen — the input whose absence forced a diagnosis by elimination", () => {
+  const at = BG_SRC.indexOf("const describeState = (s) => {");
+  assert.ok(at > 0, "describeState not found — renamed?");
+  const body = BG_SRC.slice(at, at + 2400);
+  assert.match(body, /bodyLen=/,
+    "an auth halt must report the body-text LENGTH; it is one integer and it decides isBlankAuthPage");
+});
+
+test("the unreproducible halts dump full forensics", () => {
+  const at = BG_SRC.indexOf("const FORENSIC_HALTS");
+  assert.ok(at > 0, "FORENSIC_HALTS not found — renamed?");
+  const block = BG_SRC.slice(at, at + 2600);
+  for (const halt of ["auth-unknown", "blank-page-after-signin", "signin-no-outcome", "resume-upload-input-missing"]) {
+    assert.ok(BG_SRC.slice(at, at + 400).includes(halt), `${halt} must be in the forensic set — it is one of the halts we cannot reproduce`);
+  }
+  assert.match(block, /blankAuthRefusal\(s\)/,
+    "the dump must say WHY the empty-shell reload did not run — that is the question a bare halt cannot answer");
+  assert.match(block, /Object\.keys\(markers\)/,
+    "must print ALL markers, true AND false: which markers were ABSENT is what separates a dead shell from an unrecognised page");
+  assert.match(block, /catch \(e\) \{ \/\* diagnostics must never mask the halt/,
+    "a diagnostic that can throw would replace the halt it is describing");
 });
 
 test("isAlreadyApplied: the alreadyAppliedPage marker → true (Magna wd3 — title is a stale 'Create Account')", () => {

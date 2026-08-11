@@ -6788,6 +6788,12 @@ async function runCdpOnboard(tabId, opts) {
       `signInButtonText=${!!s.signInButtonPresent}`,
       `hasAuthEl=${!!s.hasAuthEl}`,
       `markers=[${on.join(",") || "none"}]`,
+      // BODY-TEXT LENGTH — the one input a halt never printed, and the omission cost a whole
+      // investigation (2026-08-11). An `auth-unknown` halt showed every OTHER gate passing
+      // (readyState complete · formFields 0 · hasAuthEl false · markers [none]), so the cause had to be
+      // deduced by ELIMINATION down to the body-text cap — and the log's excerpt is truncated at write
+      // time, so the actual number could not be recovered afterwards at all. It is one integer; print it.
+      `bodyLen=${String(s.bodyText || "").replace(/\s+/g, " ").trim().length}`,
       // The page's OWN stated reason, when it has one — turns "the form is still up" from a dead end
       // into something actionable (2026-08-07).
       ...((s.authErrors && s.authErrors.length) ? [`pageErrors=${JSON.stringify(s.authErrors)}`] : []),
@@ -6797,11 +6803,47 @@ async function runCdpOnboard(tabId, opts) {
     ].join(" · ");
   };
 
+  // ── FORENSICS FOR THE HALTS WE CANNOT REPRODUCE (2026-08-11) ──────────────────────────────────────
+  // These four are rare, intermittent and TERMINAL: the run is over, an operator is already involved,
+  // and the next occurrence may be days away on a machine nobody is watching. So the first occurrence
+  // has to be enough to fix it — there is no "run it again with more logging".
+  //
+  // Earned the hard way. An `auth-unknown` halt printed every input to the empty-shell decision except
+  // the one that decided it, so the cause had to be deduced by eliminating all the others, and the
+  // deciding number could not be recovered from the log at all. Verbosity is free here (a terminal
+  // stop, once), and the cost of being one field short is another whole investigation.
+  //
+  // Deliberately NOT applied to every halt: an ordinary `sso` or `no-credentials` stop is
+  // self-explaining and does not need a page dump.
+  const FORENSIC_HALTS = new Set(["auth-unknown", "blank-page-after-signin", "signin-no-outcome", "resume-upload-input-missing"]);
+  const haltForensics = (stopped, s) => {
+    if (!FORENSIC_HALTS.has(stopped) || !s) return;
+    try {
+      // ALL markers, true AND false. describeState prints only the truthy ones, which is right for a
+      // one-line summary and wrong here: "which markers were absent" is exactly what distinguishes a
+      // dead shell from a page we simply did not recognise.
+      const markers = s.markers || {};
+      const allMarkers = Object.keys(markers).sort().map((k) => `${k}=${!!markers[k]}`).join(" ");
+      const body = String(s.bodyText || "").replace(/\s+/g, " ").trim();
+      LOG(`    ┌─ [AUTH-FORENSIC] ${stopped} — everything the decision saw, so this occurrence is enough to fix it:`);
+      LOG(`    │ bodyText: ${body.length} chars`);
+      LOG(`    │ excerpt : ${JSON.stringify(body.slice(0, 600))}`);
+      LOG(`    │ markers : ${allMarkers || "(none reported by the scan)"}`);
+      LOG(`    │ submit  : ${JSON.stringify(s.authBusy || null)}`);
+      // WHY the empty-shell reload did not run. Null here means the page WAS blank and the recovery
+      // should have fired — which points at the reload budget or the persistence check instead.
+      const refusal = blankAuthRefusal(s);
+      LOG(`    │ blank?  : ${refusal ? "REFUSED — " + refusal : "YES, isBlankAuthPage said this page IS an empty shell (so the reload path is the suspect, not the gate)"}`);
+      LOG(`    └─ if the cause is still not obvious from the above, the missing field is the bug — add it.`);
+    } catch (e) { /* diagnostics must never mask the halt */ }
+  };
+
   // Every human-needed stop LOGS before it returns. These used to be silent returns, so the SW console
   // ended at "detached" and the reason existed only in the popup/website response.
   const haltNeedsOperator = (stopped, detail, s) => {
     LOG(`⛔ HALT (needs operator) — ${stopped}: ${detail}`);
     if (s !== undefined) LOG(`    page state at the halt: ${describeState(s)}`);
+    haltForensics(stopped, s);
     return { ok: true, reached_form: false, needs_operator: true, stopped, detail };
   };
 
