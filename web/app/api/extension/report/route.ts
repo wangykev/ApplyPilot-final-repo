@@ -91,12 +91,16 @@ export async function POST(req: Request) {
       : admin.from("applications").insert(cols);
 
   let { error } = await write(fields);
-  // A database that has not run 0017 yet must not lose the REPORT over an optional stamp. Losing the
-  // bundle is the expensive failure — a whole fill has to be re-run to recover it (that is exactly what
-  // the stale-ingest-key 401 cost). Drop the résumé columns and write the bundle anyway.
-  if (error && /resume_(id|sha256|delta)/.test(error.message || "")) {
-    const { resume_id, resume_sha256, resume_delta, ...rest } = fields;
-    void resume_id; void resume_sha256; void resume_delta;
+  // A database that has not run the latest migration must not lose the REPORT over an optional column.
+  // Losing the bundle is the expensive failure — a whole fill has to be re-run to recover it (exactly
+  // what the stale-ingest-key 401 cost). Drop the optional columns and write the bundle anyway.
+  //
+  // ⚠ This list must GROW with every optional column added here. `approved_at` was added to the write
+  // without being added to this guard, and every report immediately 500'd against a database that had
+  // not run 0018 — the bundle was silently lost on a run that had otherwise succeeded.
+  if (error && /resume_(id|sha256|delta)|approved_at/.test(error.message || "")) {
+    const { resume_id, resume_sha256, resume_delta, approved_at, ...rest } = fields;
+    void resume_id; void resume_sha256; void resume_delta; void approved_at;
     ({ error } = await write(rest));
   }
   if (error) return j({ ok: false, error: error.message }, 500);

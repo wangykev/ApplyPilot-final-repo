@@ -44,11 +44,15 @@ export async function saveReviewBundle(id: string, bundle: ReviewBundle): Promis
     // unreviewed answer is exactly the wrong thing to show on the screen you decide from.
     const approvedAt = approval.submit_ready ? new Date().toISOString() : null;
 
-    const { error } = await supabase
-      .from("applications")
-      .update({ review_bundle_json: toStore, needs_review_count: needs, approved_at: approvedAt })
-      .eq("id", id)
-      .eq("user_id", user.id);
+    const save = (cols: Record<string, unknown>) =>
+      supabase.from("applications").update(cols).eq("id", id).eq("user_id", user.id);
+
+    let { error } = await save({ review_bundle_json: toStore, needs_review_count: needs, approved_at: approvedAt });
+    // Losing the operator's EDITS because an optional column is missing would be the worst trade here —
+    // those edits are hand-made and unrecoverable. Save the bundle without the badge.
+    if (error && /approved_at/.test(error.message || "")) {
+      ({ error } = await save({ review_bundle_json: toStore, needs_review_count: needs }));
+    }
     if (error) return { ok: false, error: error.message };
     revalidatePath(`/app/tracker/${id}`);
     revalidatePath("/app/tracker");
