@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "transition-probe-1";
+const AP_BUILD_MARKER = "settle-seed-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -2930,10 +2930,34 @@ async function awaitReviewPageSettled(act, hints) {
   return { dump, records: last > 0 ? last : 0, ms: Date.now() - t0 };
 }
 
-async function awaitFieldSetSettled(act) {
+// `seed` (optional) = { count, since } — a field count the PAGE-TRANSITION wait already observed
+// unchanged, and the timestamp it was first seen. Purely an optimisation, and deliberately a narrow one:
+//
+//   • The BAR IS UNCHANGED. Breaking still requires the count to have been unchanged for NO_GROWTH_MS.
+//     The seed only stops us re-gathering, from zero, stability we already watched — cdpWaitNextPage
+//     returns ONLY after two reads with the same count, so that run is real evidence, not an assumption.
+//   • It CANNOT skip the wait on a page that is still mounting: if the first scan below reads a DIFFERENT
+//     count than the seed, the ordinary `n !== last` branch fires, lastChangeAt resets to now, and the
+//     page gets the FULL fresh window. Growth after the transition is therefore still caught in full.
+//   • It never claims stability earlier than an actual observation (`since` is the first read showing
+//     that count), so the credited interval is always time we were genuinely watching.
+//   • Honest limitation: the seeded interval was sampled at the transition loop's beat (~500ms) rather
+//     than this loop's 150ms, so its sample spacing is wider. That is a difference in resolution, not in
+//     kind — this loop is a sampler too — but it is why the seed is capped below.
+//
+// SEED_CREDIT_CEILING_MS caps how much of the window a seed may supply, so at least one poll of THIS
+// loop's own tighter cadence always contributes before we agree to start filling. Operator's framing,
+// and the right one: 1.2s is cheap next to a run that fails because it filled a half-rendered page.
+async function awaitFieldSetSettled(act, seed) {
   const t0 = Date.now();
   const NO_GROWTH_MS = 1200, ZERO_BAIL_MS = 1000, POLL_MS = 150, CEILING_MS = 12000;
+  const SEED_CREDIT_CEILING_MS = NO_GROWTH_MS - (2 * POLL_MS); // ≥2 of our own polls must still land
   let last = -1, lastChangeAt = 0, zeroSince = null;
+  if (seed && seed.count > 0 && seed.since > 0) {
+    const credit = Math.min(Math.max(0, t0 - seed.since), SEED_CREDIT_CEILING_MS);
+    last = seed.count;
+    lastChangeAt = t0 - credit;   // as if we had been watching this count for `credit` already
+  }
   while (Date.now() - t0 < CEILING_MS) {
     let n = 0;
     try { n = (((await cdpEval(cdpPageScan)).fields) || []).length; } catch (e) { /* mid-render eval → counts as a zero read (keep polling) */ }
@@ -3009,7 +3033,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // 12s; a page with no flat fields (repeating-only, e.g. My Experience) bails after ~1s of all-zero
   // reads. Genuine value-triggered cascades still appear only AFTER a commit → they remain the cascade
   // re-scan's job; this settles the INITIAL load only.
-  const settleMs = await awaitFieldSetSettled(act);
+  const settleMs = await awaitFieldSetSettled(act, opts && opts.settleSeed);
   // Accumulation merge key — the pathname (the volatile query is dropped) + the sorted field-set.
   // Stable per page across re-runs, distinct across pages even on a same-pathname SPA.
   //
@@ -5936,6 +5960,7 @@ async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
   // call the page settled. Reported by the caller next to `settle`, which is a THIRD wait
   // (awaitFieldSetSettled) that re-proves the same stability from scratch.
   let sawNewPageAt = 0;
+  let countFirstSeenAt = 0;   // when the CURRENT field count was first observed (the settle seed)
   while (Date.now() - start < timeoutMs) {
     await cdpAdaptiveDelay(intervalMs);
     // Keep a HIDDEN tab out of the frozen lifecycle so Workday's SPA transition can run — the
@@ -5978,9 +6003,20 @@ async function cdpWaitNextPageInner(prevSig, timeoutMs, intervalMs) {
     errSince = 0;
     if (!sawNewPageAt) sawNewPageAt = Date.now();   // first read on which the NEW page existed
     if (scan.fields.length === steady) {
-      return { advanced: true, sig, sawNewPageMs: sawNewPageAt - start, confirmMs: Date.now() - sawNewPageAt, polls: Math.round((Date.now() - start) / intervalMs) };
+      // SETTLE SEED — the evidence this loop just gathered, handed to awaitFieldSetSettled so it does not
+      // re-gather it from zero. `stableSince` is when THIS count was FIRST observed (not when the page
+      // appeared): steady was assigned on the previous read, so that read is the start of the unchanged
+      // run, and this read confirms it. Deliberately conservative — never claim stability earlier than
+      // the first read that actually showed this count.
+      return {
+        advanced: true, sig,
+        sawNewPageMs: sawNewPageAt - start, confirmMs: Date.now() - sawNewPageAt,
+        polls: Math.round((Date.now() - start) / intervalMs),
+        stableCount: steady, stableSince: countFirstSeenAt,
+      };
     }
     steady = scan.fields.length;
+    countFirstSeenAt = Date.now();   // this count is new → the unchanged-run starts now
   }
   return { advanced: false, timeout: true };
 }
@@ -5994,6 +6030,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
   // terminal sets reachedReview, the loop tracks walkPage, reportPageErrors stashes lastDiag. Stamped
   // onto the bundle in the finally + reported → the website renders a loud halt banner + edit-profile link.
   let reachedReview = false, walkPage = 0, lastDiag = null;
+  // Field-count stability observed by the page-transition wait, carried to the NEXT page's settle.
+  // Null on page 1 (entered from onboarding, so no transition observed it) and after each use.
+  let _settleSeed = null;
 
   // M31.1: surface the EXACT page error text + the fields left EMPTY (no profile value —
   // the likely "required" validation cause) on a stop-with-errors. Takes the CURRENT page's
@@ -6102,7 +6141,12 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       // ── (c) Fill this (non-review) page: fold + inline M40 audit + accumulate. ──
       LOG(`──── PAGE ${page} ────`);
       emitRunProgress(`Filling page ${page}`);
-      const { out, pageKey, bundle } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page });
+      // settleSeed: the field-count stability the PREVIOUS page's transition wait already observed, so
+      // the settle counts it instead of re-proving it from zero. Consumed once (cleared below) — it is
+      // only valid for the page that transition landed on, and page 1 (entered from onboarding, no
+      // transition) correctly has none.
+      const { out, pageKey, bundle } = await fillAndPersistPage(act, prepared, defaults, jobContext, LOG, { pageNumber: page, settleSeed: _settleSeed });
+      _settleSeed = null;
       // ── RELOAD-RETRY: if this page's fill failures are ALL TRANSIENT render-flakes, reload (Workday
       //    returns to page 1) + RESTART the fill walk from page 1, bounded. A mix with a real needs-review
       //    field does NOT reload (those go to review as usual). Each page accumulate-replaces, so the
@@ -6290,6 +6334,9 @@ async function runCdpWalk(tabId, profile, defaults, jobContext) {
       if (res.advanced && res.sawNewPageMs != null) {
         LOG(`[TRANSITION] page ${page} → ${page + 1}: Workday rendered the new page in ${res.sawNewPageMs}ms · we then spent ${res.confirmMs}ms confirming it was stable (${res.polls} poll(s) × ${500}ms) — settle on the next line is a further wait.`);
       }
+      // Hand the observed stability to the next page's settle (see awaitFieldSetSettled's `seed`).
+      _settleSeed = (res.advanced && res.stableCount > 0 && res.stableSince > 0)
+        ? { count: res.stableCount, since: res.stableSince } : null;
       if (res.maintenance) {
         LOG(`⛔ WORKDAY PLANNED MAINTENANCE after Save & Continue on page ${page} ("Workday is currently unavailable") — NOT a dead session. Retry after the maintenance window.`);
         return { ok: true, stopped: "workday-maintenance", workday_maintenance: true, pages_filled: pagesFilled.length, pages: pagesFilled };
