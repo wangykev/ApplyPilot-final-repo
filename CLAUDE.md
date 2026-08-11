@@ -635,6 +635,10 @@ and "the poll didn't look often enough" is not an available explanation for a fa
 - **Don't port the Python repo blindly:** it's a design reference (intent, prompts, edge cases), not code to
   mechanically translate to JS.
 - **Commit per milestone:** each working milestone gets a commit, so we can bisect when something breaks.
+- **NO AI ATTRIBUTION in anything that reaches GitHub (operator, 2026-08-11).** No `Co-Authored-By: Claude …`
+  trailer on commits, no "Generated with Claude Code" line in PR bodies, and no equivalent mention in commit
+  text, PR titles or issue comments. This **overrides** the default tooling convention that adds them. The
+  commit bodies themselves are unchanged — still long, still reasoning-first; just unsigned.
 - **Keep this file lean:** standing rules and invariants only. When a milestone lands, update the relevant
   rule here (a few lines), append the full dated entry to `docs/progress-log.md`, put observed-DOM findings in
   `docs/dom-patterns.md`, and put mechanism in the matching skill.

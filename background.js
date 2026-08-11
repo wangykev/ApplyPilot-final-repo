@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "merge-speed-onboard-1";
+const AP_BUILD_MARKER = "fresh-rect-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -7154,6 +7154,29 @@ async function runCdpOnboard(tabId, opts) {
       if (cover && cover.blocked) {
         LOG(`"${label}" is covered by ${cover.by} — refusing a blind click. The rect was RE-MEASURED on each round, so this is a real overlay, not a stale coordinate after a reflow.`);
         return { clicked: false, blockedBy: cover.by, sel };
+      }
+      // ── RE-MEASURE IMMEDIATELY BEFORE CLICKING (2026-08-11) ───────────────────────────────────────
+      // The cover loop re-measures, but the LAST measurement is not necessarily the one we click on: a
+      // dismiss click plus its pace(800) can sit between the final probe and here, which is ample time
+      // for a reflow to move the button. Clicking a rect that is up to ~1s old is the stale-coordinate
+      // class this function's own header already documents — so take a fresh one at the moment of use.
+      //
+      // ⚠ Use `probe()` (cdpRectReady + cdpCoverCheck), NOT a bespoke hit-test. The first version of this
+      // check rolled its own "is the target under the point?" with a single `elementFromPoint`, and it
+      // fired on the FIRST live run against `Sign In submit` — reporting a stale rect on a click that
+      // then signed in perfectly. The "different element" was a bare transparent DIV: Workday's
+      // `click_filter` overlay, which cdpCoverCheck deliberately treats as THE CLICK SURFACE. That rule
+      // lives in `seeThrough` along with pointer-events:none and shadow-root handling, and it walks the
+      // whole elementsFromPoint STACK rather than the top node. Reimplementing any of that is how you
+      // get a confident warning about a click that was always fine.
+      const fresh = await probe();
+      if (fresh.rect) {
+        const moved = Math.abs(fresh.rect.cx - rect.cx) > 2 || Math.abs(fresh.rect.cy - rect.cy) > 2;
+        if (moved) LOG(`"${label}" moved between the cover check and the click (${rect.cx},${rect.cy} → ${fresh.rect.cx},${fresh.rect.cy}) — clicking the FRESH point.`);
+        rect = fresh.rect;
+        // Newly covered at the instant of use: say so, but still click. Refusing here would turn a
+        // recoverable miss into a halt, and the caller's retry ladder already handles a lost click.
+        if (fresh.cover && fresh.cover.blocked) LOG(`⚠ "${label}" reads as covered by ${fresh.cover.by} at click time. Clicking anyway — if this click is swallowed, THIS is why.`);
       }
       await cdpClickAt(rect.cx, rect.cy);
       LOG(`clicked "${label}".`);

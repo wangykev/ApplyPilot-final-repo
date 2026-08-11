@@ -20,13 +20,49 @@ export function extensionMessagingAvailable(): boolean {
   return runtime() !== null;
 }
 
+/**
+ * WHY can't this page talk to the extension? (2026-08-11)
+ *
+ * Chrome injects `chrome.runtime` into a page ONLY when that page's origin is listed in the extension's
+ * `externally_connectable.matches`. Today that list is localhost + 127.0.0.1 ONLY — so the moment this
+ * site is deployed anywhere else, every extension feature goes quiet: no sync, no Run button, and (the
+ * one that actually loses data) no self-healing of a rejected report. Nothing throws; the page simply
+ * behaves as though no extension exists.
+ *
+ * The two causes are distinguishable, which is the point of this function:
+ *   • `window.chrome` present but `chrome.runtime` missing, on a NON-localhost origin
+ *       ⇒ this origin is not in the manifest. A deploy step was missed; installing the extension will
+ *         not help, and telling the user to check the extension would send them the wrong way.
+ *   • everything else ⇒ ordinary "not installed / not Chrome".
+ *
+ * ⚠ The fix is to add the real production origin to `manifest.json`. It is deliberately NOT wildcarded
+ * (e.g. `https://*.vercel.app/*`) — externally_connectable grants message access, so a wildcard would
+ * let any site on that host drive the extension.
+ */
+export function messagingUnavailableReason(): "ok" | "origin-not-allowlisted" | "no-extension" {
+  if (runtime() !== null) return "ok";
+  if (typeof window === "undefined") return "no-extension";
+  /* eslint-disable-next-line @typescript-eslint/no-explicit-any */
+  const hasChrome = !!(window as any).chrome;
+  const host = window.location.hostname;
+  const isLocal = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  return hasChrome && !isLocal ? "origin-not-allowlisted" : "no-extension";
+}
+
 export function sendToExtension(extId: string, message: unknown): Promise<ExtResponse> {
   return new Promise((resolve) => {
     const rt = runtime();
     if (!rt) {
+      // Name the ACTUAL cause. "Install the extension" is the wrong instruction when the real problem is
+      // that this deployment's origin was never added to externally_connectable — the user would reinstall
+      // forever and nothing would change.
       resolve({
         ok: false,
-        error: "No extension messaging here — open this in Chrome with ApplyPilot installed.",
+        error: messagingUnavailableReason() === "origin-not-allowlisted"
+          ? `This site's origin (${window.location.origin}) is not listed in the extension's `
+            + `externally_connectable.matches, so Chrome will not connect it — reinstalling will not help. `
+            + `Add this exact origin to manifest.json and reload the extension.`
+          : "No extension messaging here — open this in Chrome with ApplyPilot installed.",
       });
       return;
     }

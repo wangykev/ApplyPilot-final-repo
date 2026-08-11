@@ -100,6 +100,19 @@ handoff contract).
   re-minted by a routine edit — that stays a Connect-page action. Feedback surfaces via a single
   `<LiveSyncToast/>` in the app shell.
 
+> ⛔ **DEPLOY BLOCKER — `externally_connectable` is localhost-only (2026-08-11).** Chrome injects
+> `chrome.runtime` into a page ONLY if its origin matches `manifest.json`'s
+> `externally_connectable.matches`, and that list is `http://localhost/*` + `http://127.0.0.1/*`. Deploy
+> the site anywhere else without adding the production origin and **every extension feature goes quiet**:
+> no live sync, no Run/Submit button, and no self-healing of a rejected report — the last of which
+> silently loses a completed run. Nothing throws; the page simply behaves as though no extension is
+> installed, which is the worst possible failure shape for this bridge.
+> **Add the EXACT production origin** (e.g. `https://app.example.com/*`) and reload the extension.
+> ⚠ Do NOT wildcard a shared hosting domain (`https://*.vercel.app/*`): every listed origin may write
+> the profile, read the review bundle and START A RUN, so that would hand the extension to every site on
+> that host. Pinned by `test/externally-connectable.test.js`. Until it is added, `sendToExtension` names
+> this specific cause rather than telling the user to reinstall (`messagingUnavailableReason`).
+
 - **Extension ID:** v1 = the user pastes their extension ID (from `chrome://extensions`) once on the
   Connect page; the website stores it and targets `chrome.runtime.sendMessage(id, …)`. The page must
   be on an origin listed in `externally_connectable.matches`. Hardening (P6): pin a stable ID via a
