@@ -519,6 +519,29 @@ function isSignatureDateField(f) {
 }
 
 /**
+ * The self-ID SIGNATURE NAME — the applicant's own full name, typed under an attestation.
+ *
+ * It was being AI-filled (`ai-text`, medium confidence, flagged) on a page that sits beside a legal
+ * certification, while the profile held the answer all along. Worse than the wasted call: the model can
+ * word it differently run to run, and live it produced "Kevin Wang" where the deterministic bucket had
+ * written "Kevin" — the same field answered two ways on real applications.
+ *
+ * Scoped to the self-ID page by its SIBLINGS (the same shape-test isSelfIdLanguageField uses), because
+ * `name` is far too generic a field id to claim globally — a "Company Name" or "Reference Name" box must
+ * never be stamped with the applicant's name. Returns the value, or null to leave the field alone.
+ */
+function selfIdSignatureNameValue(f, scanFields, profile) {
+  if (!f || f.widgetType !== "text" || String(f.fieldName || "") !== "name") return null;
+  const names = new Set((Array.isArray(scanFields) ? scanFields : []).map((x) => x && x.fieldName).filter(Boolean));
+  const onSelfIdPage = names.has("disabilityStatus") || names.has("disabilityForm")
+    || (names.has("dateSignedOn") && names.has("name"));
+  if (!onSelfIdPage) return null;
+  const pi = (profile && profile.personal_info) || {};
+  const full = [pi.first_name, pi.last_name].map((s) => String(s == null ? "" : s).trim()).filter(Boolean).join(" ");
+  return full || null;
+}
+
+/**
  * The disability answer as an ORDERED candidate list, most specific first.
  *
  * The profile stores one phrasing ("No, I do not have a disability"); Workday renders another ("No, I
@@ -4346,6 +4369,15 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // parse has usually already suggested a reasonable set. Off ⇒ keep the suggestions and record
         // them for review; on ⇒ add every profile skill the taxonomy will accept.
         Object.assign(record, await fillSkillsCdp(act, loc, list, budgets, { fillAll: !!(profile && profile.fill_all_skills) }));
+      } else if (selfIdSignatureNameValue(f, scan.fields, profile)) {
+        // The applicant's own name, from the profile — never an AI guess (see selfIdSignatureNameValue).
+        const full = selfIdSignatureNameValue(f, scan.fields, profile);
+        record.resolved = full;
+        Object.assign(record, await fillTextCdp(act, loc, full, budgets));
+        if (record.verified === true) {
+          record.matchTier = "profile-name";
+          record.detail = "the signature name is the applicant's own name, taken from the profile";
+        }
       } else if (isSignatureDateField(f)) {
         // ALWAYS today, REQUIRED OR NOT (operator, 2026-08-10). A signature date is knowable exactly —
         // it is the day the form is being completed — so there is nothing to infer and no reason to
@@ -8238,5 +8270,5 @@ function accumulateBundle(priorEntries, pageBundle) {
 // UMD-lite: export for the Node test runner; in the SW `module` is undefined so
 // drivePageFill stays a global (from importScripts).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { planAiBatchCandidates, deterministicTierFor, isSelfIdLanguageField, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiFillDate, aiCanonicalizeField, isSignatureDateField, selfIdDisabilityCandidates, SELF_ID_DISABILITY_PATH, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
+  module.exports = { planAiBatchCandidates, deterministicTierFor, isSelfIdLanguageField, bucketWouldAnswer, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, AI_BATCH_MAX, isChoiceWidget, aiFillCheckboxGroup, setCheckboxGroupCdp, fillCheckboxGroupCdp, fillTextCdp, drivePageFill, orderResultsByDom, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, PAGE_SECTIONS, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, CERTIFICATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, DEFAULT_BUDGETS, FIELD_MAP, resolve, boolLadderCandidates, appendFieldVariants, decidePreviousWorker, recognizeEmploymentQuestion, decideCurrentlyEmployed, decideEmploymentStatus, optionForPolarity, fillTypeaheadCdp, fillSourceCdp, fillSkillsCdp, isSkillsField, reconDropdownDump, openAndReadDropdown, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiFillField, aiFillRadio, aiFillText, aiFillDate, aiCanonicalizeField, isSignatureDateField, selfIdDisabilityCandidates, selfIdSignatureNameValue, SELF_ID_DISABILITY_PATH, aiInferEeoField, parseAiText, aiEligible, legallyLoaded, producedNothing, parseAiReply, commitOutcome, flagTierCategory, reconcileAudit, auditDateSegments, auditActualFromRaw, auditEntriesFromResults, applyAuditVerdicts, auditRefillEntry, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, isRepeatingEntry, deriveFlatWrapperSel, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, replayEntryFieldName, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, REVIEW_SCHEMA_VERSION, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, pickLastResortOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, fillFromBucket, buildBucketIndex };
 }

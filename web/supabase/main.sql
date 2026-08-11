@@ -587,3 +587,18 @@ alter table public.resumes add column if not exists deleted_at timestamptz;
 create index if not exists resumes_current_idx
   on public.resumes (user_id, kind, created_at desc)
   where deleted_at is null;
+
+
+-- ==========================================================================
+-- 0018_application_approved_at.sql
+-- ==========================================================================
+-- WHEN the operator finished approving this application review.
+--
+-- Approval already exists per FIELD, inside review_bundle_json, and the tracker LIST deliberately does
+-- not load that column (it is a large jsonb). So a row whose every flagged field was approved still read
+-- "Needs review" in the list, and there was no way to see at a glance what was actually ready to submit.
+--
+-- A TIMESTAMP rather than a boolean, matching applied_at / deleted_at / login_at: null means not
+-- approved, and a value records when. Status is deliberately NOT touched — the enum is written by the
+-- extension, and approval is a different axis from where the application sits in the pipeline.
+alter table public.applications add column if not exists approved_at timestamptz;

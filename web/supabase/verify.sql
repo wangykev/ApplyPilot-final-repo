@@ -73,6 +73,13 @@ with checks as (
          'SET NULL'
 
   union all
+  -- 0018: the tracker's "approved" signal
+  select 'approved_at column',
+         (select count(*) from information_schema.columns
+           where table_schema = 'public' and table_name = 'applications' and column_name = 'approved_at')::text,
+         '1'
+
+  union all
   -- RLS on every owner-scoped table
   select 'RLS enabled',
          (select count(*) from pg_tables

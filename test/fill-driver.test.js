@@ -10156,3 +10156,42 @@ test("cascade: a field that HOLDS a value is never re-filled", async () => {
   const recon = (out && out.cascadeRecon) || [];
   assert.ok(!recon.some((l) => /PROMOTED/.test(l)), "nothing to recover — must not re-actuate a filled field");
 });
+
+// ── the self-ID signature NAME is the applicant's own name, never an AI guess (operator 2026-08-10) ──
+// It was filling `ai-text`, medium confidence, FLAGGED — on a page beside a legal attestation, while the
+// profile held the answer. And the model words it differently run to run: live it produced "Kevin Wang"
+// where the deterministic bucket had written "Kevin", i.e. the same field answered two ways on real
+// applications.
+const { selfIdSignatureNameValue: _sigName } = require("../fill-driver.js");
+
+const SELF_ID_PAGE = [
+  { fieldName: "disabilityForm" }, { fieldName: "name" }, { fieldName: "employeeId" },
+  { fieldName: "dateSignedOn" }, { fieldName: "disabilityStatus" },
+];
+const PROFILE = { personal_info: { first_name: "Kevin", last_name: "Wang" } };
+const nameField = { fieldName: "name", widgetType: "text", label: "Name" };
+
+test("self-ID name: composed from the profile on the self-ID page", () => {
+  assert.equal(_sigName(nameField, SELF_ID_PAGE, PROFILE), "Kevin Wang");
+});
+
+test("self-ID name: a generic `name` field elsewhere is LEFT ALONE", () => {
+  // `name` is far too generic an id to claim globally — a company/reference name box must never be
+  // stamped with the applicant's name, so the page SHAPE is what authorises this.
+  const otherPage = [{ fieldName: "name" }, { fieldName: "companyName" }, { fieldName: "phoneNumber" }];
+  assert.equal(_sigName(nameField, otherPage, PROFILE), null);
+});
+
+test("self-ID name: no name in the profile ⇒ null, never a guess", () => {
+  assert.equal(_sigName(nameField, SELF_ID_PAGE, { personal_info: {} }), null);
+  assert.equal(_sigName(nameField, SELF_ID_PAGE, {}), null);
+});
+
+test("self-ID name: only a TEXT widget, and only the `name` field", () => {
+  assert.equal(_sigName({ ...nameField, widgetType: "dropdown" }, SELF_ID_PAGE, PROFILE), null);
+  assert.equal(_sigName({ ...nameField, fieldName: "legalName--firstName" }, SELF_ID_PAGE, PROFILE), null);
+});
+
+test("self-ID name: a first name alone still answers it", () => {
+  assert.equal(_sigName(nameField, SELF_ID_PAGE, { personal_info: { first_name: "Kevin" } }), "Kevin");
+});

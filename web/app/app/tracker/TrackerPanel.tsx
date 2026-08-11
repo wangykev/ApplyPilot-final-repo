@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Trash2, ExternalLink } from "lucide-react";
 import { SectionCard } from "@/components/app/SectionCard";
 import { updateApplicationStatus, deleteApplication } from "./actions";
+import { approveApplication } from "./approve-action";
 import { APP_STATUSES, type Application, type AppStatus } from "./shared";
 import { clsx } from "@/lib/clsx";
 import { prettyCompany } from "@/lib/company-name";
@@ -62,7 +63,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
   // the list in place. NOT a refresh: a JSON fetch → setState, only when the visible fields changed.
   useEffect(() => {
     const sig = (list: Application[]) =>
-      list.map((a) => `${a.id}:${a.status}:${a.needs_review_count ?? ""}:${a.company ?? ""}:${a.role ?? ""}:${a.applied_at ?? ""}`).join("|");
+      list.map((a) => `${a.id}:${a.status}:${a.needs_review_count ?? ""}:${a.company ?? ""}:${a.role ?? ""}:${a.applied_at ?? ""}:${a.approved_at ?? ""}`).join("|");
     let stopped = false;
     const poll = async () => {
       if (document.visibilityState !== "visible") return;
@@ -109,6 +110,16 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
       setErr(null);
       const r = await deleteApplication(id);
       if (r.ok) setApps((prev) => prev.filter((a) => a.id !== id));
+      else setErr(r.error);
+    });
+
+  const approve = (id: string) =>
+    startTransition(async () => {
+      setErr(null);
+      const r = await approveApplication(id);
+      if (r.ok) setApps((prev) => prev.map((a) => (a.id === id ? { ...a, approved_at: r.approvedAt, needs_review_count: 0 } : a)));
+      // The action refuses (with the reason) when the bundle is not actually submit-ready — surface that
+      // rather than silently doing nothing, because the button being visible implies it should work.
       else setErr(r.error);
     });
 
@@ -233,6 +244,29 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                   <span className="shrink-0 rounded border border-amber/40 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-label text-amber">
                     {a.needs_review_count} review
                   </span>
+                )}
+
+                {/* APPROVED — the state between "filled" and "sent", which the status enum has no word
+                    for. Only meaningful before submission: afterwards the status itself says more. */}
+                {a.approved_at && showsReviewChip(a.status) && (
+                  <span className="shrink-0 rounded border border-verified/40 bg-verified/[0.08] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-label text-verified">
+                    Approved
+                  </span>
+                )}
+
+                {/* Nothing was flagged, so there is no per-field decision to make — approving from here
+                    saves a trip into the detail page. The action still re-verifies against the bundle and
+                    refuses if it isn't genuinely ready (a blank REQUIRED field does not show up in this
+                    count), so this is a shortcut, not a bypass. */}
+                {!a.approved_at && a.needs_review_count === 0 && showsReviewChip(a.status) && (
+                  <button
+                    onClick={() => approve(a.id)}
+                    disabled={pending}
+                    className="shrink-0 rounded border border-verified/40 px-2 py-0.5 font-mono text-[10px] uppercase tracking-label text-verified transition-colors hover:bg-verified/[0.12] disabled:opacity-50"
+                    title="Nothing needs review — approve without opening"
+                  >
+                    Approve
+                  </button>
                 )}
 
                 <span className="shrink-0 font-mono text-[11px] text-ink-faint">

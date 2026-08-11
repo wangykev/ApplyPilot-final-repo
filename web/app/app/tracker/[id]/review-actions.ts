@@ -35,9 +35,18 @@ export async function saveReviewBundle(id: string, bundle: ReviewBundle): Promis
     const needs = live.filter((e) => e.needs_review && !e.is_approved).length;
     const toStore: ReviewBundle = { ...bundle, approval };
 
+    // The tracker LIST cannot see per-field approval (it never loads the bundle — a large jsonb), so the
+    // roll-up is mirrored onto its own column. Computed from the SAME server-side envelope, never from
+    // anything the client asserted.
+    //
+    // ⚠ It is CLEARED as readily as it is set. A value edit resets that field's approval, so a bundle
+    // that stops being submit_ready must stop reading "Approved" — a stale badge on a row that now has an
+    // unreviewed answer is exactly the wrong thing to show on the screen you decide from.
+    const approvedAt = approval.submit_ready ? new Date().toISOString() : null;
+
     const { error } = await supabase
       .from("applications")
-      .update({ review_bundle_json: toStore, needs_review_count: needs })
+      .update({ review_bundle_json: toStore, needs_review_count: needs, approved_at: approvedAt })
       .eq("id", id)
       .eq("user_id", user.id);
     if (error) return { ok: false, error: error.message };

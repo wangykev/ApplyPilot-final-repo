@@ -1097,12 +1097,18 @@ test("AI free-text: the calls run CONCURRENTLY, and each answer still lands on i
     atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
     atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
   });
-  const t0 = Date.now();
   const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
-  const elapsed = Date.now() - t0;
 
-  assert.ok(peak > 1, "the calls must overlap — peak concurrency was " + peak);
-  assert.ok(elapsed < 6 * CALL_MS, `serial would cost >= ${6 * CALL_MS}ms; took ${elapsed}ms`);
+  // Concurrency is asserted by OVERLAP, not by wall clock. This used to also require
+  // `elapsed < 6 * CALL_MS`, which measures the MACHINE as much as the code: it failed repeatedly on a
+  // loaded box (2247ms against a 720ms bound) while the overlap it was standing in for was perfect —
+  // a test that cries wolf trains you to ignore it. Peak in-flight is the thing the change is actually
+  // about, and it cannot be perturbed by a busy CPU.
+  // 4 = ATS_AI_PREFETCH_CONCURRENCY (ats.js), a DELIBERATE cap: an unbounded burst is how a free-tier
+  // key earns a 429, which would be slower than going serial. So "concurrent" here means exactly the
+  // pool size, and asserting it pins the cap as well as the overlap.
+  assert.strictEqual(peak, 4,
+    `the prefetch pool must run 4 calls at once (ATS_AI_PREFETCH_CONCURRENCY) — peak was ${peak}`);
   // …and every field still got ITS OWN answer, flagged, through the normal path
   assert.strictEqual(out.results.length, 6);
   for (const r of out.results) {
