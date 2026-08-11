@@ -2489,6 +2489,22 @@ function cdpOnboardScan() {
     // A spinner/progress node anywhere in the auth widget is the other likely tell.
     spinner: !!document.querySelector('[data-automation-id*="spinner" i],[data-automation-id*="progress" i],[role="progressbar"]'),
     pwFilled: !!(pwEl && pwEl.value),
+    // MEASURED 2026-08-11: at the moment the first Sign-In wait timed out, this object read
+    // {busy:false, disabled:false, pwFilled:true, spinner:true} — so `disabled`/`aria-busy` are NOT the
+    // in-flight tell (the button stays enabled while Workday processes). `spinner` was the only thing
+    // set, but a bare boolean over a DOCUMENT-WIDE selector cannot distinguish "a spinner is rendering"
+    // from "a spinner node is permanently mounted and hidden" — and Workday routinely keeps such nodes
+    // around. So report the COUNT and how many are actually laid out; a signal that reads identically on
+    // an idle form is not a discriminator, it just re-clicks with more confidence.
+    spinners: (function () { try { return document.querySelectorAll('[data-automation-id*="spinner" i],[data-automation-id*="progress" i],[role="progressbar"]').length; } catch (e) { return -1; } })(),
+    spinnersShown: (function () {
+      try {
+        return Array.prototype.filter.call(
+          document.querySelectorAll('[data-automation-id*="spinner" i],[data-automation-id*="progress" i],[role="progressbar"]'),
+          function (n) { const r = n.getBoundingClientRect(); return n.offsetParent !== null && r.width > 0 && r.height > 0; }
+        ).length;
+      } catch (e) { return -1; }
+    })(),
   } : null;
   // ── WHY the auth form refused (2026-08-07) ───────────────────────────────────────────────────────
   // A Sign In / Create Account that submits to nothing looked identical in the log to one that never

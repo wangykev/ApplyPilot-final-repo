@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "blank-shell-1";
+const AP_BUILD_MARKER = "submit-busy-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -7179,7 +7179,19 @@ async function runCdpOnboard(tabId, opts) {
     const ladder = (timeouts && timeouts.length) ? timeouts : null;
     const n = ladder ? ladder.length : tries;
     let st = null;
+    // ── IS THE RE-CLICK EVER JUSTIFIED? A PAIRED MEASUREMENT (2026-08-11) ──────────────────────────
+    // Operator: "the first click always works manually." The ladder decides "my click did not register"
+    // from the form still being MOUNTED — which is ALSO what an in-flight submit looks like, so it can
+    // re-submit a form that is already working (the double submit is what produces the empty shell).
+    // cdpOnboardScan.authBusy was added to look for positive evidence of a no-op but nothing ever
+    // consumed it, and the only samples on record were taken DURING flight — with no idle baseline they
+    // prove nothing. So take the baseline: one scan before the first click, compared against the state
+    // at the timeout. A field that DIFFERS is a usable tell; one that reads the same on an idle form is
+    // not, however suggestive it looks. Costs one scan per onboarding submit and only prints when a
+    // re-click actually happens, so a clean run stays quiet.
+    let busyBefore = null;
     for (let t = 1; t <= n; t++) {
+      if (t === 1) { try { const s0 = await scan(); busyBefore = (s0 && s0.authBusy) || null; } catch (e) { /* diagnostic only */ } }
       const submitted = await clickTarget(selectors, t > 1 ? `${label} (retry ${t - 1})` : label);
       if (!submitted.clicked) return (t > 1) ? { scan: st } : { notFound: true, blockedBy: submitted.blockedBy };
       const wait = ladder ? ladder[t - 1] : timeoutMs;
@@ -7191,6 +7203,13 @@ async function runCdpOnboard(tabId, opts) {
       // doesn't match yet) → return and let the caller re-evaluate on the next loop iteration.
       if (t < n && st && formStillUp(st)) {
         LOG(`${label}: no outcome after ${wait >= 1000 ? Math.round(wait / 1000) + "s" : wait + "ms"} and the form is still up — re-clicking (raced/not-ready button or a throttled page).`);
+        // The paired sample, printed at the ONE moment it matters: we are about to re-submit a form that
+        // may already be working. Read it as: any field that CHANGED between these two is a candidate
+        // in-flight tell we could gate the re-click on; if they are identical, this form exposes no
+        // observable difference between "processing" and "idle", and no amount of tuning the ladder can
+        // tell a swallowed click from a slow one — the recovery is what has to be good.
+        LOG(`   [SUBMIT-BUSY] idle (pre-click): ${JSON.stringify(busyBefore)}`);
+        LOG(`   [SUBMIT-BUSY] now (form still up after ${wait}ms): ${JSON.stringify((st && st.authBusy) || null)}`);
         if (beforeRetry) { try { await beforeRetry(st); } catch (e) { /* best-effort — the re-click proceeds regardless */ } }
         continue;
       }
