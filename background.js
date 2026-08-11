@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "submit-busy-1";
+const AP_BUILD_MARKER = "signin-rung-20s";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -7707,9 +7707,28 @@ async function runCdpOnboard(tabId, opts) {
           // The reload is the 8-9s. So the short rung did not make the happy path fast, it manufactured a
           // double submit whose recovery costs a full page reload. A first rung that lets a normal auth
           // round trip finish removes that entirely; a click that GENUINELY did not register (real, and
-          // why this ladder exists — 2026-08-06) is still caught, just 4s later instead of 0.5s, which is
-          // far cheaper than the reload it replaces.
-          timeouts: [4000, 6000, 6000],
+          // why this ladder exists — 2026-08-06) is still caught, just later, which is far cheaper than
+          // the reload it replaces.
+          //
+          // ── 4000ms WAS STILL TOO SHORT — MEASURED, 2026-08-11 ─────────────────────────────────────
+          // Operator: "why do we need the re-click when manually it always works?" Because manually you
+          // wait for the page; this gave up at 4s. The distribution of how long Workday ACTUALLY takes to
+          // answer the auth POST, from live cold sign-ins:
+          //     satisfied 2200ms · satisfied 4800ms · satisfied 13700ms · (timed out at 4000 x2)
+          // i.e. 2.2s-13.7s, with 4000ms sitting IN THE MIDDLE of it — so roughly half of all cold
+          // sign-ins tripped a re-click (measured: 5 of 11) and EVERY one of those re-clicks was a FALSE
+          // POSITIVE: the first click had worked and each run still logged `sign-in outcome: success`.
+          //
+          // There is nothing to poll for instead: the form exposes NO in-flight signal (refuted on two
+          // paired idle-vs-in-flight samples — `disabled`/`aria-busy` never set, and 9 spinner nodes are
+          // mounted AND laid out on the IDLE form; see the workday-onboarding skill). So the only correct
+          // lever is to stop concluding failure from a deadline shorter than the operation. 20s clears the
+          // observed tail with margin.
+          //
+          // THE TRADE, stated plainly: a genuinely swallowed click now costs 20s before the first retry
+          // instead of 4s. That is the right direction — a FALSE re-click risks the empty shell, which is
+          // a needs_operator halt that ends the run, while a slow genuine recovery only costs seconds.
+          timeouts: [20000, 8000, 8000],
           beforeRetry: signInEscalate
         });
         if (r.notFound) return haltNeedsOperator("signin-submit-not-found", r.blockedBy || "no Sign In button", st);
