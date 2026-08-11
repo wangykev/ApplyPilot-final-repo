@@ -602,6 +602,49 @@ stands on the pace-overrun mechanism, which is independent of it.
 - **`school--0` 3.6s → 60.9s across two runs of the SAME posting** — a server-backed combobox is the
   dominant and least predictable cost on this path. Any ATS timing claim needs several runs.
 
+### ⚠ HIDDEN IS ~2.4× SLOWER THAN VISIBLE ON ATS — unlike Workday (measured 2026-08-11)
+
+The operator's question: Workday hidden ≈ visible, is that true here? **No.** Same Greenhouse posting,
+same build, back-to-back:
+
+| | fill | ms/field | slowest field |
+|---|---|---|---|
+| hidden ×3 | 77.5s · 78.7s · 86.1s | ~3000ms | ONE widget hitting **34–61s** |
+| **visible** | **32.8s** | **1263ms** | candidate-location 8.4s — nothing hanging |
+
+The shape matters more than the ratio: hidden runs are not uniformly slower, they have **one
+server-backed combobox hanging to its ceiling, and a DIFFERENT one each run** (school--0 60.9s, then
+question_68143084 34.1s, then degree--0 19.3s + three questions). Visible runs have no such outlier.
+
+⚠ The `ats-tenants` skill says "visible and hidden runs are IDENTICAL". That is true of the ACTUATION
+MECHANISM — all three ATSs commit from synthetic events either way — and it is **not** true of
+wall-clock. Do not read the mechanism claim as a timing claim.
+
+**Eliminated: the `hidden-SLOW (no worker timers)` regime.** Every ATS run logged `CSP bypass ON ·
+worker-timers ON`, and the loud `warnNoWorkerTimers` banner never fired. So the polyfill IS installed and
+page timers ARE worker-backed — the Workday mechanism that makes hidden≈visible is working here and is
+still not enough.
+
+**Leading hypothesis (untested):** worker-timers fix TIMERS, not LAYOUT. A hidden tab does no layout or
+paint, and react-select positions and renders its menu off layout — so the option poll waits for a menu
+that never materialises and burns its ceiling. That fits the signature exactly (one combobox stuck at a
+ceiling, varying by run) and fits why Workday is unaffected (its widgets are plain portaled listboxes
+already handled by the settle-poll).
+
+**Fix direction — and it is the one the skill deliberately parked.** `Page.startScreencast` keeps Chrome
+producing frames for a hidden tab. It was REMOVED as unnecessary once the mid-life-overrides bug was
+fixed, on a measurement (Discord 16.9s vs 17.2s under capture), and the skill's condition for bringing it
+back is explicit: **"Bring it back only with a measurement."** That condition is now met — 32.8s visible
+vs 77.5–86.1s dark, on the same posting and build. ⚠ Two constraints from that same note still apply: it
+is not free (at `everyNthFrame:1` the JPEG encoding starved the renderer it was meant to free), and you
+cannot measure it while your own automation holds the tab under capture — confirm the probe reports `NOT
+painting` first. All three hidden runs above DID report `NOT painting`, so they are valid dark readings.
+
+**Cheaper thing to try first:** the hang is one widget at its ceiling, so before adding capture, check
+whether the option poll can be satisfied without layout (read the menu's options from the DOM even when
+unpositioned) — the menus are NOT virtualized here (measured 2026-08-07), so the options may well be in
+the DOM already while merely unplaced.
+
 ### Already refuted elsewhere — do not redo (see the `ats-tenants` skill)
 
 The 2.5s `waitAtsFormReady` floor (replacement instrumented and refuted — no observable signal separates
