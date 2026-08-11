@@ -29,9 +29,17 @@ const LABEL: Record<AppStatus, string> = {
 
 // The "N review" chip counts fields the FILL flagged for a human. Once the application has actually
 // been sent, that number is history — it isn't work you can still do, and showing it on a submitted row
-// reads as "17 things still need you". So the chip belongs only to the stages BEFORE submission.
+// reads as "17 things still need you". So the chip belongs only to the stage that still owns that work.
+// (Queued rows never reach the tracker at all — see `visible`.)
 function showsReviewChip(status: AppStatus): boolean {
-  return status === "queued" || status === "needs_review";
+  return status === "needs_review";
+}
+
+// Was this application actually SENT? Everything past needs_review means a real application exists in
+// the world, so deleting the row throws away the only record of it — that gets a confirmation. A
+// needs_review row is a fill, and a fill can simply be run again.
+function wasSent(status: AppStatus): boolean {
+  return status !== "needs_review" && status !== "queued";
 }
 
 function host(url: string | null): string {
@@ -58,6 +66,8 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
   const [filter, setFilter] = useState<AppStatus | "all">("all");
   const [pending, startTransition] = useTransition();
   const [err, setErr] = useState<string | null>(null);
+  // The row whose delete is awaiting confirmation (a sent application — see wasSent).
+  const [confirmId, setConfirmId] = useState<string | null>(null);
 
   // Poll the lightweight applications endpoint (every 12s while the tab is visible + on focus) and patch
   // the list in place. NOT a refresh: a JSON fetch → setState, only when the visible fields changed.
@@ -91,18 +101,25 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
     };
   }, []);
 
+  // QUEUED never belongs on the tracker — both loaders already exclude it, and this is the belt: it also
+  // covers the DEV_PREVIEW samples and any row still in state from before a status change.
+  const visible = apps.filter((a) => a.status !== "queued");
   const counts = APP_STATUSES.reduce<Record<string, number>>((acc, s) => {
-    acc[s] = apps.filter((a) => a.status === s).length;
+    acc[s] = visible.filter((a) => a.status === s).length;
     return acc;
   }, {});
-  const shown = filter === "all" ? apps : apps.filter((a) => a.status === filter);
+  const shown = filter === "all" ? visible : visible.filter((a) => a.status === filter);
 
   const setStatus = (id: string, status: AppStatus) =>
     startTransition(async () => {
       setErr(null);
       const r = await updateApplicationStatus(id, status);
-      if (r.ok) setApps((prev) => prev.map((a) => (a.id === id ? { ...a, status } : a)));
-      else setErr(r.error);
+      if (!r.ok) { setErr(r.error); return; }
+      // Moving a row back to QUEUED takes it off the tracker — it belongs to the queue now. Drop it here
+      // rather than waiting for the next poll to notice, so the list matches what you just asked for.
+      setApps((prev) =>
+        status === "queued" ? prev.filter((a) => a.id !== id) : prev.map((a) => (a.id === id ? { ...a, status } : a))
+      );
     });
 
   const remove = (id: string) =>
@@ -128,7 +145,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
   // clears the filter. `stage` is what a click selects; it drives the active styling too, so the strip
   // always shows which stage the list below is currently showing.
   const stats: { label: string; value: number; color: string; stage: AppStatus | "all" }[] = [
-    { label: "Total", value: apps.length, color: "#E6EDF5", stage: "all" },
+    { label: "Total", value: visible.length, color: "#E6EDF5", stage: "all" },
     { label: "Needs review", value: counts.needs_review, color: "#FFB627", stage: "needs_review" },
     { label: "Submitted", value: counts.submitted, color: "#36D6A0", stage: "submitted" },
     { label: "Interviewing", value: counts.interviewing, color: "#5BD2FF", stage: "interviewing" },
@@ -191,7 +208,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
         subtitle="Fills in automatically as the extension reports each run. Move a card through your pipeline as things progress."
       >
         {/* filters */}
-        {apps.length > 0 && (
+        {visible.length > 0 && (
           <div className="mb-4 flex flex-wrap gap-2">
             {chips.map((c) => (
               <button
@@ -204,7 +221,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                     : "border-hairline text-ink-dim hover:text-ink"
                 )}
               >
-                {c === "all" ? `All ${apps.length}` : `${LABEL[c]} ${counts[c]}`}
+                {c === "all" ? `All ${visible.length}` : `${LABEL[c]} ${counts[c]}`}
               </button>
             ))}
           </div>
@@ -212,7 +229,7 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
 
         {err && <p className="mb-3 text-sm text-signal">{err}</p>}
 
-        {apps.length === 0 ? (
+        {visible.length === 0 ? (
           <div className="py-10 text-center">
             <p className="text-sm text-ink-dim">No applications yet.</p>
             <p className="mx-auto mt-2 max-w-md text-xs leading-relaxed text-ink-faint">
@@ -247,8 +264,8 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                 )}
 
                 {/* APPROVED — the state between "filled" and "sent", which the status enum has no word
-                    for. Only meaningful before submission: afterwards the status itself says more. */}
-                {a.approved_at && showsReviewChip(a.status) && (
+                    for. Only meaningful while it is still awaiting review: afterwards the status says more. */}
+                {a.approved_at && a.status === "needs_review" && (
                   <span className="shrink-0 rounded border border-verified/40 bg-verified/[0.08] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-label text-verified">
                     Approved
                   </span>
@@ -257,8 +274,10 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                 {/* Nothing was flagged, so there is no per-field decision to make — approving from here
                     saves a trip into the detail page. The action still re-verifies against the bundle and
                     refuses if it isn't genuinely ready (a blank REQUIRED field does not show up in this
-                    count), so this is a shortcut, not a bypass. */}
-                {!a.approved_at && a.needs_review_count === 0 && showsReviewChip(a.status) && (
+                    count), so this is a shortcut, not a bypass.
+                    ONLY on `needs_review`: that status means a fill produced a bundle to approve. Any
+                    other stage has nothing to approve — a queued row has never been filled at all. */}
+                {!a.approved_at && a.needs_review_count === 0 && a.status === "needs_review" && (
                   <button
                     onClick={() => approve(a.id)}
                     disabled={pending}
@@ -294,14 +313,38 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                     <ExternalLink className="h-3.5 w-3.5" />
                   </a>
                 )}
-                <button
-                  onClick={() => remove(a.id)}
-                  disabled={pending}
-                  className="shrink-0 text-ink-faint transition-colors hover:text-signal"
-                  aria-label="Delete"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
+                {confirmId === a.id ? (
+                  // Inline, not window.confirm(): a native modal blocks every subsequent browser event,
+                  // which would freeze the extension mid-run if one were ever open.
+                  <span className="flex shrink-0 items-center gap-2">
+                    <span className="font-mono text-[10px] uppercase tracking-label text-signal">Delete?</span>
+                    <button
+                      onClick={() => { setConfirmId(null); remove(a.id); }}
+                      disabled={pending}
+                      className="rounded border border-signal/50 px-2 py-0.5 font-mono text-[10px] uppercase tracking-label text-signal transition-colors hover:bg-signal/[0.12]"
+                    >
+                      Confirm
+                    </button>
+                    <button
+                      onClick={() => setConfirmId(null)}
+                      className="font-mono text-[10px] uppercase tracking-label text-ink-faint hover:text-ink"
+                    >
+                      Cancel
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    // An application that was actually SENT is confirmed before it goes: deleting it
+                    // throws away the only record you have of applying. A needs_review row is just a
+                    // fill, and a fill can be run again — so that one still deletes on the first click.
+                    onClick={() => (wasSent(a.status) ? setConfirmId(a.id) : remove(a.id))}
+                    disabled={pending}
+                    className="shrink-0 text-ink-faint transition-colors hover:text-signal"
+                    aria-label="Delete"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                )}
               </li>
             ))}
           </ul>

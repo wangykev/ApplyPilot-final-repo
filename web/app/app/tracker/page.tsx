@@ -16,8 +16,12 @@ async function loadApplications(): Promise<Application[]> {
     } = await supabase.auth.getUser();
     if (!user) return DEV_PREVIEW ? SAMPLE_APPS : [];
     // soft-deleted apps are hidden from the tracker (their bundles live on for teach)
+    // QUEUED is not a tracker row (operator, 2026-08-11). The tracker is the record of applications
+    // that have actually been WORKED — filled, reviewed, sent. A queued row has never been filled, so it
+    // has nothing to show and nothing to act on here; queueing lives on its own tab.
     const query = (cols: string) =>
       supabase.from("applications").select(cols).eq("user_id", user.id).is("deleted_at", null)
+        .neq("status", "queued")
         .order("created_at", { ascending: false });
     const BASE = "id, company, role, url, status, needs_review_count, applied_at, created_at";
     // approved_at is fetched OPTIONALLY: on a database that has not run 0018 yet, naming it fails the
