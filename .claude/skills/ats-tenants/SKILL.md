@@ -32,6 +32,15 @@ from synthetic events (react-select opens, filters and commits fully synthetic),
 hidden runs are identical** — no pacing regime, no focus emulation, no input-event budget. If you
 find yourself reasoning about frames or trust here, check that assumption first.
 
+**Timing, measured (round 8, `docs/fill-speed-log.md`):** hidden ≈ visible in wall-clock too, so the
+sentence above is safe to read as a timing claim as well — with one caveat and one warning.
+*Caveat:* our own non-LLM fill work is ~5.8s cheaper visible on a 25-field page (1.41×, p=0.057, n=4/arm)
+— real but ~5% of a fill. *Warning:* **the LLM is 76–91% of an ATS fill**, so a hidden-vs-visible
+comparison that does not subtract the `[LLM]` line measures the provider. An earlier "hidden is 2.4×
+slower" claim came from one run per arm and was refuted; the second run of a back-to-back pair is slower
+whichever arm it is. Use `AP_DEV_LLM_PROBE` (idle, no-tab control arm) to get the provider's baseline
+before attributing anything to visibility.
+
 ## What "end to end" means
 
 Only when all four happened in one sitting:

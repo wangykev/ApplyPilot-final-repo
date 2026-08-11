@@ -602,7 +602,13 @@ stands on the pace-overrun mechanism, which is independent of it.
 - **`school--0` 3.6s → 60.9s across two runs of the SAME posting** — a server-backed combobox is the
   dominant and least predictable cost on this path. Any ATS timing claim needs several runs.
 
-### ⚠ HIDDEN IS ~2.4× SLOWER THAN VISIBLE ON ATS — unlike Workday (measured 2026-08-11)
+### ✖ SUPERSEDED — "HIDDEN IS ~2.4× SLOWER THAN VISIBLE ON ATS" — REFUTED by round 8, read that instead
+
+⚠ **The claim in this subsection is WRONG and the numbers under it are one run per arm.** Round 8 ran the
+controlled test (4+4 alternating, with an order-reversed pair and an idle no-tab control) and found NO
+hidden LLM penalty: the 2.4× was provider variance plus an ordering artefact — **the second run of a pair
+is slower whichever arm it is.** Kept, unedited below, because the reasoning is the honest record of what
+one run per arm looks like when it misleads you. The rest of round 7 stands.
 
 The operator's question: Workday hidden ≈ visible, is that true here? **No.** Same Greenhouse posting,
 same build, back-to-back:
@@ -673,6 +679,156 @@ all.
 The 2.5s `waitAtsFormReady` floor (replacement instrumented and refuted — no observable signal separates
 "finished" from "quiet before the next burst"); screencast forcing; porting `cdpScrapeTaOptions` (these
 menus are not virtualized).
+
+---
+
+## 2026-08-11 — round 8: the ATS hidden penalty — ✖ REFUTED, and what the real numbers are
+
+Round 7 left one thing open: *"hidden is ~2.4× slower than visible on ATS"* rested on 3 hidden runs
+against **one** visible run, and round 7 itself flagged that one visible run cannot separate a
+visibility effect from provider variance. This round ran the controlled test. **There is no hidden LLM
+penalty on the ATS path.** The 2.4× was provider variance plus an ordering artefact.
+
+### What was run
+
+4 hidden + 4 visible, alternating, on ONE posting, build `llm-dist-3`, plus **5 idle control probes**.
+Every run's visibility is the MEASURED `[ATS-PACING]` label + the `[ATS-TIME]` paint label, never the
+`background` flag — and all 8 agreed with intent (`hidden-fast (worker timers)` / `visible-fast`).
+
+Both arms were treated identically: fire, wait out the run **without touching Chrome**, then read. That
+matters — polling the dev tab activates it, which would have made the "visible" arm hidden, and polling
+only the hidden arm would have loaded the worker asymmetrically.
+
+### ★ The new instrument that settles it: an IDLE control arm (`AP_DEV_LLM_PROBE`)
+
+Hidden-vs-visible cannot answer "whose fault is the latency", because **both arms are measured while a
+run drives a tab**. The probe fires N calls through the same `act.llm` seam — same route resolver, same
+key rotation, same fast-retry, same `[LLM]` lines — with **no tab, no attach, no fill**. Three-way:
+
+| arm | n | min | p25 | **median** | p75 | max | mean |
+|---|---|---|---|---|---|---|---|
+| hidden | 28 | 7907 | 10143 | **11203** | 13192 | 45005 | 13333 |
+| visible | 28 | 1717 | 11328 | **14438** | 18539 | 47042 | 15795 |
+| **idle (no tab at all)** | 21 | 9658 | 10977 | **11922** | 15727 | **46777** | 14800 |
+
+The idle arm lands **between** the two run arms, and `visible vs idle` is indistinguishable
+(Mann-Whitney p=0.303). A visible tab costs nothing relative to having no tab — so there is no
+tab-driven mechanism to find. The tail says it fastest: **the three slowest calls of the session are one
+from each arm** — visible 47042ms, **idle 46777ms**, hidden 45005ms. A 46.8s call with no tab open is
+provider latency and cannot be anything else.
+
+### ★ The ordering confound — and the pair that broke it (the decisive result)
+
+In pairs 1–3 hidden ran FIRST and visible SECOND, so "visible slower" was perfectly confounded with
+"second-in-pair slower". **Pair 4 was deliberately run V-then-H:**
+
+```
+idle-A 15.9s | H1 12.0s → V1 18.6s | idle-B 10.9s | H2 10.6s → V2 12.5s
+idle-C 12.2s | H3 11.3s → V3 16.5s | idle-D 11.5s | V4 15.6s → H4 19.5s | idle-E 23.2s
+                                                    ^^^^^^^^^^^^^^^^^^^ order reversed
+```
+
+**In all four pairs the SECOND run was slower — whichever arm it was.** Reverse the order and the
+penalty follows the *slot*, not the visibility. `H4` (hidden, second) was the slowest run of the whole
+session at **156.6s**, and `idle-E` right after it was the slowest idle set (23.2s mean) — the provider
+degraded through the session, and both run arms and the no-tab arm degraded with it.
+
+So the raw `hidden vs visible` p=0.021 is an artefact of hidden systematically occupying the earlier,
+faster slot in 3 of 4 pairs. ⚠ **Do not read that p-value as an effect.** It is what a confound looks
+like when you have not controlled it yet.
+
+### The decomposition — where ATS fill time actually goes
+
+| | LLM | everything else | total |
+|---|---|---|---|
+| hidden mean (n=4) | — | **19.9s** | 113.2s |
+| visible mean (n=4) | — | **14.1s** | 124.7s |
+
+**The LLM is 76–91% of the entire fill.** Per run: `100.1s = 84.0 LLM + 16.1 ours`,
+`156.6s = 136.6 LLM + 20.0 ours`, `121.7s = 108.9 LLM + 12.8 ours`. Any ATS timing claim that does not
+subtract the `[LLM]` line is measuring the provider and calling it a tenant.
+
+**The one real, reproducible hidden cost is in OUR non-LLM work, and it is small:** hidden
+`{16.1, 19.2, 24.2, 20.0}` vs visible `{13.1, 13.2, 17.2, 12.8}` — **1.41×, a 5.8s gap** on a 25-field
+page (~230ms/field), the two sets nearly non-overlapping. Exact Mann-Whitney (n=4 each, normal approx
+invalid this small) gives **p=0.057 — suggestive, NOT significant.** Note this is the *opposite
+magnitude* to round 7's claim: ~5% of the fill, not 140%. Worth a dedicated round only if the LLM cost
+below is fixed first; until then it is inside the noise of a single LLM call.
+
+⚠ **My own instrument is asymmetric here — checked, and it is too small to matter.** The `[ATS-PACING]`
+line I added calls `cdpPacingLabel()`, which returns immediately for a VISIBLE tab but for a hidden one
+also runs `cdpTimersFast()`. That probe races against `cdpDelay(TIMER_FAST_MS)` with `TIMER_FAST_MS=200`,
+and every hidden run reported `hidden-fast`, which BY DEFINITION means the probe won the race — so the
+hidden-only cost is **<200ms, ~3% of the 5.8s gap** (and `_timerLatCache` means the run would have paid
+it anyway the first time it asked). The gap is not my instrument. Stated because a one-sided
+instrumentation cost landing in exactly the residual you are measuring is the easy way to invent an
+effect.
+
+### ⚠ MEASUREMENT TRAP — `ok in Xms` is NOT the call's cost
+
+`[LLM] ok in 855ms (11021ms total across 2 attempt(s))` — the first number is the **winning attempt**,
+not what the fill waited. That call cost **11021ms**: `gemini-3.1-flash-lite` returned **HTTP 503** after
+10166ms and it fell back to `gemini-3.5-flash-lite`, which answered in 855ms.
+
+Parsing `ok in` cost me a wrong intermediate table in which three 503-fallback calls read 716/777/855ms —
+they were really 12266/15886/11021ms. It understated hidden totals and inflated the non-LLM residual
+(H4 read 45.3s of "our" time that was actually LLM). **Always parse `(\d+)ms total across`.** Corrected
+numbers are the ones above.
+
+### ★ THE ACTUAL LEVER — the fast-retry is misfiring on ~every call (~24% of the fill)
+
+**76 of 77 calls this session exceeded 4s**, i.e. spent BOTH 2s fast tries before the attempt that
+answered. At 7 AI calls per page that is **~28s of pure overhead per run — ~24% of an average 118.9s
+fill**, and it is the largest single recoverable cost measured on this path.
+
+The rule's premise is currently FALSE. `LLM_FAST_RETRY_RULES` reasons that "observed answer time is well
+under 1s, so a call still running at 2s is a stuck socket, not a slow model" — but the honest answer time
+this session was **~7–13s** (idle median 11.9s, with no tab in play). Every call therefore looks like a
+stuck socket and pays 4s to learn it isn't.
+
+**Its safety invariant held perfectly** — every one of the 77 calls SUCCEEDED, because once the fast tries
+are spent the next attempt gets the full budget. So this is purely a LATENCY mistune, never a correctness
+or coverage problem, which is exactly why it is safe to tune. **NOT changed here:** the 2000ms is
+unit-pinned by two tests and it is the operator's design call. Options, cheapest first: make the cap
+adaptive off a rolling p50 of recent answers (the data to do it is already logged), raise it for the
+gemini rule, or gate fast-retry on the primary model's recent 503 rate. The 503s are the real signal —
+the provider was unhealthy, not the socket.
+
+### The fixture died mid-investigation — check this before reusing round 7's URL
+
+`job-boards.greenhouse.io/roblox/jobs/8072713` (round 7's posting, filled 26 fields hours earlier)
+**now 302s to `careers.roblox.com/jobs/8072713`**, UA-independent. That page loads fully with **0 inputs,
+0 selects, 0 iframes** and a JS-only "Apply Now" — the Greenhouse form is unreachable.
+
+⚠ **`atsPostingGone` does NOT catch this.** It asks whether the requested job id is still in the landed
+URL, and `careers.roblox.com/jobs/8072713?gh_jid=8072713` still contains `8072713`. So a run proceeds and
+tries to fill an employer careers page as if it were Greenhouse. Worth a follow-up: an off-HOST redirect
+away from the ATS domain is evidence in its own right, independent of the id.
+
+Replacement fixture, verified serving the form directly on the GH host:
+**`job-boards.greenhouse.io/cloudflare/jobs/7902104`** (Accounting Intern, Fall 2026) — 35 inputs, 27
+`question_*` ids, 15 comboboxes, **7 `ai-choice` LLM calls per run**, 25 fields filled, stable across 9
+consecutive runs. Found by probing `boards-api.greenhouse.io/v1/boards/<co>/jobs/<id>?questions=true` for
+a board that does not redirect off-host; `databricks`, `duolingo`, `asana` and `samsara` all redirect,
+`discord`, `figma`, `airtable`, `reddit` and `cloudflare` do not.
+
+### New instruments (both kept)
+
+- **`AP_DEV_LLM_PROBE`** (`{type, n}`) — the idle control arm described above. Refuses while a run is in
+  flight. Logs `[ApplyPilot][LLM-PROBE]`.
+- **`[ATS-PACING]`** — `runAtsApplicationRun` now logs `cdpPacingLabel()` the way the Workday path
+  already did. The ATS path previously logged no visibility at all, so every hidden-vs-visible claim
+  about it rested on the caller's `background` flag, which is an INTENTION and not an observation.
+
+### Do NOT redo
+
+- **Hidden-vs-visible on the ATS path.** Settled: no LLM effect; our own non-LLM work is ~5.8s
+  (p=0.057) cheaper visible, i.e. ~5% of a fill. Round 7's 2.4× is refuted.
+- **Believing a hidden/visible ATS comparison that does not control ORDER.** The second run of a pair
+  is slower whichever arm it is; the provider drifts on a timescale of minutes.
+- **Reading `[LLM] ok in Xms` as a call's cost.** Parse the total across attempts.
+- Everything in round 7's own "do not redo" list (the page clock here, the option-poll "layout" fix,
+  `Page.startScreencast`, attempts floors).
 
 ---
 

@@ -596,6 +596,14 @@ fast-try budget is INDEPENDENT of the error ladder, because rotation probes ever
 by tests). A fast abort is never a key fault: it does not consume a rotation slot or get a key marked bad.
 Adding another model is one line in the rule table; `fastRetry:false` opts a call out.
 
+**`AP_DEV_LLM_PROBE` is how you PROVE it — the IDLE control arm (2026-08-11).** It fires N calls through
+the same `act.llm` seam with **no tab, no attach, no run**, so provider latency is measured with nothing
+else to blame. Use it before attributing any slowness to a tenant, a tab's visibility, or the fill code:
+a hidden-vs-visible comparison cannot separate the two, because BOTH arms run while a tab is being driven.
+It refuses while a run is in flight. This retired the "hidden is 2.4× slower on ATS" claim — **the LLM is
+76–91% of an ATS fill**, an idle no-tab call hit 46.8s, and the second run of a back-to-back pair is
+slower whichever arm it is (round 8, `docs/fill-speed-log.md`).
+
 **`debugLagTrace`** (`AP_DEV_FLAG`) is the tool that settles it, and it exists because a duration alone
 never could: it times every CDP command at the `cdpSend` choke point, runs a 500ms no-op page probe, and
 measures the service worker's own timer drift — three clocks that fail independently, so each slow command

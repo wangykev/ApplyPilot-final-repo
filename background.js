@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "fresh-rect-1";
+const AP_BUILD_MARKER = "llm-dist-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -783,6 +783,52 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       if (ids.length) await new Promise((r) => chrome.tabs.remove(ids, r));
       console.log(`[ApplyPilot][DEV] closed ${ids.length} tab(s) matching ${JSON.stringify(needle)}`);
       sendResponse({ ok: true, closed: ids.length });
+    })();
+    return true;
+  }
+
+  // DEV: the IDLE CONTROL ARM for LLM latency (2026-08-11). Fires N sequential calls through the
+  // SAME act.llm seam a fill uses — same route resolver, same key rotation, same fast-retry, same
+  // [LLM] log lines — but with NO tab, NO debugger attach and NO fill in flight.
+  //
+  // WHY this exists: "a slow page is the LLM until proven otherwise" identifies the LLM as the cost,
+  // but not WHOSE fault the latency is. Comparing a hidden run against a visible run cannot separate
+  // provider variance from our own service worker being busy/starved, because BOTH arms are measured
+  // while a run is driving a tab. This arm removes the tab entirely, so the three-way comparison
+  // (hidden run · visible run · idle) can attribute the cost:
+  //   hidden ≈ visible ≈ idle  ⇒ provider noise; there is no visibility penalty to fix.
+  //   hidden >  visible ≈ idle ⇒ a real visibility effect (MV3 worker starvation while hidden).
+  //   hidden ≈ visible >  idle ⇒ the RUN inflates it, whatever the tab is doing — the SW's own load.
+  // Read-only: it never touches a page, never fills, and refuses while a run holds the attach.
+  if (type === "AP_DEV_LLM_PROBE") {
+    (async () => {
+      if (runInFlight || discoverInFlight) {
+        sendResponse({ ok: false, error: "busy", detail: "A run or sweep is in progress — the idle arm must be measured IDLE." });
+        return;
+      }
+      const n = Math.max(1, Math.min(12, Number(message.n) || 5));
+      const llmConfig = await getLlmConfig();
+      const act = makeCdpActuation(llmConfig);   // config-only use; act.llm touches no tab
+      const samples = [];
+      for (let i = 0; i < n; i++) {
+        const t0 = Date.now();
+        // Shaped like a real ai-choice dropdown question so the token count is representative.
+        const r = await act.llm({
+          system: "You pick one option from a list. Reply with the option text only.",
+          user: "Question: What is your highest level of education?\nOptions: High School, Bachelor's Degree, Master's Degree, Doctorate\nReply with exactly one option.",
+          maxTokens: 16,
+          action: "fill",
+        });
+        samples.push({
+          i, ms: Date.now() - t0, ok: !!(r && r.ok),
+          detail: r && r.ok ? String(r.text || "").trim().slice(0, 40) : String((r && r.error) || "?").slice(0, 90),
+        });
+      }
+      const oks = samples.filter((s) => s.ok).map((s) => s.ms);
+      console.log(`[ApplyPilot][LLM-PROBE] idle control, ${n} call(s): `
+        + samples.map((s) => s.ms + "ms" + (s.ok ? "" : " FAILED")).join(" · ")
+        + (oks.length ? ` — ok min ${Math.min(...oks)}ms · max ${Math.max(...oks)}ms` : " — every call FAILED"));
+      sendResponse({ ok: true, samples });
     })();
     return true;
   }
@@ -4363,6 +4409,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // worked too and was rejected for being a second page load.
     await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
     await cdpSetFocusEmulation(true).catch(() => {});
+    // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
+    // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
+    // occluded tab still reports `tab.active && !minimized`, and polling the dev tab from automation
+    // ACTIVATES it — so `background:false` at the call site is an INTENTION, not an observation. Any
+    // hidden-vs-visible timing claim about this path needs the measured label, not the flag.
+    try { LOG(`[ATS-PACING] ${await cdpPacingLabel()}`); } catch (e) { /* label only */ }
 
     // …and NOW open the posting, so its document runs with the overrides from its first byte. Defensive
     // about the starting URL: a caller that hands over an already-loaded tab (the redirect chase below
