@@ -531,6 +531,85 @@ theorised to be: these transitions take **22–76 reads**, not the ~3–14 the e
 
 ---
 
+## 2026-08-11 — round 7: the NON-WORKDAY (ATS) path — what transfers, and what does NOT
+
+First look at Greenhouse / Lever / Ashby (`ats.js`) with the Workday lessons in hand. **The headline is a
+refutation of my own change: the page clock does NOT transfer to the ATS path.**
+
+### The ATS path is a genuinely different shape — check this before porting anything
+
+| | Workday | ATS |
+|---|---|---|
+| actuation | trusted `Input.*` (synthetic when hidden) | **page-side synthetic always**, via `Runtime.evaluate` |
+| pacing inside the fill | `act.delay` (SW) everywhere | page-side `sleep()` inside injected code |
+| SW poll loops | 28 in background.js + 28 in fill-driver.js | **`ats.js` has ZERO** |
+
+So the fill loop itself is NOT on the starved MV3 clock, and most of Workday's pacing work has nothing to
+bite on here. What IS SW-side is the DRIVER: `waitAtsFormReady` (450ms beat), `waitAtsPostingSettled`
+(300ms), and the post-navigate settles.
+
+### Drift IS present in the driver — measured
+
+Live, hidden Greenhouse (Roblox) run, with `[PACE]` (always on, no flag):
+
+```
+a 450ms pace took 2987ms (sw)     ← waitAtsFormReady, 6.6× over
+a 1000ms pace took 3045ms (sw)
+```
+
+Real, and it is not merely latency: `waitAtsFormReady` accepts on **three consecutive equal reads**, so a
+6.6× beat pushes acceptance from ~900ms to ~6s and its deliberate 2500ms floor stops being what binds.
+
+### ✖ REFUTED — arming the page clock there made it WORSE (do not retry)
+
+I applied the onboarding precedent exactly: arm the page clock only for the interval FOLLOWING a
+successful in-page scan, disarm in a `finally`. Measured, same posting, same conditions:
+
+| | pace overruns | shape |
+|---|---|---|
+| SW clock (before) | **2** | both `(sw)` |
+| page clock (after) | **5** | mostly **`page-abandoned`** |
+
+The ATS settle runs immediately after a NAVIGATE, and that is the one state round 3 already identified:
+**neither clock is clean during a navigation.** The page arm hangs, and the abandonment ceiling is itself
+an SW timer, so each hang costs `want + slack` measured late.
+
+**The flaw in my gate, worth stating because it looked airtight:** a successful `cdpEval` proves the
+document EXECUTES, not that its TIMERS fire. `Runtime.evaluate` is not timer-driven. On a freshly
+navigated document those two come apart, which is exactly where this was armed. Reverted.
+
+### ⚠ And what the run-to-run numbers do NOT prove
+
+The page-clock run also measured `fill 78.7s` against the previous `fill 23.9s` — a 3.3× regression it
+would be very easy, and wrong, to pin on the change. The breakdown says otherwise:
+
+```
+run 1 (sw):   23.9s / 26 fields — slowest: candidate-location 9.3s, school--0 3.6s
+run 2 (page): 78.7s / 26 fields — slowest: school--0 60.9s, candidate-location 8.0s
+```
+
+The entire difference is **`school--0`, a server-backed react-select** whose own search hung — and the
+change touched only the two settle loops, never the fill's option poll. LLM was fast in both runs
+(750–807ms), so the standing "a slow page is the LLM until proven otherwise" rule is also cleared here.
+**One run each cannot separate a code change from a widget with that much variance**; the refutation above
+stands on the pace-overrun mechanism, which is independent of it.
+
+### The real ATS costs, as measured (baseline for anyone tuning this)
+
+- `fill 23.9s for 26 field(s) — 919ms/field` on a healthy hidden Greenhouse run.
+- **`candidate-location` 8.0–9.3s on BOTH runs** — the known GH places field. Consistent, so it is the
+  best-characterised target here.
+- **`school--0` 3.6s → 60.9s across two runs of the SAME posting** — a server-backed combobox is the
+  dominant and least predictable cost on this path. Any ATS timing claim needs several runs.
+
+### Already refuted elsewhere — do not redo (see the `ats-tenants` skill)
+
+The 2.5s `waitAtsFormReady` floor (replacement instrumented and refuted — no observable signal separates
+"finished" from "quiet before the next burst"); screencast forcing; porting `cdpScrapeTaOptions` (these
+menus are not virtualized).
+
+---
+
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
 
 Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now
