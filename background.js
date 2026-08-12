@@ -337,7 +337,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           return;
         }
         const store = await new Promise((r) =>
-          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets"], r)
+          // genericFillDisabled — the generic-driver kill switch (docs/generic-filler-plan.md). Absent
+          // ⇒ enabled, which is safe because the generic path only ever engages where this pipeline
+          // would otherwise have HALTED.
+          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets", "genericFillDisabled"], r)
         );
         if (!store.profile) {
           sendResponse({ ok: false, error: "no-profile", detail: "Sync your profile to the extension first (the Connect page)." });
@@ -468,6 +471,48 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
               }
             }
           } catch (e) { console.log("[ApplyPilot][RUN] embedded-form probe skipped:", String((e && e.message) || e)); }
+        }
+
+        // ── GENERIC ATTEMPT for an unrecognized host (docs/generic-filler-plan.md) ──────────
+        // The operator's queue comes from LinkedIn/Handshake, so most links are NOT a supported ATS:
+        // measured 2026-08-11, ~19 of 27 queued jobs were hosts this pipeline could not drive
+        // (Oracle, UKG, ADP, Dayforce, Paylocity, NEOGOV, plus employer-hosted sites). Those all land
+        // here and today go to the WORKDAY onboarding, which is not what they are.
+        //
+        // ⚠ ORDERING IS THE SAFETY. The generic attempt runs FIRST but only *reports* when it actually
+        // REACHED A FORM (`reached_form`), and `atsLooksLikeApplicationForm` is what decides that — so a
+        // Workday-fronted employer JD page (no application form on it; its Apply link points at a
+        // myworkdayjobs host) cannot be captured by it. Anything else FALLS THROUGH to the existing
+        // onboarding path with the tab put back where it started, so today's behaviour is preserved.
+        //
+        // ⚠ AND THE TAB IS BLANKED FIRST, deliberately. `runAtsApplicationRun` installs the page
+        // overrides (worker timers / rAF) and those BREAK A DOCUMENT THEY LAND ON MID-LIFE — the
+        // "dead form whose only cure was a refresh". The supported-ATS entry avoids that by opening
+        // blank and navigating under the overrides; this does the same, at the cost of one page load.
+        if (!detectAts(startUrl) && store.genericFillDisabled !== true) {
+          let generic = null;
+          try {
+            await new Promise((r) => chrome.tabs.update(tabId, { url: "about:blank" }, () => r()));
+            await waitTabComplete(tabId, 20000);
+            generic = await runAtsApplicationRun(tabId, "generic", store, startUrl, {
+              originUrl: startUrl, genericTried: true,
+            });
+          } catch (e) {
+            console.log("[ApplyPilot][RUN] generic attempt threw:", String((e && e.message) || e));
+          }
+          if (generic && generic.reached_form) {
+            console.log("[ApplyPilot][RUN] the generic driver filled this form — reporting it");
+            sendResponse({ ...generic, jd: generic.jd || jd, tabId, startUrl });
+            return;
+          }
+          console.log(`[ApplyPilot][RUN] generic attempt did not reach a form (${(generic && (generic.stopped || generic.error)) || "no result"}) — falling through to the Workday onboarding path`);
+          // put the tab back on the posting: runCdpOnboard scans the CURRENT page.
+          try {
+            await cdpDetach().catch(() => {});
+            await new Promise((r) => chrome.tabs.update(tabId, { url: startUrl }, () => r()));
+            await waitTabComplete(tabId, 20000);
+            await waitJobPageSettled(tabId);
+          } catch (e) { console.log("[ApplyPilot][RUN] could not restore the posting tab:", String((e && e.message) || e)); }
         }
 
         // Pre-form stage. The tab is ALREADY on the JD page (we created it there), so pass
@@ -4303,6 +4348,17 @@ async function pullApprovedBundle(LOG, opts) {
 
 // Poll the form until its field count is stable non-zero twice (the standing
 // "never scan a progressively-rendered page without settling it" rule — 5th site).
+// ONE scan entry point for the SW side, mirroring ats.js's `atsScanFor`. The generic kind has its
+// own injected scanner + a PURE resolution pass; every other kind reaches `atsInjScan` unchanged.
+async function cdpAtsScan(ats) {
+  if (ats !== "generic") return await cdpEval(atsInjScan, ats);
+  const raw = await cdpEval(atsInjScanGeneric);
+  const scan = atsGenericPostProcess(raw);
+  // a control we cannot re-find on the second visit is never counted as fillable (see atsScanFor)
+  scan.fields = (scan.fields || []).filter((f) => !f.unidentified);
+  return scan;
+}
+
 async function waitAtsFormReady(ats, LOG, ceilingMs) {
   const start = Date.now();
   const deadline = start + (ceilingMs || 25000);
@@ -4310,7 +4366,7 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
   while (Date.now() < deadline) {
     await cdpWakePage();
     let n = 0;
-    try { const s = await cdpEval(atsInjScan, ats); n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; }
+    try { const s = await cdpAtsScan(ats); n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; }
     // THREE consecutive equal non-zero reads AND ≥2.5s elapsed — two reads 450ms apart
     // accepted Ashby's form at 9 fields while its survey/consent entries (4 more) were
     // still mounting (live 2026-07-31). Sections mount in bursts; a stable count between
@@ -4318,7 +4374,7 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
     stable = n > 0 && n === prev ? stable + 1 : 0;
     if (stable >= 2 && Date.now() - start >= 2500) {
       // Settled — but settled on WHAT? Identify the page positively before calling it a form.
-      const scan = await cdpEval(atsInjScan, ats).catch(() => null);
+      const scan = await cdpAtsScan(ats).catch(() => null);
       const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
       const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
       if (!id.ok) {
@@ -4333,7 +4389,7 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
   LOG(`form did not settle within ${ceilingMs || 25000}ms (last field count ${prev})`);
   // Same rule on the timeout path: fields we never identified as a form are not a form.
   if (prev > 0) {
-    const scan = await cdpEval(atsInjScan, ats).catch(() => null);
+    const scan = await cdpAtsScan(ats).catch(() => null);
     const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
     const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
     if (!id.ok) { LOG(`the ${prev} field(s) here are not an application form — ${id.why}`); return { ready: false, fields: prev, notAForm: true, why: id.why }; }
@@ -4445,6 +4501,23 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // 2026-08-02, after a bad fill had been corrected). Every hop carries the origin forward.
   const originUrl = opts0.originUrl || startUrl;
   const LOG = (...a) => console.log("[ApplyPilot][ATS-RUN]", ...a);
+  // ── GENERIC FALLBACK (docs/generic-filler-plan.md) ────────────────────────────────────
+  // Engaged ONLY where this function would otherwise return a HALT, and only once per run. So it
+  // can convert `apply-off-pipeline` / `form-not-rendered` into an attempt; it can never change a
+  // run that reaches a supported form today. `store.genericFillDisabled === true` is the kill switch.
+  //
+  // The recursion is the whole mechanism: re-entering with ats="generic" reuses this function's
+  // navigation, JD scrape, settle wait and — critically — its `atsLooksLikeApplicationForm` gate,
+  // which is what stops a generic fill from grabbing a JD page's cookie banner or search form.
+  const genericOk = () => opts0.genericTried !== true && !(store && store.genericFillDisabled === true) && ats !== "generic";
+  const tryGeneric = async (url, why) => {
+    LOG(`↪ GENERIC FALLBACK: ${why} — re-running this landing as a generic form: ${url}`);
+    emitRunProgress("Trying the form generically", "unrecognized ATS");
+    await cdpDetach().catch(() => {});
+    return await runAtsApplicationRun(tabId, "generic", store, url, {
+      chase: opts0.chase || 0, applyHops: opts0.applyHops || 0, originUrl, genericTried: true,
+    });
+  };
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
@@ -4568,9 +4641,14 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         const after = await cdpEval(function () { return location.href; }).catch(() => link);
         const afterAts = detectAts(after);
         LOG(`apply link landed on ${after} (${afterAts || "unsupported host"})`);
-        if (!afterAts || afterAts === "workday") {
+        if (afterAts === "workday") {
           return { ok: true, needs_operator: true, stopped: "apply-off-pipeline", jd, redirectUrl: after,
-            detail: "The application lives at " + after + (afterAts === "workday" ? " — a Workday requisition; run that link instead." : " — a host this pipeline can't drive yet; apply there yourself.") };
+            detail: "The application lives at " + after + " — a Workday requisition; run that link instead." };
+        }
+        if (!afterAts) {
+          if (genericOk()) return await tryGeneric(after, "the apply link landed on an unrecognized host");
+          return { ok: true, needs_operator: true, stopped: "apply-off-pipeline", jd, redirectUrl: after,
+            detail: "The application lives at " + after + " — a host this pipeline can't drive yet; apply there yourself." };
         }
         await cdpDetach(); // the recursive call re-attaches; ONE tracked client per tab
         return await runAtsApplicationRun(tabId, afterAts, store, after, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1, originUrl });
@@ -4606,6 +4684,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
           await cdpDetach();
           return await runAtsApplicationRun(tabId, detectAts(embAfter), store, embAfter, { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1, originUrl });
         }
+        if (genericOk() && after2) return await tryGeneric(after2, "the apply BUTTON landed on an unrecognized host");
         return { ok: true, needs_operator: true, stopped: "apply-off-pipeline", jd, redirectUrl: after2,
           detail: "The application lives at " + after2 + " — a host this pipeline can't drive yet; apply there yourself." };
       }
@@ -4620,8 +4699,16 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         return { ok: true, needs_operator: true, stopped: "posting-gone", jd,
           detail: "This job is no longer posted — " + gone + ". Nothing is wrong with the fill; pick another posting." };
       }
+      // ⚠ NOT-A-FORM is a DIFFERENT state from no-form, and it must not become a generic attempt:
+      // `notAForm` means the settle DID identify controls and `atsLooksLikeApplicationForm` refused
+      // them (a cookie banner, a job-search box, a marketing capture). Re-running that generically
+      // would just refuse it again, more slowly — and on the two forms where this fired live (the
+      // Dayforce JD page, Crown) the refusal was correct.
+      if (genericOk() && !ready.notAForm) return await tryGeneric(hereX || startUrl, "no " + ats + " form rendered here");
       return { ok: true, needs_operator: true, stopped: "form-not-rendered",
-        detail: "No " + ats + " application form rendered at " + (hereX || startUrl) + " and no apply link could be followed — open the tab and check, then re-run.", jd };
+        detail: "No " + ats + " application form rendered at " + (hereX || startUrl) +
+          (ready.notAForm ? " — and the controls that ARE here are not an application form (" + ready.why + ")" : " and no apply link could be followed") +
+          " — open the tab and check, then re-run.", jd };
     }
     LOG(`form settled — ${ready.fields} field(s).`);
 

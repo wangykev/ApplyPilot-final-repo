@@ -612,6 +612,27 @@ function atsInjReadValue(ats, inputSel, widgetType) {
       for (const c of chips) { const t = txt(c.querySelector(".select__multi-value__label") || c); if (t && seen.indexOf(t) === -1) seen.push(t); }
       if (seen.length) return { ok: true, value: seen.join(", ") };
     }
+    // GENERIC ONLY: an arbitrary combobox renders its committed value somewhere other than
+    // react-select's `.select__single-value`. Ant puts it in `.ant-select-selection-item`, MUI in the
+    // trigger's own text, and several vendors only expose it through `aria-activedescendant`. Reading
+    // just `el.value` returns the SEARCH input, which is empty after a commit — the same false
+    // "commit did not persist" that cost three Greenhouse demographics before the chip fix.
+    // ⚠ Gated on ats === "generic" so Greenhouse / Lever / Ashby keep their exact behaviour.
+    if (ats === "generic") {
+      var shell = el.closest('.ant-select,[class*="select"],[class*="Select"],[role="combobox"]') || el.parentElement;
+      if (shell) {
+        var pick = shell.querySelector('.ant-select-selection-item,[class*="selection-item"],[class*="single-value"],[class*="singleValue"]');
+        var pv = txt(pick);
+        if (pv) return { ok: true, value: pv };
+      }
+      var ad = el.getAttribute("aria-activedescendant");
+      if (ad) { var adn = document.getElementById(ad); var adt = txt(adn); if (adt) return { ok: true, value: adt }; }
+      // a trigger BUTTON combobox (aria-haspopup=listbox) shows its value as its own text
+      if (el.tagName === "BUTTON" || el.getAttribute("aria-haspopup") === "listbox") {
+        var bt = txt(el);
+        if (bt) return { ok: true, value: bt };
+      }
+    }
     return { ok: true, value: el.value || null };
   }
   if (widgetType === "dropdown_native") return { ok: true, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null };
@@ -925,8 +946,21 @@ function atsInjAttachFile(inputSel, base64, filename, mime) {
 function atsInjSubmitState(ats) {
   const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   let btn = null;
+  let multiStep = false;
   if (ats === "lever") btn = document.querySelector("#btn-submit");
   if (!btn) btn = [...document.querySelectorAll('button[type="submit"], button')].find((b) => /submit application|submit$/i.test((b.textContent || "").trim()) && vis(b));
+  // GENERIC ONLY: an arbitrary form labels its final control "Submit", "Apply", "Send application"…
+  // ⚠ AND "Next Step" / "Continue" IS NOT A SUBMIT — it advances a WIZARD. Paylocity's primary
+  // button is literally "Next Step" (44 fields, multi-page), and treating that as the submit control
+  // would arm the gate on a page that is not the end of the application. So a page whose only
+  // primary control advances is reported `multiStep`, with hasSubmit FALSE, and the run halts
+  // honestly instead of clicking something irreversible-looking that is not the submit.
+  if (!btn && ats === "generic") {
+    const cands = [...document.querySelectorAll('button[type="submit"], input[type="submit"], button, [role="button"]')].filter(vis);
+    const textOf = (b) => ((b.textContent || b.value || b.getAttribute("aria-label") || "")).replace(/\s+/g, " ").trim();
+    btn = cands.find((b) => /^(submit|apply|send)\b|submit (my )?application|send application|finish|complete application/i.test(textOf(b))) || null;
+    if (!btn) multiStep = cands.some((b) => /next step|next\b|continue|save and continue/i.test(textOf(b)));
+  }
   const r = btn ? btn.getBoundingClientRect() : null;
   // a VISIBLE captcha challenge. ⚠ Lever's DORMANT invisible-mode hCaptcha container is a
   // FULL-VIEWPORT iframe (1547×720 live) with `visibility:hidden` — a size-only test calls
@@ -940,7 +974,7 @@ function atsInjSubmitState(ats) {
   });
   const bodyText = (document.body.innerText || "").slice(0, 4000);
   const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText) || /\/thanks(\?|$)/.test(location.href);
-  return { ok: true, hasSubmit: !!btn, rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
+  return { ok: true, hasSubmit: !!btn, multiStep, rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
     disabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null, captchaChallenge: challenge, confirmed, url: location.href };
 }
 
@@ -1407,11 +1441,18 @@ function atsLooksLikeApplicationForm(fields, submitState) {
   const hasResume = list.some((x) => (x && x.widgetType === "file_upload") || /resume|\bcv\b/.test(txt(x)));
   const hasName = list.some((x) => /(^|[^a-z])(first|last|full|preferred|legal)?[ _-]*name([^a-z]|$)/.test(txt(x)));
   const hasSubmit = !!(submitState && submitState.hasSubmit);
+  // A WIZARD's first page is a real application form even though its primary control advances
+  // rather than submits (Paylocity: 44 fields behind "Next Step"). `multiStep` is only ever set by
+  // the GENERIC submit-state reader, so this cannot change Greenhouse / Lever / Ashby, which always
+  // report a real submit. The distinction is kept: form DETECTION accepts either, while the submit
+  // GATE still requires `hasSubmit` — advancing a wizard is not submitting an application.
+  const multiStep = !!(submitState && submitState.multiStep);
+  const affordance = hasSubmit || multiStep;
   return {
-    ok: hasSubmit && (hasResume || hasEmail || hasName),
-    hasSubmit, hasResume, hasEmail, hasName,
-    why: hasSubmit ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
-                   : "no submit control on the page — this isn't a form we could ever submit",
+    ok: affordance && (hasResume || hasEmail || hasName),
+    hasSubmit, multiStep, hasResume, hasEmail, hasName,
+    why: affordance ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
+                    : "no submit or next-step control on the page — this isn't a form we could ever complete",
   };
 }
 
@@ -1576,6 +1617,27 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
       // empty mapped value → fall through (same reason as above)
     }
   }
+  // GENERIC: the RÉSUMÉ has no static map to be recognized by. Every supported family names its
+  // resume field in ATS_STATIC_MAPS (checked above, so this cannot shadow them), but a generic form's
+  // file input is just a file input — and the résumé is the single most important field on the page.
+  // Recognize it from the widget + its label, and refuse the neighbours a form usually puts beside it
+  // (cover letter, transcript, portfolio) so we never attach the résumé to the wrong slot.
+  if (ats === "generic" && f && f.widgetType === "file_upload") {
+    const l = String(f.label || f.fieldName || "");
+    if (/cover\s*letter|transcript|portfolio|writing sample|certificat|reference/i.test(l)) {
+      return { kind: "skip", source: "generic", detail: "a non-résumé attachment — the operator's own to add" };
+    }
+    if (/r[eé]sum[eé]|\bcv\b|upload.*(file|document)|attach/i.test(l) || /resume|cv/i.test(String(f.fieldName || ""))) {
+      return { kind: "resume", source: "generic" };
+    }
+    // An UNLABELLED file input is the résumé slot only when it is the form's ONLY one. With two or
+    // more and no label to tell them apart, guessing which is the résumé risks attaching it to a
+    // transcript/portfolio slot — so it goes to review instead (`soleFileInput` is computed by
+    // atsGenericPostProcess, which is the only place that sees the whole field list).
+    if (f.soleFileInput) return { kind: "resume", source: "generic", detail: "the form's only file input — treated as the résumé" };
+    return { kind: "skip", source: "generic", detail: "one of several unlabelled file inputs — which one is the résumé is not decidable, so it is left for you" };
+  }
+
   // Buckets — the operator's own taught wordings, exact-normalized (no fuzzy; misses fall
   // through). Mode A (profile_path) + Mode B (value list) both become candidates/value.
   if (bucketIndex && f.label) {
@@ -1611,10 +1673,34 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
   return null;
 }
 
+// ONE scan entry point. `generic` uses its own injected scanner + a PURE resolution pass; the three
+// supported families keep `atsInjScan` byte-identical (see the GENERIC section's safety argument).
+async function atsScanFor(act, ats) {
+  if (ats !== "generic") return await act.eval(atsInjScan, ats);
+  const raw = await act.eval(atsInjScanGeneric);
+  const scan = atsGenericPostProcess(raw);
+  // ⚠ A field with neither a durable id nor a label cannot be re-found on the SECOND visit that the
+  // fill → review → submit contract requires, so it is never filled. It is not turned into a bundle
+  // record either: an unreplayable record would block `submit_ready` forever. It is LOGGED, which is
+  // the honest middle — the operator can see the form has a control we refuse to touch.
+  const unident = scan.fields.filter((f) => f.unidentified);
+  if (unident.length) {
+    try { console.log(`[ApplyPilot][ATS-FILL] generic scan: ${unident.length} control(s) have neither a durable id nor a label — NOT filled (unreplayable): ${unident.map((f) => f.inputSel).slice(0, 6).join(", ")}`); } catch (e) { /* log */ }
+  }
+  if (scan.diag && scan.diag.noRequiredSignalAnywhere) {
+    try { console.log("[ApplyPilot][ATS-FILL] generic scan: this form marks NOTHING as required — validation is likely JS-only, so 'optional' here is not trustworthy"); } catch (e) { /* log */ }
+  }
+  if (scan.excluded && scan.excluded.length) {
+    try { console.log(`[ApplyPilot][ATS-FILL] generic scan: excluded ${scan.excluded.length} non-field control(s) (mirrors/honeypots): ${scan.excluded.map((x) => x.id + "[" + x.why + "]").slice(0, 6).join(", ")}`); } catch (e) { /* log */ }
+  }
+  scan.fields = scan.fields.filter((f) => !f.unidentified);
+  return scan;
+}
+
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
-  const scan = await act.eval(atsInjScan, ats);
+  const scan = await atsScanFor(act, ats);
   const results = [];
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
@@ -1633,7 +1719,7 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   for (let round = 0; round < 2; round++) {
     await act.delayFull(900);
     let rescan = null;
-    try { rescan = await act.eval(atsInjScan, ats); } catch (e) { break; }
+    try { rescan = await atsScanFor(act, ats); } catch (e) { break; }
     if (!rescan || !rescan.fields) break;
     const seen = new Set(results.map((r) => r.fieldName));
     const fresh = rescan.fields.filter((f) => !seen.has(f.fieldName));
@@ -1642,6 +1728,17 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     const before = results.length;
     await atsFillFields(act, ats, rescan, fresh, results, profile, defaults, jc, bucketIndex, fillOpts);
     for (let i = before; i < results.length; i++) results[i].cascadeRevealed = true;
+  }
+
+  // REVIEW PICKER (generic only): a choice field we neither filled nor deferred has no options, and
+  // that is precisely the field an operator needs a picker for. No-op for the supported families.
+  try {
+    const cap = await atsCaptureChoiceOptions(act, ats, scan, results);
+    if (cap && (cap.captured || cap.skipped)) {
+      try { console.log(`[ApplyPilot][ATS-FILL] review picker: captured ${cap.captured} option list(s), skipped ${cap.skipped}`); } catch (e) { /* log */ }
+    }
+  } catch (e) {
+    try { console.log("[ApplyPilot][ATS-FILL] review-picker capture skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
   }
 
   return await atsFinishFill(act, ats, scan, results);
@@ -3056,9 +3153,521 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════════════════
+// GENERIC FORMS — a fallback driver for an application form on ANY host
+// ════════════════════════════════════════════════════════════════════════════════════════
+//
+// Design, and the seven-ATS recon every rule below was earned from: `docs/generic-filler-plan.md`
+// (+ the dated entries in dom-patterns 2026-08-11 / 08-11(b) / 08-11(c) / 08-12).
+//
+// ⚠ THE SAFETY ARGUMENT, and it is the whole reason this can ship:
+//   • `detectAts()` NEVER returns "generic". Greenhouse / Lever / Ashby / Workday routing is
+//     byte-identical.
+//   • EVERY generic code path is gated on `ats === "generic"`.
+//   • The kind only ever reaches a caller that has already exhausted the supported paths and
+//     would otherwise have returned a HALT (`apply-off-pipeline` / `form-not-rendered`). So
+//     enabling it can convert a halt into an attempt; it cannot change a run that works today.
+//   • The scanner is a SEPARATE injected function, not a branch inside `atsInjScan`, so the three
+//     supported scanners cannot be perturbed.
+//
+// Everything downstream is REUSED unchanged: the match ladder, buckets, the deferred-AI batch, the
+// review bundle, and the submit gate. A generic run is therefore exactly as safe as an ATS run —
+// every commit read-back verified, every AI answer a candidate that must clear the ladder against
+// live options, always `filled_review` + flagged.
+
+// ── Identity: is this id durable enough to key a REPLAY on? (PURE) ──────────────────────
+// Fill and submit are two separate visits to the same blank form, so `field_id` must survive a
+// reload. These id shapes do NOT (each one measured live):
+//   input_files_input_QQUpFBNbEVDkaqRr  Workable  — regenerated on every render
+//   rc_select_4 / rc_select_5           Dayforce  — rc-select's per-render SEQUENTIAL counter
+//   <JWT-shaped token>                  Paylocity — one per repeating-entry field
+// A rejected id is not fatal: identity falls back to the label (+ an ordinal when the label is
+// duplicated), which is what Ashby already relies on.
+function atsGenericIdDurable(id) {
+  const s = String(id == null ? "" : id).trim();
+  if (!s || s.length < 2) return false;
+  if (/^\d+$/.test(s)) return false;                                   // a bare number is a position
+  if (/^(rc|mui|radix|headlessui|downshift|aria)[-_:]/i.test(s)) return false; // framework counters
+  if (/^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/.test(s)) return false; // JWT
+  // ONE long unbroken run tells the two apart. Semantic ids are camelCase words with few case
+  // transitions per character (`jobPostingApplication` → 2/21); a random token has many
+  // (`QQUpFBNbEVDkaqRr` → 6/16). Separator-delimited parts are compared individually so a long
+  // semantic id is never penalised for its length alone.
+  const parts = s.split(/[^A-Za-z0-9]+/).filter(Boolean);
+  for (const p of parts) {
+    if (p.length >= 12 && /^[0-9a-f]+$/i.test(p) && /\d/.test(p)) return false; // hex hash
+    if (p.length < 12) continue;
+    let trans = 0;
+    for (let i = 1; i < p.length; i++) {
+      const a = p[i - 1], b = p[i];
+      if (/[a-z]/.test(a) && /[A-Z]/.test(b)) trans++;
+      else if (/[A-Z]/.test(a) && /[a-z]/.test(b)) trans++;
+    }
+    if (trans / p.length > 0.25) return false;
+  }
+  return true;
+}
+
+// ── Required-ness, and the label it is hidden inside (PURE) ─────────────────────────────
+// FOUR independent mechanisms, and a form may use exactly ONE of them. Paylocity marks it ONLY as
+// literal text in the label ("First Name (required)") with `required`/`aria-required` false on
+// every field — miss it and 10+ required fields read optional, which is the dangerous direction.
+// Returns true / false / null ("this label says nothing").
+function atsGenericRequiredFromLabel(raw) {
+  const s = String(raw == null ? "" : raw);
+  if (/\(\s*required\s*\)|\brequired\b\s*$/i.test(s)) return true;
+  if (/\(\s*optional\s*\)/i.test(s)) return false;
+  // The asterisk is frequently NOT trailing — Lever's sat mid-string, ahead of an inline error
+  // message ("Current location ✱No location found…") — so this is deliberately unanchored.
+  // Over-flagging is the safe direction.
+  if (/[*✱]/.test(s)) return true;
+  return null;
+}
+
+// Strip the required marker before the label is used as a QUESTION. `(required)` / `(optional)` /
+// `*` are form chrome; left in, they are carried into `normalizeLabel` and the question can never
+// match a stored bucket wording.
+function atsGenericCleanLabel(raw) {
+  return String(raw == null ? "" : raw)
+    .replace(/\(\s*(required|optional)\s*\)/ig, " ")
+    .replace(/[*✱]/g, " ")
+    .replace(/\s*:\s*$/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ── The label ladder (PURE) ─────────────────────────────────────────────────────────────
+// Order is LOAD-BEARING and the obvious order is wrong. `placeholder` sits ABOVE the ancestor
+// heading because putting the heading first made Breezy worse: cName / cEmail / cPhoneNumber /
+// cAddress all resolved to the section heading "Personal Details" — one string for four fields —
+// where placeholder had correctly given "Full Name" / "Email Address" / "Phone Number" / "Address".
+// The heading rung still exists because the radio groups need it (`race_ethnicity` has no
+// placeholder, and without the rung it resolved to its FIRST OPTION's label, "White (not Hispanic
+// or Latino)", on a REQUIRED demographic).
+const ATS_GENERIC_LABEL_RUNGS = [
+  "ariaLabel", "ariaLabelledby", "labelFor", "labelWrap", "unitLabel", "placeholder", "heading", "adjacentText",
+];
+
+// A heading claimed by 2+ fields is a SECTION heading, not a question — reject it for all of them.
+function atsGenericHeadingClaims(fields) {
+  const claims = new Map();
+  for (const f of fields || []) {
+    const h = f && f.labelCandidates && f.labelCandidates.heading;
+    if (!h) continue;
+    const k = atsGenericCleanLabel(h).toLowerCase();
+    if (!k) continue;
+    claims.set(k, (claims.get(k) || 0) + 1);
+  }
+  return claims;
+}
+
+// Pick one label for one field. Returns { label, raw, via } — `label` is cleaned, `raw` keeps the
+// required marker so the caller can still read it.
+function atsGenericPickLabel(field, headingClaims) {
+  const cands = (field && field.labelCandidates) || {};
+  for (const rung of ATS_GENERIC_LABEL_RUNGS) {
+    const raw = cands[rung];
+    if (!raw || !String(raw).trim()) continue;
+    if (rung === "heading") {
+      const k = atsGenericCleanLabel(raw).toLowerCase();
+      if (headingClaims && (headingClaims.get(k) || 0) > 1) continue; // section heading, not a question
+    }
+    const label = atsGenericCleanLabel(raw);
+    if (!label) continue;
+    return { label, raw: String(raw), via: rung };
+  }
+  return { label: "", raw: "", via: "none" };
+}
+
+// ── Resolve a raw generic scan into the shape the drivers already consume (PURE) ────────
+// The injected scanner does only DOM work and hands back CANDIDATES; every judgement lives here so
+// it is Node-testable against fixtures captured from real forms.
+function atsGenericPostProcess(raw) {
+  const out = {
+    ats: "generic", url: (raw && raw.url) || "", title: (raw && raw.title) || "",
+    submitState: (raw && raw.submitState) || null,
+    excluded: (raw && raw.excluded) || [],
+    fields: [],
+    diag: { noRequiredSignalAnywhere: false, labelless: 0, nonDurableIds: 0, duplicateLabels: [] },
+  };
+  const rawFields = (raw && raw.fields) || [];
+  const headingClaims = atsGenericHeadingClaims(rawFields);
+
+  // pass 1 — labels + required
+  const staged = rawFields.map((f) => {
+    const picked = atsGenericPickLabel(f, headingClaims);
+    const fromLabel = atsGenericRequiredFromLabel(picked.raw);
+    // over-flag is safe, under-flag hides a blocker: ANY mechanism saying "required" wins.
+    const isRequired = !!(f.reqAttr || f.reqMarker || fromLabel === true);
+    return { f, label: picked.label, labelVia: picked.via, isRequired,
+             reqVia: f.reqAttr ? "attr" : f.reqMarker ? "marker" : fromLabel === true ? "label-text" : null };
+  });
+
+  // pass 2 — identity. Prefer a DURABLE attribute; else the label, disambiguated by ordinal.
+  // ⚠ The label alone is NOT unique on real forms: Dayforce repeats "Country" ×3, "City" ×3,
+  // "State/Province" ×3, "Start Date"/"End Date" ×2 and "Country dialing code" ×2, and the
+  // collisions land precisely on repeating sections.
+  const labelCount = new Map();
+  for (const s of staged) {
+    const k = s.label.toLowerCase();
+    if (k) labelCount.set(k, (labelCount.get(k) || 0) + 1);
+  }
+  out.diag.duplicateLabels = [...labelCount.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+  const labelSeen = new Map();
+  for (const s of staged) {
+    const f = s.f;
+    const durable = f.attrId && atsGenericIdDurable(f.attrId);
+    if (!durable && f.attrId) out.diag.nonDurableIds++;
+    if (!s.label) out.diag.labelless++;
+    let fieldName;
+    if (durable) fieldName = f.attrId;
+    else if (s.label) {
+      const k = s.label.toLowerCase();
+      const n = (labelSeen.get(k) || 0);
+      labelSeen.set(k, n + 1);
+      // an ordinal is appended ONLY when the label is genuinely duplicated, so a unique label
+      // keys stably as itself across visits.
+      fieldName = "label:" + s.label + ((labelCount.get(k) || 0) > 1 ? "#" + n : "");
+    } else {
+      // no durable id AND no label — we cannot re-find this field on a second visit, so it must
+      // never be filled. Kept in the scan so the caller can REPORT it.
+      fieldName = "unidentified#" + f.domIndex;
+    }
+    out.fields.push({
+      fieldName,
+      inputSel: f.inputSel,
+      widgetType: f.widgetType,
+      label: s.label || fieldName,
+      labelVia: s.labelVia,
+      isRequired: s.isRequired,
+      reqVia: s.reqVia,
+      value: f.value === undefined ? null : f.value,
+      options: Array.isArray(f.options) && f.options.length ? f.options.slice() : null,
+      optionsPlaceholderOnly: !!f.optionsPlaceholderOnly,
+      group: f.group || null,
+      domIndex: f.domIndex,
+      identityFrom: durable ? "attr" : s.label ? "label" : "none",
+      unidentified: !durable && !s.label,
+      // a label found several hops up a unit that holds OTHER controls is low-confidence: on
+      // Paylocity `maximumDesiredSalary` resolved to a NEIGHBOUR's label ("Desired Salary Type").
+      labelLowConfidence: !!f.labelShared,
+    });
+  }
+  // ⚠ A form may carry NO required signal at all (KEF Robotics: only `email`, validation in JS).
+  // That is reported, never read as "nothing is required".
+  out.diag.noRequiredSignalAnywhere = out.fields.length > 0 && out.fields.every((x) => !x.isRequired);
+  // Which file input (if any) is the form's ONLY one — the résumé recognizer needs this to refuse a
+  // blind guess when a form offers several unlabelled attachment slots.
+  const files = out.fields.filter((x) => x.widgetType === "file_upload");
+  out.diag.fileInputs = files.length;
+  if (files.length === 1) files[0].soleFileInput = true;
+  return out;
+}
+
+// ── The injected generic scanner ────────────────────────────────────────────────────────
+// Self-contained (stringified through act.eval), JSON-able in and out, re-resolves everything from
+// `document` on every call. Returns RAW candidates — `atsGenericPostProcess` judges them.
+//
+// It STAMPS `data-apg="<n>"` on every control it reports and uses that as `inputSel`, the same idiom
+// the Ashby branch and discover.js already use: React leaves foreign attributes alone unless it
+// remounts the node, and a remount just kills the selector → an honest needs_review, never a wrong
+// fill. Every later pass re-scans and re-stamps, so nothing depends on a stamp surviving.
+function atsInjScanGeneric() {
+  var esc = function (s) { return (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"); };
+  var vis = function (el) { if (!el) return false; var r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  var CTRL = 'input:not([type=hidden]),textarea,select,[role=combobox],[contenteditable="true"]';
+
+  // ── a FILTERED text read. Three vendors proved plain textContent unusable: Lever bled an inline
+  // error into a question, Workable bled a whole country-code option list into one, and Paylocity
+  // bled the widget's own VALUE and PLACEHOLDER ("CountryUnited States", "StateSelect a state").
+  var DROP = 'option,[role=option],[role=listbox],select,input,textarea,button,[class*="error"],[class*="Error"],[role="alert"],[class*="help"],[class*="hint"],[class*="single-value"],[class*="placeholder"],[aria-hidden="true"]';
+  var readText = function (node) {
+    if (!node) return "";
+    var c;
+    try { c = node.cloneNode(true); } catch (e) { return ""; }
+    var kill = c.querySelectorAll(DROP);
+    for (var i = 0; i < kill.length; i++) { if (kill[i].parentNode) kill[i].parentNode.removeChild(kill[i]); }
+    return (c.textContent || "").replace(/\s+/g, " ").trim();
+  };
+
+  var out = { ats: "generic", url: location.href, title: document.title, fields: [], excluded: [], submitState: null };
+
+  // ── the form root. A JD page's biggest <form> is often page CHROME: on the Dayforce posting the
+  // only controls were cookie-banner checkboxes + a language picker, and Crown's two <form> tags
+  // held nothing but search/alert inputs (q, locationsearch, frequency). The caller gates on
+  // atsLooksLikeApplicationForm; here we just pick the richest form and record what we chose.
+  var forms = [].slice.call(document.querySelectorAll("form"));
+  var root = null;
+  if (forms.length) {
+    forms.sort(function (a, b) { return b.querySelectorAll(CTRL).length - a.querySelectorAll(CTRL).length; });
+    if (forms[0].querySelectorAll(CTRL).length) root = forms[0];
+  }
+  out.usedFormTag = !!root;
+  if (!root) root = document.body;
+  if (!root) return out;
+
+  // ── submit affordance (the positive identification atsLooksLikeApplicationForm needs)
+  var subTexts = [];
+  var subs = root.querySelectorAll('button,input[type=submit],[role=button]');
+  for (var s = 0; s < subs.length; s++) {
+    if (!vis(subs[s])) continue;
+    var st = (subs[s].textContent || subs[s].value || subs[s].getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+    if (st) subTexts.push(st);
+  }
+  out.submitState = {
+    hasSubmit: subTexts.some(function (t) { return /submit|apply|send|next step|continue|finish/i.test(t); }),
+    texts: subTexts.slice(0, 12),
+  };
+
+  // ── the field unit: the nearest ancestor that carries label-ish text.
+  var unitOf = function (el) {
+    var n = el.parentElement, hops = 0;
+    while (n && hops++ < 7) {
+      if (n.querySelector('label,legend,[class*="abel"]')) return { node: n, hops: hops };
+      n = n.parentElement;
+    }
+    return { node: el.parentElement, hops: 99 };
+  };
+
+  var labelCandidatesFor = function (el, unit) {
+    var c = {};
+    var al = el.getAttribute("aria-label"); if (al && al.trim()) c.ariaLabel = al;
+    var lb = el.getAttribute("aria-labelledby");
+    if (lb) {
+      var parts = [];
+      lb.split(/\s+/).forEach(function (id) { var n = document.getElementById(id); var t = readText(n); if (t) parts.push(t); });
+      if (parts.length) c.ariaLabelledby = parts.join(" ");
+    }
+    if (el.id) {
+      var lf = null;
+      try { lf = document.querySelector('label[for="' + esc(el.id) + '"]'); } catch (e) { lf = null; }
+      var t2 = readText(lf); if (t2) c.labelFor = t2;
+    }
+    var w = el.closest("label"); var t3 = readText(w); if (t3) c.labelWrap = t3;
+    if (unit && unit.node) {
+      var ul = unit.node.querySelector('label,legend,[class*="abel"]');
+      var t4 = readText(ul); if (t4) c.unitLabel = t4;
+    }
+    if (el.placeholder && String(el.placeholder).trim()) c.placeholder = String(el.placeholder);
+    // nearest PRECEDING heading in document order (not the ancestor's first heading)
+    var heads = [].slice.call(document.querySelectorAll("h1,h2,h3,h4,h5,h6"));
+    var best = null;
+    for (var h = 0; h < heads.length; h++) {
+      var pos = heads[h].compareDocumentPosition(el);
+      if (pos & 4) best = heads[h]; // heading PRECEDES el
+    }
+    var t5 = readText(best); if (t5) c.heading = t5;
+    // an adjacent StaticText sibling (the consent-checkbox rung: both the DOM ladder and the AX
+    // tree fail to name Breezy's smsConsent box; its text is a sibling, not a label)
+    if (el.parentElement) {
+      var sib = el.nextSibling, guard = 0, acc = "";
+      while (sib && guard++ < 4) {
+        if (sib.nodeType === 3) acc += " " + (sib.nodeValue || "");
+        else if (sib.nodeType === 1 && !sib.matches(CTRL)) acc += " " + readText(sib);
+        sib = sib.nextSibling;
+      }
+      acc = acc.replace(/\s+/g, " ").trim();
+      if (acc) c.adjacentText = acc;
+    }
+    return c;
+  };
+
+  // ── EXCLUSION. Validation mirrors (every Greenhouse react-select ships a hidden twin — 6 of 30
+  // controls) and HONEYPOTS (Breezy's hp_7f2b: filling it is an automated self-report to the
+  // anti-bot layer) both fall to these four signals; any one of them catches all of them.
+  // ⚠ type=file IS EXEMPT — the very same rule wrongly excluded Lever's résumé input
+  // (tabindex=-1 + opacity:0, class "application-file-input invisible"), the most important field
+  // on the form. Exclusions are REPORTED, never silently dropped.
+  var exclReasons = function (el, isFile) {
+    if (isFile) return [];
+    var r = [];
+    var cs;
+    try { cs = getComputedStyle(el); } catch (e) { cs = null; }
+    if (el.getAttribute("aria-hidden") === "true") r.push("aria-hidden");
+    if (el.getAttribute("tabindex") === "-1") r.push("tabindex-1");
+    if (cs && cs.opacity === "0") r.push("opacity0");
+    if (cs && cs.pointerEvents === "none") r.push("ptr-none");
+    if (el.disabled) r.push("disabled");
+    if (el.readOnly && el.tagName !== "SELECT") r.push("readonly");
+    return r;
+  };
+
+  var stampN = 0;
+  var stamp = function (el) {
+    var v = "g" + (stampN++);
+    try { el.setAttribute("data-apg", v); } catch (e) { return null; }
+    return '[data-apg="' + v + '"]';
+  };
+
+  var seen = {};
+  var push = function (d) { d.domIndex = out.fields.length; out.fields.push(d); };
+
+  // ── grouped controls first (radio / checkbox by shared name), so a group is ONE logical field.
+  var groups = {};
+  var rc = root.querySelectorAll('input[type=radio],input[type=checkbox]');
+  for (var g = 0; g < rc.length; g++) {
+    var box = rc[g];
+    if (!vis(box.closest("label") || box.parentElement || box)) continue;
+    if (exclReasons(box, false).length) { out.excluded.push({ id: box.name || box.id || "?", why: exclReasons(box, false).join("+"), cls: String(box.className || "").slice(0, 30) }); continue; }
+    var nm = box.name || box.id;
+    if (!nm) continue;
+    (groups[nm] = groups[nm] || []).push(box);
+  }
+  for (var key in groups) {
+    if (!Object.prototype.hasOwnProperty.call(groups, key)) continue;
+    var list = groups[key];
+    seen[key] = 1;
+    var first = list[0];
+    var u = unitOf(first);
+    // ⚠ a group's label must NEVER come from an option's own label. Breezy's required
+    // race_ethnicity/gender groups resolved to "White (not Hispanic or Latino)" / "Male" that way.
+    // So label[for]/label-wrap are DROPPED for a group — the question is in the legend or a heading.
+    var cands = labelCandidatesFor(first, u);
+    delete cands.labelFor; delete cands.labelWrap; delete cands.placeholder;
+    var optLabel = function (r2) {
+      var l = null;
+      if (r2.id) { try { l = document.querySelector('label[for="' + esc(r2.id) + '"]'); } catch (e) { l = null; } }
+      l = l || r2.closest("label");
+      return readText(l) || r2.value || "";
+    };
+    var opts = [], chosen = [];
+    for (var i2 = 0; i2 < list.length; i2++) {
+      var t = optLabel(list[i2]);
+      if (t) opts.push(t);
+      if (list[i2].checked && t) chosen.push(t);
+    }
+    var sel = first.name ? 'input[name="' + esc(first.name) + '"]' : stamp(first);
+    push({
+      attrId: first.name || first.id || null,
+      inputSel: sel,
+      widgetType: first.type === "radio" ? "radio" : (list.length > 1 ? "checkbox_group" : "checkbox"),
+      labelCandidates: cands,
+      reqAttr: list.some(function (r3) { return r3.required === true || r3.getAttribute("aria-required") === "true"; }),
+      reqMarker: !!(u.node && u.node.querySelector('[class*="equired"]')),
+      labelShared: false,
+      value: first.type === "checkbox" && list.length === 1 ? !!first.checked : (chosen.length ? chosen.join(", ") : null),
+      options: opts,
+      group: first.type,
+    });
+  }
+
+  // ── everything else
+  var all = root.querySelectorAll(CTRL);
+  for (var k2 = 0; k2 < all.length; k2++) {
+    var el = all[k2];
+    if (el.type === "radio" || el.type === "checkbox") continue;
+    var isFile = el.type === "file";
+    var ex = exclReasons(el, isFile);
+    if (ex.length) {
+      out.excluded.push({ id: el.name || el.id || "?", why: ex.join("+"), cls: String(el.className || "").slice(0, 30) });
+      continue;
+    }
+    if (!isFile && !vis(el)) continue;               // ⚠ threshold is exactly >0: Greenhouse's real
+    var nm2 = el.name || el.id || "";                //   combobox input is 3px wide, the intl-tel
+    if (nm2 && seen[nm2]) continue;                  //   contaminant is 0px. It cannot be raised.
+    if (nm2) seen[nm2] = 1;
+    var u2 = unitOf(el);
+    var isCombo = el.getAttribute("role") === "combobox" ||
+      !!el.closest('[class*="select__"],.ant-select,.MuiSelect-root,.v-select,[class*="_select"]');
+    var wt;
+    if (isFile) wt = "file_upload";
+    else if (el.tagName === "SELECT") wt = "dropdown_native";
+    else if (isCombo) wt = "select";
+    else if (el.tagName === "TEXTAREA") wt = "textarea";
+    else if (el.type === "date" || /pick date|mm\/dd\/yyyy|dd\/mm\/yyyy/i.test(el.placeholder || "")) wt = "date";
+    else wt = "text";
+    // native <select> options. ⚠ "native select ⇒ options are free" is FALSE: KEF Robotics'
+    // citizenship select holds exactly ["Choose an option"], unchanged after 4s. A placeholder-only
+    // list is flagged so the caller treats it as must-open, not as a known vocabulary.
+    var nopts = null, phOnly = false;
+    if (el.tagName === "SELECT") {
+      nopts = [];
+      for (var o2 = 0; o2 < el.options.length; o2++) {
+        var ot = (el.options[o2].textContent || "").replace(/\s+/g, " ").trim();
+        if (ot) nopts.push(ot);
+      }
+      var real = nopts.filter(function (t2) { return !/^(choose|select|please select|--|-)\b/i.test(t2) && t2 !== "-"; });
+      phOnly = real.length === 0;
+      if (phOnly) nopts = [];
+      else nopts = real;
+    }
+    push({
+      attrId: nm2 || null,
+      inputSel: nm2 && el.id === nm2 ? "#" + esc(nm2) : (nm2 && el.name === nm2 ? (el.tagName === "SELECT" ? 'select[name="' + esc(nm2) + '"]' : (el.tagName === "TEXTAREA" ? 'textarea[name="' + esc(nm2) + '"]' : 'input[name="' + esc(nm2) + '"]')) : stamp(el)),
+      widgetType: wt,
+      labelCandidates: labelCandidatesFor(el, u2),
+      reqAttr: el.required === true || el.getAttribute("aria-required") === "true",
+      reqMarker: !!(u2.node && (u2.node.querySelector('[class*="equired"]') || u2.node.querySelector('[aria-required="true"]'))),
+      labelShared: !!(u2.node && u2.node.querySelectorAll(CTRL).length > 1 && u2.hops >= 3),
+      value: isFile ? ((el.files && el.files[0] && el.files[0].name) || null) : (el.value || null),
+      options: nopts,
+      optionsPlaceholderOnly: phOnly,
+      group: null,
+    });
+  }
+  return out;
+}
+// NOTE: the scanner deliberately does NOT duplicate the durability test in-page. It reports the raw
+// attribute and `atsGenericPostProcess` judges it SW-side, so there is exactly ONE copy of that rule
+// — the lockstep-dup trap this codebase already pays for elsewhere.
+
+// ── The review picker: capture options for a choice field we did NOT fill ────────────────
+// Operator requirement: "if it is a reconnable dropdown, it shows up in the review page."
+//
+// Radio / checkbox-group / native-select options already come from the scan and cost nothing. A
+// COMBOBOX's do not: on Greenhouse all 11 react-selects had zero options mounted and
+// `aria-controls: null`. A field the deterministic pass filled had its options read at commit time,
+// and a field the AI batch deferred had them read by the defer pass — so the ONLY gap is a choice
+// field we neither filled nor deferred (unmapped + optional), which is exactly the field an operator
+// most needs a picker for.
+//
+// This is the ATS-path twin of Workday's `captureChoiceOptions`, and it keeps that function's
+// carve-out for the same reason: a widget answered by a SERVER-SIDE ranked search can never BE the
+// picker (its list is one page of a huge taxonomy and varies run to run), so `location`/typeahead
+// widgets are skipped and review renders their recorded text instead.
+//
+// ⚠ Gated on `ats === "generic"` for now. Extending it to Greenhouse/Lever/Ashby is a separate,
+// independently-testable change — it would alter runs that currently work.
+async function atsCaptureChoiceOptions(act, ats, scan, results) {
+  if (ats !== "generic" || !act || !scan) return { captured: 0, skipped: 0 };
+  let captured = 0, skipped = 0;
+  const cache = new Map(); // label-normalized question → options (same vocabulary asked once)
+  for (const rec of results || []) {
+    if (!rec || (rec.status !== "skipped" && rec.status !== "needs_review")) continue;
+    if (Array.isArray(rec.options) && rec.options.length) continue;
+    if (Array.isArray(rec.captured_options) && rec.captured_options.length) continue;
+    const f = (scan.fields || []).find((x) => x.fieldName === rec.fieldName);
+    if (!f) continue;
+    if (f.widgetType !== "select") { // native/radio/checkbox already carry their list from the scan
+      if (Array.isArray(f.options) && f.options.length) { atsAttachOptions(rec, f.options); captured++; }
+      continue;
+    }
+    if (/location|city|address|where .* based|school|university/i.test(String(f.label || ""))) { skipped++; continue; }
+    const key = atsLib.normalizeLabel(String(f.label || "")) || f.fieldName;
+    if (!cache.has(key)) {
+      let texts = null;
+      try { texts = await atsOpenAndPollOptions(act, { inputSel: f.inputSel }); } catch (e) { texts = null; }
+      // ALWAYS close, and CONFIRM it closed — a menu left mounted swallows the next widget's
+      // open-click. Same rule as the deferred-AI read, for the same reason.
+      try { await atsCloseComboConfirmed(act, { inputSel: f.inputSel }); } catch (e) { /* reported below */ }
+      cache.set(key, texts && texts.length ? texts : null);
+    }
+    const opts = cache.get(key);
+    if (opts && opts.length) {
+      atsAttachOptions(rec, opts);
+      rec.detail = (rec.detail ? rec.detail + "; " : "") + "options captured for review (" + opts.length + ")";
+      captured++;
+    } else skipped++;
+  }
+  return { captured, skipped };
+}
+
 // ── UMD-lite export (Node tests) ─────────────────────────────────────────────────────────
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+    atsGenericIdDurable, atsGenericRequiredFromLabel, atsGenericCleanLabel,
+    atsGenericPickLabel, atsGenericHeadingClaims, atsGenericPostProcess,
+    atsInjScanGeneric, atsCaptureChoiceOptions, ATS_GENERIC_LABEL_RUNGS,
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
