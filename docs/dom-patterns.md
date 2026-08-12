@@ -4364,6 +4364,40 @@ a dead posting**:
 for these families**, and a "Not Found"/empty-document reading must not be classified `posting-gone` when
 the URL was rewritten. Both are cheap ways to mark a live job dead.
 
+### 2026-08-12 (b) — SAP SuccessFactors in the queue, and a click that landed but did nothing
+
+**SuccessFactors fronts two of the employer-hosted sites.** `jobs.lincolnelectric.com` and
+`us-careers.crown.com` share the `/job/<slug>/<id>/` shape, the "Select how often (in days) to receive an
+alert / Create Alert" widget, and a `/job/...` search header. Following Lincoln Electric's **"Apply now »"**
+lands on:
+
+```
+https://career2.successfactors.eu/careers?company=LEPROD     title: "Career Opportunities: Sign In"
+```
+
+- ⚠ **The apply hop is CROSS-ORIGIN** — employer host → `career2.successfactors.eu`. That matters twice:
+  for anything host-scoped (the CDP path is fine; `chrome.scripting` would not be), and for job-key
+  stability, since the form lives on a different origin than the posting the queue stored.
+- **Auth-first gate**: the landing page is a Sign In form (3 controls, 1 form, `signin:true`). Not entered.
+- Crown's own posting was **filled** (below), so the family's form was reached only via Lincoln Electric.
+
+⚠ **A COORDINATE CLICK LANDED ON THE RIGHT PIXEL AND DID NOTHING; `a.click()` WORKED.** The "Apply now »"
+anchor was screenshot-verified at the exact coordinate clicked, and it was a plain **same-origin `https:`
+link with no `target`, no `onclick`, no `rel`, not `javascript:`** — yet the synthetic coordinate click did
+not navigate, twice, while a DOM `.click()` navigated immediately. **For an apply hop on a plain anchor,
+prefer DOM activation over coordinate clicking.** This is exactly why `robustClick`'s ladder keeps its
+native `el.click()` fallback (strategy 2) rather than trusting the pointer sequence alone — here strategy 2
+is the only one that worked, on a vendor the ladder had never seen.
+
+**Two more gate signals from this round:**
+- **Astrion** (`careers.astrion.us/jobs/24615`): the Apply anchor's href is literally **`/jobs/<id>/login`**.
+  An auth gate that is detectable from the href **before clicking** — the cheapest possible pre-check, and
+  worth a named recognizer.
+- **Crown**: `"Sorry, this position has been filled."` — a **FIFTH** distinct posting-gone wording. And its
+  page carries **2 real `<form>` tags containing only search/alert chrome** (`q`, `locationsearch`, a
+  submit, `frequency`) with no application form anywhere — a second live confirmation, after Dayforce, that
+  "the biggest `<form>` on the page" is a hazard and `atsLooksLikeApplicationForm` must gate the scan.
+
 ### KEF Robotics (Wix) — the pure long-tail form, and it scans perfectly
 
 Inline on the JD page, no gate, no captcha: 7 fields, **7/7 labelled** (6 `label[for]`, 1 unit walk), 0

@@ -287,7 +287,10 @@ Six kinds observed, and the generic driver needs a named halt or handler for eac
 |---|---|---|
 | Apply is a **link with a readable href** | SmartRecruiters ("I'm interested"), Paylocity (**opaque base64 token**) | READ it; never construct |
 | Apply is a **button with NO href** | Dayforce | Must click — the target is not derivable at all |
-| Apply needs an **account/session** | Oracle Fusion (operator already signed in) | Existing onboarding-style auth story, per family |
+| Apply needs an **account/session** | Oracle Fusion (operator already signed in) · **SAP SuccessFactors** (Lincoln Electric, Crown) · Astrion | Existing onboarding-style auth story, per family |
+| **auth gate visible in the HREF** | Astrion — the Apply anchor points at `/jobs/<id>/login` | Cheapest possible pre-check: detect before clicking, no navigation spent |
+| **cross-origin apply hop** | SuccessFactors: employer host → `career2.successfactors.eu` | CDP is fine; anything host-scoped is not. Also breaks job-key origin assumptions |
+| **never hydrates** | Phenom (BAE) | Body/control count never rises ⇒ `needs_operator`, never "empty form" |
 | **Consent wall** | Teamtailor (hard), Dayforce / Paylocity / SmartRecruiters (banners) | Operator halt — never click an affirmative consent control |
 | **Bot-detection wall** | SmartRecruiters (DataDome) | `needs_operator`; never solve, never bypass |
 | **Posting gone** | Rippling ×2, SmartRecruiters, Jobvite, Recruitee | Four distinct signals so far (see below) |
@@ -311,6 +314,12 @@ Two real enterprise forms reached; nothing submitted, no account made, no person
   **Oracle Fusion is the counter-example** — `/job/<id>/apply` 404s, and two Apply clicks left the DOM
   byte-identical at 653 nodes while freezing the renderer >30s each time. Derive where you can; never
   assume; always keep the click path.
+- ⚠ **On a plain anchor, activate the DOM node — do not click coordinates.** Lincoln Electric's
+  "Apply now »" was screenshot-verified at the exact pixel clicked, and was a plain same-origin `https:`
+  anchor with no `target`, `onclick`, or `rel` — the coordinate click did nothing **twice**, while
+  `a.click()` navigated immediately. This is `robustClick`'s ladder earning its native-`el.click()`
+  fallback on a vendor it had never seen, and it means the apply-hop step should try DOM activation
+  **first** for anchors, keeping coordinates for real buttons and canvas-like controls.
 
 ⚠ **`postingGone` needs to be a first-class, per-family recognizer, not an afterthought.** Five of the
 search-sourced postings died within days of being listed, each announcing it differently: a redirect to
