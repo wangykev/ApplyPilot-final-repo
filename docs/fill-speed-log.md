@@ -1036,6 +1036,238 @@ both exist for.
 
 ---
 
+## 2026-08-11 — round 10: DEFERRED AI on the ATS path — one call per page instead of N
+
+Rounds 8 and 9 attacked how long each LLM call takes (adaptive fast-retry, AUTO model, key pinning:
+~11s → ~0.5s per call). This round attacks **how many calls a page makes**, which nothing had touched.
+
+### The shape that was there, and what was wrong with it
+
+`ats.js` fired ONE call per unanswered field — 7 on the cloudflare fixture, all `ai-choice`. Since
+2026-08-05 they ran 4-at-a-time (`atsPrefetchAiText`), which hid latency. It did not reduce REQUESTS,
+and requests are the scarce thing:
+
+- **Rotation does not spread them.** Round 9 measured 6/6 calls on key 1 with key 2 never touched —
+  rotation advances only on FAILURE. So N calls is N requests through ONE key, and free-tier Gemini
+  meters **15 requests/minute PER KEY**. A 7-question page spends half of one key's minute. This is
+  exactly the operator's *"sometimes I call AI 16 times per minute, the limit is 15"*.
+- **It had to PREDICT.** The prefetch ran before the deterministic pass, so it re-ran `atsRouteField`
+  to guess which fields would fall through. Every misprediction is a paid request for a question the
+  profile already answered.
+
+### The change
+
+Deterministic pass runs FIRST and to completion → every field it could not answer is RECORDED →
+**ONE call** asks about exactly those → a second actuation pass fills them.
+
+⚠ **This is the OPPOSITE ORDER to Workday's `aiBatch`, and they must not be unified.** Workday fires
+its batch BEFORE the deterministic pass so the two overlap in time — which is what makes it a
+speculative CACHE (a miss just makes its own call) and what forces it to predict. Here the outcome is
+already known, so nothing is asked about an answered field. Strictly cheaper on tokens and requests;
+paid for with a real second actuation pass, which the Workday cache does not have.
+
+**Safety is unchanged by construction:** a batched answer enters through the SAME seam the prefetch
+used (`atsAiFallback`'s `prefetched`). Still a CANDIDATE that must clear the match ladder against the
+LIVE options read at commit time, still read-back verified, still ALWAYS `filled_review` + flagged.
+A batch that fails, parses badly or omits a question leaves that field to make its own call — so a
+batch failure costs LATENCY, never COVERAGE.
+
+### The three details that are load-bearing
+
+- **Cached by QUESTION (`normalizeLabel`), never by automation-id.** The cascade rounds re-enter the
+  fill loop with late-mounted fields; the same wording under a new id reuses the answer already paid
+  for. That is not only cheaper — it makes it **impossible for one page to hold two different answers
+  to the same question**.
+- **A deferred combobox is READ then CLOSED**, gated on the option count rather than `aria-expanded`
+  (the Workday rule, same reason: a react-select menu left mounted swallows the next widget's
+  open-click). The old per-field path opened the menu and then held it open **across the whole LLM
+  call**; nothing is committed during the batch, so that window is gone. Mutation-checked — without
+  the close, both menus sit open across the call.
+- **`location` is deliberately NOT pre-read.** A places box has no list until something is typed, so
+  an empty-query open can only return nothing, and it is the most expensive widget on this path
+  (`candidate-location` spans 7.1–20.3s on ONE posting).
+
+### What it costs, stated honestly
+
+The one cost this ordering adds is **one extra open+close per deferred react-select combobox**: the
+defer pass opens it to read the options, and the commit pass re-opens it because `atsInjCommitOption`
+needs a mounted listbox. Radio / yes-no / checkbox-group / native-select options come from the scan
+and cost nothing. There is also a **double option-read on a combobox whose menu never renders** — the
+defer pass spends its budget, and the commit pass spends it again. That was deliberately not
+short-circuited via `optionsUnreadable`: a transient empty read would then permanently strand a
+REQUIRED field, and a second chance is the safer direction on a widget that is going to review either
+way.
+
+### ★ LIVE VERIFIED (build `deferred-ai-1`, hidden, cloudflare fixture)
+
+`npm test` 1385/1385 · web 273/273 · `tsc` clean, with the discard / cache-key / close behaviours each
+mutation-checked. Then two hidden runs on `job-boards.greenhouse.io/cloudflare/jobs/7902104`:
+
+```
+[ATS-FILL] question_66595614 (dropdown, req) → deferred_ai · 25ms · deferred to this page's one AI call
+      … ×7 (20–29ms each — four fast CDP evals: open + read + close + confirm)
+[ATS-FILL] AI batch: 7 deferred question(s) in ONE call (7 choice, 0 text · cap 3312 tokens)
+[LLM] gemini gemini-3.5-flash-lite (auto) thinking:off for "fill" (2 keys) [attempt 1/2]
+[LLM] ok in 2257ms (2257ms total across 1 attempt(s))            ← the ONLY [LLM] line of the run
+[ATS-FILL] question_66595614 … → filled_review · ai-choice · after "Yes" · 84ms · from the batched call
+      … ×7 (61–84ms each)
+[ATS-FILL] AI pass done: 7 deferred · 7 served by the batch · 0 made their own call (batch asked 7, answered 7)
+```
+
+**7 calls → 1. Zero fell back.** All 7 committed a real read-back value and every one is
+`filled_review · ai-choice` — the always-flagged rule held. Field counts are identical to the
+pre-change baseline on both runs: **15 `filled` · 8 `filled_review` · 2 `skipped` = 25 fields.**
+
+**And the clock says exactly what round 9 predicted it would.** `[ATS-TIME] fill 33.8s for 25 field(s)
+… slowest: candidate-location 17.1s, resume 6.5s` — the LLM was **2.3s of 33.8s (6.7%)**, so
+`candidate-location` ALONE cost 7× the entire AI spend. Collapsing 7 calls into 1 is invisible in the
+wall clock and always was going to be. **The claim this change makes is the REQUEST COUNT, which is
+what the 15/min per-key quota bills** — grading it on fill time measures `candidate-location`'s 7.1–20.3s
+spread instead.
+
+### ✔ The react-select combobox defer IS live-covered — and how a timing inference got it backwards
+
+I first read the 20–29ms defer cost as proof these were **native `<select>`s** (scan-known options ⇒ no
+DOM work), and recorded the combobox path as unverified. **That was wrong.** Inspecting the fixture's
+DOM settles it:
+
+```
+totalSelects: 0 · totalCombos: 16
+question_66595614 … 68396682  →  tag INPUT · role "combobox" · inside a .select shell   (×7)
+```
+
+**There is not one native `<select>` on the form.** All 7 deferred questions are react-select, so the
+full open→read→**close**→(batch)→re-open→commit dance ran live on every one of them. 20–29ms is what
+FOUR fast CDP evals cost, not zero: `atsInjOpenAndReadOptions` + `atsInjReadOptions` +
+`atsInjCloseCombo` + the confirming `atsInjReadOptions`, at the ~1ms/command p50 this log already
+records. A native select would have been ~5ms (scroll-into-view only).
+
+Two independent confirmations in the same run:
+- **`menu still open` never appeared** — `atsCloseComboConfirmed` succeeded on its FIRST attempt for
+  all 7, i.e. blur + outside-mousedown really does unmount a react-select menu.
+- **All 7 committed real read-back values.** `atsInjCommitOption` returns `no-open-listbox` when the
+  menu is not mounted, so the commit pass demonstrably re-opened each widget (61–84ms each).
+
+⚠ **The lesson, which is the reusable part: a duration is not a code path.** Both "no evals" and "four
+1ms evals" fit ~25ms, and I picked the wrong one and wrote it into the log as a coverage gap. When the
+question is *which branch ran*, read the DOM or add a log line — do not infer it from a timing.
+
+### Regression sweep — 8 postings, all three ATS families, all hidden
+
+| posting | ATS | deferred | served by batch | LLM calls | counts (filled/review/skipped) |
+|---|---|---|---|---|---|
+| gitlab | GH | 4 (4 choice) | 4 | **1** | 14 / 5 / 2 |
+| figma | GH | 2 (2 text) | 2 | **1** | 15 / 3 / 3 |
+| discord | GH | 4 (2c 2t) | 4 | **1** | 16 / 6 / 4 |
+| reddit | GH | 8 (4c 4t) | 8 | **1** | 15 / 9 / 1 |
+| **shieldai** | LEV | 6 (4c 2t) | **0** | **7** | 17 / 7 / 14 |
+| matchgroup | LEV | 4 (4 choice) | 4 | **1** | 10 / 5 / 6 |
+| ramp | ASH | 5 (2c 3t) | 5 | **1** | 5 / 5 / 3 (+1 needs_review) |
+| linear | ASH | 7 (1c 6t) | 6 | **2** | 5 / 7 / 2 |
+
+**8/8 `ok:true`, reached the form, walked.** 40 deferred questions cost **15 calls**; without the one
+transient failure below, 34 questions cost **8**. Pre-change that is one call per question.
+
+### ★ The failure mode this design is built for, observed live — and it cost latency, not coverage
+
+`shieldai` logged `[LLM] ok in 1364ms` and then `AI batch answered 0/6`. The call SUCCEEDED and parsed
+to nothing. All 6 questions fell back to their own calls, all 6 filled, and the page finished with the
+same `17 / 7 / 14` counts as the clean reruns. **Two reruns of the same posting both parsed 6/6 in ONE
+call**, so this was a transient bad reply, not a systematic fault.
+
+That is exactly the invariant the design claims — *a batch that fails leaves each field to make its own
+call, so a bad batch costs LATENCY, never COVERAGE* — and it is now observed rather than argued. Cost of
+the incident: 43s instead of ~13s, from 6 fallback calls (one of which was an 11983ms outlier) plus a
+`deadAsync` page reload.
+
+⚠ **Nothing logged WHY**, which is the one thing this shape cannot diagnose from outside: refusal,
+truncation mid-JSON, and ids we never asked about all look identical next to `ok in 1364ms`. Fixed —
+`atsRunAiBatch` now dumps the reply's length and first 220 chars **on a total parse failure only** (a
+partial parse is self-explaining, and the reply carries profile-derived answers), and a PARTIAL parse now
+names the missed ids and their KINDS. Armed, not yet fired.
+
+**The one discriminator the log did give:** 1364ms is SHORTER than any successful multi-answer reply
+measured this round (reddit 8 answers/1920ms, cloudflare 7/2257ms, linear 7/2884ms). That argues against
+truncation — which produces LONG output — and toward a short reply: a refusal (Shield AI is a defense
+contractor and its Lever questions are ITAR/export-control, exactly the shape a model declines) or a
+structurally wrong one. **Not resolved; do not record a cause until the dump fires.**
+
+### ✔ FIXED — the parser silently dropped an answer that arrived under the OTHER key
+
+Re-reading `atsParseBatchReply` against the sweep found a real fault of ours. It validated STRICTLY per
+kind: a `choice` question was only accepted under `choice`, a `text` one only under `answer`. A model
+replying `{"answer":"Yes"}` to a choice question had a perfectly good answer **discarded without a
+trace**, and that question then paid for its own call.
+
+The sweep's evidence points at it: **both misses were on MIXED batches** — `shieldai` (4 choice + 2 text)
+answered 0/6, `linear` (1 choice + 6 text) answered 6/7 — which is precisely where a cross-key reply is
+likeliest. Now either key is accepted for either kind.
+
+⚠ **This cannot weaken safety, which is the only reason it is allowed.** A choice arriving under the
+wrong key is still just a CANDIDATE and still has to clear the match ladder against the LIVE options
+before anything commits; being lenient about which JSON key carried it changes nothing about what may be
+written to a form. Unit-pinned and mutation-checked.
+
+⚠ **What the reruns do and do NOT show.** On build `deferred-ai-3` all three re-ran clean in ONE call —
+`linear 7/7`, `shieldai 6/6`, `reddit 8/8` (mixed 4c+4t control). **That is NOT proof the fix caused it:**
+`shieldai` had already gone 6/6 twice on `deferred-ai-2` before the fix existed, and `linear`'s 6/7 was a
+single observation. The fix stands on its own unit-level merit — a provable silent-drop path is closed —
+not on these runs.
+
+### ✔ END TO END on all three ATS families (fill → approve on the website → dry rehearsal → gate)
+
+| posting | ATS | approved | strict verify | terminal line |
+|---|---|---|---|---|
+| matchgroup | Lever | 5/5 flagged | 21 fields | `▶▶ WOULD CLICK SUBMIT ◀◀` |
+| discord | Greenhouse | 6/6 flagged | 26 replayed, **0 failures** | `▶▶ WOULD CLICK SUBMIT ◀◀` |
+| ramp | Ashby | 6/6 flagged | 14 replayed, **0 failures** | `▶▶ WOULD CLICK SUBMIT ◀◀` |
+
+Each gate line reads `bundle blockers: 0 · submit button: true (disabled false) · captcha challenge
+visible: false`. Every run returned `stopped:"simulate"` and `arm` was never passed — the never-submit
+invariant held throughout.
+
+### Hidden vs visible ON THIS BUILD — the change is arm-NEUTRAL (12 runs, 6 per arm)
+
+The prior refutations were measured on the OLD code. This build adds ~4 CDP evals per combobox plus a
+`delayFull(120)` close-retry, and `act.delay` overruns 3–69× in a hidden MV3 worker — so it needed
+re-asking. 12 runs on one posting, **order counterbalanced** (block 1 H-first, block 2 V-first), each
+arm confirmed from its own measured `[ATS-PACING]` label, never the intent flag.
+
+**The direct answer — the cost of the code I added is identical in both arms:**
+
+| | defer cost per combobox (median) | `menu still open` retries |
+|---|---|---|
+| hidden (n=6) | ~15–20ms | **0** |
+| visible (n=6) | ~15–20ms | **0** |
+
+The outliers land in BOTH arms (347ms hidden, 332ms visible), and **`atsCloseComboConfirmed` never once
+needed its retry in 12 runs** — so the `delayFull(120)` overrun I hypothesised never executes. All 12
+runs served 7/7 from one call with identical `15 / 8 / 2` counts.
+
+**Whole-fill medians still differ, and this is NOT attributable to the change:** hidden 20.25s vs
+visible 15.6s; LLM arm-independent (hidden 1.45s, visible 2.05s — visible *higher*); `candidate-location`
+similar (8.7 vs 8.2). The residual (fill − LLM − candidate-location) is hidden {4.6, 6.8, 7.8, 10.8,
+12.3, 30.4} vs visible {4.5, 4.6, 5.5, 6.2, 7.4, 10.6} — heavily overlapping, with one hidden run (a
+14.7s single-widget stall) carrying most of the gap.
+
+⚠ **Do not promote this to "hidden is slower."** That claim has now been measured three times on this
+path and flipped sign twice. n=6/arm is the largest sample yet and still cannot separate it from
+`candidate-location`'s own 7.1–20.3s spread. What IS settled: **the deferred-AI change introduces no
+hidden-specific cost.**
+
+### The measurement trap this round nearly walked into
+
+The FIRST run produced `ok:true`, 25 fields, correct counts — and **an empty log**. The MV3 worker was
+torn down after the run and the log ring went with it, so the evidence for the only claim being made
+(the call count) did not exist. Waiting ~85s before reading is enough to lose it.
+
+**Fix, and worth reusing:** poll `AP_DEV_LOGS` from the localhost tab on a `setInterval` and accumulate
+into a page-side Map keyed by `t|msg`, then read the Map afterwards. The lines then survive a worker
+restart. This composes with the existing rule that `since` is only a LOWER BOUND — accumulate DURING the
+run, filter by cursor after.
+
+---
+
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
 
 Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now

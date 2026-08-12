@@ -1075,11 +1075,16 @@ test("radio: the bundle stores the option we chose, not a label that carries its
   assert.notStrictEqual(out2.results[0].status, "needs_review", "the approved value must replay: " + out2.results[0].detail);
 });
 
-test("AI free-text: the calls run CONCURRENTLY, and each answer still lands on its own field", async () => {
-  // Live 2026-08-05, Shield AI (Lever): 7 serial calls of 1.6-5.2s were 26.2s of a 32.6s fill (80%).
-  // A free-text decision needs no DOM, so the calls overlap; the safety path is unchanged.
-  const CALL_MS = 120;
-  let inFlight = 0, peak = 0;
+// ── DEFERRED AI: one batched call per page ──────────────────────────────────────────────
+// The old shape fired one call per unanswered field, 4 at a time. Concurrency hid latency but
+// still spent N REQUESTS against a key metered at 15/minute, and it had to PREDICT which fields
+// the deterministic pass would fail before that pass had run. These pin the replacement: the
+// deterministic pass finishes, what it could not answer is deferred, ONE call asks about exactly
+// those, and a second actuation pass fills them through the unchanged safety path.
+
+test("AI free-text: a page makes ONE call for every question it could not answer", async () => {
+  // Live 2026-08-05, Shield AI (Lever): 7 per-field calls of 1.6-5.2s were 26.2s of a 32.6s fill.
+  let calls = 0;
   const values = {};
   const fields = Array.from({ length: 6 }, (_, i) => ({
     fieldName: "cards[u" + i + "][field0]", inputSel: "#c" + i, widgetType: "textarea",
@@ -1087,43 +1092,36 @@ test("AI free-text: the calls run CONCURRENTLY, and each answer still lands on i
   }));
   const act = fakeAct({
     aiEnabled: true,
-    llm: async () => {
-      inFlight++; peak = Math.max(peak, inFlight);
-      await new Promise((r) => setTimeout(r, CALL_MS));
-      inFlight--;
-      return { ok: true, text: JSON.stringify({ answer: "ANSWER-" + peak, justification: "j", confidence: "High" }) };
+    llm: async ({ user }) => {
+      calls++;
+      const ids = [...String(user).matchAll(/"id":"(q\d+)"/g)].map((m) => m[1]);
+      return { ok: true, text: JSON.stringify({ answers: ids.map((id) => ({ id, answer: "ANSWER-" + id, justification: "j", confidence: "High" })) }) };
     },
     atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
     atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
     atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
   });
   const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
 
-  // Concurrency is asserted by OVERLAP, not by wall clock. This used to also require
-  // `elapsed < 6 * CALL_MS`, which measures the MACHINE as much as the code: it failed repeatedly on a
-  // loaded box (2247ms against a 720ms bound) while the overlap it was standing in for was perfect —
-  // a test that cries wolf trains you to ignore it. Peak in-flight is the thing the change is actually
-  // about, and it cannot be perturbed by a busy CPU.
-  // 4 = ATS_AI_PREFETCH_CONCURRENCY (ats.js), a DELIBERATE cap: an unbounded burst is how a free-tier
-  // key earns a 429, which would be slower than going serial. So "concurrent" here means exactly the
-  // pool size, and asserting it pins the cap as well as the overlap.
-  assert.strictEqual(peak, 4,
-    `the prefetch pool must run 4 calls at once (ATS_AI_PREFETCH_CONCURRENCY) — peak was ${peak}`);
-  // …and every field still got ITS OWN answer, flagged, through the normal path
+  assert.strictEqual(calls, 1, `6 unanswered questions must cost exactly ONE call — made ${calls}`);
+  // …and every field still got ITS OWN answer, flagged, through the normal commit path
   assert.strictEqual(out.results.length, 6);
+  const seen = new Set();
   for (const r of out.results) {
     assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
     assert.strictEqual(r.flag, "ai-text", "an AI answer is ALWAYS flagged");
     assert.ok(String(r.after || "").startsWith("ANSWER-"), r.fieldName + " got " + JSON.stringify(r.after));
+    seen.add(r.after);
   }
+  assert.strictEqual(seen.size, 6, "each field got its OWN answer, not one answer smeared across six");
   assert.strictEqual(new Set(Object.keys(values)).size, 6, "each field written once, to its own selector");
 });
 
-test("AI choice: scan-known options are decided CONCURRENTLY, each pick still cleared vs live options", async () => {
-  // The Lever measurement's 7 slow calls were all `cards[…]` RADIOS, whose options come from the scan
-  // — so no DOM is needed to decide them, and they no longer queue behind each other.
-  const CALL_MS = 120;
-  let inFlight = 0, peak = 0, checked = {};
+test("AI choice: choice questions ride the SAME one call, each pick still cleared vs live options", async () => {
+  // The Lever measurement's 7 slow calls were all `cards[…]` RADIOS, whose options come from the
+  // scan. They now share the page's single call with everything else.
+  let calls = 0; const checked = {};
   const fields = Array.from({ length: 6 }, (_, i) => ({
     fieldName: "cards[u" + i + "][field0]", inputSel: 'input[name="cards[u' + i + '][field0]"]',
     widgetType: "radio", label: "Custom screening question " + i, isRequired: true, value: null, domIndex: i,
@@ -1131,22 +1129,19 @@ test("AI choice: scan-known options are decided CONCURRENTLY, each pick still cl
   }));
   const act = fakeAct({
     aiEnabled: true,
-    llm: async () => {
-      inFlight++; peak = Math.max(peak, inFlight);
-      await new Promise((r) => setTimeout(r, CALL_MS));
-      inFlight--;
-      return { ok: true, text: JSON.stringify({ choice: "A United States Citizen", justification: "profile", confidence: "High" }) };
+    llm: async ({ user }) => {
+      calls++;
+      const ids = [...String(user).matchAll(/"id":"(q\d+)"/g)].map((m) => m[1]);
+      return { ok: true, text: JSON.stringify({ answers: ids.map((id) => ({ id, choice: "A United States Citizen", justification: "profile", confidence: "High" })) }) };
     },
     atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
     atsInjCheckOption: (sel, t) => { checked[sel] = t; return { ok: true }; },
     atsInjReadValue: (a, sel) => ({ ok: true, value: checked[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
   });
-  const t0 = Date.now();
   const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
-  const elapsed = Date.now() - t0;
 
-  assert.ok(peak > 1, "radio decisions must overlap — peak concurrency was " + peak);
-  assert.ok(elapsed < 6 * CALL_MS, `serial would cost >= ${6 * CALL_MS}ms; took ${elapsed}ms`);
+  assert.strictEqual(calls, 1, `6 radios must cost exactly ONE call — made ${calls}`);
   for (const r of out.results) {
     assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
     assert.strictEqual(r.after, "A United States Citizen");
@@ -1155,29 +1150,284 @@ test("AI choice: scan-known options are decided CONCURRENTLY, each pick still cl
   assert.strictEqual(Object.keys(checked).length, 6, "each field committed to its own group");
 });
 
-test("AI choice prefetch: a decision is DISCARDED when the live options differ from the scan's", async () => {
-  // The prompt must always reflect what the form is showing. If the live list has changed since the
-  // scan (a cascade, a re-render), the prefetched pick is thrown away and the question re-asked.
-  let calls = 0;
-  const fields = [{
-    fieldName: "q1", inputSel: "#q1", widgetType: "select", label: "Pick one", isRequired: true,
-    value: null, domIndex: 0, options: ["Stale A", "Stale B"],
-  }];
+test("AI batch: the call asks ONLY about what the deterministic pass could not answer", async () => {
+  // This is the whole reason the batch runs AFTER the deterministic pass rather than before it
+  // (Workday's aiBatch fires first and must PREDICT, paying tokens for every misprediction).
+  let asked = null, calls = 0;
+  const values = {};
+  const fields = [
+    // answered from the profile — must never reach the prompt
+    { fieldName: "first_name", inputSel: "#first_name", widgetType: "text", label: "First Name", isRequired: true, value: null, domIndex: 0 },
+    { fieldName: "q_auth", inputSel: "#q_auth", widgetType: "radio", label: "Are you authorized to work in the country for which you applied?", isRequired: true, value: null, domIndex: 1, options: ["Yes", "No"] },
+    // nothing in the profile answers these two
+    { fieldName: "q_why", inputSel: "#q_why", widgetType: "textarea", label: "Why do you want to work here?", isRequired: true, value: null, domIndex: 2 },
+    { fieldName: "q_shift", inputSel: "#q_shift", widgetType: "radio", label: "Are you willing to work night shifts?", isRequired: true, value: null, domIndex: 3, options: ["Yes", "No"] },
+  ];
   const act = fakeAct({
     aiEnabled: true,
-    llm: async () => { calls++; return { ok: true, text: JSON.stringify({ choice: "Live One", justification: "j", confidence: "High" }) }; },
+    llm: async ({ user }) => {
+      calls++; asked = String(user);
+      const ids = [...asked.matchAll(/"id":"(q\d+)"/g)].map((m) => m[1]);
+      return { ok: true, text: JSON.stringify({ answers: ids.map((id) => ({ id, choice: "Yes", answer: "Because I like it.", justification: "j", confidence: "Medium" })) }) };
+    },
+    atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields }),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjCheckOption: (sel, t) => { values[sel] = t; return { ok: true }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+
+  assert.strictEqual(calls, 1);
+  assert.ok(/Why do you want to work here/.test(asked), "an unanswered question must be in the prompt");
+  assert.ok(/night shifts/.test(asked), "an unanswered question must be in the prompt");
+  assert.ok(!/First Name/.test(asked), "a field the profile answered must NEVER be asked about");
+  assert.ok(!/authorized to work/.test(asked), "a field the deterministic ladder answered must NEVER be asked about");
+  // and the deterministic answers are untouched, unflagged
+  assert.strictEqual(by.first_name.status, "filled");
+  assert.strictEqual(by.first_name.after, "Kevin");
+  assert.strictEqual(by.q_auth.status, "filled");
+  assert.strictEqual(by.q_auth.after, "Yes");
+  assert.strictEqual(by.q_auth.flag, null, "a deterministic answer carries no AI flag");
+});
+
+test("AI batch: a decision is DISCARDED when the live options differ from the list it was asked with", async () => {
+  // The pick must always reflect what the form is showing. If the live list has changed since the
+  // list the question was ASKED with (a cascade, a re-render), the batched pick is thrown away and
+  // that question is re-asked on its own — never committed against a list it never saw.
+  let calls = 0; const askedWith = [];
+  const fields = [
+    // scan options are STALE — the live read below disagrees
+    { fieldName: "q1", inputSel: "#q1", widgetType: "select", label: "Pick one", isRequired: true, value: null, domIndex: 0, options: ["Stale A", "Stale B"] },
+    // a second question so the batch actually fires (one question is not a batch)
+    { fieldName: "q2", inputSel: "#q2", widgetType: "radio", label: "Second question", isRequired: true, value: null, domIndex: 1, options: ["Yes", "No"] },
+  ];
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async ({ user }) => {
+      calls++; askedWith.push(String(user));
+      const ids = [...String(user).matchAll(/"id":"(q\d+)"/g)].map((m) => m[1]);
+      if (ids.length) return { ok: true, text: JSON.stringify({ answers: ids.map((id) => ({ id, choice: id === "q1" ? "Stale A" : "Yes", justification: "j", confidence: "High" })) }) };
+      return { ok: true, text: JSON.stringify({ choice: "Live One", justification: "re-asked", confidence: "High" }) };
+    },
     atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields }),
     atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
     atsInjReadOptions: () => ({ ok: true, open: true, options: [{ text: "Live One" }, { text: "Live Two" }, { text: "Live Three" }] }),
     atsInjTypeInCombo: () => ({ ok: true }),
     atsInjReadComboInput: () => ({ ok: true, value: "" }),
     atsInjCommitOption: () => ({ ok: true }),
-    atsInjReadValue: () => ({ ok: true, value: "Live One" }),
+    atsInjCheckOption: () => ({ ok: true }),
+    atsInjReadValue: (a, sel) => ({ ok: true, value: sel === "#q1" ? "Live One" : "Yes" }),
     atsInjCloseCombo: () => ({ ok: true }),
+    atsInjScrollIntoView: () => ({ ok: true }),
   });
   const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
-  assert.strictEqual(out.results[0].after, "Live One");
-  assert.ok(calls >= 1, "the question is asked against the LIVE list");
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+
+  assert.strictEqual(calls, 2, "the stale pick must be re-asked against the LIVE list");
+  assert.ok(/Pick one/.test(askedWith[1]), "the RE-ASK is the one whose list changed");
+  assert.strictEqual(by.q1.after, "Live One", "the committed value is a LIVE option, never the stale pick");
+  // …and the question whose list did NOT change was served by the batch, costing nothing extra
+  assert.strictEqual(by.q2.after, "Yes");
+});
+
+test("AI batch: a question the batch omits falls back to its own call, and the page still fills", async () => {
+  let calls = 0; const checked = {};
+  const fields = [
+    { fieldName: "a", inputSel: "#a", widgetType: "radio", label: "Question A", isRequired: true, value: null, domIndex: 0, options: ["Yes", "No"] },
+    { fieldName: "b", inputSel: "#b", widgetType: "radio", label: "Question B", isRequired: true, value: null, domIndex: 1, options: ["Yes", "No"] },
+  ];
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async ({ user }) => {
+      calls++;
+      // the batch answers only the FIRST id it was given; the per-field re-ask is the single shape
+      if (/QUESTIONS:/.test(String(user))) {
+        return { ok: true, text: JSON.stringify({ answers: [{ id: "q1", choice: "Yes", justification: "j", confidence: "High" }] }) };
+      }
+      return { ok: true, text: JSON.stringify({ choice: "No", justification: "own call", confidence: "Low" }) };
+    },
+    atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
+    atsInjCheckOption: (sel, t) => { checked[sel] = t; return { ok: true }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: checked[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+
+  assert.strictEqual(calls, 2, "1 batch + 1 fallback for the omitted question");
+  assert.strictEqual(by.a.after, "Yes", "the batched answer landed");
+  assert.strictEqual(by.b.after, "No", "the omitted question made its own call");
+  for (const r of out.results) assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
+});
+
+test("AI batch: a FAILED batch costs nothing but a per-field call each — the pre-batch behaviour", async () => {
+  let calls = 0; const checked = {};
+  const fields = Array.from({ length: 3 }, (_, i) => ({
+    fieldName: "f" + i, inputSel: "#f" + i, widgetType: "radio", label: "Question " + i,
+    isRequired: true, value: null, domIndex: i, options: ["Yes", "No"],
+  }));
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async ({ user }) => {
+      calls++;
+      if (/QUESTIONS:/.test(String(user))) return { ok: false, error: "overloaded" };   // the batch fails
+      return { ok: true, text: JSON.stringify({ choice: "Yes", justification: "own call", confidence: "High" }) };
+    },
+    atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
+    atsInjCheckOption: (sel, t) => { checked[sel] = t; return { ok: true }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: checked[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+
+  assert.strictEqual(calls, 4, "1 failed batch + one call per field — a batch failure never costs COVERAGE");
+  for (const r of out.results) {
+    assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
+    assert.strictEqual(r.after, "Yes");
+  }
+});
+
+test("AI batch: answers are cached BY QUESTION — a cascade re-mount costs no further call", async () => {
+  // A cascade round re-enters the fill loop with late-mounted fields. The same QUESTION under a new
+  // automation-id must reuse the answer already paid for — and so cannot be given a contradicting one.
+  let calls = 0, scans = 0; const checked = {};
+  const round1 = [
+    { fieldName: "a", inputSel: "#a", widgetType: "radio", label: "Shared question", isRequired: true, value: null, domIndex: 0, options: ["Yes", "No"] },
+    { fieldName: "b", inputSel: "#b", widgetType: "radio", label: "Other question", isRequired: true, value: null, domIndex: 1, options: ["Yes", "No"] },
+  ];
+  // same wording, different id — exactly what a re-mount looks like
+  const late = { fieldName: "a_v2", inputSel: "#a_v2", widgetType: "radio", label: "Shared question", isRequired: true, value: null, domIndex: 2, options: ["Yes", "No"] };
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async ({ user }) => {
+      calls++;
+      const ids = [...String(user).matchAll(/"id":"(q\d+)"/g)].map((m) => m[1]);
+      return { ok: true, text: JSON.stringify({ answers: ids.map((id) => ({ id, choice: "Yes", justification: "j", confidence: "High" })) }) };
+    },
+    atsInjScan: () => { scans++; return { ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields: scans === 1 ? round1 : round1.concat([late]) }; },
+    atsInjCheckOption: (sel, t) => { checked[sel] = t; return { ok: true }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: checked[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+
+  assert.ok(by.a_v2, "the cascade round must still fill the late-mounted field");
+  assert.strictEqual(calls, 1, `the re-mounted question must reuse the cached answer — made ${calls} call(s)`);
+  assert.strictEqual(by.a_v2.after, by.a.after, "the same question cannot get two different answers on one page");
+  assert.strictEqual(by.a_v2.status, "filled_review", "a cached AI answer is still ALWAYS flagged");
+});
+
+test("AI batch: ONE deferred question is not a batch — it takes its own path, unchanged", async () => {
+  let asked = null, calls = 0; const checked = {};
+  const fields = [{ fieldName: "only", inputSel: "#only", widgetType: "radio", label: "The one question", isRequired: true, value: null, domIndex: 0, options: ["Yes", "No"] }];
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async ({ user }) => { calls++; asked = String(user); return { ok: true, text: JSON.stringify({ choice: "Yes", justification: "j", confidence: "High" }) }; },
+    atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
+    atsInjCheckOption: (sel, t) => { checked[sel] = t; return { ok: true }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: checked[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+  assert.strictEqual(calls, 1, "still exactly one call — wrapping it in a batch prompt only adds a parse that can fail");
+  assert.ok(!/QUESTIONS:/.test(asked), "a single question uses the single-question prompt");
+  assert.strictEqual(out.results[0].after, "Yes");
+});
+
+test("AI batch: a deferred combobox is READ then CLOSED, and re-opened only to commit", async () => {
+  // Nothing is committed while the batch is in flight, so the menu the defer pass opened has to be
+  // closed — a react-select menu left mounted swallows the next widget's open-click.
+  const events = [];
+  const fields = [
+    { fieldName: "s1", inputSel: "#s1", widgetType: "select", label: "First dropdown", isRequired: true, value: null, domIndex: 0 },
+    { fieldName: "s2", inputSel: "#s2", widgetType: "select", label: "Second dropdown", isRequired: true, value: null, domIndex: 1 },
+  ];
+  let open = {};
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async ({ user }) => {
+      events.push("llm");
+      const ids = [...String(user).matchAll(/"id":"(q\d+)"/g)].map((m) => m[1]);
+      return { ok: true, text: JSON.stringify({ answers: ids.map((id) => ({ id, choice: "Alpha", justification: "j", confidence: "High" })) }) };
+    },
+    atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields }),
+    atsInjOpenAndReadOptions: (sel) => { open[sel] = true; events.push("open:" + sel); return { ok: true, opened: true }; },
+    atsInjReadOptions: (sel) => (open[sel] ? { ok: true, open: true, options: [{ text: "Alpha" }, { text: "Beta" }] } : { ok: true, open: false, options: [] }),
+    atsInjCloseCombo: (sel) => { open[sel] = false; events.push("close:" + sel); return { ok: true }; },
+    atsInjTypeInCombo: () => ({ ok: true }),
+    atsInjReadComboInput: () => ({ ok: true, value: "" }),
+    atsInjCommitOption: (sel, t) => { events.push("commit:" + sel + "=" + t); return { ok: true }; },
+    atsInjReadValue: () => ({ ok: true, value: "Alpha" }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+
+  assert.strictEqual(events.filter((e) => e === "llm").length, 1, "both dropdowns share ONE call");
+  // both menus are closed BEFORE the call goes out — no menu is left open across it
+  const llmAt = events.indexOf("llm");
+  assert.ok(events.indexOf("close:#s1") >= 0 && events.indexOf("close:#s1") < llmAt, "s1's menu must close before the call: " + events.join(" | "));
+  assert.ok(events.indexOf("close:#s2") >= 0 && events.indexOf("close:#s2") < llmAt, "s2's menu must close before the call: " + events.join(" | "));
+  assert.ok(events.lastIndexOf("open:#s1") > llmAt, "the commit pass re-opens the widget: " + events.join(" | "));
+  for (const r of out.results) {
+    assert.strictEqual(r.status, "filled_review", r.fieldName + ": " + r.detail);
+    assert.strictEqual(r.after, "Alpha");
+  }
+});
+
+test("atsParseBatchReply: both kinds, fenced JSON, and anything of the wrong shape yields no entry", () => {
+  const items = [
+    { id: "q1", kind: "choice", question: "Pick", options: ["Yes", "No"] },
+    { id: "q2", kind: "text", question: "Write" },
+    { id: "q3", kind: "choice", question: "Other", options: ["A"] },
+    { id: "q4", kind: "text", question: "Empty" },
+  ];
+  const m = ats.atsParseBatchReply("```json\n" + JSON.stringify({
+    answers: [
+      { id: "q1", choice: "Yes", justification: "profile says so", confidence: "High", maps_to: "a.b", suggested_category: "Screening" },
+      { id: "q2", answer: "  I want this job.  ", justification: "from profile" },
+      { id: "q3", answer: "A" },                                   // choice answered under the TEXT key
+      { id: "q4", answer: "   " },                                 // the AI declining
+      { id: "q9", choice: "Yes" },                                 // never asked about
+    ],
+  }) + "\n```", items);
+
+  assert.deepStrictEqual([...m.keys()], ["q1", "q2", "q3"]);
+  assert.deepStrictEqual(m.get("q1"), { ok: true, choice: "Yes", justification: "profile says so", confidence: "High", maps_to: "a.b", suggested_category: "Screening", promptOptions: ["Yes", "No"] });
+  // a free-text answer keeps atsAiWriteText's FIXED "Low" confidence and is trimmed
+  assert.deepStrictEqual(m.get("q2"), { ok: true, answer: "I want this job.", confidence: "Low", justification: "from profile" });
+  // CROSS-KEY: a choice answered under "answer" (or text under "choice") is still an answer. Dropping
+  // it silently sent that question off to buy its own call — both live misses were on MIXED batches.
+  // Safe because a choice is still only a CANDIDATE that must clear the match ladder vs live options.
+  assert.strictEqual(m.get("q3").choice, "A", "a choice arriving under the TEXT key must not be discarded");
+  assert.deepStrictEqual(m.get("q3").promptOptions, ["A"]);
+  const swapped = ats.atsParseBatchReply(JSON.stringify({ answers: [{ id: "q2", choice: "text under the choice key" }] }), items);
+  assert.strictEqual(swapped.get("q2").answer, "text under the choice key", "and the same the other way round");
+  // …but a genuinely EMPTY answer is still the AI declining, under either key
+  assert.strictEqual(ats.atsParseBatchReply(JSON.stringify({ answers: [{ id: "q1", choice: "", answer: "" }] }), items).size, 0);
+  // …and the tolerant shapes the single-answer parser also accepts
+  assert.strictEqual(ats.atsParseBatchReply(JSON.stringify([{ id: "q1", choice: "No" }]), items).get("q1").choice, "No");
+  assert.strictEqual(ats.atsParseBatchReply(JSON.stringify({ q1: { choice: "No" } }), items).get("q1").choice, "No");
+  assert.strictEqual(ats.atsParseBatchReply("not json at all", items).size, 0);
+  assert.strictEqual(ats.atsParseBatchReply("", items).size, 0);
+});
+
+test("atsSameOptionSet: order-insensitive, and any real difference re-asks", () => {
+  assert.ok(ats.atsSameOptionSet(["A", "B"], ["B", "A"]), "react-select may reorder a list it did not change");
+  assert.ok(ats.atsSameOptionSet(["United States"], ["  united   states "]), "normalized comparison");
+  assert.ok(!ats.atsSameOptionSet(["A", "B"], ["A", "B", "C"]), "a grown list is a different list");
+  assert.ok(!ats.atsSameOptionSet(["A", "B"], ["A", "C"]), "a changed member is a different list");
+  assert.ok(!ats.atsSameOptionSet(undefined, ["A"]), "no recorded list ⇒ never reusable");
+  assert.ok(!ats.atsSameOptionSet(["A"], undefined));
+});
+
+test("atsBatchMaxTokens: a free-text answer is budgeted as a paragraph, a pick as a line", () => {
+  const choice = { id: "q1", kind: "choice" }, text = { id: "q2", kind: "text" };
+  assert.strictEqual(ats.atsBatchMaxTokens([choice, choice]), 512 + 800);
+  assert.strictEqual(ats.atsBatchMaxTokens([text, text]), 512 + 1400);
+  assert.strictEqual(ats.atsBatchMaxTokens([choice, text]), 512 + 400 + 700);
 });
 
 test("location: a Greenhouse suggestion list is waited for, whatever google.maps says", async () => {
