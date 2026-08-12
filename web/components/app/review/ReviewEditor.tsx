@@ -1104,8 +1104,17 @@ function ClampedText({ text, className, mono }: { text: string; className?: stri
   if (text.length <= LONG) return <span className={className}>{text}</span>;
   return (
     <span className={clsx("block min-w-0", className)}>
+      {/* ⚠ NO `block` HERE while clamped, and it is not a style preference: `line-clamp-2` works by
+          setting `display:-webkit-box`, so a sibling `block` in the same class list SILENTLY KILLS it.
+          Tailwind emits `.block` after `.line-clamp-*`, so `block` wins the cascade regardless of the
+          order they appear in here — the DOM read said `display:block`, `-webkit-line-clamp:2`, and a
+          2,521-char label 893px tall instead of ~36px. Verified rendered, not assumed. */}
       <span
-        className={clsx("block break-all", mono && "font-mono text-[11px] leading-relaxed", !open && "line-clamp-2")}
+        className={clsx(
+          "break-all",
+          mono && "font-mono text-[11px] leading-relaxed",
+          open ? "block" : "line-clamp-2",
+        )}
       >
         {text}
       </span>
