@@ -187,6 +187,48 @@ function statedFromDetail(detail?: string | null): string | null {
   return m ? m[1] : null;
 }
 
+/**
+ * The MODEL'S OWN REASON, when it gave one worth showing (operator, 2026-08-12).
+ *
+ * Every AI prompt already asks for "a SHORT justification … that NAMES your basis: the positive
+ * profile fact used, OR plainly that you are inferring from the ABSENCE of information", and the
+ * engine records it as `detail: "AI: <justification>"` (+ ` → "<value>"` on the Workday choice path).
+ * So it was already in every bundle — the card just wasn't showing it, and instead re-quoted the value
+ * that the editor renders two inches to the right. "AI filled this as «2 weeks»" tells the reviewer
+ * nothing they cannot see; "standard professional notice period inferred from profile context" tells
+ * them the one thing they need in order to judge it.
+ *
+ * ⚠ `detail` is an ENGINE string and the frontend contract is that it never leaks (see
+ * test/review-model.test.ts). Not every `AI: …` prefix is a justification: the represented-typeahead
+ * path writes `AI: "Electrical Engineering" (genuinely represented in the list)`, which is engine
+ * jargon about the MATCH, not a reason. So this extracts and then VALIDATES, and returns null on
+ * anything that isn't a human phrase — a missing reason falls back to the flag's own wording.
+ */
+export function aiJustification(e: ReviewEntry): string | null {
+  const d = (e.detail || "").trim();
+  const m = d.match(/^AI:\s*(.+)$/s);
+  if (!m) return null;
+  let s = m[1]
+    .split(/\s+→\s+/)[0] // drop the ` → "value"` tail: that's the value, which is the thing to NOT repeat
+    .replace(/\s*—\s*(commit failed|LEGALLY-LOADED,?\s*verify).*$/i, "") // surfaced by the flag instead
+    .trim()
+    .replace(/\s+/g, " ");
+  if (s.endsWith(".")) s = s.slice(0, -1);
+  if (!s) return null;
+  // Engine jargon and the "no reason given" placeholders every path falls back to.
+  if (s.startsWith('"') || /[=]|^\(|automation-id|formField-/i.test(s)) return null;
+  if (/^(generated answer|generated from profile|inferred|chose\b)/i.test(s)) return null;
+  // A "reason" that is just the value restated is the duplication this exists to remove.
+  const val = String(e.current_value ?? "").trim().toLowerCase();
+  if (val && s.toLowerCase() === val) return null;
+  return s;
+}
+
+/** Sentence-case the model's phrase — it comes back as a fragment, sometimes lowercase. */
+function asSentence(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1) + ".";
+}
+
 /** A human, one-line explanation of how a flagged field was filled. Prefer this over the raw `detail`
  *  on the review card. Returns null only when there is nothing to say. */
 export function explainFill(e: ReviewEntry): string | null {
@@ -194,6 +236,7 @@ export function explainFill(e: ReviewEntry): string | null {
   const chose = fmt(e.current_value);
   const stated = statedFromDetail(e.detail);
   const from = stated ? `Your profile value “${stated}”` : "Your profile value";
+  const why = aiJustification(e);
 
   // NEVER say the AI "filled" a field that holds nothing. Live on Copart: a required compensation box
   // only accepts a number, so the "N/A" placeholder never landed — and the row still read
@@ -221,9 +264,9 @@ export function explainFill(e: ReviewEntry): string | null {
   if (flag === "ai-closest-forced")
     return `This field is required, but none of the options matched your profile. AI picked the nearest one — “${chose}”${stated ? ` (closest to “${stated}”)` : ""}. Double-check this one.`;
   if (flag === "ai-choice-sensitive")
-    return `A legally-loaded question your profile doesn’t answer directly — AI reasoned from your profile and answered “${chose}”. Verify carefully.`;
+    return `A legally-loaded question your profile doesn’t answer directly — ${why ? `AI’s reason: ${why}` : "AI reasoned from your profile"}. Verify carefully.`;
   if (flag === "ai-eeo-guess")
-    return `You didn’t state this in your profile — AI guessed “${chose}” from what it knows about you. Verify or clear it.`;
+    return `You didn’t state this in your profile — AI guessed it from what it knows about you${why ? `: ${why}` : ""}. Verify or clear it.`;
   // A market-rate ESTIMATE, not something your profile said — the reviewer needs to know which.
   if (flag === "ai-estimate")
     return `Your profile states no figure, so AI estimated the market rate for this role — “${chose}”. This is a guess at YOUR ask: check it before you submit.`;
@@ -233,7 +276,11 @@ export function explainFill(e: ReviewEntry): string | null {
     return `AI couldn’t find your answer among the options, so it chose “Other”. Verify that’s okay.`;
   if (flag === "ai-commit-failed")
     return `AI’s answer didn’t take on the form — please fill this in yourself.`;
-  if (isAiFlag(e)) return `AI filled this as “${chose}”. Verify it’s right.`;
+  // THE VALUE IS ALREADY ON SCREEN — this line's job is WHY, not what (operator, 2026-08-12). It used
+  // to read 'AI filled this as “<value>”', repeating the editor immediately to its right and telling
+  // the reviewer nothing they could act on; the model's own basis is what lets them judge the answer.
+  if (isAiFlag(e))
+    return why ? `${asSentence(why)} Verify it’s right.` : `AI answered this from your profile. Verify it’s right.`;
 
   // Non-AI: a taught/remembered answer, or a deterministic close (containment/fuzzy) match.
   if (flag === "bucket")
