@@ -1776,10 +1776,66 @@ async function atsScanFor(act, ats) {
   return scan;
 }
 
+// ── RÉSUMÉ FIRST, THEN WAIT FOR THE PARSE (generic only, 2026-08-12) ──────────────────────────
+// A résumé attach is not just a file write on these portals: iCIMS PARSES it server-side and posts
+// the result back into the SAME panel, re-creating the Education / Experience entries with
+// server-assigned ids. That postback lands SECONDS AFTER the attach reported success, so it
+// re-rendered the panel in the MIDDLE of the fill and blanked everything written up to that point.
+//
+// Live evidence (Astrion iCIMS, build generic-scope-7): the run logged
+// `-1_PersonProfileFields.AddressStreet1 → filled` with a verified read-back, yet the operator saw an
+// empty "Addresses (1)"; entries `-6489344_`/`-6489345_` appear in the log that DO NOT EXIST on a
+// freshly-loaded page (only `-1_` does); `CandProfileFields.Degree` read back the literal
+// `"Loading..."`; and the post-fill audit disagreed on exactly the education fields. Every one of
+// those is the same event. Confirmed separately that the actuation itself is sound — writing those
+// same three address inputs by hand persists indefinitely, so nothing about the field was at fault.
+//
+// So: attach the résumé BEFORE the main pass, then poll the field-set until it stops changing, and
+// run the real fill against the settled page. Same rule the Workday walk already follows
+// (`awaitFieldSetSettled`) — never scan a page that is still mounting.
+//
+// Deliberately NOT a generic "re-fill anything that went blank": that would be a second fill pass on
+// every page. The trigger is known and specific, so the wait is too.
+async function atsGenericResumePrepass(act, ats, scan, results, profile, defaults, jc, bucketIndex, opts) {
+  const resumeField = (scan.fields || []).find((f) => {
+    if (!f || f.widgetType !== "file_upload") return false;
+    const r = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, opts && opts.credentials);
+    return !!(r && r.kind === "resume");
+  });
+  if (!resumeField) return null;
+
+  await atsFillFields(act, ats, scan, [resumeField], results, profile, defaults, jc, bucketIndex, opts);
+  const attached = results.some((r) => r.fieldName === resumeField.fieldName && r.status === "filled");
+  if (!attached) return null;
+
+  // SETTLE ON THE FIELD SET, not a fixed delay: the parse can take a couple of seconds or not fire at
+  // all, and a page that never re-renders must not pay a fixed tax. Two consecutive equal reads.
+  const sigOf = (s) => (s && s.fields ? s.fields.map((f) => f.fieldName).sort().join("|") : "");
+  const t0 = Date.now();
+  let last = sigOf(scan);
+  let stable = 0;
+  let settled = null;
+  while (Date.now() - t0 < ATS_GENERIC_PARSE_SETTLE_MS) {
+    await act.delayFull(700);
+    let s = null;
+    try { s = await atsScanFor(act, ats); } catch (e) { break; }
+    if (!s || !s.fields) break;
+    const sig = sigOf(s);
+    settled = s;
+    if (sig === last) { if (++stable >= 2) break; } else { stable = 0; last = sig; }
+  }
+  if (!settled) return null;
+  const changed = sigOf(settled) !== sigOf(scan);
+  try {
+    console.log(`[ApplyPilot][ATS-FILL] résumé pre-pass: field set ${changed ? "CHANGED" : "unchanged"} after the attach (${scan.fields.length} → ${settled.fields.length} fields, ${Date.now() - t0}ms) — filling against the settled page`);
+  } catch (e) { /* log only */ }
+  return changed ? settled : null;
+}
+
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
-  const scan = await atsScanFor(act, ats);
+  let scan = await atsScanFor(act, ats);
   const results = [];
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
@@ -1788,7 +1844,16 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // be given a second, contradicting one.
   const fillOpts = Object.assign({}, o, { aiCache: (o && o.aiCache) || new Map() });
 
-  await atsFillFields(act, ats, scan, scan.fields, results, profile, defaults, jc, bucketIndex, fillOpts);
+  // Generic only — the supported families (Greenhouse / Lever / Ashby) do not parse-and-repopulate,
+  // and Workday never reaches this function at all.
+  if (ats === "generic" && !o.valueFor) {
+    const settled = await atsGenericResumePrepass(act, ats, scan, results, profile, defaults, jc, bucketIndex, fillOpts)
+      .catch(() => null);
+    if (settled) scan = settled;
+  }
+
+  const done = new Set(results.map((r) => r.fieldName));
+  await atsFillFields(act, ats, scan, scan.fields.filter((f) => !done.has(f.fieldName)), results, profile, defaults, jc, bucketIndex, fillOpts);
 
   // CASCADE RE-SCAN (the Workday M1 pattern, earned again 2026-07-31 on Ramp): these SPAs
   // mount sections in BURSTS, and even a 3-consecutive-reads settle can catch a pause —
@@ -3469,6 +3534,13 @@ function atsGenericScopeOf(f) {
   // an opaque block, and the scanner already reads the nearest preceding one.
   if (/education|school|university|academic/i.test(heading)) return "education";
   if (/experience|employment|work history|employer|position held/i.test(heading)) return "work";
+  // ⚠ ANY OTHER REPEATING ENTITY BLOCK owns its own location too. The work-experience fix generalises:
+  // a "City"/"State" inside a Professional Certifications entry is the ISSUING BODY's, and inside a
+  // Reference entry it is the REFEREE's — neither is where the applicant lives. iCIMS gives these
+  // blocks opaque `rcf####` names as well (`rcf2061` is its certifications section), so the heading is
+  // again the only signal. Scoping them OUT is the conservative direction: the address tier declines
+  // and the field reaches review blank, rather than being confidently filled with the wrong thing.
+  if (/certificat|licen[cs]e|reference|award|publication|training/i.test(heading)) return "other-entity";
   if (/^\s*addresses?\b/i.test(heading)) return "address";
   // no name or heading signal — fall back to the label, but ONLY for unambiguous words
   if (/education|school|degree|graduat/i.test(label)) return "education";
@@ -3498,7 +3570,7 @@ const ATS_GENERIC_ADDRESS_FIELDS = [
 ];
 function atsGenericAddressValue(profile, f) {
   const scope = atsGenericScopeOf(f);
-  if (scope === "education" || scope === "work") return null;   // their own entry owns these
+  if (scope === "education" || scope === "work" || scope === "other-entity") return null; // their own entry owns these
   const pi = (profile || {}).personal_info || {};
   const key = String((f && f.fieldName) || "") + " " + String((f && f.label) || "");
   // a phone country CODE is not the address country
@@ -4314,6 +4386,11 @@ function atsInjPairedComboClose(triggerSel, ctnrSel) {
 // How long a server-backed picker gets to answer a typed query. 8s, because the measured failure mode
 // is "loading forever", and a budget shorter than the round trip cannot tell slow from never.
 const ATS_PAIRED_FILTER_MS = 8000;
+// How long the résumé pre-pass waits for a server-side parse to post its result back into the panel.
+// Generous on purpose: overrunning costs LATENCY on one field, while under-waiting costs the whole
+// page (the fill lands on rows the postback then replaces). The poll exits as soon as two
+// consecutive scans agree, so a portal that does not re-render pays only one extra scan.
+const ATS_GENERIC_PARSE_SETTLE_MS = 20000;
 async function atsFillPairedCombo(act, f, ref, rec, candidates) {
   const probe = await act.eval(atsInjPairedComboProbe, ref.inputSel).catch(() => null);
   if (!probe || !probe.ok || !probe.triggerSel) return { handled: false };

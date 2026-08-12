@@ -1406,3 +1406,103 @@ test("isolation: atsFormUrl leaves a generic/unknown URL untouched", () => {
   const u = "https://recruiting.paylocity.com/Recruiting/Jobs/Details/4128182";
   assert.strictEqual(ats.atsFormUrl("generic", u), u);
 });
+
+// ── RÉSUMÉ PARSE POSTBACK (iCIMS, live 2026-08-12) ──────────────────────────────────────────
+// The portal parses the attached résumé server-side and posts the result back into the SAME panel,
+// re-creating the repeating entries under server-assigned ids. That landed MID-FILL and blanked
+// everything written before it: the run logged `-1_…AddressStreet1 → filled` with a verified
+// read-back while the operator saw an empty "Addresses (1)". These pin the fix — attach FIRST, wait
+// for the field set to stop moving, then fill against the settled page.
+function icimsParsePage() {
+  const RESUME = { attrId: "PortalProfileFields.Resume_File", inputSel: "#resume", widgetType: "file_upload",
+    domIndex: 0, labelCandidates: { labelFor: "Resume" } };
+  const before = { fields: [RESUME,
+    { attrId: "-1_PersonProfileFields.AddressStreet1", inputSel: "#a1", widgetType: "text", domIndex: 1,
+      labelCandidates: { labelFor: "Street Address*" }, sectionHeading: "Addresses (1)" }] };
+  // after the parse: the entry is re-created under a server id, blank again
+  const after = { fields: [RESUME,
+    { attrId: "-6489345_PersonProfileFields.AddressStreet1", inputSel: "#a2", widgetType: "text", domIndex: 1,
+      labelCandidates: { labelFor: "Street Address*" }, sectionHeading: "Addresses (1)" }] };
+  return { before, after };
+}
+
+test("INTEGRATION (generic): a résumé-parse postback cannot blank the fill — the address lands on the SETTLED entry", async () => {
+  const { before, after } = icimsParsePage();
+  const values = {};
+  let attached = 0;
+  const act = genericFakeAct({
+    // scan #1 is pre-attach; every later scan shows the re-rendered panel
+    atsInjScanGeneric: () => JSON.parse(JSON.stringify(attached ? after : before)),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] != null ? values[sel] : null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSubmitState: () => ({ ok: true, hasSubmit: true, multiStep: false, captchaChallenge: false, confirmed: false }),
+    atsInjErrors: () => ({ ok: true, errors: [] }),
+    attachResume: async () => { attached++; return { ok: true, name: "resume.pdf", verified: true }; },
+  });
+  const profile = Object.assign({}, GENERIC_PROFILE, { address_line_1: "715 Middlebrooks Circle" });
+  const buckets = GENERIC_BUCKETS.concat([{ id: "ba", profile_path: "address_line_1", questions: ["Street Address"] }]);
+  const out = await ats.driveAtsPageFill(act, "generic", profile, {}, {}, { buckets });
+
+  assert.strictEqual(attached, 1, "the résumé attaches exactly once");
+  // the load-bearing assertion: the value is on the POST-postback element, not the one that was
+  // replaced. Writing to #a1 is precisely the bug — it verifies, then vanishes.
+  assert.strictEqual(values["#a2"], "715 Middlebrooks Circle", "the address must land on the settled entry");
+  assert.ok(values["#a1"] === undefined, "nothing may be written to the entry the postback replaced");
+  const rec = (out.results || []).find((r) => /AddressStreet1/.test(r.fieldName));
+  assert.ok(rec && rec.status === "filled", "the address must be recorded filled");
+  assert.ok(/6489345/.test(rec.fieldName), "the record must name the surviving entry");
+});
+
+test("INTEGRATION (generic): a form whose field set does NOT move pays no re-fill and keeps one attach", async () => {
+  // the other half of the contract — the settle poll exits on two agreeing scans, so a portal that
+  // never re-renders must fill exactly as before (no duplicate writes, no second résumé attach).
+  const { before } = icimsParsePage();
+  const values = {}; let attached = 0, writes = 0;
+  const act = genericFakeAct({
+    atsInjScanGeneric: () => JSON.parse(JSON.stringify(before)),
+    atsInjSetText: (sel, v) => { writes++; values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] != null ? values[sel] : null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSubmitState: () => ({ ok: true, hasSubmit: true, multiStep: false, captchaChallenge: false, confirmed: false }),
+    atsInjErrors: () => ({ ok: true, errors: [] }),
+    attachResume: async () => { attached++; return { ok: true, name: "resume.pdf", verified: true }; },
+  });
+  const profile = Object.assign({}, GENERIC_PROFILE, { address_line_1: "715 Middlebrooks Circle" });
+  const buckets = GENERIC_BUCKETS.concat([{ id: "ba", profile_path: "address_line_1", questions: ["Street Address"] }]);
+  await ats.driveAtsPageFill(act, "generic", profile, {}, {}, { buckets });
+  assert.strictEqual(attached, 1, "one attach");
+  assert.strictEqual(writes, 1, "the address is written exactly once");
+  assert.strictEqual(values["#a1"], "715 Middlebrooks Circle");
+});
+
+test("LIVE iCIMS headings: only the HOME address block may take the profile address", () => {
+  // Measured on the live Astrion form, 2026-08-12, using the scanner's own h1–h6 rule. ⚠ The address
+  // block's nearest HEADING is "Enter your information" — "Addresses (1)" is a <legend>, which the
+  // scanner does not read — so the home address is recognised by its NAME, and the heading only ever
+  // has to push the other blocks away.
+  const at = (fieldName, sectionHeading) => ats.atsGenericScopeOf({ fieldName, sectionHeading, label: "" });
+  assert.strictEqual(at("-1_PersonProfileFields.AddressCity", "Enter your information"), "address");
+  assert.strictEqual(at("-1_PersonProfileFields.rcf3265", "Experience"), "work");
+  assert.strictEqual(at("-1_PersonProfileFields.rcf3217", "Experience"), "work");
+  assert.strictEqual(at("-1_CandProfileFields.EducationCity", "Education"), "education");
+  assert.strictEqual(at("-1_PersonProfileFields.rcf2065", "Professional Certifications (1)"), "other-entity");
+
+  const profile = { personal_info: { city: "Tallahassee", state_province: "Florida", postal_code: "32312" } };
+  const claims = (fieldName, sectionHeading, label) =>
+    !!ats.atsGenericAddressValue(profile, { fieldName, sectionHeading, label });
+  assert.strictEqual(claims("-1_PersonProfileFields.AddressCity", "Enter your information", "City"), true);
+  // the three the operator caught filling with the HOME address
+  assert.strictEqual(claims("-1_PersonProfileFields.rcf3265", "Experience", "Zip"), false, "employer zip");
+  assert.strictEqual(claims("-1_PersonProfileFields.rcf3217", "Experience", "State"), false, "employer state");
+  assert.strictEqual(claims("-1_PersonProfileFields.rcf2065", "Professional Certifications (1)", "City"), false,
+    "a certification's city is the issuing body's");
+});
+
+test("the résumé pre-pass is GENERIC-ONLY and never runs on a replay", () => {
+  // Greenhouse / Lever / Ashby do not parse-and-repopulate, and a replay must keep its own ordering —
+  // so the hoist is gated twice. Pinned on the source because the gate is the whole isolation story.
+  const src = ats.driveAtsPageFill.toString();
+  assert.ok(/ats === "generic" && !o\.valueFor/.test(src),
+    'the pre-pass must be gated on ats === "generic" && !o.valueFor');
+});
