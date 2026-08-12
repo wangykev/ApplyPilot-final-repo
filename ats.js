@@ -1787,16 +1787,30 @@ function atsParseBatchReply(text, items) {
     if (!a || typeof a !== "object") return;
     const it = byId.get(String(id == null ? "" : id));
     if (!it || out.has(it.id)) return;
+    // ACCEPT THE OTHER KEY TOO (2026-08-12). The prompt asks for `choice` on a choice question and
+    // `answer` on a text one, and the parser used to REQUIRE exactly that — so a model that replied
+    // `{"answer":"Yes"}` to a choice question had a perfectly good answer thrown away, silently, and
+    // that question then paid for its own call. Both observed misses in the regression sweep were on
+    // MIXED batches (shieldai 4 choice + 2 text answered 0/6; linear 1 choice + 6 text answered 6/7),
+    // which is exactly where a cross-key reply is likeliest.
+    // ⚠ THIS CANNOT WEAKEN SAFETY, which is the only reason it is allowed: a choice answer arriving
+    // under the wrong key is still just a CANDIDATE, and still has to clear the match ladder against
+    // the LIVE options before anything commits. Being lenient about which JSON key carried it changes
+    // nothing about what may be written to the form.
+    const under = (primary, secondary) => {
+      const p = a[primary] == null ? "" : String(a[primary]).trim();
+      return p || (a[secondary] == null ? "" : String(a[secondary]).trim());
+    };
     if (it.kind === "text") {
       // atsAiWriteText's shape exactly, including its FIXED "Low" confidence — an AI-written
       // paragraph is never high-confidence, and the record/bundle expect that value.
-      const answer = a.answer == null ? "" : String(a.answer).trim();
+      const answer = under("answer", "choice");
       if (!answer) return;
       out.set(it.id, { ok: true, answer, confidence: "Low",
         justification: a.justification == null || !String(a.justification).trim() ? "generated from profile" : String(a.justification) });
       return;
     }
-    const choice = a.choice == null ? "" : String(a.choice).trim();
+    const choice = under("choice", "answer");
     if (!choice) return;
     // atsAiChooseOption's shape, plus the list the question was ASKED with — the commit pass
     // reuses this answer only if the form is still showing that same list (see atsAiFallback).
@@ -1854,7 +1868,11 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
   const parsed = atsParseBatchReply(res.text, items);
   for (const [id, ans] of parsed) cache.set(idToKey.get(id), ans);
   if (parsed.size < items.length) {
-    try { console.log(`[ApplyPilot][ATS-FILL] AI batch answered ${parsed.size}/${items.length} — the rest fall back to their own call`); } catch (e) { /* log only */ }
+    // NAME the dropped questions and their KINDS. Without this a partial parse is as undiagnosable as
+    // a total one was: "6/7" says nothing about whether one kind is being lost systematically, which
+    // is the first thing you want to know.
+    const missed = items.filter((i) => !parsed.has(i.id)).map((i) => `${i.id}:${i.kind}`).join(", ");
+    try { console.log(`[ApplyPilot][ATS-FILL] AI batch answered ${parsed.size}/${items.length} — the rest fall back to their own call (missed ${missed})`); } catch (e) { /* log only */ }
   }
   // A call that SUCCEEDS and yields NOTHING is the one failure this design cannot diagnose from the
   // outside — `ok in 1364ms` next to `answered 0/6` looks identical whether the model refused, was

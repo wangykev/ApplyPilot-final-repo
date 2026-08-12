@@ -1183,7 +1183,36 @@ the incident: 43s instead of ~13s, from 6 fallback calls (one of which was an 11
 ⚠ **Nothing logged WHY**, which is the one thing this shape cannot diagnose from outside: refusal,
 truncation mid-JSON, and ids we never asked about all look identical next to `ok in 1364ms`. Fixed —
 `atsRunAiBatch` now dumps the reply's length and first 220 chars **on a total parse failure only** (a
-partial parse is self-explaining, and the reply carries profile-derived answers). Armed, not yet fired.
+partial parse is self-explaining, and the reply carries profile-derived answers), and a PARTIAL parse now
+names the missed ids and their KINDS. Armed, not yet fired.
+
+**The one discriminator the log did give:** 1364ms is SHORTER than any successful multi-answer reply
+measured this round (reddit 8 answers/1920ms, cloudflare 7/2257ms, linear 7/2884ms). That argues against
+truncation — which produces LONG output — and toward a short reply: a refusal (Shield AI is a defense
+contractor and its Lever questions are ITAR/export-control, exactly the shape a model declines) or a
+structurally wrong one. **Not resolved; do not record a cause until the dump fires.**
+
+### ✔ FIXED — the parser silently dropped an answer that arrived under the OTHER key
+
+Re-reading `atsParseBatchReply` against the sweep found a real fault of ours. It validated STRICTLY per
+kind: a `choice` question was only accepted under `choice`, a `text` one only under `answer`. A model
+replying `{"answer":"Yes"}` to a choice question had a perfectly good answer **discarded without a
+trace**, and that question then paid for its own call.
+
+The sweep's evidence points at it: **both misses were on MIXED batches** — `shieldai` (4 choice + 2 text)
+answered 0/6, `linear` (1 choice + 6 text) answered 6/7 — which is precisely where a cross-key reply is
+likeliest. Now either key is accepted for either kind.
+
+⚠ **This cannot weaken safety, which is the only reason it is allowed.** A choice arriving under the
+wrong key is still just a CANDIDATE and still has to clear the match ladder against the LIVE options
+before anything commits; being lenient about which JSON key carried it changes nothing about what may be
+written to a form. Unit-pinned and mutation-checked.
+
+⚠ **What the reruns do and do NOT show.** On build `deferred-ai-3` all three re-ran clean in ONE call —
+`linear 7/7`, `shieldai 6/6`, `reddit 8/8` (mixed 4c+4t control). **That is NOT proof the fix caused it:**
+`shieldai` had already gone 6/6 twice on `deferred-ai-2` before the fix existed, and `linear`'s 6/7 was a
+single observation. The fix stands on its own unit-level merit — a provable silent-drop path is closed —
+not on these runs.
 
 ### ✔ END TO END on all three ATS families (fill → approve on the website → dry rehearsal → gate)
 

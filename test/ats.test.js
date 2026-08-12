@@ -1388,16 +1388,25 @@ test("atsParseBatchReply: both kinds, fenced JSON, and anything of the wrong sha
     answers: [
       { id: "q1", choice: "Yes", justification: "profile says so", confidence: "High", maps_to: "a.b", suggested_category: "Screening" },
       { id: "q2", answer: "  I want this job.  ", justification: "from profile" },
-      { id: "q3", answer: "prose where a pick was asked for" },   // wrong SHAPE for its kind
+      { id: "q3", answer: "A" },                                   // choice answered under the TEXT key
       { id: "q4", answer: "   " },                                 // the AI declining
       { id: "q9", choice: "Yes" },                                 // never asked about
     ],
   }) + "\n```", items);
 
-  assert.deepStrictEqual([...m.keys()], ["q1", "q2"]);
+  assert.deepStrictEqual([...m.keys()], ["q1", "q2", "q3"]);
   assert.deepStrictEqual(m.get("q1"), { ok: true, choice: "Yes", justification: "profile says so", confidence: "High", maps_to: "a.b", suggested_category: "Screening", promptOptions: ["Yes", "No"] });
   // a free-text answer keeps atsAiWriteText's FIXED "Low" confidence and is trimmed
   assert.deepStrictEqual(m.get("q2"), { ok: true, answer: "I want this job.", confidence: "Low", justification: "from profile" });
+  // CROSS-KEY: a choice answered under "answer" (or text under "choice") is still an answer. Dropping
+  // it silently sent that question off to buy its own call — both live misses were on MIXED batches.
+  // Safe because a choice is still only a CANDIDATE that must clear the match ladder vs live options.
+  assert.strictEqual(m.get("q3").choice, "A", "a choice arriving under the TEXT key must not be discarded");
+  assert.deepStrictEqual(m.get("q3").promptOptions, ["A"]);
+  const swapped = ats.atsParseBatchReply(JSON.stringify({ answers: [{ id: "q2", choice: "text under the choice key" }] }), items);
+  assert.strictEqual(swapped.get("q2").answer, "text under the choice key", "and the same the other way round");
+  // …but a genuinely EMPTY answer is still the AI declining, under either key
+  assert.strictEqual(ats.atsParseBatchReply(JSON.stringify({ answers: [{ id: "q1", choice: "", answer: "" }] }), items).size, 0);
   // …and the tolerant shapes the single-answer parser also accepts
   assert.strictEqual(ats.atsParseBatchReply(JSON.stringify([{ id: "q1", choice: "No" }]), items).get("q1").choice, "No");
   assert.strictEqual(ats.atsParseBatchReply(JSON.stringify({ q1: { choice: "No" } }), items).get("q1").choice, "No");
