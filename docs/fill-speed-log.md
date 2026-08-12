@@ -1152,6 +1152,80 @@ Two independent confirmations in the same run:
 1ms evals" fit ~25ms, and I picked the wrong one and wrote it into the log as a coverage gap. When the
 question is *which branch ran*, read the DOM or add a log line — do not infer it from a timing.
 
+### Regression sweep — 8 postings, all three ATS families, all hidden
+
+| posting | ATS | deferred | served by batch | LLM calls | counts (filled/review/skipped) |
+|---|---|---|---|---|---|
+| gitlab | GH | 4 (4 choice) | 4 | **1** | 14 / 5 / 2 |
+| figma | GH | 2 (2 text) | 2 | **1** | 15 / 3 / 3 |
+| discord | GH | 4 (2c 2t) | 4 | **1** | 16 / 6 / 4 |
+| reddit | GH | 8 (4c 4t) | 8 | **1** | 15 / 9 / 1 |
+| **shieldai** | LEV | 6 (4c 2t) | **0** | **7** | 17 / 7 / 14 |
+| matchgroup | LEV | 4 (4 choice) | 4 | **1** | 10 / 5 / 6 |
+| ramp | ASH | 5 (2c 3t) | 5 | **1** | 5 / 5 / 3 (+1 needs_review) |
+| linear | ASH | 7 (1c 6t) | 6 | **2** | 5 / 7 / 2 |
+
+**8/8 `ok:true`, reached the form, walked.** 40 deferred questions cost **15 calls**; without the one
+transient failure below, 34 questions cost **8**. Pre-change that is one call per question.
+
+### ★ The failure mode this design is built for, observed live — and it cost latency, not coverage
+
+`shieldai` logged `[LLM] ok in 1364ms` and then `AI batch answered 0/6`. The call SUCCEEDED and parsed
+to nothing. All 6 questions fell back to their own calls, all 6 filled, and the page finished with the
+same `17 / 7 / 14` counts as the clean reruns. **Two reruns of the same posting both parsed 6/6 in ONE
+call**, so this was a transient bad reply, not a systematic fault.
+
+That is exactly the invariant the design claims — *a batch that fails leaves each field to make its own
+call, so a bad batch costs LATENCY, never COVERAGE* — and it is now observed rather than argued. Cost of
+the incident: 43s instead of ~13s, from 6 fallback calls (one of which was an 11983ms outlier) plus a
+`deadAsync` page reload.
+
+⚠ **Nothing logged WHY**, which is the one thing this shape cannot diagnose from outside: refusal,
+truncation mid-JSON, and ids we never asked about all look identical next to `ok in 1364ms`. Fixed —
+`atsRunAiBatch` now dumps the reply's length and first 220 chars **on a total parse failure only** (a
+partial parse is self-explaining, and the reply carries profile-derived answers). Armed, not yet fired.
+
+### ✔ END TO END on all three ATS families (fill → approve on the website → dry rehearsal → gate)
+
+| posting | ATS | approved | strict verify | terminal line |
+|---|---|---|---|---|
+| matchgroup | Lever | 5/5 flagged | 21 fields | `▶▶ WOULD CLICK SUBMIT ◀◀` |
+| discord | Greenhouse | 6/6 flagged | 26 replayed, **0 failures** | `▶▶ WOULD CLICK SUBMIT ◀◀` |
+| ramp | Ashby | 6/6 flagged | 14 replayed, **0 failures** | `▶▶ WOULD CLICK SUBMIT ◀◀` |
+
+Each gate line reads `bundle blockers: 0 · submit button: true (disabled false) · captcha challenge
+visible: false`. Every run returned `stopped:"simulate"` and `arm` was never passed — the never-submit
+invariant held throughout.
+
+### Hidden vs visible ON THIS BUILD — the change is arm-NEUTRAL (12 runs, 6 per arm)
+
+The prior refutations were measured on the OLD code. This build adds ~4 CDP evals per combobox plus a
+`delayFull(120)` close-retry, and `act.delay` overruns 3–69× in a hidden MV3 worker — so it needed
+re-asking. 12 runs on one posting, **order counterbalanced** (block 1 H-first, block 2 V-first), each
+arm confirmed from its own measured `[ATS-PACING]` label, never the intent flag.
+
+**The direct answer — the cost of the code I added is identical in both arms:**
+
+| | defer cost per combobox (median) | `menu still open` retries |
+|---|---|---|
+| hidden (n=6) | ~15–20ms | **0** |
+| visible (n=6) | ~15–20ms | **0** |
+
+The outliers land in BOTH arms (347ms hidden, 332ms visible), and **`atsCloseComboConfirmed` never once
+needed its retry in 12 runs** — so the `delayFull(120)` overrun I hypothesised never executes. All 12
+runs served 7/7 from one call with identical `15 / 8 / 2` counts.
+
+**Whole-fill medians still differ, and this is NOT attributable to the change:** hidden 20.25s vs
+visible 15.6s; LLM arm-independent (hidden 1.45s, visible 2.05s — visible *higher*); `candidate-location`
+similar (8.7 vs 8.2). The residual (fill − LLM − candidate-location) is hidden {4.6, 6.8, 7.8, 10.8,
+12.3, 30.4} vs visible {4.5, 4.6, 5.5, 6.2, 7.4, 10.6} — heavily overlapping, with one hidden run (a
+14.7s single-widget stall) carrying most of the gap.
+
+⚠ **Do not promote this to "hidden is slower."** That claim has now been measured three times on this
+path and flipped sign twice. n=6/arm is the largest sample yet and still cannot separate it from
+`candidate-location`'s own 7.1–20.3s spread. What IS settled: **the deferred-AI change introduces no
+hidden-specific cost.**
+
 ### The measurement trap this round nearly walked into
 
 The FIRST run produced `ok:true`, 25 fields, correct counts — and **an empty log**. The MV3 worker was
