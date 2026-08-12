@@ -1632,8 +1632,29 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   //     log lines can say WHICH credential was used without carrying it.
   //   • no credentials stored ⇒ `needs_review`, never a blank guess and never a partial account.
   if (ats === "generic" && f && f.credentialKind) {
-    const creds = credentials || null; // 7th arg; absent ⇒ needs_review, never a guess
     const kind = f.credentialKind;
+    // ⚠⚠ OFF BY DEFAULT, and the default is the point (operator, 2026-08-12 — live on iCIMS).
+    //
+    // The earlier version filled these automatically from stored credentials, reasoning that it was
+    // "the same thing the Workday onboarding does". That conflated two different situations:
+    //   • onboarding fills credentials on a SIGN-IN / create-account page, where that IS the task; but
+    //   • iCIMS embeds a "Create a login" block INSIDE the application form, and the operator reaches
+    //     it through a magic link that has ALREADY authenticated them.
+    // On an existing candidate profile, writing to "Password" + "Password (Re-enter)" is a PASSWORD
+    // CHANGE, not an account creation — an irreversible, outward-facing side effect nobody asked for.
+    // Live, the Login box already held the account's own address, which is what surfaced the mistake.
+    //
+    // So: a credential field is REPORTED, never auto-filled, unless the operator explicitly opts in
+    // (`genericFillCredentials`). Review shows it, the operator types it, and nothing about the fill
+    // depends on it. When the opt-in IS set, the value still comes ONLY from stored credentials —
+    // never a profile value, a taught bucket wording, or an LLM.
+    const optedIn = !!(credentials && credentials.__fillCredentials === true);
+    const creds = credentials || null;
+    if (!optedIn) {
+      return { kind: "credential-missing", credentialKind: kind, review: true, flag: "credential-left-to-you",
+        detail: "this form asks for a " + kind.replace("_", " ") + " — left for you on purpose: you may already have an account here, " +
+          "and writing a password into an existing profile changes it. Fill it yourself, or turn on credential filling if you want it automated." };
+    }
     if (!creds || !creds.email || !creds.password) {
       return { kind: "credential-missing", credentialKind: kind, review: true, flag: "credentials-not-stored",
         detail: "this form asks for a " + kind.replace("_", " ") + " — no credentials are stored, so it is left for you (Sign-in page)" };

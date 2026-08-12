@@ -1150,9 +1150,25 @@ test("paired combo: every injected fn is self-contained, and the OPEN uses a poi
 // ── CREDENTIALS (iCIMS embeds a "Create a login" block INSIDE the application form) ─────
 // Operator 2026-08-12: use the same stored credentials the Workday onboarding signs in with. The
 // safety of that rests entirely on the credential tier being UNREACHABLE by any other answer source.
-const CREDS = { email: "kevin@example.com", password: "correct-horse-battery-staple" };
+const CREDS = { email: "kevin@example.com", password: "correct-horse-battery-staple", __fillCredentials: true };
+const CREDS_NO_OPTIN = { email: "kevin@example.com", password: "correct-horse-battery-staple" };
 
-test("credentials: a password field is answered ONLY from stored credentials", () => {
+test("⚠⚠ credentials: OFF BY DEFAULT — an embedded login block is left for the operator", () => {
+  // Live on iCIMS: the operator reaches the form through a magic link that has ALREADY authenticated
+  // them, so writing to "Password" + "Password (Re-enter)" on an existing candidate profile is a
+  // PASSWORD CHANGE, not an account creation. That is an irreversible side effect nobody asked for,
+  // so the default is to report the field, never to fill it.
+  for (const kind of ["login", "password", "password_confirm"]) {
+    const f = { widgetType: "text", fieldName: "PersonProfileFields.X", label: "X", credentialKind: kind };
+    const r = ats.atsRouteField("generic", f, {}, {}, {}, null, CREDS_NO_OPTIN);
+    assert.strictEqual(r.kind, "credential-missing", kind + " must not be auto-filled");
+    assert.strictEqual(r.flag, "credential-left-to-you");
+    assert.ok(!r.value, "no credential value may be produced without the opt-in");
+    assert.match(r.detail, /changes it|left for you/);
+  }
+});
+
+test("credentials: WITH the opt-in, a password field is answered ONLY from stored credentials", () => {
   const f = { widgetType: "text", fieldName: "PersonProfileFields.Password", label: "Password", credentialKind: "password" };
   const r = ats.atsRouteField("generic", f, {}, {}, {}, null, CREDS);
   assert.strictEqual(r.kind, "credential");
@@ -1161,7 +1177,7 @@ test("credentials: a password field is answered ONLY from stored credentials", (
   assert.strictEqual(r.source, "credentials");
 });
 
-test("credentials: login takes the EMAIL, confirm takes the same password", () => {
+test("credentials: with the opt-in, login takes the EMAIL, confirm takes the same password", () => {
   const mk = (kind, name) => ats.atsRouteField("generic", { widgetType: "text", fieldName: name, label: name, credentialKind: kind }, {}, {}, {}, null, CREDS);
   assert.strictEqual(mk("login", "PersonProfileFields.Login").value, CREDS.email);
   assert.strictEqual(mk("password", "PersonProfileFields.Password").value, CREDS.password);
@@ -1180,12 +1196,19 @@ test("⚠ credentials: a BUCKET can never answer a credential field", () => {
   assert.ok(buckets === null || true);
 });
 
-test("⚠ credentials: with NO stored credentials the field is needs_review, never guessed", () => {
+test("⚠ credentials: even OPTED IN, incomplete credentials never half-fill", () => {
   const f = { widgetType: "text", fieldName: "PersonProfileFields.Password", label: "Password", credentialKind: "password" };
-  for (const creds of [null, undefined, {}, { email: "x@y.z" }, { password: "p" }]) {
+  // opted in but nothing (or only half) stored ⇒ still needs_review, never a partial account
+  for (const creds of [{ __fillCredentials: true }, { __fillCredentials: true, email: "x@y.z" }, { __fillCredentials: true, password: "p" }]) {
     const r = ats.atsRouteField("generic", f, {}, {}, {}, null, creds);
     assert.strictEqual(r.kind, "credential-missing", "incomplete credentials must not half-fill");
     assert.strictEqual(r.flag, "credentials-not-stored");
+    assert.ok(!r.value);
+  }
+  // and with no credentials object at all, the default (opt-out) reason is what surfaces
+  for (const creds of [null, undefined, {}]) {
+    const r = ats.atsRouteField("generic", f, {}, {}, {}, null, creds);
+    assert.strictEqual(r.kind, "credential-missing");
     assert.ok(!r.value);
   }
 });
