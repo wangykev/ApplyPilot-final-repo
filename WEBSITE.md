@@ -472,7 +472,9 @@ copy its ID, paste it on `/app/connect`, then **Sync to extension**.
 
 ### Supabase setup (one-time)
 1. Create a Supabase project. Project Settings → API → copy the URL + anon key + service-role key into `web/.env.local`.
-2. Run **`web/supabase/main.sql`** — every migration concatenated in order, and safe to run more than once. It sets up a fresh project AND brings an existing one up to date: no `drop table`, `delete` or `truncate` appears in it, policies/triggers are drop+create, columns are `add ... if not exists`, and constraints drop-if-exists before being added. The numbered files in `web/supabase/migrations/` remain the source of truth; after adding one, append it to `main.sql` too.
+2. Run **`web/supabase/main.sql`** — the whole database in one file, and safe to run more than once. It sets up a fresh project AND brings an existing one up to date: no `drop table`, `delete` or `truncate` appears in it, policies/triggers are drop+create, columns are `add ... if not exists`, and constraints drop-if-exists before being added. **Re-pasting it is the update mechanism** — that is verified by execution, not by reading (fresh → paste ×3, then a fourth over live rows with every row and value intact; see the file header).
+   Then run **`web/supabase/verify.sql`** in the same editor: it checks the END STATE, so it catches a paste that was truncated. **Every row must read PASS.**
+   ⚠ **`main.sql` is the source of truth now** — `migrations/` stops at 0016 and sections 0017+ exist only in `main.sql`. Add a new migration by appending a section there (and a matching row to `verify.sql`, which is what proves it actually landed).
 3. Auth → Providers → enable **Email** and **Google** (set the Google OAuth client + the `…/auth/callback` redirect).
 4. Remove `NEXT_PUBLIC_DEV_PREVIEW` from `.env.local` to enforce real auth.
 

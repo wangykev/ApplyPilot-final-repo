@@ -15,6 +15,9 @@
 -- Generated from migrations/ 0001-0016, then extended in place: 0017-0019 exist ONLY here, because
 -- this file is the source of truth now. If you add a migration later, append it here too.
 --
+-- After running it, run verify.sql in the same editor: it checks the END STATE, so it catches a paste
+-- that was truncated (every row must read PASS).
+--
 -- VERIFIED by execution (2026-08-10), not by reading it: run against a real Postgres (PGlite) with
 -- Supabase's auth/storage objects stubbed —
 --   * fresh database        -> succeeds; 7 tables, every applications column, RLS policies present
@@ -22,6 +25,15 @@
 --   * over a database already holding 'filling' rows under the old constraint -> succeeds, and the
 --     rows re-home by bundle presence (bundle -> needs_review, none -> queued) with nothing else
 --     touched and no row lost
+--
+-- RE-VERIFIED the same way through 0019 (2026-08-12), because "safe to re-paste" is a claim that has
+-- to be re-earned every time the file grows —
+--   * fresh -> paste -> paste -> paste  -> all three succeed
+--   * a FOURTH paste over a database holding real rows -> succeeds, every row still there, fill_mode
+--     values intact (the point of "no drop/delete/truncate": re-pasting is not a reset)
+--   * verify.sql -> every row PASS
+--   * and the two new verify.sql rows FAIL on a database built from this file with 0019 cut out —
+--     a check that cannot fail is not a check
 
 
 -- ==========================================================================

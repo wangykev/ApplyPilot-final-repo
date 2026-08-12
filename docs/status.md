@@ -62,9 +62,10 @@ with an EMPTY-entries bundle carrying the review-page scan. Extension suite **14
 
 **Remaining — three things, in this order:**
 
-1. **Re-run `web/supabase/main.sql`** (its new section 0019 adds `applications.fill_mode`; the file is
-   idempotent, so re-running it touches nothing else). Until it runs, the row still lands — the report
-   route drops the unknown column and retries — but it arrives WITHOUT the `manual` label.
+1. **Re-paste `web/supabase/main.sql`, then `verify.sql`** (section 0019 adds `applications.fill_mode`;
+   every verify row must read PASS — the two new ones are `fill_mode column` / `fill_mode constrained`).
+   Re-pasting is verified safe by execution, including over live rows. Until it runs, the row still
+   lands — the report route drops the unknown column and retries — but WITHOUT the `manual` label.
 2. **Live-verify the two buttons.** Workday: "Fill page" on an application page (expect a fast fill, no
    dropdown re-opens, nothing on the website's review page), then "Fill form" from a JD page (expect it
    to reach review and stop). **Non-Workday:** open a Greenhouse/Lever/Ashby application and press
