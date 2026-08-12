@@ -1268,6 +1268,78 @@ run, filter by cursor after.
 
 ---
 
+## 2026-08-12 — round 11: the ROUTE is per-call, so the batch splits by kind
+
+Round 10 collapsed an ATS page's AI questions into one call. Reviewing Workday's `aiBatch` for whether it
+should adopt the same ordering turned up two things that mattered more than the ordering question.
+
+### ★ FOUND: ATS long answers were never using the essay model
+
+`act.llm` resolves `resolveLlmRoute(config, action || "fill")`. **`atsAiWriteText` passed no `action`**, so
+every free-text answer on Greenhouse/Lever/Ashby — the cover-letter-shaped "why do you want to work here"
+boxes — resolved the **Fill** route. The AI page has had a separate `"Fill — essays and long answers"` slot
+all along (`LLM_ACTIONS = ["fill","essay","resume_parse","cover_letter"]`), and the Workday twin
+`aiFillText` had always used it. Only this path did not, so the operator's essay model sat unused.
+
+### The consequence for round 10's design: ONE CALL PER KIND, not per page
+
+A call carries ONE `action`, so a batch mixing picks and prose must send one kind to the other's model.
+The batch now splits — **choice → `"fill"`, text → `"essay"`** — fired CONCURRENTLY. It costs no latency
+(the page waits for the slower, not the sum) and is a small quota win, since the two actions can resolve to
+different models and different pinned keys. "One question is not a batch" now applies **per kind**.
+
+**LIVE VERIFIED** (build `deferred-ai-4`, hidden):
+
+```
+reddit  (4 text + 4 choice)
+  AI batch [choice → "fill" route]: 4 deferred question(s) in ONE call
+  AI batch [text  → "essay" route]: 4 deferred question(s) in ONE call
+  [LLM] … for "fill"  [attempt 1/2]
+  [LLM] … for "essay" [attempt 1/2]     ← both HEADERS precede either reply ⇒ genuinely concurrent
+  [LLM] ok in 1281ms · ok in 1528ms
+  AI pass done: 8 deferred · 8 served by the batch · 0 made their own call
+
+linear  (6 text + 1 choice)
+  AI batch [text → "essay" route]: 6 deferred question(s) in ONE call → ok in 2223ms
+  the lone choice fell to its own call, on "fill" → 10058ms   ← the per-kind minimum, working
+```
+
+### Workday: should it adopt round 10's ORDER? No — but its batch was too NARROW
+
+Read before deciding, and worth recording because the symmetry is tempting and wrong:
+
+- **Workday's batch is fired UN-AWAITED — the overlap IS the design.** The model works while the
+  deterministic loop drives the page. Deferring (the ATS order) forfeits that, and Workday has far more to
+  hide behind (`capture`/`scrapeTaOptions` run 2–16s).
+- **The ATS win was REQUEST COUNT** against a 15/min per-key quota. Workday's batched portion was already
+  ONE call, so flipping the order would save prompt tokens, not requests, and pay latency for them.
+- **A deferred second pass is also much harder here**: `drivePageFill` carries `only`/`onlySec` re-fill
+  modes, cascade recursion, AI-4 remediation re-entry, `sweepAlreadyFilled` and the M40 audit, all assuming
+  one pass. ATS was easy only because `atsAiFallback` was a single seam already taking `prefetched`.
+
+**What WAS wrong: the batch covered dropdowns only** — `if (f.widgetType !== "dropdown") continue;`. There
+are **13 `act.llm` sites in `fill-driver.js` and exactly one consulted the batch**, so every REQUIRED
+free-text question made its own serial call. Worse, `willUseAi` is true for a required text field, so it
+*awaited* the batch and then discarded the answer, because `aiFillText` took no pre-answer.
+
+**Fixed by widening, not by re-ordering.** Text candidates are **free**: no options ⇒ `needsOpen:false` ⇒
+zero page contact. `aiFillText` gained a `preAnswer` seam matching `aiFillField`'s. `aiBatchAnswer` awaits
+**only the route that could serve the field**, so a prose question never blocks on the dropdown call.
+
+⚠ **STATUS: the Workday half is unit-tested and mutation-checked, NOT live-verified.** The ATS half is
+live-verified above. A Workday run needs a tenant login and a multi-page walk; nothing here changes the
+deterministic path, but the claim stands only at unit level until someone runs a tenant.
+
+### Also fixed: the parser dropped an answer that arrived under the other key
+
+Both `parseBatchAiReply` (Workday) and `atsParseBatchReply` validated strictly per kind — a pick was only
+accepted under `choice`, prose only under `answer`. A model replying `{"answer":"Yes"}` to a pick had a good
+answer **discarded silently**, and that question then paid for its own call. Both misses in round 10's sweep
+were on MIXED batches, which is exactly where a cross-key reply is likeliest. Safety is untouched: the value
+is still only a CANDIDATE that must clear the match ladder against the LIVE options before anything commits.
+
+---
+
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
 
 Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now

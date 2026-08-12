@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { planAiBatchCandidates, deterministicTierFor, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, pickLastResortOption, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { planAiBatchCandidates, buildBatchAiPrompt, parseBatchAiReply, deterministicTierFor, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, pickLastResortOption, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1789,6 +1789,53 @@ test("AI batch: an unanswerable REQUIRED dropdown IS a candidate, and needs its 
   assert.strictEqual(plan.length, 1);
   assert.strictEqual(plan[0].kind, "infer");
   assert.strictEqual(plan[0].needsOpen, true, "infer is the one kind that costs an open");
+});
+
+test("AI batch: a REQUIRED free-text question IS a candidate, and costs NO page contact", async () => {
+  // Until 2026-08-12 the planner dropped everything that was not a dropdown, so every required
+  // free-text question ("why do you want to work here") made its OWN serial call — the exact
+  // one-call-per-question shape the batch exists to remove.
+  const plan = planAiBatchCandidates(
+    [{ wrapperSel: "[w-t]", fieldName: "why_here", widgetType: "textarea", isRequired: true, label: "Why do you want to work here?" }], {});
+  assert.strictEqual(plan.length, 1);
+  assert.strictEqual(plan[0].kind, "text");
+  assert.strictEqual(plan[0].needsOpen, false,
+    "a text question has no options, so batching it must cost ZERO page contact — only `infer` opens anything");
+  // an OPTIONAL one is still never a candidate (optional stays deterministic-or-blank, no LLM)
+  assert.deepStrictEqual(planAiBatchCandidates(
+    [{ wrapperSel: "[w-t]", fieldName: "why_here", widgetType: "textarea", isRequired: false, label: "Why?" }], {}), []);
+  // and a widget with its OWN inline AI path is still left alone
+  assert.deepStrictEqual(planAiBatchCandidates(
+    [{ wrapperSel: "[w-ta]", fieldName: "skills", widgetType: "typeahead", isRequired: true, label: "Skills" }], {}), []);
+});
+
+test("AI batch prompt: a text question carries NO options list", () => {
+  // Sending `options: []` to a free-text question invites the model to treat it as a closed list it
+  // must pick from, which is the opposite of what a free-text answer is.
+  const { user } = buildBatchAiPrompt(
+    [{ key: "q_text", kind: "text", label: "Describe your experience." },
+     { key: "q_pick", kind: "infer", label: "Consent?", options: ["Yes", "No"] }], {}, {});
+  const qs = JSON.parse(user.slice(user.indexOf("["), user.indexOf("]\nApplicant profile:") + 1));
+  const t = qs.find((q) => q.id === "q_text");
+  const p = qs.find((q) => q.id === "q_pick");
+  assert.ok(!("options" in t), "a text question must carry no options key at all");
+  assert.deepStrictEqual(p.options, ["Yes", "No"], "a pick still carries its live list");
+});
+
+test("AI batch reply: an answer under the OTHER key is still an answer", () => {
+  // The prompt asks for `choice` on a pick and `answer` on a text question. Requiring exactly that
+  // threw away a good answer that arrived under the other name — silently, after which that question
+  // paid for its own call. Safety is untouched: the value is still only a CANDIDATE that must clear
+  // the match ladder against the LIVE options before anything commits.
+  const items = [{ key: "a", kind: "text", label: "Why?" }, { key: "b", kind: "infer", label: "Consent?", options: ["Yes"] }];
+  const m = parseBatchAiReply(JSON.stringify({ answers: [
+    { id: "a", answer: "Because it fits my background." },   // text under its own key
+    { id: "b", answer: "Yes" },                              // a PICK arriving under the text key
+  ] }), items);
+  assert.strictEqual(m.get("a").choice, "Because it fits my background.");
+  assert.strictEqual(m.get("b").choice, "Yes", "a pick under the text key must not be discarded");
+  // an empty value under BOTH keys is still the model declining
+  assert.strictEqual(parseBatchAiReply(JSON.stringify({ answers: [{ id: "a", choice: "", answer: "  " }] }), items).size, 0);
 });
 
 test("AI batch: an OPTIONAL unmapped dropdown is never a candidate (optional stays deterministic-or-blank)", async () => {

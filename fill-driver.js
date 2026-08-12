@@ -1172,10 +1172,15 @@ function buildBatchAiPrompt(items, profile, jobContext) {
     + "Each question has a \"kind\":\n"
     + "  • \"infer\" — the applicant did NOT state an answer. Choose the SINGLE best option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record). These are REQUIRED: always choose the most likely option, NEVER refuse and never answer UNKNOWN.\n"
     + "  • \"canonicalize\" — the applicant ALREADY STATED a value (given as \"stated\"). Your ONLY job is to pick the option that means the SAME thing (vocabulary mapping, e.g. \"Male\"→\"Man\"). You are NOT inferring, deciding, or changing anything. If NO option means the same, answer \"UNKNOWN\". Never pick an option that differs in meaning.\n"
+    + "  • \"text\" — a FREE-TEXT question with no options. Write the answer in the applicant's own plain, professional first-person voice, in the \"answer\" field. Answer when the value FOLLOWS from what the profile says (deriving is not inventing). Use \"answer\":null ONLY when the answer is a fact about the applicant the profile does NOT determine — a salary expectation, an employee or reference id, a date they never gave.\n"
     + "For every answer give a SHORT justification — one terse phrase, about 12 words, no preamble, no restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give confidence: High, Medium, or Low. "
     + "ALSO map each question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
   const qs = items.map((it) => {
-    const o = { id: it.key, kind: it.kind, question: String(it.label || ""), options: it.options || [] };
+    // a text question has no options — sending `options: []` invites the model to treat it as a
+    // closed list it must pick from, which is the opposite of what a free-text answer is
+    const o = it.kind === "text"
+      ? { id: it.key, kind: it.kind, question: String(it.label || "") }
+      : { id: it.key, kind: it.kind, question: String(it.label || ""), options: it.options || [] };
     if (it.kind === "canonicalize") o.stated = Array.isArray(it.stated) ? it.stated.join(" / ") : String(it.stated == null ? "" : it.stated);
     return o;
   });
@@ -1183,7 +1188,7 @@ function buildBatchAiPrompt(items, profile, jobContext) {
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
     + "\n\nReply ONLY with a JSON object and nothing else, one entry per question id:\n"
-    + "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<exact option text, or UNKNOWN for a canonicalize with no equivalent>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
+    + "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<exact option text — kind infer/canonicalize; UNKNOWN for a canonicalize with no equivalent>\",\"answer\":\"<free text — kind text only>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
   return { system, user };
 }
 
@@ -1204,8 +1209,15 @@ function parseBatchAiReply(text, items) {
     if (!a || typeof a !== "object") return;
     const key = String(id == null ? "" : id);
     if (!known.has(key) || out.has(key)) return;           // ignore ids we never asked about
-    const choice = a.choice == null ? "" : String(a.choice);
-    if (!choice) return;
+    // EITHER KEY, whatever the kind (2026-08-12). The prompt asks for `choice` on a pick and `answer`
+    // on a text question, and requiring exactly that threw away a perfectly good answer that arrived
+    // under the other name — silently, after which that question paid for its own call. The value is
+    // still only a CANDIDATE that must clear the match ladder against the LIVE options before
+    // anything commits, so being lenient about which JSON key carried it changes nothing about what
+    // may be written to a form. Carried over from the ATS twin, where mixed batches surfaced it.
+    const choice = a.choice != null && String(a.choice).trim() ? String(a.choice)
+      : (a.answer == null ? "" : String(a.answer));
+    if (!String(choice).trim()) return;
     out.set(key, { choice, justification: a.justification == null ? "" : String(a.justification),
       confidence: _aiConf(a.confidence),   // SAME normalization as parseAiReply — the record/bundle expect it lowercased
 
@@ -1363,11 +1375,17 @@ function planAiBatchCandidates(fields, profile, known, bucketIndex, empCompany) 
   const answered = (f) => !!(known instanceof Map && known.size && known.has(aiLabelKey(f && f.label)));
   for (const f of fields || []) {
     if (out.length >= AI_BATCH_MAX) break;
-    if (f.widgetType !== "dropdown") continue;   // text/date/checkbox keep their own call — see the batch header
+    // TEXT IS BATCHED TOO (2026-08-12). Until now this was dropdowns only, so every REQUIRED free-text
+    // question — the "why do you want to work here" boxes — made its OWN serial call. On an essay-heavy
+    // page that is exactly the one-call-per-question shape the batch exists to remove.
+    // A text candidate is FREE to include: it needs no options, so `needsOpen` is false and it costs
+    // ZERO page contact. Only `infer` dropdowns ever open anything.
+    const isText = f.widgetType === "text" || f.widgetType === "textarea";
+    if (f.widgetType !== "dropdown" && !isText) continue;   // date/checkbox/typeahead keep their own call
     try {
       if (deterministicTierFor(f, profile, bucketIndex, empCompany)) continue; // some tier owns it — not an AI question
       if (answered(f)) continue;                 // already decided this page — reuse, never re-ask
-      if (f.isRequired && aiEligible(f)) out.push({ key: f.fieldName, kind: "infer", label: f.label, wrapperSel: f.wrapperSel, needsOpen: true, options: null });
+      if (f.isRequired && aiEligible(f)) out.push({ key: f.fieldName, kind: isText ? "text" : "infer", label: f.label, wrapperSel: f.wrapperSel, needsOpen: !isText, options: null });
     } catch (e) { /* this field simply isn't batched — it keeps its own per-field call */ }
   }
   return out;
@@ -1586,7 +1604,7 @@ const aiFillDate = async (act, loc, f, profile, jobContext, budgets, opts) => {
 // blank** (a blank halts the walk short of review). OPTIONAL skip → blank needs_review; REQUIRED
 // skip → a CONSPICUOUS placeholder (non-blank → walk advances; the review banners it + the deferred
 // SUBMIT hard-blocks on the marker). ALWAYS filled_review. Provider-agnostic (act.llm).
-const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
+const aiFillText = async (act, loc, f, profile, jobContext, budgets, preAnswer) => {
   const required = !!f.isRequired;
   const tag = f.widgetType === "textarea" ? "textarea" : "input";
   // OPTIONAL decline → blank+flag; REQUIRED decline → placeholder so the walk reaches review.
@@ -1698,11 +1716,21 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets) => {
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
     + "\n\nReply ONLY with a JSON object and nothing else:\n{\"answer\":\"<your answer>\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}  OR  {\"skip\":true,\"reason\":\"<short reason>\"}";
-  // action:"essay" — this is the free-text/prose path, routed separately from the short
-  // screening answers every other act.llm call makes (which default to "fill").
-  const res = await act.llm({ system, user, maxTokens: 1024, action: "essay" });
-  if (!res || !res.ok) return await declineOrPlaceholder("AI call failed — " + ((res && res.error) || "no reply"));
-  const parsed = parseAiText(res.text);
+  // preAnswer = this question's entry from the page's batched TEXT call. Transport only: from here
+  // down the answer takes exactly the path a per-field reply would (commit, read-back, ALWAYS
+  // filled_review). Absent ⇒ make the call, i.e. today's behaviour unchanged.
+  // The batch normalizes every answer onto `choice` (parseBatchAiReply's one shape), so unwrap it
+  // back into parseAiText's `{answer}` contract rather than teaching the rest of this function two.
+  let parsed;
+  if (preAnswer && String(preAnswer.choice || "").trim()) {
+    parsed = { answer: String(preAnswer.choice), maps_to: preAnswer.maps_to || "", suggested_category: preAnswer.suggested_category || "" };
+  } else {
+    // action:"essay" — this is the free-text/prose path, routed separately from the short
+    // screening answers every other act.llm call makes (which default to "fill").
+    const res = await act.llm({ system, user, maxTokens: 1024, action: "essay" });
+    if (!res || !res.ok) return await declineOrPlaceholder("AI call failed — " + ((res && res.error) || "no reply"));
+    parsed = parseAiText(res.text);
+  }
   if (parsed.skip || !parsed.answer) return await declineOrPlaceholder(parsed.reason || "AI returned no answer");
 
   const r = await fillTextCdp(act, loc, parsed.answer, budgets, tag);
@@ -4145,7 +4173,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
   // let it fly while the deterministic fields fill. By the time the loop reaches an AI question the reply
   // is usually already in hand, so the page pays ~0 for it instead of one serial round trip per question.
   // The result is a CACHE consulted by the normal per-field AI path — never a gate (see buildBatchAiPrompt).
-  const aiBatch = { answers: new Map(), promise: null, items: [], awaited: false, error: null, recon: null };
+  // `promises` is per ROUTE ("fill" / "essay"); `promise` stays as the both-routes aggregate purely so
+  // the aiBatchInfo log's "did anything fire at all" check reads unchanged. `awaited` is per route too.
+  const aiBatch = { answers: new Map(), promise: null, promises: {}, items: [], awaited: {}, error: null, recon: null };
   // ── ONE ANSWER PER QUESTION, FOR THE WHOLE PAGE (2026-08-06) ─────────────────────────────────────
   // Keyed by the QUESTION, not the automation-id, and SHARED with the recursive cascade fills through
   // opts.aiAnswers. Two problems, one cause: the cascade re-fill calls drivePageFill again, which built a
@@ -4165,8 +4195,19 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       const collected = await collectAiBatchItems(act, scan.fields, profile, budgets, aiAnswerByLabel, bucketIndex, empCompany, trace);
       trace(`SCOUT done — ${collected.items.length} AI question(s), ${collected.recon.opened} dropdown(s) opened`, collected.recon.ms);
       aiBatch.items = collected.items; aiBatch.recon = collected.recon;
-      if (aiBatch.items.length > 1) { // ONE question is not a batch — leave it to its own path, unchanged
-        const { system, user } = buildBatchAiPrompt(aiBatch.items, profile, jobContext);
+      // ── SPLIT BY ROUTE, NOT BY BATCH (2026-08-12) ────────────────────────────────────────────
+      // `act.llm` carries ONE `action` per call, and the AI page configures a different model per
+      // action: "fill" for short picks, "essay" for prose. Now that TEXT questions are batched too, a
+      // single mixed call would have to send one kind to the other kind's model — so the picks and the
+      // prose go out as two calls on their own routes. Both are fired UN-AWAITED, so the overlap that
+      // makes this whole design worthwhile is unchanged; they simply overlap each other as well.
+      // "One question is not a batch" is applied PER ROUTE: 4 essays still batch when the page's only
+      // dropdown rides alone.
+      const groups = { fill: aiBatch.items.filter((i) => i.kind !== "text"), essay: aiBatch.items.filter((i) => i.kind === "text") };
+      for (const action of Object.keys(groups)) {
+        const group = groups[action];
+        if (group.length < 2) continue;
+        const { system, user } = buildBatchAiPrompt(group, profile, jobContext);
         // NOT awaited: this is the overlap. The deterministic loop runs against the live page while the
         // model works. Errors are captured, never thrown — a failed batch just means per-field calls.
         // OUTPUT BUDGET SCALES WITH THE BATCH (2026-08-06, operator). Every answer carries a choice, a
@@ -4177,16 +4218,20 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // so a cut-off reply fails to parse and the whole page falls back to per-field calls — losing
         // exactly the saving the batch exists for. So the per-question allowance is set well above what a
         // well-formed answer needs rather than tuned to the average.
-        trace(`AI CALL fired — ${aiBatch.items.length} question(s) in ONE call (cap ${aiBatchMaxTokens(aiBatch.items.length)}); the deterministic fill runs while it is in flight`);
-        aiBatch.promise = act.llm({ system, user, maxTokens: aiBatchMaxTokens(aiBatch.items.length) })
+        trace(`AI CALL fired [${action}] — ${group.length} question(s) in ONE call (cap ${aiBatchMaxTokens(group.length)}); the deterministic fill runs while it is in flight`);
+        aiBatch.promises[action] = act.llm({ system, user, maxTokens: aiBatchMaxTokens(group.length), action })
           .then((res) => {
             if (!res || !res.ok) { aiBatch.error = (res && res.error) || "no reply"; return; }
-            aiBatch.answers = parseBatchAiReply(res.text, aiBatch.items);
+            const got = parseBatchAiReply(res.text, group);
+            for (const [k, v] of got) aiBatch.answers.set(k, v);
             // Re-key onto the QUESTION so a remount under a new id still finds its answer.
-            for (const it of aiBatch.items) { const a = aiBatch.answers.get(it.key); if (a) aiAnswerByLabel.set(aiLabelKey(it.label), Object.assign({ _kind: it.kind }, a)); }
+            for (const it of group) { const a = got.get(it.key); if (a) aiAnswerByLabel.set(aiLabelKey(it.label), Object.assign({ _kind: it.kind }, a)); }
           })
           .catch((e) => { aiBatch.error = String((e && e.message) || e); });
       }
+      // Kept so every downstream reader ("did a batch fire at all?") keeps working unchanged.
+      const fired = Object.keys(aiBatch.promises);
+      aiBatch.promise = fired.length ? Promise.all(fired.map((a) => aiBatch.promises[a])) : null;
     } catch (e) { aiBatch.error = String((e && e.message) || e); }
     aiBatchScanMs = Date.now() - t0Batch;
   }
@@ -4203,13 +4248,20 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     const usable = (a) => (a && (!a._kind || !wantKind || a._kind === wantKind)) ? a : null;
     const cached = lk ? usable(aiAnswerByLabel.get(lk)) : null;
     if (cached) { aiBatch.served++; return cached; }        // same QUESTION, whatever id it now carries
-    if (!aiBatch.promise) { aiBatch.fellBack++; return null; }
-    if (!aiBatch.awaited) {
-      aiBatch.awaited = true;
+    // AWAIT ONLY THE ROUTE THIS FIELD COULD BE SERVED BY (2026-08-12). The two batched calls are
+    // independent and concurrent, so blocking a prose question on the dropdown call — which can never
+    // hold its answer — would make the first AI field wait for the SLOWER of the two for nothing.
+    const wantAction = wantKind === "text" ? "essay" : "fill";
+    const mine = (aiBatch.promises && aiBatch.promises[wantAction]) || null;
+    if (!mine) { aiBatch.fellBack++; return null; }
+    if (!aiBatch.awaited[wantAction]) {
+      aiBatch.awaited[wantAction] = true;
       const w0 = Date.now();
-      trace(`WAITING on the AI reply (first AI field reached: "${String((f && f.label) || "").slice(0, 50)}")`);
-      await aiBatch.promise;
-      trace(`AI reply in hand — every AI answer for this page is now known`, Date.now() - w0);
+      trace(`WAITING on the AI reply [${wantAction}] (first such field reached: "${String((f && f.label) || "").slice(0, 50)}")`);
+      await mine;
+      trace(`AI reply in hand [${wantAction}]`, Date.now() - w0);
+    } else {
+      await mine;   // already awaited once by an earlier field — resolves immediately
     }
     const hit = usable((lk && aiAnswerByLabel.get(lk)) || aiBatch.answers.get(f && f.fieldName));
     if (hit) { aiBatch.served++; if (lk) aiAnswerByLabel.set(lk, hit); } else aiBatch.fellBack++;
@@ -4670,7 +4722,8 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // Ask for the kind THIS branch needs. An infer answer must never be spent on a canonicalize (or
         // the reverse) — they answer different prompts. A cached answer has no batch item behind it, so
         // the kind travels with the answer rather than being looked up in aiBatch.items.
-        const wantKind = canonicalize ? "canonicalize" : "infer";
+        const isTextWidget = f.widgetType === "text" || f.widgetType === "textarea";
+        const wantKind = canonicalize ? "canonicalize" : (isTextWidget ? "text" : "infer");
         // ONLY CONSULT THE BATCH IF THIS FIELD WOULD USE AN AI ANSWER (2026-08-06). aiBatchAnswer AWAITS
         // the in-flight call, so asking it about a field that is not AI-eligible blocks the walk for the
         // model's full latency and then throws the answer away. Live on waystar page 3: an OPTIONAL
@@ -4679,8 +4732,9 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         // to create. The eligibility test is the same one the branches below use.
         const willUseAi = canonicalize || (f.isRequired && aiEligible(f));
         const batched = willUseAi ? await aiBatchAnswer(f, wantKind) : null;
-        const preInfer = !canonicalize ? batched : null;
+        const preInfer = (!canonicalize && !isTextWidget) ? batched : null;
         const preCanon = canonicalize ? batched : null;
+        const preText = (!canonicalize && isTextWidget) ? batched : null;
         // Canonicalize ALWAYS picks an option now (see aiCanonicalizeField) — a closed list must be
         // answered, so there is no "declined" case left to recover from here. The previous shape added a
         // SECOND llm call and a SECOND open/close of the same dropdown purely to undo the first call's
@@ -4694,7 +4748,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
             : (f.widgetType === "date")
               ? await aiFillDate(act, loc, f, profile, jobContext, budgets,
                   (() => { const s = apMatch.dateOrderOf(f.dateSegments || []); return s.length ? { segments: s } : undefined; })())
-              : await aiFillText(act, loc, f, profile, jobContext, budgets);
+              : await aiFillText(act, loc, f, profile, jobContext, budgets, preText);
           // EEO retraction: an AI-INFERRED demographic still gets the loud demographic badge. Only a
           // committed inference (filled_review); canonicalize keeps ai-canonicalized (maps a STATED value).
           if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess";

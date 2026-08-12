@@ -1154,20 +1154,24 @@ test("AI batch: the call asks ONLY about what the deterministic pass could not a
   // This is the whole reason the batch runs AFTER the deterministic pass rather than before it
   // (Workday's aiBatch fires first and must PREDICT, paying tokens for every misprediction).
   let asked = null, calls = 0;
+  const byAction = {};
   const values = {};
   const fields = [
     // answered from the profile — must never reach the prompt
     { fieldName: "first_name", inputSel: "#first_name", widgetType: "text", label: "First Name", isRequired: true, value: null, domIndex: 0 },
     { fieldName: "q_auth", inputSel: "#q_auth", widgetType: "radio", label: "Are you authorized to work in the country for which you applied?", isRequired: true, value: null, domIndex: 1, options: ["Yes", "No"] },
-    // nothing in the profile answers these two
+    // nothing in the profile answers these — TWO of each kind, because the "one question is not a
+    // batch" rule applies PER KIND now that each kind rides its own route
     { fieldName: "q_why", inputSel: "#q_why", widgetType: "textarea", label: "Why do you want to work here?", isRequired: true, value: null, domIndex: 2 },
-    { fieldName: "q_shift", inputSel: "#q_shift", widgetType: "radio", label: "Are you willing to work night shifts?", isRequired: true, value: null, domIndex: 3, options: ["Yes", "No"] },
+    { fieldName: "q_why2", inputSel: "#q_why2", widgetType: "textarea", label: "Describe a hard problem you solved.", isRequired: true, value: null, domIndex: 3 },
+    { fieldName: "q_shift", inputSel: "#q_shift", widgetType: "radio", label: "Are you willing to work night shifts?", isRequired: true, value: null, domIndex: 4, options: ["Yes", "No"] },
+    { fieldName: "q_wknd", inputSel: "#q_wknd", widgetType: "radio", label: "Are you willing to work weekends?", isRequired: true, value: null, domIndex: 5, options: ["Yes", "No"] },
   ];
   const act = fakeAct({
     aiEnabled: true,
-    llm: async ({ user }) => {
-      calls++; asked = String(user);
-      const ids = [...asked.matchAll(/"id":"(q\d+)"/g)].map((m) => m[1]);
+    llm: async ({ user, action }) => {
+      calls++; asked = (asked || "") + "\n" + String(user); byAction[action || "(none)"] = String(user);
+      const ids = [...String(user).matchAll(/"id":"(q\d+)"/g)].map((m) => m[1]);
       return { ok: true, text: JSON.stringify({ answers: ids.map((id) => ({ id, choice: "Yes", answer: "Because I like it.", justification: "j", confidence: "Medium" })) }) };
     },
     atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields }),
@@ -1179,9 +1183,15 @@ test("AI batch: the call asks ONLY about what the deterministic pass could not a
   const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
   const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
 
-  assert.strictEqual(calls, 1);
-  assert.ok(/Why do you want to work here/.test(asked), "an unanswered question must be in the prompt");
-  assert.ok(/night shifts/.test(asked), "an unanswered question must be in the prompt");
+  // ONE CALL PER KIND — 6 questions, 4 of them unanswered, and still only two requests.
+  assert.strictEqual(calls, 2, "one batched call per kind, not per question");
+  // …and each kind went to ITS OWN configured route (see ATS_BATCH_ACTION)
+  assert.deepStrictEqual(Object.keys(byAction).sort(), ["essay", "fill"]);
+  assert.ok(/Why do you want to work here/.test(byAction.essay), "prose questions ride the ESSAY route");
+  assert.ok(/hard problem/.test(byAction.essay));
+  assert.ok(/night shifts/.test(byAction.fill), "picks ride the FILL route");
+  assert.ok(!/night shifts/.test(byAction.essay), "a pick must never be sent to the essay model");
+  assert.ok(!/Why do you want to work here/.test(byAction.fill), "an essay must never be sent to the fill model");
   assert.ok(!/First Name/.test(asked), "a field the profile answered must NEVER be asked about");
   assert.ok(!/authorized to work/.test(asked), "a field the deterministic ladder answered must NEVER be asked about");
   // and the deterministic answers are untouched, unflagged
@@ -1421,6 +1431,41 @@ test("atsSameOptionSet: order-insensitive, and any real difference re-asks", () 
   assert.ok(!ats.atsSameOptionSet(["A", "B"], ["A", "C"]), "a changed member is a different list");
   assert.ok(!ats.atsSameOptionSet(undefined, ["A"]), "no recorded list ⇒ never reusable");
   assert.ok(!ats.atsSameOptionSet(["A"], undefined));
+});
+
+test("AI routing: a long answer goes to the ESSAY model, a pick to the FILL model", async () => {
+  // `act.llm` resolves `action || "fill"`, so omitting it silently sent every long answer to the
+  // model configured for yes/no picks — the AI page's "Fill — essays and long answers" slot went
+  // unused on GH/Lever/Ashby while the Workday twin had always used it (2026-08-12).
+  // Pinned on the SINGLE-question path too, because that path bypasses the batch entirely.
+  const seen = [];
+  const values = {};
+  const fields = [
+    { fieldName: "essay1", inputSel: "#essay1", widgetType: "textarea", label: "Tell us why you want this role.", isRequired: true, value: null, domIndex: 0 },
+    { fieldName: "pick1", inputSel: "#pick1", widgetType: "radio", label: "Can you work weekends?", isRequired: true, value: null, domIndex: 1, options: ["Yes", "No"] },
+  ];
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async ({ action, user }) => {
+      seen.push({ action: action || "(none)", isEssay: /Tell us why/.test(String(user)) });
+      return { ok: true, text: JSON.stringify({ answer: "Because it fits my background.", choice: "Yes", justification: "j", confidence: "High" }) };
+    },
+    atsInjScan: () => ({ ats: "lever", url: "https://jobs.lever.co/x/uuid/apply", title: "t", fields }),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjCheckOption: (sel, t) => { values[sel] = t; return { ok: true }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  await ats.driveAtsPageFill(act, "lever", PROFILE, {}, {}, {});
+
+  // one of each kind ⇒ neither batches ⇒ each takes its own per-field call, and the ROUTE still has
+  // to be right — which is the whole point.
+  const essayCall = seen.find((c) => c.isEssay);
+  const pickCall = seen.find((c) => !c.isEssay);
+  assert.ok(essayCall, "the long answer must have been asked about");
+  assert.strictEqual(essayCall.action, "essay", "a long answer must resolve the ESSAY route, never the default fill route");
+  assert.ok(pickCall, "the pick must have been asked about");
+  assert.notStrictEqual(pickCall.action, "essay", "a yes/no pick must NOT be billed to the essay model");
 });
 
 test("atsBatchMaxTokens: a free-text answer is budgeted as a paragraph, a pick as a line", () => {
