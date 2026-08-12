@@ -426,8 +426,14 @@ export function ReviewEditor({
   // original number however many you approved, so "Needs review 9" sat directly above
   // "9 / 9 flagged fields approved" — the one strip a reviewer scans to know whether they are
   // finished flatly contradicted the approval bar underneath it.
-  const reviewTotal = useMemo(() => live.filter((e) => e.needs_review).length, [live]);
-  const reviewPending = useMemo(() => live.filter((e) => e.needs_review && !e.is_approved).length, [live]);
+  // ⚠ COUNT WHAT NEEDS APPROVING, WHICH IS NOT THE SAME SET AS `needs_review` (2026-08-12).
+  // `requiresApproval` is needs_review OR cascade_revealed, and the approval bar has always counted
+  // that set — so a page with 2 cascade-revealed fields showed "7" here and "0 / 9" in the bar, and
+  // those 2 were reachable ONLY by hunting through All fields. You could approve all 7 the section
+  // offered and stay stuck at 7/9 with nothing telling you where the rest were. The section, the
+  // chip and the bar now all count the same thing.
+  const reviewTotal = useMemo(() => live.filter((e) => requiresApproval(e)).length, [live]);
+  const reviewPending = useMemo(() => live.filter((e) => requiresApproval(e) && !e.is_approved).length, [live]);
   const allReviewed = reviewTotal > 0 && reviewPending === 0;
   const liveCounts = useMemo(
     () =>
@@ -447,7 +453,7 @@ export function ReviewEditor({
 
   // NEW items first (questions a submit run sent back), then the pre-existing loudness ordering —
   // see reviewPriority. Stable, so form order still decides within a tier.
-  const flagged = useMemo(() => orderForReview(live.filter((e) => e.needs_review)), [live]);
+  const flagged = useMemo(() => orderForReview(live.filter((e) => requiresApproval(e))), [live]);
   // PENDING FIRST, APPROVED SUNK BELOW. An approved row must stay visible — you have to be able to
   // take an approval back — but it is no longer WORK, and leaving it interleaved meant the remaining
   // questions were scattered between rows that were already done.
@@ -468,7 +474,9 @@ export function ReviewEditor({
   }, [entries]);
 
   const filterPass = useCallback(
-    (e: ReviewEntry) => (filter === "review" ? !!e.needs_review : filter === "edited" ? !!editKindOf(e) : true),
+    // "review" filters on the SAME predicate the chip counts, or clicking a chip reading 9 would
+    // narrow the list to 7.
+    (e: ReviewEntry) => (filter === "review" ? requiresApproval(e) : filter === "edited" ? !!editKindOf(e) : true),
     [filter]
   );
 
@@ -1004,17 +1012,20 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
   }, [e.field_id, review, ctx]);
 
   const kind = editKindOf(e);
-  const approvedRow = !!(e.needs_review && e.is_approved);
+  // Keyed on requiresApproval, not needs_review — a cascade-revealed field demands approval too, and
+  // tinting it neutral made it look like settled background while it was still holding up the gate.
+  const approvedRow = !!(requiresApproval(e) && e.is_approved);
+  const pendingApproval = requiresApproval(e) && !e.is_approved;
   // A field the operator CHANGED that was NOT flagged for review → tint it green (a confirmed edit),
   // mirroring the extension viewer's f-edit. The "autofilled: <bot value>" ref shows too (below).
-  const editedRow = !e.needs_review && !!kind;
+  const editedRow = !requiresApproval(e) && !!kind;
   // An APPROVED flagged row gets the same left-bar treatment a confirmed edit gets — a bare tint was
   // too close to the amber "still needs you" wash to read as done at a glance.
   const rowTint = approvedRow
     ? "border-l-2 border-verified/60 bg-verified/[0.06]"
-    : e.needs_review && mustReplace(e)
+    : pendingApproval && mustReplace(e)
       ? "bg-signal/[0.05]"
-      : e.needs_review
+      : pendingApproval
         ? "bg-amber/[0.04]"
         : editedRow
           ? "border-l-2 border-verified/60 bg-verified/[0.07]"
