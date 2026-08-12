@@ -1649,15 +1649,13 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   // Recognize it from the widget + its label, and refuse the neighbours a form usually puts beside it
   // (cover letter, transcript, portfolio) so we never attach the résumé to the wrong slot.
   if (ats === "generic" && f && f.widgetType === "file_upload") {
-    const l = String(f.label || f.fieldName || "");
-    if (/cover\s*letter|transcript|portfolio|writing sample|certificat|reference/i.test(l)) {
-      return { kind: "skip", source: "generic", detail: "a non-résumé attachment — the operator's own to add" };
-    }
-    if (/r[eé]sum[eé]|\bcv\b|upload.*(file|document)|attach/i.test(l) || /resume|cv/i.test(String(f.fieldName || ""))) {
-      // ⚠ only the PRIMARY slot. A form offering two routes to the same upload (Paylocity's
-      // btn-forceResume + btn-resume) must not receive the résumé twice — see atsGenericPostProcess.
-      // `primaryResumeSlot` is undefined when the scan did not run through the resolver (unit tests
-      // of a single field), so an explicit `=== false` is what refuses a secondary slot.
+    // ONE predicate (atsGenericIsResumeSlot) decides résumé-ness for both this router and
+    // atsGenericPostProcess — see the ⚠ on that function for the three-copies bug that forced it.
+    if (atsGenericIsResumeSlot(f)) {
+      // ⚠ …and only the PRIMARY slot. A form can offer several routes to the same upload (Paylocity's
+      // btn-forceResume + btn-resume), and iCIMS offers four file inputs. `primaryResumeSlot` is set
+      // BOTH ways by the resolver, so `=== false` reliably refuses a secondary slot; `undefined` only
+      // happens in a unit test of a single detached field.
       if (f.primaryResumeSlot === false) {
         return { kind: "skip", source: "generic", detail: "a second résumé upload route on this form — the primary slot already has it" };
       }
@@ -1665,10 +1663,10 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
     }
     // An UNLABELLED file input is the résumé slot only when it is the form's ONLY one. With two or
     // more and no label to tell them apart, guessing which is the résumé risks attaching it to a
-    // transcript/portfolio slot — so it goes to review instead (`soleFileInput` is computed by
-    // atsGenericPostProcess, which is the only place that sees the whole field list).
+    // transcript/attachment slot — so it goes to review instead. iCIMS is exactly this shape:
+    // Resume_File + Additional Documents + Attachment 1 + Attachment 2.
     if (f.soleFileInput) return { kind: "resume", source: "generic", detail: "the form's only file input — treated as the résumé" };
-    return { kind: "skip", source: "generic", detail: "one of several unlabelled file inputs — which one is the résumé is not decidable, so it is left for you" };
+    return { kind: "skip", source: "generic", detail: "a non-résumé attachment slot — the operator's own to add" };
   }
 
   // Buckets — the operator's own taught wordings, exact-normalized (no fuzzy; misses fall
@@ -3243,23 +3241,47 @@ function atsGenericIdDurable(id) {
   if (/^\d+$/.test(s)) return false;                                   // a bare number is a position
   if (/^(rc|mui|radix|headlessui|downshift|aria)[-_:]/i.test(s)) return false; // framework counters
   if (/^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/.test(s)) return false; // JWT
-  // ONE long unbroken run tells the two apart. Semantic ids are camelCase words with few case
-  // transitions per character (`jobPostingApplication` → 2/21); a random token has many
-  // (`QQUpFBNbEVDkaqRr` → 6/16). Separator-delimited parts are compared individually so a long
-  // semantic id is never penalised for its length alone.
+  // ONE long unbroken run tells the two apart — but NOT by counting case transitions. That was the
+  // first attempt and it is wrong: `CandProfileFields` (iCIMS, a perfectly good name) has 5
+  // transitions in 17 chars = 0.29, while the random `QQUpFBNbEVDkaqRr` has 6 in 16 = 0.375. The
+  // ratios overlap, and the live consequence was iCIMS' whole education section losing its durable
+  // ids and falling back to `label:School#0` (2026-08-12).
+  //
+  // The real difference is SHAPE. A camelCase identifier splits into whole words
+  // (Cand|Profile|Fields); a random token splits into debris (Q|Q|Up|F|B|Nb|E|V|Dkaqr). So split on
+  // case boundaries and look at how many fragments are a single character.
   const parts = s.split(/[^A-Za-z0-9]+/).filter(Boolean);
   for (const p of parts) {
     if (p.length >= 12 && /^[0-9a-f]+$/i.test(p) && /\d/.test(p)) return false; // hex hash
     if (p.length < 12) continue;
-    let trans = 0;
-    for (let i = 1; i < p.length; i++) {
-      const a = p[i - 1], b = p[i];
-      if (/[a-z]/.test(a) && /[A-Z]/.test(b)) trans++;
-      else if (/[A-Z]/.test(a) && /[a-z]/.test(b)) trans++;
-    }
-    if (trans / p.length > 0.25) return false;
+    const frags = p.split(/(?=[A-Z])/).filter(Boolean);
+    if (frags.length < 2) continue;                      // one long lowercase run — not camel debris
+    const singles = frags.filter((x) => x.length === 1).length;
+    if (singles / frags.length > 0.3) return false;
   }
   return true;
+}
+
+// ── Is this file input the RÉSUMÉ slot? ONE predicate, two callers (PURE) ────────────────
+// ⚠ This exists because two different predicates disagreed and the résumé was uploaded THREE times
+// on a live iCIMS run (2026-08-12): into the real résumé field AND into "Attachment 1" and
+// "Attachment 2". Two compounding mistakes —
+//   1. the router's regex included a bare `attach`, intended for "Attach resume", which matches
+//      "Attachment 1"; and
+//   2. `primaryResumeSlot` was computed from a NARROWER regex, so those two slots were never marked
+//      and the router's `=== false` refusal never fired.
+// Sending an employer three copies of a résumé is a real defect, so résumé-ness now has exactly one
+// definition and both callers use it.
+//
+// `attach` is only accepted when it is attaching a RÉSUMÉ/CV — never on its own.
+const ATS_RESUME_RX = /r[eé]sum[eé]|\bcv\b|curriculum vitae/i;
+const ATS_NOT_RESUME_RX = /cover\s*letter|transcript|portfolio|writing sample|certificat|reference|attachment\s*\d|additional document/i;
+function atsGenericIsResumeSlot(f) {
+  if (!f || f.widgetType !== "file_upload") return false;
+  const label = String((f && f.label) || "");
+  const name = String((f && f.fieldName) || "");
+  if (ATS_NOT_RESUME_RX.test(label) || ATS_NOT_RESUME_RX.test(name)) return false;
+  return ATS_RESUME_RX.test(label) || ATS_RESUME_RX.test(name);
 }
 
 // ── Required-ness, and the label it is hidden inside (PURE) ─────────────────────────────
@@ -3408,6 +3430,36 @@ function atsGenericPostProcess(raw) {
       labelLowConfidence: !!f.labelShared,
     });
   }
+  // ── DEDUPE A WIDGET SHIM ────────────────────────────────────────────────────────────────
+  // iCIMS renders every dropdown as a real <select id="X"> PLUS a companion
+  // <a id="X_icimsDropdown" role=combobox> that is the visible widget. Both match the control
+  // selector, so each dropdown was scanned TWICE (live 2026-08-12: `rcf3077` and
+  // `rcf3077_icimsDropdown` as separate fields) — doubling the review rows, the option captures and,
+  // for a required one, the AI questions.
+  //
+  // Generic rule, no vendor knowledge: when one field's id is another's id plus a suffix AND the two
+  // resolve to the SAME label, they are one control. Keep the SHORTER id — that is the element that
+  // actually posts a value; the longer one is the shim. Requiring identical labels is what keeps a
+  // genuine pair like `phone` / `phone_ext` (different labels) from being collapsed.
+  const byId = new Map();
+  for (const f of out.fields) if (f.identityFrom === "attr") byId.set(f.fieldName, f);
+  const shimmed = new Set();
+  for (const f of out.fields) {
+    if (f.identityFrom !== "attr") continue;
+    for (const [otherId, other] of byId) {
+      if (otherId === f.fieldName) continue;
+      if (f.fieldName.length <= otherId.length) continue;
+      if (!f.fieldName.startsWith(otherId)) continue;
+      if (!/^[_-][A-Za-z][A-Za-z0-9]*$/.test(f.fieldName.slice(otherId.length))) continue;
+      if (String(f.label || "").toLowerCase() !== String(other.label || "").toLowerCase()) continue;
+      shimmed.add(f.fieldName);
+    }
+  }
+  if (shimmed.size) {
+    out.diag.widgetShimsDropped = [...shimmed];
+    out.fields = out.fields.filter((f) => !shimmed.has(f.fieldName));
+  }
+
   // ⚠ A form may carry NO required signal at all (KEF Robotics: only `email`, validation in JS).
   // That is reported, never read as "nothing is required".
   out.diag.noRequiredSignalAnywhere = out.fields.length > 0 && out.fields.every((x) => !x.isRequired);
@@ -3421,12 +3473,7 @@ function atsGenericPostProcess(raw) {
   // resume"), and both match the résumé wording. Attaching to both would upload twice and can kick
   // off two server-side parses, so only the FIRST résumé-looking slot is the primary; the rest are
   // left to the operator. The recognizer in atsRouteField requires this flag.
-  const RESUME_RX = /r[eé]sum[eé]|\bcv\b/i;
-  const NON_RESUME_RX = /cover\s*letter|transcript|portfolio|writing sample|certificat|reference/i;
-  const resumeish = files.filter((f) => {
-    const l = String(f.label || f.fieldName || "");
-    return !NON_RESUME_RX.test(l) && (RESUME_RX.test(l) || RESUME_RX.test(String(f.fieldName || "")));
-  });
+  const resumeish = files.filter((f) => atsGenericIsResumeSlot(f));
   // set BOTH ways explicitly: the recognizer refuses on `=== false`, so a secondary slot must carry
   // the flag rather than merely lack it.
   resumeish.forEach((f, i) => { f.primaryResumeSlot = i === 0; });
@@ -3896,7 +3943,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsGenericIdDurable, atsGenericRequiredFromLabel, atsGenericCleanLabel,
     atsGenericPickLabel, atsGenericHeadingClaims, atsGenericPostProcess,
     atsInjScanGeneric, atsInjReadNativeOptions, atsCaptureChoiceOptions, ATS_GENERIC_LABEL_RUNGS,
-    atsInjFindFormFrame, atsPickFormFrame,
+    atsInjFindFormFrame, atsPickFormFrame, atsGenericIsResumeSlot,
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,

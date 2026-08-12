@@ -843,7 +843,23 @@ async function cdpEval(fn, ...args) {
   const expression = "(" + String(fn) + ")(" + args.map((a) => JSON.stringify(a)).join(",") + ")";
   const params = { expression, returnByValue: true, awaitPromise: true };
   if (_frameCtxId != null) params.contextId = _frameCtxId;
-  const res = await cdpSend("Runtime.evaluate", params);
+  let res;
+  try {
+    res = await cdpSend("Runtime.evaluate", params);
+  } catch (e) {
+    // ⚠ AN ISOLATED WORLD DIES WITH ITS DOCUMENT. iCIMS does partial postbacks, and mid-fill the
+    // frame re-created its context: `Cannot find context with specified id` (-32000), which surfaced
+    // as `error` records on two fields of an otherwise-good live run (2026-08-12). Re-arm ONCE and
+    // retry — a stale world is a recoverable condition, not a failed field.
+    // Only ever taken when a frame context is armed, so the top-frame path is untouched.
+    const msg = String((e && e.message) || e);
+    if (_frameCtxId == null || !/Cannot find context with specified id/i.test(msg)) throw e;
+    const again = await cdpUseFormFrame(1).catch(() => ({ ok: false }));
+    if (!again.ok) { _frameCtxId = null; throw e; }
+    console.log("[ApplyPilot][CDP] the frame's isolated world was replaced (a postback) — re-armed and retrying");
+    const retry = { expression, returnByValue: true, awaitPromise: true, contextId: _frameCtxId };
+    res = await cdpSend("Runtime.evaluate", retry);
+  }
   if (res && res.exceptionDetails) {
     const d = res.exceptionDetails;
     throw new Error("cdpEval: " + ((d.exception && d.exception.description) || d.text || "page exception"));

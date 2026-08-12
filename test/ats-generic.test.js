@@ -27,6 +27,15 @@ test("generic identity: real durable ids pass, real per-render ids are rejected"
   // Wix build ids survive a session (they change only on republish) — accepted, and a change just
   // fails to re-find the field, which is an honest needs_review rather than a wrong fill.
   assert.ok(d("collection_comp-lpjwscz6"));
+  // ⚠ iCIMS — these regressed once. A case-TRANSITION ratio rejected `CandProfileFields` (5/17=0.29)
+  // as random while accepting `QQUpFBNbEVDkaqRr` (6/16=0.375), and the live consequence was the whole
+  // education section losing its ids and keying on `label:School#0`. The shape test (camel fragments
+  // vs single-char debris) is what separates them.
+  assert.ok(d("-1_CandProfileFields.School"));
+  assert.ok(d("-1_CandProfileFields.EducationStartDate_Month"));
+  assert.ok(d("-1_PersonProfileFields.AddressStreet1"));
+  assert.ok(d("PortalProfileFields.Resume_File"));
+  assert.ok(d("PersonProfileFields.Password_Confirm"));
 
   // Workable — regenerated on EVERY render, so it can never key a replay
   assert.ok(!d("input_files_input_QQUpFBNbEVDkaqRr"));
@@ -745,6 +754,81 @@ test("INTEGRATION (generic): the AI is never asked when nothing is required and 
   // OPTIONAL, and the operator rule is that an optional unmapped field fills deterministically or
   // stays BLANK — it must never buy an LLM call.
   assert.strictEqual(llmCalls, 0, "no optional field may spend an AI request");
+});
+
+// ── ⚠ the RÉSUMÉ was attached THREE times on a live iCIMS run — one predicate, two callers ──
+test("LIVE iCIMS: exactly ONE of four file inputs receives the résumé", () => {
+  // Live 2026-08-12 the résumé went into the real slot AND "Attachment 1" AND "Attachment 2", because
+  // the router's regex contained a bare `attach` (matching "Attachment 1") while primaryResumeSlot was
+  // computed from a narrower one, so the refusal never fired. Three copies to an employer.
+  const s = ats.atsGenericPostProcess({
+    fields: [
+      { attrId: "PortalProfileFields.Resume_File", inputSel: "#r", widgetType: "file_upload", domIndex: 0,
+        labelCandidates: { labelFor: "Please upload your resume (max size: 5 MB)" }, reqAttr: true },
+      { attrId: "rcf2000_File", inputSel: "#a0", widgetType: "file_upload", domIndex: 1,
+        labelCandidates: { labelFor: "Additional Documents" } },
+      { attrId: "rcf2100_File", inputSel: "#a1", widgetType: "file_upload", domIndex: 2,
+        labelCandidates: { labelFor: "Attachment 1" } },
+      { attrId: "rcf2101_File", inputSel: "#a2", widgetType: "file_upload", domIndex: 3,
+        labelCandidates: { labelFor: "Attachment 2" } },
+    ],
+  });
+  assert.strictEqual(s.diag.fileInputs, 4);
+  assert.strictEqual(s.diag.resumeSlots, 1, "only the real résumé field may count as a résumé slot");
+  const kinds = s.fields.map((f) => ats.atsRouteField("generic", f, {}, {}, {}, null).kind);
+  assert.deepStrictEqual(kinds, ["resume", "skip", "skip", "skip"]);
+});
+
+test("résumé predicate: 'attach' alone is not enough, and attachment/document slots are refused", () => {
+  const mk = (label, name) => ({ widgetType: "file_upload", label, fieldName: name || "f" });
+  assert.ok(ats.atsGenericIsResumeSlot(mk("Attach Resume")));
+  assert.ok(ats.atsGenericIsResumeSlot(mk("Upload Resume")));
+  assert.ok(ats.atsGenericIsResumeSlot(mk("Resume/CV")));
+  assert.ok(ats.atsGenericIsResumeSlot(mk("Curriculum Vitae")));
+  assert.ok(ats.atsGenericIsResumeSlot(mk("", "cResume")));
+  // the live false positives
+  assert.ok(!ats.atsGenericIsResumeSlot(mk("Attachment 1")));
+  assert.ok(!ats.atsGenericIsResumeSlot(mk("Attachment 2")));
+  assert.ok(!ats.atsGenericIsResumeSlot(mk("Additional Documents")));
+  // and the neighbours it must keep refusing
+  for (const l of ["Cover Letter", "Transcript", "Portfolio", "Writing sample", "References"]) {
+    assert.ok(!ats.atsGenericIsResumeSlot(mk(l)), l);
+  }
+  // a non-file widget is never a résumé slot however it is labelled
+  assert.ok(!ats.atsGenericIsResumeSlot({ widgetType: "text", label: "Resume" }));
+});
+
+test("LIVE iCIMS: a widget SHIM sharing a label is collapsed into the real control", () => {
+  // iCIMS pairs <select id="rcf3077"> with <a id="rcf3077_icimsDropdown" role=combobox>; both matched
+  // the control selector, so each dropdown was scanned twice live — doubling review rows, option
+  // captures and (for a required one) AI questions.
+  const s = ats.atsGenericPostProcess({
+    fields: [
+      { attrId: "rcf3077", inputSel: "#rcf3077", widgetType: "dropdown_native", domIndex: 0, options: ["A", "B"],
+        labelCandidates: { labelFor: "Time Zone" } },
+      { attrId: "rcf3077_icimsDropdown", inputSel: "#rcf3077_icimsDropdown", widgetType: "select", domIndex: 1,
+        labelCandidates: { labelFor: "Time Zone" } },
+      { attrId: "-1_CandProfileFields.School", inputSel: "#s", widgetType: "dropdown_native", domIndex: 2,
+        labelCandidates: { labelFor: "School" } },
+      { attrId: "-1_CandProfileFields.School_icimsDropdown", inputSel: "#s2", widgetType: "select", domIndex: 3,
+        labelCandidates: { labelFor: "School" } },
+    ],
+  });
+  assert.deepStrictEqual(s.fields.map((f) => f.fieldName), ["rcf3077", "-1_CandProfileFields.School"]);
+  assert.strictEqual(s.diag.widgetShimsDropped.length, 2);
+  // the survivor is the one that posts a value, and it keeps its options
+  assert.deepStrictEqual(s.fields[0].options, ["A", "B"]);
+});
+
+test("⚠ shim dedupe: a genuine pair with DIFFERENT labels is never collapsed", () => {
+  const s = ats.atsGenericPostProcess({
+    fields: [
+      { attrId: "phone", inputSel: "#p", widgetType: "text", domIndex: 0, labelCandidates: { labelFor: "Phone" } },
+      { attrId: "phone_ext", inputSel: "#pe", widgetType: "text", domIndex: 1, labelCandidates: { labelFor: "Extension" } },
+    ],
+  });
+  assert.strictEqual(s.fields.length, 2, "different labels ⇒ two real fields");
+  assert.ok(!s.diag.widgetShimsDropped);
 });
 
 // ── the form inside a SAME-ORIGIN IFRAME (iCIMS) ────────────────────────────────────────
