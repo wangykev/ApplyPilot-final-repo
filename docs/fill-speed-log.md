@@ -1098,18 +1098,50 @@ short-circuited via `optionsUnreadable`: a transient empty read would then perma
 REQUIRED field, and a second chance is the safer direction on a widget that is going to review either
 way.
 
-### ⚠ STATUS: unit-verified, NOT yet live-measured
+### ★ LIVE VERIFIED (build `deferred-ai-1`, hidden, cloudflare fixture)
 
 `npm test` 1385/1385 · web 273/273 · `tsc` clean, with the discard / cache-key / close behaviours each
-mutation-checked. **No live run yet** — the extension is loaded from a different working copy, so a
-live A/B needs it re-pointed first (build marker `deferred-ai-1`).
+mutation-checked. Then two hidden runs on `job-boards.greenhouse.io/cloudflare/jobs/7902104`:
 
-**What a live run must show, and the trap in reading it:** the `[ATS-FILL] AI batch:` line naming N
-deferred questions, then exactly ONE `[LLM]` line for them. ⚠ **Do not grade this on wall-clock.**
-Round 9 left the per-call cost at ~0.5s when AUTO picks a healthy model, so collapsing 7 calls into 1
-is worth only a few seconds of a ~20s fill — and `candidate-location` alone varies by 13s across runs
-of one posting, which swamps it. **The measurable claim is the REQUEST COUNT (7 → 1), not the clock**,
-and the request count is what the 15/min quota actually bills.
+```
+[ATS-FILL] question_66595614 (dropdown, req) → deferred_ai · 25ms · deferred to this page's one AI call
+      … ×7 (20–29ms each — these are NATIVE selects, so the defer costs only the record)
+[ATS-FILL] AI batch: 7 deferred question(s) in ONE call (7 choice, 0 text · cap 3312 tokens)
+[LLM] gemini gemini-3.5-flash-lite (auto) thinking:off for "fill" (2 keys) [attempt 1/2]
+[LLM] ok in 2257ms (2257ms total across 1 attempt(s))            ← the ONLY [LLM] line of the run
+[ATS-FILL] question_66595614 … → filled_review · ai-choice · after "Yes" · 84ms · from the batched call
+      … ×7 (61–84ms each)
+[ATS-FILL] AI pass done: 7 deferred · 7 served by the batch · 0 made their own call (batch asked 7, answered 7)
+```
+
+**7 calls → 1. Zero fell back.** All 7 committed a real read-back value and every one is
+`filled_review · ai-choice` — the always-flagged rule held. Field counts are identical to the
+pre-change baseline on both runs: **15 `filled` · 8 `filled_review` · 2 `skipped` = 25 fields.**
+
+**And the clock says exactly what round 9 predicted it would.** `[ATS-TIME] fill 33.8s for 25 field(s)
+… slowest: candidate-location 17.1s, resume 6.5s` — the LLM was **2.3s of 33.8s (6.7%)**, so
+`candidate-location` ALONE cost 7× the entire AI spend. Collapsing 7 calls into 1 is invisible in the
+wall clock and always was going to be. **The claim this change makes is the REQUEST COUNT, which is
+what the 15/min per-key quota bills** — grading it on fill time measures `candidate-location`'s 7.1–20.3s
+spread instead.
+
+⚠ **ONE PATH IS NOT LIVE-COVERED: the react-select combobox defer.** Every deferred question on this
+fixture was a **native `<select>`** whose options come from the scan — the tell is the 20–29ms defer
+cost, far too fast for an open+poll+close, and `menu still open` never appeared. So the extra
+open→read→**close**→(batch)→re-open→commit dance is unit-tested and mutation-checked but has **not**
+run against a real react-select yet. A fixture whose `question_*` fields are comboboxes AND unanswered
+by the profile would close that gap.
+
+### The measurement trap this round nearly walked into
+
+The FIRST run produced `ok:true`, 25 fields, correct counts — and **an empty log**. The MV3 worker was
+torn down after the run and the log ring went with it, so the evidence for the only claim being made
+(the call count) did not exist. Waiting ~85s before reading is enough to lose it.
+
+**Fix, and worth reusing:** poll `AP_DEV_LOGS` from the localhost tab on a `setInterval` and accumulate
+into a page-side Map keyed by `t|msg`, then read the Map afterwards. The lines then survive a worker
+restart. This composes with the existing rule that `since` is only a LOWER BOUND — accumulate DURING the
+run, filter by cursor after.
 
 ---
 
