@@ -4406,3 +4406,56 @@ exclusions, 0.2ms. Identity mixes human ids (`first-name`, `email`) with **Wix b
 carries any required signal**, element and unit agreeing on `false` for everything else including the
 plainly-required citizenship question: on custom forms required-ness can be **JS-only and entirely absent
 from the DOM**, and under-flagging is the dangerous direction.
+
+## 2026-08-12 — Astrion iCIMS: the RÉSUMÉ PARSE POSTBACK re-renders the panel mid-fill
+
+Measured on `astrioncareers-astrion.icims.com/jobs/24615/...candidate`, the form reached through the
+apply gate. This is the answer to "the address block is empty even though the log says filled".
+
+**Layout.** One frame holds the whole form: `top/icims_content_iframe` — 93 controls, 72 visible. The
+top document has ZERO controls, and two further nested iframes are cross-origin and hold nothing we
+need. A frame-scoped eval is mandatory here; a top-frame eval sees no form at all.
+
+**A freshly-loaded page has exactly ONE entry prefix: `-1_`.** Every repeating block renders one blank
+entry plus an "Add More" control:
+
+| Add More button id | section |
+|---|---|
+| `PersonProfileFields.AddressesButton_-1` | Addresses |
+| `PersonProfileFields.PhonesButton_-1` | Phones |
+| `CandProfileFields.EducationButton_-1` | Education |
+| `rcf2061Button_-1` | Professional Certifications |
+| `rcf3211Button_-1` | Professional Experience |
+
+So `-1_PersonProfileFields.AddressStreet1` **is the visible entry**, not a hidden template — an earlier
+theory the DOM refutes outright.
+
+**⚠ THE PARSE POSTBACK.** Server-assigned ids (`-6489344_`, `-6489345_`) appear in a run log but exist
+on NO freshly-loaded page. They are created DURING the run: iCIMS parses the attached résumé
+server-side and posts the result back into the same panel, re-creating the repeating entries under
+real ids. The postback lands **seconds after the attach reports success**, so it re-renders the panel
+mid-fill and blanks everything written up to that point. Three symptoms of one event:
+
+- the address logged `filled` with a verified read-back, and the operator saw an empty "Addresses (1)"
+- `CandProfileFields.Degree` read back the literal `"Loading..."`
+- the post-fill audit disagreed on precisely the education fields
+
+Ruled out by measurement, not reasoning: the **actuation** (writing those same three address inputs by
+hand — native setter + input/change — persists indefinitely), the **frame** (only one has controls),
+and a **hidden template row** (refuted above). Fix: attach the résumé first, poll the field set until
+two consecutive scans agree, then fill against the settled page.
+
+**Section headings, by the scanner’s own `h1–h6` rule** — this is what scopes a repeating entry, and it
+does not say what you would guess:
+
+| fields | nearest `h1–h6` |
+|---|---|
+| `-1_PersonProfileFields.Address*` | **`Enter your information`** |
+| `-1_PersonProfileFields.rcf3212…rcf3218`, `rcf3264`, `rcf3265` | `Experience` |
+| `-1_CandProfileFields.Education*` | `Education` |
+
+⚠ **`Addresses (1)* required.` is a `<legend>`, not a heading**, so the home-address block reads as
+`Enter your information`. The home address is therefore recognised by its **NAME**; the heading rung's
+only job is to push the OTHER blocks away. `rcf32xx` under `Experience` is the employer address —
+filling it from `personal_info` is wrong (operator, 2026-08-12) — and a Professional Certifications
+entry's City/State is the issuing body's.
