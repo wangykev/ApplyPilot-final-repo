@@ -305,12 +305,34 @@ object, silently destroying `keys`/`routes`/`fallbacks`. `AP_SET_LLM` also recor
 `webOrigin`, so the popup can link to the AI page without the extension hardcoding a site URL.
 
 ```
-{ provider, model, apiKey, enabled,             // v1 fields — still present, see below
+{ provider, model, apiKey, enabled, keyId,      // v1 fields — still present, see below
   preferFreeFirst: bool,                        // spend free-tier keys before paid ones
   keys:      { [provider]: [{ id, label, key, tier: "free"|"paid", enabled }] },
-  fallbacks: [{ provider, model }],             // default chain
-  routes:    { [action]: { provider, model, fallbacks: [{provider,model}] } } }
+  fallbacks: [{ provider, model, keyId }],      // default chain
+  routes:    { [action]: { provider, model, keyId, fallbacks: [{provider,model,keyId}] } } }
 ```
+
+**`keyId` — PIN A SLOT TO ONE KEY (2026-08-11).** `""` = today's behaviour (any key for the provider, in
+rotation order). *Why it exists:* rotation only advances when a key **FAILS**, so N equal-tier keys send
+every call through the FIRST one (measured: 6/6 calls on key 1, key 2 never touched) — and free-tier Gemini
+meters **15 requests/minute PER KEY**, so an account with two keys breaches a 15/min limit while holding
+30/min. Pinning the primary slot to key A and its fallback to key B spends both. The pin is **STRICT** for
+the slot (the isolated budget is the whole point, so it must not spill onto the other key); resilience comes
+from the NEXT slot carrying its own `keyId`. An id matching no stored key is **IGNORED, never obeyed** — a
+deleted key degrades to rotation instead of silently disabling the slot. It is part of a slot's dedupe
+identity in `resolveLlmRoute`, without which "same model, two keys" collapses to one attempt.
+
+**`model: "auto"` — LET THE EXTENSION PICK (2026-08-11).** Offered per provider in `LLM_AUTO_CANDIDATES`
+(gemini: `3.5-flash-lite` then `3.1-flash-lite`). Resolved **in the extension**, per call, because only the
+extension holds the latency measurements. **Ordered preference with failover, not a latency race:** the
+first candidate always wins unless evidenced unhealthy — a **5xx sidelines** it for 2min, or a sibling
+answering **≥3× quicker** demotes it. *Why:* the two siblings measured **11499/7620/10903ms vs
+409/682/395ms on the same key in the same minute** — a 20× gap that is pure server-side model health, and
+which sibling is degraded changes, so the right model is an observation rather than a setting. A 429 must
+never demote a model (that is the KEY's quota); only 5xx counts. Recovery is automatic and needs no timer:
+AUTO judges a model only on samples from the last 15min, so a demoted primary ages back to "unmeasured",
+returns to the front, and the next real fill call is the probe. Full detail: `docs/fill-speed-log.md`
+round 9.
 
 `action` ∈ `fill` | `essay` | `resume_parse` | `cover_letter` (`LLM_ACTIONS`, `llm-keys.js`); an unset action
 follows the default pair. **`fill` vs `essay` is the distinction that matters to an operator** — dozens of short

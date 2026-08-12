@@ -832,6 +832,114 @@ a board that does not redirect off-host; `databricks`, `duolingo`, `asana` and `
 
 ---
 
+## 2026-08-11 — round 9: WHY the call took 10s — it was the MODEL, and three fixes landed
+
+Round 8 proved the LLM was 76–91% of an ATS fill and that visibility had nothing to do with it. It did not
+answer the operator's actual question: *"why did a 3.1-flash-lite call take 10 seconds? on Workday it is
+usually half a second."*
+
+### ★ THE ANSWER: one sibling model was degraded server-side. Measured, not inferred.
+
+The decisive test is an A/B **on the same key, in the same minute, alternating** — so key, network, tab,
+prompt, token count and our own code are all held fixed and only the model varies:
+
+| call | model | latency |
+|---|---|---|
+| 1 | `gemini-3.1-flash-lite` | **11499ms** |
+| 2 | `gemini-3.5-flash-lite` | **409ms** |
+| 3 | `gemini-3.1-flash-lite` | **7620ms** |
+| 4 | `gemini-3.5-flash-lite` | **682ms** |
+| 5 | `gemini-3.1-flash-lite` | **10903ms** |
+| 6 | `gemini-3.5-flash-lite` | **395ms** |
+
+**A 20× gap between two same-price, same-quota siblings on one free key.** `gemini-3.1-flash-lite` was
+also returning **HTTP 503** ("overloaded", once after 10166ms). So:
+
+- **NOT rate limiting.** Both models shared the key and 3.5 was instant throughout.
+- **NOT the free tier, the network, our code, the tab, or ATS-vs-Workday.** Round 8's idle no-tab arm had
+  already removed those, and a tiny 16-token prompt was just as slow.
+- **NOT "the provider" as a whole** — which is where round 8's own standing rule stops being precise
+  enough. *A slow page is the LLM* was right; the LLM is not one thing. **Latency belongs to a
+  provider+MODEL, and siblings diverge by 20× for hours.**
+- The "on Workday it's 0.5s" memory is a **different day**, not a different pipeline: the 486/646/796ms
+  figures are from 2026-08-09 when 3.1 was healthy.
+
+⚠ **The operator's AI page had 3.1 as PRIMARY with 3.5 as fallback** — the reverse of
+`GEMINI_STARTER_CHAIN`. So every call paid the degraded model first and only reached the fast one when the
+slow one outright failed.
+
+### Also measured: only ONE of two keys was ever used
+
+Both keys are free tier, and rotation **only advances when a key FAILS** — so `orderLlmKeys` put the same
+key first every time. Across 6 consecutive calls, key 1 served all 6 and **key 2 was never touched.** The
+operator independently hit the consequence: *"sometimes I call AI 16 times per minute, the limit is 15."*
+Free-tier Gemini meters **15 requests/minute PER KEY**, so the account held 30/min of headroom and was
+breaching a 15/min limit inside half of it.
+
+### The three fixes
+
+**1. ADAPTIVE fast-retry cap (`llm.js`).** Round 8 measured 76/77 calls spending both 2s fast tries
+(~4s wasted per call, ~28s per page, ~24% of the fill). The static 2000ms was tuned for a ~650ms p50 and
+misfires the moment that changes. The cap now follows the observed p50 of recent answers, and **switches
+OFF entirely when no short cap could separate "stuck" from "slow"**.
+
+The reasoning that sets it is `P(stuck | still running at the cap)`, not "is the model slow": at a 650ms
+p50 almost nothing healthy reaches 2000ms, so a trip is near-certainly a stuck socket and the abort is
+close to free; at an 11s p50 EVERY call trips it, so the abort is paid by all and rescues none. `K=3` is
+calibrated, not picked: 3 × 650ms ≈ the hand-chosen 2000ms. Cold worker ⇒ the static value, unchanged.
+
+**2. AUTO model (`llm.js` + the AI page).** Model id `"auto"` resolves per call. **Ordered preference with
+failover**, per the operator — 3.5-flash-lite is always tried first and a sibling is only reached on
+evidence: a **503/5xx sidelines** a model for 2min, or a sibling answering **≥3× quicker** demotes it.
+⚠ 429/401 deliberately do NOT demote a model — those are the KEY's problem, and demoting the operator's
+primary over a per-key quota would be plainly wrong.
+
+**Recovery is the part that needed a second pass, and the operator caught it** ("make sure it doesn't stay
+on 3.1 if 3.5 comes back"). The first cut re-probed on staleness but read the WHOLE window, so a re-probe
+dropped one fresh fast sample among four stale slow ones, the MEDIAN stayed slow, and a recovered model
+needed ~5 probes ≈ **75 minutes** to win its traffic back. Fixed by bounding reads to
+`LLM_AUTO_STALE_MS` (15min, inside the operator's "10–20 minutes" ask): **stale measurements are DISCARDED,
+not averaged with fresh ones.** A demoted primary therefore ages back to "unmeasured", returns to the front,
+and **the next real fill call IS the probe** — no timer, no calls the fill wasn't already making, nothing
+running while idle. `LLM_AUTO_MIN_SAMPLES=2` (vs the cap's 4) so re-confirmation costs ~1–2 calls.
+
+**3. PER-SLOT KEY PINNING (`keyId`, AI page → `resolveLlmRoute` → `callLLM`).** Every model slot gets a
+**Key** dropdown ("Any key (rotate)" by default). Pinning the primary to key A and its fallback to key B
+spends **two** per-minute budgets. The pin is STRICT for the slot — the isolated budget IS the feature, so
+it must not spill — and resilience comes from the next slot carrying its own key. An id matching no stored
+key is **IGNORED, never obeyed**, so deleting a key degrades to rotation rather than disabling the slot.
+`keyId` is part of a slot's dedupe IDENTITY in `resolveLlmRoute`: without that, "3.1 on key A → 3.1 on
+key B" collapses to one attempt and the second key is silently discarded.
+
+### LIVE VERIFICATION (build `auto-model-1`)
+
+```
+auto → gemini-3.5-flash-lite · 448ms · 669ms · 0 fast-retry aborts
+      (same probe on 3.1: 7620–11499ms, 2 aborts every call)
+pin  → pinKeyId=<key 2> · 544ms · 508ms · both served by KEY 2
+      (before: 6/6 calls served by key 1, key 2 never touched)
+```
+
+So the fix chain is worth **~11s → ~0.5s per AI call**, and on a 7-call ATS page that is the difference
+between a ~120s fill and a ~25s one. `npm test` 1366/1366 · web 273/273 · `tsc` clean. Every behaviour above
+is unit-pinned AND mutation-checked (reverted, confirmed the test FAILS, restored).
+
+### New instrument
+
+**`AP_DEV_LLM_PROBE` grew an A/B mode**: `{n, models:[…], pinKeyId}` calls each model **directly** and
+alternates them round-robin, and reports the resolved route + key tiers from the AI page.
+Direct is the whole point — `act.llm`'s fallback chain silently answers from the NEXT model when the first
+is slow, which makes "model X is slow" unmeasurable. It also accepts `"auto"`, so the picker can be
+verified without editing the config under test.
+
+### Do NOT redo
+
+- **Blaming "the provider" without naming the MODEL.** Siblings diverge 20×. A/B them on one key.
+- **Reading a 429 as model ill-health.** It is the key's per-minute quota; 5xx is the model's.
+- **Assuming rotation spreads load.** It advances only on FAILURE, so N equal keys still means one key.
+
+---
+
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
 
 Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now

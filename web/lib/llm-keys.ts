@@ -72,6 +72,8 @@ export type LlmRouteAttempt = {
   thinking: LlmThinking;
   /** Only meaningful when thinking === "manual"; "" otherwise. */
   effort: string;
+  /** Pinned key id for this slot, or "" to use any key for the provider (rotation order). */
+  keyId: string;
   source: "action" | "action-fallback" | "default" | "default-fallback";
 };
 
@@ -256,35 +258,42 @@ export function resolveLlmRoute(
   defaultModels: Partial<Record<string, string>>
 ): LlmRouteAttempt[] {
   const cfg = (config && typeof config === "object" ? config : {}) as {
-    routes?: Record<string, { provider?: string; model?: string; thinking?: unknown; effort?: unknown; fallbacks?: unknown }>;
+    routes?: Record<string, { provider?: string; model?: string; thinking?: unknown; effort?: unknown; keyId?: unknown; fallbacks?: unknown }>;
     fallbacks?: unknown;
     provider?: string;
     model?: string;
     thinking?: unknown;
     effort?: unknown;
+    keyId?: unknown;
   };
   const models = defaultModels || {};
   const out: LlmRouteAttempt[] = [];
 
+  // `keyId` pins a slot to ONE key (2026-08-11) and is part of a slot's IDENTITY: the same
+  // provider+model on two different keys is two USEFUL attempts, not a duplicate — that is the
+  // "3.1 on key A, then 3.1 on key B" chain the free tier's 15-requests-per-minute-PER-KEY limit
+  // calls for. Omitting keyId from the dedupe would collapse it and discard the second key.
   const push = (
     provider: string | undefined,
     model: string | undefined,
     thinking: unknown,
     effort: unknown,
-    source: LlmRouteAttempt["source"]
+    source: LlmRouteAttempt["source"],
+    keyId?: unknown
   ) => {
     if (!provider) return;
     const resolved = model || models[provider] || "";
     const think: LlmThinking = thinking === "adaptive" || thinking === "manual" ? thinking : "off";
     const eff = think === "manual" && typeof effort === "string" ? effort : "";
-    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think && a.effort === eff)) return;
-    out.push({ provider: provider as LlmProvider, model: resolved, thinking: think, effort: eff, source });
+    const kid = typeof keyId === "string" ? keyId : "";
+    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think && a.effort === eff && a.keyId === kid)) return;
+    out.push({ provider: provider as LlmProvider, model: resolved, thinking: think, effort: eff, keyId: kid, source });
   };
 
   const pushChain = (chain: unknown, source: LlmRouteAttempt["source"]) => {
     (Array.isArray(chain) ? chain : []).forEach((f) => {
-      const t = f as { provider?: string; model?: string; thinking?: unknown; effort?: unknown };
-      if (f && typeof f === "object") push(t.provider, t.model, t.thinking, t.effort, source);
+      const t = f as { provider?: string; model?: string; thinking?: unknown; effort?: unknown; keyId?: unknown };
+      if (f && typeof f === "object") push(t.provider, t.model, t.thinking, t.effort, source, t.keyId);
     });
   };
 
@@ -293,10 +302,10 @@ export function resolveLlmRoute(
   const act = action ? LLM_ACTION_ALIASES[action] ?? action : action;
   const route = act && cfg.routes && typeof cfg.routes === "object" ? cfg.routes[act] : null;
   if (route?.provider) {
-    push(route.provider, route.model, route.thinking, route.effort, "action");
+    push(route.provider, route.model, route.thinking, route.effort, "action", route.keyId);
     pushChain(route.fallbacks, "action-fallback");
   }
-  push(cfg.provider, cfg.model, cfg.thinking, cfg.effort, "default");
+  push(cfg.provider, cfg.model, cfg.thinking, cfg.effort, "default", cfg.keyId);
   pushChain(cfg.fallbacks, "default-fallback");
   return out;
 }
