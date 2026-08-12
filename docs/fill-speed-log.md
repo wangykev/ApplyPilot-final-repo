@@ -1105,7 +1105,7 @@ mutation-checked. Then two hidden runs on `job-boards.greenhouse.io/cloudflare/j
 
 ```
 [ATS-FILL] question_66595614 (dropdown, req) → deferred_ai · 25ms · deferred to this page's one AI call
-      … ×7 (20–29ms each — these are NATIVE selects, so the defer costs only the record)
+      … ×7 (20–29ms each — four fast CDP evals: open + read + close + confirm)
 [ATS-FILL] AI batch: 7 deferred question(s) in ONE call (7 choice, 0 text · cap 3312 tokens)
 [LLM] gemini gemini-3.5-flash-lite (auto) thinking:off for "fill" (2 keys) [attempt 1/2]
 [LLM] ok in 2257ms (2257ms total across 1 attempt(s))            ← the ONLY [LLM] line of the run
@@ -1125,12 +1125,32 @@ wall clock and always was going to be. **The claim this change makes is the REQU
 what the 15/min per-key quota bills** — grading it on fill time measures `candidate-location`'s 7.1–20.3s
 spread instead.
 
-⚠ **ONE PATH IS NOT LIVE-COVERED: the react-select combobox defer.** Every deferred question on this
-fixture was a **native `<select>`** whose options come from the scan — the tell is the 20–29ms defer
-cost, far too fast for an open+poll+close, and `menu still open` never appeared. So the extra
-open→read→**close**→(batch)→re-open→commit dance is unit-tested and mutation-checked but has **not**
-run against a real react-select yet. A fixture whose `question_*` fields are comboboxes AND unanswered
-by the profile would close that gap.
+### ✔ The react-select combobox defer IS live-covered — and how a timing inference got it backwards
+
+I first read the 20–29ms defer cost as proof these were **native `<select>`s** (scan-known options ⇒ no
+DOM work), and recorded the combobox path as unverified. **That was wrong.** Inspecting the fixture's
+DOM settles it:
+
+```
+totalSelects: 0 · totalCombos: 16
+question_66595614 … 68396682  →  tag INPUT · role "combobox" · inside a .select shell   (×7)
+```
+
+**There is not one native `<select>` on the form.** All 7 deferred questions are react-select, so the
+full open→read→**close**→(batch)→re-open→commit dance ran live on every one of them. 20–29ms is what
+FOUR fast CDP evals cost, not zero: `atsInjOpenAndReadOptions` + `atsInjReadOptions` +
+`atsInjCloseCombo` + the confirming `atsInjReadOptions`, at the ~1ms/command p50 this log already
+records. A native select would have been ~5ms (scroll-into-view only).
+
+Two independent confirmations in the same run:
+- **`menu still open` never appeared** — `atsCloseComboConfirmed` succeeded on its FIRST attempt for
+  all 7, i.e. blur + outside-mousedown really does unmount a react-select menu.
+- **All 7 committed real read-back values.** `atsInjCommitOption` returns `no-open-listbox` when the
+  menu is not mounted, so the commit pass demonstrably re-opened each widget (61–84ms each).
+
+⚠ **The lesson, which is the reusable part: a duration is not a code path.** Both "no evals" and "four
+1ms evals" fit ~25ms, and I picked the wrong one and wrote it into the log as a coverage gap. When the
+question is *which branch ran*, read the DOM or add a log line — do not infer it from a timing.
 
 ### The measurement trap this round nearly walked into
 
