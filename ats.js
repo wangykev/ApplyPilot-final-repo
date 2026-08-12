@@ -1856,6 +1856,15 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
   if (parsed.size < items.length) {
     try { console.log(`[ApplyPilot][ATS-FILL] AI batch answered ${parsed.size}/${items.length} — the rest fall back to their own call`); } catch (e) { /* log only */ }
   }
+  // A call that SUCCEEDS and yields NOTHING is the one failure this design cannot diagnose from the
+  // outside — `ok in 1364ms` next to `answered 0/6` looks identical whether the model refused, was
+  // truncated mid-JSON, or answered with ids we never asked about. Live on Shield AI (Lever,
+  // 2026-08-12). So dump the head of the reply, but ONLY in that case: a partial parse is already
+  // self-explaining, and the reply carries profile-derived answers, so this stays short and rare.
+  if (!parsed.size) {
+    const t = String((res && res.text) || "");
+    try { console.log(`[ApplyPilot][ATS-FILL] AI batch parsed NOTHING from a successful call — reply was ${t.length} char(s): ${JSON.stringify(t.slice(0, 220))}`); } catch (e) { /* log only */ }
+  }
   return { fired: true, items: items.length, answers: parsed.size, cached, dup, noOptions, capped };
 }
 
