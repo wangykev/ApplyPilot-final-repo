@@ -940,15 +940,38 @@ test("education: entry ordinal 1 reaches the SECOND entry, so a repeating sectio
 test("education: one stored date serves iCIMS' three separate controls", () => {
   const v = (label) => { const r = ats.atsGenericEducationValue(EDU_PROFILE, label, 0); return r && r.value; };
   assert.strictEqual(v("Graduation Date Year"), "2028");
-  assert.strictEqual(v("Graduation Date Month"), "5");
+  assert.deepStrictEqual(v("Graduation Date Month"), ["May", "05", "5", "May"]); // tiered — see below
   assert.strictEqual(v("Start Date Year"), "2024");
   // the part extractor itself
-  assert.strictEqual(ats.atsGenericDatePart("2028-05-15", "Graduation Date Day"), "15");
   assert.strictEqual(ats.atsGenericDatePart("05/15/2028", "End Date Year"), "2028");
   assert.strictEqual(ats.atsGenericDatePart("2026", "Start Date Year"), "2026");
   // a bare year cannot answer a MONTH box — better blank than wrong
   assert.strictEqual(ats.atsGenericDatePart("2026", "Start Date Month"), null);
   assert.strictEqual(ats.atsGenericDatePart("", "Year"), null);
+});
+
+test("⚠ dates: a MONTH control is offered a TIERED vocabulary, because forms disagree on it", () => {
+  // Live on iCIMS a bare "5" reached a 12-option month dropdown and was refused
+  // (`stated-value-unmatched`) — that form lists month NAMES. We do not know which vocabulary a form
+  // uses until its options are read, so all three go to the match ladder in order.
+  const m = ats.atsGenericDatePart("2028-05", "Graduation Date Month");
+  assert.ok(Array.isArray(m), "a month must be a tiered candidate list");
+  assert.deepStrictEqual(m, ["May", "05", "5", "May"]);
+  assert.deepStrictEqual(ats.atsGenericDatePart("2028-12", "Month"), ["December", "12", "12", "Dec"]);
+  // out-of-range or missing ⇒ blank, never a guess
+  assert.strictEqual(ats.atsGenericDatePart("2028", "Month"), null);
+});
+
+test("⚠ dates: a DAY control gets a day or NOTHING — never a year, never a whole date", () => {
+  // Two live bugs, both refused by the ladder but wrong to have offered at all: iCIMS names its day
+  // field `..._Date`, so a missing day fell through to the whole-date branch and offered "05/1/2028",
+  // and `EducationStartDate_Date` was offered the bare year "2024".
+  assert.strictEqual(ats.atsGenericDatePart("2028-05", "Graduation Date Date"), null, "no day stored ⇒ blank");
+  assert.strictEqual(ats.atsGenericDatePart("2024", "Start Date Date"), null, "a year must never reach a day box");
+  assert.strictEqual(ats.atsGenericDatePart("2024", "Start Date Day"), null);
+  // …and a real day IS offered, zero-padded as a fallback
+  assert.deepStrictEqual(ats.atsGenericDatePart("2028-05-15", "Graduation Date Day"), ["15", "15"]);
+  assert.deepStrictEqual(ats.atsGenericDatePart("05/09/2028", "End Date Date"), ["9", "09"]);
 });
 
 test("education: 'Did You Graduate?' is derived, and currently-enrolled means NO", () => {

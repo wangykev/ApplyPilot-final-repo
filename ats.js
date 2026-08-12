@@ -3338,6 +3338,8 @@ function atsGenericEducationOrder(list) {
 
 // A stored date → the piece a given control wants. iCIMS splits one date across _Month/_Date/_Year,
 // and the scanner surfaces those as separate fields labelled e.g. "Graduation Date Month".
+const ATS_MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
 function atsGenericDatePart(raw, label) {
   const s = String(raw == null ? "" : raw).trim();
   if (!s) return null;
@@ -3349,10 +3351,28 @@ function atsGenericDatePart(raw, label) {
   if (iso) { y = iso[1]; m = iso[2]; d = iso[3] || null; }
   else if (us) { m = us[1]; d = us[2]; y = us[3]; }
   else if (yOnly) { y = yOnly[1]; }
-  else return /year/.test(l) ? null : s;            // an unparseable date only answers a whole-date box
+  else return /year|month|\bday\b/.test(l) ? null : s; // an unparseable date only answers a whole-date box
   if (/year/.test(l)) return y;
-  if (/month/.test(l)) return m ? String(Number(m)) : null;
-  if (/\bday\b|\bdate\b$/.test(l) && d) return String(Number(d));
+  if (/month/.test(l)) {
+    // ⚠ TIERED, because a month control can want any of three vocabularies and we do not know which
+    // until the options are read. Live on iCIMS a bare "5" reached a 12-option month dropdown and was
+    // rightly refused (`stated-value-unmatched`) — the form lists names. The match ladder tries these
+    // in order against the LIVE options, so whichever the form uses wins and no guess is involved.
+    if (!m) return null;
+    const n = Number(m);
+    if (!(n >= 1 && n <= 12)) return null;
+    return [ATS_MONTH_NAMES[n - 1], String(n).padStart(2, "0"), String(n), ATS_MONTH_NAMES[n - 1].slice(0, 3)];
+  }
+  // ⚠ A DAY control gets a day or NOTHING. iCIMS names its day field `..._Date`, so a `\bdate\b$`
+  // match plus a missing day used to fall through to the whole-date branch and offer "05/1/2028" —
+  // and `EducationStartDate_Date` was offered the bare year "2024". Both were refused by the ladder,
+  // but offering a year to a day box is a bug, not a near miss: blank is the correct answer when the
+  // profile stores no day.
+  if (/\bday\b|\bdate\b$/.test(l)) {
+    if (!d) return null;
+    const dn = Number(d);
+    return (dn >= 1 && dn <= 31) ? [String(dn), String(dn).padStart(2, "0")] : null;
+  }
   return y ? (m ? [m, d || "1", y].join("/") : y) : null;
 }
 
