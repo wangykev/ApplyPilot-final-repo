@@ -1,8 +1,9 @@
 import { PageHeader } from "@/components/app/PageHeader";
 import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, DEV_PREVIEW } from "@/lib/env";
-import { QueuePanel } from "./QueuePanel";
+import { QueueTabs } from "./QueueTabs";
 import type { QueueItem } from "./shared";
+import type { Application } from "../tracker/shared";
 
 export const dynamic = "force-dynamic";
 
@@ -32,16 +33,51 @@ async function loadQueue(): Promise<QueueItem[]> {
   }
 }
 
+/**
+ * THE SUBMIT QUEUE — filled and approved, not yet sent. Derived from `applications`, never its own
+ * table: that state already exists as `approved_at` set while the status is still `needs_review`, and
+ * a second copy of it could only ever disagree with the first.
+ *
+ * ⚠ `approved_at` is selected OPTIONALLY, exactly as the tracker list does it: on a database that has
+ * not run migration 0018 the column does not exist, and naming it fails the WHOLE query. There the
+ * submit queue is simply empty — approval is unknowable, so claiming anything is ready would be a
+ * guess — while the fill queue beside it keeps working.
+ */
+async function loadReadyToSubmit(): Promise<Application[]> {
+  if (!isSupabaseConfigured()) return [];
+  try {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) return [];
+    const { data, error } = await supabase
+      .from("applications")
+      .select("id, company, role, url, status, needs_review_count, applied_at, created_at, approved_at")
+      .eq("user_id", user.id)
+      .is("deleted_at", null)
+      .eq("status", "needs_review")
+      .not("approved_at", "is", null)
+      // OLDEST APPROVAL FIRST: the queue's order is the order you decided these were ready, which is
+      // the order you want to work through them — not when they happened to be filled.
+      .order("approved_at", { ascending: true });
+    if (error) return [];
+    return ((data ?? []) as unknown as Application[]);
+  } catch {
+    return [];
+  }
+}
+
 export default async function QueuePage() {
-  const items = await loadQueue();
+  const [items, ready] = await Promise.all([loadQueue(), loadReadyToSubmit()]);
   return (
     <div className="space-y-8">
       <PageHeader
         eyebrow="Apply in batches"
         title="Job queue"
-        description="Line up Workday applications and let the extension work through them, one fill → review at a time. Paste links here, or let Discover on the Run page fill this from LinkedIn, Handshake and the Simplify board."
+        description="Two stages of the same pipeline: jobs lined up to be FILLED, and applications you've approved that are waiting to be SENT. Paste links below, or let Discover on the Run page fill this from LinkedIn, Handshake and the Simplify board."
       />
-      <QueuePanel items={items} />
+      <QueueTabs items={items} ready={ready} />
     </div>
   );
 }

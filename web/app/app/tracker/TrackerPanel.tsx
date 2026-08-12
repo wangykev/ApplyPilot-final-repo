@@ -248,13 +248,25 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
         ) : (
           <ul className="space-y-2">
             {shown.map((a) => (
+              // A SENT application is the one row you want to find at a glance, so it gets a green
+              // box rather than only a 8px status dot. Approved-but-not-sent stays neutral — its
+              // status control already says so, and tinting both would collapse the distinction
+              // between "ready to go" and "gone".
               <li
                 key={a.id}
-                className="flex flex-wrap items-center gap-3 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-3"
+                className={clsx(
+                  "flex flex-wrap items-center gap-3 rounded-lg border px-3 py-3",
+                  a.status === "submitted"
+                    ? "border-verified/40 bg-verified/[0.06]"
+                    : "border-hairline bg-panel-raised/40"
+                )}
               >
+                {/* The dot follows the same relabelling as the status control beside it — leaving it
+                    amber on an approved row put the two indicators for ONE state in disagreement,
+                    which is the bug this change set out to remove. */}
                 <span
                   className="h-2 w-2 shrink-0 rounded-full"
-                  style={{ background: COLOR[a.status] }}
+                  style={{ background: approvedPending(a) ? COLOR.submitted : COLOR[a.status] }}
                 />
                 <Link href={`/app/tracker/${a.id}`} className="group min-w-0 flex-1">
                   <div className="truncate text-sm text-ink transition-colors group-hover:text-amber">
