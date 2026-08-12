@@ -39,6 +39,12 @@ function showsReviewChip(status: AppStatus): boolean {
 // `approved` member would mean a migration and teaching every writer (including the extension) a new
 // value, so the row keeps `needs_review` and the UI relabels it. Only meaningful while it is still
 // awaiting review: once the status moves on, the status itself says more than this ever could.
+//
+// ⚠ RELABEL ONLY — no green (operator, 2026-08-12). Approved is NOT sent. The row is still in the
+// needs-review stage, so its dot and its status control keep the amber that says so; green is
+// reserved for an application that actually left the building. The checkmark carries the whole
+// signal, which is why the label is a bare "✓ Approved" and not "ready to submit" — the queue tab
+// is where readiness gets talked about.
 function approvedPending(a: Application): boolean {
   return !!a.approved_at && a.status === "needs_review";
 }
@@ -261,12 +267,13 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                     : "border-hairline bg-panel-raised/40"
                 )}
               >
-                {/* The dot follows the same relabelling as the status control beside it — leaving it
-                    amber on an approved row put the two indicators for ONE state in disagreement,
-                    which is the bug this change set out to remove. */}
+                {/* The dot stays the STATUS colour — amber — on an approved row (operator,
+                    2026-08-12). Approved is not sent: the application is still sitting in the
+                    needs-review stage, and green here would read as "done" for something that has
+                    not left the building. Only the label says approved. */}
                 <span
                   className="h-2 w-2 shrink-0 rounded-full"
-                  style={{ background: approvedPending(a) ? COLOR.submitted : COLOR[a.status] }}
+                  style={{ background: COLOR[a.status] }}
                 />
                 <Link href={`/app/tracker/${a.id}`} className="group min-w-0 flex-1">
                   <div className="truncate text-sm text-ink transition-colors group-hover:text-amber">
@@ -317,15 +324,12 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                   value={a.status}
                   onChange={(e) => setStatus(a.id, e.target.value as AppStatus)}
                   disabled={pending}
-                  className={clsx(
-                    "shrink-0 rounded-md border bg-cockpit px-2 py-1 text-xs text-ink outline-none focus:border-amber",
-                    approvedPending(a) ? "border-verified/50" : "border-hairline"
-                  )}
-                  style={{ color: approvedPending(a) ? COLOR.submitted : COLOR[a.status] }}
+                  className="shrink-0 rounded-md border border-hairline bg-cockpit px-2 py-1 text-xs text-ink outline-none focus:border-amber"
+                  style={{ color: COLOR[a.status] }}
                 >
                   {APP_STATUSES.map((s) => (
                     <option key={s} value={s} className="bg-panel text-ink">
-                      {s === "needs_review" && approvedPending(a) ? "✓ Approved — ready to submit" : LABEL[s]}
+                      {s === "needs_review" && approvedPending(a) ? "✓ Approved" : LABEL[s]}
                     </option>
                   ))}
                 </select>
