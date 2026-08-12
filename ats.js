@@ -1662,6 +1662,14 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
         (f.value ? "; the form had a value here and it was replaced" : "") };
   }
 
+  // GENERIC ADDRESS — before buckets, because a bucket keyed on a bare wording ("City") cannot tell
+  // the applicant's address from a school's or an employer's, and picking wrong is silent and
+  // confident. Scoped, so it only ever answers the address block.
+  if (ats === "generic" && f) {
+    const addr = atsGenericAddressValue(profile, f);
+    if (addr) return { raw: addr.value, path: addr.path, source: "address", detail: "your address (" + addr.path.replace("personal_info.", "") + ")" };
+  }
+
   // GENERIC EDUCATION — the repeating-entry tier. Runs BEFORE buckets so a bucket bound to a scalar
   // path cannot claim an entry field (a bucket has no index, so it would give every entry the same
   // answer). `entryOrdinal` comes from the scan; ABSENT MEANS 0, i.e. the TOP entry, which is the
@@ -1700,9 +1708,18 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
     return { kind: "skip", source: "generic", detail: "a non-résumé attachment slot — the operator's own to add" };
   }
 
+  // ⚠ GENERIC: a bucket must NOT answer an AMBIGUOUS LOCATION label on an education / work entry.
+  // A bucket maps one wording to one scalar path with no entry index, so "City" inside an education
+  // entry resolved to the applicant's home city — live, `EducationCity` was filled "Tallahassee" for
+  // a school in Pittsburgh, confidently and silently. The entry owns these; if the profile's entry
+  // has no city, BLANK is the correct answer, not a borrowed one.
+  const genericEntryLocation = ats === "generic" &&
+    /^(city|town|state|province|state\/province|country|zip|postal code|zip\/postal code|region)$/i.test(atsGenericCleanLabel(f.label || "")) &&
+    ["education", "work"].includes(atsGenericScopeOf(f));
+
   // Buckets — the operator's own taught wordings, exact-normalized (no fuzzy; misses fall
   // through). Mode A (profile_path) + Mode B (value list) both become candidates/value.
-  if (bucketIndex && f.label) {
+  if (bucketIndex && f.label && !genericEntryLocation) {
     const b = bucketIndex.get ? bucketIndex.get(atsLib.normalizeLabel(f.label)) : bucketIndex[atsLib.normalizeLabel(f.label)];
     if (b) {
       if (b.profile_path) {
@@ -3431,6 +3448,59 @@ function atsGenericEducationValue(profile, label, ordinal) {
   return { value: v, path: "education." + hit.prop };
 }
 
+// ── WHICH SECTION does a field belong to? (PURE) ─────────────────────────────────────────
+// A generic form repeats the same generic labels — "City", "State/Province", "Country" appear in the
+// address block, in every education entry, and in every work-experience entry. The LABEL alone cannot
+// tell them apart, which is how the home city ("Tallahassee") ended up in EducationCity on a live run.
+// The field NAME can: iCIMS names them `PersonProfileFields.AddressCity`,
+// `CandProfileFields.EducationCity`, `PersonProfileFields.rcf3216`. Name first, label only as a hint.
+function atsGenericScopeOf(f) {
+  const name = String((f && f.fieldName) || "");
+  const label = String((f && f.label) || "");
+  if (/education|school|degree|major|graduat|alma/i.test(name)) return "education";
+  if (/address/i.test(name)) return "address";
+  if (/employ|work.?history|workhistory|experience|employer/i.test(name)) return "work";
+  // no name signal — fall back to the label, but ONLY for unambiguous words
+  if (/education|school|degree|graduat/i.test(label)) return "education";
+  if (/employer|work experience|job title/i.test(label)) return "work";
+  return "none";
+}
+
+// ── THE ADDRESS TIER (PURE) ──────────────────────────────────────────────────────────────
+// Why it has to exist: the profile holds a complete address (address_line_1, city, state_province,
+// postal_code, country) and NONE of it reached the form. The bucket tier is keyed on question wording
+// and the website seeds those wordings from PROFILE FIELD NAMES, so "City" and "Country" happened to
+// match and committed, while "Address", "Zip/Postal Code" and "State/Province" matched nothing and
+// were never routed a value at all. The review picker still scraped those dropdowns, which is what
+// "it scrapes the dropdowns but doesn't click commit" looks like from the outside (operator,
+// 2026-08-12): the options were read for review, but no candidate ever existed to commit.
+//
+// ⚠ SCOPED. This tier answers ADDRESS-scoped fields only, so it cannot repeat the mistake it is
+// fixing — an education entry's "City" is the school's city, not where the applicant lives, and a
+// profile that stores no school city must leave it BLANK rather than borrow the home one.
+const ATS_GENERIC_ADDRESS_FIELDS = [
+  { rx: /street\s*1|address\s*(line\s*)?1$|^address$|^street$|address_?street1/i, path: "address_line_1" },
+  { rx: /street\s*2|address\s*(line\s*)?2|apt|suite|unit\b|address_?street2/i, path: "address_line_2" },
+  { rx: /^city$|^town$|city\/|address_?city/i, path: "city" },
+  { rx: /state|province|region(?!.*country)/i, path: "state_province" },
+  { rx: /zip|postal/i, path: "postal_code" },
+  { rx: /^country$|country(?!.*(code|dial))/i, path: "country" },
+];
+function atsGenericAddressValue(profile, f) {
+  const scope = atsGenericScopeOf(f);
+  if (scope === "education" || scope === "work") return null;   // their own entry owns these
+  const pi = (profile || {}).personal_info || {};
+  const key = String((f && f.fieldName) || "") + " " + String((f && f.label) || "");
+  // a phone country CODE is not the address country
+  if (/phone|dial/i.test(key)) return null;
+  const hit = ATS_GENERIC_ADDRESS_FIELDS.find((x) => x.rx.test(key));
+  if (!hit) return null;
+  const v = pi[hit.path];
+  if (v === undefined || v === null) return null;
+  if (Array.isArray(v) ? !v.length : String(v).trim() === "") return null;
+  return { value: v, path: "personal_info." + hit.path };
+}
+
 // ── Is this file input the RÉSUMÉ slot? ONE predicate, two callers (PURE) ────────────────
 // ⚠ This exists because two different predicates disagreed and the résumé was uploaded THREE times
 // on a live iCIMS run (2026-08-12): into the real résumé field AND into "Attachment 1" and
@@ -4395,6 +4465,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPairedComboProbe, atsInjPairedComboOpen, atsInjPairedComboRead, atsInjPairedComboFilter,
     atsInjPairedComboCommit, atsInjPairedComboValue, atsInjPairedComboClose, atsFillPairedCombo,
     atsGenericEducationOrder, atsGenericEducationValue, atsGenericDatePart, ATS_GENERIC_EDUCATION_FIELDS,
+    atsGenericScopeOf, atsGenericAddressValue, ATS_GENERIC_ADDRESS_FIELDS,
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,

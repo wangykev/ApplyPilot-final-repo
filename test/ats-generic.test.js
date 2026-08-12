@@ -858,6 +858,79 @@ test("frame hop: a trivial frame is below the floor, and cross-origin frames nev
   assert.doesNotThrow(() => new Function("return (" + src + ")"));
 });
 
+// ── ADDRESS: the tier that was missing entirely ─────────────────────────────────────────
+const ADDR_PROFILE = {
+  personal_info: {
+    address_line_1: "715 Middlebrooks Circle", address_line_2: "",
+    city: "Tallahassee", state_province: "Florida", postal_code: "32312",
+    country: ["United States of America", "United States"],
+    country_phone_code: ["United States of America (+1)"],
+  },
+};
+
+test("address: the whole block resolves from the profile (it filled NOTHING before)", () => {
+  // Live on iCIMS only City and Country committed -- and only because a bucket wording happened to
+  // match those two words. "Address", "Zip/Postal Code" and "State/Province" matched nothing, so no
+  // candidate was ever routed to them. The review picker still scraped their options, which is what
+  // "it scrapes the dropdowns but doesn't click commit" looks like from outside.
+  const v = (name, label) => {
+    const r = ats.atsGenericAddressValue(ADDR_PROFILE, { fieldName: name, label, widgetType: "text" });
+    return r && r.value;
+  };
+  assert.strictEqual(v("-1_PersonProfileFields.AddressStreet1", "Address"), "715 Middlebrooks Circle");
+  assert.strictEqual(v("-1_PersonProfileFields.AddressCity", "City"), "Tallahassee");
+  assert.strictEqual(v("-1_PersonProfileFields.AddressZip", "Zip/Postal Code"), "32312");
+  assert.strictEqual(v("-1_PersonProfileFields.AddressState", "State/Province"), "Florida");
+  assert.deepStrictEqual(v("-1_PersonProfileFields.AddressCountry", "Country"), ["United States of America", "United States"]);
+  // an empty profile field stays blank rather than becoming ""
+  assert.strictEqual(v("-1_PersonProfileFields.AddressStreet2", "Address 2"), null);
+});
+
+test("⚠ address: an EDUCATION or WORK entry's City/State is NOT the applicant's address", () => {
+  // Live: EducationCity was filled "Tallahassee" for a school in Pittsburgh -- a bucket answering a
+  // bare "City" with the home address, silently and confidently. The entry owns these.
+  const v = (name, label) => ats.atsGenericAddressValue(ADDR_PROFILE, { fieldName: name, label, widgetType: "text" });
+  assert.strictEqual(v("-1_CandProfileFields.EducationCity", "City"), null);
+  assert.strictEqual(v("-1_CandProfileFields.EducationState", "State/Province"), null);
+  assert.strictEqual(v("-6481216_PersonProfileFields.rcf3216", "City"), null, "a work entry's city is the employer's");
+});
+
+test("address: a phone COUNTRY CODE is never answered with the address country", () => {
+  const v = (name, label) => ats.atsGenericAddressValue(ADDR_PROFILE, { fieldName: name, label, widgetType: "select" });
+  assert.strictEqual(v("-1_PersonProfileFields.PhoneCountryCode", "Country dialing code"), null);
+  assert.strictEqual(v("rcf_phone", "Phone Country"), null);
+});
+
+test("scope: the field NAME decides, because the label cannot", () => {
+  const s = (name, label) => ats.atsGenericScopeOf({ fieldName: name, label });
+  assert.strictEqual(s("-1_PersonProfileFields.AddressCity", "City"), "address");
+  assert.strictEqual(s("-1_CandProfileFields.EducationCity", "City"), "education");
+  assert.strictEqual(s("-1_CandProfileFields.School", "School"), "education");
+  assert.strictEqual(s("jobPostingApplication_workHistory_0_city", "City"), "work");
+  assert.strictEqual(s("info.firstName", "First Name"), "none");
+  // label-only fallback, for names that carry no signal
+  assert.strictEqual(s("rcf1234", "Highest degree earned"), "education");
+  assert.strictEqual(s("rcf9999", "Current employer"), "work");
+});
+
+test("⚠ buckets are BLOCKED from an entry-scoped location label", () => {
+  // the guard that stops a scalar bucket answering "City" inside an education entry
+  const idx = new Map([["city", { id: "b", profile_path: "personal_info.city", questions: ["City"] }]]);
+  const edu = ats.atsRouteField("generic", { widgetType: "text", fieldName: "-1_CandProfileFields.EducationCity", label: "City" }, ADDR_PROFILE, {}, {}, idx);
+  assert.ok(!edu || edu.source !== "bucket", "a bucket must not answer an education entry's city");
+  // …while the ADDRESS one still resolves (via the address tier, before buckets)
+  const addr = ats.atsRouteField("generic", { widgetType: "text", fieldName: "-1_PersonProfileFields.AddressCity", label: "City" }, ADDR_PROFILE, {}, {}, idx);
+  assert.strictEqual(addr.source, "address");
+  assert.strictEqual(addr.raw, "Tallahassee");
+});
+
+test("isolation: the address tier is generic-only", () => {
+  for (const kind of ["greenhouse", "lever", "ashby"]) {
+    const r = ats.atsRouteField(kind, { widgetType: "text", fieldName: "AddressCity", label: "City" }, ADDR_PROFILE, {}, {}, null);
+    assert.ok(!r || r.source !== "address", kind + " must not use the generic address tier");
+  }
+});
+
 // ── EDUCATION: the repeating-entry tier, and the NON-repeating rule ─────────────────────
 const EDU_PROFILE = {
   education: [
