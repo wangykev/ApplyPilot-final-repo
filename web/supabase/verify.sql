@@ -80,6 +80,21 @@ with checks as (
          '1'
 
   union all
+  -- 0019: how the application was filled ('manual' = the extension assisted, you submitted it)
+  select 'fill_mode column',
+         (select count(*) from information_schema.columns
+           where table_schema = 'public' and table_name = 'applications' and column_name = 'fill_mode')::text,
+         '1'
+
+  union all
+  -- …and its CHECK, which is a separate statement in main.sql — a paste truncated between the two
+  -- would leave the column with nothing constraining it, and that is worth catching separately.
+  select 'fill_mode constrained',
+         (select case when count(*) = 1 then 'yes' else 'no' end
+            from pg_constraint where conname = 'applications_fill_mode_check'),
+         'yes'
+
+  union all
   -- RLS on every owner-scoped table
   select 'RLS enabled',
          (select count(*) from pg_tables

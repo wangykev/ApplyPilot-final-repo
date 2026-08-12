@@ -25,10 +25,12 @@ async function loadApplications(): Promise<Application[]> {
         .neq("status", "queued")
         .order("created_at", { ascending: false });
     const BASE = "id, company, role, url, status, needs_review_count, applied_at, created_at";
-    // approved_at is fetched OPTIONALLY: on a database that has not run 0018 yet, naming it fails the
-    // whole query and the tracker list — the page's entire reason to exist — renders empty. An "Approved"
-    // badge is not worth that, so fall back to the columns that have always been there.
-    let { data, error } = await query(BASE + ", approved_at");
+    // approved_at and fill_mode are fetched OPTIONALLY, newest first: on a database that has not run the
+    // migration that adds one, naming it fails the WHOLE query and the tracker list — the page's entire
+    // reason to exist — renders empty. A badge is never worth that, so each tier drops the newest column
+    // and retries, ending at the columns that have always been there.
+    let { data, error } = await query(BASE + ", approved_at, fill_mode");
+    if (error) ({ data, error } = await query(BASE + ", approved_at"));
     if (error) ({ data } = await query(BASE));
     if ((!data || data.length === 0) && DEV_PREVIEW) return SAMPLE_APPS;
     return ((data ?? []) as unknown as Application[]);

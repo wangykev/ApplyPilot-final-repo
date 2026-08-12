@@ -64,7 +64,9 @@ gate).
   `background.js` does all storage I/O (e.g. persisting the review summary). **Keep this boundary.**
 - **Pipeline shape:** fill (engine, per page) → review (the `reviewSummary` + the website review editor,
   human edits) → submit (replay approved values).
-- **UI:** `popup.html` / `popup.js` — profile/résumé/LLM config + the fill, recon, and walk buttons.
+- **UI:** `popup.html` — the **manual-assist** surface (`assist.js`: match card + "Fill form" / "Fill
+  page") over the old dev console (`popup.js`: profile/résumé/LLM config + the fill, recon and walk
+  buttons), which is intact behind a `Developer tools` disclosure.
   `summary.html` / `summary.js` — the fallback review-summary viewer/editor. `[ApplyPilot]` logs land in the
   **service-worker** console.
 
@@ -484,6 +486,12 @@ The standing rules:
   leaves the page half-native/half-ours, after which react-select never resolves again — **and a refresh cures
   it**. A run opens its tab BLANK, attaches, registers overrides, then navigates. *If a widget works by hand
   and not under a run, ask what the run did to the page before the page loaded.*
+  **The manual "Fill page" DOESN'T INSTALL THEM AT ALL, which is why it can fill in place** (no reload, no
+  navigation): `cdpInstallPageOverrides` both registers-on-new-document AND `Runtime.evaluate`s itself into
+  the CURRENT document — that second half is what half-natives a live React page. The overrides exist to
+  free a **hidden** tab from Chrome's timer throttle, and a manual fill is by definition on the tab the
+  operator is looking at, where native timers are already fast. So the rule is about the OVERRIDES, not
+  about filling in place. `cdpSetFocusEmulation` is still fine there — a CDP flag, not a page script.
 - **`runAtsSubmitRun` gates** (all must pass before the one trusted click): bundle blockers + STRICT live
   verify + **no VISIBLE captcha challenge** + `arm===true` (absent ⇒ full dry rehearsal logging "WOULD CLICK
   SUBMIT"). **AI is OFF for submit runs regardless of the toggle.** A VISIBLE challenge halts
@@ -518,6 +526,62 @@ The standing rules:
   to the operator's yes/no model while the "Fill — essays and long answers" slot sat unused; the Workday
   twin (`aiFillText`) had always routed correctly. Live-verified: `AI batch [text → "essay" route]` next to
   `[LLM] … for "essay"`.
+
+## Manual assist — the popup's own surface (match card + two buttons; NEVER submits)
+
+The end-to-end run is **website-driven**. The EXTENSION is the hands-on tool: open the popup on a posting
+and it shows a **match card** (1–10 + verdict + *what the JD asks for that your résumé doesn't say*), plus
+exactly two buttons — **"Fill form"** (into the application and through every page to the review page,
+where the walk stops) and **"Fill page"** (this page only, no Next). **Both work on Workday AND on
+Greenhouse / Lever / Ashby.** Lives in `assist.js` + `getAssistState` / `runMatchScore` /
+`runManualFillPage` / `runManualAtsFillPage` / `runManualFillForm` (background.js). The old dev
+console is INTACT behind `Developer tools` in popup.html — `popup.js` binds those ids directly and throws
+on the first missing one, so **never delete an id from popup.html without editing popup.js**.
+
+- **"Fill form" is AI-GATED; "Fill page" is not.** AI off ⇒ a screening question the profile can't answer
+  leaves a REQUIRED field empty and the walk halts `nav-timeout` pages later, so the button refuses UP
+  FRONT — and `runManualFillForm` **re-checks it itself**: an enabled button is a UI fact, this is what
+  advances a live application. AI off + "Fill page" = those questions stay BLANK (operator's rule).
+- **NO AI checkbox in the popup — the website owns `llmConfig`;** the popup shows a read-only lamp.
+- **A manual fill NEVER pushes a review bundle.** The operator is on the page; pushing it would ask them
+  to approve what they are looking at. The manual walk skips only `reportApplication` (it still persists
+  LOCALLY — the walk reads its own bundle back for section shapes/page keys); a single-page manual fill
+  persists **nothing** (an overwrite of the accumulated bundle is how a dry-replay replays the wrong job).
+- **`manual` mode skips `captureChoiceOptions` + `sweepAlreadyFilled` — review-only passes, and capture is
+  the page's most expensive read-only work.** Everything protecting the VALUE (per-commit read-back, the
+  M40 audit + its repair) is untouched. **Manual = no review surface, never less verification.**
+- **NON-WORKDAY "Fill page" fills IN PLACE — `runManualAtsFillPage`.** No navigation, no reload, no page
+  overrides (see the ATS section for why that is what makes it safe), and none of `runAtsApplicationRun`'s
+  landing work — posting-gone checks, apply-link/button chase, redirect hops. That work exists to FIND an
+  application from a link; here the operator is already on it. `waitAtsFormReady` still runs: it is a
+  readiness check (are the fields mounted, and is this an application form at all), not recon.
+  **"Fill form" on an ATS keeps `runAtsApplicationRun` + `forceReload`** — it is the GET-ME-IN button, it
+  navigates, so the overrides land on a fresh document exactly as the invariant requires. The popup labels
+  it "Fill form (reloads)" because on a form you have typed into, "Fill page" is the one that spares it.
+- **Which button may fire is `formIsOnPage` (lib.js, unit-pinned).** `formFieldCount` is Workday's
+  `formField-*` count and does NOT generalize — an ATS form has none — so the other three use the generic
+  visible-input count against `ATS_FORM_MIN_FIELDS`. A HINT, never a verdict: the run function re-checks
+  with its own scan, so an over-eager button costs a message, never a wrong fill.
+- **The tracker row comes from the SUBMIT, not the fill.** `armManualSubmitWatch` + a `tabs.onUpdated`
+  watcher (no polling/alarms — a submit navigates, which wakes the SW) snapshots the Workday review page
+  on the way past and, on confirmation, writes `fill_mode:'manual'` (main.sql **0019**) with a bundle whose
+  **`entries` is EMPTY** — that is what keeps the row off the review and teach surfaces, which derive their
+  work per entry. The scan rides in that bundle as **`workday_review_page`**, the shape
+  `components/app/SubmittedRecord` already renders, so it is visible instead of stored where nothing reads
+  it. Not readable ⇒ URL-only evidence ⇒ the row just says filled manually.
+  ⚠ `fill_mode` is an OPTIONAL column, so it is named in the report route's drop-and-retry guard: a
+  database that has not run 0019 must lose the LABEL, never the row.
+- **⚠ `submitEvidenceVerdict` accepts TEXT or an unambiguous confirmation URL — NEVER structure alone.**
+  Leaving the review page looks identical to submitting, and a row invented from that is a fabricated
+  application. **Workday's post-submit page is the one DOM in this project never observed** (nothing has
+  ever been submitted): the regex is cross-ATS wording, and the watcher logs any unrecognised same-host
+  page once so the first real submit tightens it. Update `SUBMIT_CONFIRM_RX` from that trace.
+- **Permissions unchanged — still NOT `<all_urls>`.** The card reaches any employer careers page through
+  `activeTab`, granted by the operator's own click on the toolbar icon.
+- **Scoring: `lib.js` ↔ `web/lib/score.ts` are a LOCKSTEP dup**, test-enforced by
+  `web/test/score-lockstep.test.ts`. "Missing from your résumé" is DERIVED (whole-word check of
+  `keywords`/`gaps` against the candidate summary), never asked of the model. Cached per `job_key` +
+  profile fingerprint; `match` rides `fill`'s route via `LLM_ACTION_ALIASES` (both copies).
 
 ## Onboarding walk (pre-form: JD → apply → login → verify)
 
@@ -741,4 +805,8 @@ and "the poll didn't look often enough" is not an available explanation for a fa
   **test-enforced** (`web/test/discover.test.ts` cross-loads the real `discover.js` and fails on drift). Do
   the same for the others when convenient.
 - `normalizeLabel` (lib.js) ↔ `normalizeQuestion` (web `lib/buckets.ts`).
+- The JD-match rubric — `SCORE_SYSTEM` / `buildCandidateSummary` / `buildScorePrompt` / `parseScoreReply`
+  in `lib.js` ↔ `web/lib/score.ts`. **Test-enforced** (`web/test/score-lockstep.test.ts` cross-loads the
+  real `lib.js`): two copies of a PROMPT drift silently, and only in the answers.
+- `LLM_ACTION_ALIASES` — `llm-keys.js` ↔ `web/lib/llm-keys.ts`.
 - `summary-lib.js` ↔ `web/lib/review-approval.ts`; `summary.js` grouping ↔ `web/lib/review-model.ts`.

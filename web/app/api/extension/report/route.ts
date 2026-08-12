@@ -98,9 +98,12 @@ export async function POST(req: Request) {
   // ⚠ This list must GROW with every optional column added here. `approved_at` was added to the write
   // without being added to this guard, and every report immediately 500'd against a database that had
   // not run 0018 — the bundle was silently lost on a run that had otherwise succeeded.
-  if (error && /resume_(id|sha256|delta)|approved_at/.test(error.message || "")) {
-    const { resume_id, resume_sha256, resume_delta, approved_at, ...rest } = fields;
-    void resume_id; void resume_sha256; void resume_delta; void approved_at;
+  // (`fill_mode` — main.sql 0019 — joined the list when it was added, for the same reason: a manual
+  //  submit's row is the ONLY record that application exists, so losing the whole write over a column
+  //  that merely LABELS it would be the worst possible trade. The row still lands, just unlabelled.)
+  if (error && /resume_(id|sha256|delta)|approved_at|fill_mode/.test(error.message || "")) {
+    const { resume_id, resume_sha256, resume_delta, approved_at, fill_mode, ...rest } = fields;
+    void resume_id; void resume_sha256; void resume_delta; void approved_at; void fill_mode;
     ({ error } = await write(rest));
   }
   if (error) return j({ ok: false, error: error.message }, 500);

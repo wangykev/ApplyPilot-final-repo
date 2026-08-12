@@ -88,5 +88,11 @@ export function reportColumns(body: ReportBody, userId: string): Record<string, 
   if (url) cols.url = url;
   if (jobKey) cols.job_key = jobKey;
   if (appliedAt) cols.applied_at = appliedAt;
+
+  // MANUAL ASSIST (main.sql, 0019). Only 'manual' is accepted — an unknown value is dropped rather than
+  // written, because the column is CHECK-constrained and a rejected INSERT would lose the whole report
+  // over a label. Follows the file's rule: absent means "nothing to say", never "set it to nothing", so
+  // an ordinary fill report can never blank the mode on a row that was filled by hand.
+  if (str(body.fill_mode) === "manual") cols.fill_mode = "manual";
   return cols;
 }

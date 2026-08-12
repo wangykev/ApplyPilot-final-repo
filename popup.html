@@ -3,150 +3,332 @@
   <head>
     <meta charset="utf-8">
     <style>
-      body { font-family: system-ui, sans-serif; width: 280px; padding: 12px; }
-      button { display: block; width: 100%; margin: 0 0 8px; padding: 8px; cursor: pointer; }
-      label { display: block; font-size: 12px; margin-top: 4px; }
-      input { width: 100%; box-sizing: border-box; margin: 4px 0 6px; padding: 6px; }
-      hr { margin: 10px 0; border: none; border-top: 1px solid #ddd; }
-      .section-title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #888; margin: 2px 0 6px; }
-      #status { font-size: 12px; color: #333; white-space: pre-wrap; min-height: 1.4em; }
+      /* ── The popup is the extension's ONE user-facing surface, so it wears the website's own
+           night-flight-deck palette (web/tailwind.config.ts) rather than browser defaults. Two
+           controls, one card, everything else folded away. ────────────────────────────────────── */
+      :root {
+        --cockpit: #0A0E14;
+        --panel: #121821;
+        --panel-raised: #1A2230;
+        --hairline: #26303D;
+        --ink: #E6EDF5;
+        --ink-dim: #7E8C9E;
+        --ink-faint: #566273;
+        --amber: #FFB627;
+        --amber-dim: #8a6a22;
+        --verified: #36D6A0;
+        --signal: #FF5C5C;
+        color-scheme: dark;
+      }
+      * { box-sizing: border-box; }
+      body {
+        width: 340px; margin: 0; padding: 0;
+        background: var(--cockpit); color: var(--ink);
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        font-size: 13px; line-height: 1.45;
+      }
+      .eyebrow {
+        font-family: ui-monospace, SFMono-Regular, monospace;
+        font-size: 10px; text-transform: uppercase; letter-spacing: .18em; color: var(--ink-dim);
+      }
+
+      /* Header — brand + the AI lamp. The AI toggle lives on the WEBSITE; this is a read-out, not a
+         control, which is why it is a lamp and not a checkbox. */
+      header {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 10px 14px; border-bottom: 1px solid var(--hairline);
+      }
+      .brand { font-family: ui-monospace, monospace; font-size: 11px; letter-spacing: .18em; color: var(--amber); }
+      .lamp {
+        display: inline-flex; align-items: center; gap: 6px;
+        font-family: ui-monospace, monospace; font-size: 10px; letter-spacing: .12em;
+        color: var(--ink-dim); text-transform: uppercase;
+      }
+      .lamp::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ink-faint); }
+      .lamp.on { color: var(--verified); }
+      .lamp.on::before { background: var(--verified); box-shadow: 0 0 8px rgba(54,214,160,.6); }
+
+      main { padding: 14px; }
+
+      /* The job you are looking at. */
+      #job-company { margin-bottom: 2px; }
+      #job-title {
+        font-size: 15px; font-weight: 600; margin: 0 0 12px; line-height: 1.3;
+        overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      }
+
+      .card {
+        background: var(--panel); border: 1px solid var(--hairline); border-radius: 12px;
+        padding: 12px; margin-bottom: 12px;
+        box-shadow: inset 0 1px 0 0 rgba(255,255,255,.04), 0 1px 2px 0 rgba(0,0,0,.4);
+      }
+
+      /* Score read-out: the number carries the weight, the meter makes the 1–10 scale legible at a
+         glance, and the verdict word says what the number means so nobody has to remember the bands. */
+      .score-row { display: flex; align-items: baseline; gap: 10px; }
+      .score { font-size: 30px; font-weight: 650; letter-spacing: -.02em; line-height: 1; }
+      .score-of { font-size: 12px; color: var(--ink-faint); }
+      .verdict {
+        margin-left: auto; font-family: ui-monospace, monospace; font-size: 10px; letter-spacing: .14em;
+        text-transform: uppercase; padding: 3px 8px; border-radius: 999px; border: 1px solid;
+      }
+      .verdict.strong { color: var(--verified); border-color: rgba(54,214,160,.4); background: rgba(54,214,160,.08); }
+      .verdict.moderate { color: var(--amber); border-color: rgba(255,182,39,.4); background: rgba(255,182,39,.08); }
+      .verdict.weak { color: var(--signal); border-color: rgba(255,92,92,.4); background: rgba(255,92,92,.08); }
+      .meter { display: flex; gap: 3px; margin: 10px 0 0; }
+      .meter i { flex: 1; height: 4px; border-radius: 2px; background: var(--panel-raised); }
+      .meter i.lit { background: currentColor; }
+      .meter.strong { color: var(--verified); }
+      .meter.moderate { color: var(--amber); }
+      .meter.weak { color: var(--signal); }
+
+      .section-label { margin: 12px 0 6px; }
+      .chips { display: flex; flex-wrap: wrap; gap: 5px; }
+      .chip {
+        font-size: 11px; padding: 3px 8px; border-radius: 999px;
+        background: var(--panel-raised); border: 1px solid var(--hairline); color: var(--ink);
+      }
+      .chip.gap { border-color: rgba(255,182,39,.35); color: var(--amber); background: rgba(255,182,39,.06); }
+      .rationale { color: var(--ink-dim); font-size: 12px; margin: 10px 0 0; }
+      .muted { color: var(--ink-dim); }
+      .tiny { font-size: 11px; }
+
+      /* Actions — exactly two. */
+      .actions { display: grid; gap: 8px; }
+      button.act {
+        width: 100%; padding: 10px 12px; border-radius: 10px; cursor: pointer;
+        font-size: 13px; font-weight: 550; font-family: inherit;
+        border: 1px solid var(--hairline); background: var(--panel-raised); color: var(--ink);
+        transition: background .12s ease, border-color .12s ease;
+      }
+      button.act:hover:not(:disabled) { background: #212b3b; border-color: #33404f; }
+      button.act.primary { background: var(--amber); border-color: var(--amber); color: #16120A; }
+      button.act.primary:hover:not(:disabled) { background: var(--amber-soft, #FFC85C); }
+      button.act:disabled { opacity: .38; cursor: not-allowed; }
+      .why { margin: -2px 0 2px; }
+
+      #assist-result { margin-top: 12px; }
+      .result-ok { border-left: 2px solid var(--verified); padding-left: 8px; }
+      .result-warn { border-left: 2px solid var(--amber); padding-left: 8px; }
+      .result-bad { border-left: 2px solid var(--signal); padding-left: 8px; }
+      .list { margin: 6px 0 0; padding-left: 16px; color: var(--ink-dim); font-size: 11px; }
+      .list li { margin: 1px 0; }
+
+      .spinner {
+        display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+        border: 2px solid var(--amber); border-top-color: transparent; vertical-align: -1px;
+        animation: spin .7s linear infinite; margin-right: 6px;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+
+      a { color: var(--amber); }
+      .linkish {
+        background: none; border: 0; padding: 0; font: inherit; color: var(--ink-dim);
+        text-decoration: underline; cursor: pointer;
+      }
+      .linkish:hover { color: var(--ink); }
+
+      /* ── Everything below is the dev console this popup used to BE. Kept verbatim (popup.js binds
+           every one of these ids) and folded away, so the default view is the two buttons. ──────── */
+      details.dev { border-top: 1px solid var(--hairline); }
+      details.dev > summary {
+        padding: 10px 14px; cursor: pointer; list-style: none;
+        font-family: ui-monospace, monospace; font-size: 10px; letter-spacing: .18em;
+        text-transform: uppercase; color: var(--ink-faint);
+      }
+      details.dev > summary::-webkit-details-marker { display: none; }
+      details.dev > summary:hover { color: var(--ink-dim); }
+      details.dev .dev-body { padding: 0 14px 14px; }
+      details.dev button {
+        display: block; width: 100%; margin: 0 0 6px; padding: 7px; cursor: pointer;
+        font-size: 12px; font-family: inherit; border-radius: 8px;
+        border: 1px solid var(--hairline); background: var(--panel); color: var(--ink-dim);
+      }
+      details.dev button:hover { color: var(--ink); }
+      details.dev label { display: block; font-size: 11px; margin-top: 6px; color: var(--ink-dim); }
+      details.dev input[type="text"], details.dev input[type="number"], details.dev input[type="file"] {
+        width: 100%; margin: 4px 0 6px; padding: 6px; font-size: 12px; border-radius: 6px;
+        border: 1px solid var(--hairline); background: var(--cockpit); color: var(--ink);
+      }
+      details.dev hr { margin: 10px 0; border: none; border-top: 1px solid var(--hairline); }
+      .section-title {
+        font-family: ui-monospace, monospace; font-size: 10px; text-transform: uppercase;
+        letter-spacing: .14em; color: var(--ink-faint); margin: 2px 0 6px;
+      }
+      #status, #resume-status, #credentials-status, #llm-summary {
+        font-size: 11px; color: var(--ink-dim); white-space: pre-wrap;
+      }
+      #status { min-height: 1.4em; }
     </style>
   </head>
   <body>
-    <button id="load-profile">Load default profile</button>
-    <button id="fill-page">Fill current page</button>
-    <button id="walk-pages">Fill 2 pages (walk)</button>
-    <button id="view-summary">View last summary</button>
-    <!-- Reset the accumulated review summary (the CDP full-page fill / walk accumulates
-         write-per-page, so prior pages persist across runs) — click before a NEW application. -->
-    <button id="clear-summary">Clear summary (reset for a new application)</button>
-    <hr>
-    <!-- Store ONE resume (PDF) in IndexedDB. Fill (current page / walk) attaches it
-         automatically on the page that has the upload widget (M16.3). -->
-    <label for="resume-file">Resume (PDF) — stored in the extension:</label>
-    <input id="resume-file" type="file" accept="application/pdf,.pdf">
-    <div id="resume-status">Saved resume: none</div>
-    <hr>
-    <div class="section-title">Onboarding (JD → apply → login → verify)</div>
-    <!-- Load the Workday account credentials (data/credentials.json → chrome.storage.local.credentials).
-         Same website→extension handoff pattern as "Load default profile"; the file is gitignored + operator-
-         managed. The email should be the Gmail address (or a +alias of it) whose inbox Gmail auto-verify reads. -->
-    <button id="load-credentials">Load account credentials (data/credentials.json)</button>
-    <div id="credentials-status">Credentials: none loaded</div>
-    <!-- Optional: navigate the tab to this job-posting URL before onboarding. Leave BLANK to run on
-         whatever Workday page is already open in the active tab (the active-tab philosophy). -->
-    <label for="onboard-url">Start URL (optional — blank = use the current tab):</label>
-    <input id="onboard-url" type="text" placeholder="https://<tenant>.myworkdayjobs.com/…/job/…">
-    <!-- Gmail auto-verify (chrome.identity.getAuthToken, gmail.readonly ONLY). When ON, account-creation
-         email verification is automatic. "Connect / test" proves the token + shows the connected inbox —
-         run it ONCE first (see docs/gmail-setup.md for the one-time OAuth client setup). -->
-    <label><input id="onboard-gmail" type="checkbox"> Gmail auto-verify ON (reads your inbox — read-only)</label>
-    <button id="gmail-connect">Connect / test Gmail (readonly)</button>
-    <!-- After login lands on the form, ALSO run the CDP fill walk. OFF by default: the fill walk ADVANCES a
-         LIVE application page-by-page — keep it off until you're on a DISPOSABLE application (the hard gate). -->
-    <label><input id="onboard-continue" type="checkbox"> Continue into the fill walk after login (⚠ advances the app)</label>
-    <!-- Drive the whole pre-form flow on the ACTIVE tab. Keep the tab VISIBLE to watch. Never submits.
-         [ONBOARD] in the service-worker console. -->
-    <button id="cdp-onboard">Start application (apply → login → verify → form)</button>
-    <hr>
-    <div class="section-title">Job discovery (LinkedIn · Handshake · Simplify board)</div>
-    <!-- DRY RUN of the sweep the website's Discover button drives. LinkedIn + Handshake are read
-         from YOUR signed-in session (cookies — no API key, no login attempt); the Simplify 2026
-         internship board is a plain fetch of its published listings.json. Each posting is opened
-         just long enough to scrape its description, then closed. Nothing is applied to, and from
-         the POPUP nothing is queued either (there's no website here to store it) — results land in
-         the service-worker console as [DISCOVER]. Use the website's Discover button for real. -->
-    <label for="discover-query">Keyword filter (blank = everything recent):</label>
-    <input id="discover-query" type="text" placeholder="software engineer intern">
-    <label for="discover-days">Posted within (days):</label>
-    <input id="discover-days" type="number" min="1" max="60" value="7">
-    <label><input id="discover-simplify" type="checkbox" checked> Simplify 2026 internships (GitHub board)</label>
-    <label><input id="discover-linkedin" type="checkbox" checked> LinkedIn (your signed-in session)</label>
-    <label><input id="discover-handshake" type="checkbox" checked> Handshake (your signed-in session)</label>
-    <button id="discover-run">Discover jobs (dry run — logs, queues nothing)</button>
-    <!-- RECON FIRST on a fresh install / after a board redesign: dumps what the LinkedIn and
-         Handshake search pages ACTUALLY look like in your session (selector hit-counts + one real
-         card's markup) so the list scrapers stop guessing. [DISCOVER-RECON] in the SW console. -->
-    <button id="discover-recon">Discover recon (dump the board DOM — read-only)</button>
-    <hr>
-    <div class="section-title">CDP fill</div>
-    <!-- CDP fill FULL PAGE (M38 Part 1 — the FOLD; foreground fast-fill): ONE click fills the
-         flat fields AND every repeating section present. On page 1 == simple-widgets; on page 2
-         (My Experience) fills the whole page. NO minimize gate: keep the tab VISIBLE for a FAST
-         fill (watch it) or MINIMIZE for slow/background — it adapts live. Load profile first,
-         click. [CDP-PAGE] in the service-worker console. -->
-    <button id="cdp-fill-page">CDP fill FULL PAGE (flat + sections; visible=fast)</button>
-    <!-- CDP WALK (M38 Part 3): the N-PAGE WALK. Fills each page (the full fold + audit +
-         accumulating review summary) → guarded Save & Continue → repeats to the REVIEW
-         page, where it STOPS and NEVER submits (double guard). Clears the prior summary
-         once at start. ⚠ on a LIVE session this ADVANCES the real application through every
-         page — use a DISPOSABLE application. Keep the tab VISIBLE to watch it reach review
-         and stop. [CDP-WALK] in the service-worker console. -->
-    <button id="cdp-walk">CDP WALK to review (fills all pages; never submits)</button>
-    <!-- REFILL = replay the reviewed bundle onto the form (skip-if-correct, no re-fill/re-recon) AND
-         fresh-fill any page the first fill never reached, continuing to the REVIEW page; never submits. -->
-    <button id="cdp-refill">CDP REFILL (replay reviewed values + fill new pages → review; never submits)</button>
-    <!-- M3 SUBMIT REPLAY (DRY): replays the SAVED approved review-summary bundle onto THIS live
-         page — flat fields + repeating sections, NO Next, NO Submit. Load the same page you filled
-         (fresh), keep it VISIBLE. Uses the bundle, not the profile. [CDP-REPLAY] in the SW console. -->
-    <button id="cdp-replay-page">CDP replay this page — DRY (flat + repeating; no submit)</button>
-    <!-- M3 SUBMIT REPLAY WALK (DRY): replays the SAVED approved bundle page-by-page to the REVIEW
-         page, verifying each field and advancing with the guarded Save & Continue — NEVER submits.
-         Load page 1 of a filled+reviewed application (fresh), keep it VISIBLE. [CDP-REPLAY-WALK]. -->
-    <button id="cdp-replay-walk">CDP replay WALK to review — DRY (all pages; never submits)</button>
-    <!-- M5 ARMED SUBMIT (SIMULATED): replays to review + runs the FULL precondition gate (authorize=true),
-         then — if every check passes — LOGS "▶▶ WOULD CLICK SUBMIT ◀◀" and STOPS. ⚠ Does NOT actually
-         submit yet (simulateSubmit hardcoded on). Load page 1 of a filled+reviewed app, keep VISIBLE.
-         [CDP-REPLAY-WALK]. Flip to a real submit later in the RUN_CDP_SUBMIT handler. -->
-    <button id="cdp-submit">Replay + SUBMIT (armed — SIMULATED: logs "would submit", no real click)</button>
-    <hr>
-    <div class="section-title">New-tenant recon (read-only)</div>
-    <!-- Run FIRST on any new Workday tenant before relying on the fill path. Each dumps
-         structure to the SERVICE-WORKER console. Keep page DevTools CLOSED on the tab — a
-         second debugger client kills the attach. -->
-    <!-- Probe what chrome.debugger INPUT can do to a HIDDEN tab (insertText vs per-char keys,
-         mouse vs keyboard commits, rect validity, latencies). Click, then MINIMIZE within 60s.
-         [CDP-RECON]. -->
-    <button id="cdp-recon">CDP recon: simple widgets (minimize!)</button>
-    <!-- Read-only structure dump of a repeating-section page (sections present → entries →
-         per-entry fields) + a bounded date-spinbutton probe. Run on My Experience (page 2);
-         minimize within 60s. [REPEAT-RECON]. -->
-    <button id="cdp-repeat-recon">CDP recon: repeating sections (minimize!)</button>
-    <!-- Read-only static snapshot to classify a live form vs a logged-out/expired state.
-         No minimize. Run once on a VALID form and once LOGGED-OUT, diff. [SESSION-RECON]. -->
-    <button id="cdp-session-recon">CDP recon: session state (no minimize)</button>
-    <!-- Read-only dump of a screening-questions page (verbatim labels + each dropdown's
-         options + a clean-close proof). [Q-RECON]. -->
-    <button id="cdp-questions-recon">CDP recon: screening QUESTIONS (read-only)</button>
-    <!-- Read-only fingerprint of ANY page (maintenance / dead session / login / error / a
-         normal form) so an unknown page state can be detected in code. [CDP-PAGE-RECON]. -->
-    <button id="cdp-page-recon">CDP recon: page identity (read-only; ANY page — maintenance/error/login)</button>
-    <!-- Read-only: on the FINAL review page, diff the page's displayed values vs the saved
-         reviewSummary bundle. Disagreements flag fill bugs. NEVER submits. [REVIEW-CHECK]. -->
-    <button id="cdp-review-check">CDP: review-page CHECK (diff vs summary, read-only)</button>
-    <hr>
-    <!-- AI config (AI-0) — READ-ONLY HERE. The website's AI page owns chrome.storage.local
-         .llmConfig and pushes it via AP_SET_LLM: it holds the key LIST per provider, the
-         per-action model routes and their fallback chains. This panel used to be a second
-         editor, and its Save wrote the flat {provider,model,apiKey,enabled} shape over the
-         whole object — silently destroying the key list and routes. One owner instead of
-         two, so that can't happen. "Test" round-trips the STORED config ([LLM-TEST] in the
-         SW console) without writing anything. -->
-    <div id="llm-summary">AI: reading config…</div>
-    <button id="llm-open-site">Edit on the website → AI page</button>
-    <button id="llm-test">Test the stored AI config</button>
-    <!-- DEBUG: log every CDP keystroke/click ([ApplyPilot][INPUT]) in the SW console. Saved on toggle;
-         cdp.js reads it at each run start. Off by default (keeps production fills quiet). -->
-    <label><input id="debug-input-trace" type="checkbox"> Debug: log every keystroke/click (SW console)</label>
-    <hr>
-    <!-- TEMPORARY: per-posting company. Later the JD-page extraction writes jobContext. -->
-    <label for="company">Company for this application (temporary):</label>
-    <input id="company" type="text" placeholder="e.g. Cambium Learning">
-    <button id="set-company">Set company</button>
-    <div id="status"></div>
+    <header>
+      <span class="brand">APPLYPILOT</span>
+      <!-- READ-ONLY lamp. The AI switch lives on the website (it owns llmConfig); duplicating it here
+           is what once let the popup overwrite the whole object. -->
+      <span class="lamp" id="ai-lamp" title="AI is configured on the website">AI —</span>
+    </header>
+
+    <main>
+      <div id="job-company" class="eyebrow"></div>
+      <h1 id="job-title">Reading this page…</h1>
+
+      <!-- The match card. Filled by one cached LLM call; hidden on pages that are not postings. -->
+      <section class="card" id="match-card" hidden></section>
+
+      <div class="actions">
+        <!-- Fill form: get into the application and fill it through to the review page, where it stops.
+             Disabled without AI — the screening questions need it (see runManualFillForm). -->
+        <button class="act primary" id="assist-fill-form" disabled>Fill form</button>
+        <!-- Fill page: fill the page in front of you and stop. You click Save & Continue. -->
+        <button class="act" id="assist-fill-page" disabled>Fill page</button>
+      </div>
+      <div class="why tiny muted" id="assist-why"></div>
+
+      <div id="assist-result"></div>
+    </main>
+
+    <details class="dev">
+      <summary>Developer tools</summary>
+      <div class="dev-body">
+        <button id="load-profile">Load default profile</button>
+        <button id="fill-page">Fill current page</button>
+        <button id="walk-pages">Fill 2 pages (walk)</button>
+        <button id="view-summary">View last summary</button>
+        <!-- Reset the accumulated review summary (the CDP full-page fill / walk accumulates
+             write-per-page, so prior pages persist across runs) — click before a NEW application. -->
+        <button id="clear-summary">Clear summary (reset for a new application)</button>
+        <hr>
+        <!-- Store ONE resume (PDF) in IndexedDB. Fill (current page / walk) attaches it
+             automatically on the page that has the upload widget (M16.3). -->
+        <label for="resume-file">Resume (PDF) — stored in the extension:</label>
+        <input id="resume-file" type="file" accept="application/pdf,.pdf">
+        <div id="resume-status">Saved resume: none</div>
+        <hr>
+        <div class="section-title">Onboarding (JD → apply → login → verify)</div>
+        <!-- Load the Workday account credentials (data/credentials.json → chrome.storage.local.credentials).
+             Same website→extension handoff pattern as "Load default profile"; the file is gitignored + operator-
+             managed. The email should be the Gmail address (or a +alias of it) whose inbox Gmail auto-verify reads. -->
+        <button id="load-credentials">Load account credentials (data/credentials.json)</button>
+        <div id="credentials-status">Credentials: none loaded</div>
+        <!-- Optional: navigate the tab to this job-posting URL before onboarding. Leave BLANK to run on
+             whatever Workday page is already open in the active tab (the active-tab philosophy). -->
+        <label for="onboard-url">Start URL (optional — blank = use the current tab):</label>
+        <input id="onboard-url" type="text" placeholder="https://<tenant>.myworkdayjobs.com/…/job/…">
+        <!-- Gmail auto-verify (chrome.identity.getAuthToken, gmail.readonly ONLY). When ON, account-creation
+             email verification is automatic. "Connect / test" proves the token + shows the connected inbox —
+             run it ONCE first (see docs/gmail-setup.md for the one-time OAuth client setup). -->
+        <label><input id="onboard-gmail" type="checkbox"> Gmail auto-verify ON (reads your inbox — read-only)</label>
+        <button id="gmail-connect">Connect / test Gmail (readonly)</button>
+        <!-- After login lands on the form, ALSO run the CDP fill walk. OFF by default: the fill walk ADVANCES a
+             LIVE application page-by-page — keep it off until you're on a DISPOSABLE application (the hard gate). -->
+        <label><input id="onboard-continue" type="checkbox"> Continue into the fill walk after login (⚠ advances the app)</label>
+        <!-- Drive the whole pre-form flow on the ACTIVE tab. Keep the tab VISIBLE to watch. Never submits.
+             [ONBOARD] in the service-worker console. -->
+        <button id="cdp-onboard">Start application (apply → login → verify → form)</button>
+        <hr>
+        <div class="section-title">Job discovery (LinkedIn · Handshake · Simplify board)</div>
+        <!-- DRY RUN of the sweep the website's Discover button drives. LinkedIn + Handshake are read
+             from YOUR signed-in session (cookies — no API key, no login attempt); the Simplify 2026
+             internship board is a plain fetch of its published listings.json. Each posting is opened
+             just long enough to scrape its description, then closed. Nothing is applied to, and from
+             the POPUP nothing is queued either (there's no website here to store it) — results land in
+             the service-worker console as [DISCOVER]. Use the website's Discover button for real. -->
+        <label for="discover-query">Keyword filter (blank = everything recent):</label>
+        <input id="discover-query" type="text" placeholder="software engineer intern">
+        <label for="discover-days">Posted within (days):</label>
+        <input id="discover-days" type="number" min="1" max="60" value="7">
+        <label><input id="discover-simplify" type="checkbox" checked> Simplify 2026 internships (GitHub board)</label>
+        <label><input id="discover-linkedin" type="checkbox" checked> LinkedIn (your signed-in session)</label>
+        <label><input id="discover-handshake" type="checkbox" checked> Handshake (your signed-in session)</label>
+        <button id="discover-run">Discover jobs (dry run — logs, queues nothing)</button>
+        <!-- RECON FIRST on a fresh install / after a board redesign: dumps what the LinkedIn and
+             Handshake search pages ACTUALLY look like in your session (selector hit-counts + one real
+             card's markup) so the list scrapers stop guessing. [DISCOVER-RECON] in the SW console. -->
+        <button id="discover-recon">Discover recon (dump the board DOM — read-only)</button>
+        <hr>
+        <div class="section-title">CDP fill</div>
+        <!-- CDP fill FULL PAGE (M38 Part 1 — the FOLD; foreground fast-fill): ONE click fills the
+             flat fields AND every repeating section present. On page 1 == simple-widgets; on page 2
+             (My Experience) fills the whole page. NO minimize gate: keep the tab VISIBLE for a FAST
+             fill (watch it) or MINIMIZE for slow/background — it adapts live. Load profile first,
+             click. [CDP-PAGE] in the service-worker console. -->
+        <button id="cdp-fill-page">CDP fill FULL PAGE (flat + sections; visible=fast)</button>
+        <!-- CDP WALK (M38 Part 3): the N-PAGE WALK. Fills each page (the full fold + audit +
+             accumulating review summary) → guarded Save & Continue → repeats to the REVIEW
+             page, where it STOPS and NEVER submits (double guard). Clears the prior summary
+             once at start. ⚠ on a LIVE session this ADVANCES the real application through every
+             page — use a DISPOSABLE application. Keep the tab VISIBLE to watch it reach review
+             and stop. [CDP-WALK] in the service-worker console. -->
+        <button id="cdp-walk">CDP WALK to review (fills all pages; never submits)</button>
+        <!-- REFILL = replay the reviewed bundle onto the form (skip-if-correct, no re-fill/re-recon) AND
+             fresh-fill any page the first fill never reached, continuing to the REVIEW page; never submits. -->
+        <button id="cdp-refill">CDP REFILL (replay reviewed values + fill new pages → review; never submits)</button>
+        <!-- M3 SUBMIT REPLAY (DRY): replays the SAVED approved review-summary bundle onto THIS live
+             page — flat fields + repeating sections, NO Next, NO Submit. Load the same page you filled
+             (fresh), keep it VISIBLE. Uses the bundle, not the profile. [CDP-REPLAY] in the SW console. -->
+        <button id="cdp-replay-page">CDP replay this page — DRY (flat + repeating; no submit)</button>
+        <!-- M3 SUBMIT REPLAY WALK (DRY): replays the SAVED approved bundle page-by-page to the REVIEW
+             page, verifying each field and advancing with the guarded Save & Continue — NEVER submits.
+             Load page 1 of a filled+reviewed application (fresh), keep it VISIBLE. [CDP-REPLAY-WALK]. -->
+        <button id="cdp-replay-walk">CDP replay WALK to review — DRY (all pages; never submits)</button>
+        <!-- M5 ARMED SUBMIT (SIMULATED): replays to review + runs the FULL precondition gate (authorize=true),
+             then — if every check passes — LOGS "▶▶ WOULD CLICK SUBMIT ◀◀" and STOPS. ⚠ Does NOT actually
+             submit yet (simulateSubmit hardcoded on). Load page 1 of a filled+reviewed app, keep VISIBLE.
+             [CDP-REPLAY-WALK]. Flip to a real submit later in the RUN_CDP_SUBMIT handler. -->
+        <button id="cdp-submit">Replay + SUBMIT (armed — SIMULATED: logs "would submit", no real click)</button>
+        <hr>
+        <div class="section-title">New-tenant recon (read-only)</div>
+        <!-- Run FIRST on any new Workday tenant before relying on the fill path. Each dumps
+             structure to the SERVICE-WORKER console. Keep page DevTools CLOSED on the tab — a
+             second debugger client kills the attach. -->
+        <!-- Probe what chrome.debugger INPUT can do to a HIDDEN tab (insertText vs per-char keys,
+             mouse vs keyboard commits, rect validity, latencies). Click, then MINIMIZE within 60s.
+             [CDP-RECON]. -->
+        <button id="cdp-recon">CDP recon: simple widgets (minimize!)</button>
+        <!-- Read-only structure dump of a repeating-section page (sections present → entries →
+             per-entry fields) + a bounded date-spinbutton probe. Run on My Experience (page 2);
+             minimize within 60s. [REPEAT-RECON]. -->
+        <button id="cdp-repeat-recon">CDP recon: repeating sections (minimize!)</button>
+        <!-- Read-only static snapshot to classify a live form vs a logged-out/expired state.
+             No minimize. Run once on a VALID form and once LOGGED-OUT, diff. [SESSION-RECON]. -->
+        <button id="cdp-session-recon">CDP recon: session state (no minimize)</button>
+        <!-- Read-only dump of a screening-questions page (verbatim labels + each dropdown's
+             options + a clean-close proof). [Q-RECON]. -->
+        <button id="cdp-questions-recon">CDP recon: screening QUESTIONS (read-only)</button>
+        <!-- Read-only fingerprint of ANY page (maintenance / dead session / login / error / a
+             normal form) so an unknown page state can be detected in code. [CDP-PAGE-RECON]. -->
+        <button id="cdp-page-recon">CDP recon: page identity (read-only; ANY page — maintenance/error/login)</button>
+        <!-- Read-only: on the FINAL review page, diff the page's displayed values vs the saved
+             reviewSummary bundle. Disagreements flag fill bugs. NEVER submits. [REVIEW-CHECK]. -->
+        <button id="cdp-review-check">CDP: review-page CHECK (diff vs summary, read-only)</button>
+        <hr>
+        <!-- AI config (AI-0) — READ-ONLY HERE. The website's AI page owns chrome.storage.local
+             .llmConfig and pushes it via AP_SET_LLM: it holds the key LIST per provider, the
+             per-action model routes and their fallback chains. This panel used to be a second
+             editor, and its Save wrote the flat {provider,model,apiKey,enabled} shape over the
+             whole object — silently destroying the key list and routes. One owner instead of
+             two, so that can't happen. "Test" round-trips the STORED config ([LLM-TEST] in the
+             SW console) without writing anything. -->
+        <div id="llm-summary">AI: reading config…</div>
+        <button id="llm-open-site">Edit on the website → AI page</button>
+        <button id="llm-test">Test the stored AI config</button>
+        <!-- DEBUG: log every CDP keystroke/click ([ApplyPilot][INPUT]) in the SW console. Saved on toggle;
+             cdp.js reads it at each run start. Off by default (keeps production fills quiet). -->
+        <label><input id="debug-input-trace" type="checkbox"> Debug: log every keystroke/click (SW console)</label>
+        <hr>
+        <!-- TEMPORARY: per-posting company. Later the JD-page extraction writes jobContext. -->
+        <label for="company">Company for this application (temporary):</label>
+        <input id="company" type="text" placeholder="e.g. Cambium Learning">
+        <button id="set-company">Set company</button>
+        <div id="status"></div>
+      </div>
+    </details>
+
     <script src="db.js"></script>
     <script src="llm-keys.js"></script>
     <script src="llm.js"></script>
+    <script src="assist.js"></script>
     <script src="popup.js"></script>
   </body>
 </html>

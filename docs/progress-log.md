@@ -33,6 +33,7 @@ For current state and open work, see **`docs/status.md`**.
 | **AI batching / stray clicks** | `2026-08-06 — one AI call per page, and the stray click that was blamed on Workday` |
 | **Résumé attach** | `2026-07-29 (later) - ` (the `role="alert"` status-channel fix) |
 | **Service-worker breakage (the two Node-invisible classes)** | `2026-07-28 — Dead service worker: two files declaring one name`, `2026-07-28 — The replay walk never settled the page` |
+| **Manual assist (the popup's match card + two buttons)** | `2026-08-10 — MANUAL ASSIST: the extension gets its own surface` |
 | **Latest live sweeps** | `2026-08-09 — live sweep: marvell + moog verified`, `2026-08-09 (b) — the non-Workday merge did NOT regress Workday` |
 
 ## Progress log
@@ -4931,3 +4932,135 @@ and nothing re-evaluated it.
 
 Reverted immediately (`git checkout -- fill-driver.js background.js`), suite re-run, and the extension
 reloaded so the running build matches the committed one — the experiment flag was never committed.
+
+## 2026-08-10 — MANUAL ASSIST: the extension gets its own surface (a match card + two buttons)
+
+Operator: *"the full end to end run should be website controlled, but the extension should be manual
+filling like simplify."*
+
+Until now the popup WAS the dev console — ~25 buttons, every recon probe, three separate fill paths, and
+no answer to the only question someone opening it on a job posting actually has. The end-to-end pipeline
+had already moved to the website, so the popup was left as an instrument panel for a machine that is
+driven from somewhere else.
+
+**What it is now.** One card and two buttons:
+
+- **the match card** — open the popup on any posting and it scores the job against your profile (1–10 +
+  verdict) and lists **what the posting asks for that your résumé does not say**. One LLM call, then
+  cached per job.
+- **"Fill form"** — get into the application (Apply → sign in → verify) and fill every page through to
+  the review page, where the walk stops. Never submits.
+- **"Fill page"** — fill the page in front of you and stop. No Next; you click Save & Continue.
+
+Everything that used to be here is folded behind a `Developer tools` disclosure, verbatim — `popup.js`
+binds every one of those ids directly and would throw on the first missing one, so it was left untouched
+and the new surface lives in its own `assist.js`.
+
+**AI-GATED "Fill form" (the operator's own amendment to the design).** With AI off, any page carrying a
+screening question the profile does not answer leaves a REQUIRED field empty, Workday refuses to advance,
+and the walk halts `nav-timeout` several pages in. So the button REFUSES up front, with the reason on
+screen, and the SW re-checks it rather than trusting the UI state — the button being enabled is a UI
+fact; this is the thing that advances a live application. "Fill page" stays available with AI off and
+simply leaves those questions blank, which is what the operator asked for ("if AI is off, then skip the
+AI filled questions"). There is no AI checkbox in the popup: the website owns `llmConfig`, and the popup
+shows a read-only lamp — the same one-owner rule that stopped the popup destroying the key list.
+
+**Neither button pushes a review bundle.** A manual fill is not work awaiting review — the operator is
+looking at the page. Pushing it would put it on the website's review/teach pile and ask them to approve
+what is already in front of them. So: `runCdpWalk({manual:true})` fills identically and skips only the
+`reportApplication` push; a single-page manual fill persists NOTHING at all (it has no downstream reader,
+and the accumulated bundle it would overwrite belongs to whatever application was filled last — clobbering
+that is how a later dry-replay replays the wrong job's values). The manual WALK still persists locally,
+because the walk reads back its own bundle for section shapes and page keying.
+
+**The tracker row comes from the SUBMIT, not the fill.** `armManualSubmitWatch` records the tab; a
+`tabs.onUpdated` listener (no polling, no alarms — a submit navigates, and a navigation is what wakes an
+MV3 worker) re-reads it, snapshots Workday's REVIEW page on the way past, and on confirmation writes the
+row as `fill_mode:'manual'`.
+
+The row carries a bundle whose **`entries` array is EMPTY**, and that — not a null bundle — is what keeps
+it off the review and teach surfaces: both derive their work PER ENTRY (`teachableCards` iterates
+`bundle.entries || []`), so zero entries means zero cards and nothing to approve. Reporting a null bundle
+would have done the same job while throwing away the review-page scan, because the scan already has a home
+and a renderer — `review_bundle_json.workday_review_page` → `components/app/SubmittedRecord`, built for
+submit runs. So the manual row reuses that exact shape (same field names, same 400-item cap, same recorded
+truncation) and the operator can actually SEE what was submitted. `main.sql` section **0019** therefore
+adds ONE column, `fill_mode`, appended to main.sql rather than as a numbered file — 0017/0018 already live
+only there, and the header now says so. The tracker shows a `manual` chip, fetched through the same
+optional-column ladder `approved_at` uses, so a database that has not run 0019 renders the tracker
+normally instead of empty; and `fill_mode` is named in the report route's drop-and-retry guard (whose
+comment says the list "must GROW with every optional column"), so such a database loses the LABEL, never
+the row.
+
+What it can SEE depends on the host, and it never pretends otherwise: a Workday host is in the manifest,
+so it reads the page and can both snapshot review and confirm from the confirmation text; anywhere else it
+sees the URL only, so just the unambiguous confirmation paths count and the row simply says the
+application was filled manually — exactly the operator's "if it is possible sure put the review page scan,
+if not possible, just put nothing and say manually filled."
+
+**⚠ The one unobserved DOM in the whole pipeline.** Nothing has ever been submitted through this project,
+so Workday's post-submit page has never been traced — and the standing rule is to trace before writing a
+handler. `SUBMIT_CONFIRM_RX` is therefore built from wording common across ATSs (the live-verified
+Greenhouse/Lever regex in `atsInjSubmitState` is its ancestor), and the watcher LOGS the heading of any
+same-host page it does not recognise as a confirmation, once per URL, so the first real submit hands over
+the evidence to tighten it with. `submitEvidenceVerdict` refuses structure-only evidence: navigating off
+the review page looks identical to submitting, and a tracker row invented from that would be a fabricated
+application.
+
+**"No recon happens, the page just fills."** Manual mode skips `captureChoiceOptions` and
+`sweepAlreadyFilled` — both exist ONLY to feed the website review editor, and capture is the most
+expensive read-only pass on the page (8.6s of page 2's 15.6s on cat.wd5; it is also literally what the
+operator saw as the walk "hovering" over the fields). Everything protecting the VALUE is untouched:
+per-commit read-back, and the M40 audit with its repair pass. Manual means no review surface, never less
+verification.
+
+**Scoring is the website's rubric, ported and PINNED.** `web/lib/score.ts` is now a TODO(dup) lockstep
+pair with lib.js, enforced by `web/test/score-lockstep.test.ts` cross-loading the real `lib.js` — two
+copies of a PROMPT drift silently and only in the answers, which would make the same card mean different
+things depending on where it was computed. "Missing from your resume" is DERIVED, not asked for: the model
+already returns `keywords`/`gaps`, and which of those you have is a fact about your own profile, so it is
+a **whole-word** check against the candidate summary (bare `includes` puts `Git` inside "Digital" and
+`CAN` inside "Canadian" — the lesson the skills matcher paid for live). `match` rides `fill`'s model route
+via a new alias in both `llm-keys` copies.
+
+**Permissions unchanged — still deliberately NOT `<all_urls>`.** The card works on an arbitrary employer
+careers page because the operator's own click on the toolbar icon grants `activeTab`; the background
+watcher is limited to hosts already in the manifest and records less when it cannot read a page. An
+on-page Simplify-style widget was offered and declined for exactly this reason.
+
+**NON-WORKDAY GETS THE SAME "Fill page", AND IT FILLS IN PLACE (operator, 2026-08-12: "for non workday
+forms, there should also be a fill page button and no recon needed").** The first cut routed a Greenhouse
+/ Lever / Ashby page through `runAtsApplicationRun` with a forced reload, on the standing invariant that
+our page overrides must be installed BEFORE a document exists or react-select never resolves again. That
+was the wrong reading of the rule. `cdpInstallPageOverrides` does two things — registers on new documents
+AND `Runtime.evaluate`s itself into the CURRENT one — and it is the second half that half-natives a live
+React page. The overrides exist to free a **hidden** tab from Chrome's timer throttle, and a manual fill is
+by definition on the tab the operator is looking at, where native timers are already fast. **So the rule is
+about the OVERRIDES, not about filling in place: don't install them, and the page can be filled where it
+stands.** `runManualAtsFillPage` therefore does no navigation, no reload, and none of the landing work
+(posting-gone checks, apply-link/button chase, redirect hops) — that work exists to FIND an application
+from a link, and here the operator has already found it. `waitAtsFormReady` still runs, because it is a
+readiness check rather than recon: it answers "are the fields mounted, and is this an application form at
+all" before anything is touched. `cdpSetFocusEmulation` is kept — a CDP flag, not a page script, so it
+cannot half-native anything. "Fill form" on an ATS keeps the reload-and-chase path (it is the get-me-in
+button and it navigates anyway), and the popup labels it "Fill form (reloads)" so the difference is visible
+on a form you have already typed into.
+
+Which button may fire is now `formIsOnPage` (lib.js, unit-pinned): `formFieldCount` counts Workday's
+`formField-*` wrappers and an ATS form has none, so the other three fall back to the generic visible-input
+count against `ATS_FORM_MIN_FIELDS`. It is a HINT — the run function re-checks with its own scan — which is
+why a coarse threshold is acceptable here and would not be at the actuation layer.
+
+**Rebased onto main (79 commits) and re-fitted to what changed there.** Four things had to move:
+`0016_manual_fill.sql` collided with main's own `0016_drop_filling_status` and became a section in
+`main.sql`, which is the source of truth now; the tracker's column select joined main's optional-column
+ladder (naming a column the database lacks fails the WHOLE query and renders the tracker empty — the trap
+main documented for `approved_at`); `fill_mode` joined the report route's drop-and-retry guard for the same
+reason; and `runMatchScore` stopped hand-rolling its provider loop in favour of `makeCdpActuation(cfg).llm`
+— main had since grown in-call expansion of an `auto` slot into one attempt per candidate, and a duplicated
+loop would have sent the literal model name "auto" to the provider. `makeCdpActuation` builds closures
+only, so calling it without a tab or an attach is free.
+
+**Verified:** extension suite **1416/1416**, website **279/279** + `tsc --noEmit` clean, and both popup
+states rendered and eyeballed against the real CSS. **LIVE-VERIFY PENDING** — no real posting has been
+driven through the new buttons yet, and the submit detector is waiting on its first real submit.

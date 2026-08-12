@@ -32,4 +32,8 @@ export type Application = {
   login_created?: boolean | null;
   login_verified?: boolean | null;
   login_at?: string | null;
+  // "manual" = filled with the extension's own two-button surface and submitted by hand (migration
+  // 0016). Such a row carries no review bundle by design — there is nothing to approve, it is already
+  // sent — so the tracker labels it instead of offering a review it cannot give.
+  fill_mode?: string | null;
 };

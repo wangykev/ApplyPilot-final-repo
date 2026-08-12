@@ -37,7 +37,9 @@ const LLM_ACTIONS = ["fill", "essay", "resume_parse", "cover_letter"];
 // `teach` classifies a question the same way the fill does — same kind of judgement, same
 // prompt shape — so giving it a separate model would be a knob with no real decision
 // behind it. It follows whatever `fill` is set to, including fill's fallback chain.
-const LLM_ACTION_ALIASES = { teach: "fill" };
+// `match` (the popup's JD match card) is the same kind of judgement call against the same profile, so it
+// rides fill's route rather than adding a row nobody would set differently.
+const LLM_ACTION_ALIASES = { teach: "fill", match: "fill" };
 
 // ─── Config normalization ───────────────────────────────────────────────────
 
