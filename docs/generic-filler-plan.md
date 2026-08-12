@@ -418,16 +418,121 @@ run spends far more of its life navigating: JD → apply-CTA hop → possible in
 vendors whose CTA may be a button with no href (Dayforce) or an opaque token (Paylocity). Every one of
 those hops is the navigation case. So:
 
-- The page clock turns on **only once a form is confirmed present and settled** — not when the run starts.
-- Every hop before that is SW-timed, and therefore **budget-bounded, never attempts-bounded** (round 6:
-  lateness is latency, not lost coverage — a wait that timed out wants a bigger BUDGET).
+- ⚠ **DO NOT arm the page clock on the generic path. This plan proposed it and main REFUTED it**
+  (`2a52635`, reverted, no code shipped). Arming it in the two ATS settle loops made things **worse** —
+  2 pace overruns became **5, mostly `page-abandoned`** — because the settle runs immediately after a
+  NAVIGATE, the state round 3 already flagged as unsafe for *either* clock.
+- ⚠ **And the gate this plan proposed — "turn it on once a form is confirmed present" — is the exact gate
+  that failed.** The flaw, worth memorising: **a successful `cdpEval` proves the document EXECUTES, not
+  that its TIMERS fire.** `Runtime.evaluate` is not timer-driven, so on a freshly navigated document those
+  two come apart, and the page arm hangs while the abandonment ceiling (itself an SW timer) fires late.
+  A scan succeeding is **not** evidence the page clock is safe.
+- **What DOES transfer is the drift, and the fix is BUDGET.** Live hidden Greenhouse: a 450ms pace took
+  2987ms (6.6×), a 1000ms pace took 3045ms. `waitAtsFormReady` accepts on three consecutive equal reads,
+  so a 6.6× beat pushes acceptance from ~900ms to ~6s and its deliberate 2500ms floor stops being what
+  binds. So: **budget-bounded, never attempts-bounded** (round 6: lateness is latency, not lost coverage).
+- **Check what there is to pace before porting anything.** `ats.js` has **ZERO SW poll loops**
+  (background.js 28, fill-driver.js 28): actuation is page-side synthetic and the fill's own sleeps run in
+  the page. Most of the Workday pacing work has nothing to bite on in an ATS-shaped driver.
+- **There is no hidden-tab penalty on this path** — refuted with an idle control arm (`871cb09`): per-call
+  medians hidden 11203ms / visible 14438ms / **idle 11922ms**, with visible-vs-idle indistinguishable
+  (p=0.303). A 46.8s call with no tab open is provider latency and can be nothing else. Do not re-open this.
 - Any NEW poll the generic driver adds must be classified **monotone / stability / transient** before it
   ships. Transients cannot be polled on a starved clock; they need a page-side `MutationObserver`. Round 6
   audited all 59 existing loops and found class-transient empty — do not be the one to add the first.
 - **Never print a poll count you did not COUNT** — a derived count assumes the clock kept time, which is
   the one thing under test.
 
-## 8. Constraints the design must respect
+## 8. The AI request budget — mirror the DEFERRED batch, not the speculative cache
+
+**The generic driver must adopt the ATS path's deferred-AI ordering** (`1cc377f`, live-verified round 10).
+This is the single most important efficiency decision in the design, and it is about **request COUNT, not
+wall-clock**.
+
+### The shape
+
+```
+fill deterministically TO COMPLETION
+  → record every question that could not be answered  (defer — do NOT ask yet)
+  → ONE batched call for exactly those questions
+  → a SECOND actuation pass commits the answers
+```
+
+Live on the cloudflare fixture: **7 calls became 1** — `AI batch: 7 deferred question(s) in ONE call`,
+`[LLM] ok in 2257ms`, the only `[LLM]` line of the run, all 7 committing read-back values as
+`filled_review · ai-choice`, with field counts identical to the pre-change baseline (15 filled / 8
+filled_review / 2 skipped).
+
+### Why the count is what matters
+
+**Key rotation advances only on FAILURE**, so N calls all go through the same key, and a free Gemini key
+meters **15 requests/minute**. A 7-question page burned half of one key's minute — which is exactly the
+operator's "sometimes I call AI 16 times a minute, the limit is 15". A generic driver is *more* exposed
+than the ATS path, because it knows less and will therefore defer more questions per page.
+
+⚠ **Do not grade this on fill time.** In that run the LLM was 2.3s of a 33.8s fill (6.7%) while
+`candidate-location` alone was 17.1s. Collapsing 7 calls into 1 is invisible on the clock and always was.
+
+### ⚠ This is the OPPOSITE ORDER to Workday's `aiBatch`, and the two must NOT be unified
+
+| | Workday `aiBatch` (fill-driver ~4180) | ATS deferred batch — **what the generic driver copies** |
+|---|---|---|
+| When | **Before** the deterministic pass, so they overlap in time | **After** it, once the outcome is known |
+| What it is | a speculative **CACHE** — a miss just makes its own call | a **deferred batch** — nothing is asked about an answered field |
+| Cost | must **PREDICT** which fields will fall through; every misprediction is a paid request for a question the profile already answered | strictly cheaper |
+| Price paid | none | needs a real **second actuation pass** |
+
+The generic driver has no reason to predict — it can afford the second pass — so it takes the deferred
+form. Keeping both shapes in the codebase is deliberate; a "unification" refactor would silently
+re-introduce prediction.
+
+### Four load-bearing details, each of which is a bug if dropped
+
+- **Cache by QUESTION (`normalizeLabel`), never by field id.** Cascade rounds re-enter the fill loop with
+  late-mounted fields; the same wording under a new id reuses the answer already paid for. Beyond cost,
+  this makes it **impossible for one page to hold two different answers to the same question** — which
+  matters more on the generic path, where §3's identity ladder already admits that ids are often
+  non-durable and labels are often duplicated.
+- **A deferred combobox is READ then CLOSED — gated on the option COUNT, not `aria-expanded`.** Same
+  reason as everywhere else: a menu left mounted swallows the next widget's open-click. The old per-field
+  path held a menu open across the entire LLM call; deferring removes that window because nothing is
+  committed while the call is in flight.
+- **ONE deferred question is not a batch.** It takes the single-question path unchanged — wrapping one
+  request in a batch prompt buys nothing and adds a parse that can fail.
+- **Places/location widgets are deliberately NOT pre-read.** A places box has no list until something is
+  typed, so an empty-query open can only return nothing — and it is the most expensive widget on the path
+  (`candidate-location` spans **7.1–20.3s on one posting**). This generalizes directly: Workable's address
+  autocomplete and Paylocity's `public-site-address-address-1` are the same widget class.
+
+### Cost, stated honestly
+
+One extra **open + close per deferred combobox** (defer reads the options; the commit pass re-opens because
+committing needs a mounted listbox). Radio / yes-no / checkbox-group / native-select options come from the
+scan and cost nothing — which is exactly why §7's `mustOpen` census is the number to watch. There is also a
+**double option-read on a combobox whose menu never renders**, deliberately not short-circuited: a
+transient empty read would otherwise permanently strand a REQUIRED field, and a second chance is the safer
+direction on a widget headed for review either way.
+
+### Safety is unchanged, and that is the point
+
+A batched answer enters through the **same seam** a per-field answer did. It is still only a **CANDIDATE
+that must clear the match ladder against the LIVE options read at commit time**, still read-back verified,
+still **always `filled_review` + flagged**. A batch that fails, parses badly, or omits a question leaves
+that field to make its own call — the pre-batch behaviour exactly. **A batch failure costs LATENCY, never
+COVERAGE.** Two failure modes already found and fixed upstream, both worth copying:
+- the parser **silently dropped an answer that arrived under the OTHER key** (`2fa5a55`) — accept both;
+- a successful call that parses to nothing must **dump the reply** (`fe5ee46`), or the evidence for the
+  only claim being made does not exist.
+
+### ⚠ And a method rule from this round: a duration is not a code path
+
+The round-10 log first recorded the react-select defer as *not* live-covered, inferring from a 20–29ms
+defer cost that those fields were native `<select>`s. Inspecting the DOM refuted it — **0 native selects,
+16 comboboxes** — and 20–29ms is simply what four ~1ms CDP evals cost. When the question is *which branch
+ran*, read the DOM or add a log line. Never infer a branch from a timing. (This plan's own §7 census makes
+the same mistake easy: `mustOpen` must be decided from list CONTENTS, not from tag names or timings.)
+
+## 9. Constraints the design must respect
 
 - **CDP-only.** Universal filling across arbitrary employer hosts via content scripts would need
   `<all_urls>`, which the manifest deliberately refuses. Discovery already reads arbitrary pages through
@@ -445,17 +550,22 @@ those hops is the navigation case. So:
 
 ---
 
-## 9. Build order
+## 10. Build order
 
 1. **The scan ladder** (§3–§4) as a pure, Node-testable function over a DOM+AX snapshot, with the corpus
    above pinned as fixtures. Each rung gets the regression it was earned from: Greenhouse's 6 mirrors,
    Breezy's 2 wrong group labels + honeypot, Lever's error-bleed and excluded résumé, Workable's random
    id and option-list bleed.
-2. **The generic driver** — scan → the existing brain → the existing bundle. Everything flagged. Verify
-   against the two controls first: it must reproduce what `ats.js` already gets right on Greenhouse and
-   Lever before it is pointed at anything new.
+2. **The generic driver, with the DEFERRED-AI ordering built in from the start** (§8) — scan → settle gate
+   → deterministic fill to completion → record deferred questions → ONE batched call → second actuation
+   pass → the existing bundle. Everything flagged. **Do not ship a per-field-call version first**: the ATS
+   path already paid for that mistake, and a generic driver defers *more* questions per page than
+   `ats.js` does, so it would hit the 15-req/min key quota sooner. Verify against the two controls first —
+   it must reproduce what `ats.js` already gets right on Greenhouse and Lever before it is pointed at
+   anything new.
 3. **The widget-driver registry** (§5), fingerprint-keyed, extracted from `atsActuateField`.
-4. **Flow blockers** (§6) as explicit halts: bot-wall, consent-wall, posting-gone, apply-CTA vocabulary.
+4. **Flow blockers** (§6) as explicit halts: bot-wall, consent-wall, posting-gone, apply-CTA vocabulary,
+   never-hydrates (Phenom), and the guest-vs-account chooser.
 5. **Named adapters, cheapest first** — each one now a *refinement* of a working baseline: recon tells you
    the three things the generic scanner got wrong, and you override only those.
 
@@ -475,7 +585,7 @@ If the generic driver handles Paylocity honestly, the ladder is real.
 
 ---
 
-## 10. Open questions — each needs recon, none should be guessed
+## 11. Open questions — each needs recon, none should be guessed
 
 - **AngularJS commit semantics** (Breezy). Does native-setter + `input` commit through `ng-model`, or is a
   digest needed? Untested; every current synthetic-input assumption was proven against React only.

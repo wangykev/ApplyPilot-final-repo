@@ -37,7 +37,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
-| **Generic filler / non-Workday ATS survey** | `2026-08-11 — SEVEN non-Workday ATSs` (Workable · Breezy · SmartRecruiters · Teamtailor · Rippling + the Greenhouse/Lever controls; the DOM-vs-AX-tree experiment, honeypots, validation mirrors, label pollution, consent + bot-detection walls) · `2026-08-11 (b) — the generic scan is FREE` (scan cost 0.2–0.4ms, the options census, the heading-rung regression, the apply-GATE taxonomy, the operator's real queue, KEF Robotics/Wix) |
+| **Generic filler / non-Workday ATS survey** | `2026-08-11 — SEVEN non-Workday ATSs` (Workable · Breezy · SmartRecruiters · Teamtailor · Rippling + the Greenhouse/Lever controls; the DOM-vs-AX-tree experiment, honeypots, validation mirrors, label pollution, consent + bot-detection walls) · `2026-08-11 (b) — the generic scan is FREE` (scan cost 0.2–0.4ms, the options census, the heading-rung regression, the apply-GATE taxonomy, the operator's real queue, KEF Robotics/Wix) · `2026-08-11 (c) — THROUGH the apply gate` (real Dayforce + Paylocity forms: form grows after paint, label-only required markers, duplicate labels, opaque entry ids, multi-step) · `2026-08-12 — Phenom People` (never-hydrates blocker; UltiPro/NEOGOV job identity lives in the query string) |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
 | **Host / URL shapes** | `2026-07-22 — logged-in host is` |
 
@@ -4235,6 +4235,7 @@ would report page chrome as application fields. Gate on `atsLooksLikeApplication
 | account/session | Oracle Fusion (`eeho.fa.us2.oraclecloud.com`) | operator was already signed in |
 | consent wall | Teamtailor (hard); Dayforce / Paylocity banners | never click an affirmative control |
 | bot wall | SmartRecruiters (DataDome) | `needs_operator` |
+| **never hydrates** | Phenom (BAE) | body/control count never rises ⇒ `needs_operator`, never "empty form" |
 | posting gone | Rippling ×2 · SmartRecruiters · Jobvite · Recruitee | **4 distinct signals** (below) |
 
 **Posting-gone signals so far:** redirect → board index (Rippling) · redirect → vendor homepage
@@ -4320,6 +4321,48 @@ nodes; labels **100%** (14 `label[for]`, 2 `aria-label`).
 and `getComputedStyle()` per control, forcing a reflow each time, and 44 fields is where it starts to bite.
 **Fix direction: batch the reads** — collect all rects, then all styles, then classify. Still ~1.5ms
 typical, so this is a tail-latency note, not a refutation of "the scan is free".
+
+### 2026-08-12 — Phenom People, and two vendors whose job identity lives in the QUERY STRING
+
+Third recon round off the operator's queue. Two new blocker classes, no new forms reached.
+
+**Phenom People (`jobs.baesystems.com`) — the JD never hydrates**
+
+Fingerprint is unambiguous: **287 `[data-ph-at-id]` nodes**. Phenom fronts many enterprise ATSs, so the
+family matters more than this one employer. But the page never became usable:
+
+- `document.body.innerText.length` stayed at **2001 chars** through a 7s wait, a scroll, and a further 6s —
+  only accessibility/AI-usage boilerplate, never the job description.
+- **`[data-ph-at-id]` count DROPPED 287 → 124 after scrolling** — the page is de-hydrating/re-rendering, not
+  progressively filling in.
+- **No Apply CTA ever existed.** The only apply-ish controls were nav chrome ("Applicant Resources",
+  "How to Apply", "Check Application Status" — the last two `visible:false`). 0 form controls throughout.
+- A sticky **Deny/Allow consent banner survived a coordinate click** on Deny and remained pinned to the
+  viewport top.
+
+⚠ **New blocker class: NEVER-HYDRATES.** Distinct from consent-wall (there a form exists once consent is
+resolved) and from posting-gone (there the vendor says so). Here the page is live, the posting is real, and
+the content simply never arrives. The generic driver needs to recognise it — a body-text/control-count
+floor that fails to rise across N settle rounds — and halt `needs_operator` rather than scanning 2001 chars
+of boilerplate and reporting an empty form. **Unresolved** whether this is Phenom generally, this tenant,
+consent-gating, or automation detection.
+
+Also on that page: an explicit employer notice that **"AI tools are not permitted during interviews"**
+(interviews, not applications). Page content, recorded as context rather than as a rule.
+
+**⚠ UltiPro and NEOGOV put the job identity in the QUERY STRING, not the path**
+
+Both were unreachable from the path-only URLs used in the 08-11 round, and this was **my sanitization, not
+a dead posting**:
+- `recruiting2.ultipro.com/…/OpportunityDetail` without `?opportunityId=…` renders **"Not Found"** plus a
+  browser-compatibility notice — which reads exactly like a posting-gone signal and is not one.
+- `governmentjobs.com/OnlineApplication/Application/PartialIndex` without its params returns a **completely
+  empty document** (0 controls, 0 forms, empty body) — it is a *partial* endpoint meant to be loaded with
+  params.
+
+**Consequence for the pipeline:** any canonicalization of a queued job URL **must preserve the query string
+for these families**, and a "Not Found"/empty-document reading must not be classified `posting-gone` when
+the URL was rewritten. Both are cheap ways to mark a live job dead.
 
 ### KEF Robotics (Wix) — the pure long-tail form, and it scans perfectly
 
