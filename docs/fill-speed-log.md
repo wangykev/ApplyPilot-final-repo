@@ -1036,6 +1036,83 @@ both exist for.
 
 ---
 
+## 2026-08-11 — round 10: DEFERRED AI on the ATS path — one call per page instead of N
+
+Rounds 8 and 9 attacked how long each LLM call takes (adaptive fast-retry, AUTO model, key pinning:
+~11s → ~0.5s per call). This round attacks **how many calls a page makes**, which nothing had touched.
+
+### The shape that was there, and what was wrong with it
+
+`ats.js` fired ONE call per unanswered field — 7 on the cloudflare fixture, all `ai-choice`. Since
+2026-08-05 they ran 4-at-a-time (`atsPrefetchAiText`), which hid latency. It did not reduce REQUESTS,
+and requests are the scarce thing:
+
+- **Rotation does not spread them.** Round 9 measured 6/6 calls on key 1 with key 2 never touched —
+  rotation advances only on FAILURE. So N calls is N requests through ONE key, and free-tier Gemini
+  meters **15 requests/minute PER KEY**. A 7-question page spends half of one key's minute. This is
+  exactly the operator's *"sometimes I call AI 16 times per minute, the limit is 15"*.
+- **It had to PREDICT.** The prefetch ran before the deterministic pass, so it re-ran `atsRouteField`
+  to guess which fields would fall through. Every misprediction is a paid request for a question the
+  profile already answered.
+
+### The change
+
+Deterministic pass runs FIRST and to completion → every field it could not answer is RECORDED →
+**ONE call** asks about exactly those → a second actuation pass fills them.
+
+⚠ **This is the OPPOSITE ORDER to Workday's `aiBatch`, and they must not be unified.** Workday fires
+its batch BEFORE the deterministic pass so the two overlap in time — which is what makes it a
+speculative CACHE (a miss just makes its own call) and what forces it to predict. Here the outcome is
+already known, so nothing is asked about an answered field. Strictly cheaper on tokens and requests;
+paid for with a real second actuation pass, which the Workday cache does not have.
+
+**Safety is unchanged by construction:** a batched answer enters through the SAME seam the prefetch
+used (`atsAiFallback`'s `prefetched`). Still a CANDIDATE that must clear the match ladder against the
+LIVE options read at commit time, still read-back verified, still ALWAYS `filled_review` + flagged.
+A batch that fails, parses badly or omits a question leaves that field to make its own call — so a
+batch failure costs LATENCY, never COVERAGE.
+
+### The three details that are load-bearing
+
+- **Cached by QUESTION (`normalizeLabel`), never by automation-id.** The cascade rounds re-enter the
+  fill loop with late-mounted fields; the same wording under a new id reuses the answer already paid
+  for. That is not only cheaper — it makes it **impossible for one page to hold two different answers
+  to the same question**.
+- **A deferred combobox is READ then CLOSED**, gated on the option count rather than `aria-expanded`
+  (the Workday rule, same reason: a react-select menu left mounted swallows the next widget's
+  open-click). The old per-field path opened the menu and then held it open **across the whole LLM
+  call**; nothing is committed during the batch, so that window is gone. Mutation-checked — without
+  the close, both menus sit open across the call.
+- **`location` is deliberately NOT pre-read.** A places box has no list until something is typed, so
+  an empty-query open can only return nothing, and it is the most expensive widget on this path
+  (`candidate-location` spans 7.1–20.3s on ONE posting).
+
+### What it costs, stated honestly
+
+The one cost this ordering adds is **one extra open+close per deferred react-select combobox**: the
+defer pass opens it to read the options, and the commit pass re-opens it because `atsInjCommitOption`
+needs a mounted listbox. Radio / yes-no / checkbox-group / native-select options come from the scan
+and cost nothing. There is also a **double option-read on a combobox whose menu never renders** — the
+defer pass spends its budget, and the commit pass spends it again. That was deliberately not
+short-circuited via `optionsUnreadable`: a transient empty read would then permanently strand a
+REQUIRED field, and a second chance is the safer direction on a widget that is going to review either
+way.
+
+### ⚠ STATUS: unit-verified, NOT yet live-measured
+
+`npm test` 1385/1385 · web 273/273 · `tsc` clean, with the discard / cache-key / close behaviours each
+mutation-checked. **No live run yet** — the extension is loaded from a different working copy, so a
+live A/B needs it re-pointed first (build marker `deferred-ai-1`).
+
+**What a live run must show, and the trap in reading it:** the `[ATS-FILL] AI batch:` line naming N
+deferred questions, then exactly ONE `[LLM]` line for them. ⚠ **Do not grade this on wall-clock.**
+Round 9 left the per-call cost at ~0.5s when AUTO picks a healthy model, so collapsing 7 calls into 1
+is worth only a few seconds of a ~20s fill — and `candidate-location` alone varies by 13s across runs
+of one posting, which swamps it. **The measurable claim is the REQUEST COUNT (7 → 1), not the clock**,
+and the request count is what the 15/min quota actually bills.
+
+---
+
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
 
 Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now

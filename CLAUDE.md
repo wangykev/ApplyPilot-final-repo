@@ -481,6 +481,24 @@ The standing rules:
 - **A CLOSED POSTING IS NOT A BROKEN PIPELINE** — `atsPostingGone` reads Lever's `Not found` title and
   Greenhouse's redirect-to-board-index, and halts `posting-gone` rather than sending the operator to debug a
   fill on a job that no longer exists.
+- **AI IS DEFERRED, THEN ASKED ONCE — and the ORDER is the point (2026-08-11).** The deterministic pass runs
+  FIRST and to completion; every field it could not answer is RECORDED, then **ONE** `act.llm` call asks
+  about exactly those, then a **second actuation pass** fills them. ⚠ **This is the OPPOSITE ORDER to
+  Workday's `aiBatch` (fill-driver.js) — do NOT unify them.** Workday fires BEFORE the deterministic pass so
+  the two overlap in time, which makes it a speculative CACHE that must PREDICT which fields will fall
+  through, paying tokens for every misprediction; here the outcome is already known, so nothing is asked
+  about an answered field. *Why it matters more than latency:* rotation advances only on FAILURE, so N calls
+  are N requests through ONE key, and free-tier Gemini meters **15 requests/minute per key** — a 7-question
+  page spent half of one key's minute. **Safety is unchanged by construction:** the batched answer enters
+  through the SAME seam the old prefetch used (`atsAiFallback`'s `prefetched`), so it is still a CANDIDATE
+  that must clear the match ladder vs the LIVE options read at commit time, still read-back verified, still
+  ALWAYS `filled_review` + flagged — and a batch that fails, parses badly or omits a question leaves that
+  field to make its own call, so a batch failure costs LATENCY, never COVERAGE. Answers are cached **by
+  QUESTION (`normalizeLabel`), never by automation-id**, so a cascade re-mount reuses the answer already
+  paid for and **one page can never hold two different answers to the same question**. A deferred combobox
+  is **read then CLOSED** (gated on the option count, not `aria-expanded`) — nothing is committed while the
+  call is in flight, so no menu is left open across it. **ONE deferred question is not a batch** and takes
+  its own path unchanged. Round 10 of `docs/fill-speed-log.md`.
 
 ## Onboarding walk (pre-form: JD → apply → login → verify)
 
