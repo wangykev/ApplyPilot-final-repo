@@ -37,7 +37,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
-| **Generic filler / non-Workday ATS survey** | `2026-08-11 — SEVEN non-Workday ATSs` (Workable · Breezy · SmartRecruiters · Teamtailor · Rippling + the Greenhouse/Lever controls; the DOM-vs-AX-tree experiment, honeypots, validation mirrors, label pollution, consent + bot-detection walls) |
+| **Generic filler / non-Workday ATS survey** | `2026-08-11 — SEVEN non-Workday ATSs` (Workable · Breezy · SmartRecruiters · Teamtailor · Rippling + the Greenhouse/Lever controls; the DOM-vs-AX-tree experiment, honeypots, validation mirrors, label pollution, consent + bot-detection walls) · `2026-08-11 (b) — the generic scan is FREE` (scan cost 0.2–0.4ms, the options census, the heading-rung regression, the apply-GATE taxonomy, the operator's real queue, KEF Robotics/Wix) |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
 | **Host / URL shapes** | `2026-07-22 — logged-in host is` |
 
@@ -4173,3 +4173,87 @@ heading — hence the two extra rungs in the plan's label ladder.
 - **Posting-gone generalizes.** Both Rippling postings redirected to the board index; the expired
   SmartRecruiters posting rendered `"Sorry, this job has expired"` with 0 forms. `atsPostingGone`'s existing
   redirect-to-index signal covers the first case already.
+
+## 2026-08-11 (b) — the generic scan is FREE; options are the only cost. Plus the operator's real queue
+
+Follow-up round, measured in the **operator's own Chrome** (so bot-defenses see a real profile) against
+live URLs pulled from the queue at `localhost:3500/app/queue`, plus re-probes of the 08-11 corpus.
+Design consequences: `docs/generic-filler-plan.md` §7.
+
+### The generic scan costs 0.2–0.4ms — discovery is not a lag source
+
+`performance.now()`, warm, median of 7 full-scan runs (enumerate → exclude → label ladder → identity →
+required):
+
+| form | DOM nodes | fields | scan median |
+|---|---|---|---|
+| Greenhouse (Anthropic) | 1546 | 24 | **0.4ms** |
+| KEF Robotics (Wix) | 610 | 7 | **0.2ms** |
+| Breezy (Victory) | 300 | 9 | **0.3ms** |
+| Jobvite (locale gate) | 69 | 1 | **0.1ms** |
+
+Flat across a 22× node range. **Treat "the generic scan is slow" as refuted** absent a `[TRACE]`-grade
+measurement. `window.getComputedAccessibleNode` is NOT available, so the AX half cannot be priced
+page-side — it needs a real `Accessibility.getFullAXTree` call inside the extension.
+
+### Options are the only per-field cost — and two census rules are wrong by default
+
+Greenhouse: **11 react-select comboboxes, ALL with 0 options mounted and `aria-controls: null`.** Neither
+the "read them free" path nor Workday's aria-controls-scoped scrape works; each needs open→settle→
+scrape→close.
+
+- ⚠ **Mounted `[role=option]` nodes are not evidence a widget is free.** The page had **244** mounted
+  option nodes — every one belonging to a single always-mounted `iti-0__country-listbox` (intl-tel-input
+  dial codes, `visible:false`), none to any of the 11 comboboxes. **Attribute options to their owning
+  listbox before counting.**
+- ⚠ **"native `<select>` ⇒ options are free" is FALSE.** KEF Robotics' "Are you a US Citizen?" is a real
+  `<select>` whose entire list is `["Choose an option"]`, **unchanged after 4s**. Decide `mustOpen` from
+  the list's CONTENTS, never the tag name.
+
+### ⚠ The heading label-rung made labels WORSE where placeholder already worked
+
+Adding "nearest ancestor heading" to the label ladder *above* `placeholder` regressed Breezy: `cName`,
+`cEmail`, `cPhoneNumber` and `cAddress` all resolved to the section heading **`"Personal Details"` — one
+string for four fields** — where `placeholder` had correctly given "Full Name" / "Email Address" /
+"Phone Number" / "Address". The rung is still required for the radio groups (no placeholder to fall back
+on), so it stays — but **below `placeholder`, and rejecting any heading claimed by 2+ fields** (that is a
+section heading, not a question).
+
+### A JD page is not a form — and the "biggest `<form>`" heuristic lies about it
+
+On the **Dayforce** JD page the only visible controls were **cookie-banner checkboxes plus a language
+picker**, sitting inside a genuine `<form>`. A generic scan trusting "the form with the most controls"
+would report page chrome as application fields. Gate on `atsLooksLikeApplicationForm` before scanning.
+
+### The apply GATE taxonomy, from the operator's live queue
+
+| gate | tenant | note |
+|---|---|---|
+| link with readable href | SmartRecruiters ("I'm interested") | CTA text is not "apply" |
+| link with **opaque base64 token** | Paylocity | not constructible |
+| **button, NO href** | Dayforce | target not derivable at all — must click |
+| account/session | Oracle Fusion (`eeho.fa.us2.oraclecloud.com`) | operator was already signed in |
+| consent wall | Teamtailor (hard); Dayforce / Paylocity banners | never click an affirmative control |
+| bot wall | SmartRecruiters (DataDome) | `needs_operator` |
+| posting gone | Rippling ×2 · SmartRecruiters · Jobvite · Recruitee | **4 distinct signals** (below) |
+
+**Posting-gone signals so far:** redirect → board index (Rippling) · redirect → vendor homepage
+(Recruitee) · `"Sorry, this job has expired"` (SmartRecruiters) · `"The job listing no longer exists."`
+(Jobvite). Five search-sourced postings died within days — **the operator's live queue is the better
+source of test targets.**
+
+### Queue composition — the case for the generic driver
+
+27 queued jobs / 22 hosts. Supported today: Workday ×3, Lever ×2, Greenhouse ×2 (+2 `grnh.se`).
+Unsupported: **Oracle Fusion · UKG/UltiPro · ADP WorkforceNow · Ceridian Dayforce · Paylocity · NEOGOV ·
+BAE ×2 · Crown ×2 · Lincoln Electric · Fives · Astrion · Amazon.jobs · ByteDance · KEF Robotics (Wix) ·
+Getro · recruitics redirect.** **≈19 of 27 (~70%) cannot be driven at all today.**
+
+### KEF Robotics (Wix) — the pure long-tail form, and it scans perfectly
+
+Inline on the JD page, no gate, no captcha: 7 fields, **7/7 labelled** (6 `label[for]`, 1 unit walk), 0
+exclusions, 0.2ms. Identity mixes human ids (`first-name`, `email`) with **Wix build ids**
+(`collection_comp-lpjwscz6`, `fileInputcomp-lpjx9isk`) — the durability-test case again. ⚠ **Only `email`
+carries any required signal**, element and unit agreeing on `false` for everything else including the
+plainly-required citizenship question: on custom forms required-ness can be **JS-only and entirely absent
+from the DOM**, and under-flagging is the dangerous direction.

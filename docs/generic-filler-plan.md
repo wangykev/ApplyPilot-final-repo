@@ -91,10 +91,25 @@ then apply these rungs. Every rung below exists because a corpus form defeated t
 4. wrapping `<label>`
 5. **AX accessible name** (Chrome's AccName, which subsumes 1–4 but also catches vendor quirks)
 6. field-unit `<label>` / `<legend>` / `[class*=label]`
-7. **nearest preceding `<h1>`–`<h6>` heading** ← *the Breezy rung; without it, required EEO groups get an option label as their question*
-8. **adjacent `StaticText` sibling** ← *the consent-checkbox rung*
-9. `placeholder`
+7. `placeholder`
+8. **nearest preceding `<h1>`–`<h6>` heading, DISAMBIGUATED** ← *the Breezy rung; without it, required EEO groups get an option label as their question*
+9. **adjacent `StaticText` sibling** ← *the consent-checkbox rung*
 10. none → **`needs_review`, never a guess**
+
+⚠ **Rung ORDER is load-bearing, and the obvious order is wrong (measured 2026-08-11).** The heading rung
+was first placed *above* `placeholder`, inside the field-unit walk. On Breezy that made labels **worse**:
+`cName` / `cEmail` / `cPhoneNumber` / `cAddress` all resolved to the section heading
+**`"Personal Details"` — the same string for four different fields** — where `placeholder` had correctly
+given "Full Name", "Email Address", "Phone Number", "Address". So:
+
+- `placeholder` is tried **before** an ancestor heading.
+- A heading is accepted only if it is **not already claimed by another field** in the same scan. A heading
+  that would label 2+ fields is a SECTION heading, not a question, and must be rejected.
+- Prefer the nearest **preceding heading in document order** over the nearest ancestor's first heading,
+  and prefer the deepest level (`h3` over `h1`).
+
+The radio-group case still needs the rung (`race_ethnicity` has no placeholder to fall back to), which is
+exactly why it stays in the ladder rather than being dropped.
 
 **⚠ Label text must be a FILTERED read, never `textContent` of the wrapper.** Two corpus forms proved
 this independently:
@@ -214,9 +229,133 @@ and never construct a form URL.
 reconcile-to-exactly-N machinery and the `*_MAP` shape will eventually be needed outside Workday — worth
 knowing before the maps are hard-wired to Workday's containers.
 
+### What the OPERATOR's real queue actually contains (2026-08-11)
+
+The corpus in §1 was assembled from web search. The operator's live queue is a better sample of what the
+tool is actually pointed at, and it is dominated by families no one would have picked from search — **27
+queued jobs across 22 hosts:**
+
+| Family | Hosts in the queue |
+|---|---|
+| **Supported today** | Workday ×3 (sonos.wd1, hp.wd5, moog.wd5) · Lever ×2 · Greenhouse ×2 + 2 `grnh.se` short links |
+| **Enterprise HCM — unsupported** | Oracle Fusion Recruiting (`eeho.fa.us2.oraclecloud.com`) · UKG/UltiPro (`recruiting2.ultipro.com`) · ADP WorkforceNow · Ceridian Dayforce · Paylocity |
+| **Public sector — unsupported** | NEOGOV (`governmentjobs.com`) |
+| **Employer-hosted / custom — unsupported** | BAE ×2 · Crown ×2 · Lincoln Electric · Fives · Astrion · Amazon.jobs · ByteDance · KEF Robotics (Wix) · MAC VC board (Getro) · `jsv3.recruitics.com` (a marketing redirect layer) |
+
+**Roughly 19 of 27 (~70%) are ATSs the extension cannot drive at all today.** That is the case for the
+generic driver, and it says the long tail is not a rounding error — it is the majority of this queue.
+
+### The apply-GATE taxonomy (what stands between a JD and a form)
+
+Six kinds observed, and the generic driver needs a named halt or handler for each:
+
+| Gate | Seen on | Handling |
+|---|---|---|
+| Apply is a **link with a readable href** | SmartRecruiters ("I'm interested"), Paylocity (**opaque base64 token**) | READ it; never construct |
+| Apply is a **button with NO href** | Dayforce | Must click — the target is not derivable at all |
+| Apply needs an **account/session** | Oracle Fusion (operator already signed in) | Existing onboarding-style auth story, per family |
+| **Consent wall** | Teamtailor (hard), Dayforce / Paylocity / SmartRecruiters (banners) | Operator halt — never click an affirmative consent control |
+| **Bot-detection wall** | SmartRecruiters (DataDome) | `needs_operator`; never solve, never bypass |
+| **Posting gone** | Rippling ×2, SmartRecruiters, Jobvite, Recruitee | Four distinct signals so far (see below) |
+
+⚠ **`postingGone` needs to be a first-class, per-family recognizer, not an afterthought.** Five of the
+search-sourced postings died within days of being listed, each announcing it differently: a redirect to
+the board index (Rippling), a redirect to the vendor homepage (Recruitee), `"Sorry, this job has expired"`
+(SmartRecruiters), `"The job listing no longer exists."` (Jobvite). A recon corpus rots fast — which is
+also why the operator's live queue is the better source of test targets.
+
+⚠ **A JD page is not a form, and the "biggest `<form>`" heuristic will happily lie about it.** On the
+Dayforce JD page the only visible controls were **cookie-banner checkboxes and a language picker**, inside
+a real `<form>` tag. A generic scan that trusts "the form with the most controls" reports page chrome as
+application fields. `ats.js` already has `atsLooksLikeApplicationForm`; the generic driver must gate on it
+before scanning anything.
+
 ---
 
-## 7. Constraints the design must respect
+## 7. Speed — the lag model, measured (2026-08-11)
+
+**Read `docs/fill-speed-log.md` first.** Its standing conclusions govern this design, and the biggest one
+is counter-intuitive: **the lag was never the DOM or the tenant — it was our own MV3 service-worker
+`setTimeout`, overrunning `act.delay` by 3–69×** (a `delay(250)` measured at 17.30s). Round 2 fixed it by
+pacing on the page's worker-backed clock: page-1 fill **154.6s → 6.4s**, whole-run **194.5s → 30.4s**.
+
+### What the generic scan actually costs — it is free
+
+Measured page-side with `performance.now()`, warm, median of 7 runs of the full scan (enumerate →
+exclude → label ladder → identity → required):
+
+| Form | DOM nodes | fields | **scan median** |
+|---|---|---|---|
+| Greenhouse (Anthropic) | 1,546 | 24 | **0.4 ms** |
+| KEF Robotics (custom Wix) | 610 | 7 | **0.2 ms** |
+| Breezy (Victory) | 300 | 9 | **0.3 ms** |
+| Jobvite (locale gate) | 69 | 1 | **0.1 ms** |
+
+Sub-millisecond on every form, and flat against DOM size over a 22× node range. **Discovery is not a lag
+source and must not be optimized.** Any future "the generic scan is slow" claim should be treated as
+already refuted unless it comes with a `[TRACE]`-grade measurement.
+
+### The ONLY expensive part is learning a widget's OPTIONS
+
+This is `captureChoiceOptions` generalized, and it is the one real cost: **4.7–21.1s per Workday run**
+today, all of it re-opening choice widgets purely so the review editor gets a real picker.
+
+Measured on Greenhouse: **11 react-select comboboxes, every one with zero options mounted and
+`aria-controls: null`.** So neither trick available elsewhere works — options are not in the DOM, and
+Workday's "scope the scrape to the trigger's own `aria-controls` listbox" resolves to nothing. Learning
+those 11 vocabularies means 11 × (open → settle → scrape → close), each step paced.
+
+⚠ **Two census rules, both earned by measurement:**
+- **A mounted `[role=option]` set is not evidence the widget is free.** Greenhouse had 244 mounted option
+  nodes — *all 244 belonged to one always-mounted `intl-tel-input` dial-code list*, and none to any of the
+  11 comboboxes. Attribute options to their owning listbox before counting them.
+- **"native `<select>` ⇒ options are free" is FALSE.** KEF Robotics' "Are you a US Citizen?" is a real
+  `<select>` holding exactly one option, `"Choose an option"`, still unchanged after 4s. A select whose
+  list is only a placeholder is `mustOpen`, same as a combobox. **Decide `mustOpen` from the list's
+  CONTENTS, never from the tag name.**
+
+### The design rule that keeps the generic filler fast
+
+**Open a widget only when a FILL decision depends on its options. Never open one merely to populate the
+review picker.**
+
+This generalizes the carve-out `CLAUDE.md` already documents for skills ("capture SKIPS skills… review
+renders its recorded `"A; B; C"` text instead", page 2 fill 15.6s → 8.0s). It matters more here than on
+Workday, because a generic driver knows *less* about each widget and is therefore tempted to open *more*
+of them. Concretely:
+
+- A field the profile/bucket answers, on a widget we must match against → open it (the match ladder needs
+  the live options; that is a correctness requirement, not a nicety).
+- A field left blank, or one whose value we will replay as recorded text → **do not open**. Review shows
+  the recorded value, not a picker.
+- The vocabulary is already mounted and attributable to that widget → read it free, open nothing.
+
+⚠ **The obvious next lever — caching fixed vocabularies across runs — was built, live-verified at
+21.3s → 0.0s, and then REVERTED (`f685b10`, reverted by `235dd9e`) with an empty commit message and no
+note in any doc.** Until that reason is recovered it must be treated as a **known-refused approach**, not
+a free win. See open questions.
+
+### Pacing: the generic driver's new hazard
+
+`cdpSetPageClock(on)` is **scoped opt-in** — FILL and REPLAY enable it; **onboarding, auth and recon stay
+SW-timed**, because *a navigating document's timer does not fire* and the abandon ceiling is itself an SW
+timer, so a pace there has no reliable bound (50ms requested, 3.5–5.0s observed).
+
+**⚠ This is sharper for the generic filler than for Workday, and it is the main new lag risk.** A generic
+run spends far more of its life navigating: JD → apply-CTA hop → possible interstitial → the form, across
+vendors whose CTA may be a button with no href (Dayforce) or an opaque token (Paylocity). Every one of
+those hops is the navigation case. So:
+
+- The page clock turns on **only once a form is confirmed present and settled** — not when the run starts.
+- Every hop before that is SW-timed, and therefore **budget-bounded, never attempts-bounded** (round 6:
+  lateness is latency, not lost coverage — a wait that timed out wants a bigger BUDGET).
+- Any NEW poll the generic driver adds must be classified **monotone / stability / transient** before it
+  ships. Transients cannot be polled on a starved clock; they need a page-side `MutationObserver`. Round 6
+  audited all 59 existing loops and found class-transient empty — do not be the one to add the first.
+- **Never print a poll count you did not COUNT** — a derived count assumes the clock kept time, which is
+  the one thing under test.
+
+## 8. Constraints the design must respect
 
 - **CDP-only.** Universal filling across arbitrary employer hosts via content scripts would need
   `<all_urls>`, which the manifest deliberately refuses. Discovery already reads arbitrary pages through
@@ -234,7 +373,7 @@ knowing before the maps are hard-wired to Workday's containers.
 
 ---
 
-## 8. Build order
+## 9. Build order
 
 1. **The scan ladder** (§3–§4) as a pure, Node-testable function over a DOM+AX snapshot, with the corpus
    above pinned as fixtures. Each rung gets the regression it was earned from: Greenhouse's 6 mirrors,
@@ -255,7 +394,7 @@ iCIMS / Taleo / SuccessFactors are Workday-shaped and belong in a separate, late
 
 ---
 
-## 9. Open questions — each needs recon, none should be guessed
+## 10. Open questions — each needs recon, none should be guessed
 
 - **AngularJS commit semantics** (Breezy). Does native-setter + `input` commit through `ng-model`, or is a
   digest needed? Untested; every current synthetic-input assumption was proven against React only.
@@ -264,9 +403,20 @@ iCIMS / Taleo / SuccessFactors are Workday-shaped and belong in a separate, late
   blocked either way — but the answer decides whether the address flow needs a composite handler.
 - **Does DataDome pass in the operator's own Chrome?** Decides whether SmartRecruiters is supportable at
   all. Must be tested in a real profile, not an automated one.
-- **Does the AX tree stay cheap at scale?** `getFullAXTree` on a large form is unmeasured. Given the
-  standing rule that a slow page is the LLM until proven otherwise, this needs its own measurement before
-  it is blamed or exonerated.
+- **Does the AX tree stay cheap at scale?** Still unmeasured, and it now has to be measured **inside the
+  extension**: `window.getComputedAccessibleNode` is unavailable in Chrome here, so there is no page-side
+  AccName proxy — only a real `Accessibility.getFullAXTree` CDP call can answer it. The DOM half of the
+  join is settled (0.2–0.4ms, §7); the AX half is the only unpriced piece of discovery.
+- **⚠ Why was the option-vocabulary cache reverted?** `f685b10` shipped it (live-verified 21.3s → 0.0s,
+  bounded by per-tenant key + 30-day TTL + 12-tenant LRU, and safe because `rec.options` feeds only the
+  review picker); `235dd9e` reverted it with an **empty message**, no doc note, and no surviving code.
+  This blocks the most obvious lag win in §7, and the design deliberately does not assume it. **Operator
+  question — was this a correctness problem, a scope call, or just a clean-branch revert?**
+- **Required-ness may be entirely absent on custom forms.** On KEF Robotics only `email` carried any
+  required signal — element and field-unit agreed, both `false` — while "Are you a US Citizen?" is
+  plainly required in practice and enforced in JS only. Under-flagging is the dangerous direction
+  (`CLAUDE.md`), so the generic driver may need to treat "no required signal anywhere on the form" as a
+  distinct, reported state rather than "nothing is required".
 - **Multi-step wizards.** None of the four reachable forms was multi-page. The generic driver's page-
   transition model is therefore **completely untested** — and Workday's history says that is where the
   cost hides.
