@@ -4196,6 +4196,9 @@ function atsInjPairedComboClose(triggerSel, ctnrSel) {
 // options read LIVE from this widget at commit time, the commit is read-back verified, an exact hit is
 // `filled` and anything looser is `filled_review`, and a value that cannot be verified is
 // `needs_review` — never a silent wrong value. No new matching logic lives here.
+// How long a server-backed picker gets to answer a typed query. 8s, because the measured failure mode
+// is "loading forever", and a budget shorter than the round trip cannot tell slow from never.
+const ATS_PAIRED_FILTER_MS = 8000;
 async function atsFillPairedCombo(act, f, ref, rec, candidates) {
   const probe = await act.eval(atsInjPairedComboProbe, ref.inputSel).catch(() => null);
   if (!probe || !probe.ok || !probe.triggerSel) return { handled: false };
@@ -4214,11 +4217,18 @@ async function atsFillPairedCombo(act, f, ref, rec, candidates) {
   let texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
 
   // A server-backed list (iCIMS' school picker) only answers a QUERY — type the first candidate in
-  // and re-read before giving up on an empty list.
+  // and re-read. ⚠ THE BUDGET HAS TO BE REAL: the first version polled 8×200ms and gave up in 1.6s on
+  // a widget whose search is a round trip. Measured on iCIMS' School picker, the query fires (the box
+  // holds the text and the list collapses) and `loading` stays true past 5.4s, so a short poll cannot
+  // tell "slow" from "never". Same lesson as every other wait here — a wait that timed out wants a
+  // bigger budget, never an attempts floor.
+  let filtered = false;
   if (!texts.length && candidates && candidates.length) {
     await act.eval(atsInjPairedComboFilter, probe.ctnrSel, String(candidates[0])).catch(() => null);
-    for (let i = 0; i < 8; i++) {
-      await act.delayFull(200);
+    filtered = true;
+    const deadline = Date.now() + ATS_PAIRED_FILTER_MS;
+    while (Date.now() < deadline) {
+      await act.delayFull(300);
       read = await act.eval(atsInjPairedComboRead, probe.ctnrSel).catch(() => null);
       if (read && read.options && read.options.length && !read.loading) break;
     }
@@ -4228,7 +4238,16 @@ async function atsFillPairedCombo(act, f, ref, rec, candidates) {
   if (!texts.length) {
     await act.eval(atsInjPairedComboClose, probe.triggerSel, probe.ctnrSel).catch(() => null);
     rec.status = "needs_review";
-    rec.detail = "the dropdown opened but listed no options" + (read && read.loading ? " (still loading)" : "");
+    const stuck = !!(read && read.loading);
+    // ⚠ Route a stuck server-backed picker into the EXISTING dead-async path rather than inventing a
+    // second one: `listUnproven` + this wording is what `atsFinishFill` collects into `deadAsync`, and
+    // what lets the RUN decide to reload once and retry — the same remedy a human applies, and the
+    // same one Greenhouse's never-answering comboboxes already use.
+    rec.listUnproven = stuck;
+    rec.detail = stuck
+      ? "this form's own search never answered our search — the picker is server-backed and returned nothing" +
+        (filtered ? " for " + JSON.stringify(String(candidates[0])) : "")
+      : "the dropdown opened but listed no options";
     rec.flag = rec.flag || "options-never-rendered";
     return { handled: true };
   }

@@ -1090,7 +1090,11 @@ test("paired combo: an EMPTY list types into the widget's own filter box before 
   assert.strictEqual(rec.status, "filled");
 });
 
-test("paired combo: an option list that never renders is reported, not guessed", async () => {
+test("⚠ paired combo: a picker STUCK loading routes into the existing dead-async path", async () => {
+  // Measured on iCIMS' School picker: the query fires (the box holds the text, the list collapses) and
+  // `loading` stays true past 5.4s with zero results — this form's own search never answers. It must
+  // be reported as that, not as our failure, and it must reuse `listUnproven` so atsFinishFill's
+  // deadAsync collection (and the run's reload-once remedy) picks it up.
   const act = {
     delay: async () => {}, delayFull: async () => {},
     eval: async (fn) => {
@@ -1101,10 +1105,29 @@ test("paired combo: an option list that never renders is reported, not guessed",
     },
   };
   const rec = {};
-  await ats.atsFillPairedCombo(act, { label: "School" }, { inputSel: "#s" }, rec, ["UCLA"]);
+  await ats.atsFillPairedCombo(act, { label: "School" }, { inputSel: "#s" }, rec, ["Carnegie Mellon University"]);
   assert.strictEqual(rec.status, "needs_review");
   assert.strictEqual(rec.flag, "options-never-rendered");
-  assert.match(rec.detail, /still loading/);
+  assert.strictEqual(rec.listUnproven, true, "must reuse the dead-async signal, not a second one");
+  // the wording is what atsFinishFill's deadAsync regex matches on
+  assert.match(rec.detail, /never answered our search/);
+  assert.match(rec.detail, /Carnegie Mellon University/, "say WHAT was searched for");
+});
+
+test("paired combo: an empty list that is NOT loading reads as empty, not as a dead search", async () => {
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    eval: async (fn) => {
+      if (fn.name === "atsInjPairedComboProbe") return { ok: true, triggerSel: "#t", ctnrSel: "#c" };
+      if (fn.name === "atsInjPairedComboOpen") return { ok: true, expanded: true };
+      if (fn.name === "atsInjPairedComboRead") return { ok: true, open: true, loading: false, options: [] };
+      return { ok: true, open: false };
+    },
+  };
+  const rec = {};
+  await ats.atsFillPairedCombo(act, { label: "Degree" }, { inputSel: "#d" }, rec, ["BS"]);
+  assert.ok(!rec.listUnproven, "a genuinely empty list is not a stuck server call");
+  assert.match(rec.detail, /listed no options/);
 });
 
 test("paired combo: every injected fn is self-contained, and the OPEN uses a pointer sequence", () => {
