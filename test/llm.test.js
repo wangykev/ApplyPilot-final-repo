@@ -15,6 +15,28 @@ const { callLLM, callLLMOnce, LLM_DEFAULT_MODELS, LLM_MODELS, LLM_RETRY_DELAYS_M
   LLM_FAST_RETRY_DELAY_MS,
   llmFastRetryMs,
   llmAttemptTimeoutMs,
+  LLM_FAST_ADAPT_K,
+  LLM_FAST_ADAPT_MIN_SAMPLES,
+  LLM_FAST_ADAPT_MAX_CAP_MS,
+  LLM_LAT_WINDOW,
+  recordLlmAnswerMs,
+  llmObservedAnswerP50,
+  llmLatencyNewestAt,
+  resetLlmLatency,
+  LLM_AUTO_MODEL,
+  LLM_AUTO_CANDIDATES,
+  LLM_AUTO_STALE_MS,
+  LLM_AUTO_SIDELINE_MS,
+  LLM_AUTO_SLOW_FACTOR,
+  LLM_AUTO_MIN_SAMPLES,
+  llmRecentSamples,
+  llmAutoPick,
+  llmAutoOrder,
+  llmExpandAutoAttempts,
+  llmResolveAutoModel,
+  recordLlmModelUnhealthy,
+  llmModelSidelined,
+  llmStatusIsServerHealth,
 } = require("../llm.js");
 
 // A fake fetch that captures the request + returns a canned JSON body.
@@ -335,6 +357,398 @@ test("fast-retry is SCOPED: other gemini models and other providers are untouche
   assert.equal(llmFastRetryMs({ provider: "gemini", model: "gemini-3.5-flash-lite" }), null);
   assert.equal(llmFastRetryMs({ provider: "anthropic", model: "gemini-3.1-flash-lite" }), null, "provider must match too");
   assert.equal(llmAttemptTimeoutMs({ provider: "gemini", model: "gemini-3.5-flash-lite" }, 2), LLM_REQUEST_TIMEOUT_MS);
+});
+
+// ── ADAPTIVE CAP (2026-08-11) ────────────────────────────────────────────────────────────────────
+// Round 8 measured 76 of 77 calls spending BOTH fast tries because the model's real p50 had moved to
+// ~7–13s. Nothing failed (the last attempt always gets the full budget) but ~4s per call was wasted,
+// ~28s a page. The cap now follows the observed p50 and switches OFF when no short cap could separate
+// "stuck" from merely "slow". Every test here reset the window first — it is worker-lifetime state.
+const G31 = { provider: "gemini", model: "gemini-3.1-flash-lite" };
+const feed = (ms, n) => { for (let i = 0; i < n; i++) recordLlmAnswerMs(G31.provider, G31.model, ms); };
+
+test("adaptive cap: a COLD worker uses the rule's static ms (today's behaviour, unchanged)", () => {
+  resetLlmLatency();
+  assert.equal(llmObservedAnswerP50(G31.provider, G31.model), null, "no samples ⇒ no opinion");
+  assert.equal(llmFastRetryMs(G31), 2000);
+  feed(650, LLM_FAST_ADAPT_MIN_SAMPLES - 1);
+  assert.equal(llmObservedAnswerP50(G31.provider, G31.model), null,
+    "under the minimum, still no opinion — one stuck-socket recovery must not be able to retune it");
+  assert.equal(llmFastRetryMs(G31), 2000);
+  resetLlmLatency();
+});
+
+test("adaptive cap: a HEALTHY model keeps the 2000ms static floor (K×p50 lands right on it)", () => {
+  resetLlmLatency();
+  feed(650, LLM_FAST_ADAPT_MIN_SAMPLES);
+  assert.equal(llmObservedAnswerP50(G31.provider, G31.model), 650);
+  // 3 × 650 = 1950, under the static floor ⇒ the hand-picked 2000 stands. This is the calibration
+  // check: K was chosen so the adaptive rule REPRODUCES the value that was tuned by hand.
+  assert.equal(650 * LLM_FAST_ADAPT_K < 2000, true);
+  assert.equal(llmFastRetryMs(G31), 2000, "a fast model behaves exactly as before the change");
+  resetLlmLatency();
+});
+
+test("adaptive cap: a MODERATELY slower model gets a PROPORTIONALLY wider cap", () => {
+  resetLlmLatency();
+  feed(1200, LLM_FAST_ADAPT_MIN_SAMPLES);
+  assert.equal(llmFastRetryMs(G31), 3600, "3 × 1200ms — still short enough to police a stuck socket");
+  resetLlmLatency();
+});
+
+test("★ adaptive cap: the ROUND 8 REGRESSION — a ~11s p50 turns the fast-retry OFF", () => {
+  resetLlmLatency();
+  feed(11000, LLM_FAST_ADAPT_MIN_SAMPLES);
+  assert.equal(llmFastRetryMs(G31), null,
+    "at this p50 EVERY healthy call is still running at 2000ms, so the cap fires on all of them and rescues none");
+  // …and OFF must mean the full budget on the FIRST attempt, which is where the ~4s/call is recovered.
+  assert.equal(llmAttemptTimeoutMs(G31, LLM_FAST_RETRY_ATTEMPTS), LLM_REQUEST_TIMEOUT_MS);
+  assert.equal(llmAttemptTimeoutMs(G31, 0), LLM_REQUEST_TIMEOUT_MS);
+  resetLlmLatency();
+});
+
+test("adaptive cap: the OFF threshold is where K×p50 crosses LLM_FAST_ADAPT_MAX_CAP_MS", () => {
+  const justUnder = Math.floor(LLM_FAST_ADAPT_MAX_CAP_MS / LLM_FAST_ADAPT_K) - 1;
+  resetLlmLatency();
+  feed(justUnder, LLM_FAST_ADAPT_MIN_SAMPLES);
+  assert.equal(typeof llmFastRetryMs(G31), "number", "still policeable just under the threshold");
+  resetLlmLatency();
+  feed(Math.ceil(LLM_FAST_ADAPT_MAX_CAP_MS / LLM_FAST_ADAPT_K) + 50, LLM_FAST_ADAPT_MIN_SAMPLES);
+  assert.equal(llmFastRetryMs(G31), null, "past it, OFF");
+  resetLlmLatency();
+});
+
+test("adaptive cap: RECOVERS — a model that speeds up gets its fast-retry back", () => {
+  resetLlmLatency();
+  feed(11000, LLM_FAST_ADAPT_MIN_SAMPLES);
+  assert.equal(llmFastRetryMs(G31), null);
+  feed(600, LLM_LAT_WINDOW);                 // the window rolls the slow era out entirely
+  assert.equal(llmFastRetryMs(G31), 2000, "back to the static floor once answers are fast again");
+  resetLlmLatency();
+});
+
+test("adaptive cap: the window is BOUNDED and keeps only the most recent answers", () => {
+  resetLlmLatency();
+  feed(500, LLM_LAT_WINDOW + 6);
+  assert.equal(llmObservedAnswerP50(G31.provider, G31.model), 500);
+  feed(9000, LLM_LAT_WINDOW);                // fully displaces them
+  assert.equal(llmObservedAnswerP50(G31.provider, G31.model), 9000);
+  resetLlmLatency();
+});
+
+test("adaptive cap: a MEDIAN, so one outlier neither widens nor disables the cap", () => {
+  resetLlmLatency();
+  feed(600, 3);
+  recordLlmAnswerMs(G31.provider, G31.model, 30000);   // one genuine 30s hang, the case the feature exists for
+  assert.equal(llmObservedAnswerP50(G31.provider, G31.model), 600);
+  assert.equal(llmFastRetryMs(G31), 2000, "the fast-retry must SURVIVE the very event it guards against");
+  resetLlmLatency();
+});
+
+test("adaptive cap: samples are per provider+model — one route cannot retune another", () => {
+  resetLlmLatency();
+  feed(11000, LLM_FAST_ADAPT_MIN_SAMPLES);
+  assert.equal(llmFastRetryMs(G31), null);
+  assert.equal(llmObservedAnswerP50("gemini", "gemini-3.5-flash-lite"), null, "a sibling model is unaffected");
+  assert.equal(llmObservedAnswerP50("anthropic", "gemini-3.1-flash-lite"), null, "and so is another provider");
+  resetLlmLatency();
+});
+
+test("adaptive cap: opt-out and scoping still win over any observed latency", () => {
+  resetLlmLatency();
+  feed(1200, LLM_FAST_ADAPT_MIN_SAMPLES);
+  assert.equal(llmFastRetryMs({ ...G31, fastRetry: false }), null, "explicit opt-out is absolute");
+  assert.equal(llmFastRetryMs({ provider: "gemini", model: "gemini-3.5-flash-lite" }), null,
+    "an unruled model never gains a cap by being measured");
+  resetLlmLatency();
+});
+
+test("adaptive cap: garbage samples are ignored rather than poisoning the p50", () => {
+  resetLlmLatency();
+  feed(700, LLM_FAST_ADAPT_MIN_SAMPLES);
+  [NaN, Infinity, -5, undefined, null, "slow"].forEach((bad) => recordLlmAnswerMs(G31.provider, G31.model, bad));
+  assert.equal(llmObservedAnswerP50(G31.provider, G31.model), 700);
+  resetLlmLatency();
+});
+
+test("★ adaptive cap: an ABORTED attempt is never recorded (it would justify its own cap)", async () => {
+  resetLlmLatency();
+  // Attempt 1 hangs past the cap and is abandoned; attempt 2 answers in ~0ms. Only the answer counts.
+  let call = 0;
+  const ff = async (url, opts) => {
+    call++;
+    if (call === 1) return await new Promise((_, rej) => { if (opts && opts.signal) opts.signal.addEventListener("abort", () => rej(new Error("aborted"))); });
+    return { ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text: "hi" }] } }] }), text: async () => "{}" };
+  };
+  const r = await callLLMOnce({ ...G31, apiKey: "k", user: "q", timeoutMs: 20, fastRetry: undefined }, ff, async () => {});
+  assert.equal(r.ok, true);
+  const p50 = llmObservedAnswerP50(G31.provider, G31.model);
+  assert.equal(p50 === null || p50 < 2000, true,
+    "the censored 20ms-capped attempt must not be in the window — counting aborts drags the p50 toward the cap");
+  resetLlmLatency();
+});
+
+// ── AUTO MODEL (2026-08-11) ──────────────────────────────────────────────────────────────────────
+// Operator: "try 3.5 flash lite first and if it is busy, errors, or something else, then go to 3".
+// So this is ORDERED PREFERENCE WITH FAILOVER, not a lowest-latency race — the primary is honoured and
+// a sibling is only reached on EVIDENCE. Measured cause: interleaved on one free key in one minute,
+// 3.1 answered in 11499/7620/10903ms while 3.5 answered in 409/682/395ms.
+const AUTO_1ST = LLM_AUTO_CANDIDATES.gemini[0];   // gemini-3.5-flash-lite
+const AUTO_2ND = LLM_AUTO_CANDIDATES.gemini[1];   // gemini-3.1-flash-lite
+const feedM = (model, ms, n, at) => { for (let i = 0; i < n; i++) recordLlmAnswerMs("gemini", model, ms, at); };
+const healthy = (model, ms) => feedM(model, ms, LLM_FAST_ADAPT_MIN_SAMPLES);
+
+test("auto: the PREFERRED model is 3.5-flash-lite and it wins with nothing measured", () => {
+  resetLlmLatency();
+  assert.equal(AUTO_1ST, "gemini-3.5-flash-lite");
+  assert.equal(AUTO_2ND, "gemini-3.1-flash-lite");
+  assert.equal(llmAutoPick("gemini").model, AUTO_1ST, "order is honoured, not raced");
+  resetLlmLatency();
+});
+
+test("auto: the preferred model wins even when the sibling has measured FASTER but not 3× faster", () => {
+  resetLlmLatency();
+  healthy(AUTO_1ST, 900);
+  healthy(AUTO_2ND, 600);   // faster, but only 1.5×
+  assert.equal(llmAutoPick("gemini").model, AUTO_1ST,
+    "a stable primary beats chasing a small latency edge — that is the point of preference order");
+  resetLlmLatency();
+});
+
+test("★ auto: 'BUSY' — the preferred model answering ≥3× slower steps down to the sibling", () => {
+  resetLlmLatency();
+  healthy(AUTO_1ST, 11000);
+  healthy(AUTO_2ND, 500);
+  const pick = llmAutoPick("gemini");
+  assert.equal(pick.model, AUTO_2ND);
+  assert.match(pick.reason, /slower/);
+  assert.equal(500 * LLM_AUTO_SLOW_FACTOR <= 11000, true);
+  resetLlmLatency();
+});
+
+test("★ auto: 'ERRORS' — a 503 sidelines the preferred model, and it comes back after the cooldown", () => {
+  resetLlmLatency();
+  healthy(AUTO_1ST, 400);
+  healthy(AUTO_2ND, 800);
+  assert.equal(llmAutoPick("gemini").model, AUTO_1ST, "healthy ⇒ preferred");
+  const t0 = 1_000_000;
+  recordLlmModelUnhealthy("gemini", AUTO_1ST, t0);
+  assert.equal(llmModelSidelined("gemini", AUTO_1ST, t0 + 1), true);
+  assert.equal(llmAutoPick("gemini", t0 + 1).model, AUTO_2ND, "sidelined ⇒ the sibling serves");
+  // …and the sideline EXPIRES, so a recovered model is not demoted permanently.
+  assert.equal(llmModelSidelined("gemini", AUTO_1ST, t0 + LLM_AUTO_SIDELINE_MS + 1), false);
+  assert.equal(llmAutoPick("gemini", t0 + LLM_AUTO_SIDELINE_MS + 1).model, AUTO_1ST);
+  resetLlmLatency();
+});
+
+test("auto: only SERVER-health statuses sideline a model — a 429/401 is the KEY's fault, not the model's", () => {
+  [500, 502, 503, 504].forEach((s) => assert.equal(llmStatusIsServerHealth(s), true, `${s} is server health`));
+  [400, 401, 403, 404, 429].forEach((s) => assert.equal(llmStatusIsServerHealth(s), false,
+    `${s} must NOT demote the operator's chosen primary — a rate-limited key says nothing about the model`));
+});
+
+test("★ auto: a demoted primary is RE-PROBED once its data goes stale (never a permanent demotion)", () => {
+  resetLlmLatency();
+  const t0 = 5_000_000;
+  feedM(AUTO_1ST, 11000, LLM_FAST_ADAPT_MIN_SAMPLES, t0);
+  feedM(AUTO_2ND, 500, LLM_FAST_ADAPT_MIN_SAMPLES, t0);
+  assert.equal(llmAutoPick("gemini", t0 + 1000).model, AUTO_2ND, "slow ⇒ stepped down");
+  // We stop calling the primary, so its measurement ages. Staleness must return it to the front,
+  // otherwise the very first verdict is permanent and a recovered model can never win traffic back.
+  const later = t0 + LLM_AUTO_STALE_MS + 1;
+  feedM(AUTO_2ND, 500, 1, later - 10);   // the sibling keeps being measured; only the primary is stale
+  const pick = llmAutoPick("gemini", later);
+  assert.equal(pick.model, AUTO_1ST);
+  assert.match(pick.reason, /recovered|nothing measured/);
+  resetLlmLatency();
+});
+
+test("★★ auto: RECOVERY IS FAST — stale slow samples are DISCARDED, not averaged with the fresh one", () => {
+  resetLlmLatency();
+  const t0 = 6_000_000;
+  // The primary was measured slow and stepped down.
+  feedM(AUTO_1ST, 11000, LLM_LAT_WINDOW, t0);
+  feedM(AUTO_2ND, 500, LLM_AUTO_MIN_SAMPLES, t0);
+  assert.equal(llmAutoPick("gemini", t0 + 1000).model, AUTO_2ND);
+
+  // 15min later it is re-probed and comes back HEALTHY. Only ONE fresh sample exists.
+  const later = t0 + LLM_AUTO_STALE_MS + 1;
+  feedM(AUTO_2ND, 500, LLM_AUTO_MIN_SAMPLES, later);
+  recordLlmAnswerMs("gemini", AUTO_1ST, 410, later);
+  assert.equal(llmAutoPick("gemini", later + 1).model, AUTO_1ST,
+    "one fresh sample is under LLM_AUTO_MIN_SAMPLES ⇒ unmeasured ⇒ the preferred model is used again");
+
+  // A second fresh fast sample CONFIRMS it, and the eight stale 11000ms readings must not drag the
+  // median back up — that bug would need ~5 probes (~75min) to switch back instead of ~1.
+  recordLlmAnswerMs("gemini", AUTO_1ST, 400, later + 5);
+  assert.equal(llmObservedAnswerP50("gemini", AUTO_1ST, { now: later + 6, maxAgeMs: LLM_AUTO_STALE_MS, minSamples: LLM_AUTO_MIN_SAMPLES }), 405,
+    "the p50 sees ONLY the two fresh samples");
+  assert.equal(llmAutoPick("gemini", later + 6).model, AUTO_1ST, "and it stays on the recovered primary");
+  resetLlmLatency();
+});
+
+test("auto: a re-probe that finds the primary STILL slow steps back down without a long stall", () => {
+  resetLlmLatency();
+  const t0 = 7_000_000;
+  const later = t0 + LLM_AUTO_STALE_MS + 1;
+  feedM(AUTO_2ND, 500, LLM_AUTO_MIN_SAMPLES, later);
+  // Two fresh slow answers are enough to demote again — the low AUTO sample bar cuts both ways, which
+  // is the point: reacting quickly must be cheap in BOTH directions.
+  feedM(AUTO_1ST, 12000, LLM_AUTO_MIN_SAMPLES, later);
+  assert.equal(llmAutoPick("gemini", later + 1).model, AUTO_2ND);
+  resetLlmLatency();
+});
+
+test("auto: if EVERY candidate is sidelined it still returns the preferred one — never nothing", () => {
+  resetLlmLatency();
+  const t0 = 9_000_000;
+  LLM_AUTO_CANDIDATES.gemini.forEach((m) => recordLlmModelUnhealthy("gemini", m, t0));
+  const pick = llmAutoPick("gemini", t0 + 1);
+  assert.equal(pick.model, AUTO_1ST,
+    "a degraded answer beats no answer — a failed AI call blanks a required field and halts a walk");
+  resetLlmLatency();
+});
+
+test("auto: a provider with no candidate list falls back to its DEFAULT model, never ''", () => {
+  resetLlmLatency();
+  assert.equal(LLM_AUTO_CANDIDATES.anthropic, undefined);
+  assert.equal(llmAutoPick("anthropic").model, LLM_DEFAULT_MODELS.anthropic);
+  resetLlmLatency();
+});
+
+test("auto: llmResolveAutoModel passes a CONCRETE model through untouched", () => {
+  resetLlmLatency();
+  assert.equal(llmResolveAutoModel("gemini", "gemini-2.5-flash-lite"), "gemini-2.5-flash-lite",
+    "only the literal \"auto\" sentinel is expanded");
+  assert.equal(llmResolveAutoModel("gemini", LLM_AUTO_MODEL), AUTO_1ST);
+  resetLlmLatency();
+});
+
+test("auto: the sentinel is the literal string \"auto\"", () => {
+  assert.equal(LLM_AUTO_MODEL, "auto");
+});
+
+test("auto: latency samples carry a TIMESTAMP (what staleness and re-probing are built on)", () => {
+  resetLlmLatency();
+  assert.equal(llmLatencyNewestAt("gemini", AUTO_1ST), null);
+  recordLlmAnswerMs("gemini", AUTO_1ST, 500, 4242);
+  assert.equal(llmLatencyNewestAt("gemini", AUTO_1ST), 4242);
+  recordLlmAnswerMs("gemini", AUTO_1ST, 500, 9999);
+  assert.equal(llmLatencyNewestAt("gemini", AUTO_1ST), 9999, "newest wins");
+  resetLlmLatency();
+});
+
+test("★ auto + adaptive cap share ONE window, so a 503 fallback does not distort the cap", async () => {
+  resetLlmLatency();
+  // The live shape: 3.1 503s after ~10s, the route falls to 3.5 which answers in ~0.4s. The 3.5 sample
+  // must land under 3.5 — attributing it to 3.1 would make the slow model look fast and keep it primary.
+  recordLlmAnswerMs("gemini", AUTO_2ND, 10500);
+  recordLlmAnswerMs("gemini", AUTO_1ST, 409);
+  assert.equal(llmLatencyNewestAt("gemini", AUTO_1ST) !== null, true);
+  healthy(AUTO_1ST, 409);
+  healthy(AUTO_2ND, 10500);
+  assert.equal(llmAutoPick("gemini").model, AUTO_1ST, "the fast one is primary AND preferred");
+  resetLlmLatency();
+});
+
+// ── IN-CALL EXPANSION OF "auto" (2026-08-11) ─────────────────────────────────────────────────────
+// act.llm loops the attempt list and fails fast on every attempt but the last, so the list IS the
+// in-call failover. An `auto` slot that resolved to ONE model was therefore also the LAST attempt: a
+// persistent 503 ended the call unanswered (field → review) and the sibling was only reached by a LATER
+// call. Live on the operator's config resolveLlmRoute returned a route of LENGTH 1 — no fallback at all.
+const slot = (model, extra) => ({ provider: "gemini", model, thinking: "off", effort: "", keyId: "", ...(extra || {}) });
+
+test("★ auto expansion: ONE auto slot becomes one attempt PER CANDIDATE, health-ranked", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL)]);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_1ST, AUTO_2ND],
+    "the whole point: a single auto slot now carries its own in-call fallback");
+  assert.equal(out.every((a) => a.fromAuto === true), true, "marked, so the log can say (auto)");
+  resetLlmLatency();
+});
+
+test("★ auto expansion: the order follows HEALTH — a sidelined primary drops behind the sibling", () => {
+  resetLlmLatency();
+  const t0 = 3_000_000;
+  recordLlmModelUnhealthy("gemini", AUTO_1ST, t0);
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL)], t0 + 1);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_2ND, AUTO_1ST],
+    "the sidelined model is kept as a LAST RESORT, never dropped — a degraded answer beats none");
+  resetLlmLatency();
+});
+
+test("★ auto expansion: keyId rides onto every attempt, so Auto and key PINNING compose", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL, { keyId: "keyA" })]);
+  assert.deepEqual(out.map((a) => `${a.model}@${a.keyId}`), [`${AUTO_1ST}@keyA`, `${AUTO_2ND}@keyA`],
+    "an auto slot pinned to key A must not silently lose the pin when it expands");
+  resetLlmLatency();
+});
+
+test("★ auto expansion: two auto slots on DIFFERENT keys give both models on both keys", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL, { keyId: "keyA" }), slot(LLM_AUTO_MODEL, { keyId: "keyB" })]);
+  assert.deepEqual(out.map((a) => `${a.model}@${a.keyId}`),
+    [`${AUTO_1ST}@keyA`, `${AUTO_2ND}@keyA`, `${AUTO_1ST}@keyB`, `${AUTO_2ND}@keyB`],
+    "attempts differing only by KEY are genuinely useful — that is the free tier's per-key minute budget");
+  resetLlmLatency();
+});
+
+test("★ auto expansion: RE-DEDUPES against a concrete slot the operator also configured", () => {
+  resetLlmLatency();
+  // [auto, 3.1-flash-lite] naively expands to [3.5, 3.1, 3.1] — the duplicate would be a wasted
+  // request on a model that just failed one line earlier.
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL), slot(AUTO_2ND)]);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_1ST, AUTO_2ND]);
+  resetLlmLatency();
+});
+
+test("auto expansion: two auto slots with the SAME key collapse (one slot already yields both)", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL), slot(LLM_AUTO_MODEL)]);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_1ST, AUTO_2ND],
+    "the dedupe that used to LOSE the fallback is now harmless — expansion already supplied it");
+  resetLlmLatency();
+});
+
+test("auto expansion: a CONCRETE route is passed through completely untouched", () => {
+  resetLlmLatency();
+  const route = [slot("gemini-2.5-flash-lite"), slot(AUTO_2ND, { keyId: "keyB" })];
+  const out = llmExpandAutoAttempts(route);
+  assert.deepEqual(out, route, "no auto slot ⇒ byte-identical behaviour to before this existed");
+  assert.equal(out.some((a) => a.fromAuto), false);
+  resetLlmLatency();
+});
+
+test("auto expansion: junk in the route is skipped, never crashes the call", () => {
+  resetLlmLatency();
+  assert.deepEqual(llmExpandAutoAttempts(null), []);
+  assert.deepEqual(llmExpandAutoAttempts([null, undefined, "nope", 7]).length, 0);
+  const out = llmExpandAutoAttempts([null, slot(LLM_AUTO_MODEL)]);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_1ST, AUTO_2ND]);
+  resetLlmLatency();
+});
+
+test("auto expansion: a provider with NO candidate list expands to its single default model", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([{ provider: "anthropic", model: LLM_AUTO_MODEL, thinking: "off", effort: "", keyId: "" }]);
+  assert.deepEqual(out.map((a) => a.model), [LLM_DEFAULT_MODELS.anthropic]);
+  resetLlmLatency();
+});
+
+test("★ auto expansion: the HEALTHY case still costs ONE request — extra attempts are fallbacks only", async () => {
+  resetLlmLatency();
+  // act.llm's contract: it returns on the FIRST ok attempt, so a longer attempt list must not mean more
+  // requests when the first model answers. Proven against callLLM directly, one fetch per successful call.
+  let calls = 0;
+  const okFetch = async () => { calls++; return { ok: true, status: 200,
+    json: async () => ({ candidates: [{ content: { parts: [{ text: "Doctorate" }] } }] }), text: async () => "{}" }; };
+  const attempts = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL)]);
+  assert.equal(attempts.length, 2, "two attempts available");
+  const r = await callLLM({ provider: "gemini", model: attempts[0].model, apiKey: "k", user: "q" }, okFetch, async () => {});
+  assert.equal(r.ok, true);
+  assert.equal(calls, 1, "a working primary means exactly one request — the expansion is latent, not eager");
+  resetLlmLatency();
 });
 
 test("fast-retry honours an explicit per-call timeout as the ceiling", () => {

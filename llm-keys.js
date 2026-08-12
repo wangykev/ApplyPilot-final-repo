@@ -226,18 +226,24 @@ function resolveLlmRoute(config, action, defaultModels) {
 
   // `thinking` rides along per attempt ("off" | "adaptive"): the right answer differs by
   // JOB on the same model — prose wants deliberation, a yes/no does not.
-  const push = (provider, model, thinking, effort, source) => {
+  // `keyId` pins a slot to ONE key (2026-08-11). It is part of a slot's IDENTITY here: the same
+  // provider+model on two different keys is two USEFUL attempts, not a duplicate — that is exactly the
+  // "3.1 on key A, then 3.1 on key B" chain the free tier's 15-requests-per-minute-PER-KEY limit calls
+  // for. Leaving keyId out of the dedupe key would have collapsed that chain to a single attempt and
+  // silently discarded the operator's second key.
+  const push = (provider, model, thinking, effort, source, keyId) => {
     if (!provider) return;
     const resolved = model || models[provider] || "";
     const think = thinking === "adaptive" || thinking === "manual" ? thinking : "off";
     const eff = think === "manual" && typeof effort === "string" ? effort : "";
-    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think && a.effort === eff)) return;
-    out.push({ provider, model: resolved, thinking: think, effort: eff, source });
+    const kid = typeof keyId === "string" ? keyId : "";
+    if (out.some((a) => a.provider === provider && a.model === resolved && a.thinking === think && a.effort === eff && a.keyId === kid)) return;
+    out.push({ provider, model: resolved, thinking: think, effort: eff, keyId: kid, source });
   };
 
   const pushChain = (chain, source) => {
     (Array.isArray(chain) ? chain : []).forEach((f) => {
-      if (f && typeof f === "object") push(f.provider, f.model, f.thinking, f.effort, source);
+      if (f && typeof f === "object") push(f.provider, f.model, f.thinking, f.effort, source, f.keyId);
     });
   };
 
@@ -247,11 +253,11 @@ function resolveLlmRoute(config, action, defaultModels) {
   const act = action && LLM_ACTION_ALIASES[action] ? LLM_ACTION_ALIASES[action] : action;
   const route = act && routes[act] && typeof routes[act] === "object" ? routes[act] : null;
   if (route && route.provider) {
-    push(route.provider, route.model, route.thinking, route.effort, "action");
+    push(route.provider, route.model, route.thinking, route.effort, "action", route.keyId);
     pushChain(route.fallbacks, "action-fallback");
   }
 
-  push(cfg.provider, cfg.model, cfg.thinking, cfg.effort, "default");
+  push(cfg.provider, cfg.model, cfg.thinking, cfg.effort, "default", cfg.keyId);
   pushChain(cfg.fallbacks, "default-fallback");
   return out;
 }

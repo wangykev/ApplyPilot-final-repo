@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "fresh-rect-1";
+const AP_BUILD_MARKER = "auto-expand-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -783,6 +783,106 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       if (ids.length) await new Promise((r) => chrome.tabs.remove(ids, r));
       console.log(`[ApplyPilot][DEV] closed ${ids.length} tab(s) matching ${JSON.stringify(needle)}`);
       sendResponse({ ok: true, closed: ids.length });
+    })();
+    return true;
+  }
+
+  // DEV: the IDLE CONTROL ARM for LLM latency (2026-08-11). Fires N sequential calls through the
+  // SAME act.llm seam a fill uses — same route resolver, same key rotation, same fast-retry, same
+  // [LLM] log lines — but with NO tab, NO debugger attach and NO fill in flight.
+  //
+  // WHY this exists: "a slow page is the LLM until proven otherwise" identifies the LLM as the cost,
+  // but not WHOSE fault the latency is. Comparing a hidden run against a visible run cannot separate
+  // provider variance from our own service worker being busy/starved, because BOTH arms are measured
+  // while a run is driving a tab. This arm removes the tab entirely, so the three-way comparison
+  // (hidden run · visible run · idle) can attribute the cost:
+  //   hidden ≈ visible ≈ idle  ⇒ provider noise; there is no visibility penalty to fix.
+  //   hidden >  visible ≈ idle ⇒ a real visibility effect (MV3 worker starvation while hidden).
+  //   hidden ≈ visible >  idle ⇒ the RUN inflates it, whatever the tab is doing — the SW's own load.
+  // Read-only: it never touches a page, never fills, and refuses while a run holds the attach.
+  if (type === "AP_DEV_LLM_PROBE") {
+    (async () => {
+      if (runInFlight || discoverInFlight) {
+        sendResponse({ ok: false, error: "busy", detail: "A run or sweep is in progress — the idle arm must be measured IDLE." });
+        return;
+      }
+      const n = Math.max(1, Math.min(12, Number(message.n) || 5));
+      const llmConfig = await getLlmConfig();
+      const action = String(message.action || "fill");
+      // WHICH ROUTE the fill actually uses, straight from the AI page's stored config. Reported so
+      // "the model and fallback should come from the AI page" is a CHECKABLE claim rather than a
+      // reading of the code: ats.js and fill-driver.js both call act.llm WITHOUT an action, so both
+      // resolve this same list. Keys are summarised by id/tier only — never the secret.
+      const route = typeof resolveLlmRoute === "function"
+        ? resolveLlmRoute(llmConfig, action, LLM_DEFAULT_MODELS).map((a) => ({ provider: a.provider, model: a.model, thinking: a.thinking, keyId: a.keyId || "" }))
+        : [];
+      const keySummary = {};
+      for (const p of [...new Set(route.map((a) => a.provider))]) {
+        const ks = typeof llmKeysFor === "function" ? llmKeysFor(llmConfig, p) : [];
+        keySummary[p] = ks.map((k) => ({ id: k.id, tier: k.tier }));
+      }
+      const info = { action, enabled: !!llmConfig.enabled, route, keys: keySummary, preferFreeFirst: llmConfig.preferFreeFirst !== false };
+      console.log(`[ApplyPilot][LLM-PROBE] route for "${action}" (from the AI page): `
+        + (route.length ? route.map((a, i) => `${i + 1}) ${a.provider} ${a.model}${a.keyId ? " pinned:" + a.keyId : " (any key)"}`).join(" → ") : "NONE CONFIGURED")
+        + ` · keys ${JSON.stringify(keySummary)} · preferFreeFirst ${info.preferFreeFirst}`);
+      if (!llmConfig.enabled) { sendResponse({ ok: false, error: "ai-disabled", info }); return; }
+
+      // A/B MODE: `models:[…]` calls each model DIRECTLY (callLLM, not act.llm) and alternates them
+      // round-robin. Direct is the point — act.llm's fallback chain would silently answer from the
+      // NEXT model when the first is slow, which is precisely the confusion this is here to remove:
+      // it makes "model X is slow" unmeasurable. Isolates model while key pool and moment stay fixed.
+      const models = Array.isArray(message.models) && message.models.length ? message.models.map(String) : null;
+      const SYS = "You pick one option from a list. Reply with the option text only.";
+      const USER = "Question: What is your highest level of education?\nOptions: High School, Bachelor's Degree, Master's Degree, Doctorate\nReply with exactly one option.";
+      const samples = [];
+      if (models) {
+        const provider = (route[0] && route[0].provider) || llmConfig.provider || "gemini";
+        const keys = typeof llmKeysFor === "function" ? llmKeysFor(llmConfig, provider) : [];
+        let keyState = typeof newLlmKeyState === "function" ? newLlmKeyState() : undefined;
+        for (let i = 0; i < n; i++) {
+          for (const model of models) {
+            const t0 = Date.now();
+            // "auto" is honoured here too, so the AUTO picker can be exercised without editing the
+            // operator's stored config — otherwise verifying it live means changing the thing under test.
+            const resolved = typeof llmResolveAutoModel === "function" ? llmResolveAutoModel(provider, model) : model;
+            const r = await callLLM({
+              provider, model: resolved, thinking: "off", keys, apiKey: keys.length ? "" : llmConfig.apiKey,
+              pinKeyId: message.pinKeyId ? String(message.pinKeyId) : "",
+              preferFreeFirst: llmConfig.preferFreeFirst !== false,
+              keyState, onKeyState: (s) => { keyState = s; },
+              system: SYS, user: USER, maxTokens: 16,
+            });
+            samples.push({
+              i, model: resolved + (model === "auto" ? " (auto)" : ""), ms: Date.now() - t0, ok: !!(r && r.ok),
+              keyTier: (r && r.keyTier) || null, keyId: (r && r.keyId) || null,
+              fastAborts: (r && r.fastAborts) || 0, status: (r && r.status) || null,
+              detail: r && r.ok ? String(r.text || "").trim().slice(0, 40) : String((r && r.error) || "?").slice(0, 120),
+            });
+          }
+        }
+      } else {
+        const act = makeCdpActuation(llmConfig);   // config-only use; act.llm touches no tab
+        for (let i = 0; i < n; i++) {
+          const t0 = Date.now();
+          // Shaped like a real ai-choice dropdown question so the token count is representative.
+          const r = await act.llm({ system: SYS, user: USER, maxTokens: 16, action });
+          samples.push({
+            i, model: (r && r.model) || null, ms: Date.now() - t0, ok: !!(r && r.ok),
+            keyTier: (r && r.keyTier) || null, fastAborts: (r && r.fastAborts) || 0,
+            detail: r && r.ok ? String(r.text || "").trim().slice(0, 40) : String((r && r.error) || "?").slice(0, 120),
+          });
+        }
+      }
+      const by = {};
+      for (const s of samples) { (by[s.model || "?"] = by[s.model || "?"] || []).push(s); }
+      for (const [model, list] of Object.entries(by)) {
+        const oks = list.filter((s) => s.ok).map((s) => s.ms).sort((a, b) => a - b);
+        console.log(`[ApplyPilot][LLM-PROBE] ${model}: `
+          + list.map((s) => s.ms + "ms" + (s.ok ? "" : ` FAILED(${s.status || "err"})`) + (s.fastAborts ? `/${s.fastAborts}ab` : "")).join(" · ")
+          + (oks.length ? ` — median ${oks[(oks.length - 1) >> 1]}ms over ${oks.length} ok` : " — every call FAILED")
+          + ` · key tiers ${JSON.stringify([...new Set(list.map((s) => s.keyTier).filter(Boolean))])}`);
+      }
+      sendResponse({ ok: true, samples, info });
     })();
     return true;
   }
@@ -4363,6 +4463,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // worked too and was rejected for being a second page load.
     await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
     await cdpSetFocusEmulation(true).catch(() => {});
+    // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
+    // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
+    // occluded tab still reports `tab.active && !minimized`, and polling the dev tab from automation
+    // ACTIVATES it — so `background:false` at the call site is an INTENTION, not an observation. Any
+    // hidden-vs-visible timing claim about this path needs the measured label, not the flag.
+    try { LOG(`[ATS-PACING] ${await cdpPacingLabel()}`); } catch (e) { /* label only */ }
 
     // …and NOW open the posting, so its document runs with the overrides from its first byte. Defensive
     // about the starting URL: a caller that hands over an already-loaded tab (the redirect chase below

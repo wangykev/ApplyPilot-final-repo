@@ -53,6 +53,22 @@ const routeTargetSchema = z.object({
   thinking: z.enum(["off", "adaptive", "manual"]).default("off"),
   /** Only used when thinking === "manual"; ignored (and unsent) otherwise. */
   effort: z.string().default(""),
+  /**
+   * PIN THIS SLOT TO ONE KEY (2026-08-11, operator). Empty = today's behaviour: any key for
+   * the provider, in rotation order.
+   *
+   * WHY it exists: Gemini's free tier is **15 requests/minute PER KEY**, and rotation only
+   * moves to the next key when one FAILS. So two equal free keys still funnel every call
+   * through the first — measured live, 6 consecutive calls all used key 1 while key 2 sat
+   * idle — and a fill doing ~16 calls/min breaches a 15/min limit while holding 30/min of
+   * headroom. Pinning the primary to key A and its fallback to key B spends both.
+   *
+   * The pin is STRICT for the slot (that is the whole point — an isolated budget), and
+   * resilience comes from the NEXT slot having its own key. An id that no longer matches a
+   * stored key is IGNORED rather than obeyed, so deleting a key degrades to rotation
+   * instead of silently disabling the slot.
+   */
+  keyId: z.string().default(""),
 });
 
 const routeSchema = routeTargetSchema.extend({
@@ -67,6 +83,8 @@ export const aiConfigSchema = z
     model: z.string().default(LLM_DEFAULT_MODELS.gemini),
     thinking: z.enum(["off", "adaptive", "manual"]).default("off"),
     effort: z.string().default(""),
+    /** Pin the DEFAULT slot to one key — same semantics as routeTargetSchema.keyId. */
+    keyId: z.string().default(""),
     apiKey: z.string().default(""),
     enabled: z.boolean().default(false),
 

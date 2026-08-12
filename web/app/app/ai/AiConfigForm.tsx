@@ -7,6 +7,7 @@ import { SelectField, FieldLabel } from "@/components/form/fields";
 import {
   LLM_MODELS, LLM_DEFAULT_MODELS, LLM_PROVIDER_LABELS, GEMINI_FREE_TIER, LLM_PRICING, LLM_PRICING_URLS,
   LLM_MODEL_META, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_EFFORT_LEVELS, GEMINI_STARTER_CHAIN,
+  LLM_AUTO_MODEL, LLM_AUTO_CANDIDATES,
   type LlmProvider,
 } from "@/lib/llm";
 import { LLM_ACTIONS, type LlmAction } from "@/lib/llm-keys";
@@ -102,7 +103,25 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
   const modelOptions = (provider: LlmProvider) => {
     const freeOnly = provider === "gemini" && geminiFreeOnly;
     const ids = freeOnly ? LLM_MODELS.gemini.filter((m) => GEMINI_FREE_TIER[m]) : LLM_MODELS[provider];
-    return ids.map((m) => ({ value: m, label: modelOptionLabel(provider, m, freeOnly) }));
+    const opts = ids.map((m) => ({ value: m, label: modelOptionLabel(provider, m, freeOnly) }));
+    // AUTO leads the list where the provider has interchangeable siblings to choose between. It is a
+    // real answer to a measured problem rather than a convenience: a sibling can be 20× slower than the
+    // other for hours at a time, and which one it is changes — see LLM_AUTO_CANDIDATES.
+    const auto = LLM_AUTO_CANDIDATES[provider];
+    if (auto && auto.length > 1) {
+      // Name the ACTUAL behaviour — ordered preference with failover, NOT "the fastest one". A label
+      // promising a race would misdescribe it: the first candidate always wins unless it is erroring or
+      // measurably slower, which is deliberate (a stable primary beats chasing a small latency edge).
+      const short = (m: string) => m.replace(/^gemini-/, "");
+      return [
+        {
+          value: LLM_AUTO_MODEL,
+          label: `Auto — ${short(auto[0])}, switching to ${auto.slice(1).map(short).join(" / ")} if it errors or slows`,
+        },
+        ...opts,
+      ];
+    }
+    return opts;
   };
 
   const save = () =>
@@ -179,9 +198,11 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
             model: cfg.model,
             thinking: cfg.thinking,
             effort: cfg.effort,
+            keyId: cfg.keyId,
             fallbacks: cfg.fallbacks,
           }}
           modelOptions={modelOptions}
+          keysFor={(p) => keysForProvider(cfg, p)}
           onChange={(next) =>
             edit((c) => ({
               ...c,
@@ -189,6 +210,7 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
               model: next.model,
               thinking: next.thinking ?? "off",
               effort: next.effort ?? "",
+              keyId: next.keyId ?? "",
               fallbacks: next.fallbacks,
             }))
           }
@@ -202,7 +224,14 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
       >
         <div className="space-y-4">
           {LLM_ACTIONS.map((action) => (
-            <ActionRoute key={action} action={action} cfg={cfg} edit={edit} modelOptions={modelOptions} />
+            <ActionRoute
+              key={action}
+              action={action}
+              cfg={cfg}
+              edit={edit}
+              modelOptions={modelOptions}
+              keysFor={(p) => keysForProvider(cfg, p)}
+            />
           ))}
         </div>
       </SectionCard>
@@ -273,7 +302,7 @@ function ProviderKeys({
       const isFirstKeyHere = keys.filter((k) => k.key).length === 0;
       if (provider === "gemini" && isFirstKeyHere && c.provider === "gemini" && (c.fallbacks?.length ?? 0) === 0) {
         next.model = GEMINI_STARTER_CHAIN.model;
-        next.fallbacks = [{ provider: "gemini", model: GEMINI_STARTER_CHAIN.fallback, thinking: "off", effort: "" }];
+        next.fallbacks = [{ provider: "gemini", model: GEMINI_STARTER_CHAIN.fallback, thinking: "off", effort: "", keyId: "" }];
       }
       return next;
     });
@@ -507,28 +536,41 @@ function KeyRow({
 // thinking is REQUIRED here: the schema always supplies it, so making it optional just
 // pushed undefined into every consumer.
 type ThinkingMode = "off" | "adaptive" | "manual";
-type RouteTarget = { provider: LlmProvider; model: string; thinking: ThinkingMode; effort: string };
+type RouteTarget = { provider: LlmProvider; model: string; thinking: ThinkingMode; effort: string; keyId: string };
 type RouteValue = RouteTarget & { fallbacks: RouteTarget[] };
 
 function RouteEditor({
   target,
   modelOptions,
+  keysFor,
   onChange,
 }: {
   target: RouteValue;
   modelOptions: (p: LlmProvider) => { value: string; label: string }[];
+  keysFor: (p: LlmProvider) => LlmKeyEntry[];
   onChange: (next: RouteValue) => void;
 }) {
   const providerOptions = PROVIDERS.map((p) => ({ value: p, label: LLM_PROVIDER_LABELS[p] }));
 
-  const setPair = (i: number | null, provider: LlmProvider, model: string, thinking?: ThinkingMode, effort?: string) => {
+  const setPair = (
+    i: number | null,
+    provider: LlmProvider,
+    model: string,
+    thinking?: ThinkingMode,
+    effort?: string,
+    keyId?: string
+  ) => {
     const mode: ThinkingMode = thinking ?? "off";
     // Effort only means anything on "manual", and must be one this model accepts — the
     // levels differ (xhigh arrived with Opus 4.7). Fall back to the model's middle option
     // rather than sending something it would reject.
     const levels = ANTHROPIC_EFFORT_LEVELS[model] ?? [];
     const eff = mode === "manual" ? (levels.includes(effort ?? "") ? (effort as string) : levels[2] ?? levels[0] ?? "") : "";
-    const next: RouteTarget = { provider, model, thinking: mode, effort: eff };
+    // A pin belongs to a PROVIDER's key list, so it cannot survive a provider swap — carrying it
+    // would point this slot at a key that lives under a different provider and be silently ignored
+    // at call time, which reads as "the dropdown didn't save".
+    const kid = keysFor(provider).some((k) => k.id === (keyId ?? "")) ? (keyId as string) : "";
+    const next: RouteTarget = { provider, model, thinking: mode, effort: eff, keyId: kid };
     if (i === null) return onChange({ ...target, ...next });
     onChange({ ...target, fallbacks: target.fallbacks.map((f, j) => (j === i ? next : f)) });
   };
@@ -546,8 +588,18 @@ function RouteEditor({
     // Only Claude 4.6-and-newer accept an adaptive/off choice, so anything else would be a
     // knob that silently does nothing — it isn't shown.
     const canThink = !!ANTHROPIC_THINKING_ADJUSTABLE[pair.model];
+    // One row per key the operator holds for THIS provider, plus "any". Disabled keys are shown but
+    // marked, because a pin naming a disabled key is a real configuration to explain rather than hide.
+    const keyRows = keysFor(pair.provider);
+    const keyOptions = [
+      { value: "", label: keyRows.length > 1 ? "Any key (rotate)" : "Any key" },
+      ...keyRows.map((k, n) => ({
+        value: k.id,
+        label: `${k.label?.trim() || `Key ${n + 1}`}${k.tier === "free" ? " · free" : ""}${k.enabled ? "" : " · disabled"}`,
+      })),
+    ];
     return (
-      <div key={i ?? "primary"} className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[9rem_minmax(0,1fr)_auto_auto_2.5rem]">
+      <div key={i ?? "primary"} className="grid grid-cols-1 items-end gap-3 sm:grid-cols-[9rem_minmax(0,1fr)_10rem_auto_auto_2.5rem]">
         <SelectField
           label={i === null ? "Provider" : `Fallback ${i + 1}`}
           value={pair.provider}
@@ -558,7 +610,16 @@ function RouteEditor({
           label="Model"
           value={pair.model}
           options={opts}
-          onChange={(v) => setPair(i, pair.provider, v, pair.thinking, pair.effort)}
+          onChange={(v) => setPair(i, pair.provider, v, pair.thinking, pair.effort, pair.keyId)}
+        />
+        {/* Gemini's free tier meters 15 requests/MINUTE PER KEY, and rotation only advances when a key
+            FAILS — so two equal keys still funnel every call through the first. Pinning the primary to
+            one key and its fallback to the other spends both budgets instead of half of them. */}
+        <SelectField
+          label="Key"
+          value={keyRows.some((k) => k.id === pair.keyId) ? pair.keyId : ""}
+          options={keyOptions}
+          onChange={(v) => setPair(i, pair.provider, pair.model, pair.thinking, pair.effort, v)}
         />
         {canThink ? (
           <SelectField
@@ -569,7 +630,7 @@ function RouteEditor({
               { value: "adaptive", label: "Adaptive — the model decides" },
               { value: "manual", label: "Manual — you set the depth" },
             ]}
-            onChange={(v) => setPair(i, pair.provider, pair.model, v as ThinkingMode, pair.effort)}
+            onChange={(v) => setPair(i, pair.provider, pair.model, v as ThinkingMode, pair.effort, pair.keyId)}
           />
         ) : (
           <span />
@@ -582,7 +643,7 @@ function RouteEditor({
               value: lvl,
               label: EFFORT_COPY[lvl] ?? lvl,
             }))}
-            onChange={(v) => setPair(i, pair.provider, pair.model, "manual", v)}
+            onChange={(v) => setPair(i, pair.provider, pair.model, "manual", v, pair.keyId)}
           />
         )}
         {i === null ? (
@@ -603,7 +664,7 @@ function RouteEditor({
 
   return (
     <div className="space-y-3">
-      {row({ provider: target.provider, model: target.model, thinking: target.thinking, effort: target.effort }, null)}
+      {row({ provider: target.provider, model: target.model, thinking: target.thinking, effort: target.effort, keyId: target.keyId }, null)}
       {target.fallbacks.map((f, i) => row(f, i))}
       {target.fallbacks.length < 4 && (
         <button
@@ -618,6 +679,15 @@ function RouteEditor({
                   model: modelOptions(target.provider)[1]?.value || target.model,
                   thinking: "off",
                   effort: "",
+                  // If the row above is already pinned, pin this one to a DIFFERENT key by default —
+                  // that is the entire point of pinning (two per-minute budgets instead of one), and
+                  // it is the arrangement an operator who pinned the primary is reaching for. When
+                  // nothing above is pinned, stay on "any key" and change nothing.
+                  keyId: target.keyId
+                    ? keysFor(target.provider).find(
+                        (k) => k.enabled && k.id !== target.keyId && !target.fallbacks.some((f) => f.keyId === k.id)
+                      )?.id ?? ""
+                    : "",
                 },
               ],
             })
@@ -645,11 +715,13 @@ function ActionRoute({
   cfg,
   edit,
   modelOptions,
+  keysFor,
 }: {
   action: LlmAction;
   cfg: AiConfig;
   edit: (u: (c: AiConfig) => AiConfig) => void;
   modelOptions: (p: LlmProvider) => { value: string; label: string }[];
+  keysFor: (p: LlmProvider) => LlmKeyEntry[];
 }) {
   const route = cfg.routes?.[action];
   const copy = ACTION_COPY[action];
@@ -674,7 +746,7 @@ function ActionRoute({
               setRoute(
                 e.target.checked
                   ? null
-                  : { provider: cfg.provider, model: cfg.model, thinking: cfg.thinking, effort: cfg.effort, fallbacks: [] }
+                  : { provider: cfg.provider, model: cfg.model, thinking: cfg.thinking, effort: cfg.effort, keyId: cfg.keyId, fallbacks: [] }
               )
             }
           />
@@ -684,7 +756,7 @@ function ActionRoute({
       <p className="mt-1 text-xs leading-relaxed text-ink-dim">{copy.desc}</p>
       {route ? (
         <div className="mt-3">
-          <RouteEditor target={route} modelOptions={modelOptions} onChange={setRoute} />
+          <RouteEditor target={route} modelOptions={modelOptions} keysFor={keysFor} onChange={setRoute} />
         </div>
       ) : (
         <p className="mt-2 flex items-baseline gap-2 text-xs text-ink-faint">

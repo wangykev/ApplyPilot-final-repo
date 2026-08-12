@@ -528,6 +528,26 @@ export const GEMINI_STARTER_CHAIN = {
   fallback: "gemini-3.1-flash-lite",
 } as const;
 
+/**
+ * AUTO model (lockstep with llm.js — LLM_AUTO_MODEL / LLM_AUTO_CANDIDATES).
+ *
+ * Stored as the model id "auto"; the EXTENSION resolves it per call to whichever candidate is
+ * observably fastest, because only the extension has the latency measurements. Offered only for
+ * providers listed in LLM_AUTO_CANDIDATES.
+ *
+ * Why it exists: measured 2026-08-11, interleaved on the same free key in the same minute,
+ * gemini-3.1-flash-lite answered in 11499/7620/10903ms while gemini-3.5-flash-lite answered in
+ * 409/682/395ms. A 20× gap, purely server-side model health, and which sibling is degraded changes —
+ * so the right model is an observation, not a setting.
+ *
+ * Candidates are interchangeable same-price, same-quota siblings ONLY. 2.5-flash-lite shares the name
+ * but allows 20 requests/day against these two's 500, so auto-ing onto it would exhaust in one page.
+ */
+export const LLM_AUTO_MODEL = "auto";
+export const LLM_AUTO_CANDIDATES: Partial<Record<LlmProvider, string[]>> = {
+  gemini: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
+};
+
 export const LLM_PROVIDER_LABELS: Record<LlmProvider, string> = {
   gemini: "Google Gemini",
   anthropic: "Anthropic Claude",

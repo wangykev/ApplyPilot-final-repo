@@ -531,6 +531,511 @@ theorised to be: these transitions take **22–76 reads**, not the ~3–14 the e
 
 ---
 
+## 2026-08-11 — round 7: the NON-WORKDAY (ATS) path — what transfers, and what does NOT
+
+First look at Greenhouse / Lever / Ashby (`ats.js`) with the Workday lessons in hand. **The headline is a
+refutation of my own change: the page clock does NOT transfer to the ATS path.**
+
+### The ATS path is a genuinely different shape — check this before porting anything
+
+| | Workday | ATS |
+|---|---|---|
+| actuation | trusted `Input.*` (synthetic when hidden) | **page-side synthetic always**, via `Runtime.evaluate` |
+| pacing inside the fill | `act.delay` (SW) everywhere | page-side `sleep()` inside injected code |
+| SW poll loops | 28 in background.js + 28 in fill-driver.js | **`ats.js` has ZERO** |
+
+So the fill loop itself is NOT on the starved MV3 clock, and most of Workday's pacing work has nothing to
+bite on here. What IS SW-side is the DRIVER: `waitAtsFormReady` (450ms beat), `waitAtsPostingSettled`
+(300ms), and the post-navigate settles.
+
+### Drift IS present in the driver — measured
+
+Live, hidden Greenhouse (Roblox) run, with `[PACE]` (always on, no flag):
+
+```
+a 450ms pace took 2987ms (sw)     ← waitAtsFormReady, 6.6× over
+a 1000ms pace took 3045ms (sw)
+```
+
+Real, and it is not merely latency: `waitAtsFormReady` accepts on **three consecutive equal reads**, so a
+6.6× beat pushes acceptance from ~900ms to ~6s and its deliberate 2500ms floor stops being what binds.
+
+### ✖ REFUTED — arming the page clock there made it WORSE (do not retry)
+
+I applied the onboarding precedent exactly: arm the page clock only for the interval FOLLOWING a
+successful in-page scan, disarm in a `finally`. Measured, same posting, same conditions:
+
+| | pace overruns | shape |
+|---|---|---|
+| SW clock (before) | **2** | both `(sw)` |
+| page clock (after) | **5** | mostly **`page-abandoned`** |
+
+The ATS settle runs immediately after a NAVIGATE, and that is the one state round 3 already identified:
+**neither clock is clean during a navigation.** The page arm hangs, and the abandonment ceiling is itself
+an SW timer, so each hang costs `want + slack` measured late.
+
+**The flaw in my gate, worth stating because it looked airtight:** a successful `cdpEval` proves the
+document EXECUTES, not that its TIMERS fire. `Runtime.evaluate` is not timer-driven. On a freshly
+navigated document those two come apart, which is exactly where this was armed. Reverted.
+
+### ⚠ And what the run-to-run numbers do NOT prove
+
+The page-clock run also measured `fill 78.7s` against the previous `fill 23.9s` — a 3.3× regression it
+would be very easy, and wrong, to pin on the change. The breakdown says otherwise:
+
+```
+run 1 (sw):   23.9s / 26 fields — slowest: candidate-location 9.3s, school--0 3.6s
+run 2 (page): 78.7s / 26 fields — slowest: school--0 60.9s, candidate-location 8.0s
+```
+
+The entire difference is **`school--0`, a server-backed react-select** whose own search hung — and the
+change touched only the two settle loops, never the fill's option poll. LLM was fast in both runs
+(750–807ms), so the standing "a slow page is the LLM until proven otherwise" rule is also cleared here.
+**One run each cannot separate a code change from a widget with that much variance**; the refutation above
+stands on the pace-overrun mechanism, which is independent of it.
+
+### The real ATS costs, as measured (baseline for anyone tuning this)
+
+- `fill 23.9s for 26 field(s) — 919ms/field` on a healthy hidden Greenhouse run.
+- **`candidate-location` 8.0–9.3s on BOTH runs** — the known GH places field. Consistent, so it is the
+  best-characterised target here.
+- **`school--0` 3.6s → 60.9s across two runs of the SAME posting** — a server-backed combobox is the
+  dominant and least predictable cost on this path. Any ATS timing claim needs several runs.
+
+### ✖ SUPERSEDED — "HIDDEN IS ~2.4× SLOWER THAN VISIBLE ON ATS" — REFUTED by round 8, read that instead
+
+⚠ **The claim in this subsection is WRONG and the numbers under it are one run per arm.** Round 8 ran the
+controlled test (4+4 alternating, with an order-reversed pair and an idle no-tab control) and found NO
+hidden LLM penalty: the 2.4× was provider variance plus an ordering artefact — **the second run of a pair
+is slower whichever arm it is.** Kept, unedited below, because the reasoning is the honest record of what
+one run per arm looks like when it misleads you. The rest of round 7 stands.
+
+The operator's question: Workday hidden ≈ visible, is that true here? **No.** Same Greenhouse posting,
+same build, back-to-back:
+
+| | fill | ms/field | slowest field |
+|---|---|---|---|
+| hidden ×3 | 77.5s · 78.7s · 86.1s | ~3000ms | ONE widget hitting **34–61s** |
+| **visible** | **32.8s** | **1263ms** | candidate-location 8.4s — nothing hanging |
+
+The shape matters more than the ratio: hidden runs are not uniformly slower, they have **one
+server-backed combobox hanging to its ceiling, and a DIFFERENT one each run** (school--0 60.9s, then
+question_68143084 34.1s, then degree--0 19.3s + three questions). Visible runs have no such outlier.
+
+⚠ The `ats-tenants` skill says "visible and hidden runs are IDENTICAL". That is true of the ACTUATION
+MECHANISM — all three ATSs commit from synthetic events either way — and it is **not** true of
+wall-clock. Do not read the mechanism claim as a timing claim.
+
+**Eliminated: the `hidden-SLOW (no worker timers)` regime.** Every ATS run logged `CSP bypass ON ·
+worker-timers ON`, and the loud `warnNoWorkerTimers` banner never fired. So the polyfill IS installed and
+page timers ARE worker-backed — the Workday mechanism that makes hidden≈visible is working here and is
+still not enough.
+
+### ✖✖ THE CAUSE IS THE LLM, NOT THE FORM — both hypotheses above were WRONG (same day)
+
+I proposed two fixes — a layout-independent option poll, then restoring `Page.startScreencast`. **Both
+were aimed at the wrong thing, and the field-level log said so immediately.** Recorded in full because
+the reasoning was plausible and someone will re-derive it.
+
+**1. The option poll is ALREADY layout-independent.** `atsInjReadOptions` (ats.js) is pure
+`querySelectorAll` + `textContent` — no `getBoundingClientRect`, no visibility test. "Read the
+unpositioned menu" is what it already does, so there was nothing to fix.
+
+**2. The hung field was never a widget.** The slowest field in the worst hidden run:
+
+```
+question_68143084 (dropdown, req) → filled_review · ai-choice · "Python 3" · 34113ms   ← hidden
+question_68143084 (dropdown, req) → filled_review · ai-choice · "Python 3" ·  2911ms   ← visible
+```
+
+`ai-choice` — an LLM call. On that same run `school--0` read `loading false · waited 417ms/2 reads ·
+1253ms`: the combobox was FAST. The per-call `[LLM]` numbers confirm it outright:
+
+| run | LLM per call | fill |
+|---|---|---|
+| early hidden | 831 · 1959 · 732 · 972ms | **23.9s** |
+| hidden ×3 | 7734 · 9332 · 11521 · 12223 · 13845 · 13976 · 14984 · **34006**ms | 77–86s |
+| visible | 1207 · 2853 · 5778 · 8102ms | **32.8s** |
+
+This form has ~4–5 `ai-choice` dropdowns, so +10–30s per call IS the whole gap. **The
+standing rule caught this and I nearly walked past it: subtract the `[LLM]` line before blaming a
+tenant, the DOM, or the fill code.** It applies to the ATS path verbatim.
+
+**⚠ What is still NOT established: that VISIBILITY causes it.** The 23.9s baseline was *also hidden*, with
+fast LLM calls — so "hidden ⇒ slow LLM" does not hold. Provider latency is the documented biggest random
+variable here (486ms → 30657ms on identical config, same model, same session). One visible run cannot
+separate a visibility effect from ordinary provider variance, and the visible run being the LATEST also
+argues against simple time-based degradation. **Do not "fix" hidden-tab ATS speed until this is settled.**
+
+**The controlled test that would settle it:** alternate hidden/visible several times on one posting and
+compare the `[LLM]` latency DISTRIBUTIONS, not the fill totals. If a visibility effect is real the
+mechanism must be MV3-worker starvation (the LLM call is issued from the service worker and never touches
+the tab), which the `[CLOCKS]` probe can corroborate — high SW drift during hidden runs, low during
+visible. If the distributions overlap, this is provider noise and the ATS path has no hidden penalty at
+all.
+
+### Already refuted elsewhere — do not redo (see the `ats-tenants` skill)
+
+The 2.5s `waitAtsFormReady` floor (replacement instrumented and refuted — no observable signal separates
+"finished" from "quiet before the next burst"); screencast forcing; porting `cdpScrapeTaOptions` (these
+menus are not virtualized).
+
+---
+
+## 2026-08-11 — round 8: the ATS hidden penalty — ✖ REFUTED, and what the real numbers are
+
+Round 7 left one thing open: *"hidden is ~2.4× slower than visible on ATS"* rested on 3 hidden runs
+against **one** visible run, and round 7 itself flagged that one visible run cannot separate a
+visibility effect from provider variance. This round ran the controlled test. **There is no hidden LLM
+penalty on the ATS path.** The 2.4× was provider variance plus an ordering artefact.
+
+### What was run
+
+4 hidden + 4 visible, alternating, on ONE posting, build `llm-dist-3`, plus **5 idle control probes**.
+Every run's visibility is the MEASURED `[ATS-PACING]` label + the `[ATS-TIME]` paint label, never the
+`background` flag — and all 8 agreed with intent (`hidden-fast (worker timers)` / `visible-fast`).
+
+Both arms were treated identically: fire, wait out the run **without touching Chrome**, then read. That
+matters — polling the dev tab activates it, which would have made the "visible" arm hidden, and polling
+only the hidden arm would have loaded the worker asymmetrically.
+
+### ★ The new instrument that settles it: an IDLE control arm (`AP_DEV_LLM_PROBE`)
+
+Hidden-vs-visible cannot answer "whose fault is the latency", because **both arms are measured while a
+run drives a tab**. The probe fires N calls through the same `act.llm` seam — same route resolver, same
+key rotation, same fast-retry, same `[LLM]` lines — with **no tab, no attach, no fill**. Three-way:
+
+| arm | n | min | p25 | **median** | p75 | max | mean |
+|---|---|---|---|---|---|---|---|
+| hidden | 28 | 7907 | 10143 | **11203** | 13192 | 45005 | 13333 |
+| visible | 28 | 1717 | 11328 | **14438** | 18539 | 47042 | 15795 |
+| **idle (no tab at all)** | 21 | 9658 | 10977 | **11922** | 15727 | **46777** | 14800 |
+
+The idle arm lands **between** the two run arms, and `visible vs idle` is indistinguishable
+(Mann-Whitney p=0.303). A visible tab costs nothing relative to having no tab — so there is no
+tab-driven mechanism to find. The tail says it fastest: **the three slowest calls of the session are one
+from each arm** — visible 47042ms, **idle 46777ms**, hidden 45005ms. A 46.8s call with no tab open is
+provider latency and cannot be anything else.
+
+### ★ The ordering confound — and the pair that broke it (the decisive result)
+
+In pairs 1–3 hidden ran FIRST and visible SECOND, so "visible slower" was perfectly confounded with
+"second-in-pair slower". **Pair 4 was deliberately run V-then-H:**
+
+```
+idle-A 15.9s | H1 12.0s → V1 18.6s | idle-B 10.9s | H2 10.6s → V2 12.5s
+idle-C 12.2s | H3 11.3s → V3 16.5s | idle-D 11.5s | V4 15.6s → H4 19.5s | idle-E 23.2s
+                                                    ^^^^^^^^^^^^^^^^^^^ order reversed
+```
+
+**In all four pairs the SECOND run was slower — whichever arm it was.** Reverse the order and the
+penalty follows the *slot*, not the visibility. `H4` (hidden, second) was the slowest run of the whole
+session at **156.6s**, and `idle-E` right after it was the slowest idle set (23.2s mean) — the provider
+degraded through the session, and both run arms and the no-tab arm degraded with it.
+
+So the raw `hidden vs visible` p=0.021 is an artefact of hidden systematically occupying the earlier,
+faster slot in 3 of 4 pairs. ⚠ **Do not read that p-value as an effect.** It is what a confound looks
+like when you have not controlled it yet.
+
+### The decomposition — where ATS fill time actually goes
+
+| | LLM | everything else | total |
+|---|---|---|---|
+| hidden mean (n=4) | — | **19.9s** | 113.2s |
+| visible mean (n=4) | — | **14.1s** | 124.7s |
+
+**The LLM is 76–91% of the entire fill.** Per run: `100.1s = 84.0 LLM + 16.1 ours`,
+`156.6s = 136.6 LLM + 20.0 ours`, `121.7s = 108.9 LLM + 12.8 ours`. Any ATS timing claim that does not
+subtract the `[LLM]` line is measuring the provider and calling it a tenant.
+
+**The one real, reproducible hidden cost is in OUR non-LLM work, and it is small:** hidden
+`{16.1, 19.2, 24.2, 20.0}` vs visible `{13.1, 13.2, 17.2, 12.8}` — **1.41×, a 5.8s gap** on a 25-field
+page (~230ms/field), the two sets nearly non-overlapping. Exact Mann-Whitney (n=4 each, normal approx
+invalid this small) gives **p=0.057 — suggestive, NOT significant.** Note this is the *opposite
+magnitude* to round 7's claim: ~5% of the fill, not 140%. Worth a dedicated round only if the LLM cost
+below is fixed first; until then it is inside the noise of a single LLM call.
+
+⚠ **My own instrument is asymmetric here — checked, and it is too small to matter.** The `[ATS-PACING]`
+line I added calls `cdpPacingLabel()`, which returns immediately for a VISIBLE tab but for a hidden one
+also runs `cdpTimersFast()`. That probe races against `cdpDelay(TIMER_FAST_MS)` with `TIMER_FAST_MS=200`,
+and every hidden run reported `hidden-fast`, which BY DEFINITION means the probe won the race — so the
+hidden-only cost is **<200ms, ~3% of the 5.8s gap** (and `_timerLatCache` means the run would have paid
+it anyway the first time it asked). The gap is not my instrument. Stated because a one-sided
+instrumentation cost landing in exactly the residual you are measuring is the easy way to invent an
+effect.
+
+### ⚠ MEASUREMENT TRAP — `ok in Xms` is NOT the call's cost
+
+`[LLM] ok in 855ms (11021ms total across 2 attempt(s))` — the first number is the **winning attempt**,
+not what the fill waited. That call cost **11021ms**: `gemini-3.1-flash-lite` returned **HTTP 503** after
+10166ms and it fell back to `gemini-3.5-flash-lite`, which answered in 855ms.
+
+Parsing `ok in` cost me a wrong intermediate table in which three 503-fallback calls read 716/777/855ms —
+they were really 12266/15886/11021ms. It understated hidden totals and inflated the non-LLM residual
+(H4 read 45.3s of "our" time that was actually LLM). **Always parse `(\d+)ms total across`.** Corrected
+numbers are the ones above.
+
+### ★ THE ACTUAL LEVER — the fast-retry is misfiring on ~every call (~24% of the fill)
+
+**76 of 77 calls this session exceeded 4s**, i.e. spent BOTH 2s fast tries before the attempt that
+answered. At 7 AI calls per page that is **~28s of pure overhead per run — ~24% of an average 118.9s
+fill**, and it is the largest single recoverable cost measured on this path.
+
+The rule's premise is currently FALSE. `LLM_FAST_RETRY_RULES` reasons that "observed answer time is well
+under 1s, so a call still running at 2s is a stuck socket, not a slow model" — but the honest answer time
+this session was **~7–13s** (idle median 11.9s, with no tab in play). Every call therefore looks like a
+stuck socket and pays 4s to learn it isn't.
+
+**Its safety invariant held perfectly** — every one of the 77 calls SUCCEEDED, because once the fast tries
+are spent the next attempt gets the full budget. So this is purely a LATENCY mistune, never a correctness
+or coverage problem, which is exactly why it is safe to tune. **NOT changed here:** the 2000ms is
+unit-pinned by two tests and it is the operator's design call. Options, cheapest first: make the cap
+adaptive off a rolling p50 of recent answers (the data to do it is already logged), raise it for the
+gemini rule, or gate fast-retry on the primary model's recent 503 rate. The 503s are the real signal —
+the provider was unhealthy, not the socket.
+
+### The fixture died mid-investigation — check this before reusing round 7's URL
+
+`job-boards.greenhouse.io/roblox/jobs/8072713` (round 7's posting, filled 26 fields hours earlier)
+**now 302s to `careers.roblox.com/jobs/8072713`**, UA-independent. That page loads fully with **0 inputs,
+0 selects, 0 iframes** and a JS-only "Apply Now" — the Greenhouse form is unreachable.
+
+⚠ **`atsPostingGone` does NOT catch this.** It asks whether the requested job id is still in the landed
+URL, and `careers.roblox.com/jobs/8072713?gh_jid=8072713` still contains `8072713`. So a run proceeds and
+tries to fill an employer careers page as if it were Greenhouse. Worth a follow-up: an off-HOST redirect
+away from the ATS domain is evidence in its own right, independent of the id.
+
+Replacement fixture, verified serving the form directly on the GH host:
+**`job-boards.greenhouse.io/cloudflare/jobs/7902104`** (Accounting Intern, Fall 2026) — 35 inputs, 27
+`question_*` ids, 15 comboboxes, **7 `ai-choice` LLM calls per run**, 25 fields filled, stable across 9
+consecutive runs. Found by probing `boards-api.greenhouse.io/v1/boards/<co>/jobs/<id>?questions=true` for
+a board that does not redirect off-host; `databricks`, `duolingo`, `asana` and `samsara` all redirect,
+`discord`, `figma`, `airtable`, `reddit` and `cloudflare` do not.
+
+### New instruments (both kept)
+
+- **`AP_DEV_LLM_PROBE`** (`{type, n}`) — the idle control arm described above. Refuses while a run is in
+  flight. Logs `[ApplyPilot][LLM-PROBE]`.
+- **`[ATS-PACING]`** — `runAtsApplicationRun` now logs `cdpPacingLabel()` the way the Workday path
+  already did. The ATS path previously logged no visibility at all, so every hidden-vs-visible claim
+  about it rested on the caller's `background` flag, which is an INTENTION and not an observation.
+
+### Do NOT redo
+
+- **Hidden-vs-visible on the ATS path.** Settled: no LLM effect; our own non-LLM work is ~5.8s
+  (p=0.057) cheaper visible, i.e. ~5% of a fill. Round 7's 2.4× is refuted.
+- **Believing a hidden/visible ATS comparison that does not control ORDER.** The second run of a pair
+  is slower whichever arm it is; the provider drifts on a timescale of minutes.
+- **Reading `[LLM] ok in Xms` as a call's cost.** Parse the total across attempts.
+- Everything in round 7's own "do not redo" list (the page clock here, the option-poll "layout" fix,
+  `Page.startScreencast`, attempts floors).
+
+---
+
+## 2026-08-11 — round 9: WHY the call took 10s — it was the MODEL, and three fixes landed
+
+Round 8 proved the LLM was 76–91% of an ATS fill and that visibility had nothing to do with it. It did not
+answer the operator's actual question: *"why did a 3.1-flash-lite call take 10 seconds? on Workday it is
+usually half a second."*
+
+### ★ THE ANSWER: one sibling model was degraded server-side. Measured, not inferred.
+
+The decisive test is an A/B **on the same key, in the same minute, alternating** — so key, network, tab,
+prompt, token count and our own code are all held fixed and only the model varies:
+
+| call | model | latency |
+|---|---|---|
+| 1 | `gemini-3.1-flash-lite` | **11499ms** |
+| 2 | `gemini-3.5-flash-lite` | **409ms** |
+| 3 | `gemini-3.1-flash-lite` | **7620ms** |
+| 4 | `gemini-3.5-flash-lite` | **682ms** |
+| 5 | `gemini-3.1-flash-lite` | **10903ms** |
+| 6 | `gemini-3.5-flash-lite` | **395ms** |
+
+**A 20× gap between two same-price, same-quota siblings on one free key.** `gemini-3.1-flash-lite` was
+also returning **HTTP 503** ("overloaded", once after 10166ms). So:
+
+- **NOT rate limiting.** Both models shared the key and 3.5 was instant throughout.
+- **NOT the free tier, the network, our code, the tab, or ATS-vs-Workday.** Round 8's idle no-tab arm had
+  already removed those, and a tiny 16-token prompt was just as slow.
+- **NOT "the provider" as a whole** — which is where round 8's own standing rule stops being precise
+  enough. *A slow page is the LLM* was right; the LLM is not one thing. **Latency belongs to a
+  provider+MODEL, and siblings diverge by 20× for hours.**
+- The "on Workday it's 0.5s" memory is a **different day**, not a different pipeline: the 486/646/796ms
+  figures are from 2026-08-09 when 3.1 was healthy.
+
+⚠ **The operator's AI page had 3.1 as PRIMARY with 3.5 as fallback** — the reverse of
+`GEMINI_STARTER_CHAIN`. So every call paid the degraded model first and only reached the fast one when the
+slow one outright failed.
+
+### Also measured: only ONE of two keys was ever used
+
+Both keys are free tier, and rotation **only advances when a key FAILS** — so `orderLlmKeys` put the same
+key first every time. Across 6 consecutive calls, key 1 served all 6 and **key 2 was never touched.** The
+operator independently hit the consequence: *"sometimes I call AI 16 times per minute, the limit is 15."*
+Free-tier Gemini meters **15 requests/minute PER KEY**, so the account held 30/min of headroom and was
+breaching a 15/min limit inside half of it.
+
+### The three fixes
+
+**1. ADAPTIVE fast-retry cap (`llm.js`).** Round 8 measured 76/77 calls spending both 2s fast tries
+(~4s wasted per call, ~28s per page, ~24% of the fill). The static 2000ms was tuned for a ~650ms p50 and
+misfires the moment that changes. The cap now follows the observed p50 of recent answers, and **switches
+OFF entirely when no short cap could separate "stuck" from "slow"**.
+
+The reasoning that sets it is `P(stuck | still running at the cap)`, not "is the model slow": at a 650ms
+p50 almost nothing healthy reaches 2000ms, so a trip is near-certainly a stuck socket and the abort is
+close to free; at an 11s p50 EVERY call trips it, so the abort is paid by all and rescues none. `K=3` is
+calibrated, not picked: 3 × 650ms ≈ the hand-chosen 2000ms. Cold worker ⇒ the static value, unchanged.
+
+**2. AUTO model (`llm.js` + the AI page).** Model id `"auto"` resolves per call. **Ordered preference with
+failover**, per the operator — 3.5-flash-lite is always tried first and a sibling is only reached on
+evidence: a **503/5xx sidelines** a model for 2min, or a sibling answering **≥3× quicker** demotes it.
+⚠ 429/401 deliberately do NOT demote a model — those are the KEY's problem, and demoting the operator's
+primary over a per-key quota would be plainly wrong.
+
+**Recovery is the part that needed a second pass, and the operator caught it** ("make sure it doesn't stay
+on 3.1 if 3.5 comes back"). The first cut re-probed on staleness but read the WHOLE window, so a re-probe
+dropped one fresh fast sample among four stale slow ones, the MEDIAN stayed slow, and a recovered model
+needed ~5 probes ≈ **75 minutes** to win its traffic back. Fixed by bounding reads to
+`LLM_AUTO_STALE_MS` (15min, inside the operator's "10–20 minutes" ask): **stale measurements are DISCARDED,
+not averaged with fresh ones.** A demoted primary therefore ages back to "unmeasured", returns to the front,
+and **the next real fill call IS the probe** — no timer, no calls the fill wasn't already making, nothing
+running while idle. `LLM_AUTO_MIN_SAMPLES=2` (vs the cap's 4) so re-confirmation costs ~1–2 calls.
+
+**3. PER-SLOT KEY PINNING (`keyId`, AI page → `resolveLlmRoute` → `callLLM`).** Every model slot gets a
+**Key** dropdown ("Any key (rotate)" by default). Pinning the primary to key A and its fallback to key B
+spends **two** per-minute budgets. The pin is STRICT for the slot — the isolated budget IS the feature, so
+it must not spill — and resilience comes from the next slot carrying its own key. An id matching no stored
+key is **IGNORED, never obeyed**, so deleting a key degrades to rotation rather than disabling the slot.
+`keyId` is part of a slot's dedupe IDENTITY in `resolveLlmRoute`: without that, "3.1 on key A → 3.1 on
+key B" collapses to one attempt and the second key is silently discarded.
+
+### LIVE VERIFICATION (build `auto-model-1`)
+
+```
+auto → gemini-3.5-flash-lite · 448ms · 669ms · 0 fast-retry aborts
+      (same probe on 3.1: 7620–11499ms, 2 aborts every call)
+pin  → pinKeyId=<key 2> · 544ms · 508ms · both served by KEY 2
+      (before: 6/6 calls served by key 1, key 2 never touched)
+```
+
+So the fix chain is worth **~11s → ~0.5s per AI call**, and on a 7-call ATS page that is the difference
+between a ~120s fill and a ~25s one. `npm test` 1366/1366 · web 273/273 · `tsc` clean. Every behaviour above
+is unit-pinned AND mutation-checked (reverted, confirmed the test FAILS, restored).
+
+### New instrument
+
+**`AP_DEV_LLM_PROBE` grew an A/B mode**: `{n, models:[…], pinKeyId}` calls each model **directly** and
+alternates them round-robin, and reports the resolved route + key tiers from the AI page.
+Direct is the whole point — `act.llm`'s fallback chain silently answers from the NEXT model when the first
+is slow, which makes "model X is slow" unmeasurable. It also accepts `"auto"`, so the picker can be
+verified without editing the config under test.
+
+### ★ HIDDEN vs VISIBLE, RE-MEASURED with the LLM no longer dominating — still NO hidden lag
+
+Round 8's hidden-vs-visible ran while the LLM was **76–91% of the fill**, which is a bad place to look for
+a ~6s effect in our own code. With AUTO picking a healthy model the LLM drops to **17–27%**, so the
+non-LLM work is finally the visible term. Re-ran 3 hidden + 3 visible on the same posting, build
+`auto-model-1`, every run's visibility measured from its own `[ATS-PACING]` + paint label:
+
+| run | arm | fill | LLM | everything else | slowest field |
+|---|---|---|---|---|---|
+| H1 | hidden | 20.0s | 5.3s (27%) | 14.7s | candidate-location 7.9s |
+| H2 | hidden | 21.9s | 5.1s (23%) | 16.8s | candidate-location 11.1s |
+| H3 | hidden | **32.4s** | 5.4s (17%) | 27.0s | candidate-location 9.2s · country 6.3s |
+| V1 | visible | **62.8s** | 15.0s (24%) | 47.8s | question_68396682 29.3s · candidate-location 20.3s |
+| V2 | visible | 18.6s | 4.7s (25%) | 13.9s | candidate-location 7.1s |
+| V3 | visible | 17.5s | 4.7s (27%) | 12.8s | candidate-location 7.1s |
+
+**fill MEDIAN: hidden 21.9s · visible 18.6s (0.85×). Best run: hidden 20.0s · visible 17.5s.**
+**LLM per call is now indistinguishable between arms — hidden median 692ms, visible median 682ms.**
+
+**Verdict: there is no hidden lag on the ATS path.** The 3.3s median gap is well inside the per-run
+spread, and **each arm produced exactly ONE outlier** — H3 at 32.4s and V1 at 62.8s — so "one arm has
+hanging widgets" does not hold either. V1's 62.8s decomposes into one 10960ms LLM call plus
+`candidate-location` at 20.3s against 7.1s on the two neighbouring visible runs.
+
+⚠ **And it points the opposite way to round 8's own residual.** Round 8 measured non-LLM hidden 19.9s vs
+visible 14.1s (hidden +5.8s, p=0.057, "suggestive"); this round measures non-LLM **hidden 19.5s vs visible
+24.8s** — hidden now *cheaper*. Two measurements disagreeing in DIRECTION is the same noise signature that
+killed round 7's 2.4× claim. **Treat the round-8 residual as unproven and do not build on it.** The real
+variable on this path is `candidate-location` (7.1–20.3s across six runs of one posting), which is a
+server-backed places lookup and arm-independent.
+
+**What the whole fix chain is worth, hidden:** old build mean **113.2s → 21.9s median, 5.2×.** Composed of
+the adaptive cap (~28s: seen live as `fast-retry cap … OFF — observed p50 8407ms over the last 4 answers`,
+after which that run's LLM totals dropped from 17583/11728/11048/13823ms to 3540/7769/5511ms) and AUTO
+(~11s → ~0.7s per call, 7 calls a page).
+
+### ✔ FIXED — "auto" now expands to ONE ATTEMPT PER CANDIDATE, so failover happens IN-CALL
+
+**The bug, found on the operator's own config the moment they switched to Auto:** `resolveLlmRoute`
+returned a route of **length 1**. `keyId` is part of a slot's dedupe identity, and two `auto` slots with
+the same (empty) `keyId` are identical, so the fallback collapsed. `auto` also resolved to ONE model, so
+that single slot was the LAST attempt — and `act.llm`'s loop over the attempt list IS the in-call failover.
+Net effect: a persistent 503 ended the call unanswered (field → review) and the sibling was only reached
+by a LATER call via the 2min sideline. Strictly weaker than the stated intent, which wants per-CALL
+failover: *"try 3.5 first and if it is busy, errors, or something else, then go to 3."*
+
+**The fix** (`llmExpandAutoAttempts`, llm.js — pure, so it is unit-tested rather than living inline in
+cdp.js which no Node test can require): one `auto` slot expands to one attempt per candidate, in
+`llmAutoOrder`'s health rank.
+
+```
+before:  [ {gemini, "auto"} ]                  → attempts: [ 3.5-flash-lite ]            ← no fallback
+after:   [ {gemini, "auto"} ]                  → attempts: [ 3.5-flash-lite, 3.1-flash-lite ]
+```
+
+Four properties, each unit-pinned and mutation-checked:
+
+- **Health-ranked, not static** — a sidelined primary drops behind the sibling but is kept as a LAST
+  RESORT rather than dropped, because a degraded answer beats none (a failed AI call blanks a required
+  field and halts a walk).
+- **`keyId` rides onto every expansion**, so Auto and per-slot pinning COMPOSE: an auto slot pinned to key
+  A becomes `3.5@A → 3.1@A`. Two auto slots on different keys give all four combinations, and attempts
+  differing only by KEY survive the dedupe — that is the free tier's per-key minute budget.
+- **Re-deduped**, because expansion can collide with a concrete slot the operator also configured
+  (`[auto, 3.1] → [3.5, 3.1, 3.1]`); a duplicate is a wasted request on a model that just failed. This
+  also makes the original dedupe bug **moot** — one slot already supplies both models.
+- **Expanded per CALL, never written to storage.** The order is an observation; freezing it into the saved
+  config is exactly what must not happen.
+
+⚠ **The one real behavioural trade, stated because it is not a pure bugfix.** `act.llm` passes
+`noRetry: !isLast`, so every attempt but the last fails fast. Previously a lone `auto` slot was last and
+its model got the FULL retry ladder (~75s worst case) and never reached the sibling; now it gets one shot
+and the sibling takes over holding the ladder. That is faster and likelier to answer — the same
+"rotation before waiting" reasoning key rotation already uses — but it IS less persistence on the
+preferred model.
+
+**LIVE VERIFIED** (build `auto-expand-1`, hidden Greenhouse run):
+
+```
+[LLM] gemini gemini-3.5-flash-lite (auto) thinking:off for "fill" (2 keys) [attempt 1/2]
+```
+
+`[attempt 1/2]` is the proof — that suffix only prints when `attempts.length > 1`, and before this change
+the same config produced no suffix at all. All 7 calls answered on attempt 1, so attempt 2 never ran:
+**the healthy case still costs exactly one request.**
+
+⚠ That run also took 67.8s, and it is worth recording why rather than reading it as a regression: its LLM
+calls were `629 · 656 · 671 · 723 · 8257 · 18131 · 5718`ms — **3.5-flash-lite had its own slow spell
+mid-run** — plus `candidate-location` at 11.7s. The expansion issued zero extra requests. So the preferred
+sibling is not permanently fast either, which is the case AUTO's health tracking and this in-call failover
+both exist for.
+
+### Do NOT redo
+
+- **Blaming "the provider" without naming the MODEL.** Siblings diverge 20×. A/B them on one key.
+- **Reading a 429 as model ill-health.** It is the key's per-minute quota; 5xx is the model's.
+- **Assuming rotation spreads load.** It advances only on FAILURE, so N equal keys still means one key.
+- **Hidden-vs-visible on the ATS path.** Measured twice now, on builds where the LLM was 76–91% and 17–27%
+  of the fill, and the residual flipped sign. No hidden lag; stop looking for one.
+- **Measuring anything on this path with fewer than ~3 runs per arm.** `candidate-location` alone spans
+  7.1–20.3s on one posting.
+
+---
+
 ## 2026-08-10 — round 2: the fix (pace on the page's clock) — LIVE VERIFIED
 
 Fix direction 1 from round 1, built and verified. `cdpDelay` (`cdp.js`, the "PACING CLOCK" block) now

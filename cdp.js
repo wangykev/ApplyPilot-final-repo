@@ -5235,9 +5235,19 @@ function makeCdpActuation(llmConfig) {
         console.log(`[ApplyPilot][AI-CALL] action=${action || "fill"} maxTokens=${maxTokens || "?"} — QUESTIONS/OPTIONS: `
           + qOnly.slice(0, 1400) + (qOnly.length > 1400 ? " …[cut]" : ""));
       }
-      const attempts = typeof resolveLlmRoute === "function"
+      const routeSlots = typeof resolveLlmRoute === "function"
         ? resolveLlmRoute(llmConfig, action || "fill", LLM_DEFAULT_MODELS)
         : [{ provider: llmConfig.provider, model: llmConfig.model }];
+      // IN-CALL EXPANSION OF AN "auto" SLOT (2026-08-11): one slot becomes one ATTEMPT PER CANDIDATE,
+      // health-ranked, so the loop below performs the operator's failover ("if it is busy, errors, or
+      // something else, then go to 3") inside a SINGLE call. Before this, `auto` resolved to one model
+      // and was therefore also the LAST attempt: a persistent 503 ended the call unanswered and the
+      // sibling was only reached by a later call. Live on the operator's config this left a route of
+      // length 1 with no in-call fallback at all. Logic + dedupe live in llm.js so they are unit-tested;
+      // expansion happens per CALL and is never written to storage, because the order is an observation.
+      const attempts = typeof llmExpandAutoAttempts === "function"
+        ? llmExpandAutoAttempts(routeSlots)
+        : routeSlots;
       if (!attempts.length) return { ok: false, error: "no AI model configured (set one on the website's AI page)" };
 
       let last = null;
@@ -5253,20 +5263,31 @@ function makeCdpActuation(llmConfig) {
         // Name the route BEFORE the call, so a wrong model is visible in the log next to the field it
         // answered rather than inferred from the answer's quality. Never the key itself — only how many
         // are available to rotate through, which is what you need when a call fails.
-        console.log(`[LLM] ${attempt.provider} ${attempt.model}` +
+        // Already concrete after the expansion above; the call is kept because a route can still carry a
+        // bare "auto" if llmAutoOrder is unavailable, and it passes a concrete model through untouched.
+        const attemptModel = typeof llmResolveAutoModel === "function"
+          ? llmResolveAutoModel(attempt.provider, attempt.model)
+          : attempt.model;
+        console.log(`[LLM] ${attempt.provider} ${attemptModel}${attempt.fromAuto ? " (auto)" : ""}` +
           (attempt.thinking ? ` thinking:${attempt.thinking}${attempt.effort ? "/" + attempt.effort : ""}` : "") +
           ` for "${action || "fill"}"` +
           (keys.length ? ` (${keys.length} key${keys.length > 1 ? "s" : ""})` : " (single key)") +
+          // Name the PIN, so "is this slot actually using the key I bound?" is answerable from the log
+          // rather than by inspecting storage — the whole point of pinning is spending a second key's
+          // separate per-minute budget, and that is invisible unless it is stated.
+          (attempt.keyId ? ` pinned:${attempt.keyId}` : "") +
           (attempts.length > 1 ? ` [attempt ${attempts.indexOf(attempt) + 1}/${attempts.length}]` : ""));
         const res = await callLLM({
           provider: attempt.provider,
-          model: attempt.model,
+          model: attemptModel,
           thinking: attempt.thinking,
           effort: attempt.effort,
           // llmKeysFor already folds a v1 flat apiKey into a one-key list, so passing
           // apiKey as well would just duplicate it.
           keys,
           apiKey: keys.length ? "" : llmConfig.apiKey,
+          // The slot's pinned key, if the AI page bound one. "" ⇒ rotate normally.
+          pinKeyId: attempt.keyId || "",
           preferFreeFirst: llmConfig.preferFreeFirst !== false,
           // Cooldowns live for the service worker's lifetime, so a key parked on one
           // field is skipped for the rest of the form instead of being re-probed 60 times.
@@ -5294,13 +5315,13 @@ function makeCdpActuation(llmConfig) {
         // A run that quietly spends every call on the fallback looks like "the AI is slow" and stays a
         // mystery. Count it and say so ONCE, loudly, the first time — the operator should learn their
         // primary model is down from the log, not from wondering why a fill dragged.
-        cdpLlmDemotions.push({ model: attempt.model, error: String((res && res.error) || "").slice(0, 80) });
+        cdpLlmDemotions.push({ model: attemptModel, error: String((res && res.error) || "").slice(0, 80) });
         if (cdpLlmDemotions.length === 1 && !isLast) {
-          console.log(`[ApplyPilot] ⚠ YOUR PRIMARY AI MODEL IS FAILING — ${attempt.provider} ${attempt.model} did not answer,` +
+          console.log(`[ApplyPilot] ⚠ YOUR PRIMARY AI MODEL IS FAILING — ${attempt.provider} ${attemptModel} did not answer,` +
             ` so this run is using the fallback instead. Every AI field pays a wasted request first.` +
             ` If this keeps happening, reorder the models on the AI page so a working one is first.`);
         }
-        console.log(`[LLM] ${attempt.provider} ${attempt.model} FAILED after ${Date.now() - tAttempt}ms` +
+        console.log(`[LLM] ${attempt.provider} ${attemptModel} FAILED after ${Date.now() - tAttempt}ms` +
           (isLast ? " (full retry ladder — no fallback left)" : " (failing fast to the next model)") +
           ` — ${String((res && res.error) || "no reply").slice(0, 140)}`);
         last = res;

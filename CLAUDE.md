@@ -596,6 +596,47 @@ fast-try budget is INDEPENDENT of the error ladder, because rotation probes ever
 by tests). A fast abort is never a key fault: it does not consume a rotation slot or get a key marked bad.
 Adding another model is one line in the rule table; `fastRetry:false` opts a call out.
 
+**⚠ "THE LLM" IS NOT ONE THING — LATENCY BELONGS TO A provider+MODEL (2026-08-11).** Two same-price,
+same-quota siblings diverge by **20×** for hours: A/B'd on ONE key in ONE minute, `gemini-3.1-flash-lite`
+answered in 11499/7620/10903ms while `gemini-3.5-flash-lite` answered in 409/682/395ms (3.1 also 503'ing
+"overloaded"). So "a slow page is the LLM" is right but not precise enough — **name the model, and A/B the
+siblings on one key before concluding anything.** A 429 is the KEY's per-minute quota; a 5xx is the MODEL's
+health; they must never be treated alike. Three fixes came out of it, all in `docs/fill-speed-log.md`
+round 9: the **adaptive fast-retry cap** (the static 2000ms was tuned for a ~650ms p50 and fired on 76/77
+calls once the real p50 hit ~11s — it now tracks the observed p50 and switches OFF when no short cap could
+separate "stuck" from "slow"), the **AUTO model** (`model:"auto"` — ordered preference with failover, and
+stale measurements are DISCARDED not averaged, which is what makes a recovered model win its traffic back
+in ~1 call instead of ~75min), and **per-slot key pinning**.
+
+**An `auto` route slot expands to ONE ATTEMPT PER CANDIDATE** (`llmExpandAutoAttempts`, llm.js — pure and
+unit-tested, because cdp.js cannot be `require`d by a Node test). `act.llm`'s loop over the attempt list IS
+the in-call failover, so a slot resolving to ONE model was also the LAST attempt: a persistent 503 ended
+the call unanswered and the sibling was only reached by a later call. **One `auto` slot is therefore a
+complete config** — it carries its own fallback, inherits the slot's `keyId` onto every attempt (Auto and
+pinning compose), and re-dedupes against any concrete slot. ⚠ It expands per CALL and is NEVER written to
+storage — the order is an observation, and freezing it into the saved config is the thing to avoid.
+
+**Rotation does NOT spread load — it advances only on FAILURE (2026-08-11).** N equal-tier keys therefore
+send every call through the FIRST one (measured: 6/6 calls on key 1, key 2 never touched), so a free-tier
+account holding 30 requests/min of headroom breaches a **15/min PER-KEY** limit inside half of it. The fix
+is the AI page's per-slot **Key** dropdown (`keyId`): pin the primary to key A and its fallback to key B.
+The pin is STRICT for the slot (the isolated budget is the point), resilience comes from the NEXT slot's
+own key, and an id matching no stored key is IGNORED rather than obeyed. `keyId` is part of a slot's dedupe
+identity in `resolveLlmRoute` — without that, "same model, two keys" collapses to one attempt.
+
+**Both the fill (`ats.js`) and the Workday walk (`fill-driver.js`) call `act.llm` with NO `action`**, so
+both resolve the SAME `"fill"` route from the AI page, and `makeAtsActuation` reuses `workday.llm`
+verbatim. Model + fallback + key bindings all come from the website's AI page for every path — verify with
+`AP_DEV_LLM_PROBE`, which reports the resolved route rather than requiring you to read the code.
+
+**`AP_DEV_LLM_PROBE` is how you PROVE it — the IDLE control arm (2026-08-11).** It fires N calls through
+the same `act.llm` seam with **no tab, no attach, no run**, so provider latency is measured with nothing
+else to blame. Use it before attributing any slowness to a tenant, a tab's visibility, or the fill code:
+a hidden-vs-visible comparison cannot separate the two, because BOTH arms run while a tab is being driven.
+It refuses while a run is in flight. This retired the "hidden is 2.4× slower on ATS" claim — **the LLM is
+76–91% of an ATS fill**, an idle no-tab call hit 46.8s, and the second run of a back-to-back pair is
+slower whichever arm it is (round 8, `docs/fill-speed-log.md`).
+
 **`debugLagTrace`** (`AP_DEV_FLAG`) is the tool that settles it, and it exists because a duration alone
 never could: it times every CDP command at the `cdpSend` choke point, runs a 500ms no-op page probe, and
 measures the service worker's own timer drift — three clocks that fail independently, so each slow command

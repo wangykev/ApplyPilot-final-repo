@@ -48,6 +48,26 @@ variance swamps most page-level timing comparisons, so never conclude from a sin
 the read, not the run). If the MCP tab group flips to a Chrome profile with no `applypilot.extensionId` in
 localStorage, run `switch_browser` and have the operator reconnect.
 
+⚠ **`AP_PING` right after `AP_RELOAD` reports the OLD build (2026-08-11).** The marker check below is only
+trustworthy once the new worker is actually up: a ping ~3.5s after the reload answered `{ok:true}` with the
+PREVIOUS marker, which reads exactly like "my edit didn't load" and sends you off to re-read correct code —
+the very failure the marker exists to prevent. Repeated `chrome.runtime.reload()` calls are also throttled,
+so a second reload soon after a first can be deferred. Wait ~9s and retry the ping a few times until the
+marker CHANGES; if it never does, then suspect the edit. Cheap recipe:
+
+```js
+await window.__apSend({type:"AP_RELOAD"}, 10000);
+await new Promise(r => setTimeout(r, 9000));
+let p; for (let i = 0; i < 3; i++) { p = await window.__apSend({type:"AP_PING"}, 20000); if (p && p.ok) break;
+  await new Promise(r => setTimeout(r, 2500)); }
+p.build;   // compare against AP_BUILD_MARKER in background.js
+```
+
+**A dead worker looks different from a stale one:** if the reload hit a SyntaxError the extension fails to
+register at all and the ping keeps timing out rather than returning an old marker. `node --check background.js`
+(plus any file you edited) separates the two in seconds — it catches the one-global-scope collisions that
+`importScripts` turns into a completely dead extension.
+
 **Two traps this session cost real time:**
 - **A 91-second LLM call.** `llm.js` had no request timeout, so one stalled fetch dragged a page fill from
   ~10s to 100.1s. Now capped by `LLM_REQUEST_TIMEOUT_MS`, which is **30000, not the 20s this doc claimed
