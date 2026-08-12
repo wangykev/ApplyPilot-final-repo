@@ -1628,6 +1628,13 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
       return { kind: "skip", source: "generic", detail: "a non-résumé attachment — the operator's own to add" };
     }
     if (/r[eé]sum[eé]|\bcv\b|upload.*(file|document)|attach/i.test(l) || /resume|cv/i.test(String(f.fieldName || ""))) {
+      // ⚠ only the PRIMARY slot. A form offering two routes to the same upload (Paylocity's
+      // btn-forceResume + btn-resume) must not receive the résumé twice — see atsGenericPostProcess.
+      // `primaryResumeSlot` is undefined when the scan did not run through the resolver (unit tests
+      // of a single field), so an explicit `=== false` is what refuses a secondary slot.
+      if (f.primaryResumeSlot === false) {
+        return { kind: "skip", source: "generic", detail: "a second résumé upload route on this form — the primary slot already has it" };
+      }
       return { kind: "resume", source: "generic" };
     }
     // An UNLABELLED file input is the résumé slot only when it is the form's ONLY one. With two or
@@ -3361,6 +3368,21 @@ function atsGenericPostProcess(raw) {
   const files = out.fields.filter((x) => x.widgetType === "file_upload");
   out.diag.fileInputs = files.length;
   if (files.length === 1) files[0].soleFileInput = true;
+  // ⚠ EXACTLY ONE résumé slot. A form can offer several routes to the same upload — Paylocity has
+  // BOTH `btn-forceResume` ("Apply with resume") and `btn-resume` ("Fill out application with my
+  // resume"), and both match the résumé wording. Attaching to both would upload twice and can kick
+  // off two server-side parses, so only the FIRST résumé-looking slot is the primary; the rest are
+  // left to the operator. The recognizer in atsRouteField requires this flag.
+  const RESUME_RX = /r[eé]sum[eé]|\bcv\b/i;
+  const NON_RESUME_RX = /cover\s*letter|transcript|portfolio|writing sample|certificat|reference/i;
+  const resumeish = files.filter((f) => {
+    const l = String(f.label || f.fieldName || "");
+    return !NON_RESUME_RX.test(l) && (RESUME_RX.test(l) || RESUME_RX.test(String(f.fieldName || "")));
+  });
+  // set BOTH ways explicitly: the recognizer refuses on `=== false`, so a secondary slot must carry
+  // the flag rather than merely lack it.
+  resumeish.forEach((f, i) => { f.primaryResumeSlot = i === 0; });
+  out.diag.resumeSlots = resumeish.length;
   return out;
 }
 
@@ -3380,7 +3402,13 @@ function atsInjScanGeneric() {
   // ── a FILTERED text read. Three vendors proved plain textContent unusable: Lever bled an inline
   // error into a question, Workable bled a whole country-code option list into one, and Paylocity
   // bled the widget's own VALUE and PLACEHOLDER ("CountryUnited States", "StateSelect a state").
-  var DROP = 'option,[role=option],[role=listbox],select,input,textarea,button,[class*="error"],[class*="Error"],[role="alert"],[class*="help"],[class*="hint"],[class*="single-value"],[class*="placeholder"],[aria-hidden="true"]';
+  // …and NESTED label/legend nodes are dropped too. A question label can WRAP its own option labels:
+  // live on Paylocity, `label[for="info.howDidYouHearAboutUs"]` read
+  // "How did you hear about us?(optional)Advertisement-PrintCollege-Recruiting Event…" — the question
+  // with all 8 options glued on. Removing descendant labels leaves exactly the question. (Safe for a
+  // plain wrapping label, which has no nested one; `readText` only strips DESCENDANTS of its clone,
+  // never the node it was handed.)
+  var DROP = 'option,[role=option],[role=listbox],select,input,textarea,button,label,legend,[class*="error"],[class*="Error"],[role="alert"],[class*="help"],[class*="hint"],[class*="single-value"],[class*="placeholder"],[aria-hidden="true"]';
   var readText = function (node) {
     if (!node) return "";
     var c;
@@ -3414,8 +3442,12 @@ function atsInjScanGeneric() {
     var st = (subs[s].textContent || subs[s].value || subs[s].getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
     if (st) subTexts.push(st);
   }
+  // ⚠ Keep the SAME split atsInjSubmitState uses: a real submit vs a wizard advance. "Next Step"
+  // must never read as a submit — Paylocity's primary control is literally that. Form DETECTION
+  // accepts either (a wizard page IS an application form); only the submit GATE requires hasSubmit.
   out.submitState = {
-    hasSubmit: subTexts.some(function (t) { return /submit|apply|send|next step|continue|finish/i.test(t); }),
+    hasSubmit: subTexts.some(function (t) { return /^(submit|apply|send)\b|submit (my )?application|send application|finish|complete application/i.test(t); }),
+    multiStep: subTexts.some(function (t) { return /next step|^next\b|continue|save and continue/i.test(t); }),
     texts: subTexts.slice(0, 12),
   };
 
@@ -3521,9 +3553,43 @@ function atsInjScanGeneric() {
     var u = unitOf(first);
     // ⚠ a group's label must NEVER come from an option's own label. Breezy's required
     // race_ethnicity/gender groups resolved to "White (not Hispanic or Latino)" / "Male" that way.
-    // So label[for]/label-wrap are DROPPED for a group — the question is in the legend or a heading.
+    // Dropping label[for]/label-wrap is NOT enough: the unit CONTAINS the option labels, so
+    // `unitLabel` picks the first one too — live on Paylocity, `info.howDidYouHearAboutUs` resolved to
+    // "Advertisement-Print". So a group's unit label is recomputed here: a <legend> first, else the
+    // first label-ish node that is NOT one of this group's own option labels.
     var cands = labelCandidatesFor(first, u);
     delete cands.labelFor; delete cands.labelWrap; delete cands.placeholder;
+    delete cands.unitLabel;
+    var memberIds = {};
+    for (var mi = 0; mi < list.length; mi++) { if (list[mi].id) memberIds[list[mi].id] = 1; }
+    // (1) a <legend> is the semantically strongest label for a group.
+    var lg = u.node && u.node.querySelector("legend");
+    var lgt = readText(lg);
+    if (lgt) cands.unitLabel = lgt;
+    // (2) …else a label whose `for` names the GROUP (its shared `name`) rather than any one input.
+    // That is how Paylocity labels its radio groups, and it is the only place the question exists.
+    if (!cands.unitLabel && first.name) {
+      var byName = null;
+      try { byName = document.querySelector('label[for="' + esc(first.name) + '"]'); } catch (e) { byName = null; }
+      var bnt = readText(byName);
+      if (bnt) cands.unitLabel = bnt;
+    }
+    // (3) …else the first label-ish node in the unit that is NOT one option's own label. ⚠ A label
+    // wrapping EXACTLY ONE member is an option label; one wrapping SEVERAL is the question, so the
+    // test is the member COUNT, not mere containment.
+    if (!cands.unitLabel && u.node) {
+      var labs = u.node.querySelectorAll('label,[class*="abel"]');
+      for (var li = 0; li < labs.length; li++) {
+        var cand = labs[li];
+        var forId = cand.getAttribute && cand.getAttribute("for");
+        if (forId && memberIds[forId]) continue;                   // an option's own label
+        var owns = 0;
+        for (var mj = 0; mj < list.length; mj++) { if (cand.contains && cand.contains(list[mj])) owns++; }
+        if (owns === 1) continue;                                   // wraps exactly ONE option
+        var ct = readText(cand);
+        if (ct) { cands.unitLabel = ct; break; }
+      }
+    }
     var optLabel = function (r2) {
       var l = null;
       if (r2.id) { try { l = document.querySelector('label[for="' + esc(r2.id) + '"]'); } catch (e) { l = null; } }

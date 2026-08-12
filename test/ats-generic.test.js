@@ -481,6 +481,103 @@ test("LIVE KEF Robotics: identified as an application form, and its résumé slo
   assert.ok(s.fields.every((f) => f.identityFrom === "attr"));
 });
 
+// ── three bugs found by running the scanner against the LIVE Paylocity form (2026-08-12) ──
+test("LIVE Paylocity: a radio group must not take an OPTION's text from unitLabel either", () => {
+  // Found live: `info.howDidYouHearAboutUs` resolved to "Advertisement-Print" — its first option —
+  // because the field UNIT contains the option labels. Dropping labelFor/labelWrap was not enough.
+  // The scanner now recomputes a group's unit label (legend first, else a non-member label), so by
+  // the time the resolver sees it the option text is gone. This pins the resolver end of that: an
+  // option-looking unitLabel is all the group has, and the ordinal/identity path must still hold.
+  const s = ats.atsGenericPostProcess({
+    fields: [{ attrId: "info.howDidYouHearAboutUs", inputSel: 'input[name="info.howDidYouHearAboutUs"]',
+      widgetType: "radio", domIndex: 0, options: ["Advertisement-Print", "Employee Referral", "Job Board"],
+      labelCandidates: { unitLabel: "How did you hear about us?" } }],
+  });
+  assert.strictEqual(s.fields[0].label, "How did you hear about us?");
+  assert.deepStrictEqual(s.fields[0].options, ["Advertisement-Print", "Employee Referral", "Job Board"]);
+});
+
+test("LIVE Paylocity: only ONE résumé slot is primary when a form offers two upload routes", () => {
+  // btn-forceResume ("Apply with resume") and btn-resume ("Fill out application with my resume") both
+  // match the résumé wording. Attaching to both would upload twice and can start two server parses.
+  const s = ats.atsGenericPostProcess({
+    fields: [
+      { attrId: "btn-forceResume", inputSel: "#btn-forceResume", widgetType: "file_upload", domIndex: 0,
+        labelCandidates: { adjacentText: "Upload Resume" } },
+      { attrId: "btn-resume", inputSel: "#btn-resume", widgetType: "file_upload", domIndex: 1,
+        labelCandidates: { unitLabel: "Fill out application with my resume" } },
+      { attrId: "btn-coverLetter", inputSel: "#btn-coverLetter", widgetType: "file_upload", domIndex: 2,
+        labelCandidates: { unitLabel: "Upload Cover Letter" } },
+    ],
+  });
+  assert.strictEqual(s.diag.fileInputs, 3);
+  assert.strictEqual(s.diag.resumeSlots, 2, "the cover letter must not count as a résumé slot");
+  assert.strictEqual(s.fields[0].primaryResumeSlot, true);
+  assert.strictEqual(s.fields[1].primaryResumeSlot, false);
+  const route = (f) => ats.atsRouteField("generic", f, {}, {}, {}, null);
+  assert.strictEqual(route(s.fields[0]).kind, "resume");
+  assert.strictEqual(route(s.fields[1]).kind, "skip", "the second upload route must not also receive it");
+  assert.strictEqual(route(s.fields[2]).kind, "skip", "the cover letter must never receive the résumé");
+});
+
+test("LIVE Paylocity: required comes from the label for 10+ fields that carry NO attribute", () => {
+  // Measured live: only the `public-site-address-*` fields set aria-required. Everything else marks
+  // it as literal "(required)" text — so the label rung is carrying most of this form.
+  const mk = (id, label, reqAttr) => ({ attrId: id, inputSel: "#" + id, widgetType: "text", domIndex: 0, reqAttr: !!reqAttr, labelCandidates: { unitLabel: label } });
+  const s = ats.atsGenericPostProcess({ fields: [
+    mk("info.firstName", "First Name (required)"), mk("info.lastName", "Last Name (required)"),
+    mk("info.email", "Email Address (required)"), mk("info.cellPhone", "Mobile Number (required)"),
+    mk("info.referredBy", "Referred by (required)"), mk("info.middleName", "Middle Name"),
+    mk("public-site-address-city", "City", true),
+  ] });
+  const req = s.fields.filter((f) => f.isRequired).map((f) => f.fieldName);
+  assert.strictEqual(req.length, 6);
+  assert.ok(req.includes("info.firstName") && req.includes("info.referredBy"));
+  assert.ok(!req.includes("info.middleName"));
+  // and the marker is gone from every question
+  assert.ok(!s.fields.some((f) => /required/i.test(f.label)), "no question may still carry '(required)'");
+  // the label-text rung is what did the work for five of them
+  assert.strictEqual(s.fields.filter((f) => f.reqVia === "label-text").length, 5);
+  assert.strictEqual(s.fields.find((f) => f.fieldName === "public-site-address-city").reqVia, "attr");
+});
+
+test("LIVE Paylocity: the scanner strips NESTED labels, and finds a group's label[for=<name>]", () => {
+  // Both earned live. The question label WRAPS its own option labels, so a plain textContent read gave
+  // "How did you hear about us?(optional)Advertisement-PrintCollege-Recruiting Event…". And the
+  // question is a label[for="info.howDidYouHearAboutUs"] — pointing at the group's shared NAME, not
+  // at any input id — which is the only place it exists on that form.
+  const src = ats.atsInjScanGeneric.toString();
+  assert.ok(/label,legend,/.test(src), "nested label/legend must be in the filtered-read DROP list");
+  assert.ok(/label\[for="' \+ esc\(first\.name\)/.test(src), "a group must look up label[for=<group name>]");
+  // the ladder order for a group: legend, then label[for=name], then a non-option label
+  const i = src.indexOf('querySelector("legend")');
+  const j = src.indexOf("esc(first.name)");
+  assert.ok(i > 0 && j > i, "legend must be tried before label[for=<name>]");
+});
+
+test("LIVE Paylocity: the resolved group question is clean and its (optional) marker is read", () => {
+  // what the live scanner now hands the resolver, verbatim
+  const s = ats.atsGenericPostProcess({
+    fields: [{ attrId: "info.howDidYouHearAboutUs", inputSel: 'input[name="info.howDidYouHearAboutUs"]',
+      widgetType: "radio", domIndex: 0, options: ["Advertisement-Print", "Employee Referral", "Other"],
+      labelCandidates: { unitLabel: "How did you hear about us?(optional)" } }],
+  });
+  assert.strictEqual(s.fields[0].label, "How did you hear about us?");
+  assert.strictEqual(s.fields[0].isRequired, false, "(optional) must be read as NOT required");
+  assert.ok(!/Advertisement/.test(s.fields[0].label), "no option text may survive in the question");
+});
+
+test("LIVE Paylocity: 'Next Step' is reported as multiStep, never as a submit", () => {
+  // the scanner's own submitState must use the SAME split as atsInjSubmitState
+  const src = ats.atsInjScanGeneric.toString();
+  assert.ok(/multiStep:/.test(src), "the generic scanner must report multiStep");
+  // and the shared judgement accepts the page as a form while refusing to call it submittable
+  const fields = [{ fieldName: "info.email", label: "Email Address", widgetType: "text" }];
+  const id = ats.atsLooksLikeApplicationForm(fields, { hasSubmit: false, multiStep: true });
+  assert.strictEqual(id.ok, true);
+  assert.strictEqual(id.hasSubmit, false);
+});
+
 // ── ISOLATION: the generic kind must not leak into the supported families ───────────────
 test("isolation: detectAts NEVER returns 'generic'", () => {
   const urls = [

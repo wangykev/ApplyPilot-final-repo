@@ -559,6 +559,55 @@ the same mistake easy: `mustOpen` must be decided from list CONTENTS, not from t
 
 ---
 
+## 9b. STATUS — built 2026-08-12 (steps 1–4 of the build order)
+
+Shipped in `ats.js` + `background.js`, with 40 tests in `test/ats-generic.test.js`:
+
+| Piece | Where |
+|---|---|
+| Injected generic scanner (DOM → raw candidates) | `atsInjScanGeneric` |
+| PURE resolver (labels, identity, required, options) | `atsGenericPostProcess` + `atsGenericIdDurable` / `atsGenericCleanLabel` / `atsGenericRequiredFromLabel` / `atsGenericPickLabel` |
+| One scan entry point | `atsScanFor` (ats.js) · `cdpAtsScan` (background.js) |
+| Review picker for unfilled choice fields | `atsCaptureChoiceOptions` |
+| Résumé recognizer (no static map exists) | `atsRouteField`, generic branch |
+| Wizard-vs-submit split | `atsInjSubmitState` (`multiStep`) + `atsLooksLikeApplicationForm` |
+| Fallback hooks | `runAtsApplicationRun` (3 bail points) + the `AP_RUN_APPLICATION` unrecognized-host branch |
+
+**Kill switch:** `chrome.storage.local.genericFillDisabled = true`.
+
+### ⚠ Three bugs the LIVE run found that the fixtures did not
+
+Running the real scanner against the live Paylocity form (43 fields) caught three things unit tests
+had passed. Recorded because each is the same lesson: *a fixture is written from what you already
+believe.*
+
+1. **The Breezy group bug came back through a DIFFERENT rung.** Blocking `labelFor`/`labelWrap` for a
+   group is not enough — the field UNIT contains the option labels, so `unitLabel` picked the first
+   one and `info.howDidYouHearAboutUs` resolved to **"Advertisement-Print"**. A group's label now
+   resolves legend → `label[for=<group NAME>]` → a label that wraps ≠1 members.
+2. **A question label can WRAP its own options.** `label[for="info.howDidYouHearAboutUs"]` read
+   `"How did you hear about us?(optional)Advertisement-PrintCollege-Recruiting Event…"`. Nested
+   `label`/`legend` are now stripped by the filtered read — verified against every other control on
+   that page: **0 labels changed**, so it only helps the group case.
+3. **Two file inputs both matched the résumé.** Paylocity offers `btn-forceResume` *and* `btn-resume`
+   as two routes to the same upload; attaching to both would upload twice and can start two
+   server-side parses. Exactly one slot is now `primaryResumeSlot`.
+
+### What is NOT verified yet
+
+**A real end-to-end FILL has not been run.** The scanner and resolver are verified against live DOM
+(KEF Robotics and Paylocity), and every downstream stage is reused code — but the actuation pass on a
+generic form has only been reasoned about, not observed. It needs the worktree loaded as an unpacked
+extension; the operator's Chrome runs the main checkout.
+
+Confidence, stated honestly: text / textarea / native-select / radio / checkbox / file all actuate
+through injected functions that are already ATS-agnostic (`atsInjSetText`, `atsInjSelectNative`,
+`atsInjCheckOption`, `atsInjSetChecked`, `atsInjAttachFile`), so KEF Robotics should fill. An
+arbitrary COMBOBOX is the weak spot: the commit path is react-select-shaped, and a vendor widget that
+is not react-select will fail its read-back and reach review as `needs_review` — honest, but unfilled.
+That is the first thing to measure on a live run, and the widget-driver registry (§5, build step 3) is
+the fix.
+
 ## 10. Build order
 
 1. **The scan ladder** (§3–§4) as a pure, Node-testable function over a DOM+AX snapshot, with the corpus
