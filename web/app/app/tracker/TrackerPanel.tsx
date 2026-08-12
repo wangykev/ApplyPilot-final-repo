@@ -35,6 +35,14 @@ function showsReviewChip(status: AppStatus): boolean {
   return status === "needs_review";
 }
 
+// FILLED AND APPROVED, BUT NOT YET SENT — the one state the status enum cannot name. Adding an
+// `approved` member would mean a migration and teaching every writer (including the extension) a new
+// value, so the row keeps `needs_review` and the UI relabels it. Only meaningful while it is still
+// awaiting review: once the status moves on, the status itself says more than this ever could.
+function approvedPending(a: Application): boolean {
+  return !!a.approved_at && a.status === "needs_review";
+}
+
 // Was this application actually SENT? Everything past needs_review means a real application exists in
 // the world, so deleting the row throws away the only record of it — that gets a confirmation. A
 // needs_review row is a fill, and a fill can simply be run again.
@@ -263,13 +271,12 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                   </span>
                 )}
 
-                {/* APPROVED — the state between "filled" and "sent", which the status enum has no word
-                    for. Only meaningful while it is still awaiting review: afterwards the status says more. */}
-                {a.approved_at && a.status === "needs_review" && (
-                  <span className="shrink-0 rounded border border-verified/40 bg-verified/[0.08] px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-label text-verified">
-                    Approved
-                  </span>
-                )}
+                {/* APPROVED is shown BY THE STATUS DROPDOWN ITSELF (below), not as a chip beside it
+                    (2026-08-12). It is the state between "filled" and "sent" and the enum has no word
+                    for it, so the row used to read "Needs review" in the status control with a green
+                    "Approved" sticker next to it — the control and the sticker saying opposite things
+                    about the same row. The dropdown now relabels its own current value; the stored
+                    status is untouched, so nothing downstream has to learn a new enum member. */}
 
                 {/* Nothing was flagged, so there is no per-field decision to make — approving from here
                     saves a trip into the detail page. The action still re-verifies against the bundle and
@@ -298,12 +305,15 @@ export function TrackerPanel({ applications }: { applications: Application[] }) 
                   value={a.status}
                   onChange={(e) => setStatus(a.id, e.target.value as AppStatus)}
                   disabled={pending}
-                  className="shrink-0 rounded-md border border-hairline bg-cockpit px-2 py-1 text-xs text-ink outline-none focus:border-amber"
-                  style={{ color: COLOR[a.status] }}
+                  className={clsx(
+                    "shrink-0 rounded-md border bg-cockpit px-2 py-1 text-xs text-ink outline-none focus:border-amber",
+                    approvedPending(a) ? "border-verified/50" : "border-hairline"
+                  )}
+                  style={{ color: approvedPending(a) ? COLOR.submitted : COLOR[a.status] }}
                 >
                   {APP_STATUSES.map((s) => (
                     <option key={s} value={s} className="bg-panel text-ink">
-                      {LABEL[s]}
+                      {s === "needs_review" && approvedPending(a) ? "✓ Approved — ready to submit" : LABEL[s]}
                     </option>
                   ))}
                 </select>
