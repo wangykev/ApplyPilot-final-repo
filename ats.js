@@ -1595,7 +1595,9 @@ async function atsAiWriteText(act, f, profile, jobContext) {
 // Order: static map → bucket (exact wording) → label recognizers → employment recognizer →
 // null (the driver then tries AI for REQUIRED fields, else leaves blank). Same tiering as
 // the Workday driver: deterministic tiers run for optional fields too, AI is required-only.
-function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
+// `credentials` ({email, password}) is the 7th arg and is ONLY consulted for a field the scanner
+// tagged `credentialKind`. Omitting it (every existing caller) leaves such a field needs_review.
+function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, credentials) {
   const map = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
@@ -1617,6 +1619,30 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
       // empty mapped value → fall through (same reason as above)
     }
   }
+  // GENERIC CREDENTIALS — a dedicated tier, ABOVE buckets/labels/AI, and the ONLY way a credential
+  // field is ever answered (operator 2026-08-12: "you can create accounts and enter passwords by doing
+  // the onboarding workday uses — use the username and password there").
+  //
+  // ⚠ Three properties make this safe, and all three are load-bearing:
+  //   • the value comes ONLY from `store.credentials` — the same source background.js's Workday
+  //     `createAccount` uses. It can never come from a profile field, a taught bucket wording, or an
+  //     LLM: a guessed password is meaningless, and a profile value typed into a password box is a
+  //     leak. This tier RETURNS before any of those rungs can see the field.
+  //   • the value is never logged. The record carries `credential: true` so the review bundle and the
+  //     log lines can say WHICH credential was used without carrying it.
+  //   • no credentials stored ⇒ `needs_review`, never a blank guess and never a partial account.
+  if (ats === "generic" && f && f.credentialKind) {
+    const creds = credentials || null; // 7th arg; absent ⇒ needs_review, never a guess
+    const kind = f.credentialKind;
+    if (!creds || !creds.email || !creds.password) {
+      return { kind: "credential-missing", credentialKind: kind, review: true, flag: "credentials-not-stored",
+        detail: "this form asks for a " + kind.replace("_", " ") + " — no credentials are stored, so it is left for you (Sign-in page)" };
+    }
+    const value = kind === "login" ? creds.email : creds.password;
+    return { kind: "credential", credentialKind: kind, value, source: "credentials", credential: true,
+      detail: "filled from your stored " + (kind === "login" ? "login" : "password") + " (never from the profile or the AI)" };
+  }
+
   // GENERIC: the RÉSUMÉ has no static map to be recognized by. Every supported family names its
   // resume field in ATS_STATIC_MAPS (checked above, so this cannot shadow them), but a generic form's
   // file input is just a file input — and the résumé is the single most important field on the page.
@@ -2056,7 +2082,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           if (shape && shape.kind === "dial") route.kind = "dial";
         }
       } else {
-        route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
+        route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, o && o.credentials);
       }
 
       if (route && route.kind === "resume") {
@@ -2064,6 +2090,27 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
         Object.assign(rec, att.ok
           ? { status: "filled", after: att.name || "resume attached", detail: att.detail || null, verified: !!att.verified }
           : { status: f.isRequired ? "needs_review" : "skipped", detail: "resume attach failed: " + (att.error || "unknown"), flag: "resume-attach-failed" });
+        results.push(fin()); continue;
+      }
+      // CREDENTIALS (generic only) — filled from stored credentials, read-back verified, and the value
+      // is NEVER logged or put in the bundle. `credential:true` on the record is what lets review and
+      // the logs name WHICH credential was used without carrying it.
+      if (route && route.kind === "credential") {
+        const set = await act.eval(atsInjSetText, ref.inputSel, route.value);
+        const back = await atsReadBackSettled(act, ats, ref.inputSel, "text");
+        const got = back && back.ok ? String(back.value == null ? "" : back.value) : "";
+        const ok = !!(set && set.ok) && got.length === String(route.value).length;
+        rec.credential = true;
+        rec.credentialKind = route.credentialKind;
+        rec.after = ok ? "(stored " + (route.credentialKind === "login" ? "login" : "password") + ")" : null;
+        rec.status = ok ? "filled" : "needs_review";
+        rec.detail = ok ? route.detail : "could not verify the credential was entered — fill it yourself";
+        if (!ok) rec.flag = "credential-not-verified";
+        results.push(fin()); continue;
+      }
+      if (route && route.kind === "credential-missing") {
+        rec.status = "needs_review"; rec.flag = route.flag; rec.detail = route.detail;
+        rec.credentialKind = route.credentialKind;
         results.push(fin()); continue;
       }
       if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(fin()); continue; }
@@ -3349,6 +3396,7 @@ function atsGenericPostProcess(raw) {
       isRequired: s.isRequired,
       reqVia: s.reqVia,
       value: f.value === undefined ? null : f.value,
+      credentialKind: f.credentialKind || null,
       options: Array.isArray(f.options) && f.options.length ? f.options.slice() : null,
       optionsPlaceholderOnly: !!f.optionsPlaceholderOnly,
       group: f.group || null,
@@ -3510,7 +3558,35 @@ function atsInjScanGeneric() {
   // ⚠ type=file IS EXEMPT — the very same rule wrongly excluded Lever's résumé input
   // (tabindex=-1 + opacity:0, class "application-file-input invisible"), the most important field
   // on the form. Exclusions are REPORTED, never silently dropped.
+  // ⚠⚠ CREDENTIALS TAKE A DEDICATED PATH — they are NEVER routed through the match ladder, buckets,
+  // or the AI. iCIMS embeds a "Create a login" block (PersonProfileFields.Login / .Password /
+  // .Password_Confirm) inside the application form itself, and the operator's instruction is to use
+  // the SAME stored credentials the Workday onboarding already signs in with (background.js
+  // `createAccount` fills `input[type="password"]` from `store.credentials`).
+  //
+  // Classifying them here rather than excluding them is what makes that safe: a field tagged
+  // `credentialKind` can ONLY ever receive `store.credentials`. It cannot be answered by a profile
+  // value, a taught bucket wording, or an LLM — a guessed password is meaningless and a leaked
+  // profile value in a password box is worse. The value is never logged.
+  //
+  // GOVERNMENT IDs are a different matter and stay REFUSED outright: SSN / passport / national id are
+  // not credentials the pipeline holds, and no part of this tool should ever type one.
+  var credentialKindOf = function (el) {
+    var key = ((el.name || "") + " " + (el.id || "") + " " + (el.autocomplete || "")).toLowerCase();
+    var isPw = el.type === "password" || /(^|[^a-z])pass(word|wd|phrase)([^a-z]|$)/.test(key) || /new-password|current-password/.test(key);
+    if (isPw) return /confirm|re-?enter|repeat|verify|again|_2\b/.test(key) ? "password_confirm" : "password";
+    // an account-creation LOGIN/username box. Deliberately NOT "email": an ordinary contact-email
+    // field is a legitimate application answer and must keep filling from the profile.
+    if (/(^|[^a-z])(login|username|userid|user_id)([^a-z]|$)/.test(key)) return "login";
+    return null;
+  };
+  var isGovernmentId = function (el) {
+    var key = ((el.name || "") + " " + (el.id || "")).toLowerCase();
+    return /\b(ssn|social.?security|tax.?id|passport.?number|national.?id)\b/.test(key);
+  };
+
   var exclReasons = function (el, isFile) {
+    if (isGovernmentId(el)) return ["government-id-never-filled"];
     if (isFile) return [];
     var r = [];
     var cs;
@@ -3659,6 +3735,7 @@ function atsInjScanGeneric() {
     }
     push({
       attrId: nm2 || null,
+      credentialKind: credentialKindOf(el),
       inputSel: nm2 && el.id === nm2 ? "#" + esc(nm2) : (nm2 && el.name === nm2 ? (el.tagName === "SELECT" ? 'select[name="' + esc(nm2) + '"]' : (el.tagName === "TEXTAREA" ? 'textarea[name="' + esc(nm2) + '"]' : 'input[name="' + esc(nm2) + '"]')) : stamp(el)),
       widgetType: wt,
       labelCandidates: labelCandidatesFor(el, u2),
@@ -3687,6 +3764,56 @@ function atsInjReadNativeOptions(inputSel) {
   }
   var real = all.filter(function (t) { return !/^(choose|select|please select|--|-)\b/i.test(t) && t !== "-"; });
   return { ok: true, options: real, placeholder: real.length ? null : (all[0] || null), total: all.length };
+}
+
+// ── Find a SAME-ORIGIN iframe that holds the real application form ──────────────────────
+// iCIMS serves its whole application inside an iframe: the top document has ~121 nodes and ZERO
+// controls, while the frame holds 91 visible ones (dom-patterns 2026-08-12). A top-frame-only scan
+// therefore reports "no form" on a page that is nothing but a form.
+//
+// The remedy is the one `atsPickEmbeddedForm` already uses for Greenhouse embeds — open the FRAME URL
+// as a top-level page — deliberately chosen over making the scan frame-aware, because `inputSel` is
+// resolved by `document.querySelector` in every actuation function; a selector found inside a frame
+// would not resolve for any of them, so frame-aware scanning means frame-aware EVERYTHING.
+//
+// Cross-origin frames are reported but never counted: their contents cannot be read here, and a URL
+// we cannot verify holds a form is not evidence. Returns the richest same-origin candidate, with the
+// control count that justifies it.
+function atsInjFindFormFrame() {
+  var out = { candidates: [], crossOrigin: 0, topControls: 0 };
+  try {
+    out.topControls = document.querySelectorAll('input:not([type=hidden]),textarea,select,[role=combobox]').length;
+  } catch (e) { /* keep 0 */ }
+  var frames = document.querySelectorAll("iframe");
+  for (var i = 0; i < frames.length; i++) {
+    var f = frames[i];
+    var src = f.getAttribute("src") || f.src || "";
+    if (!src) continue;
+    var d = null;
+    try { d = f.contentDocument; } catch (e) { d = null; }
+    if (!d) { out.crossOrigin++; continue; }
+    var n = 0;
+    try { n = d.querySelectorAll('input:not([type=hidden]),textarea,select,[role=combobox]').length; } catch (e) { n = 0; }
+    var r = f.getBoundingClientRect();
+    out.candidates.push({ src: src, controls: n, visible: r.width > 0 && r.height > 0 });
+  }
+  out.candidates.sort(function (a, b) { return b.controls - a.controls; });
+  return out;
+}
+
+// Which frame (if any) should the run re-open as a top-level page? PURE.
+// ⚠ Only when the TOP document has essentially nothing and the frame has substantially more — a page
+// that already shows its own form must never be abandoned for a frame (a marketing iframe, a video
+// embed, a captcha frame). `minControls` keeps a 1-input newsletter frame from qualifying.
+function atsPickFormFrame(probe, minControls) {
+  const p = probe || {};
+  const floor = minControls == null ? 4 : minControls;
+  const cands = (p.candidates || []).filter((c) => c && c.src && c.controls >= floor);
+  if (!cands.length) return null;
+  const best = cands[0];
+  // the top page must be clearly poorer than the frame, else we are on the real form already
+  if ((p.topControls || 0) >= best.controls) return null;
+  try { return new URL(best.src, "https://x.invalid").href.startsWith("https://x.invalid") ? best.src : new URL(best.src, "https://x.invalid").href; } catch (e) { return best.src; }
 }
 
 // NOTE: the scanner deliberately does NOT duplicate the durability test in-page. It reports the raw
@@ -3769,6 +3896,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsGenericIdDurable, atsGenericRequiredFromLabel, atsGenericCleanLabel,
     atsGenericPickLabel, atsGenericHeadingClaims, atsGenericPostProcess,
     atsInjScanGeneric, atsInjReadNativeOptions, atsCaptureChoiceOptions, ATS_GENERIC_LABEL_RUNGS,
+    atsInjFindFormFrame, atsPickFormFrame,
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,

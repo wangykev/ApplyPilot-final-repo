@@ -747,6 +747,101 @@ test("INTEGRATION (generic): the AI is never asked when nothing is required and 
   assert.strictEqual(llmCalls, 0, "no optional field may spend an AI request");
 });
 
+// ── the form inside a SAME-ORIGIN IFRAME (iCIMS) ────────────────────────────────────────
+test("frame hop: a rich same-origin frame beats an empty top page", () => {
+  // Measured on iCIMS: top document ~121 nodes / 0 controls, frame 91 controls.
+  const pick = ats.atsPickFormFrame({
+    topControls: 0, crossOrigin: 0,
+    candidates: [{ src: "https://x.icims.com/jobs/1/candidate?in_iframe=1", controls: 91, visible: true }],
+  });
+  assert.match(pick, /in_iframe=1/);
+});
+
+test("⚠ frame hop: a page that already shows its own form is NEVER abandoned for a frame", () => {
+  // a marketing / video / captcha iframe must not steal a run off a real form
+  assert.strictEqual(ats.atsPickFormFrame({ topControls: 7, candidates: [{ src: "https://ads.example/x", controls: 2, visible: true }] }), null);
+  // …and not even when the frame has a few controls, if the top page has more
+  assert.strictEqual(ats.atsPickFormFrame({ topControls: 20, candidates: [{ src: "https://x/y", controls: 9, visible: true }] }), null);
+});
+
+test("frame hop: a trivial frame is below the floor, and cross-origin frames never count", () => {
+  // a 1-input newsletter frame must not qualify
+  assert.strictEqual(ats.atsPickFormFrame({ topControls: 0, candidates: [{ src: "https://x/y", controls: 1, visible: true }] }), null);
+  // the probe reports cross-origin frames but never lists them as candidates (it cannot read them)
+  assert.strictEqual(ats.atsPickFormFrame({ topControls: 0, crossOrigin: 3, candidates: [] }), null);
+  const src = ats.atsInjFindFormFrame.toString();
+  assert.ok(/crossOrigin\+\+/.test(src), "unreadable frames must be counted, not guessed at");
+  assert.doesNotThrow(() => new Function("return (" + src + ")"));
+});
+
+// ── CREDENTIALS (iCIMS embeds a "Create a login" block INSIDE the application form) ─────
+// Operator 2026-08-12: use the same stored credentials the Workday onboarding signs in with. The
+// safety of that rests entirely on the credential tier being UNREACHABLE by any other answer source.
+const CREDS = { email: "kevin@example.com", password: "correct-horse-battery-staple" };
+
+test("credentials: a password field is answered ONLY from stored credentials", () => {
+  const f = { widgetType: "text", fieldName: "PersonProfileFields.Password", label: "Password", credentialKind: "password" };
+  const r = ats.atsRouteField("generic", f, {}, {}, {}, null, CREDS);
+  assert.strictEqual(r.kind, "credential");
+  assert.strictEqual(r.credentialKind, "password");
+  assert.strictEqual(r.value, CREDS.password);
+  assert.strictEqual(r.source, "credentials");
+});
+
+test("credentials: login takes the EMAIL, confirm takes the same password", () => {
+  const mk = (kind, name) => ats.atsRouteField("generic", { widgetType: "text", fieldName: name, label: name, credentialKind: kind }, {}, {}, {}, null, CREDS);
+  assert.strictEqual(mk("login", "PersonProfileFields.Login").value, CREDS.email);
+  assert.strictEqual(mk("password", "PersonProfileFields.Password").value, CREDS.password);
+  assert.strictEqual(mk("password_confirm", "PersonProfileFields.Password_Confirm").value, CREDS.password);
+});
+
+test("⚠ credentials: a BUCKET can never answer a credential field", () => {
+  // a hostile/careless bucket wording that matches the password label must NOT win — the credential
+  // tier returns before the bucket rung is reached.
+  const buckets = ats.atsRouteField ? new Map() : null;
+  const idx = new Map([["password", { id: "b", profile_path: "personal_info.first_name", questions: ["Password"] }]]);
+  const f = { widgetType: "text", fieldName: "PersonProfileFields.Password", label: "Password", credentialKind: "password" };
+  const r = ats.atsRouteField("generic", f, { personal_info: { first_name: "Kevin" } }, {}, {}, idx, CREDS);
+  assert.strictEqual(r.source, "credentials", "the bucket must not reach a credential field");
+  assert.notStrictEqual(r.value, "Kevin");
+  assert.ok(buckets === null || true);
+});
+
+test("⚠ credentials: with NO stored credentials the field is needs_review, never guessed", () => {
+  const f = { widgetType: "text", fieldName: "PersonProfileFields.Password", label: "Password", credentialKind: "password" };
+  for (const creds of [null, undefined, {}, { email: "x@y.z" }, { password: "p" }]) {
+    const r = ats.atsRouteField("generic", f, {}, {}, {}, null, creds);
+    assert.strictEqual(r.kind, "credential-missing", "incomplete credentials must not half-fill");
+    assert.strictEqual(r.flag, "credentials-not-stored");
+    assert.ok(!r.value);
+  }
+});
+
+test("⚠ credentials: the scanner tags them, and a GOVERNMENT ID is refused outright", () => {
+  const src = ats.atsInjScanGeneric.toString();
+  assert.ok(/credentialKindOf/.test(src), "the scanner must classify credential fields");
+  assert.ok(/isGovernmentId/.test(src), "the scanner must refuse government ids");
+  // government id is an EXCLUSION (never a field); a credential is a TAGGED field (fillable only
+  // from stored credentials) — the two must not be conflated
+  assert.ok(/government-id-never-filled/.test(src));
+  assert.ok(/password_confirm/.test(src));
+  // ⚠ the government-id refusal must come BEFORE the type=file exemption, or a file input named
+  // "passport" would slip through
+  const gi = src.indexOf("isGovernmentId(el)");
+  const fileExempt = src.indexOf("if (isFile) return []");
+  assert.ok(gi > 0 && fileExempt > gi, "the government-id refusal must precede the file exemption");
+});
+
+test("isolation: a credential field on a SUPPORTED ats is not special-cased", () => {
+  // the three supported families are login-free, and their scanner never sets credentialKind — so the
+  // tier is unreachable there even if a field were somehow tagged.
+  const f = { widgetType: "text", fieldName: "password", label: "Password", credentialKind: "password" };
+  for (const kind of ["greenhouse", "lever", "ashby"]) {
+    const r = ats.atsRouteField(kind, f, {}, {}, {}, null, CREDS);
+    assert.ok(!r || r.source !== "credentials", kind + " must not use the credential tier");
+  }
+});
+
 // ── ISOLATION: the generic kind must not leak into the supported families ───────────────
 test("isolation: detectAts NEVER returns 'generic'", () => {
   const urls = [

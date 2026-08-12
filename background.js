@@ -4607,6 +4607,31 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     emitRunProgress("Waiting for the form", ats);
     let ready = await waitAtsFormReady(ats, LOG);
 
+    // ── GENERIC: the form may live in a SAME-ORIGIN IFRAME ────────────────────────────────
+    // iCIMS serves its entire application inside one: the top document has ~121 nodes and ZERO
+    // controls while the frame holds 91 (dom-patterns 2026-08-12). Re-open the FRAME as a top-level
+    // page — the same remedy `atsPickEmbeddedForm` uses for Greenhouse embeds, and chosen over making
+    // the scan frame-aware because `inputSel` is resolved by `document.querySelector` in every
+    // actuation function: a node found inside a frame would not resolve for any of them.
+    //
+    // Bounded to ONE hop, and `atsPickFormFrame` refuses unless the top page is clearly poorer than
+    // the frame — so a page that already shows its own form is never abandoned for a marketing or
+    // captcha iframe.
+    if (!ready.ready && ats === "generic" && !(opts0.frameHops >= 1)) {
+      const probe = await cdpEval(atsInjFindFormFrame).catch(() => null);
+      const frameUrl = atsPickFormFrame(probe);
+      if (frameUrl) {
+        LOG(`the form is inside a same-origin IFRAME (${(probe.candidates[0] || {}).controls} control(s) vs ${probe.topControls} on the top page) — re-opening the frame directly`);
+        emitRunProgress("Opening the embedded form", "iframe");
+        await cdpDetach().catch(() => {});
+        return await runAtsApplicationRun(tabId, "generic", store, frameUrl, {
+          chase: opts0.chase || 0, applyHops: opts0.applyHops || 0, originUrl,
+          genericTried: true, frameHops: 1,
+        });
+      }
+      if (probe && probe.crossOrigin) LOG(`${probe.crossOrigin} cross-origin iframe(s) here — their contents cannot be read, so they are not treated as the form`);
+    }
+
     // THE LANDING MAY NOT BE THE FORM (generic, 2026-07-31): a posting URL can serve the
     // employer's OWN careers page — live, a Greenhouse posting 302'd to the company's branded
     // site with zero fields and only an "Apply" link. Never conclude "the form never rendered"
@@ -4725,7 +4750,11 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
     const prepared = prepareProfile(store.profile);
-    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+    // `credentials` is consulted ONLY for a field the generic scanner tagged `credentialKind` (a
+// "Create a login" block inside an application form — iCIMS does this). Same source the Workday
+    // onboarding signs in with; never reachable by a profile value, a bucket, or the AI.
+    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext,
+      { buckets: store.buckets || [], credentials: store.credentials || null });
 
     // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
     // here, added when Greenhouse forms would land in a state where every server-backed combobox returned
