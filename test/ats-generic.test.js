@@ -858,6 +858,249 @@ test("frame hop: a trivial frame is below the floor, and cross-origin frames nev
   assert.doesNotThrow(() => new Function("return (" + src + ")"));
 });
 
+// ── EDUCATION: the repeating-entry tier, and the NON-repeating rule ─────────────────────
+const EDU_PROFILE = {
+  education: [
+    { school_or_university: "State College", degree: "Associate's Degree", field_of_study: "General", to_year: "2022" },
+    { school_or_university: "Carnegie Mellon University", degree: "Bachelor of Science",
+      field_of_study: "Electrical and Computer Engineering", minor: "Robotics", gpa: "3.95",
+      from_year: "2024", graduation_date: "2028-05", currently_enrolled: true },
+  ],
+};
+
+test("⚠ entry ordinal and IDENTITY are independent — a durable id keeps its name AND gets an ordinal", () => {
+  // Regression: threading entryOrdinal turned `else if (s.label)` into `if (s.label)`, so the label
+  // branch overwrote perfectly good durable ids and 8 tests went red at once. A repeating section can
+  // have excellent per-entry ids (Dayforce's ..._educationHistory_0_...) and still need its index.
+  const s = ats.atsGenericPostProcess({
+    fields: [
+      { attrId: "jobPostingApplication_educationHistory_0_schoolName", inputSel: "#a", widgetType: "text", domIndex: 0, labelCandidates: { labelFor: "School" } },
+      { attrId: "jobPostingApplication_educationHistory_1_schoolName", inputSel: "#b", widgetType: "text", domIndex: 1, labelCandidates: { labelFor: "School" } },
+      { attrId: "jobPostingApplication_personalInfo_email", inputSel: "#e", widgetType: "text", domIndex: 2, labelCandidates: { labelFor: "Email Address" } },
+    ],
+  });
+  // identity is the durable id, untouched by the ordinal
+  assert.deepStrictEqual(s.fields.map((f) => f.fieldName), [
+    "jobPostingApplication_educationHistory_0_schoolName",
+    "jobPostingApplication_educationHistory_1_schoolName",
+    "jobPostingApplication_personalInfo_email",
+  ]);
+  assert.ok(s.fields.every((f) => f.identityFrom === "attr"));
+  // …and the ordinal still says which entry each one is
+  assert.deepStrictEqual(s.fields.map((f) => f.entryOrdinal), [0, 1, 0]);
+});
+
+test("entry ordinal: the k-th field carrying a label IS entry k; a unique label is entry 0", () => {
+  const s = ats.atsGenericPostProcess({
+    fields: [
+      { attrId: null, inputSel: "#a", widgetType: "select", domIndex: 0, labelCandidates: { labelFor: "School" } },
+      { attrId: null, inputSel: "#b", widgetType: "select", domIndex: 1, labelCandidates: { labelFor: "School" } },
+      { attrId: null, inputSel: "#c", widgetType: "text", domIndex: 2, labelCandidates: { labelFor: "GPA" } },
+    ],
+  });
+  assert.deepStrictEqual(s.fields.map((f) => f.entryOrdinal), [0, 1, 0]);
+  assert.deepStrictEqual(s.fields.map((f) => f.fieldName), ["label:School#0", "label:School#1", "label:GPA"]);
+});
+
+test("education ordering: 'top' means currently enrolled, then most recent — not profile order", () => {
+  // ⚠ load-bearing, not cosmetic: the operator's rule is that a NON-repeating education block fills
+  // the top choice, and ordinal 0 is what "top" resolves to.
+  const ordered = ats.atsGenericEducationOrder(EDU_PROFILE.education);
+  assert.strictEqual(ordered[0].school_or_university, "Carnegie Mellon University");
+  assert.strictEqual(ordered[1].school_or_university, "State College");
+  // ties keep the profile's own order (stable) so a curated list is never reshuffled
+  const tied = ats.atsGenericEducationOrder([{ school_or_university: "A", to_year: "2020" }, { school_or_university: "B", to_year: "2020" }]);
+  assert.deepStrictEqual(tied.map((e) => e.school_or_university), ["A", "B"]);
+  assert.deepStrictEqual(ats.atsGenericEducationOrder(null), []);
+});
+
+test("education: a NON-repeating block fills the TOP entry (the operator's rule)", () => {
+  const v = (label) => { const r = ats.atsGenericEducationValue(EDU_PROFILE, label, 0); return r && r.value; };
+  assert.strictEqual(v("School"), "Carnegie Mellon University");
+  assert.strictEqual(v("Degree"), "Bachelor of Science");
+  assert.strictEqual(v("Major"), "Electrical and Computer Engineering");
+  assert.strictEqual(v("Minor"), "Robotics");
+  assert.strictEqual(v("GPA"), "3.95");
+  // …and the router defaults the ordinal to 0, so a field with no entry index gets the top entry
+  const r = ats.atsRouteField("generic", { widgetType: "select", label: "School" }, EDU_PROFILE, {}, {}, null);
+  assert.strictEqual(r.source, "education");
+  assert.strictEqual(r.raw, "Carnegie Mellon University");
+  assert.match(r.detail, /most recent/);
+});
+
+test("education: entry ordinal 1 reaches the SECOND entry, so a repeating section fills distinctly", () => {
+  const r0 = ats.atsRouteField("generic", { widgetType: "select", label: "School", entryOrdinal: 0 }, EDU_PROFILE, {}, {}, null);
+  const r1 = ats.atsRouteField("generic", { widgetType: "select", label: "School", entryOrdinal: 1 }, EDU_PROFILE, {}, {}, null);
+  assert.strictEqual(r0.raw, "Carnegie Mellon University");
+  assert.strictEqual(r1.raw, "State College");
+  // an ordinal beyond the profile's entries yields nothing rather than repeating the last one
+  assert.strictEqual(ats.atsGenericEducationValue(EDU_PROFILE, "School", 9), null);
+});
+
+test("education: one stored date serves iCIMS' three separate controls", () => {
+  const v = (label) => { const r = ats.atsGenericEducationValue(EDU_PROFILE, label, 0); return r && r.value; };
+  assert.strictEqual(v("Graduation Date Year"), "2028");
+  assert.strictEqual(v("Graduation Date Month"), "5");
+  assert.strictEqual(v("Start Date Year"), "2024");
+  // the part extractor itself
+  assert.strictEqual(ats.atsGenericDatePart("2028-05-15", "Graduation Date Day"), "15");
+  assert.strictEqual(ats.atsGenericDatePart("05/15/2028", "End Date Year"), "2028");
+  assert.strictEqual(ats.atsGenericDatePart("2026", "Start Date Year"), "2026");
+  // a bare year cannot answer a MONTH box — better blank than wrong
+  assert.strictEqual(ats.atsGenericDatePart("2026", "Start Date Month"), null);
+  assert.strictEqual(ats.atsGenericDatePart("", "Year"), null);
+});
+
+test("education: 'Did You Graduate?' is derived, and currently-enrolled means NO", () => {
+  const g = (p) => { const r = ats.atsGenericEducationValue(p, "Did You Graduate?", 0); return r && r.value; };
+  assert.strictEqual(g(EDU_PROFILE), false, "currently enrolled ⇒ has not graduated");
+  assert.strictEqual(g({ education: [{ school_or_university: "X", graduation_date: "2020-05" }] }), true);
+  assert.strictEqual(g({ education: [{ school_or_university: "X" }] }), false);
+});
+
+test("education: a non-education label is left alone, and an empty profile yields nothing", () => {
+  assert.strictEqual(ats.atsGenericEducationValue(EDU_PROFILE, "Legal First Name", 0), null);
+  assert.strictEqual(ats.atsGenericEducationValue(EDU_PROFILE, "Phone Number", 0), null);
+  assert.strictEqual(ats.atsGenericEducationValue({}, "School", 0), null);
+  assert.strictEqual(ats.atsGenericEducationValue({ education: [] }, "School", 0), null);
+});
+
+test("isolation: the education tier is generic-only", () => {
+  for (const kind of ["greenhouse", "lever", "ashby"]) {
+    const r = ats.atsRouteField(kind, { widgetType: "select", label: "School" }, EDU_PROFILE, {}, {}, null);
+    assert.ok(!r || r.source !== "education", kind + " must not use the generic education tier");
+  }
+});
+
+// ── WIDGET DRIVER: the paired ARIA combobox (traced on iCIMS) ────────────────────────────
+// <select id=X visibility:hidden> + <a id=X_icimsDropdown role=combobox> + a container holding
+// ul[role=listbox] > li[role=option]. The real Degree list, verbatim from the live widget.
+const ICIMS_DEGREES = ["AS", "BS", "MS", "PhD", "MBA", "MCS", "BCS", "BA", "B.S", "Diploma",
+  "Master's Degree", "Bachelor's Degree", "Bachelor of Science", "Associate's Degree"];
+
+function pairedAct(over) {
+  const calls = [];
+  const base = {
+    delay: async () => {}, delayFull: async () => {},
+    eval: async (fn, ...args) => {
+      calls.push(fn.name);
+      switch (fn.name) {
+        case "atsInjPairedComboProbe": return { ok: true, triggerSel: "#d_icimsDropdown", ctnrSel: "#d_ctnr", expanded: false, triggerText: "— Make a Selection —" };
+        case "atsInjPairedComboOpen": return { ok: true, expanded: true };
+        case "atsInjPairedComboRead": return { ok: true, open: true, loading: false, options: ICIMS_DEGREES.map((t) => ({ text: t, disabled: false })) };
+        case "atsInjPairedComboFilter": return { ok: true, filtered: true };
+        case "atsInjPairedComboCommit": return { ok: true, clicked: args[1] };
+        case "atsInjPairedComboValue": return { ok: true, value: over && over.readBack !== undefined ? over.readBack : "BS", from: "trigger" };
+        case "atsInjPairedComboClose": return { ok: true, open: false };
+        default: return { ok: true };
+      }
+    },
+  };
+  return Object.assign(base, { calls }, over && over.eval ? { eval: over.eval } : {});
+}
+
+test("paired combo: an exact match commits, verifies, and CLOSES the list", async () => {
+  const act = pairedAct();
+  const rec = {};
+  const r = await ats.atsFillPairedCombo(act, { label: "Degree" }, { inputSel: "#d" }, rec, ["BS"]);
+  assert.strictEqual(r.handled, true);
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "BS");
+  assert.deepStrictEqual(rec.options, ICIMS_DEGREES, "review gets the real list");
+  assert.ok(act.calls.includes("atsInjPairedComboClose"), "a list left mounted eats the next open-click");
+});
+
+test("paired combo: a non-exact (typo) match is filled_review, never silently filled", async () => {
+  const act = pairedAct({ readBack: "Bachelor's Degree" });
+  const rec = {};
+  await ats.atsFillPairedCombo(act, { label: "Degree" }, { inputSel: "#d" }, rec, ["Bachelors Degree"]);
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "non-exact-match");
+});
+
+test("⚠ paired combo: a read-back that disagrees ends needs_review", async () => {
+  const act = pairedAct({ readBack: "PhD" });   // we chose BS, the page shows PhD
+  const rec = {};
+  await ats.atsFillPairedCombo(act, { label: "Degree" }, { inputSel: "#d" }, rec, ["BS"]);
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /commit did not persist/);
+});
+
+test("⚠ paired combo: no candidate match NEVER guesses, and still hands review the options", async () => {
+  const act = pairedAct();
+  const rec = {};
+  await ats.atsFillPairedCombo(act, { label: "Degree" }, { inputSel: "#d" }, rec, ["Underwater Basket Weaving"]);
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /no candidate matched 14 option/);
+  assert.deepStrictEqual(rec.options, ICIMS_DEGREES);
+});
+
+test("paired combo: a widget of a DIFFERENT shape is not handled — the caller falls through", async () => {
+  const act = pairedAct({ eval: async (fn) => (fn.name === "atsInjPairedComboProbe" ? { ok: false, error: "no-paired-trigger" } : { ok: true }) });
+  const r = await ats.atsFillPairedCombo(act, { label: "x" }, { inputSel: "#x" }, {}, ["y"]);
+  assert.strictEqual(r.handled, false, "react-select etc. must reach their own path unchanged");
+});
+
+test("paired combo: an EMPTY list types into the widget's own filter box before giving up", async () => {
+  // iCIMS' school picker is server-backed: it returns nothing until a query is typed.
+  let filtered = false, reads = 0;
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    eval: async (fn, ...args) => {
+      if (fn.name === "atsInjPairedComboProbe") return { ok: true, triggerSel: "#t", ctnrSel: "#c" };
+      if (fn.name === "atsInjPairedComboOpen") return { ok: true, expanded: true };
+      if (fn.name === "atsInjPairedComboFilter") { filtered = true; return { ok: true, filtered: true }; }
+      if (fn.name === "atsInjPairedComboRead") {
+        reads++;
+        return filtered
+          ? { ok: true, open: true, loading: false, options: [{ text: "University of California, Los Angeles", disabled: false }] }
+          : { ok: true, open: true, loading: false, options: [] };
+      }
+      if (fn.name === "atsInjPairedComboCommit") return { ok: true, clicked: args[1] };
+      if (fn.name === "atsInjPairedComboValue") return { ok: true, value: "University of California, Los Angeles" };
+      return { ok: true, open: false };
+    },
+  };
+  const rec = {};
+  await ats.atsFillPairedCombo(act, { label: "School" }, { inputSel: "#s" }, rec, ["University of California, Los Angeles"]);
+  assert.ok(filtered, "it must query a server-backed list rather than declaring it empty");
+  assert.strictEqual(rec.status, "filled");
+});
+
+test("paired combo: an option list that never renders is reported, not guessed", async () => {
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    eval: async (fn) => {
+      if (fn.name === "atsInjPairedComboProbe") return { ok: true, triggerSel: "#t", ctnrSel: "#c" };
+      if (fn.name === "atsInjPairedComboOpen") return { ok: true, expanded: true };
+      if (fn.name === "atsInjPairedComboRead") return { ok: true, open: true, loading: true, options: [] };
+      return { ok: true, open: false };
+    },
+  };
+  const rec = {};
+  await ats.atsFillPairedCombo(act, { label: "School" }, { inputSel: "#s" }, rec, ["UCLA"]);
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "options-never-rendered");
+  assert.match(rec.detail, /still loading/);
+});
+
+test("paired combo: every injected fn is self-contained, and the OPEN uses a pointer sequence", () => {
+  for (const n of ["atsInjPairedComboProbe", "atsInjPairedComboOpen", "atsInjPairedComboRead",
+                   "atsInjPairedComboFilter", "atsInjPairedComboCommit", "atsInjPairedComboValue", "atsInjPairedComboClose"]) {
+    const src = String(ats[n]);
+    assert.doesNotThrow(() => new Function("return (" + src + ")"), n + " must parse standalone");
+    for (const other of ["atsLib", "atsFd", "atsAttachOptions", "ATS_POLL"]) assert.ok(!src.includes(other), n + " references " + other);
+  }
+  // ⚠ a plain el.click() does NOT open this widget — measured live; aria-expanded stayed false until
+  // the pointer/mouse sequence was dispatched.
+  const openSrc = String(ats.atsInjPairedComboOpen);
+  for (const ev of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    assert.ok(openSrc.includes(ev), "the open sequence must dispatch " + ev);
+  }
+  // and the option read must be SCOPED to this widget's container (the chip-contamination lesson)
+  assert.ok(String(ats.atsInjPairedComboRead).includes("querySelectorAll('[role=\"option\"]')"));
+});
+
 // ── CREDENTIALS (iCIMS embeds a "Create a login" block INSIDE the application form) ─────
 // Operator 2026-08-12: use the same stored credentials the Workday onboarding signs in with. The
 // safety of that rests entirely on the credential tier being UNREACHABLE by any other answer source.

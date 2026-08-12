@@ -1643,6 +1643,18 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
       detail: "filled from your stored " + (kind === "login" ? "login" : "password") + " (never from the profile or the AI)" };
   }
 
+  // GENERIC EDUCATION — the repeating-entry tier. Runs BEFORE buckets so a bucket bound to a scalar
+  // path cannot claim an entry field (a bucket has no index, so it would give every entry the same
+  // answer). `entryOrdinal` comes from the scan; ABSENT MEANS 0, i.e. the TOP entry, which is the
+  // operator's rule for a non-repeating education block.
+  if (ats === "generic" && f && f.label) {
+    const edu = atsGenericEducationValue(profile, f.label, f.entryOrdinal || 0);
+    if (edu) {
+      return { raw: edu.value, path: edu.path, source: "education",
+        detail: "education entry " + ((f.entryOrdinal || 0) + 1) + (f.entryOrdinal ? "" : " (your most recent)") };
+    }
+  }
+
   // GENERIC: the RÉSUMÉ has no static map to be recognized by. Every supported family names its
   // resume field in ATS_STATIC_MAPS (checked above, so this cannot shadow them), but a generic form's
   // file input is just a file input — and the résumé is the single most important field on the page.
@@ -2388,6 +2400,14 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   }
 
   // combobox family (react-select + ashby selects + GH location + the dial composite).
+  // GENERIC: try the PAIRED ARIA COMBOBOX driver first for any choice widget. It reports
+  // `handled:false` when the widget is not that shape, so the normal paths below run unchanged — and
+  // it is unreachable for greenhouse/lever/ashby, whose comboboxes are react-select.
+  if (ats === "generic" && (wt === "select" || wt === "dropdown_native")) {
+    const paired = await atsFillPairedCombo(act, f, ref, rec, candidates);
+    if (paired && paired.handled) return !paired.noCandidates;
+  }
+
   if (wt === "select" || wt === "dial" || wt === "location") {
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
@@ -3262,6 +3282,105 @@ function atsGenericIdDurable(id) {
   return true;
 }
 
+// ── REPEATING ENTRIES: education (and the non-repeating case) ────────────────────────────
+//
+// Why this tier has to exist at all: on a generic form NONE of the other four rungs can express "the
+// Nth entry of a repeating section". The static map has no `generic` key; a bucket maps one wording to
+// one profile PATH and has no notion of an index (so `School#0` and `School#1` would both resolve to
+// entry 0); `atsRouteLabel` deliberately carries no education rungs; and the employment recognizer
+// only answers "have you worked here before". So every education field fell through to the AI —
+// measured live on iCIMS as `School → deferred_ai`, for data the profile plainly holds.
+//
+// Workday fills education through EDUCATION_MAP + a section descriptor keyed to its `data-fkit-id`
+// containers, all in fill-driver.js. None of that transfers, and it is deliberately not touched.
+//
+// ⚠ OPERATOR RULE (2026-08-12): "if it asks for education stuff and it is NOT a repeating section,
+// then it only fills the top choice." So the entry ordinal defaults to 0 and 0 means the TOP entry —
+// which makes `atsGenericEducationOrder` load-bearing rather than cosmetic: "top" has to mean the most
+// relevant education, not whatever order the profile happens to store.
+//
+// The profile's own shape (data/profile.json): school_or_university, degree, field_of_study, minor,
+// gpa, gpa_scale, from_year, to_year, graduation_date, currently_enrolled. Note the names and SHAPES
+// both differ from a form's — iCIMS wants GraduationDate_Month/_Date/_Year, so one stored date has to
+// serve three controls.
+const ATS_GENERIC_EDUCATION_FIELDS = [
+  { rx: /^(other\s+)?school$|university|college|institution|school name/i, prop: "school_or_university" },
+  { rx: /^degree|degree (level|type|earned)|qualification/i, prop: "degree" },
+  { rx: /^major|field of study|area of study|concentration|discipline/i, prop: "field_of_study" },
+  { rx: /^minor/i, prop: "minor" },
+  { rx: /^gpa\b|grade point/i, prop: "gpa" },
+  { rx: /did you graduate|graduated\?/i, prop: "__graduated" },
+  { rx: /graduation date|date of graduation|end date|completion date|to\b.*year/i, prop: "__endDate" },
+  { rx: /start date|from\b.*year|attended from/i, prop: "__startDate" },
+];
+
+// Order the profile's education so index 0 is the TOP entry: currently enrolled first, then most
+// recently finished. Ties keep the profile's own order (a stable sort), so a hand-curated list is
+// never silently reshuffled.
+function atsGenericEducationOrder(list) {
+  const arr = (Array.isArray(list) ? list : []).filter((e) => e && typeof e === "object");
+  const year = (e) => {
+    const s = String(e.to_year || e.graduation_date || "");
+    const m = /(\d{4})/.exec(s);
+    return m ? Number(m[1]) : -1;
+  };
+  return arr
+    .map((e, i) => ({ e, i }))
+    .sort((a, b) => {
+      const ca = a.e.currently_enrolled ? 1 : 0, cb = b.e.currently_enrolled ? 1 : 0;
+      if (ca !== cb) return cb - ca;                 // in progress outranks finished
+      const ya = year(a.e), yb = year(b.e);
+      if (ya !== yb) return yb - ya;                 // most recent first
+      return a.i - b.i;                              // else keep the profile's order
+    })
+    .map((x) => x.e);
+}
+
+// A stored date → the piece a given control wants. iCIMS splits one date across _Month/_Date/_Year,
+// and the scanner surfaces those as separate fields labelled e.g. "Graduation Date Month".
+function atsGenericDatePart(raw, label) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return null;
+  const l = String(label || "").toLowerCase();
+  const iso = /^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?/.exec(s);
+  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(s);
+  const yOnly = /^(\d{4})$/.exec(s);
+  let y = null, m = null, d = null;
+  if (iso) { y = iso[1]; m = iso[2]; d = iso[3] || null; }
+  else if (us) { m = us[1]; d = us[2]; y = us[3]; }
+  else if (yOnly) { y = yOnly[1]; }
+  else return /year/.test(l) ? null : s;            // an unparseable date only answers a whole-date box
+  if (/year/.test(l)) return y;
+  if (/month/.test(l)) return m ? String(Number(m)) : null;
+  if (/\bday\b|\bdate\b$/.test(l) && d) return String(Number(d));
+  return y ? (m ? [m, d || "1", y].join("/") : y) : null;
+}
+
+// Route ONE education-looking field to a value from the profile's education entry `ordinal`.
+// Returns null when the label is not an education field or the profile has nothing for it.
+function atsGenericEducationValue(profile, label, ordinal) {
+  const ordered = atsGenericEducationOrder((profile || {}).education);
+  if (!ordered.length) return null;
+  const entry = ordered[Math.max(0, ordinal || 0)];
+  if (!entry) return null;
+  const l = String(label || "");
+  const hit = ATS_GENERIC_EDUCATION_FIELDS.find((x) => x.rx.test(l));
+  if (!hit) return null;
+  if (hit.prop === "__graduated") {
+    if (entry.currently_enrolled === true) return { value: false, path: "education.currently_enrolled" };
+    const done = !!(entry.graduation_date || entry.to_year);
+    return { value: done, path: "education.graduation_date" };
+  }
+  if (hit.prop === "__endDate" || hit.prop === "__startDate") {
+    const raw = hit.prop === "__endDate" ? (entry.graduation_date || entry.to_year) : entry.from_year;
+    const part = atsGenericDatePart(raw, l);
+    return part ? { value: part, path: "education." + (hit.prop === "__endDate" ? "graduation_date" : "from_year") } : null;
+  }
+  const v = entry[hit.prop];
+  if (v === undefined || v === null || String(v).trim() === "") return null;
+  return { value: v, path: "education." + hit.prop };
+}
+
 // ── Is this file input the RÉSUMÉ slot? ONE predicate, two callers (PURE) ────────────────
 // ⚠ This exists because two different predicates disagreed and the résumé was uploaded THREE times
 // on a live iCIMS run (2026-08-12): into the real résumé field AND into "Attachment 1" and
@@ -3397,13 +3516,30 @@ function atsGenericPostProcess(raw) {
     if (!s.label) out.diag.labelless++;
     let fieldName;
     if (durable) fieldName = f.attrId;
-    else if (s.label) {
-      const k = s.label.toLowerCase();
-      const n = (labelSeen.get(k) || 0);
-      labelSeen.set(k, n + 1);
+    // ENTRY ORDINAL — which entry of a repeating section is this? The k-th field carrying a given
+    // label IS entry k: on a repeating section every entry repeats the same question ("School",
+    // "School"), so the duplicate-label counter already computed here is the entry index. A UNIQUE
+    // label gets ordinal 0, which is the operator's non-repeating rule ("only fills the top choice")
+    // falling out for free.
+    //
+    // ⚠ Limitation, recorded rather than hidden: two fields that share a label WITHOUT being entries
+    // of one section would be numbered 0 and 1. That only matters for a label the education tier
+    // recognizes, and iCIMS' cross-section repeats ("Country", "City", "State") are not education
+    // fields, so it does not bite here. A real section model (grouping by the section heading) is the
+    // proper fix and is still the open item.
+    // ⚠ The ordinal is counted for EVERY field with a label — including one whose identity comes from
+    // a durable id — because a repeating section can have perfectly good ids per entry (Dayforce's
+    // `..._educationHistory_0_...`) and its entry index is still needed. Counting it here, before the
+    // identity branch, is what keeps the two independent.
+    const labelKey = s.label ? s.label.toLowerCase() : "";
+    const entryOrdinal = labelKey ? (labelSeen.get(labelKey) || 0) : 0;
+    if (labelKey) labelSeen.set(labelKey, entryOrdinal + 1);
+    if (durable) {
+      // identity is the durable attribute; the ordinal above still describes which entry it is
+    } else if (s.label) {
       // an ordinal is appended ONLY when the label is genuinely duplicated, so a unique label
       // keys stably as itself across visits.
-      fieldName = "label:" + s.label + ((labelCount.get(k) || 0) > 1 ? "#" + n : "");
+      fieldName = "label:" + s.label + ((labelCount.get(labelKey) || 0) > 1 ? "#" + entryOrdinal : "");
     } else {
       // no durable id AND no label — we cannot re-find this field on a second visit, so it must
       // never be filled. Kept in the scan so the caller can REPORT it.
@@ -3418,6 +3554,7 @@ function atsGenericPostProcess(raw) {
       isRequired: s.isRequired,
       reqVia: s.reqVia,
       value: f.value === undefined ? null : f.value,
+      entryOrdinal,
       credentialKind: f.credentialKind || null,
       options: Array.isArray(f.options) && f.options.length ? f.options.slice() : null,
       optionsPlaceholderOnly: !!f.optionsPlaceholderOnly,
@@ -3867,6 +4004,248 @@ function atsPickFormFrame(probe, minControls) {
 // attribute and `atsGenericPostProcess` judges it SW-side, so there is exactly ONE copy of that rule
 // — the lockstep-dup trap this codebase already pays for elsewhere.
 
+// ════════════════════════════════════════════════════════════════════════════════════════
+// WIDGET DRIVER — the PAIRED ARIA COMBOBOX
+// ════════════════════════════════════════════════════════════════════════════════════════
+//
+// The first entry in the fingerprint-keyed registry the plan calls for (§5). Not an iCIMS handler: it
+// drives any widget of the shape "a hidden/placeholder <select> that posts the value + a separate
+// trigger that opens a [role=listbox] of [role=option]s". iCIMS is simply where it was traced
+// (dom-patterns 2026-08-12):
+//
+//   <select id="X" style="visibility:hidden">      ← posts the value, holds ONE empty option
+//   <a id="X_icimsDropdown" class="dropdown-select" role="combobox" aria-expanded="false">
+//   <div id="X_icimsDropdown_ctnr" class="dropdown-container">
+//     <input class="dropdown-search" role="combobox">      ← filters, server-backed on big lists
+//     <ul class="dropdown-results" role="listbox">
+//       <li role="option" class="dropdown-result">AS</li>  ← 26 of these for Degree
+//
+// ⚠ A PLAIN el.click() DOES NOT OPEN IT — measured. The trigger listens on the pointer/mouse
+// sequence, so `aria-expanded` stayed "false" until pointerdown/mousedown/pointerup/mouseup/click
+// were dispatched in order. That is precisely the ladder `robustClick` leads with, and the same
+// lesson the Lever apply anchor taught in reverse (there a DOM .click() worked where coordinates did
+// not). Neither strategy is universally right, which is why the ladder keeps both.
+//
+// Self-contained (stringified through act.eval), and `sel` is the SELECT's selector — the trigger and
+// container are derived from it, so callers keep using the field's own inputSel.
+
+// Locate the trigger + container for a paired combobox. Returns ids so later calls can re-resolve
+// (never a held node — React/jQuery both remount these).
+function atsInjPairedComboProbe(sel) {
+  var el = document.querySelector(sel);
+  if (!el) return { ok: false, error: "not-found:" + sel };
+  var id = el.id || "";
+  var trigger = null, ctnr = null;
+  // (1) the id-suffix convention (iCIMS: X + "_icimsDropdown")
+  if (id) {
+    var all = document.querySelectorAll('[id^="' + (window.CSS && CSS.escape ? CSS.escape(id) : id) + '"]');
+    for (var i = 0; i < all.length; i++) {
+      var n = all[i];
+      if (n === el) continue;
+      if (!trigger && (n.getAttribute("role") === "combobox" || n.getAttribute("aria-haspopup") === "listbox")) trigger = n;
+      if (!ctnr && n.querySelector && n.querySelector('[role="listbox"]')) ctnr = n;
+    }
+  }
+  // (2) …else a sibling trigger, and the container that holds a listbox
+  var p = el.parentElement;
+  if (p) {
+    var kids = p.children;
+    for (var k = 0; k < kids.length; k++) {
+      var c = kids[k];
+      if (c === el) continue;
+      if (!trigger && (c.getAttribute("role") === "combobox" || c.getAttribute("aria-haspopup") === "listbox")) trigger = c;
+      if (!ctnr && c.querySelector && c.querySelector('[role="listbox"]')) ctnr = c;
+    }
+  }
+  if (!trigger) return { ok: false, error: "no-paired-trigger" };
+  if (!trigger.id) { try { trigger.id = "apg-trigger-" + Math.floor(performance.now()); } catch (e) { /* selector falls back below */ } }
+  if (ctnr && !ctnr.id) { try { ctnr.id = trigger.id + "-ctnr"; } catch (e) { /* ignore */ } }
+  return {
+    ok: true,
+    triggerSel: trigger.id ? "#" + (window.CSS && CSS.escape ? CSS.escape(trigger.id) : trigger.id) : null,
+    ctnrSel: ctnr && ctnr.id ? "#" + (window.CSS && CSS.escape ? CSS.escape(ctnr.id) : ctnr.id) : null,
+    expanded: trigger.getAttribute("aria-expanded") === "true",
+    triggerText: (trigger.textContent || "").replace(/\s+/g, " ").trim(),
+  };
+}
+
+// Open the widget with a REAL pointer sequence and report whether it actually expanded.
+function atsInjPairedComboOpen(triggerSel) {
+  var t = document.querySelector(triggerSel);
+  if (!t) return { ok: false, error: "no-trigger" };
+  var r = t.getBoundingClientRect();
+  var opts = { bubbles: true, cancelable: true, view: window, clientX: Math.round(r.x + r.width / 2), clientY: Math.round(r.y + r.height / 2) };
+  var seq = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+  for (var i = 0; i < seq.length; i++) {
+    try { t.dispatchEvent(new MouseEvent(seq[i], opts)); } catch (e) { try { t.dispatchEvent(new Event(seq[i], { bubbles: true })); } catch (e2) { /* keep going */ } }
+  }
+  return { ok: true, expanded: t.getAttribute("aria-expanded") === "true" };
+}
+
+// Read the options, scoped to THIS widget's container — never a page-wide [role=option] scrape (the
+// Workday chip-contamination lesson). Drops the placeholder row and reports whether it is still loading.
+function atsInjPairedComboRead(ctnrSel) {
+  var c = ctnrSel ? document.querySelector(ctnrSel) : null;
+  if (!c) return { ok: false, error: "no-container" };
+  var loading = !!c.querySelector('[class*="loading"]:not([class*="hide"])');
+  var out = [];
+  var nodes = c.querySelectorAll('[role="option"]');
+  for (var i = 0; i < nodes.length; i++) {
+    var t = (nodes[i].textContent || "").replace(/\s+/g, " ").trim();
+    if (!t) continue;
+    if (/^—\s*make a selection\s*—$|^—+$|^please select/i.test(t)) continue; // the placeholder row
+    out.push({ text: t, disabled: nodes[i].getAttribute("aria-disabled") === "true" });
+  }
+  return { ok: true, open: getComputedStyle(c).display !== "none", loading, options: out };
+}
+
+// Type into the widget's own filter box when it has one — a server-backed list (iCIMS' 3000-school
+// picker) only returns rows for a query. No-op when the widget filters client-side.
+function atsInjPairedComboFilter(ctnrSel, text) {
+  var c = ctnrSel ? document.querySelector(ctnrSel) : null;
+  if (!c) return { ok: false, error: "no-container" };
+  var box = c.querySelector('input[class*="search"],input[role="combobox"],input[type="text"]');
+  if (!box) return { ok: true, filtered: false };
+  var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  setter.call(box, "");
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+  setter.call(box, String(text == null ? "" : text));
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+  box.dispatchEvent(new Event("keyup", { bubbles: true }));
+  return { ok: true, filtered: true };
+}
+
+// Commit by clicking the option whose text matches EXACTLY (normalized) — the caller has already put
+// the value through the match ladder, so this must not do any matching of its own.
+function atsInjPairedComboCommit(ctnrSel, optionText) {
+  var c = ctnrSel ? document.querySelector(ctnrSel) : null;
+  if (!c) return { ok: false, error: "no-container" };
+  var want = String(optionText == null ? "" : optionText).replace(/\s+/g, " ").trim().toLowerCase();
+  var nodes = c.querySelectorAll('[role="option"]');
+  for (var i = 0; i < nodes.length; i++) {
+    var n = nodes[i];
+    var t = (n.textContent || "").replace(/\s+/g, " ").trim();
+    if (t.toLowerCase() !== want) continue;
+    var r = n.getBoundingClientRect();
+    var o = { bubbles: true, cancelable: true, view: window, clientX: Math.round(r.x + r.width / 2), clientY: Math.round(r.y + r.height / 2) };
+    var seq = ["pointerdown", "mousedown", "pointerup", "mouseup", "click"];
+    for (var s = 0; s < seq.length; s++) {
+      try { n.dispatchEvent(new MouseEvent(seq[s], o)); } catch (e) { /* keep going */ }
+    }
+    return { ok: true, clicked: t };
+  }
+  return { ok: false, error: "option-not-in-list" };
+}
+
+// Read the committed value back. The <select> is the authority when the widget wrote to it; the
+// trigger's own text is the fallback (iCIMS updates the trigger and leaves the select's option list
+// alone), and a still-placeholder trigger reads as EMPTY rather than as a value.
+function atsInjPairedComboValue(sel, triggerSel) {
+  var out = { ok: true, value: null, from: null };
+  var s = document.querySelector(sel);
+  if (s && s.tagName === "SELECT" && s.selectedIndex > 0) {
+    var t = (s.options[s.selectedIndex].textContent || "").replace(/\s+/g, " ").trim();
+    if (t) { out.value = t; out.from = "select"; return out; }
+  }
+  var tr = triggerSel ? document.querySelector(triggerSel) : null;
+  if (tr) {
+    var tt = (tr.textContent || "").replace(/\s+/g, " ").trim();
+    if (tt && !/^—\s*make a selection\s*—$|^—+$|^please select/i.test(tt)) { out.value = tt; out.from = "trigger"; }
+  }
+  return out;
+}
+
+// Close and CONFIRM it closed — a mounted list swallows the next widget's open-click (the standing rule).
+function atsInjPairedComboClose(triggerSel, ctnrSel) {
+  var t = triggerSel ? document.querySelector(triggerSel) : null;
+  if (t) {
+    try { t.dispatchEvent(new MouseEvent("keydown", { bubbles: true })); } catch (e) { /* ignore */ }
+    try { t.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Escape", keyCode: 27 })); } catch (e) { /* ignore */ }
+    try { t.blur(); } catch (e) { /* ignore */ }
+  }
+  try { document.body.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })); } catch (e) { /* ignore */ }
+  var c = ctnrSel ? document.querySelector(ctnrSel) : null;
+  var open = !!(c && getComputedStyle(c).display !== "none" && c.querySelectorAll('[role="option"]').length);
+  return { ok: true, open };
+}
+
+// Fill one paired ARIA combobox. Returns {handled:false} when the widget is not this shape, so the
+// caller falls through to its normal dropdown path unchanged.
+//
+// The SAFETY CONTRACT is the existing one, unchanged: candidates clear `matchCandidates` against the
+// options read LIVE from this widget at commit time, the commit is read-back verified, an exact hit is
+// `filled` and anything looser is `filled_review`, and a value that cannot be verified is
+// `needs_review` — never a silent wrong value. No new matching logic lives here.
+async function atsFillPairedCombo(act, f, ref, rec, candidates) {
+  const probe = await act.eval(atsInjPairedComboProbe, ref.inputSel).catch(() => null);
+  if (!probe || !probe.ok || !probe.triggerSel) return { handled: false };
+
+  const open = await act.eval(atsInjPairedComboOpen, probe.triggerSel);
+  if (!open || !open.ok) { rec.status = "needs_review"; rec.detail = "the dropdown's trigger could not be opened"; return { handled: true }; }
+  await act.delayFull(220);
+
+  // poll for the list: a server-backed widget renders nothing for a beat, and `loading` says so
+  let read = null;
+  for (let i = 0; i < 8; i++) {
+    read = await act.eval(atsInjPairedComboRead, probe.ctnrSel).catch(() => null);
+    if (read && read.ok && read.options && read.options.length && !read.loading) break;
+    await act.delayFull(180);
+  }
+  let texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+
+  // A server-backed list (iCIMS' school picker) only answers a QUERY — type the first candidate in
+  // and re-read before giving up on an empty list.
+  if (!texts.length && candidates && candidates.length) {
+    await act.eval(atsInjPairedComboFilter, probe.ctnrSel, String(candidates[0])).catch(() => null);
+    for (let i = 0; i < 8; i++) {
+      await act.delayFull(200);
+      read = await act.eval(atsInjPairedComboRead, probe.ctnrSel).catch(() => null);
+      if (read && read.options && read.options.length && !read.loading) break;
+    }
+    texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+  }
+
+  if (!texts.length) {
+    await act.eval(atsInjPairedComboClose, probe.triggerSel, probe.ctnrSel).catch(() => null);
+    rec.status = "needs_review";
+    rec.detail = "the dropdown opened but listed no options" + (read && read.loading ? " (still loading)" : "");
+    rec.flag = rec.flag || "options-never-rendered";
+    return { handled: true };
+  }
+  atsAttachOptions(rec, texts);
+
+  if (!candidates || !candidates.length) {
+    await act.eval(atsInjPairedComboClose, probe.triggerSel, probe.ctnrSel).catch(() => null);
+    return { handled: true, noCandidates: true };
+  }
+
+  // the SAME ladder every other choice widget uses — containment OFF (picking a substring is a guess)
+  const m = atsLib.matchCandidates(candidates, texts, { containment: false });
+  if (!m || m.targetIndex < 0) {
+    await act.eval(atsInjPairedComboClose, probe.triggerSel, probe.ctnrSel).catch(() => null);
+    rec.status = "needs_review";
+    rec.detail = "no candidate matched " + texts.length + " option(s); closest: " + JSON.stringify(atsNearOptions(texts, candidates[0], 3));
+    return { handled: true };
+  }
+  const want = texts[m.targetIndex];
+  const clicked = await act.eval(atsInjPairedComboCommit, probe.ctnrSel, want);
+  await act.delayFull(260);
+  const back = await act.eval(atsInjPairedComboValue, ref.inputSel, probe.triggerSel).catch(() => null);
+  const got = back && back.value ? String(back.value) : "";
+  const ok = !!(clicked && clicked.ok) && atsFd.textValuesMatch(got, want);
+
+  // ALWAYS close, and confirm — a list left mounted eats the NEXT widget's open-click.
+  const closed = await act.eval(atsInjPairedComboClose, probe.triggerSel, probe.ctnrSel).catch(() => null);
+  if (closed && closed.open) rec.detail = (rec.detail ? rec.detail + "; " : "") + "⚠ the option list is still mounted";
+
+  rec.after = got || null;
+  rec.status = ok ? (m.matchTier === "exact-normalized" ? "filled" : "filled_review") : "needs_review";
+  if (!ok) rec.detail = "commit did not persist (read " + JSON.stringify(got) + " after choosing " + JSON.stringify(want) + ")";
+  else if (rec.status === "filled_review") rec.flag = rec.flag || "non-exact-match";
+  rec.matchTier = m.matchTier;
+  return { handled: true };
+}
+
 // ── The review picker: capture options for a choice field we did NOT fill ────────────────
 // Operator requirement: "if it is a reconnable dropdown, it shows up in the review page."
 //
@@ -3944,6 +4323,9 @@ if (typeof module !== "undefined" && module.exports) {
     atsGenericPickLabel, atsGenericHeadingClaims, atsGenericPostProcess,
     atsInjScanGeneric, atsInjReadNativeOptions, atsCaptureChoiceOptions, ATS_GENERIC_LABEL_RUNGS,
     atsInjFindFormFrame, atsPickFormFrame, atsGenericIsResumeSlot,
+    atsInjPairedComboProbe, atsInjPairedComboOpen, atsInjPairedComboRead, atsInjPairedComboFilter,
+    atsInjPairedComboCommit, atsInjPairedComboValue, atsInjPairedComboClose, atsFillPairedCombo,
+    atsGenericEducationOrder, atsGenericEducationValue, atsGenericDatePart, ATS_GENERIC_EDUCATION_FIELDS,
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
