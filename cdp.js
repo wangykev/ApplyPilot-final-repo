@@ -274,6 +274,7 @@ function cdpAttach(tabId) {
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
       _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
       _pageClockOn = false;                    // page-clock pacing is per-run opt-in (FILL/REPLAY only) — onboarding/auth/recon stay SW-timed
+      _frameCtxId = null;                      // frame-scoped eval is per-run opt-in (GENERIC only) — everything else evaluates in the top frame
       _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
       try {
         await cdpSend("Runtime.enable", {});
@@ -782,9 +783,67 @@ function cdpAuthButtonReady(selector) {
 // discipline as chrome.scripting injections). CDP-injected evaluation executes
 // promptly even hidden (it is not timer-driven) — this is the DOM-READ channel;
 // all WAITING between reads stays SW-side (cdpDelay).
+// ── FRAME-SCOPED EVAL (GENERIC forms only) ──────────────────────────────────────────────
+// iCIMS serves its whole application inside a same-origin iframe, and re-opening that frame as a
+// top-level page does NOT work when the session was established by a one-time magic link: the first
+// navigation consumes the `eem`/`code` token, so the second lands on a login page with 0 fields
+// (measured live 2026-08-12 — the run reached `unknown-page` after a successful frame hop).
+//
+// So the form has to be driven WHERE IT IS. `cdpEval` gains an optional target frame, discovered
+// request/response — `Page.getFrameTree` then `Page.createIsolatedWorld` — because cdp.js
+// deliberately registers NO event listener, which rules out `Runtime.executionContextCreated`.
+//
+// ⚠ An ISOLATED world is the right world here, and it is not a compromise: it shares the DOM with the
+// page, so the native-setter + dispatchEvent pattern every injected function uses works identically
+// (that is exactly how a content script fills a React input). It only lacks the page's own JS globals,
+// which no injected function here touches.
+//
+// ⚠ DEFAULTS TO NULL, AND ONLY THE GENERIC PATH SETS IT. With `_frameCtxId === null` this is
+// byte-identical to the previous `Runtime.evaluate` call, so Workday / Greenhouse / Lever / Ashby are
+// untouched. Reset on every attach.
+let _frameCtxId = null;
+let _frameCtxUrl = null;
+
+// Point subsequent cdpEval calls at the richest same-origin CHILD frame. Returns
+// {ok, url, controls} or {ok:false, reason}. Idempotent-ish: re-resolving is cheap and a
+// navigation invalidates the world, so callers re-arm after any navigation.
+async function cdpUseFormFrame(minControls) {
+  const floor = minControls == null ? 4 : minControls;
+  _frameCtxId = null; _frameCtxUrl = null;
+  let tree = null;
+  try { tree = await cdpSend("Page.getFrameTree", {}); } catch (e) { return { ok: false, reason: "no-frame-tree" }; }
+  const kids = (tree && tree.frameTree && tree.frameTree.childFrames) || [];
+  if (!kids.length) return { ok: false, reason: "no-child-frames" };
+  let best = null;
+  for (const k of kids) {
+    const frameId = k.frame && k.frame.id;
+    if (!frameId) continue;
+    let ctx = null;
+    try { ctx = await cdpSend("Page.createIsolatedWorld", { frameId, worldName: "apGeneric", grantUniveralAccess: false }); } catch (e) { continue; }
+    const contextId = ctx && ctx.executionContextId;
+    if (!contextId) continue;
+    let n = 0;
+    try {
+      const r = await cdpSend("Runtime.evaluate", {
+        expression: "document.querySelectorAll('input:not([type=hidden]),textarea,select,[role=combobox]').length",
+        returnByValue: true, contextId,
+      });
+      n = (r && r.result && r.result.value) || 0;
+    } catch (e) { n = 0; }
+    if (!best || n > best.controls) best = { contextId, controls: n, url: (k.frame && k.frame.url) || "" };
+  }
+  if (!best || best.controls < floor) return { ok: false, reason: "no-frame-with-a-form", controls: best ? best.controls : 0 };
+  _frameCtxId = best.contextId; _frameCtxUrl = best.url;
+  return { ok: true, url: best.url, controls: best.controls };
+}
+function cdpClearFormFrame() { _frameCtxId = null; _frameCtxUrl = null; }
+function cdpFormFrameUrl() { return _frameCtxUrl; }
+
 async function cdpEval(fn, ...args) {
   const expression = "(" + String(fn) + ")(" + args.map((a) => JSON.stringify(a)).join(",") + ")";
-  const res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+  const params = { expression, returnByValue: true, awaitPromise: true };
+  if (_frameCtxId != null) params.contextId = _frameCtxId;
+  const res = await cdpSend("Runtime.evaluate", params);
   if (res && res.exceptionDetails) {
     const d = res.exceptionDetails;
     throw new Error("cdpEval: " + ((d.exception && d.exception.description) || d.text || "page exception"));

@@ -4617,17 +4617,22 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // Bounded to ONE hop, and `atsPickFormFrame` refuses unless the top page is clearly poorer than
     // the frame — so a page that already shows its own form is never abandoned for a marketing or
     // captcha iframe.
-    if (!ready.ready && ats === "generic" && !(opts0.frameHops >= 1)) {
+    if (!ready.ready && ats === "generic") {
       const probe = await cdpEval(atsInjFindFormFrame).catch(() => null);
-      const frameUrl = atsPickFormFrame(probe);
-      if (frameUrl) {
-        LOG(`the form is inside a same-origin IFRAME (${(probe.candidates[0] || {}).controls} control(s) vs ${probe.topControls} on the top page) — re-opening the frame directly`);
-        emitRunProgress("Opening the embedded form", "iframe");
-        await cdpDetach().catch(() => {});
-        return await runAtsApplicationRun(tabId, "generic", store, frameUrl, {
-          chase: opts0.chase || 0, applyHops: opts0.applyHops || 0, originUrl,
-          genericTried: true, frameHops: 1,
-        });
+      const worth = atsPickFormFrame(probe);
+      if (worth) {
+        // ⚠ DRIVE THE FRAME WHERE IT IS — do NOT re-open it as a top-level page. That was tried live
+        // (2026-08-12) and failed: iCIMS' session comes from a one-time magic link, so the first
+        // navigation consumes the `eem`/`code` token and re-opening the frame URL lands on a login
+        // page with 0 fields — the run reached `unknown-page` after an otherwise-correct frame hop.
+        const armed = await cdpUseFormFrame(4);
+        if (armed.ok) {
+          LOG(`the form is inside a same-origin IFRAME (${armed.controls} control(s) vs ${probe.topControls} on the top page) — evaluating INSIDE the frame from here on`);
+          emitRunProgress("Reading the embedded form", "iframe");
+          ready = await waitAtsFormReady(ats, LOG);
+        } else {
+          LOG(`a frame looked like the form but could not be targeted (${armed.reason}) — staying on the top document`);
+        }
       }
       if (probe && probe.crossOrigin) LOG(`${probe.crossOrigin} cross-origin iframe(s) here — their contents cannot be read, so they are not treated as the form`);
     }
