@@ -310,6 +310,45 @@ test("atsCaptureChoiceOptions: opens an unfilled combobox, attaches options, CON
   });
 });
 
+test("atsCaptureChoiceOptions: a placeholder-only NATIVE select is re-read live (the KEF gap)", async () => {
+  // Found on the first real run: the citizenship <select> was placeholder-only at scan time, so the
+  // scan claimed no vocabulary, the capture pass skipped it as "not a combobox", and review got NO
+  // picker — the operator's requirement, missed. It is now re-read from the live page.
+  let reads = 0;
+  const act = { delayFull: async () => {},
+    eval: async (fn, sel) => {
+      if (fn.name === "atsInjReadNativeOptions") { reads++; return { ok: true, options: ["Yes", "No"], placeholder: null, total: 3 }; }
+      throw new Error("unexpected eval " + fn.name);
+    } };
+  const scan = { fields: [{ fieldName: "cit", inputSel: "#cit", widgetType: "dropdown_native", label: "Are you a US Citizen?", options: null }] };
+  const results = [{ fieldName: "cit", status: "skipped" }];
+  const r = await ats.atsCaptureChoiceOptions(act, "generic", scan, results);
+  assert.strictEqual(reads, 1, "it must re-read the live select");
+  assert.strictEqual(r.captured, 1);
+  assert.deepStrictEqual(results[0].options, ["Yes", "No"]);
+});
+
+test("atsCaptureChoiceOptions: a native select that is STILL empty explains itself, never sits silent", async () => {
+  const act = { delayFull: async () => {},
+    eval: async (fn) => (fn.name === "atsInjReadNativeOptions"
+      ? { ok: true, options: [], placeholder: "Choose an option", total: 1 }
+      : (() => { throw new Error("unexpected"); })()) };
+  const scan = { fields: [{ fieldName: "cit", inputSel: "#cit", widgetType: "dropdown_native", label: "Are you a US Citizen?", options: null }] };
+  const results = [{ fieldName: "cit", status: "skipped" }];
+  const r = await ats.atsCaptureChoiceOptions(act, "generic", scan, results);
+  assert.strictEqual(r.captured, 0);
+  assert.strictEqual(r.skipped, 1);
+  assert.strictEqual(results[0].flag, "options-never-rendered");
+  assert.match(results[0].detail, /offers no options/);
+  assert.match(results[0].detail, /Choose an option/);
+});
+
+test("atsInjReadNativeOptions: strips the placeholder and reports it when nothing real remains", () => {
+  const src = ats.atsInjReadNativeOptions.toString();
+  assert.doesNotThrow(() => new Function("return (" + src + ")"), "must parse standalone");
+  for (const other of ["atsLib", "atsFd", "atsGenericCleanLabel"]) assert.ok(!src.includes(other));
+});
+
 test("atsCaptureChoiceOptions: a server-ranked widget is SKIPPED (it can never BE the picker)", () => {
   const act = { eval: async () => { throw new Error("must not open a location widget"); }, delayFull: async () => {} };
   const scan = { fields: [{ fieldName: "label:Where are you based?", inputSel: "#l", widgetType: "select", label: "Where are you currently based?" }] };
@@ -576,6 +615,136 @@ test("LIVE Paylocity: 'Next Step' is reported as multiStep, never as a submit", 
   const id = ats.atsLooksLikeApplicationForm(fields, { hasSubmit: false, multiStep: true });
   assert.strictEqual(id.ok, true);
   assert.strictEqual(id.hasSubmit, false);
+});
+
+// ── INTEGRATION: drive the real fill loop over the LIVE-captured KEF form ───────────────
+// Same fake-actuation pattern test/ats.test.js uses for Greenhouse, but through the GENERIC path:
+// atsInjScanGeneric → atsGenericPostProcess → routing → actuation → the review picker. This is what
+// exercises `driveAtsPageFill` end to end without a browser.
+const GENERIC_PROFILE = {
+  personal_info: { first_name: "Kevin", last_name: "Wang", email: "kevin@example.com", phone_number: "+1 555 010 2030",
+    city: "Los Angeles", state: "CA", country: "United States" },
+  work_authorization: { authorized_to_work_in_us: true, requires_sponsorship_now: false, requires_sponsorship_future: false },
+};
+
+// ⚠ A GENERIC form has NO static field map, so the identity fields reach the profile through the
+// BUCKET tier — which is the DESIGNED path, not a gap: the operator ruled that identity aliases must
+// live in operator-visible bucket wordings rather than hidden backend regexes (2026-07-31), and the
+// website seeds one bucket per profile field in `ensureDefaultFieldWordings`. The first live run
+// confirmed it: every identity field logged `filled · bucket`.
+//
+// The consequence worth knowing: on a generic form, bucket coverage is what decides whether a field
+// fills deterministically — and a REQUIRED field with no wording goes to the AI instead. Supplying
+// realistic buckets here is therefore reproducing production, not papering over anything.
+const GENERIC_BUCKETS = [
+  { id: "b1", profile_path: "personal_info.first_name", questions: ["First Name"] },
+  { id: "b2", profile_path: "personal_info.last_name", questions: ["Last Name"] },
+  { id: "b3", profile_path: "personal_info.email", questions: ["Email", "Email Address"] },
+];
+
+function genericFakeAct(page) {
+  return {
+    aiEnabled: !!page.aiEnabled,
+    llm: page.llm || (async () => ({ ok: false, error: "no-llm" })),
+    delay: async () => {}, delayFull: async () => {},
+    attachResume: page.attachResume || (async () => ({ ok: true, name: "resume.pdf", verified: true })),
+    eval: async (fn, ...args) => {
+      const h = page[fn.name];
+      if (!h) throw new Error("fake page has no handler for " + fn.name);
+      return h(...args);
+    },
+  };
+}
+
+test("INTEGRATION (generic, live KEF scan): text fills verified, résumé attaches, dropdown reaches review WITH a picker", async () => {
+  const values = {};
+  let resumeAttached = 0, opened = [], closed = [];
+  const act = genericFakeAct({
+    // the generic path calls atsInjScanGeneric, never atsInjScan — a handler for the latter would
+    // never fire, which is itself part of what this asserts.
+    atsInjScanGeneric: () => JSON.parse(JSON.stringify(KEF_LIVE_SCAN)),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] != null ? values[sel] : null }),
+    atsInjSelectNative: (sel, text) => { values[sel] = text; return { ok: true }; },
+    atsInjReadFileState: () => ({ ok: true, name: "resume.pdf" }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSubmitState: () => ({ ok: true, hasSubmit: true, multiStep: false, captchaChallenge: false, confirmed: false }),
+    atsInjErrors: () => ({ ok: true, errors: [] }),
+    // the citizenship <select> was placeholder-only at scan time, so the review picker must RE-READ it
+    // live — the exact gap the first real run exposed. Here the page has since populated it.
+    atsInjReadNativeOptions: (sel) => { opened.push(sel); return { ok: true, options: ["Yes", "No"], placeholder: null, total: 3 }; },
+    atsInjOpenAndReadOptions: (sel) => { opened.push(sel); return { ok: true, opened: true }; },
+    atsInjReadOptions: (sel) => (closed.includes(sel)
+      ? { ok: true, open: false, options: [] }
+      : { ok: true, open: true, options: [{ text: "Yes", disabled: false }, { text: "No", disabled: false }] }),
+    atsInjCloseCombo: (sel) => { closed.push(sel); return { ok: true }; },
+    attachResume: async () => { resumeAttached++; return { ok: true, name: "resume.pdf", verified: true }; },
+  });
+
+  const out = await ats.driveAtsPageFill(act, "generic", GENERIC_PROFILE, {}, { company: "KEF Robotics" }, { buckets: GENERIC_BUCKETS });
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+
+  // the identity fields fill deterministically off the profile and are read-back verified
+  assert.strictEqual(by["first-name"].after, "Kevin");
+  assert.strictEqual(by["first-name"].status, "filled");
+  assert.strictEqual(by["last-name"].after, "Wang");
+  assert.strictEqual(by.email.after, "kevin@example.com");
+
+  // the résumé slot is recognized with no static map and attached exactly once
+  assert.strictEqual(resumeAttached, 1, "the résumé must attach exactly once");
+
+  // ⚠ THE OPERATOR'S REQUIREMENT: the unfilled citizenship dropdown reaches review WITH a picker.
+  // Its <select> was placeholder-only, so the options can only have come from the capture pass.
+  const cit = by["collection_comp-lpjwscz6"];
+  assert.ok(cit, "the citizenship dropdown must reach review");
+  assert.deepStrictEqual(cit.options, ["Yes", "No"], "review must get a real picker for it");
+  assert.ok(opened.includes("#collection_comp-lpjwscz6"), "the capture pass must have re-read it");
+
+  // nothing was silently dropped: every scanned field produced a record
+  assert.strictEqual(out.results.length, KEF_LIVE_SCAN.fields.length);
+});
+
+test("INTEGRATION (generic): a field whose read-back disagrees ends needs_review, never a silent wrong value", async () => {
+  const act = genericFakeAct({
+    atsInjScanGeneric: () => JSON.parse(JSON.stringify(KEF_LIVE_SCAN)),
+    // the page accepts the write but reports something else back — the false-verify class
+    atsInjSetText: () => ({ ok: true, after: "Kevin" }),
+    atsInjReadValue: () => ({ ok: true, value: "SOMETHING ELSE" }),
+    atsInjSelectNative: () => ({ ok: true }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSubmitState: () => ({ ok: true, hasSubmit: true }),
+    atsInjErrors: () => ({ ok: true, errors: [] }),
+    atsInjOpenAndReadOptions: () => ({ ok: true }),
+    atsInjReadOptions: () => ({ ok: true, open: false, options: [] }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "generic", GENERIC_PROFILE, {}, {}, { buckets: GENERIC_BUCKETS });
+  const first = out.results.find((r) => r.fieldName === "first-name");
+  assert.notStrictEqual(first.status, "filled", "a disagreeing read-back must never report filled");
+  assert.ok(["needs_review", "filled_review"].includes(first.status));
+});
+
+test("INTEGRATION (generic): the AI is never asked when nothing is required and unmapped", async () => {
+  let llmCalls = 0;
+  const act = genericFakeAct({
+    aiEnabled: true,
+    llm: async () => { llmCalls++; return { ok: true, text: '{"answer":"x"}' }; },
+    atsInjScanGeneric: () => JSON.parse(JSON.stringify(KEF_LIVE_SCAN)),
+    atsInjSetText: (sel, v) => ({ ok: true, after: v }),
+    atsInjReadValue: (a, sel) => ({ ok: true, value: null }),
+    atsInjSelectNative: () => ({ ok: true }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSubmitState: () => ({ ok: true, hasSubmit: true }),
+    atsInjErrors: () => ({ ok: true, errors: [] }),
+    atsInjOpenAndReadOptions: () => ({ ok: true }),
+    atsInjReadOptions: () => ({ ok: true, open: false, options: [] }),
+    atsInjCloseCombo: () => ({ ok: true }),
+  });
+  await ats.driveAtsPageFill(act, "generic", GENERIC_PROFILE, {}, {}, { buckets: GENERIC_BUCKETS });
+  // On this form only `email` is required, and the profile answers it. The two free-text questions are
+  // OPTIONAL, and the operator rule is that an optional unmapped field fills deterministically or
+  // stays BLANK — it must never buy an LLM call.
+  assert.strictEqual(llmCalls, 0, "no optional field may spend an AI request");
 });
 
 // ── ISOLATION: the generic kind must not leak into the supported families ───────────────

@@ -3673,6 +3673,22 @@ function atsInjScanGeneric() {
   }
   return out;
 }
+// Re-read a native <select>'s options from the LIVE page. Separate from the scan because a Wix/CMS
+// select can be populated lazily (or never) — the scan's placeholder-only reading is a snapshot, and
+// the review picker deserves a second look after the fill has run. Reports the placeholder it saw so
+// an option-less dropdown can explain itself instead of looking like our failure.
+function atsInjReadNativeOptions(inputSel) {
+  var el = document.querySelector(inputSel);
+  if (!el || el.tagName !== "SELECT") return { ok: false, error: "not-a-select" };
+  var all = [];
+  for (var i = 0; i < el.options.length; i++) {
+    var t = (el.options[i].textContent || "").replace(/\s+/g, " ").trim();
+    if (t) all.push(t);
+  }
+  var real = all.filter(function (t) { return !/^(choose|select|please select|--|-)\b/i.test(t) && t !== "-"; });
+  return { ok: true, options: real, placeholder: real.length ? null : (all[0] || null), total: all.length };
+}
+
 // NOTE: the scanner deliberately does NOT duplicate the durability test in-page. It reports the raw
 // attribute and `atsGenericPostProcess` judges it SW-side, so there is exactly ONE copy of that rule
 // — the lockstep-dup trap this codebase already pays for elsewhere.
@@ -3704,8 +3720,27 @@ async function atsCaptureChoiceOptions(act, ats, scan, results) {
     if (Array.isArray(rec.captured_options) && rec.captured_options.length) continue;
     const f = (scan.fields || []).find((x) => x.fieldName === rec.fieldName);
     if (!f) continue;
-    if (f.widgetType !== "select") { // native/radio/checkbox already carry their list from the scan
-      if (Array.isArray(f.options) && f.options.length) { atsAttachOptions(rec, f.options); captured++; }
+    if (f.widgetType !== "select") {
+      // native / radio / checkbox normally carry their list from the scan
+      if (Array.isArray(f.options) && f.options.length) { atsAttachOptions(rec, f.options); captured++; continue; }
+      // ⚠ …EXCEPT a native <select> whose list was placeholder-only at scan time. Live on KEF
+      // Robotics the citizenship <select> held exactly ["Choose an option"], so the scan claimed no
+      // vocabulary and review got NO picker — the operator's requirement, missed. Re-read it from the
+      // live DOM here (the page has had the whole fill to populate it), and if it is STILL empty say
+      // so in the record rather than leaving a silently option-less dropdown in review.
+      if (f.widgetType === "dropdown_native") {
+        let live = null;
+        try { live = await act.eval(atsInjReadNativeOptions, f.inputSel); } catch (e) { live = null; }
+        const texts = (live && live.options) || [];
+        if (texts.length) { atsAttachOptions(rec, texts); captured++; }
+        else {
+          skipped++;
+          rec.detail = (rec.detail ? rec.detail + "; " : "") +
+            "this form's own dropdown offers no options" + (live && live.placeholder ? " (only " + JSON.stringify(live.placeholder) + ")" : "") +
+            " — nothing to choose from, so review shows a free-text box";
+          rec.flag = rec.flag || "options-never-rendered";
+        }
+      }
       continue;
     }
     if (/location|city|address|where .* based|school|university/i.test(String(f.label || ""))) { skipped++; continue; }
@@ -3733,7 +3768,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     atsGenericIdDurable, atsGenericRequiredFromLabel, atsGenericCleanLabel,
     atsGenericPickLabel, atsGenericHeadingClaims, atsGenericPostProcess,
-    atsInjScanGeneric, atsCaptureChoiceOptions, ATS_GENERIC_LABEL_RUNGS,
+    atsInjScanGeneric, atsInjReadNativeOptions, atsCaptureChoiceOptions, ATS_GENERIC_LABEL_RUNGS,
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
