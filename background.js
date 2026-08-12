@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "deferred-ai-3";
+const AP_BUILD_MARKER = "deferred-ai-6";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -334,6 +334,17 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // rather than let the two fight over cdp.js's single tracked tab mid-fill.
         if (discoverInFlight) {
           sendResponse({ ok: false, error: "discover-in-flight", detail: "A job-discovery sweep is running. Wait for it to finish, then run again." });
+          return;
+        }
+        // …AND A SECOND RUN IS THE SAME HAZARD (2026-08-12). Every other handler already refuses on
+        // `runInFlight` — the discovery sweep, all the dev probes — but run-vs-run was unguarded, even
+        // though the reason is identical and stated in CLAUDE.md: cdp.js tracks ONE `cdpTabId`, so the
+        // second run steals the first one's debugger attach mid-fill. OBSERVED, not theorised: two
+        // overlapping runs on one posting produced a bundle with **12 `error` fields** where the same
+        // posting fills 15/9/1 cleanly. Safe to refuse — both exit paths reset the flag in a `finally`,
+        // so a crashed run cannot strand the next one.
+        if (runInFlight) {
+          sendResponse({ ok: false, error: "run-in-flight", detail: "A fill or submit run is already going. Wait for it to finish, then run again." });
           return;
         }
         const store = await new Promise((r) =>
@@ -941,6 +952,13 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // mid-replay. Same guard AP_RUN_APPLICATION carries.
         if (discoverInFlight) {
           sendResponse({ ok: false, error: "discover-in-flight", detail: "A job-discovery sweep is running. Wait for it to finish, then submit again." });
+          return;
+        }
+        // Same guard as the fill run, and it matters MORE here: this is the path that can ARM a real
+        // submit. A concurrent run mutating the page under the replay's strict verify is exactly the
+        // state in which "the page agrees with the approved bundle" stops meaning anything.
+        if (runInFlight) {
+          sendResponse({ ok: false, error: "run-in-flight", detail: "A fill or submit run is already going. Wait for it to finish, then submit again." });
           return;
         }
         const arm = message.arm === true; // the per-run submit token — absent ⇒ dry rehearsal

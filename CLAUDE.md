@@ -227,6 +227,16 @@ safety contract, which is absolute:
 
 - **Every AI fill is guess + fill + FLAG `needs_review`, never silent trust — the human review gate is the
   safety.** ALWAYS `filled_review`.
+- **The Workday batch covers DROPDOWNS *and* FREE TEXT, split across two ROUTES (2026-08-12).** It fires
+  BEFORE the deterministic pass and un-awaited — **that overlap is the design and must not be traded away**
+  (it is the opposite order to `ats.js`, deliberately: see the multi-ATS section). Text was excluded until
+  this date, so every REQUIRED free-text question made its own serial call. Text candidates are **free to
+  batch — they need no options, so they add ZERO page contact**; only an `infer` dropdown ever opens
+  anything. Because `act.llm` carries one `action`, picks go out on `"fill"` and prose on `"essay"` as two
+  concurrent un-awaited calls, and `aiBatchAnswer` **awaits only the route that could serve the field** —
+  blocking a prose question on the dropdown call would make the first AI field wait for the slower of two
+  replies for nothing. `aiFillText` takes a `preAnswer` exactly like `aiFillField`; the batch normalizes
+  every answer onto `choice`, so it unwraps back into `parseAiText`'s `{answer}` contract at that seam.
 - **Every AI choice is a CANDIDATE that must clear the match ladder vs the live options — never a blind
   commit**, then text-keyed commit + read-back + persistence re-read.
 - **`llm.js` is the ONLY provider-aware code.** `callLLM({provider, model, apiKey, system, user, maxTokens})`
@@ -499,6 +509,15 @@ The standing rules:
   is **read then CLOSED** (gated on the option count, not `aria-expanded`) — nothing is committed while the
   call is in flight, so no menu is left open across it. **ONE deferred question is not a batch** and takes
   its own path unchanged. Round 10 of `docs/fill-speed-log.md`.
+- **ONE CALL PER KIND, because `action` is per-call (2026-08-12).** `act.llm` resolves ONE `action`, and the
+  AI page configures a different model per action — `"fill"` for short picks, `"essay"` for prose. So the
+  batch splits: **choice → `fill`, text → `essay`**, fired CONCURRENTLY (no latency cost, and the two may
+  resolve to different keys, spreading a page across two per-minute budgets). **"One question is not a
+  batch" therefore applies PER KIND** — 5 essays still batch when the page's only pick rides alone.
+  ⚠ `atsAiWriteText` passed NO action until this date, so every long answer on GH/Lever/Ashby silently went
+  to the operator's yes/no model while the "Fill — essays and long answers" slot sat unused; the Workday
+  twin (`aiFillText`) had always routed correctly. Live-verified: `AI batch [text → "essay" route]` next to
+  `[LLM] … for "essay"`.
 
 ## Onboarding walk (pre-form: JD → apply → login → verify)
 
@@ -530,7 +549,14 @@ SAFETY INVARIANTS (always apply): discovery **only READS** — it never applies,
 (clicking LinkedIn's can mark a posting applied when it has not been), and **never attempts a login**. It
 RETURNS jobs and writes nothing; the WEBSITE persists them (engine computes / caller does I/O).
 `discoverInFlight` and `runInFlight` are **MUTUALLY EXCLUSIVE** — cdp.js tracks ONE `cdpTabId`, so a sweep
-would clobber a running walk's attach mid-fill. **No silent caps:** whatever a cap drops is reported as a note.
+would clobber a running walk's attach mid-fill. ⚠ **AND SO ARE TWO RUNS (2026-08-12).** `AP_RUN_APPLICATION`
+and `AP_SUBMIT_APPLICATION` guarded only on `discoverInFlight` while every other handler already refused on
+`runInFlight`, so a second run could steal the first's attach for exactly the same reason. Observed, not
+theorised: two overlapping runs on one Greenhouse posting produced a bundle with **12 `error` fields** where
+that posting fills `15/9/1` cleanly. Both now refuse `run-in-flight`; safe because both reset the flag in a
+`finally`, so a crashed run cannot strand the next one. It matters most on the SUBMIT path — a concurrent
+run mutating the page under the replay's strict verify is exactly when "the page agrees with the approved
+bundle" stops meaning anything. **No silent caps:** whatever a cap drops is reported as a note.
 
 Mechanism (the one board driver + each board's JSON contract, the location resolver, `discoveryJobKey`
 lockstep with web/lib/discover.ts, ranking, the hidden-tab levers): **load the `job-discovery` skill.**

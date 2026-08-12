@@ -1543,7 +1543,15 @@ async function atsAiWriteText(act, f, profile, jobContext) {
     (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground your answer in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
     (style ? "\nSTYLE RULES: " + style : "") +
     "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000);
-  const res = await act.llm({ system, user, maxTokens: 700 });
+  // ROUTE: "essay", not the default "fill" (2026-08-12). `act.llm` resolves `action || "fill"`, so
+  // omitting it sent every free-text answer — the cover-letter-shaped "why do you want to work here"
+  // boxes — to the model configured for yes/no picks. The AI page has had a separate
+  // "Fill — essays and long answers" slot all along and the Workday twin (`aiFillText`) already used
+  // it; only this path did not, so the operator's essay model was silently unused on GH/Lever/Ashby.
+  // …EXCEPT a date, which reaches this function for its prompt SHAPE but is a short factual answer,
+  // not prose. Workday's `aiFillDate` routes a date to "fill"; keep the two paths agreeing.
+  const action = f && f.widgetType === "date" ? "fill" : "essay";
+  const res = await act.llm({ system, user, maxTokens: 700, action });
   if (!res || !res.ok) return { ok: false, error: (res && res.error) || "llm-failed" };
   const parsed = atsFd.parseAiText(res.text); // {skip, answer, reason, maps_to?, suggested_category?}
   if (!parsed || parsed.skip || !String(parsed.answer || "").trim()) return { ok: false, error: (parsed && parsed.reason) || "ai-declined" };
@@ -1685,7 +1693,12 @@ const ATS_AI_BATCH_MAX = 24;   // same reasoning as fill-driver's AI_BATCH_MAX: 
 // text/textarea/date answer in prose (atsAiWriteText's contract); everything else picks an option.
 function atsAiBatchKind(f) {
   const wt = f && f.widgetType;
-  if (wt === "text" || wt === "textarea" || wt === "date") return "text";
+  if (wt === "text" || wt === "textarea") return "text";
+  // A DATE still defers (so it is filled, and in form order) but is NEVER batched: it shares
+  // atsAiWriteText's prompt shape, yet it is a short factual answer, not prose — batching it would put
+  // it in the "essay" group and bill it to the operator's essay model. Workday's `aiFillDate` routes a
+  // date to "fill" for the same reason; this keeps the two paths saying the same thing.
+  if (wt === "date") return "date";
   if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location"].includes(wt)) return "choice";
   return null;
 }
@@ -1827,63 +1840,95 @@ function atsParseBatchReply(text, items) {
   return out;
 }
 
-// Fire the ONE call for everything the deterministic pass deferred, and fold the answers into the
-// page-level cache (key = normalized QUESTION). Never throws: every failure mode simply leaves the
+// ONE CALL PER KIND, NOT ONE PER PAGE — and the reason is ROUTING, not batching (2026-08-12).
+// `act.llm` resolves ONE `action` per call, and the AI page configures a different model per action:
+// "Fill" for picks, "Fill — essays and long answers" for prose. A single mixed call can only carry one
+// of them, so it would have to send someone's essay questions to their yes/no model (or the reverse).
+// Splitting by kind keeps each question on the model the operator chose for it.
+//
+// It costs nothing in latency: the two calls are INDEPENDENT and fire CONCURRENTLY. And it is a small
+// quota win — the two actions may resolve to different models and different pinned keys, so a page's
+// AI spend now spreads across two per-minute budgets instead of one.
+const ATS_BATCH_ACTION = { choice: "fill", text: "essay" };
+
+// Fire the batched call(s) for everything the deterministic pass deferred, and fold the answers into
+// the page-level cache (key = normalized QUESTION). Never throws: every failure mode simply leaves the
 // cache without that question, and the commit pass then makes its own per-field call.
 async function atsRunAiBatch(act, deferred, profile, jc, cache) {
-  const items = [];
+  const byKind = { choice: [], text: [] };
   const idToKey = new Map();
-  let cached = 0, dup = 0, noOptions = 0, capped = 0;
+  const seen = new Set();
+  let cached = 0, dup = 0, noOptions = 0, capped = 0, unbatched = 0, n = 0;
   for (const d of deferred) {
     if (cache.has(d.qKey)) { cached++; continue; }         // an earlier cascade round already answered this question
-    if (idToKey.size && [...idToKey.values()].includes(d.qKey)) { dup++; continue; } // same question twice on one page
+    if (seen.has(d.qKey)) { dup++; continue; }              // same question twice on one page
+    if (!byKind[d.kind]) { unbatched++; continue; }          // a kind with no batch group (date) — its own call
     // A choice question with nothing to choose from is not answerable — the commit pass re-reads the
     // widget and reports it honestly. Asking about it would only spend tokens.
     if (d.kind === "choice" && !d.options.length) { noOptions++; continue; }
-    if (items.length >= ATS_AI_BATCH_MAX) { capped++; continue; }
+    if (n >= ATS_AI_BATCH_MAX) { capped++; continue; }
     // SHORT SYNTHETIC IDS, not the question text: a long id invites the model to paraphrase it, and
-    // an id that comes back paraphrased is an answer we throw away.
-    const id = "q" + (items.length + 1);
+    // an id that comes back paraphrased is an answer we throw away. Unique across BOTH kinds so the
+    // two replies can never be confused for one another.
+    const id = "q" + (++n);
+    seen.add(d.qKey);
     idToKey.set(id, d.qKey);
-    items.push({ id, kind: d.kind, question: d.label, options: d.kind === "choice" ? d.options : null });
+    byKind[d.kind].push({ id, kind: d.kind, question: d.label, options: d.kind === "choice" ? d.options : null });
   }
   if (capped) {
     try { console.log(`[ApplyPilot][ATS-FILL] AI batch capped at ${ATS_AI_BATCH_MAX} — ${capped} question(s) will make their own call`); } catch (e) { /* log only */ }
   }
-  // ONE question is not a batch: the same single request, wrapped in a prompt whose parse can fail.
-  // Leave it to its own path, unchanged (the rule fill-driver's aiBatch already applies).
-  if (items.length < 2) {
-    return { fired: false, items: items.length, answers: 0, cached, dup, noOptions, capped };
+
+  // ONE question of a kind is not a batch: the same single request, wrapped in a prompt whose parse
+  // can fail. Leave it to its own path (the rule fill-driver's aiBatch already applies) — and note it
+  // is applied PER KIND, so 5 essays still batch even when the page's only pick rides alone.
+  const runs = Object.keys(byKind).filter((k) => byKind[k].length >= 2);
+  const solo = Object.keys(byKind).reduce((a, k) => a + (byKind[k].length === 1 ? 1 : 0), 0);
+  const askable = Object.keys(byKind).reduce((a, k) => a + byKind[k].length, 0);
+  if (!runs.length) {
+    // report the ASKABLE count, not 0 — "no batch — 0 askable question(s)" next to two deferred
+    // fields reads like a collection bug when it is really the per-kind minimum doing its job.
+    return { fired: false, items: askable, answers: 0, cached, dup, noOptions, capped, solo };
   }
-  const { system, user } = atsBuildBatchPrompt(items, profile, jc);
-  const kinds = items.reduce((m, i) => { m[i.kind] = (m[i.kind] || 0) + 1; return m; }, {});
-  try { console.log(`[ApplyPilot][ATS-FILL] AI batch: ${items.length} deferred question(s) in ONE call (${kinds.choice || 0} choice, ${kinds.text || 0} text; cap ${atsBatchMaxTokens(items)} tokens)${cached ? ` · ${cached} already cached` : ""}`); } catch (e) { /* log only */ }
-  let res = null;
-  try { res = await act.llm({ system, user, maxTokens: atsBatchMaxTokens(items) }); }
-  catch (e) { res = { ok: false, error: String((e && e.message) || e) }; }
-  if (!res || !res.ok) {
-    try { console.log(`[ApplyPilot][ATS-FILL] AI batch FAILED (${(res && res.error) || "no reply"}) — each question falls back to its own call`); } catch (e) { /* log only */ }
-    return { fired: true, items: items.length, answers: 0, cached, dup, noOptions, capped, error: (res && res.error) || "no reply" };
-  }
-  const parsed = atsParseBatchReply(res.text, items);
-  for (const [id, ans] of parsed) cache.set(idToKey.get(id), ans);
-  if (parsed.size < items.length) {
-    // NAME the dropped questions and their KINDS. Without this a partial parse is as undiagnosable as
-    // a total one was: "6/7" says nothing about whether one kind is being lost systematically, which
-    // is the first thing you want to know.
-    const missed = items.filter((i) => !parsed.has(i.id)).map((i) => `${i.id}:${i.kind}`).join(", ");
-    try { console.log(`[ApplyPilot][ATS-FILL] AI batch answered ${parsed.size}/${items.length} — the rest fall back to their own call (missed ${missed})`); } catch (e) { /* log only */ }
-  }
-  // A call that SUCCEEDS and yields NOTHING is the one failure this design cannot diagnose from the
-  // outside — `ok in 1364ms` next to `answered 0/6` looks identical whether the model refused, was
-  // truncated mid-JSON, or answered with ids we never asked about. Live on Shield AI (Lever,
-  // 2026-08-12). So dump the head of the reply, but ONLY in that case: a partial parse is already
-  // self-explaining, and the reply carries profile-derived answers, so this stays short and rare.
-  if (!parsed.size) {
-    const t = String((res && res.text) || "");
-    try { console.log(`[ApplyPilot][ATS-FILL] AI batch parsed NOTHING from a successful call — reply was ${t.length} char(s): ${JSON.stringify(t.slice(0, 220))}`); } catch (e) { /* log only */ }
-  }
-  return { fired: true, items: items.length, answers: parsed.size, cached, dup, noOptions, capped };
+
+  const fireOne = async (kind) => {
+    const items = byKind[kind];
+    const action = ATS_BATCH_ACTION[kind] || "fill";
+    const { system, user } = atsBuildBatchPrompt(items, profile, jc);
+    try { console.log(`[ApplyPilot][ATS-FILL] AI batch [${kind} → "${action}" route]: ${items.length} deferred question(s) in ONE call (cap ${atsBatchMaxTokens(items)} tokens)${cached ? ` · ${cached} already cached` : ""}`); } catch (e) { /* log only */ }
+    let res = null;
+    try { res = await act.llm({ system, user, maxTokens: atsBatchMaxTokens(items), action }); }
+    catch (e) { res = { ok: false, error: String((e && e.message) || e) }; }
+    if (!res || !res.ok) {
+      try { console.log(`[ApplyPilot][ATS-FILL] AI batch [${kind}] FAILED (${(res && res.error) || "no reply"}) — each question falls back to its own call`); } catch (e) { /* log only */ }
+      return 0;
+    }
+    const parsed = atsParseBatchReply(res.text, items);
+    for (const [id, ans] of parsed) cache.set(idToKey.get(id), ans);
+    if (parsed.size < items.length) {
+      // NAME the dropped questions and their KINDS. Without this a partial parse is as undiagnosable
+      // as a total one was: "6/7" says nothing about whether one kind is being lost systematically,
+      // which is the first thing you want to know.
+      const missed = items.filter((i) => !parsed.has(i.id)).map((i) => `${i.id}:${i.kind}`).join(", ");
+      try { console.log(`[ApplyPilot][ATS-FILL] AI batch [${kind}] answered ${parsed.size}/${items.length} — the rest fall back to their own call (missed ${missed})`); } catch (e) { /* log only */ }
+    }
+    // A call that SUCCEEDS and yields NOTHING is the one failure this design cannot diagnose from the
+    // outside — `ok in 1364ms` next to `answered 0/6` looks identical whether the model refused, was
+    // truncated mid-JSON, or answered with ids we never asked about. Live on Shield AI (Lever,
+    // 2026-08-12). So dump the head of the reply, but ONLY in that case: a partial parse is already
+    // self-explaining, and the reply carries profile-derived answers, so this stays short and rare.
+    if (!parsed.size) {
+      const t = String((res && res.text) || "");
+      try { console.log(`[ApplyPilot][ATS-FILL] AI batch [${kind}] parsed NOTHING from a successful call — reply was ${t.length} char(s): ${JSON.stringify(t.slice(0, 220))}`); } catch (e) { /* log only */ }
+    }
+    return parsed.size;
+  };
+
+  // CONCURRENT: the two kinds are independent questions on different routes, so the page waits for the
+  // SLOWER of the two rather than their sum.
+  const counts = await Promise.all(runs.map(fireOne));
+  const asked = runs.reduce((a, k) => a + byKind[k].length, 0);
+  return { fired: true, items: asked, answers: counts.reduce((a, b) => a + b, 0), cached, dup, noOptions, capped, solo, kinds: runs };
 }
 
 // The per-field fill loop — extracted so the cascade pass runs the IDENTICAL ladder. THREE phases

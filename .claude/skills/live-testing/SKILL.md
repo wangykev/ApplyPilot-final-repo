@@ -408,6 +408,20 @@ during one. `AP_DEV_ATS_SCAN` is the equivalent for GH/Lever/Ashby.
 
 ## Traps that produce false results
 
+- **`review pull skipped: Failed to fetch` ⇒ a STALE `apSession.reviewUrl`, not a broken submit path**
+  (2026-08-12). A rehearsal refused `no-approved-bundle … (exception)` while the tracker rendered fine,
+  the app showed `9/9 flagged approved`, and `AP_REPORT_HEALTH` said `connected:true, healthy:true`.
+  ⚠ **`reportApplication` kept WORKING throughout** — fills reached the tracker — which is what makes this
+  confusing: report and pull use the SAME session but DIFFERENT stored URLs
+  (`apSession.ingestUrl` vs `apSession.reviewUrl`), so the link can be half-dead. It happens whenever the
+  extension was last linked from a different origin than the dev server now running (e.g. linked on
+  `:3000`, now serving on `:3100`).
+  **Fix:** `/app/connect` → **"Link for tracking only"**. ⚠ NOT "Sync everything", which overwrites the
+  extension's profile, résumé and AI config with the website's.
+  **Do not chase it as a code bug** — I burned two re-runs on "the dev server died" and "the route is
+  cold-compiling" (an 11.3s first compile is real, and was not the cause) before reading `pullApprovedBundle`
+  and noticing it reads its own URL key.
+
 - **Don't close tabs mid-run.** `AP_DEV_CLOSE_TABS` while a run is tearing down produces
   `walk aborted: CDP not attached`. Close BEFORE starting, never after.
 - **A leftover Workday tab can hold a browser dialog** (password manager / breach warning) that
