@@ -932,11 +932,62 @@ Direct is the whole point — `act.llm`'s fallback chain silently answers from t
 is slow, which makes "model X is slow" unmeasurable. It also accepts `"auto"`, so the picker can be
 verified without editing the config under test.
 
+### ★ HIDDEN vs VISIBLE, RE-MEASURED with the LLM no longer dominating — still NO hidden lag
+
+Round 8's hidden-vs-visible ran while the LLM was **76–91% of the fill**, which is a bad place to look for
+a ~6s effect in our own code. With AUTO picking a healthy model the LLM drops to **17–27%**, so the
+non-LLM work is finally the visible term. Re-ran 3 hidden + 3 visible on the same posting, build
+`auto-model-1`, every run's visibility measured from its own `[ATS-PACING]` + paint label:
+
+| run | arm | fill | LLM | everything else | slowest field |
+|---|---|---|---|---|---|
+| H1 | hidden | 20.0s | 5.3s (27%) | 14.7s | candidate-location 7.9s |
+| H2 | hidden | 21.9s | 5.1s (23%) | 16.8s | candidate-location 11.1s |
+| H3 | hidden | **32.4s** | 5.4s (17%) | 27.0s | candidate-location 9.2s · country 6.3s |
+| V1 | visible | **62.8s** | 15.0s (24%) | 47.8s | question_68396682 29.3s · candidate-location 20.3s |
+| V2 | visible | 18.6s | 4.7s (25%) | 13.9s | candidate-location 7.1s |
+| V3 | visible | 17.5s | 4.7s (27%) | 12.8s | candidate-location 7.1s |
+
+**fill MEDIAN: hidden 21.9s · visible 18.6s (0.85×). Best run: hidden 20.0s · visible 17.5s.**
+**LLM per call is now indistinguishable between arms — hidden median 692ms, visible median 682ms.**
+
+**Verdict: there is no hidden lag on the ATS path.** The 3.3s median gap is well inside the per-run
+spread, and **each arm produced exactly ONE outlier** — H3 at 32.4s and V1 at 62.8s — so "one arm has
+hanging widgets" does not hold either. V1's 62.8s decomposes into one 10960ms LLM call plus
+`candidate-location` at 20.3s against 7.1s on the two neighbouring visible runs.
+
+⚠ **And it points the opposite way to round 8's own residual.** Round 8 measured non-LLM hidden 19.9s vs
+visible 14.1s (hidden +5.8s, p=0.057, "suggestive"); this round measures non-LLM **hidden 19.5s vs visible
+24.8s** — hidden now *cheaper*. Two measurements disagreeing in DIRECTION is the same noise signature that
+killed round 7's 2.4× claim. **Treat the round-8 residual as unproven and do not build on it.** The real
+variable on this path is `candidate-location` (7.1–20.3s across six runs of one posting), which is a
+server-backed places lookup and arm-independent.
+
+**What the whole fix chain is worth, hidden:** old build mean **113.2s → 21.9s median, 5.2×.** Composed of
+the adaptive cap (~28s: seen live as `fast-retry cap … OFF — observed p50 8407ms over the last 4 answers`,
+after which that run's LLM totals dropped from 17583/11728/11048/13823ms to 3540/7769/5511ms) and AUTO
+(~11s → ~0.7s per call, 7 calls a page).
+
+### ⚠ TWO "auto" SLOTS WITH THE SAME KEY DEDUPE INTO ONE ATTEMPT
+
+Found on the operator's own config immediately after they switched: `resolveLlmRoute` returned a route of
+**length 1**. `keyId` is part of a slot's dedupe identity, but two `auto` slots with the same (empty)
+`keyId` are identical, so the fallback collapsed. Consequence: a 503 on the chosen model makes the CALL
+fail — the field goes to review — and only the NEXT call steps down to the sibling. That is weaker than
+the stated intent ("if it is busy, errors, or something else, then go to 3"), which wants per-CALL
+failover. Remedies, in order of preference: expand an `auto` slot into its full candidate list as separate
+in-call attempts (correct fix); or, until then, pin the two slots to different keys, or leave the fallback
+as a concrete model so a real second attempt exists.
+
 ### Do NOT redo
 
 - **Blaming "the provider" without naming the MODEL.** Siblings diverge 20×. A/B them on one key.
 - **Reading a 429 as model ill-health.** It is the key's per-minute quota; 5xx is the model's.
 - **Assuming rotation spreads load.** It advances only on FAILURE, so N equal keys still means one key.
+- **Hidden-vs-visible on the ATS path.** Measured twice now, on builds where the LLM was 76–91% and 17–27%
+  of the fill, and the residual flipped sign. No hidden lag; stop looking for one.
+- **Measuring anything on this path with fewer than ~3 runs per arm.** `candidate-location` alone spans
+  7.1–20.3s on one posting.
 
 ---
 
