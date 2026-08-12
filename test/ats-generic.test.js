@@ -1150,25 +1150,56 @@ test("paired combo: every injected fn is self-contained, and the OPEN uses a poi
 // ── CREDENTIALS (iCIMS embeds a "Create a login" block INSIDE the application form) ─────
 // Operator 2026-08-12: use the same stored credentials the Workday onboarding signs in with. The
 // safety of that rests entirely on the credential tier being UNREACHABLE by any other answer source.
-const CREDS = { email: "kevin@example.com", password: "correct-horse-battery-staple", __fillCredentials: true };
-const CREDS_NO_OPTIN = { email: "kevin@example.com", password: "correct-horse-battery-staple" };
+const CREDS = { email: "kevin@example.com", password: "correct-horse-battery-staple" };
 
-test("⚠⚠ credentials: OFF BY DEFAULT — an embedded login block is left for the operator", () => {
-  // Live on iCIMS: the operator reaches the form through a magic link that has ALREADY authenticated
-  // them, so writing to "Password" + "Password (Re-enter)" on an existing candidate profile is a
-  // PASSWORD CHANGE, not an account creation. That is an irreversible side effect nobody asked for,
-  // so the default is to report the field, never to fill it.
-  for (const kind of ["login", "password", "password_confirm"]) {
-    const f = { widgetType: "text", fieldName: "PersonProfileFields.X", label: "X", credentialKind: kind };
-    const r = ats.atsRouteField("generic", f, {}, {}, {}, null, CREDS_NO_OPTIN);
-    assert.strictEqual(r.kind, "credential-missing", kind + " must not be auto-filled");
-    assert.strictEqual(r.flag, "credential-left-to-you");
-    assert.ok(!r.value, "no credential value may be produced without the opt-in");
-    assert.match(r.detail, /changes it|left for you/);
-  }
+test("credentials: ALWAYS filled, and a PREPOPULATED value is overwritten", () => {
+  // Operator 2026-08-12: this class of application creates the ACCOUNT AS PART OF THE SUBMISSION —
+  // there is no separate login onboarding — so the credentials block is just another section of the
+  // form, and whatever the page already shows must be replaced by the stored credentials.
+  const f = { widgetType: "text", fieldName: "PersonProfileFields.Login", label: "Login",
+    credentialKind: "login", value: "someone.else@old-account.com" };
+  const r = ats.atsRouteField("generic", f, {}, {}, {}, null, CREDS);
+  assert.strictEqual(r.kind, "credential");
+  assert.strictEqual(r.value, CREDS.email);
+  assert.strictEqual(r.overwrite, true);
+  assert.match(r.detail, /had a value here and it was replaced/);
 });
 
-test("credentials: WITH the opt-in, a password field is answered ONLY from stored credentials", () => {
+test("credentials: the rewrite CLEARS the box first, so a refill cannot merge strings", async () => {
+  // atsInjSetText SETS a value rather than replacing a selection, so rewriting a prepopulated login
+  // without clearing risks "old@x.comkevin@example.com". Same "clear before typing" rule the typeahead
+  // path already follows.
+  const writes = [];
+  // RAW shape — the generic path runs the scan through atsGenericPostProcess before filling
+  const scan = {
+    ats: "generic", url: "u", title: "t", excluded: [],
+    fields: [{ attrId: "PersonProfileFields.Login", inputSel: "#login", widgetType: "text",
+      credentialKind: "login", value: "someone.else@old-account.com", domIndex: 0,
+      labelCandidates: { labelFor: "Login" } }],
+  };
+  const act = {
+    delay: async () => {}, delayFull: async () => {},
+    attachResume: async () => ({ ok: true }),
+    eval: async (fn, sel, val) => {
+      if (fn.name === "atsInjScanGeneric") return scan;
+      if (fn.name === "atsInjSetText") { writes.push(val); return { ok: true, after: val }; }
+      if (fn.name === "atsInjReadValue") return { ok: true, value: writes[writes.length - 1] || null };
+      if (fn.name === "atsInjSubmitState") return { ok: true, hasSubmit: true };
+      if (fn.name === "atsInjErrors") return { ok: true, errors: [] };
+      return { ok: true };
+    },
+  };
+  // the resolver is bypassed here (a hand-built scan), so drive the fill directly
+  const out = await ats.driveAtsPageFill(act, "generic", {}, {}, {}, { credentials: CREDS });
+  assert.deepStrictEqual(writes, ["", CREDS.email], "must clear, THEN write the stored login");
+  const rec = out.results.find((r) => r.fieldName === "PersonProfileFields.Login");
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.credential, true);
+  assert.strictEqual(rec.after, "(stored login)", "the value must never enter the record");
+  assert.ok(!JSON.stringify(out.results).includes(CREDS.email), "no credential value may reach the bundle");
+});
+
+test("credentials: a password field is answered ONLY from stored credentials", () => {
   const f = { widgetType: "text", fieldName: "PersonProfileFields.Password", label: "Password", credentialKind: "password" };
   const r = ats.atsRouteField("generic", f, {}, {}, {}, null, CREDS);
   assert.strictEqual(r.kind, "credential");
@@ -1177,7 +1208,7 @@ test("credentials: WITH the opt-in, a password field is answered ONLY from store
   assert.strictEqual(r.source, "credentials");
 });
 
-test("credentials: with the opt-in, login takes the EMAIL, confirm takes the same password", () => {
+test("credentials: login takes the EMAIL, confirm takes the same password", () => {
   const mk = (kind, name) => ats.atsRouteField("generic", { widgetType: "text", fieldName: name, label: name, credentialKind: kind }, {}, {}, {}, null, CREDS);
   assert.strictEqual(mk("login", "PersonProfileFields.Login").value, CREDS.email);
   assert.strictEqual(mk("password", "PersonProfileFields.Password").value, CREDS.password);
@@ -1196,16 +1227,16 @@ test("⚠ credentials: a BUCKET can never answer a credential field", () => {
   assert.ok(buckets === null || true);
 });
 
-test("⚠ credentials: even OPTED IN, incomplete credentials never half-fill", () => {
+test("⚠ credentials: incomplete credentials never half-fill", () => {
   const f = { widgetType: "text", fieldName: "PersonProfileFields.Password", label: "Password", credentialKind: "password" };
   // opted in but nothing (or only half) stored ⇒ still needs_review, never a partial account
-  for (const creds of [{ __fillCredentials: true }, { __fillCredentials: true, email: "x@y.z" }, { __fillCredentials: true, password: "p" }]) {
+  for (const creds of [{ email: "x@y.z" }, { password: "p" }]) {
     const r = ats.atsRouteField("generic", f, {}, {}, {}, null, creds);
     assert.strictEqual(r.kind, "credential-missing", "incomplete credentials must not half-fill");
     assert.strictEqual(r.flag, "credentials-not-stored");
     assert.ok(!r.value);
   }
-  // and with no credentials object at all, the default (opt-out) reason is what surfaces
+  // and with no credentials stored at all
   for (const creds of [null, undefined, {}]) {
     const r = ats.atsRouteField("generic", f, {}, {}, {}, null, creds);
     assert.strictEqual(r.kind, "credential-missing");

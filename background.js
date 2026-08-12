@@ -340,7 +340,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           // genericFillDisabled — the generic-driver kill switch (docs/generic-filler-plan.md). Absent
           // ⇒ enabled, which is safe because the generic path only ever engages where this pipeline
           // would otherwise have HALTED.
-          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets", "genericFillDisabled", "genericFillCredentials"], r)
+          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets", "genericFillDisabled"], r)
         );
         if (!store.profile) {
           sendResponse({ ok: false, error: "no-profile", detail: "Sync your profile to the extension first (the Connect page)." });
@@ -4758,15 +4758,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // `credentials` is consulted ONLY for a field the generic scanner tagged `credentialKind` (a
 // "Create a login" block inside an application form — iCIMS does this). Same source the Workday
     // onboarding signs in with; never reachable by a profile value, a bucket, or the AI.
-    // ⚠ Credential filling is OPT-IN (`genericFillCredentials`), default OFF. An embedded
-    // "Create a login" block on an application form is frequently reached with a session ALREADY
-    // established, where writing a password CHANGES the account rather than creating one. Off by
-    // default, those fields simply reach review for the operator to type. See atsRouteField.
-    const genericCreds = store.credentials
-      ? Object.assign({}, store.credentials, { __fillCredentials: store.genericFillCredentials === true })
-      : null;
+    // Credentials are ALWAYS filled on a generic form, and a prepopulated box is overwritten: this
+    // class of application CREATES THE ACCOUNT AS PART OF THE SUBMISSION (operator, 2026-08-12), so
+    // the credentials block is just another section of the form. Consulted ONLY for a field the
+    // generic scanner tagged `credentialKind`, and never reachable by a profile value, a bucket or
+    // the AI — see atsRouteField.
     let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext,
-      { buckets: store.buckets || [], credentials: genericCreds });
+      { buckets: store.buckets || [], credentials: store.credentials || null });
 
     // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
     // here, added when Greenhouse forms would land in a state where every server-backed combobox returned

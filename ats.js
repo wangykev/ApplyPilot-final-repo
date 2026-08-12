@@ -1633,35 +1633,33 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   //   • no credentials stored ⇒ `needs_review`, never a blank guess and never a partial account.
   if (ats === "generic" && f && f.credentialKind) {
     const kind = f.credentialKind;
-    // ⚠⚠ OFF BY DEFAULT, and the default is the point (operator, 2026-08-12 — live on iCIMS).
+    // ⚠ ALWAYS FILLED, and a PREPOPULATED value is OVERWRITTEN (operator, 2026-08-12).
     //
-    // The earlier version filled these automatically from stored credentials, reasoning that it was
-    // "the same thing the Workday onboarding does". That conflated two different situations:
-    //   • onboarding fills credentials on a SIGN-IN / create-account page, where that IS the task; but
-    //   • iCIMS embeds a "Create a login" block INSIDE the application form, and the operator reaches
-    //     it through a magic link that has ALREADY authenticated them.
-    // On an existing candidate profile, writing to "Password" + "Password (Re-enter)" is a PASSWORD
-    // CHANGE, not an account creation — an irreversible, outward-facing side effect nobody asked for.
-    // Live, the Login box already held the account's own address, which is what surfaced the mistake.
+    // I briefly made this opt-in, reasoning that writing to "Password" + "Password (Re-enter)" on a
+    // profile reached through an already-authenticated magic link is a PASSWORD CHANGE rather than an
+    // account creation. The operator supplied the domain fact that settles it: on this class of form
+    // the ACCOUNT IS CREATED AS PART OF THE SUBMISSION — there is no separate login onboarding, so the
+    // credentials block is simply another section of the application and must be filled like any other.
     //
-    // So: a credential field is REPORTED, never auto-filled, unless the operator explicitly opts in
-    // (`genericFillCredentials`). Review shows it, the operator types it, and nothing about the fill
-    // depends on it. When the opt-in IS set, the value still comes ONLY from stored credentials —
-    // never a profile value, a taught bucket wording, or an LLM.
-    const optedIn = !!(credentials && credentials.__fillCredentials === true);
+    // Prepopulated is not a reason to skip: whatever the page shows, the account this application
+    // creates must use the credentials the operator stored on the website, so the field is rewritten.
+    //
+    // The properties that made this safe are UNCHANGED, and none of them depended on the gate:
+    //   • the value comes ONLY from stored credentials — never a profile value, never a taught bucket
+    //     wording, never an LLM. This tier returns before any of those rungs can see the field.
+    //   • it is never logged and never enters the bundle; the record carries credential:true +
+    //     credentialKind so review can name WHICH credential was used without carrying it.
+    //   • incomplete or absent credentials ⇒ needs_review, never a half-made account.
     const creds = credentials || null;
-    if (!optedIn) {
-      return { kind: "credential-missing", credentialKind: kind, review: true, flag: "credential-left-to-you",
-        detail: "this form asks for a " + kind.replace("_", " ") + " — left for you on purpose: you may already have an account here, " +
-          "and writing a password into an existing profile changes it. Fill it yourself, or turn on credential filling if you want it automated." };
-    }
     if (!creds || !creds.email || !creds.password) {
       return { kind: "credential-missing", credentialKind: kind, review: true, flag: "credentials-not-stored",
         detail: "this form asks for a " + kind.replace("_", " ") + " — no credentials are stored, so it is left for you (Sign-in page)" };
     }
     const value = kind === "login" ? creds.email : creds.password;
     return { kind: "credential", credentialKind: kind, value, source: "credentials", credential: true,
-      detail: "filled from your stored " + (kind === "login" ? "login" : "password") + " (never from the profile or the AI)" };
+      overwrite: true, // a prepopulated box is rewritten — the new account must use the stored credentials
+      detail: "filled from your stored " + (kind === "login" ? "login" : "password") + " (never from the profile or the AI)" +
+        (f.value ? "; the form had a value here and it was replaced" : "") };
   }
 
   // GENERIC EDUCATION — the repeating-entry tier. Runs BEFORE buckets so a bucket bound to a scalar
@@ -2127,6 +2125,11 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // is NEVER logged or put in the bundle. `credential:true` on the record is what lets review and
       // the logs name WHICH credential was used without carrying it.
       if (route && route.kind === "credential") {
+        // CLEAR FIRST. The page may already show an account's own login (iCIMS does when the session
+        // was established by a magic link), and `atsInjSetText` sets a value rather than replacing a
+        // selection — so a rewrite without a clear risks a merged string. Same "clear before typing"
+        // rule the typeahead path already follows.
+        await act.eval(atsInjSetText, ref.inputSel, "").catch(() => null);
         const set = await act.eval(atsInjSetText, ref.inputSel, route.value);
         const back = await atsReadBackSettled(act, ats, ref.inputSel, "text");
         const got = back && back.ok ? String(back.value == null ? "" : back.value) : "";
@@ -2323,6 +2326,12 @@ async function atsFinishFill(act, ats, scan, results) {
   await act.delayFull(600);
   for (const rec of results) {
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
+    // ⚠ A CREDENTIAL RECORD CANNOT BE AUDITED, by construction. `rec.after` is deliberately the
+    // placeholder "(stored login)" / "(stored password)" so the value never enters the bundle — so
+    // comparing it against the live field would mismatch on EVERY credential and flag a correct fill.
+    // The commit was already read-back verified at fill time (length-compared, without logging it),
+    // which is the strongest check available for a value we refuse to hold.
+    if (rec.credential) continue;
     const f = scan.fields.find((x) => x.fieldName === rec.fieldName);
     if (!f || f.widgetType === "file_upload") continue;
     try {
