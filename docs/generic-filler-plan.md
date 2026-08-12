@@ -633,6 +633,42 @@ manifest must request permission to access this host.)` — `chrome.scripting` i
 host is not in `host_permissions`, yet the fill worked, because the generic path runs through CDP,
 which is not. "The CDP substrate is what makes universality permission-free" is now measured.
 
+### ✔ iCIMS — 130 fields, and the education section fills (2026-08-12)
+
+Astrion / iCIMS, build `generic-icims-e2e-5`. **130 fields · 35 filled · 74 skipped · 38 to verify**,
+reported to the tracker and rendered on the review page with a proper `EDUCATION (8)` section.
+
+What the run proved, each previously unbuilt:
+
+| Piece | Evidence |
+|---|---|
+| **Frame-scoped eval** | `the form is inside a same-origin IFRAME (111 controls vs 0 on the top page) — evaluating INSIDE the frame` |
+| **Paired-combobox driver** | `Degree → filled · exact-normalized · "Bachelor of Science" · 520ms`; same for `IsGraduated` → "Yes", `EducationCountry` → "United States" |
+| **Education tier** | `OtherSchool → filled · "Carnegie Mellon University" · education entry 1 (your most recent)` |
+| **Tiered month vocabulary** | `GraduationDate_Month → filled · exact-normalized · "May"` (the form lists NAMES) |
+| **Day-control guard** | `GraduationDate_Date → skipped`, `EducationStartDate_Date → skipped` (was `"05/1/2028"` and `"2024"`) |
+| **Résumé single-slot** | one `filled`, three `skipped · a non-résumé attachment slot` |
+| **Credential tier** | `Login/Password/Re-enter → filled · "(stored login)" / "(stored password)"`, values absent from the log |
+| **Context re-arm** | `the frame's isolated world was replaced (a postback) — re-armed and retrying`, zero `error` records |
+| **Review picker** | School renders its 25 options + "ApplyPilot couldn't fill this" |
+
+### ⚠ OPEN — the post-fill audit disagrees with the fill on iCIMS
+
+`Other School` and `Degree` both reach review as **"The form ended up showing a different value than
+expected"** — the M40-lite audit in `atsFinishFill` re-read them after the page settled and did not
+find what the fill recorded, even though each was read-back verified at commit time.
+
+The likely cause is the same postback that replaced the isolated world mid-run: iCIMS re-renders an
+entry after certain commits, so either the value did not survive or the audit read a re-rendered node.
+**Not yet diagnosed, and deliberately not papered over** — the audit refusing to confirm a value it
+cannot see is the behaviour that exists to prevent the false-verify class, so the fix belongs on the
+iCIMS side (settle before auditing / re-arm before the audit read), never on the audit's strictness.
+
+Next-step candidates, in order: re-arm the frame context immediately before the audit pass; settle on
+the entry container rather than a fixed delay; and check whether iCIMS clears a field when a sibling
+dropdown commits (the "value CHANGED to another real option ⇒ OURS" rule from `CLAUDE.md` applies —
+value GONE is plausibly the tenant, value DIFFERENT is us).
+
 ### Still NOT verified
 
 - **An arbitrary COMBOBOX.** KEF's only choice widget was a native `<select>`. The `select` commit
