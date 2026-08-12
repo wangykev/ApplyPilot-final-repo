@@ -593,20 +593,58 @@ believe.*
    as two routes to the same upload; attaching to both would upload twice and can start two
    server-side parses. Exactly one slot is now `primaryResumeSlot`.
 
-### What is NOT verified yet
+### ✔ VERIFIED END TO END — 2026-08-12, KEF Robotics
 
-**A real end-to-end FILL has not been run.** The scanner and resolver are verified against live DOM
-(KEF Robotics and Paylocity), and every downstream stage is reused code — but the actuation pass on a
-generic form has only been reasoned about, not observed. It needs the worktree loaded as an unpacked
-extension; the operator's Chrome runs the main checkout.
+A real run, with the worktree loaded unpacked and the build confirmed the documented way (bump
+`AP_BUILD_MARKER` → `AP_RELOAD` → re-read ⇒ `generic-driver-1`, never trusting the string):
 
-Confidence, stated honestly: text / textarea / native-select / radio / checkbox / file all actuate
-through injected functions that are already ATS-agnostic (`atsInjSetText`, `atsInjSelectNative`,
-`atsInjCheckOption`, `atsInjSetChecked`, `atsInjAttachFile`), so KEF Robotics should fill. An
-arbitrary COMBOBOX is the weak spot: the commit path is react-select-shaped, and a vendor widget that
-is not react-select will fail its read-back and reach review as `needs_review` — honest, but unfilled.
-That is the first thing to measure on a live run, and the widget-driver registry (§5, build step 3) is
-the fix.
+```
+[ATS-RUN]  posting: "GNC Engineer, SLAM Focus" @ KEF Robotics
+[RUN]      » Waiting for the form — generic
+[ATS-RUN]  form settled — 7 field(s).
+[ATS-FILL] first-name  (text)        → filled · bucket · after="Kevin"
+[ATS-FILL] last-name   (text)        → filled · bucket · after="Wang"
+[ATS-FILL] email       (text, req)   → filled · bucket · after="wangykev@gmail.com"
+[ATS-FILL] fileInput…  (file_upload) → filled · after="Kevin's Resume.pdf"
+[ATS-FILL] review picker: captured 1 option list(s), skipped 0
+fill complete — 7 field(s), 0 need review     {ok, reached_form, ats:"generic"}
+```
+
+Hidden 4.3s (620ms/field); visible 9.3s.
+
+**…and it reached the REVIEW PAGE.** The bundle rendered on `/app/tracker/<id>` as
+`All 7 · Needs review 0 · 4 filled · 3 skipped`, grouped PERSONAL INFORMATION / OTHER FIELDS /
+DOCUMENTS, with `Upload Resume → Kevin's Resume.pdf` and — the operator's requirement —
+**"Are you a US Citizen?" rendered as a real dropdown offering `Yes / No / Green Card Holder`.**
+Those options exist only because the capture pass re-read the placeholder-only `<select>`; without it
+that field reached review as an option-less box.
+
+Three things the run PROVED rather than argued:
+- the entry hook routes an unrecognized host to the generic driver instead of the Workday onboarding
+  it used to fall into;
+- identity fields fill through the **bucket** tier, which is the designed path (the operator ruled
+  identity aliases live in visible bucket wordings, not hidden backend regexes) — so on a generic
+  form **bucket coverage is load-bearing**, and a REQUIRED field with no wording goes to the AI;
+- the résumé attached from the label alone, with no static map.
+
+⚠ **And it confirmed §9's permission claim by accident.** The log carries
+`job page did NOT settle (read-failed: Cannot access contents of url "…kefrobotics.com…". Extension
+manifest must request permission to access this host.)` — `chrome.scripting` is host-gated and that
+host is not in `host_permissions`, yet the fill worked, because the generic path runs through CDP,
+which is not. "The CDP substrate is what makes universality permission-free" is now measured.
+
+### Still NOT verified
+
+- **An arbitrary COMBOBOX.** KEF's only choice widget was a native `<select>`. The `select` commit
+  path is still react-select-shaped, so a vendor widget that is not react-select will fail its
+  read-back and reach review as `needs_review` — honest, but unfilled. The widget-driver registry
+  (§5, build step 3) is the fix, and Dayforce (Ant Design) is the test.
+- **A gated form end to end** — Paylocity/Dayforce need the consent dismissal + guest-chooser hops
+  exercised by a real run, not just recon.
+- **A multi-step wizard.** Paylocity's "Next Step" is refused by the submit gate by design, but the
+  page-to-page walk on a generic form is unexercised.
+- **Replay / submit on a generic form.** The bundle says "Ready to submit"; the replay pass has not
+  been run against one.
 
 ## 10. Build order
 
