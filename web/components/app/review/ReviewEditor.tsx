@@ -1047,7 +1047,7 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
               </span>
             )}
             {review && <ReviewBadges e={e} />}
-            <span className="text-sm text-ink">{fmt(e.question_label)}</span>
+            <ClampedText text={fmt(e.question_label)} className="text-sm text-ink" mono />
             {e.is_required && (
               <span className="text-signal" title="required">
                 ✱
@@ -1056,7 +1056,10 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
             <StatusDot e={e} />
           </div>
           {review && explainFill(e) && (
-            <p className="mt-1 text-xs leading-relaxed text-ink-dim">{explainFill(e)}</p>
+            // the explanation quotes the ANSWER back, so a long answer makes this long too
+            <div className="mt-1 text-xs leading-relaxed text-ink-dim">
+              <ClampedText text={explainFill(e) as string} />
+            </div>
           )}
           {review && e.tree_structure?.chosen && (
             <p className="mt-1 text-xs text-ink-faint">
@@ -1080,6 +1083,40 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * A question label is usually a sentence. Sometimes it is a 2,000-character base64 blob — Ramp puts
+ * an encoded challenge in the label itself, and a few boards paste an entire policy paragraph there.
+ * Rendered raw that is not "a long label", it is a broken page: one unbroken token has no spaces to
+ * wrap on, so it forces the row wider than the viewport and shoves the value editor off-screen.
+ *
+ * So anything past a sentence-ish length is CLAMPED with an explicit opt-in to see the rest, and
+ * `break-all` is used rather than `break-words` because the pathological case is precisely the one
+ * with no word boundaries to break on. The character count goes in the button: the useful question
+ * about a blob like this is "how much is there", and it also tells you at a glance that the form —
+ * not ApplyPilot — is what put it there.
+ */
+function ClampedText({ text, className, mono }: { text: string; className?: string; mono?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const LONG = 200;
+  if (text.length <= LONG) return <span className={className}>{text}</span>;
+  return (
+    <span className={clsx("block min-w-0", className)}>
+      <span
+        className={clsx("block break-all", mono && "font-mono text-[11px] leading-relaxed", !open && "line-clamp-2")}
+      >
+        {text}
+      </span>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="mt-0.5 font-mono text-[10px] uppercase tracking-label text-amber hover:underline"
+      >
+        {open ? "show less" : `show all ${text.length} chars`}
+      </button>
+    </span>
   );
 }
 
