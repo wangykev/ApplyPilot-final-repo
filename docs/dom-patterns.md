@@ -4249,6 +4249,78 @@ Unsupported: **Oracle Fusion · UKG/UltiPro · ADP WorkforceNow · Ceridian Dayf
 BAE ×2 · Crown ×2 · Lincoln Electric · Fives · Astrion · Amazon.jobs · ByteDance · KEF Robotics (Wix) ·
 Getro · recruitics redirect.** **≈19 of 27 (~70%) cannot be driven at all today.**
 
+### 2026-08-11 (c) — THROUGH the apply gate: real Dayforce and Paylocity forms
+
+Operator authorized clicking Apply on queued jobs. Reached two real enterprise forms; **nothing was ever
+submitted**, no account created, no personal data entered.
+
+**Getting through the gate — three lessons:**
+- ⚠ **A consent modal silently eats the Apply click.** Dayforce's Apply sits at the same coordinates
+  whether or not the Cookie Preferences modal is up; two clicks did nothing and the renderer froze, with no
+  error. Dismissing consent (**Reject** — the privacy-preserving, non-affirmative control) made the very
+  same click work. A generic driver must resolve consent BEFORE it decides an Apply click failed.
+- **A guest-vs-account chooser can sit between Apply and the form.** Dayforce → `/apply?flowSelection=true`
+  offering *"Apply without an Account"* / Sign In / Create one. Structurally the same as Workday's
+  `autofillWithResume` vs `applyManually` chooser, and **the guest path reaches the form with no auth.**
+- **The apply URL is often derivable even when the link/button says otherwise.** Dayforce's Apply is a
+  `<button>` with NO href, yet the route is a plain `/jobs/<id>/apply`. Paylocity's Apply href is an opaque
+  base64 tracking token, yet it lands on `/Recruiting/Jobs/Apply/<id>` — derivable from
+  `/Recruiting/Jobs/Details/<id>`. **Oracle Fusion is the counter-example**: `/job/<id>/apply` 404s, two
+  Apply clicks left the DOM byte-identical (653 nodes) while freezing the renderer >30s each time, and no
+  form was reached. Derive where you can, but never assume.
+
+**Dayforce (`jobs.dayforcehcm.com`, Legence/CMTA) — Ant Design, semantic ids, duplicate labels**
+
+`/apply/manualApplication?applicationSource=Manual`. `antd` 57 nodes, reCAPTCHA ×2. Scan **0.7ms** on 1003
+nodes; labels **100%** (14 `label[for]`, 2 `aria-label`).
+
+- ⚠ **THE FORM GROWS AFTER FIRST PAINT: 16 visible controls at +3s, 37 at +20s** — the Education/Work
+  History blocks mount late. A scan taken early silently sees **less than half the form**. This is the
+  `awaitFieldSetSettled` rule, and it generalizes: **the generic driver needs a field-set-stability gate
+  before scanning, on every tenant.**
+- Identity is excellent and *semantic*, with the repeating index IN the id:
+  `jobPostingApplication_personalInfo_email`, `..._educationHistory_0_degreeName`,
+  `..._workHistory_0_title`. Entry scoping comes free here — unlike Workday's duplicated `formField-*`.
+- ⚠ **But the LABEL is not unique: "Country dialing code" ×2, "Country" ×3, "State/Province" ×3, "City" ×3,
+  "Start Date" ×2, "End Date" ×2.** Label-hash identity fails on exactly the repeating sections.
+- ⚠ Worst case on this form: the two dialing-code selects have **neither a durable id nor a unique label** —
+  they are `rc_select_4` / `rc_select_5`, rc-select's **sequential per-render counter**. Identity there
+  must come from label + section/ordinal.
+- 5 controls correctly excluded, all `ant-select-selection-search` (Ant's internal combobox inputs) — the
+  exclusion rule earning its keep on a fourth widget library.
+- `mustOpen` 3, `roleOptionsMounted` 0. Required-ness is marked properly (`reqEl` and `reqUnit` agree on all 16).
+
+**Paylocity (`recruiting.paylocity.com`) — 44 fields, and four new failure modes**
+
+`/Recruiting/Jobs/Apply/<id>`. No framework fingerprint matched (custom). Scan median **1.5ms** on 581 nodes.
+
+- ⚠ **REQUIRED-NESS IS ONLY IN THE LABEL TEXT.** `"First Name (required)"`, `"Email Address (required)"`,
+  `"Address Line 2(optional)"` — and **`required` / `aria-required` are false on every one of them**. This
+  is a THIRD required mechanism after Workday's `<abbr>`/trailing-asterisk and Dayforce's proper attributes.
+  Miss it and 10+ required fields read optional, which is the dangerous direction.
+- ⚠ …and therefore **the label must be STRIPPED of `(required)` / `(optional)` before it is used as a
+  question key**, or it will never match a bucket wording.
+- ⚠ **The label read swallows the widget's own VALUE and PLACEHOLDER**: `"CountryUnited States"` (label +
+  current value), `"StateSelect a state"` (label + placeholder), and
+  `"How did you hear about us?(optional)Advertise…"` (label + the whole radio option list). Third vendor to
+  prove the same rule — after Lever's error-text bleed and Workable's dial-code list. **A filtered label
+  read is not optional.**
+- ⚠ **Labels are mis-assigned across a field unit**: `info.maximumDesiredSalary` resolved to
+  `"Desired Salary Type"` — a neighbouring field's label, not its own. Duplicate labels here:
+  "Fill out application with my resume", "Desired Salary Type", "City".
+- ⚠ **Repeating-entry field ids are opaque signed tokens (JWT-shaped)**, one per entry field — the
+  strongest case yet that `id` cannot be a replay key without a durability test. Non-repeating fields use
+  clean names (`info.firstName`, `public-site-address-city`).
+- **First MULTI-STEP non-Workday form in the corpus** — the primary button is **"Next Step"**, plus
+  "Add Work History" / "Add Education" repeating sections. Multi-page is not a Workday-only shape.
+- `mustOpen` 9 of 44, `roleOptionsMounted` 0.
+
+**⚠ One real scan-cost outlier, and its cause.** Paylocity's scan measured min 0.8ms / **median 1.5ms** /
+**max 399.9ms** across 7 runs. The spike is layout thrash: the scan interleaves `getBoundingClientRect()`
+and `getComputedStyle()` per control, forcing a reflow each time, and 44 fields is where it starts to bite.
+**Fix direction: batch the reads** — collect all rects, then all styles, then classify. Still ~1.5ms
+typical, so this is a tail-latency note, not a refutation of "the scan is free".
+
 ### KEF Robotics (Wix) — the pure long-tail form, and it scans perfectly
 
 Inline on the JD page, no gate, no captcha: 7 fields, **7/7 labelled** (6 `label[for]`, 1 unit walk), 0

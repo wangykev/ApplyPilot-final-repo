@@ -118,8 +118,22 @@ this independently:
 - Workable: `"Phone (Optional)+1United States+1United Kingdom+44Canada+1Ge…"` — the **entire country-code
   option list** concatenated into the question.
 
-Both strings would have been handed to the LLM as the question to answer. So the read must exclude
-descendant option lists, error/help nodes, and any nested control's own text.
+- Paylocity: `"CountryUnited States"` (label + the widget's **current value**), `"StateSelect a state"`
+  (label + **placeholder**), `"How did you hear about us?(optional)Advertise…"` (label + the whole radio
+  option list).
+
+Three vendors, same failure. So the read must exclude descendant option lists, error/help nodes,
+placeholders, the widget's own rendered value, and any nested control's text.
+
+⚠ **Then STRIP the required marker from the question.** `(required)` / `(optional)` / a trailing `*` are
+form chrome, not part of the question. Left in, they are carried into `normalizeLabel` and the label will
+never match a stored bucket wording. Extract required-ness from them first (above), then strip.
+
+⚠ **A label can be MIS-ASSIGNED, not merely polluted.** On Paylocity `info.maximumDesiredSalary` resolved
+to `"Desired Salary Type"` — a *neighbouring field's* label. A field-unit walk that climbs too far grabs
+the wrong sibling's label, and the result looks perfectly plausible. This is why the unit walk records
+which rung fired and how many hops it took: a label found 3+ hops up, in a unit holding other controls,
+is low-confidence and belongs in review rather than being trusted.
 
 **Identity**, first durable hit wins:
 1. `name`
@@ -130,15 +144,35 @@ descendant option lists, error/help nodes, and any nested control's own text.
 3. a stable `data-*` attribute
 4. **the label**, hashed — Ashby already relies on this ("the label is the only durable key"), and
    Workable's telephone-country-code combobox and Lever's `cards[<uuid>][field0]` customs land here too.
-5. none → `needs_review`. Never fill a field you cannot re-find.
+5. **label + section/ordinal**, because ⚠ **the label alone is NOT unique on real forms.** Dayforce
+   repeats "Country dialing code" ×2, "Country" ×3, "State/Province" ×3, "City" ×3, "Start Date" ×2,
+   "End Date" ×2 — the collisions land precisely on repeating sections. Paylocity repeats three more.
+6. none → `needs_review`. Never fill a field you cannot re-find.
 
-**Required-ness** — over-flag is the safe direction; under-flag hides a blocker:
+**The durability test is doing real work.** Ids observed that must be REJECTED as replay keys:
+`input_files_input_QQUpFBNbEVDkaqRr` (Workable, per-render random) · `rc_select_4` / `rc_select_5`
+(Dayforce, rc-select's **sequential per-render counter** — and these two *also* share the duplicate label
+"Country dialing code", so they have neither a durable id nor a unique name) · Paylocity's
+repeating-entry ids, which are **opaque JWT-shaped tokens**. Ids that pass: Dayforce's semantic
+`jobPostingApplication_educationHistory_0_degreeName` — note it even carries the **repeating index**, so
+entry scoping comes free there, unlike Workday's duplicated `formField-*`.
+
+**Required-ness** — over-flag is the safe direction; under-flag hides a blocker. **Four independent
+mechanisms observed, and a form may use exactly one of them:**
+1. `[required]` / `[aria-required]` on a control in the field unit — Dayforce marks all 16 fields this way.
+2. A `*` / `✱` in the label, heading or legend — Workday, Lever, Greenhouse.
+3. **`(required)` / `(optional)` as literal text inside the label** — **Paylocity, where it is the ONLY
+   signal**: `"First Name (required)"` while `required` and `aria-required` are **false on every field**.
+   Miss this and 10+ required fields read optional.
+4. A `[class*=required]` marker node, or the AX node's own required flag.
+
 - ⚠ **Never trust `required` on the visible control.** On every Greenhouse react-select, the real
-  `select__input` reads `required:false` while its hidden mirror carries `required:true`. Recover from
-  the field unit: any `[required]`/`[aria-required]` inside it, a `*`/`✱` in the label or heading, a
-  `[class*=required]` marker, or the AX node's own required flag.
-- Note the asterisk is frequently *not* trailing (Lever's was mid-string, ahead of the error text), so an
+  `select__input` reads `required:false` while its hidden mirror carries `required:true`.
+- The asterisk is frequently *not* trailing (Lever's was mid-string, ahead of an error message), so an
   end-anchored `\*$` test is not enough.
+- ⚠ **A form may carry NO required signal at all** (KEF Robotics: only `email`, with validation in JS).
+  Treat "no required signal anywhere on this form" as a distinct, reported state — not as "nothing is
+  required".
 
 ---
 
@@ -258,6 +292,26 @@ Six kinds observed, and the generic driver needs a named halt or handler for eac
 | **Bot-detection wall** | SmartRecruiters (DataDome) | `needs_operator`; never solve, never bypass |
 | **Posting gone** | Rippling ×2, SmartRecruiters, Jobvite, Recruitee | Four distinct signals so far (see below) |
 
+### Getting THROUGH the gate — measured by actually doing it (2026-08-11, operator-authorized)
+
+Two real enterprise forms reached; nothing submitted, no account made, no personal data entered.
+
+- ⚠ **A consent modal silently eats the Apply click, with no error.** Dayforce's Apply sits at the same
+  coordinates whether or not the Cookie Preferences modal is up. Two clicks did nothing and the renderer
+  froze; dismissing consent first (**Reject** — privacy-preserving and non-affirmative, so it satisfies
+  both the extension's "never click an affirmative consent control" rule and the safety policy) made the
+  identical click work. **Resolve consent before concluding an Apply click failed.**
+- **A guest-vs-account chooser can sit between Apply and the form** — Dayforce's
+  `/apply?flowSelection=true` offers *"Apply without an Account"*, and that path reaches the form with no
+  auth. Structurally the same as Workday's `autofillWithResume` vs `applyManually` chooser, and it needs
+  the same explicit handling.
+- **The apply URL is often derivable even when the control says otherwise** — Dayforce's Apply is a
+  `<button>` with no href yet the route is a plain `/jobs/<id>/apply`; Paylocity's href is an opaque base64
+  tracking token yet it lands on `/Recruiting/Jobs/Apply/<id>`, derivable from `/Jobs/Details/<id>`.
+  **Oracle Fusion is the counter-example** — `/job/<id>/apply` 404s, and two Apply clicks left the DOM
+  byte-identical at 653 nodes while freezing the renderer >30s each time. Derive where you can; never
+  assume; always keep the click path.
+
 ⚠ **`postingGone` needs to be a first-class, per-family recognizer, not an afterthought.** Five of the
 search-sourced postings died within days of being listed, each announcing it differently: a redirect to
 the board index (Rippling), a redirect to the vendor homepage (Recruitee), `"Sorry, this job has expired"`
@@ -291,9 +345,27 @@ exclude → label ladder → identity → required):
 | Breezy (Victory) | 300 | 9 | **0.3 ms** |
 | Jobvite (locale gate) | 69 | 1 | **0.1 ms** |
 
-Sub-millisecond on every form, and flat against DOM size over a 22× node range. **Discovery is not a lag
-source and must not be optimized.** Any future "the generic scan is slow" claim should be treated as
-already refuted unless it comes with a `[TRACE]`-grade measurement.
+Sub-millisecond on every form, and flat against DOM size over a 22× node range. Two later forms behind the
+apply gate agree: **Dayforce 0.7ms** (1,003 nodes, 37 fields), **Paylocity median 1.5ms** (581 nodes, 44
+fields). **Discovery is not a lag source and must not be optimized.** Any future "the generic scan is slow"
+claim should be treated as already refuted unless it comes with a `[TRACE]`-grade measurement.
+
+⚠ **One tail-latency caveat, measured.** Paylocity's 7 runs read min 0.8ms / median 1.5ms / **max 399.9ms**.
+The spike is **layout thrash**: the scan interleaves `getBoundingClientRect()` and `getComputedStyle()` per
+control, forcing a reflow each time, and ~44 fields is where it bites. **Batch the reads** — all rects,
+then all styles, then classify. Typical cost is unchanged; this only removes the tail.
+
+### ⚠ The form is not all there when it first paints — settle before scanning
+
+**Dayforce showed 16 visible controls at +3s and 37 at +20s**; the Education and Work History blocks mount
+late. A scan taken early silently sees **less than half the form**, and every field it misses is a field
+the review bundle never learns about.
+
+This is `awaitFieldSetSettled` — `CLAUDE.md`'s "NEVER scan a Workday page without settling it first" — and
+it **generalizes to every tenant**. The generic driver needs a field-set-stability gate (N equal reads of
+the control set) before it scans. Note the settle poll is a STABILITY predicate, which round 6 showed
+drift makes *safer*, not weaker — so it is the adaptive FAST path, not a starved clock, that is the risk
+here.
 
 ### The ONLY expensive part is learning a widget's OPTIONS
 
@@ -387,10 +459,19 @@ those hops is the navigation case. So:
 5. **Named adapters, cheapest first** — each one now a *refinement* of a working baseline: recon tells you
    the three things the generic scanner got wrong, and you override only those.
 
-Cheapest-first order for step 5, from the corpus: **Workable** and **Breezy** are `ats.js`-shaped
-(one page, no login, one submit button) and mostly work off the generic ladder already. Teamtailor and
-SmartRecruiters are gated by §6 blockers, not by fill difficulty, so they wait on an operator story.
-iCIMS / Taleo / SuccessFactors are Workday-shaped and belong in a separate, later, depth-first effort.
+Cheapest-first order for step 5, now graded by what the recon actually reached:
+
+| Tier | Families | Why |
+|---|---|---|
+| **1 — nearly free** | KEF-style custom/Wix forms, **Workable**, **Breezy** | One page, no gate, no login, one submit. All scan clean off the generic ladder today. |
+| **2 — one gate each** | **Dayforce**, **Paylocity** | Forms reached and fully scanned. Each needs: consent dismissal, the guest-path chooser (Dayforce), and — for Paylocity — the label-text required parser and multi-step support. |
+| **3 — blocked on an operator story, not on fill** | Teamtailor (consent wall), SmartRecruiters (DataDome) | Nothing to build until access is settled. |
+| **4 — own recon session** | **Oracle Fusion**, UKG/UltiPro, ADP, NEOGOV, iCIMS/Taleo/SuccessFactors | Workday-shaped: auth + wizard + drafts. Oracle already resisted once. |
+
+**Paylocity is the best single target for step 2 of the build order**, because one form exercises almost
+every rule at once: 44 fields, label-only required markers, value/placeholder bleed, mis-assigned labels,
+duplicate labels, opaque JWT entry ids, repeating sections, a multi-step wizard, and 9 must-open widgets.
+If the generic driver handles Paylocity honestly, the ladder is real.
 
 ---
 
@@ -417,6 +498,11 @@ iCIMS / Taleo / SuccessFactors are Workday-shaped and belong in a separate, late
   plainly required in practice and enforced in JS only. Under-flagging is the dangerous direction
   (`CLAUDE.md`), so the generic driver may need to treat "no required signal anywhere on the form" as a
   distinct, reported state rather than "nothing is required".
-- **Multi-step wizards.** None of the four reachable forms was multi-page. The generic driver's page-
-  transition model is therefore **completely untested** — and Workday's history says that is where the
-  cost hides.
+- **Multi-step wizards — no longer hypothetical, still untested.** Paylocity's primary control is
+  **"Next Step"**, so multi-page is not a Workday-only shape. The generic driver's page-transition model
+  remains unexercised, and Workday's history says that is where the cost hides. This is now the largest
+  unknown in the plan.
+- **Oracle Fusion resisted every approach tried.** Apply URL 404s, and two Apply clicks changed nothing
+  while freezing the renderer >30s. Unresolved whether it needs a different control, a popup that was
+  blocked, or a session state we did not have. Given Oracle's install base this deserves its own recon
+  session rather than a guess.
