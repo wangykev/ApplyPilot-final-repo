@@ -109,7 +109,17 @@ export function AiConfigForm({ initial }: { initial: AiConfig }) {
     // other for hours at a time, and which one it is changes — see LLM_AUTO_CANDIDATES.
     const auto = LLM_AUTO_CANDIDATES[provider];
     if (auto && auto.length > 1) {
-      return [{ value: LLM_AUTO_MODEL, label: `Auto — fastest of ${auto.length} (${auto.map((m) => m.replace(/^gemini-/, "")).join(" / ")})` }, ...opts];
+      // Name the ACTUAL behaviour — ordered preference with failover, NOT "the fastest one". A label
+      // promising a race would misdescribe it: the first candidate always wins unless it is erroring or
+      // measurably slower, which is deliberate (a stable primary beats chasing a small latency edge).
+      const short = (m: string) => m.replace(/^gemini-/, "");
+      return [
+        {
+          value: LLM_AUTO_MODEL,
+          label: `Auto — ${short(auto[0])}, switching to ${auto.slice(1).map(short).join(" / ")} if it errors or slows`,
+        },
+        ...opts,
+      ];
     }
     return opts;
   };
