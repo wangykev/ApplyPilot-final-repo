@@ -549,7 +549,14 @@ SAFETY INVARIANTS (always apply): discovery **only READS** — it never applies,
 (clicking LinkedIn's can mark a posting applied when it has not been), and **never attempts a login**. It
 RETURNS jobs and writes nothing; the WEBSITE persists them (engine computes / caller does I/O).
 `discoverInFlight` and `runInFlight` are **MUTUALLY EXCLUSIVE** — cdp.js tracks ONE `cdpTabId`, so a sweep
-would clobber a running walk's attach mid-fill. **No silent caps:** whatever a cap drops is reported as a note.
+would clobber a running walk's attach mid-fill. ⚠ **AND SO ARE TWO RUNS (2026-08-12).** `AP_RUN_APPLICATION`
+and `AP_SUBMIT_APPLICATION` guarded only on `discoverInFlight` while every other handler already refused on
+`runInFlight`, so a second run could steal the first's attach for exactly the same reason. Observed, not
+theorised: two overlapping runs on one Greenhouse posting produced a bundle with **12 `error` fields** where
+that posting fills `15/9/1` cleanly. Both now refuse `run-in-flight`; safe because both reset the flag in a
+`finally`, so a crashed run cannot strand the next one. It matters most on the SUBMIT path — a concurrent
+run mutating the page under the replay's strict verify is exactly when "the page agrees with the approved
+bundle" stops meaning anything. **No silent caps:** whatever a cap drops is reported as a note.
 
 Mechanism (the one board driver + each board's JSON contract, the location resolver, `discoveryJobKey`
 lockstep with web/lib/discover.ts, ranking, the hidden-tab levers): **load the `job-discovery` skill.**
