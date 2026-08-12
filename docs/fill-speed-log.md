@@ -1326,9 +1326,32 @@ free-text question made its own serial call. Worse, `willUseAi` is true for a re
 zero page contact. `aiFillText` gained a `preAnswer` seam matching `aiFillField`'s. `aiBatchAnswer` awaits
 **only the route that could serve the field**, so a prose question never blocks on the dropdown call.
 
-⚠ **STATUS: the Workday half is unit-tested and mutation-checked, NOT live-verified.** The ATS half is
-live-verified above. A Workday run needs a tenant login and a multi-page walk; nothing here changes the
-deterministic path, but the claim stands only at unit level until someone runs a tenant.
+### Workday LIVE (build `deferred-ai-6`, hidden, `cat.wd5` R0000385733, fresh req)
+
+```
+✓✓ reached the REVIEW page after 5 page(s) — the whole application is filled. NOT submitting (terminal).
+[AI-BATCH-RECON] planned 1 [infer:disabilityForm] · needed an open: 1 · OPENED: 0
+                 · no kind reaches 2 candidates — no page contact
+```
+
+**No regression: 5 pages, REVIEW reached, zero nav-timeouts, zero halts.** And `needed an open: 1 ·
+OPENED: 0` is the new per-route gate working live — a dropdown whose route cannot batch is no longer
+opened for a prompt nobody sends.
+
+⚠ **The TEXT batching itself is still not live-exercised.** Every page on this tenant had ≤1 AI question,
+so no group ever reached 2 and no batch fired at all (1 LLM call for the whole 5-page walk, on `"fill"`).
+That is worth knowing in its own right: **on a typical Workday page the batch has little to collapse**,
+because most text fields are MAPPED (name, email, address) and the unmapped prose questions that make the
+ATS path expensive are rare here. The widening is cheap insurance for an essay-heavy tenant, not a
+routine win — do not expect the ATS-sized effect.
+
+### End to end after all of it (ATS, build `deferred-ai-6`)
+
+```
+review pull: loaded the website-approved bundle (25 fields, 9/9 flagged approved)
+[ATS-SUBMIT] verify: 25 field(s) replayed, 0 failure(s) · blockers: 0 · captcha visible: false
+[ATS-SUBMIT] ▶▶ WOULD CLICK SUBMIT ◀◀
+```
 
 ### Also fixed: the parser dropped an answer that arrived under the other key
 
