@@ -334,6 +334,14 @@ AUTO judges a model only on samples from the last 15min, so a demoted primary ag
 returns to the front, and the next real fill call is the probe. Full detail: `docs/fill-speed-log.md`
 round 9.
 
+⚠ **An `auto` slot expands to ONE ATTEMPT PER CANDIDATE, so a single slot carries its own in-call
+fallback** (`llmExpandAutoAttempts`). The website stores just `"auto"`; the extension expands it per call
+in health order, inherits the slot's `keyId` onto every attempt (Auto and pinning compose), and re-dedupes
+against any concrete slot you also configured. **So one `auto` slot is a complete config** — you do NOT
+need a second slot to get a fallback, and two `auto` slots with the same key still collapse to one (now
+harmlessly). Set a second slot only to pin a DIFFERENT key, which is what buys the extra
+15-requests-per-minute budget.
+
 `action` ∈ `fill` | `essay` | `resume_parse` | `cover_letter` (`LLM_ACTIONS`, `llm-keys.js`); an unset action
 follows the default pair. **`fill` vs `essay` is the distinction that matters to an operator** — dozens of short
 screening answers per application (cheap, fast) versus a paragraph or two of prose (worth a stronger model);

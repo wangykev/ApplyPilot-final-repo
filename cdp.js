@@ -5235,9 +5235,19 @@ function makeCdpActuation(llmConfig) {
         console.log(`[ApplyPilot][AI-CALL] action=${action || "fill"} maxTokens=${maxTokens || "?"} — QUESTIONS/OPTIONS: `
           + qOnly.slice(0, 1400) + (qOnly.length > 1400 ? " …[cut]" : ""));
       }
-      const attempts = typeof resolveLlmRoute === "function"
+      const routeSlots = typeof resolveLlmRoute === "function"
         ? resolveLlmRoute(llmConfig, action || "fill", LLM_DEFAULT_MODELS)
         : [{ provider: llmConfig.provider, model: llmConfig.model }];
+      // IN-CALL EXPANSION OF AN "auto" SLOT (2026-08-11): one slot becomes one ATTEMPT PER CANDIDATE,
+      // health-ranked, so the loop below performs the operator's failover ("if it is busy, errors, or
+      // something else, then go to 3") inside a SINGLE call. Before this, `auto` resolved to one model
+      // and was therefore also the LAST attempt: a persistent 503 ended the call unanswered and the
+      // sibling was only reached by a later call. Live on the operator's config this left a route of
+      // length 1 with no in-call fallback at all. Logic + dedupe live in llm.js so they are unit-tested;
+      // expansion happens per CALL and is never written to storage, because the order is an observation.
+      const attempts = typeof llmExpandAutoAttempts === "function"
+        ? llmExpandAutoAttempts(routeSlots)
+        : routeSlots;
       if (!attempts.length) return { ok: false, error: "no AI model configured (set one on the website's AI page)" };
 
       let last = null;
@@ -5253,13 +5263,12 @@ function makeCdpActuation(llmConfig) {
         // Name the route BEFORE the call, so a wrong model is visible in the log next to the field it
         // answered rather than inferred from the answer's quality. Never the key itself — only how many
         // are available to rotate through, which is what you need when a call fails.
-        // AUTO expands HERE, per attempt, not once per route: the choice is an observation and the
-        // observation changes mid-run (a model degrading is exactly the case this exists for). Resolved
-        // before the log line so the log names the model that is actually about to be called.
+        // Already concrete after the expansion above; the call is kept because a route can still carry a
+        // bare "auto" if llmAutoOrder is unavailable, and it passes a concrete model through untouched.
         const attemptModel = typeof llmResolveAutoModel === "function"
           ? llmResolveAutoModel(attempt.provider, attempt.model)
           : attempt.model;
-        console.log(`[LLM] ${attempt.provider} ${attemptModel}${attempt.model === "auto" ? " (auto)" : ""}` +
+        console.log(`[LLM] ${attempt.provider} ${attemptModel}${attempt.fromAuto ? " (auto)" : ""}` +
           (attempt.thinking ? ` thinking:${attempt.thinking}${attempt.effort ? "/" + attempt.effort : ""}` : "") +
           ` for "${action || "fill"}"` +
           (keys.length ? ` (${keys.length} key${keys.length > 1 ? "s" : ""})` : " (single key)") +

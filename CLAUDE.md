@@ -608,6 +608,14 @@ separate "stuck" from "slow"), the **AUTO model** (`model:"auto"` — ordered pr
 stale measurements are DISCARDED not averaged, which is what makes a recovered model win its traffic back
 in ~1 call instead of ~75min), and **per-slot key pinning**.
 
+**An `auto` route slot expands to ONE ATTEMPT PER CANDIDATE** (`llmExpandAutoAttempts`, llm.js — pure and
+unit-tested, because cdp.js cannot be `require`d by a Node test). `act.llm`'s loop over the attempt list IS
+the in-call failover, so a slot resolving to ONE model was also the LAST attempt: a persistent 503 ended
+the call unanswered and the sibling was only reached by a later call. **One `auto` slot is therefore a
+complete config** — it carries its own fallback, inherits the slot's `keyId` onto every attempt (Auto and
+pinning compose), and re-dedupes against any concrete slot. ⚠ It expands per CALL and is NEVER written to
+storage — the order is an observation, and freezing it into the saved config is the thing to avoid.
+
 **Rotation does NOT spread load — it advances only on FAILURE (2026-08-11).** N equal-tier keys therefore
 send every call through the FIRST one (measured: 6/6 calls on key 1, key 2 never touched), so a free-tier
 account holding 30 requests/min of headroom breaches a **15/min PER-KEY** limit inside half of it. The fix

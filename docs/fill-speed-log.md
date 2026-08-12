@@ -968,16 +968,61 @@ the adaptive cap (~28s: seen live as `fast-retry cap … OFF — observed p50 84
 after which that run's LLM totals dropped from 17583/11728/11048/13823ms to 3540/7769/5511ms) and AUTO
 (~11s → ~0.7s per call, 7 calls a page).
 
-### ⚠ TWO "auto" SLOTS WITH THE SAME KEY DEDUPE INTO ONE ATTEMPT
+### ✔ FIXED — "auto" now expands to ONE ATTEMPT PER CANDIDATE, so failover happens IN-CALL
 
-Found on the operator's own config immediately after they switched: `resolveLlmRoute` returned a route of
-**length 1**. `keyId` is part of a slot's dedupe identity, but two `auto` slots with the same (empty)
-`keyId` are identical, so the fallback collapsed. Consequence: a 503 on the chosen model makes the CALL
-fail — the field goes to review — and only the NEXT call steps down to the sibling. That is weaker than
-the stated intent ("if it is busy, errors, or something else, then go to 3"), which wants per-CALL
-failover. Remedies, in order of preference: expand an `auto` slot into its full candidate list as separate
-in-call attempts (correct fix); or, until then, pin the two slots to different keys, or leave the fallback
-as a concrete model so a real second attempt exists.
+**The bug, found on the operator's own config the moment they switched to Auto:** `resolveLlmRoute`
+returned a route of **length 1**. `keyId` is part of a slot's dedupe identity, and two `auto` slots with
+the same (empty) `keyId` are identical, so the fallback collapsed. `auto` also resolved to ONE model, so
+that single slot was the LAST attempt — and `act.llm`'s loop over the attempt list IS the in-call failover.
+Net effect: a persistent 503 ended the call unanswered (field → review) and the sibling was only reached
+by a LATER call via the 2min sideline. Strictly weaker than the stated intent, which wants per-CALL
+failover: *"try 3.5 first and if it is busy, errors, or something else, then go to 3."*
+
+**The fix** (`llmExpandAutoAttempts`, llm.js — pure, so it is unit-tested rather than living inline in
+cdp.js which no Node test can require): one `auto` slot expands to one attempt per candidate, in
+`llmAutoOrder`'s health rank.
+
+```
+before:  [ {gemini, "auto"} ]                  → attempts: [ 3.5-flash-lite ]            ← no fallback
+after:   [ {gemini, "auto"} ]                  → attempts: [ 3.5-flash-lite, 3.1-flash-lite ]
+```
+
+Four properties, each unit-pinned and mutation-checked:
+
+- **Health-ranked, not static** — a sidelined primary drops behind the sibling but is kept as a LAST
+  RESORT rather than dropped, because a degraded answer beats none (a failed AI call blanks a required
+  field and halts a walk).
+- **`keyId` rides onto every expansion**, so Auto and per-slot pinning COMPOSE: an auto slot pinned to key
+  A becomes `3.5@A → 3.1@A`. Two auto slots on different keys give all four combinations, and attempts
+  differing only by KEY survive the dedupe — that is the free tier's per-key minute budget.
+- **Re-deduped**, because expansion can collide with a concrete slot the operator also configured
+  (`[auto, 3.1] → [3.5, 3.1, 3.1]`); a duplicate is a wasted request on a model that just failed. This
+  also makes the original dedupe bug **moot** — one slot already supplies both models.
+- **Expanded per CALL, never written to storage.** The order is an observation; freezing it into the saved
+  config is exactly what must not happen.
+
+⚠ **The one real behavioural trade, stated because it is not a pure bugfix.** `act.llm` passes
+`noRetry: !isLast`, so every attempt but the last fails fast. Previously a lone `auto` slot was last and
+its model got the FULL retry ladder (~75s worst case) and never reached the sibling; now it gets one shot
+and the sibling takes over holding the ladder. That is faster and likelier to answer — the same
+"rotation before waiting" reasoning key rotation already uses — but it IS less persistence on the
+preferred model.
+
+**LIVE VERIFIED** (build `auto-expand-1`, hidden Greenhouse run):
+
+```
+[LLM] gemini gemini-3.5-flash-lite (auto) thinking:off for "fill" (2 keys) [attempt 1/2]
+```
+
+`[attempt 1/2]` is the proof — that suffix only prints when `attempts.length > 1`, and before this change
+the same config produced no suffix at all. All 7 calls answered on attempt 1, so attempt 2 never ran:
+**the healthy case still costs exactly one request.**
+
+⚠ That run also took 67.8s, and it is worth recording why rather than reading it as a regression: its LLM
+calls were `629 · 656 · 671 · 723 · 8257 · 18131 · 5718`ms — **3.5-flash-lite had its own slow spell
+mid-run** — plus `candidate-location` at 11.7s. The expansion issued zero extra requests. So the preferred
+sibling is not permanently fast either, which is the case AUTO's health tracking and this in-call failover
+both exist for.
 
 ### Do NOT redo
 

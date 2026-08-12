@@ -426,6 +426,61 @@ function llmAutoPick(provider, nowMs) {
   return { model: first, reason: "preferring " + first + " — healthy at p50 " + p50First + "ms" + sidelinedNote };
 }
 
+// The FULL candidate list in the order to try them, health-ranked. This is what an "auto" route slot
+// expands into (see cdp.js act.llm), so one slot becomes one ATTEMPT PER CANDIDATE and the failover the
+// operator asked for — "if it is busy, errors, or something else, then go to 3" — happens WITHIN a single
+// call instead of only on the next one.
+//
+// WHY IN-CALL MATTERS: a single `auto` slot used to resolve to ONE model, so it was also the LAST attempt.
+// A persistent 503 on the chosen model therefore ended the call unanswered — the field goes to review —
+// and the sibling was only reached by a LATER call via the 2min sideline. Live on the operator's own
+// config, `resolveLlmRoute` returned a route of length 1 and there was no in-call fallback at all.
+//
+// Sidelined candidates go to the BACK rather than being dropped: a degraded answer still beats no answer
+// (a failed AI call blanks a required field and halts a walk), it just must not outrank a live model.
+function llmAutoOrder(provider, nowMs) {
+  const cands = llmAutoCandidates(provider);
+  if (!cands.length) {
+    const d = (LLM_DEFAULT_MODELS && LLM_DEFAULT_MODELS[provider]) || "";
+    return d ? [d] : [];
+  }
+  const now = Number(nowMs) || Date.now();
+  const head = llmAutoPick(provider, now).model;
+  const rest = cands.filter((m) => m !== head);
+  return [
+    head,
+    ...rest.filter((m) => !llmModelSidelined(provider, m, now)),
+    ...rest.filter((m) => llmModelSidelined(provider, m, now)),
+  ];
+}
+
+// Turn a resolved ROUTE (a list of slots from resolveLlmRoute) into the ATTEMPT list act.llm loops over,
+// expanding every "auto" slot into one attempt per candidate. Pure, so the whole behaviour is unit-tested
+// rather than living inline in cdp.js, which no Node test can require.
+//
+// `keyId` rides onto every expansion, so Auto and per-slot key pinning COMPOSE: an auto slot pinned to
+// key A becomes 3.5@A → 3.1@A rather than silently losing the pin.
+//
+// The re-dedupe is not cosmetic: expansion can collide with a concrete slot the operator ALSO configured
+// ([auto, 3.1-flash-lite] → [3.5, 3.1, 3.1]), and a duplicate attempt is a wasted request on a model that
+// just failed. Identity matches resolveLlmRoute's own dedupe, keyId included — two attempts differing only
+// by KEY are genuinely useful (that is the free tier's per-key minute budget) and must survive.
+function llmExpandAutoAttempts(slots, nowMs) {
+  const out = [];
+  const seen = new Set();
+  for (const slot of Array.isArray(slots) ? slots : []) {
+    if (!slot || typeof slot !== "object") continue;
+    const models = slot.model === LLM_AUTO_MODEL ? llmAutoOrder(slot.provider, nowMs) : [slot.model];
+    for (const model of models) {
+      const k = [slot.provider, model, slot.thinking || "off", slot.effort || "", slot.keyId || ""].join("|");
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(slot.model === LLM_AUTO_MODEL ? { ...slot, model, fromAuto: true } : slot);
+    }
+  }
+  return out;
+}
+
 // Expand an "auto" slot to a concrete model, logging only when the choice CHANGES (a per-call line
 // would bury the run log, and a silent switch is untraceable when an answer looks off).
 function llmResolveAutoModel(provider, model, nowMs) {
@@ -874,7 +929,8 @@ if (typeof module !== "undefined" && module.exports) {
     recordLlmAnswerMs, llmObservedAnswerP50, llmLatencyNewestAt, resetLlmLatency,
     LLM_AUTO_MODEL, LLM_AUTO_CANDIDATES, LLM_AUTO_STALE_MS, LLM_AUTO_SIDELINE_MS, LLM_AUTO_SLOW_FACTOR,
     LLM_AUTO_MIN_SAMPLES, llmRecentSamples,
-    llmAutoCandidates, llmAutoPick, llmResolveAutoModel, recordLlmModelUnhealthy, llmModelSidelined,
+    llmAutoCandidates, llmAutoPick, llmAutoOrder, llmExpandAutoAttempts, llmResolveAutoModel,
+    recordLlmModelUnhealthy, llmModelSidelined,
     llmStatusIsServerHealth,
     GEMINI_FREE_TIER, geminiFreeTierModels, isFreeTierModel, LLM_PRICING, LLM_PRICING_URLS,
     llmCostUsd, GEMINI_STARTER_CHAIN, LLM_MODEL_META, llmModelLabel, ANTHROPIC_THINKING_ADJUSTABLE, ANTHROPIC_THINKING_DEFAULT_ON,

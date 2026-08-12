@@ -31,6 +31,8 @@ const { callLLM, callLLMOnce, LLM_DEFAULT_MODELS, LLM_MODELS, LLM_RETRY_DELAYS_M
   LLM_AUTO_MIN_SAMPLES,
   llmRecentSamples,
   llmAutoPick,
+  llmAutoOrder,
+  llmExpandAutoAttempts,
   llmResolveAutoModel,
   recordLlmModelUnhealthy,
   llmModelSidelined,
@@ -646,6 +648,106 @@ test("★ auto + adaptive cap share ONE window, so a 503 fallback does not disto
   healthy(AUTO_1ST, 409);
   healthy(AUTO_2ND, 10500);
   assert.equal(llmAutoPick("gemini").model, AUTO_1ST, "the fast one is primary AND preferred");
+  resetLlmLatency();
+});
+
+// ── IN-CALL EXPANSION OF "auto" (2026-08-11) ─────────────────────────────────────────────────────
+// act.llm loops the attempt list and fails fast on every attempt but the last, so the list IS the
+// in-call failover. An `auto` slot that resolved to ONE model was therefore also the LAST attempt: a
+// persistent 503 ended the call unanswered (field → review) and the sibling was only reached by a LATER
+// call. Live on the operator's config resolveLlmRoute returned a route of LENGTH 1 — no fallback at all.
+const slot = (model, extra) => ({ provider: "gemini", model, thinking: "off", effort: "", keyId: "", ...(extra || {}) });
+
+test("★ auto expansion: ONE auto slot becomes one attempt PER CANDIDATE, health-ranked", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL)]);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_1ST, AUTO_2ND],
+    "the whole point: a single auto slot now carries its own in-call fallback");
+  assert.equal(out.every((a) => a.fromAuto === true), true, "marked, so the log can say (auto)");
+  resetLlmLatency();
+});
+
+test("★ auto expansion: the order follows HEALTH — a sidelined primary drops behind the sibling", () => {
+  resetLlmLatency();
+  const t0 = 3_000_000;
+  recordLlmModelUnhealthy("gemini", AUTO_1ST, t0);
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL)], t0 + 1);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_2ND, AUTO_1ST],
+    "the sidelined model is kept as a LAST RESORT, never dropped — a degraded answer beats none");
+  resetLlmLatency();
+});
+
+test("★ auto expansion: keyId rides onto every attempt, so Auto and key PINNING compose", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL, { keyId: "keyA" })]);
+  assert.deepEqual(out.map((a) => `${a.model}@${a.keyId}`), [`${AUTO_1ST}@keyA`, `${AUTO_2ND}@keyA`],
+    "an auto slot pinned to key A must not silently lose the pin when it expands");
+  resetLlmLatency();
+});
+
+test("★ auto expansion: two auto slots on DIFFERENT keys give both models on both keys", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL, { keyId: "keyA" }), slot(LLM_AUTO_MODEL, { keyId: "keyB" })]);
+  assert.deepEqual(out.map((a) => `${a.model}@${a.keyId}`),
+    [`${AUTO_1ST}@keyA`, `${AUTO_2ND}@keyA`, `${AUTO_1ST}@keyB`, `${AUTO_2ND}@keyB`],
+    "attempts differing only by KEY are genuinely useful — that is the free tier's per-key minute budget");
+  resetLlmLatency();
+});
+
+test("★ auto expansion: RE-DEDUPES against a concrete slot the operator also configured", () => {
+  resetLlmLatency();
+  // [auto, 3.1-flash-lite] naively expands to [3.5, 3.1, 3.1] — the duplicate would be a wasted
+  // request on a model that just failed one line earlier.
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL), slot(AUTO_2ND)]);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_1ST, AUTO_2ND]);
+  resetLlmLatency();
+});
+
+test("auto expansion: two auto slots with the SAME key collapse (one slot already yields both)", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL), slot(LLM_AUTO_MODEL)]);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_1ST, AUTO_2ND],
+    "the dedupe that used to LOSE the fallback is now harmless — expansion already supplied it");
+  resetLlmLatency();
+});
+
+test("auto expansion: a CONCRETE route is passed through completely untouched", () => {
+  resetLlmLatency();
+  const route = [slot("gemini-2.5-flash-lite"), slot(AUTO_2ND, { keyId: "keyB" })];
+  const out = llmExpandAutoAttempts(route);
+  assert.deepEqual(out, route, "no auto slot ⇒ byte-identical behaviour to before this existed");
+  assert.equal(out.some((a) => a.fromAuto), false);
+  resetLlmLatency();
+});
+
+test("auto expansion: junk in the route is skipped, never crashes the call", () => {
+  resetLlmLatency();
+  assert.deepEqual(llmExpandAutoAttempts(null), []);
+  assert.deepEqual(llmExpandAutoAttempts([null, undefined, "nope", 7]).length, 0);
+  const out = llmExpandAutoAttempts([null, slot(LLM_AUTO_MODEL)]);
+  assert.deepEqual(out.map((a) => a.model), [AUTO_1ST, AUTO_2ND]);
+  resetLlmLatency();
+});
+
+test("auto expansion: a provider with NO candidate list expands to its single default model", () => {
+  resetLlmLatency();
+  const out = llmExpandAutoAttempts([{ provider: "anthropic", model: LLM_AUTO_MODEL, thinking: "off", effort: "", keyId: "" }]);
+  assert.deepEqual(out.map((a) => a.model), [LLM_DEFAULT_MODELS.anthropic]);
+  resetLlmLatency();
+});
+
+test("★ auto expansion: the HEALTHY case still costs ONE request — extra attempts are fallbacks only", async () => {
+  resetLlmLatency();
+  // act.llm's contract: it returns on the FIRST ok attempt, so a longer attempt list must not mean more
+  // requests when the first model answers. Proven against callLLM directly, one fetch per successful call.
+  let calls = 0;
+  const okFetch = async () => { calls++; return { ok: true, status: 200,
+    json: async () => ({ candidates: [{ content: { parts: [{ text: "Doctorate" }] } }] }), text: async () => "{}" }; };
+  const attempts = llmExpandAutoAttempts([slot(LLM_AUTO_MODEL)]);
+  assert.equal(attempts.length, 2, "two attempts available");
+  const r = await callLLM({ provider: "gemini", model: attempts[0].model, apiKey: "k", user: "q" }, okFetch, async () => {});
+  assert.equal(r.ok, true);
+  assert.equal(calls, 1, "a working primary means exactly one request — the expansion is latent, not eager");
   resetLlmLatency();
 });
 
