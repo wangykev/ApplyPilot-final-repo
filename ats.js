@@ -3457,10 +3457,20 @@ function atsGenericEducationValue(profile, label, ordinal) {
 function atsGenericScopeOf(f) {
   const name = String((f && f.fieldName) || "");
   const label = String((f && f.label) || "");
+  const heading = String((f && f.sectionHeading) || "");
   if (/education|school|degree|major|graduat|alma/i.test(name)) return "education";
   if (/address/i.test(name)) return "address";
   if (/employ|work.?history|workhistory|experience|employer/i.test(name)) return "work";
-  // no name signal — fall back to the label, but ONLY for unambiguous words
+  // ⚠ THE SECTION HEADING, because a field NAME is often opaque. iCIMS names its whole
+  // professional-experience block `rcf3212`…`rcf3218` — nothing in those says "work", so they scoped
+  // as "none" and the address tier could claim their "Address"/"City" and write the applicant's HOME
+  // address into an EMPLOYER's address (operator, 2026-08-12: "in the work experience section,
+  // address actually means the address of the workplace"). The heading is the only durable signal for
+  // an opaque block, and the scanner already reads the nearest preceding one.
+  if (/education|school|university|academic/i.test(heading)) return "education";
+  if (/experience|employment|work history|employer|position held/i.test(heading)) return "work";
+  if (/^\s*addresses?\b/i.test(heading)) return "address";
+  // no name or heading signal — fall back to the label, but ONLY for unambiguous words
   if (/education|school|degree|graduat/i.test(label)) return "education";
   if (/employer|work experience|job title/i.test(label)) return "work";
   return "none";
@@ -3675,6 +3685,7 @@ function atsGenericPostProcess(raw) {
       reqVia: s.reqVia,
       value: f.value === undefined ? null : f.value,
       entryOrdinal,
+      sectionHeading: f.sectionHeading || "",
       credentialKind: f.credentialKind || null,
       options: Array.isArray(f.options) && f.options.length ? f.options.slice() : null,
       optionsPlaceholderOnly: !!f.optionsPlaceholderOnly,
@@ -3988,6 +3999,7 @@ function atsInjScanGeneric() {
       inputSel: sel,
       widgetType: first.type === "radio" ? "radio" : (list.length > 1 ? "checkbox_group" : "checkbox"),
       labelCandidates: cands,
+      sectionHeading: cands.heading || "",
       reqAttr: list.some(function (r3) { return r3.required === true || r3.getAttribute("aria-required") === "true"; }),
       reqMarker: !!(u.node && u.node.querySelector('[class*="equired"]')),
       labelShared: false,
@@ -4043,6 +4055,9 @@ function atsInjScanGeneric() {
       inputSel: nm2 && el.id === nm2 ? "#" + esc(nm2) : (nm2 && el.name === nm2 ? (el.tagName === "SELECT" ? 'select[name="' + esc(nm2) + '"]' : (el.tagName === "TEXTAREA" ? 'textarea[name="' + esc(nm2) + '"]' : 'input[name="' + esc(nm2) + '"]')) : stamp(el)),
       widgetType: wt,
       labelCandidates: labelCandidatesFor(el, u2),
+      // the RAW nearest preceding heading, kept independently of whether the label ladder chose it —
+      // it is the only durable section signal for an opaque field name (iCIMS' rcf3212…rcf3218).
+      sectionHeading: (function () { var c = labelCandidatesFor(el, u2); return c.heading || ""; })(),
       reqAttr: el.required === true || el.getAttribute("aria-required") === "true",
       reqMarker: !!(u2.node && (u2.node.querySelector('[class*="equired"]') || u2.node.querySelector('[aria-required="true"]'))),
       labelShared: !!(u2.node && u2.node.querySelectorAll(CTRL).length > 1 && u2.hops >= 3),

@@ -901,6 +901,42 @@ test("address: a phone COUNTRY CODE is never answered with the address country",
   assert.strictEqual(v("rcf_phone", "Phone Country"), null);
 });
 
+test("⚠ scope: a WORK-EXPERIENCE address is the EMPLOYER's, not the applicant's", () => {
+  // Operator 2026-08-12: "in the work experience section, address actually means the address of the
+  // workplace so filling the address of the home location is wrong." iCIMS names that whole block
+  // rcf3212…rcf3218 — nothing in the NAME says "work" — so the section HEADING is what scopes it.
+  const wf = (label) => ({ fieldName: "-6481216_PersonProfileFields.rcf3216", label,
+    sectionHeading: "Professional Experience (beginning with your most recent)", widgetType: "text" });
+  assert.strictEqual(ats.atsGenericScopeOf(wf("Address")), "work");
+  assert.strictEqual(ats.atsGenericAddressValue(ADDR_PROFILE, wf("Address")), null, "the home street must not reach an employer's address");
+  assert.strictEqual(ats.atsGenericAddressValue(ADDR_PROFILE, wf("City")), null);
+  assert.strictEqual(ats.atsGenericAddressValue(ADDR_PROFILE, wf("Country")), null);
+
+  // …while the real address section, under its own heading, still fills
+  const af = (label, name) => ({ fieldName: name, label, sectionHeading: "Addresses (1)* required.", widgetType: "text" });
+  assert.strictEqual(ats.atsGenericScopeOf(af("Address", "-1_PersonProfileFields.AddressStreet1")), "address");
+  const r = ats.atsGenericAddressValue(ADDR_PROFILE, af("Address", "-1_PersonProfileFields.AddressStreet1"));
+  assert.strictEqual(r && r.value, "715 Middlebrooks Circle");
+});
+
+test("scope: an opaque field under an EDUCATION heading scopes to education", () => {
+  const f = { fieldName: "rcf9001", label: "City", sectionHeading: "Education (1)", widgetType: "text" };
+  assert.strictEqual(ats.atsGenericScopeOf(f), "education");
+  assert.strictEqual(ats.atsGenericAddressValue(ADDR_PROFILE, f), null);
+});
+
+test("scope: the scanner records the raw nearest heading independently of the label ladder", () => {
+  const src = ats.atsInjScanGeneric.toString();
+  assert.ok(/sectionHeading:/.test(src), "every scanned field must carry its section heading");
+  // and the resolver must carry it through to the field the router sees
+  const s = ats.atsGenericPostProcess({
+    fields: [{ attrId: "rcf3216", inputSel: "#x", widgetType: "text", domIndex: 0,
+      sectionHeading: "Professional Experience", labelCandidates: { labelFor: "City" } }],
+  });
+  assert.strictEqual(s.fields[0].sectionHeading, "Professional Experience");
+  assert.strictEqual(ats.atsGenericScopeOf(s.fields[0]), "work");
+});
+
 test("scope: the field NAME decides, because the label cannot", () => {
   const s = (name, label) => ats.atsGenericScopeOf({ fieldName: name, label });
   assert.strictEqual(s("-1_PersonProfileFields.AddressCity", "City"), "address");
