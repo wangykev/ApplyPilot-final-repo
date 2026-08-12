@@ -4,7 +4,7 @@
 // widgets are NEVER actuated and unverified commits are NEVER pressed.
 const { test } = require("node:test");
 const assert = require("node:assert");
-const { planAiBatchCandidates, buildBatchAiPrompt, parseBatchAiReply, deterministicTierFor, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, pickLastResortOption, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
+const { planAiBatchCandidates, buildBatchAiPrompt, parseBatchAiReply, collectAiBatchItems, DEFAULT_BUDGETS, deterministicTierFor, fillTextCdp, setCheckboxGroupCdp, orderResultsByDom, drivePageFill, fillSourceCdp, fillTypeaheadCdp, commitOutcome, driveRepeatingSectionCdp, sectionsFromErrorNames, deleteTargetsFromErrorNames, deleteEmptyErrorRows, overwriteNoMatchResting, WEBSITE_MAP, LANGUAGE_MAP, EDUCATION_MAP, WORK_EXPERIENCE_MAP, fillDateCompositeCdp, buildReviewBundle, accumulateBundle, samePhysicalPage, detectSectionShapes, revealUnknownSection, CERT_NESTED, fillNestedSpecialtiesCdp, sweepAlreadyFilled, reconPageTruth, sectionsInDomOrder, PAGE_SECTIONS, reconcileAudit, auditDateSegments, auditEntriesFromResults, applyAuditVerdicts, replayField, replayValueMatches, textValuesMatch, phoneShaped, replayFlatFields, deriveFlatWrapperSel, isRepeatingEntry, bundleToSectionItems, coerceReplayValue, replayRepeatingSections, selectPageBundleEntries, submitPrecondition, bundleSubmitBlockers, isTransientRenderFailure, reconDropdownDump, closeAndVerifyBlank, closeDropdownConfirmed, overwriteBeatLadder, aiEligible, legallyLoaded, parseAiReply, parseAiText, aiRemediateError, parseRemediation, captureFieldOptions, captureDropdownOptions, captureChoiceOptions, awaitListTerminal, awaitListStable, awaitSourceListStable, awaitSourceListLoaded, parseAiTypeaheadReply, aiTypeaheadEligible, aiTypeaheadFallback, isOtherOption, runAiTypeaheadPass, parseAiTreeReply, aiTreeDrillFallback, makeStartCapture, buildBucketIndex, pickLastResortOption, resolve, boolLadderCandidates, appendFieldVariants } = require("../fill-driver.js");
 
 // Tiny budgets: success paths settle on the first reads; failure-path polls
 // spin only for a few ms of wall clock.
@@ -1754,7 +1754,8 @@ test("AI batch: ONE candidate costs ZERO page contact (the count gate)", async (
   const rc = out.aiBatchInfo.recon;
   assert.strictEqual(rc.planned, 1, "it is a candidate…");
   assert.strictEqual(rc.opened, 0, "…but nothing was opened for a batch that cannot fire");
-  assert.match(rc.dropped.join(" "), /fewer than 2/);
+  // wording widened when the gate became PER ROUTE (2026-08-12) — one candidate still means no batch
+  assert.match(rc.dropped.join(" "), /reaches 2 candidates/);
   assert.strictEqual(out.results.find((r) => r.fieldName === "only").after, "Yes", "and it still fills, per-field");
 });
 
@@ -1807,6 +1808,38 @@ test("AI batch: a REQUIRED free-text question IS a candidate, and costs NO page 
   // and a widget with its OWN inline AI path is still left alone
   assert.deepStrictEqual(planAiBatchCandidates(
     [{ wrapperSel: "[w-ta]", fieldName: "skills", widgetType: "typeahead", isRequired: true, label: "Skills" }], {}), []);
+});
+
+test("AI batch: a lone dropdown beside essays is NEVER opened — its route cannot batch", async () => {
+  // The count gate is PER ROUTE now that picks and prose are separate calls. `plan.length >= 2` is no
+  // longer sufficient: 1 dropdown + 1 text is two candidates and ZERO batches, and opening that
+  // dropdown would spend ~333ms filling a prompt nobody sends — the exact waste this gate exists for.
+  let opened = 0;
+  const act = {
+    aiEnabled: true,
+    eval: async () => ({}),
+    readDropdownState: async () => { opened++; return { triggerText: "", optionCount: 2, options: [{ text: "Yes" }, { text: "No" }] }; },
+    openDropdown: async () => { opened++; return { ok: true }; },
+    delay: async () => {}, delayFull: async () => {}, llm: async () => ({ ok: false }),
+  };
+  const budgets = DEFAULT_BUDGETS;
+  // 1 dropdown + 1 text ⇒ neither route reaches 2 ⇒ nothing collected, nothing opened
+  const a = await collectAiBatchItems(act, [
+    { wrapperSel: "[w-d]", fieldName: "d1", widgetType: "dropdown", isRequired: true, label: "Consent?" },
+    { wrapperSel: "[w-t]", fieldName: "t1", widgetType: "textarea", isRequired: true, label: "Why here?" },
+  ], {}, budgets, null, null, null, null);
+  assert.deepStrictEqual(a.items, [], "neither route can batch, so nothing is collected");
+  assert.strictEqual(opened, 0, "and the dropdown must NOT have been opened");
+
+  // 1 dropdown + 2 text ⇒ the TEXT route fires, the dropdown still keeps its own call and stays shut
+  opened = 0;
+  const b = await collectAiBatchItems(act, [
+    { wrapperSel: "[w-d]", fieldName: "d1", widgetType: "dropdown", isRequired: true, label: "Consent?" },
+    { wrapperSel: "[w-t]", fieldName: "t1", widgetType: "textarea", isRequired: true, label: "Why here?" },
+    { wrapperSel: "[w-t2]", fieldName: "t2", widgetType: "textarea", isRequired: true, label: "Describe a project." },
+  ], {}, budgets, null, null, null, null);
+  assert.deepStrictEqual(b.items.map((i) => i.kind), ["text", "text"], "only the route that can fire is carried");
+  assert.strictEqual(opened, 0, "a dropdown whose route cannot batch is never opened");
 });
 
 test("AI batch prompt: a text question carries NO options list", () => {

@@ -1468,6 +1468,29 @@ test("AI routing: a long answer goes to the ESSAY model, a pick to the FILL mode
   assert.notStrictEqual(pickCall.action, "essay", "a yes/no pick must NOT be billed to the essay model");
 });
 
+test("AI routing: a DATE is a short factual answer, so it goes to FILL, never the essay model", async () => {
+  // A date reaches atsAiWriteText for its prompt SHAPE, but it is not prose. Workday's aiFillDate
+  // routes a date to "fill"; the two paths must agree, and a date must never join the essay batch.
+  assert.strictEqual(ats.atsAiBatchKind({ widgetType: "date" }), "date", "its own kind — never batched");
+  assert.strictEqual(ats.atsAiBatchKind({ widgetType: "textarea" }), "text");
+  assert.strictEqual(ats.atsAiBatchKind({ widgetType: "radio" }), "choice");
+
+  const seen = [];
+  const values = {};
+  const act = fakeAct({
+    aiEnabled: true,
+    llm: async ({ action }) => { seen.push(action || "(none)"); return { ok: true, text: JSON.stringify({ answer: "2026-09-01", confidence: "Low" }) }; },
+    atsInjScan: () => ({ ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t",
+      fields: [{ fieldName: "start", inputSel: "#start", widgetType: "date", label: "When could you start?", isRequired: true, value: null, domIndex: 0 }] }),
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  assert.deepStrictEqual(seen, ["fill"], "a date must resolve the FILL route");
+  assert.ok(String(out.results[0].after || "").length, "and it still fills: " + out.results[0].detail);
+});
+
 test("atsBatchMaxTokens: a free-text answer is budgeted as a paragraph, a pick as a line", () => {
   const choice = { id: "q1", kind: "choice" }, text = { id: "q2", kind: "text" };
   assert.strictEqual(ats.atsBatchMaxTokens([choice, choice]), 512 + 800);

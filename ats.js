@@ -1548,7 +1548,10 @@ async function atsAiWriteText(act, f, profile, jobContext) {
   // boxes — to the model configured for yes/no picks. The AI page has had a separate
   // "Fill — essays and long answers" slot all along and the Workday twin (`aiFillText`) already used
   // it; only this path did not, so the operator's essay model was silently unused on GH/Lever/Ashby.
-  const res = await act.llm({ system, user, maxTokens: 700, action: "essay" });
+  // …EXCEPT a date, which reaches this function for its prompt SHAPE but is a short factual answer,
+  // not prose. Workday's `aiFillDate` routes a date to "fill"; keep the two paths agreeing.
+  const action = f && f.widgetType === "date" ? "fill" : "essay";
+  const res = await act.llm({ system, user, maxTokens: 700, action });
   if (!res || !res.ok) return { ok: false, error: (res && res.error) || "llm-failed" };
   const parsed = atsFd.parseAiText(res.text); // {skip, answer, reason, maps_to?, suggested_category?}
   if (!parsed || parsed.skip || !String(parsed.answer || "").trim()) return { ok: false, error: (parsed && parsed.reason) || "ai-declined" };
@@ -1690,7 +1693,12 @@ const ATS_AI_BATCH_MAX = 24;   // same reasoning as fill-driver's AI_BATCH_MAX: 
 // text/textarea/date answer in prose (atsAiWriteText's contract); everything else picks an option.
 function atsAiBatchKind(f) {
   const wt = f && f.widgetType;
-  if (wt === "text" || wt === "textarea" || wt === "date") return "text";
+  if (wt === "text" || wt === "textarea") return "text";
+  // A DATE still defers (so it is filled, and in form order) but is NEVER batched: it shares
+  // atsAiWriteText's prompt shape, yet it is a short factual answer, not prose — batching it would put
+  // it in the "essay" group and bill it to the operator's essay model. Workday's `aiFillDate` routes a
+  // date to "fill" for the same reason; this keeps the two paths saying the same thing.
+  if (wt === "date") return "date";
   if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location"].includes(wt)) return "choice";
   return null;
 }
@@ -1850,10 +1858,11 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
   const byKind = { choice: [], text: [] };
   const idToKey = new Map();
   const seen = new Set();
-  let cached = 0, dup = 0, noOptions = 0, capped = 0, n = 0;
+  let cached = 0, dup = 0, noOptions = 0, capped = 0, unbatched = 0, n = 0;
   for (const d of deferred) {
     if (cache.has(d.qKey)) { cached++; continue; }         // an earlier cascade round already answered this question
     if (seen.has(d.qKey)) { dup++; continue; }              // same question twice on one page
+    if (!byKind[d.kind]) { unbatched++; continue; }          // a kind with no batch group (date) — its own call
     // A choice question with nothing to choose from is not answerable — the commit pass re-reads the
     // widget and reports it honestly. Asking about it would only spend tokens.
     if (d.kind === "choice" && !d.options.length) { noOptions++; continue; }
@@ -1864,7 +1873,7 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
     const id = "q" + (++n);
     seen.add(d.qKey);
     idToKey.set(id, d.qKey);
-    (byKind[d.kind] || byKind.choice).push({ id, kind: d.kind, question: d.label, options: d.kind === "choice" ? d.options : null });
+    byKind[d.kind].push({ id, kind: d.kind, question: d.label, options: d.kind === "choice" ? d.options : null });
   }
   if (capped) {
     try { console.log(`[ApplyPilot][ATS-FILL] AI batch capped at ${ATS_AI_BATCH_MAX} — ${capped} question(s) will make their own call`); } catch (e) { /* log only */ }

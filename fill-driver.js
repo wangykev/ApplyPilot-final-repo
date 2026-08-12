@@ -1399,11 +1399,24 @@ async function collectAiBatchItems(act, fields, profile, budgets, known, bucketI
   const plan = planAiBatchCandidates(fields, profile, known, bucketIndex, empCompany);
   const recon = { planned: plan.length, plannedKeys: plan.map((c) => c.kind + ":" + c.key),
     needOpen: plan.filter((c) => c.needsOpen).length, opened: 0, openFailed: [], dropped: [], ms: 0 };
-  // THE COUNT GATE: a batch needs 2+ questions to be worth anything, and that is knowable before any
-  // page contact. One candidate ⇒ spend nothing and let it make its own call.
-  if (plan.length < 2) { recon.dropped.push("fewer than 2 candidates — no page contact"); recon.ms = Date.now() - t0; return { items: [], recon }; }
+  // THE COUNT GATE, NOW PER ROUTE (2026-08-12): a batch needs 2+ questions OF THE SAME KIND to be
+  // worth anything, because picks and prose go out as separate calls on separate routes (see the fire
+  // site). `plan.length >= 2` is no longer sufficient — **1 dropdown + 1 text is two candidates and
+  // ZERO batches**, and believing otherwise would open that dropdown to fill a prompt nobody sends:
+  // exactly the ~333ms-for-a-call-that-never-happened this gate was added to prevent.
+  // All of it is still knowable before any page contact.
+  const opens = plan.filter((c) => c.needsOpen);     // dropdowns — the only kind that costs an open
+  const free = plan.filter((c) => !c.needsOpen);     // text — no options, so no page contact at all
+  const willOpen = opens.length >= 2;
+  const willText = free.length >= 2;
+  if (!willOpen && !willText) { recon.dropped.push("no kind reaches 2 candidates — no page contact"); recon.ms = Date.now() - t0; return { items: [], recon }; }
+  if (!willOpen && opens.length) recon.dropped.push(`${opens.length} dropdown(s) left to their own call — that route cannot batch`);
+  if (!willText && free.length) recon.dropped.push(`${free.length} text question(s) left to their own call — that route cannot batch`);
   const items = [];
   for (const c of plan) {
+    // Only carry a candidate whose OWN route will actually fire; anything else keeps its per-field
+    // call, and a dropdown in that position must not be opened for a prompt it will never be in.
+    if (c.needsOpen ? !willOpen : !willText) continue;
     if (!c.needsOpen) { items.push({ key: c.key, kind: c.kind, label: c.label, options: c.options, stated: c.stated }); continue; }
     const loc = { wrapperSel: c.wrapperSel };
     let before = null;
