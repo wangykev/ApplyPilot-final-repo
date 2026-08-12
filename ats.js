@@ -1618,8 +1618,12 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const results = [];
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
+  // ONE AI answer cache for the whole page, keyed by normalized QUESTION — so a field a cascade
+  // round re-mounts under a new automation-id reuses the answer we already paid for, and cannot
+  // be given a second, contradicting one.
+  const fillOpts = Object.assign({}, o, { aiCache: (o && o.aiCache) || new Map() });
 
-  await atsFillFields(act, ats, scan, scan.fields, results, profile, defaults, jc, bucketIndex, o);
+  await atsFillFields(act, ats, scan, scan.fields, results, profile, defaults, jc, bucketIndex, fillOpts);
 
   // CASCADE RE-SCAN (the Workday M1 pattern, earned again 2026-07-31 on Ramp): these SPAs
   // mount sections in BURSTS, and even a 3-consecutive-reads settle can catch a pause —
@@ -1636,78 +1640,233 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     if (!fresh.length) break;
     try { console.log(`[ApplyPilot][ATS-FILL] cascade round ${round + 1}: ${fresh.length} late-mounted field(s) — ${fresh.map((f) => f.fieldName).slice(0, 6).join(", ")}`); } catch (e) { /* log */ }
     const before = results.length;
-    await atsFillFields(act, ats, rescan, fresh, results, profile, defaults, jc, bucketIndex, o);
+    await atsFillFields(act, ats, rescan, fresh, results, profile, defaults, jc, bucketIndex, fillOpts);
     for (let i = before; i < results.length; i++) results[i].cascadeRevealed = true;
   }
 
   return await atsFinishFill(act, ats, scan, results);
 }
 
-// The per-field fill loop — extracted so the cascade pass runs the IDENTICAL ladder.
-// AI free-text answers are the DOMINANT cost on a form full of custom questions, and the cost is
-// serialization rather than any single slow call. Measured live 2026-08-05 on Shield AI (Lever): 7
-// calls of 1630/3241/3005/3098/5215/5227/4799ms = 26.2s of a 32.6s fill — 80%. Compare Ashby's 2
-// calls (1.4s, 7%): same code, different question count.
+// ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
 //
-// The DECISION for a free-text field needs the label, the profile and the JD — no DOM at all — so
-// those calls can run CONCURRENTLY before the loop touches the page, and the loop then actuates with
-// answers already in hand. CHOICE fields are deliberately NOT prefetched: their prompt must carry the
-// widget's LIVE options, which means opening it first.
+// The deterministic pass runs FIRST and to completion. Every field it could not answer is
+// RECORDED rather than asked about; once the page is otherwise done the recorded questions go
+// out in ONE call, and a second actuation pass fills them.
 //
-// Bounded concurrency, because a burst of N is how a free-tier key earns a 429 (which would be slower
-// than serial, not faster). Every safety property is untouched: the same answer goes through the same
-// commit + read-back + ALWAYS-flagged path; only the moment the call is issued changes. A prefetch
-// miss simply leaves the loop to make its own call.
-const ATS_AI_PREFETCH_CONCURRENCY = 4;
-// CHOICE questions can be prefetched too — when their options are already known WITHOUT touching the
-// page. Radio / yes-no / checkbox-group options come from the SCAN (only a combobox has to be opened
-// to be read), so their decisions need no DOM either. That is exactly the shape that dominated the
-// Lever measurement: all 7 slow calls were `cards[…]` RADIOS, and each waited for the one before it.
-// A combobox is deliberately left serial — its prompt must carry the widget's LIVE options.
-const ATS_PREFETCH_CHOICE_WIDGETS = ["radio", "yesno", "checkbox_group"];
-function atsPrefetchKind(f) {
-  if (!f) return null;
-  if (f.widgetType === "text" || f.widgetType === "textarea") return "text";
-  if (ATS_PREFETCH_CHOICE_WIDGETS.includes(f.widgetType) && (f.options || []).length) return "choice";
+// ⚠ THIS IS THE OPPOSITE ORDER TO WORKDAY'S `aiBatch` (fill-driver.js ~4180) — do not "unify"
+// them. Workday fires its batch BEFORE the deterministic pass so the two overlap in time, which
+// makes it a speculative CACHE (a question it misses simply makes its own call) and forces it to
+// PREDICT which fields the deterministic tiers will fail to answer — every misprediction is
+// prompt tokens spent on a question that was already answered. Here the deterministic outcome is
+// already KNOWN, so the call asks about exactly the fields that need it and nothing else. That is
+// strictly cheaper, and it buys it with something Workday's cache does not have: a real second
+// actuation pass.
+//
+// WHAT THIS REPLACES: N concurrent per-field calls (4 at a time). Concurrency hid latency but
+// still spent N REQUESTS, and rotation does not spread them — a free-tier Gemini key meters
+// 15 requests/MINUTE and rotation only advances on FAILURE, so a 7-question page burned half of
+// one key's minute (round 9, docs/fill-speed-log.md). One call per page is the quota fix as much
+// as the latency one, and it also ends the speculation: nothing is asked about a field the
+// deterministic pass answered.
+//
+// CACHED BY QUESTION, never by automation-id. The cascade rounds re-enter this function with
+// late-mounted fields, and the same question appearing again must reuse the first answer rather
+// than pay for — and possibly CONTRADICT — a second one. `normalizeLabel` is the same key the
+// bucket index uses.
+//
+// SAFETY IS UNCHANGED, and deliberately so: a batched answer enters through the SAME seam the old
+// prefetch used — `atsAiFallback`'s `prefetched` argument. It is still only a CANDIDATE that must
+// clear the match ladder against the LIVE options read at commit time, still read-back verified,
+// still ALWAYS `filled_review` + flagged. A batch that fails, parses badly, or omits a question
+// leaves that field to make its own call, exactly as a prefetch miss did.
+const ATS_AI_BATCH_MAX = 24;   // same reasoning as fill-driver's AI_BATCH_MAX: past this the reply stops being reliable
+
+// Which AI shape does this field need? `null` = not an AI field.
+// text/textarea/date answer in prose (atsAiWriteText's contract); everything else picks an option.
+function atsAiBatchKind(f) {
+  const wt = f && f.widgetType;
+  if (wt === "text" || wt === "textarea" || wt === "date") return "text";
+  if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location"].includes(wt)) return "choice";
   return null;
 }
-async function atsPrefetchAiText(act, ats, fields, profile, defaults, jc, bucketIndex) {
+
+// Open a combobox and poll its option list. Extracted from atsAiFallback so the DEFER pass and
+// the commit pass read the list the same way — read-first, then poll adaptively, and never treat
+// an empty menu as an answer while the widget still reports `loading` (the Discord school-picker
+// lesson: "No options" at 4ms, "Loading..." at 24ms, the real answer at 4049ms).
+async function atsOpenAndPollOptions(act, ref) {
+  await act.eval(atsInjOpenAndReadOptions, ref.inputSel);
+  const optDeadline = Date.now() + ATS_POLL.open;
+  const optCeiling = Date.now() + ATS_POLL.openCeil;
+  for (;;) {
+    const read = await act.eval(atsInjReadOptions, ref.inputSel);
+    const texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+    const now = Date.now();
+    if (texts.length || now >= optCeiling || (now >= optDeadline && !(read && read.loading))) return texts;
+    await act.delayFull(150); // real interval — see pollFor's note on starving the renderer
+  }
+}
+
+// Close a menu the DEFER pass opened only to read, and CONFIRM it closed. The Workday rule
+// ("every dropdown close confirms the portaled options are GONE, not merely aria-expanded") applies
+// for the same reason here: a react-select menu left mounted still swallows clicks aimed at the
+// next widget. Cheap — one read, and one retry before giving up and saying so.
+async function atsCloseComboConfirmed(act, ref) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { await act.eval(atsInjCloseCombo, ref.inputSel); } catch (e) { return false; }
+    let read = null;
+    try { read = await act.eval(atsInjReadOptions, ref.inputSel); } catch (e) { return false; }
+    if (!read || !read.open || !((read.options || []).length)) return true;
+    await act.delayFull(120);
+  }
+  return false;
+}
+
+// Same option list, order-insensitive — "did the AI choose from what the form is showing NOW?"
+function atsSameOptionSet(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+  // NEWLINE, not a space: `normalize` collapses every whitespace run to a single space, so an
+  // option can contain spaces and ["a b"] would otherwise key the same as ["a","b"] — but no
+  // normalized option can contain a newline, so this separator cannot be forged.
+  const key = (arr) => arr.map((s) => atsLib.normalize(String(s == null ? "" : s))).sort().join("\n");
+  return key(a) === key(b);
+}
+
+// The batched prompt. TWO kinds in one call, because an ATS page mixes screening dropdowns with
+// "why do you want to work here" boxes and both are deferred by the same rule. Each kind keeps the
+// contract its single-call twin (atsAiChooseOption / atsAiWriteText) already states, so an answer
+// arriving by batch is indistinguishable downstream from one that came from its own call.
+function atsBuildBatchPrompt(items, profile, jobContext) {
+  const system = "You help an applicant fill out ONE job-application page. You are given the applicant's profile (JSON) and SEVERAL questions at once. Answer EVERY question, keyed by its id.\n" +
+    "Each question has a \"kind\":\n" +
+    "  • \"choice\" — put EXACTLY ONE of that question's \"options\", VERBATIM, in the \"choice\" field. These are REQUIRED questions: always choose the most likely option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education or enrollment dates, criminal/background answers from the ABSENCE of any such record). NEVER refuse, never answer UNKNOWN, and never write an option that is not in that question's list.\n" +
+    "  • \"text\" — write the answer as free text in the \"answer\" field, in the applicant's own plain, professional first-person voice. If the question wants a factual answer the profile clearly holds, give it concisely. Use null for \"answer\" ONLY if you have no basis at all.\n" +
+    "For every answer give a SHORT justification — one terse phrase, about 12 words, no preamble, no restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give confidence: High, Medium, or Low. " +
+    "ALSO map each question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
+  const style = ((profile || {}).application_questions || {}).writing_style || "";
+  const qs = items.map((it) => (it.kind === "choice"
+    ? { id: it.id, kind: "choice", question: it.question, options: it.options }
+    : { id: it.id, kind: "text", question: it.question }));
+  const user = "QUESTIONS: " + JSON.stringify(qs) +
+    "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
+    (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
+    (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground free-text answers in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
+    (style ? "\nSTYLE RULES for free-text answers: " + style : "") +
+    "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000) +
+    "\n\nReply ONLY with a JSON object and nothing else, one entry per question id:\n" +
+    "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<verbatim option — kind=choice only>\",\"answer\":\"<free text — kind=text only>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
+  return { system, user };
+}
+
+// Room for the reply. A cap is not a spend — it only bounds what the model MAY produce — but it has
+// to be per-KIND here: a choice answer is ~70-80 tokens (fill-driver budgets 400 for 5x headroom)
+// while a free-text answer is a paragraph (the single-call path allows 700).
+function atsBatchMaxTokens(items) {
+  const texts = items.filter((i) => i.kind === "text").length;
+  return 512 + 400 * (items.length - texts) + 700 * texts;
+}
+
+// Sibling of fill-driver's `parseBatchAiReply` — same latitude with ```-fences, embedded JSON and an
+// object-keyed-by-id shape instead of the asked-for array. NOT shared with it, because this reply
+// carries TWO answer kinds and each is validated for the kind it was ASKED about: a "choice" that
+// comes back as prose is not a pick, and a "text" that comes back empty is the AI declining (which
+// has its own N/A path downstream). An id we never asked about, or an answer of the wrong shape,
+// simply yields no entry — and that field then makes its own call.
+// Returns Map id → the SAME answer object shape atsAiChooseOption / atsAiWriteText return.
+function atsParseBatchReply(text, items) {
   const out = new Map();
-  if (!act || !act.aiEnabled || !Array.isArray(fields)) return out;
-  const eligible = fields.filter((f) => {
-    if (!f || !f.isRequired) return false;
-    if (!atsPrefetchKind(f)) return false;
-    if (f.value != null && String(f.value).trim() !== "") return false; // already answered on the form
-    let route = null;
-    try { route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex); } catch (e) { return false; }
-    if (!route) return true;                       // nothing deterministic → the loop will ask the AI
-    if (route.kind) return false;                  // resume/skip/dial/location/employment — not AI text
-    const hasValue = route.value != null || route.raw !== undefined || (route.candidates && route.candidates.length);
-    return !hasValue;
-  });
-  if (!eligible.length) return out;
-  const kinds = eligible.reduce((m, f) => { const k = atsPrefetchKind(f); m[k] = (m[k] || 0) + 1; return m; }, {});
-  try { console.log(`[ApplyPilot][ATS-FILL] prefetching ${eligible.length} AI answer(s) concurrently (${ATS_AI_PREFETCH_CONCURRENCY} at a time) — ${kinds.text || 0} text, ${kinds.choice || 0} choice`); } catch (e) { /* log only */ }
-  let i = 0;
-  const worker = async () => {
-    for (;;) {
-      const f = eligible[i++];
-      if (!f) return;
-      try {
-        const ai = atsPrefetchKind(f) === "choice"
-          ? await atsAiChooseOption(act, f, f.options || [], profile, jc)
-          : await atsAiWriteText(act, f, profile, jc);
-        if (ai) out.set(f.fieldName, ai);
-      } catch (e) { /* the loop falls back to its own call */ }
+  const byId = new Map((items || []).map((i) => [i.id, i]));
+  const t = String(text == null ? "" : text).trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  let obj = null;
+  try { obj = JSON.parse(t); } catch (e) {
+    const m = t.match(/\{[\s\S]*\}/);
+    if (m) { try { obj = JSON.parse(m[0]); } catch (e2) { return out; } }
+  }
+  if (!obj || typeof obj !== "object") return out;
+  const take = (id, a) => {
+    if (!a || typeof a !== "object") return;
+    const it = byId.get(String(id == null ? "" : id));
+    if (!it || out.has(it.id)) return;
+    if (it.kind === "text") {
+      // atsAiWriteText's shape exactly, including its FIXED "Low" confidence — an AI-written
+      // paragraph is never high-confidence, and the record/bundle expect that value.
+      const answer = a.answer == null ? "" : String(a.answer).trim();
+      if (!answer) return;
+      out.set(it.id, { ok: true, answer, confidence: "Low",
+        justification: a.justification == null || !String(a.justification).trim() ? "generated from profile" : String(a.justification) });
+      return;
     }
+    const choice = a.choice == null ? "" : String(a.choice).trim();
+    if (!choice) return;
+    // atsAiChooseOption's shape, plus the list the question was ASKED with — the commit pass
+    // reuses this answer only if the form is still showing that same list (see atsAiFallback).
+    out.set(it.id, { ok: true, choice,
+      justification: a.justification == null ? "" : String(a.justification),
+      confidence: a.confidence == null || !String(a.confidence).trim() ? "Low" : String(a.confidence),
+      maps_to: a.maps_to == null ? "" : String(a.maps_to),
+      suggested_category: a.suggested_category == null ? "" : String(a.suggested_category),
+      promptOptions: it.options || [] });
   };
-  await Promise.all(Array.from({ length: Math.min(ATS_AI_PREFETCH_CONCURRENCY, eligible.length) }, worker));
+  if (Array.isArray(obj.answers)) obj.answers.forEach((a) => take(a && a.id, a));
+  else if (Array.isArray(obj)) obj.forEach((a) => take(a && a.id, a));
+  else for (const k of Object.keys(obj)) take(k, obj[k]);
   return out;
 }
 
+// Fire the ONE call for everything the deterministic pass deferred, and fold the answers into the
+// page-level cache (key = normalized QUESTION). Never throws: every failure mode simply leaves the
+// cache without that question, and the commit pass then makes its own per-field call.
+async function atsRunAiBatch(act, deferred, profile, jc, cache) {
+  const items = [];
+  const idToKey = new Map();
+  let cached = 0, dup = 0, noOptions = 0, capped = 0;
+  for (const d of deferred) {
+    if (cache.has(d.qKey)) { cached++; continue; }         // an earlier cascade round already answered this question
+    if (idToKey.size && [...idToKey.values()].includes(d.qKey)) { dup++; continue; } // same question twice on one page
+    // A choice question with nothing to choose from is not answerable — the commit pass re-reads the
+    // widget and reports it honestly. Asking about it would only spend tokens.
+    if (d.kind === "choice" && !d.options.length) { noOptions++; continue; }
+    if (items.length >= ATS_AI_BATCH_MAX) { capped++; continue; }
+    // SHORT SYNTHETIC IDS, not the question text: a long id invites the model to paraphrase it, and
+    // an id that comes back paraphrased is an answer we throw away.
+    const id = "q" + (items.length + 1);
+    idToKey.set(id, d.qKey);
+    items.push({ id, kind: d.kind, question: d.label, options: d.kind === "choice" ? d.options : null });
+  }
+  if (capped) {
+    try { console.log(`[ApplyPilot][ATS-FILL] AI batch capped at ${ATS_AI_BATCH_MAX} — ${capped} question(s) will make their own call`); } catch (e) { /* log only */ }
+  }
+  // ONE question is not a batch: the same single request, wrapped in a prompt whose parse can fail.
+  // Leave it to its own path, unchanged (the rule fill-driver's aiBatch already applies).
+  if (items.length < 2) {
+    return { fired: false, items: items.length, answers: 0, cached, dup, noOptions, capped };
+  }
+  const { system, user } = atsBuildBatchPrompt(items, profile, jc);
+  const kinds = items.reduce((m, i) => { m[i.kind] = (m[i.kind] || 0) + 1; return m; }, {});
+  try { console.log(`[ApplyPilot][ATS-FILL] AI batch: ${items.length} deferred question(s) in ONE call (${kinds.choice || 0} choice, ${kinds.text || 0} text; cap ${atsBatchMaxTokens(items)} tokens)${cached ? ` · ${cached} already cached` : ""}`); } catch (e) { /* log only */ }
+  let res = null;
+  try { res = await act.llm({ system, user, maxTokens: atsBatchMaxTokens(items) }); }
+  catch (e) { res = { ok: false, error: String((e && e.message) || e) }; }
+  if (!res || !res.ok) {
+    try { console.log(`[ApplyPilot][ATS-FILL] AI batch FAILED (${(res && res.error) || "no reply"}) — each question falls back to its own call`); } catch (e) { /* log only */ }
+    return { fired: true, items: items.length, answers: 0, cached, dup, noOptions, capped, error: (res && res.error) || "no reply" };
+  }
+  const parsed = atsParseBatchReply(res.text, items);
+  for (const [id, ans] of parsed) cache.set(idToKey.get(id), ans);
+  if (parsed.size < items.length) {
+    try { console.log(`[ApplyPilot][ATS-FILL] AI batch answered ${parsed.size}/${items.length} — the rest fall back to their own call`); } catch (e) { /* log only */ }
+  }
+  return { fired: true, items: items.length, answers: parsed.size, cached, dup, noOptions, capped };
+}
+
+// The per-field fill loop — extracted so the cascade pass runs the IDENTICAL ladder. THREE phases
+// (see the DEFERRED AI block above): fill deterministically and record what needs the AI → ONE call
+// for exactly those questions → a second actuation pass that fills them.
 async function atsFillFields(act, ats, scan, fields, results, profile, defaults, jc, bucketIndex, o) {
-  // fire the free-text AI calls now, concurrently, while the page is untouched (see atsPrefetchAiText)
-  const aiPre = o && o.valueFor ? new Map() : await atsPrefetchAiText(act, ats, fields, profile, defaults, jc, bucketIndex);
+  // Page-level, so a question repeated by a cascade round costs ZERO further calls (keyed by
+  // QUESTION, not automation-id). Absent (a direct call, a test) ⇒ this loop keeps its own.
+  const aiCache = (o && o.aiCache) || new Map();
+  const deferred = [];
   for (const f of fields) {
     const rec = {
       fieldName: f.fieldName, label: f.label, widgetType: ATS_REVIEW_WIDGET[f.widgetType] || f.widgetType,
@@ -1843,8 +2002,38 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       if (!produced) {
         // Deterministic tiers produced nothing. AI fallback — REQUIRED fields only (the
         // operator rule: an optional blank costs nothing; a required blank blocks submit).
-        if (f.isRequired && act.aiEnabled && ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "textarea", "text", "location", "date"].includes(f.widgetType)) {
-          await atsAiFallback(act, ats, f, ref, rec, jc, profile, aiPre.get(f.fieldName) || null);
+        const aiKind = f.isRequired && act.aiEnabled ? atsAiBatchKind(f) : null;
+        if (aiKind) {
+          // DEFER, don't ask. Record everything the question needs and move on; the batch below
+          // asks about all of them at once and the commit pass actuates them.
+          const d = { f, ref, rec, kind: aiKind, options: [], label: rec.label || f.fieldName };
+          d.qKey = atsLib.normalizeLabel(d.label);
+          if (aiKind === "choice") {
+            // Options the SCAN already carries (radio / yes-no / checkbox-group / native select) are
+            // free. A react-select combobox has to be OPENED to be read — and then CLOSED again,
+            // because nothing is committed here. That open is the one cost this ordering adds, and
+            // it is paid once: today's per-field path opened the menu and then held it open across
+            // the whole LLM call, which is both longer and more fragile.
+            // ⚠ NOT `location`: a places box has no list until something is TYPED, so an empty-query
+            // open can only ever return nothing. Reading it here would be a guaranteed-wasted open on
+            // the single most expensive widget on this path (candidate-location spans 7.1-20.3s on
+            // ONE posting — round 9, docs/fill-speed-log.md). It goes to the commit pass unbatched,
+            // which handles it exactly as before.
+            d.options = (f.options || []).slice();
+            if (!d.options.length && ["select", "dial"].includes(f.widgetType)) {
+              try {
+                d.options = await atsOpenAndPollOptions(act, ref);
+                if (!(await atsCloseComboConfirmed(act, ref))) {
+                  try { console.log(`[ApplyPilot][ATS-FILL] ${rec.fieldName}: menu still open after the deferred option read`); } catch (e) { /* log only */ }
+                }
+              } catch (e) { d.options = []; }   // the commit pass re-reads and reports it honestly
+            }
+          }
+          deferred.push(d);
+          // PROVISIONAL — phase 3 overwrites both, so neither ever reaches a review bundle. The
+          // record is pushed HERE, in the loop, so REVIEW ORDER stays FORM ORDER.
+          rec.status = "deferred_ai";
+          rec.detail = "deferred to this page's one AI call";
         } else if (rec.status == null) {
           // A STATED value that the form couldn't take is NOT "blank is fine" (live 2026-07-31,
           // Discord: the profile says "Bachelor of Science", the form offers "Bachelor's Degree",
@@ -1878,6 +2067,44 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
     }
     results.push(fin());
   }
+
+  if (!deferred.length) return;
+
+  // ── PHASE 2: ONE call for everything the deterministic pass could not answer ─────────────
+  // Never fatal: a batch that cannot even be BUILT must not cost the page its deferred fields —
+  // they each make their own call below, which is exactly the pre-batch behaviour.
+  let batch = { fired: false, items: 0, answers: 0 };
+  try { batch = await atsRunAiBatch(act, deferred, profile, jc, aiCache); }
+  catch (e) { try { console.log(`[ApplyPilot][ATS-FILL] AI batch threw (${String((e && e.message) || e)}) — every deferred question falls back to its own call`); } catch (e2) { /* log only */ } }
+
+  // ── PHASE 3: the second actuation pass ───────────────────────────────────────────────────
+  // Nothing new here — each deferred field goes through the SAME atsAiFallback the per-field path
+  // always used, with the batched answer handed in as its `prefetched`. So the match ladder vs the
+  // LIVE options, the read-back, the decline fallback and the always-flagged rule are untouched,
+  // and a question the batch did not answer simply makes its own call inside it.
+  let served = 0, fellBack = 0;
+  for (const d of deferred) {
+    const answer = aiCache.get(d.qKey) || null;
+    if (answer) served++; else fellBack++;
+    const t0 = Date.now();
+    try { await act.eval(atsInjScrollIntoView, d.ref.inputSel); } catch (e) { /* a field we cannot scroll to still fills */ }
+    try {
+      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, profile, answer);
+    } catch (e) {
+      d.rec.status = "needs_review";
+      d.rec.detail = "AI commit pass exception: " + String((e && e.message) || e);
+    }
+    // The record already carries phase 1's cost; this pass is the rest of the SAME field's time,
+    // so [ATS-TIME]'s slowest-field list keeps naming the field rather than a phantom.
+    d.rec.elapsedMs = (d.rec.elapsedMs || 0) + (Date.now() - t0);
+    try {
+      console.log(`[ApplyPilot][ATS-FILL] ${d.rec.fieldName} (${d.rec.widgetType}${d.rec.isRequired ? ", req" : ""}) → ${d.rec.status}${d.rec.flag ? " · " + d.rec.flag : ""}${d.rec.after != null ? " · after=" + JSON.stringify(String(d.rec.after).slice(0, 60)) : ""} · ${d.rec.elapsedMs}ms · ${answer ? "from the batched call" : "own call"}${d.rec.detail ? " · " + d.rec.detail : ""}`);
+    } catch (e) { /* log only */ }
+  }
+  try {
+    console.log(`[ApplyPilot][ATS-FILL] AI pass done: ${deferred.length} deferred · ${served} served by the batch · ${fellBack} made their own call` +
+      (batch.fired ? ` (batch asked ${batch.items}, answered ${batch.answers})` : ` (no batch — ${batch.items} askable question(s))`));
+  } catch (e) { /* log only */ }
 }
 
 // The audit + envelope — extracted with the loop (see atsFillFields).
@@ -2721,22 +2948,11 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       return;
     }
     if (wt === "select" || wt === "dial" || wt === "location" || wt === "dropdown_native") {
-      if (wt !== "dropdown_native") {
-        await act.eval(atsInjOpenAndReadOptions, ref.inputSel);
-        // read-first, then poll adaptively (same rule as the deterministic path) — a one-shot
-        // read after a flat wait both over-waits an open menu and under-waits a slow one
-        const optDeadline = Date.now() + ATS_POLL.open;
-        const optCeiling = Date.now() + ATS_POLL.openCeil;
-        for (;;) {
-          const read = await act.eval(atsInjReadOptions, ref.inputSel);
-          texts = ((read && read.options) || []).filter((o) => !o.disabled).map((o) => o.text);
-          const now = Date.now();
-          // …and an empty menu is not an answer while the widget is still FETCHING (2026-08-04);
-          // giving up here is what strands a required field with "no live options to choose from".
-          if (texts.length || now >= optCeiling || (now >= optDeadline && !(read && read.loading))) break;
-          await act.delayFull(150); // real interval — see pollFor's note on starving the renderer
-        }
-      }
+      // read-first, then poll adaptively (same rule as the deterministic path) — a one-shot read
+      // after a flat wait both over-waits an open menu and under-waits a slow one. ⚠ THIS READ IS
+      // NOT OPTIONAL EVEN WHEN THE ANSWER WAS BATCHED: the menu has to be OPEN for the commit
+      // anyway, and the answer must be matched against what the form is showing NOW.
+      if (wt !== "dropdown_native") texts = await atsOpenAndPollOptions(act, ref);
     }
     if (!texts.length) { rec.status = "needs_review"; rec.detail = "AI fallback: no live options to choose from"; return; }
     // ATTACH THE LIVE OPTIONS NOW, before any early return. A choice field that reaches review
@@ -2763,10 +2979,12 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       rec.detail = why + " — chose this form's own " + JSON.stringify(dec) + " so it cannot block the submit; change it here if you would rather answer" + (ok ? "" : " (commit failed)");
       return ok;
     };
-    // a prefetched decision (atsPrefetchAiText) was made against the SAME options the scan reported,
-    // so it is only reused when the live read agrees with that list — otherwise ask again, because the
-    // AI must always choose from what the form is actually showing.
-    const preUsable = prefetched && Array.isArray(f.options) && f.options.length === texts.length;
+    // A batched decision was made against a SPECIFIC option list — the one the defer pass recorded,
+    // carried on the answer as `promptOptions`. Reuse it only when the form is showing that same
+    // list NOW; anything else (a cascade, a re-render, a server-backed list that answered
+    // differently) re-asks, because the AI must always choose from what the form is actually
+    // showing. Order-insensitive: react-select is free to reorder a list it did not change.
+    const preUsable = !!(prefetched && atsSameOptionSet(prefetched.promptOptions, texts));
     const ai = preUsable ? prefetched : await atsAiChooseOption(act, f, texts, profile, jobContext);
     if (!ai.ok) { await declineFallback("no grounded answer for this REQUIRED question (" + ai.error + ")"); return; }
     const m = atsLib.matchCandidates([ai.choice], texts, { containment: true });
@@ -2817,6 +3035,8 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
+    ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
+    atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
