@@ -2087,6 +2087,19 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     for (let i = before; i < results.length; i++) results[i].cascadeRevealed = true;
   }
 
+  // CREDENTIAL RE-CHECK — after the cascade rounds (so every re-render has happened) but BEFORE the
+  // read-only option capture. ⚠ It used to run dead last, and the operator watching a live fill saw
+  // the password box get written "at the very end" when it sits at the TOP of the page (2026-08-12).
+  // That late write is the REPAIR, not the fill — the fill happens in page order with everything
+  // else — but ordering the visible actuation like the page reads is worth more than the handful of
+  // extra seconds of settling that came from sitting behind the option scrape, which touches no
+  // credential field and so cannot be what clobbers one.
+  try {
+    await atsGenericCredentialRecheck(act, ats, scan, results, o && o.credentials);
+  } catch (e) {
+    try { console.log("[ApplyPilot][ATS-FILL] credential re-check skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
+  }
+
   // REVIEW PICKER (generic only): a choice field we neither filled nor deferred has no options, and
   // that is precisely the field an operator needs a picker for. No-op for the supported families.
   try {
@@ -2096,13 +2109,6 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     }
   } catch (e) {
     try { console.log("[ApplyPilot][ATS-FILL] review-picker capture skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
-  }
-
-  // LAST — after the cascade rounds and the option capture, so anything that re-renders already has.
-  try {
-    await atsGenericCredentialRecheck(act, ats, scan, results, o && o.credentials);
-  } catch (e) {
-    try { console.log("[ApplyPilot][ATS-FILL] credential re-check skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
   }
 
   return await atsFinishFill(act, ats, scan, results);

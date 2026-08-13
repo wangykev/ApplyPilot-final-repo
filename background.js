@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "gate-reload-poll-19";
+const AP_BUILD_MARKER = "no-worker-overrides-20";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4737,7 +4737,16 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // fetched and every document the run touches starts with it. That costs NOTHING — it is the same
     // single navigation the run always made, just moved to after the install. A reload here would have
     // worked too and was rejected for being a second page load.
-    await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
+    // ⚠ A VISIBLE RUN DOES NOT GET THE WORKER-TIMER / CSP-BYPASS HALF (2026-08-12). Those two exist
+    // only to unthrottle a HIDDEN tab's timers — a visible tab already runs full speed, so they buy
+    // nothing — and they demonstrably break an auth page: with them on, iCIMS' login refused a
+    // trusted click, a trusted Enter, an in-page click AND `form.requestSubmit()`, while the same
+    // page in an ordinary tab advanced on one plain click. Turning them off took onboarding from
+    // 1-of-3 and 3-of-4 to 3-of-3. The rAF/hasFocus patches stay on in both cases; a HIDDEN run keeps
+    // the full set, where the speed matters and the login-gate ladder is the mitigation.
+    const visibleRun = await cdpVisible().catch(() => false);
+    await cdpInstallPageOverrides({ noWorkerTimers: visibleRun });
+    LOG(`page overrides: ${visibleRun ? "VISIBLE run — worker-timers/CSP-bypass skipped (they break auth pages and buy nothing here)" : "hidden run — full override set"}`);
     await cdpSetFocusEmulation(true).catch(() => {});
     // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
     // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an

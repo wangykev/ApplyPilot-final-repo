@@ -684,9 +684,15 @@ function buildOverrideSrc(opts) {
 // SPA doc, then read back whether worker-timers took. Best-effort: an install failure
 // logs and is swallowed — it must NEVER abort a run (the fill already works hidden;
 // this helps page-to-page advancement AND, via worker-timers, hidden-run SPEED).
-async function cdpInstallPageOverrides() {
-  let forceNoWorker = false;
-  try { const { forceWorkerTimersOff } = await new Promise((r) => chrome.storage.local.get("forceWorkerTimersOff", r)); forceNoWorker = !!forceWorkerTimersOff; } catch (e) { /* default OFF */ }
+// `opts.noWorkerTimers` skips the CSP-bypass + blob-worker-timer half, leaving only the rAF/hasFocus
+// patches. Those two exist SOLELY to unthrottle a HIDDEN tab's timers, so a caller that knows the tab
+// is visible gains nothing from them — and they are not free: with both on, iCIMS' login form refused
+// every submit path we have (trusted click, trusted Enter, in-page click, form.requestSubmit) while
+// the same page in an ordinary tab advanced on one plain click. Measured 2026-08-12: 3-of-3 runs
+// reached the form with them off, against 3-of-4 and 1-of-3 with them on.
+async function cdpInstallPageOverrides(opts) {
+  let forceNoWorker = !!(opts && opts.noWorkerTimers);
+  try { const { forceWorkerTimersOff } = await new Promise((r) => chrome.storage.local.get("forceWorkerTimersOff", r)); forceNoWorker = forceNoWorker || !!forceWorkerTimersOff; } catch (e) { /* default OFF */ }
   // CSP BYPASS (2026-07-25 — the wd3.myworkdaysite.com slow-run diagnosis): a tenant whose CSP blocks
   // blob: workers silently killed the WHOLE fast hidden path — the worker-timers install threw, the
   // readback stayed false, and every page-side debounce/render quantized to the ~1Hz throttle (the
