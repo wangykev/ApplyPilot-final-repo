@@ -1744,3 +1744,71 @@ test("the résumé pre-pass is GENERIC-ONLY and never runs on a replay", () => {
   assert.ok(/ats === "generic" && !o\.valueFor/.test(src),
     'the pre-pass must be gated on ats === "generic" && !o.valueFor');
 });
+
+// ── THE AI ONLY SEES ITS OWN ENTRY (operator, 2026-08-12) ───────────────────────────────────
+// "if inside education it asks for state and city, it should only look for values in the profile
+// repeating section for education… education 0 to AI for the education 0 field, and education 1, AI
+// only gets education 1 … so it can determine that carnegie mellon is in pittsburgh rather than
+// following the tallahassee answer from a different part of my profile."
+// Live, `EducationCity → ai-text · "Tallahassee" · AI: "City is listed in personal info address."`
+// The model was not hallucinating — it was shown a fact that had no business being in front of it.
+const SCOPE_PROFILE = {
+  personal_info: { city: "Tallahassee", state_province: "Florida", email: "wangykev@gmail.com" },
+  education: [
+    { school_or_university: "Carnegie Mellon University", degree: "Bachelor of Science", currently_enrolled: true },
+    { school_or_university: "Some Other College", degree: "Associate", to: "2020" },
+  ],
+  work_experience: [{ company: "Acme", title: "Intern" }],
+};
+
+test("⚠ AI scope: an education field's profile view holds ONLY that entry — no home city at all", () => {
+  const f = { fieldName: "-1_CandProfileFields.EducationCity", label: "City", sectionHeading: "Education", entryOrdinal: 0 };
+  const view = ats.atsGenericProfileForAi(SCOPE_PROFILE, f);
+  assert.deepStrictEqual(Object.keys(view), ["education"], "nothing but the education section reaches the model");
+  assert.strictEqual(view.education.length, 1, "and only ONE entry");
+  assert.strictEqual(view.education[0].school_or_university, "Carnegie Mellon University");
+  // the actual defect: the home city must be UNREACHABLE, not merely unlikely to be chosen
+  assert.ok(!JSON.stringify(view).includes("Tallahassee"), "the home city cannot appear in the prompt");
+  assert.ok(!JSON.stringify(view).includes("Some Other College"), "nor a sibling entry");
+});
+
+test("⚠ AI scope: entry 1 gets entry 1 — never entry 0's school", () => {
+  const f = { fieldName: "-1_CandProfileFields.EducationCity", label: "City", sectionHeading: "Education", entryOrdinal: 1 };
+  const view = ats.atsGenericProfileForAi(SCOPE_PROFILE, f);
+  assert.strictEqual(view.education.length, 1);
+  assert.strictEqual(view.education[0].school_or_university, "Some Other College");
+  assert.ok(!JSON.stringify(view).includes("Carnegie Mellon"), "entry 0 is invisible to entry 1's question");
+});
+
+test("AI scope: a WORK entry is scoped the same way, and an unscoped field still sees everything", () => {
+  const w = { fieldName: "-1_PersonProfileFields.rcf3216", label: "City", sectionHeading: "Experience", entryOrdinal: 0 };
+  const wv = ats.atsGenericProfileForAi(SCOPE_PROFILE, w);
+  assert.deepStrictEqual(Object.keys(wv), ["work_experience"]);
+  assert.ok(!JSON.stringify(wv).includes("Tallahassee"));
+  // an ordinary question is unchanged — this must not become a page-wide narrowing
+  const plain = { fieldName: "PersonProfileFields.Email", label: "Email", sectionHeading: "Enter your information", entryOrdinal: 0 };
+  assert.strictEqual(ats.atsGenericProfileForAi(SCOPE_PROFILE, plain), SCOPE_PROFILE);
+  assert.strictEqual(ats.atsGenericAiScopeKey(plain), "", "no scope key means no narrowing");
+});
+
+test("⚠ AI scope: the answer CACHE is keyed per entry, so two schools cannot share one city", () => {
+  // Answers are cached by QUESTION so a cascade re-mount reuses one already paid for. Inside a
+  // repeating section that rule inverts: both entries ask "City" and must get DIFFERENT answers.
+  assert.strictEqual(ats.atsGenericAiScopeKey({ label: "City", sectionHeading: "Education", entryOrdinal: 0 }), "education#0");
+  assert.strictEqual(ats.atsGenericAiScopeKey({ label: "City", sectionHeading: "Education", entryOrdinal: 1 }), "education#1");
+  assert.notStrictEqual(ats.atsGenericAiScopeKey({ label: "City", sectionHeading: "Education", entryOrdinal: 0 }),
+    ats.atsGenericAiScopeKey({ label: "City", sectionHeading: "Education", entryOrdinal: 1 }));
+});
+
+test("⚠ AI scope: an entry the profile does not have yields an EMPTY section, never a borrowed one", () => {
+  const f = { fieldName: "x", label: "City", sectionHeading: "Education", entryOrdinal: 7 };
+  const view = ats.atsGenericProfileForAi(SCOPE_PROFILE, f);
+  assert.deepStrictEqual(view, { education: [] }, "blank is the correct answer, not another entry's city");
+});
+
+test("isolation: AI scoping is generic-only at the call sites", () => {
+  const src = require("fs").readFileSync(require("path").join(__dirname, "..", "ats.js"), "utf8");
+  assert.ok((src.match(/ats === "generic" \? atsGenericProfileForAi/g) || []).length >= 1,
+    "the per-field fallback must scope only on the generic path");
+  assert.match(src, /const aiScope = ats === "generic" \? atsGenericAiScopeKey/, "…and so must the cache key");
+});

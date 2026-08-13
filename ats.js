@@ -1750,6 +1750,7 @@ async function atsAiChooseOption(act, f, options, profile, jobContext) {
     "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
     (jobContext && jobContext.description ? "\nJOB DESCRIPTION (for context):\n" + String(jobContext.description).slice(0, 4000) : "") +
+    atsGenericEntryScopeNote(f) +
     "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000);
   const res = await act.llm({ system, user, maxTokens: 400 });
   if (!res || !res.ok) return { ok: false, error: (res && res.error) || "llm-failed" };
@@ -1766,6 +1767,7 @@ async function atsAiWriteText(act, f, profile, jobContext) {
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
     (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground your answer in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
     (style ? "\nSTYLE RULES: " + style : "") +
+    atsGenericEntryScopeNote(f) +
     "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000);
   const res = await act.llm({ system, user, maxTokens: 700 });
   if (!res || !res.ok) return { ok: false, error: (res && res.error) || "llm-failed" };
@@ -2204,10 +2206,24 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // credential field and so cannot be what clobbers one.
   // WHOLE-PAGE verify + repair FIRST — it re-fills anything the page reset, and that re-fill can
   // itself disturb neighbours — then the credential re-check has the last word on the credentials.
-  try {
-    await atsGenericVerifyAndRepair(act, ats, scan, results, profile, defaults, jc, bucketIndex, fillOpts);
-  } catch (e) {
-    try { console.log("[ApplyPilot][ATS-FILL] post-fill verify skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
+  // ⚠ LOOP IT — A REPAIR CAN BREAK ITS OWN DEPENDANT (2026-08-12). One pass is not enough when a
+  // dropdown depends on another: live, the page blanked AddressCountry, the repair re-selected it,
+  // and that reset the dependent AddressState list — whose repair, running in the same round, found
+  // "the dropdown opened but listed no options" and ended `needs_review` on a field that had been
+  // filled correctly minutes earlier. A second round, after the parent's list has reloaded, is
+  // exactly what that field needs. Bounded, and it stops as soon as a round repairs nothing, so a
+  // page that is genuinely settled still pays only the one verifying read.
+  for (let round = 1; round <= ATS_GENERIC_REPAIR_ROUNDS; round++) {
+    let r = null;
+    try {
+      r = await atsGenericVerifyAndRepair(act, ats, scan, results, profile, defaults, jc, bucketIndex, fillOpts);
+    } catch (e) {
+      try { console.log("[ApplyPilot][ATS-FILL] post-fill verify skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
+      break;
+    }
+    if (!r || !r.reverted) break;                    // nothing lost this round ⇒ nothing a further round could fix
+    if (round < ATS_GENERIC_REPAIR_ROUNDS && (r.lost || r.repaired)) continue;
+    break;
   }
   try {
     await atsGenericCredentialRecheck(act, ats, scan, results, o && o.credentials);
@@ -2318,7 +2334,29 @@ function atsSameOptionSet(a, b) {
 // "why do you want to work here" boxes and both are deferred by the same rule. Each kind keeps the
 // contract its single-call twin (atsAiChooseOption / atsAiWriteText) already states, so an answer
 // arriving by batch is indistinguishable downstream from one that came from its own call.
-function atsBuildBatchPrompt(items, profile, jobContext) {
+// The line that tells the model what the cut-down profile IS, and what it may do about the gaps.
+// Without it, scoping the profile turns a wrong answer into a blank one: given only
+// `{education:[{school_or_university:"Carnegie Mellon University"}]}` and a "City" question, the model
+// answered "N/A" — correct-by-its-lights (the entry holds no city) but not the answer wanted. The
+// operator's own framing is the rule: "it can determine that carnegie mellon is in pittsburgh". A
+// named institution's city is a PUBLIC fact about that institution, not a guess about the candidate,
+// so it is exactly the thing a model should supply. Facts about the CANDIDATE still may not be
+// invented — that distinction is the whole of this note.
+function atsGenericEntryScopeNote(f) {
+  const key = f ? atsGenericAiScopeKey(f) : "";
+  if (!key) return "";
+  const which = key.startsWith("education") ? "EDUCATION" : "EMPLOYMENT";
+  const thing = key.startsWith("education") ? "school/university" : "employer";
+  return "\nSCOPE: every question here belongs to ONE " + which + " entry, and the profile below has been" +
+    " deliberately cut down to that single entry — the applicant's home address and their other entries are" +
+    " NOT shown because they are the wrong answer here. A question about location (city, state, country) asks" +
+    " where THAT " + thing + " is, not where the applicant lives." +
+    "\nYou MAY answer such a question from well-known public knowledge about the named " + thing +
+    " (e.g. the city a named university sits in) — that is a fact about the " + thing + ", not a guess about" +
+    " the applicant. Do NOT invent facts about the APPLICANT that the entry does not state.";
+}
+
+function atsBuildBatchPrompt(items, profile, jobContext, scopeNote) {
   const system = "You help an applicant fill out ONE job-application page. You are given the applicant's profile (JSON) and SEVERAL questions at once. Answer EVERY question, keyed by its id.\n" +
     "Each question has a \"kind\":\n" +
     "  • \"choice\" — put EXACTLY ONE of that question's \"options\", VERBATIM, in the \"choice\" field. These are REQUIRED questions: always choose the most likely option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education or enrollment dates, criminal/background answers from the ABSENCE of any such record). NEVER refuse, never answer UNKNOWN, and never write an option that is not in that question's list.\n" +
@@ -2334,6 +2372,7 @@ function atsBuildBatchPrompt(items, profile, jobContext) {
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
     (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground free-text answers in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
     (style ? "\nSTYLE RULES for free-text answers: " + style : "") +
+    (scopeNote || "") +
     "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000) +
     "\n\nReply ONLY with a JSON object and nothing else, one entry per question id:\n" +
     "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<verbatim option — kind=choice only>\",\"answer\":\"<free text — kind=text only>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
@@ -2437,7 +2476,7 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
   if (items.length < 2) {
     return { fired: false, items: items.length, answers: 0, cached, dup, noOptions, capped };
   }
-  const { system, user } = atsBuildBatchPrompt(items, profile, jc);
+  const { system, user } = atsBuildBatchPrompt(items, profile, jc, atsGenericEntryScopeNote(items[0] && items[0].f));
   const kinds = items.reduce((m, i) => { m[i.kind] = (m[i.kind] || 0) + 1; return m; }, {});
   try { console.log(`[ApplyPilot][ATS-FILL] AI batch: ${items.length} deferred question(s) in ONE call (${kinds.choice || 0} choice, ${kinds.text || 0} text; cap ${atsBatchMaxTokens(items)} tokens)${cached ? ` · ${cached} already cached` : ""}`); } catch (e) { /* log only */ }
   let res = null;
@@ -2642,7 +2681,14 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           // DEFER, don't ask. Record everything the question needs and move on; the batch below
           // asks about all of them at once and the commit pass actuates them.
           const d = { f, ref, rec, kind: aiKind, options: [], label: rec.label || f.fieldName };
-          d.qKey = atsLib.normalizeLabel(d.label);
+          // ⚠ THE ENTRY SCOPE IS PART OF THE CACHE KEY. Answers are cached by QUESTION so a cascade
+          // re-mount reuses one already paid for, and so one page can never hold two different
+          // answers to the same question (CLAUDE.md). Inside a repeating section that rule inverts:
+          // education entry 0 and entry 1 both ask "City" and MUST get different answers — keying on
+          // the wording alone would serve Carnegie Mellon's city to the second school. Scoping the
+          // key keeps the dedupe everywhere it was right and disables it exactly where it was wrong.
+          const aiScope = ats === "generic" ? atsGenericAiScopeKey(f) : "";
+          d.qKey = (aiScope ? aiScope + "::" : "") + atsLib.normalizeLabel(d.label);
           if (aiKind === "choice") {
             // Options the SCAN already carries (radio / yes-no / checkbox-group / native select) are
             // free. A react-select combobox has to be OPENED to be read — and then CLOSED again,
@@ -2708,9 +2754,29 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
   // ── PHASE 2: ONE call for everything the deterministic pass could not answer ─────────────
   // Never fatal: a batch that cannot even be BUILT must not cost the page its deferred fields —
   // they each make their own call below, which is exactly the pre-batch behaviour.
+  // ⚠ GROUPED BY ENTRY SCOPE, not one call for the page. A question inside education entry k is
+  // asked with ONLY that entry's profile subset in front of the model (atsGenericProfileForAi), so a
+  // school's city cannot be answered from the home address or from a sibling entry. Everything
+  // unscoped still shares a single call, so the common page is unchanged.
   let batch = { fired: false, items: 0, answers: 0 };
-  try { batch = await atsRunAiBatch(act, deferred, profile, jc, aiCache); }
-  catch (e) { try { console.log(`[ApplyPilot][ATS-FILL] AI batch threw (${String((e && e.message) || e)}) — every deferred question falls back to its own call`); } catch (e2) { /* log only */ } }
+  const groups = new Map();
+  for (const d of deferred) {
+    const key = ats === "generic" ? atsGenericAiScopeKey(d.f) : "";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(d);
+  }
+  if (groups.size > 1) {
+    try { console.log(`[ApplyPilot][ATS-FILL] AI batch split into ${groups.size} scoped call(s): ${[...groups.entries()].map(([k, v]) => (k || "general") + "×" + v.length).join(", ")} — an entry's question only ever sees its own entry`); } catch (e) { /* log only */ }
+  }
+  for (const [key, items] of groups) {
+    const scoped = key ? atsGenericProfileForAi(profile, items[0].f) : profile;
+    try {
+      const b = await atsRunAiBatch(act, items, scoped, jc, aiCache);
+      batch = { fired: batch.fired || (b && b.fired), items: batch.items + ((b && b.items) || 0), answers: batch.answers + ((b && b.answers) || 0) };
+    } catch (e) {
+      try { console.log(`[ApplyPilot][ATS-FILL] AI batch (${key || "general"}) threw (${String((e && e.message) || e)}) — those questions fall back to their own calls`); } catch (e2) { /* log only */ }
+    }
+  }
 
   // ── PHASE 3: the second actuation pass ───────────────────────────────────────────────────
   // Nothing new here — each deferred field goes through the SAME atsAiFallback the per-field path
@@ -2724,7 +2790,9 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
     const t0 = Date.now();
     try { await act.eval(atsInjScrollIntoView, d.ref.inputSel); } catch (e) { /* a field we cannot scroll to still fills */ }
     try {
-      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, profile, answer);
+      // …and a question the batch could not serve makes its OWN call with the same scoped view,
+      // otherwise the fallback path would quietly reintroduce the whole profile.
+      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, ats === "generic" ? atsGenericProfileForAi(profile, d.f) : profile, answer);
     } catch (e) {
       d.rec.status = "needs_review";
       d.rec.detail = "AI commit pass exception: " + String((e && e.message) || e);
@@ -3756,6 +3824,54 @@ function atsGenericIdDurable(id) {
 // gpa, gpa_scale, from_year, to_year, graduation_date, currently_enrolled. Note the names and SHAPES
 // both differ from a form's — iCIMS wants GraduationDate_Month/_Date/_Year, so one stored date has to
 // serve three controls.
+// ── WHAT THE AI IS ALLOWED TO SEE FOR A REPEATING-ENTRY FIELD (operator, 2026-08-12) ────────
+// "if inside education it asks for state and city, it should only look for values in the profile
+// repeating section for education… if a field goes to AI, give everything in education 0 to AI for
+// the education 0 field, and education 1, AI only gets education 1. this way it won't get confused
+// and it can determine that carnegie mellon is in pittsburgh rather than following the tallahassee
+// answer from a different part of my profile."
+//
+// That is exactly what went wrong: the deterministic tiers already refuse this (the bucket tier's
+// `genericEntryLocation` guard, and the address tier's scope bail), but the AI was handed the WHOLE
+// profile and did the obvious thing — live, `EducationCity → ai-text · "Tallahassee" · AI: "City is
+// listed in personal info address."` It was not hallucinating; it was reading a fact that had no
+// business being in front of it.
+//
+// So the profile the AI sees is CUT DOWN to the one entry the question belongs to. A model that
+// cannot see Tallahassee cannot answer Tallahassee — and, given only "Carnegie Mellon University",
+// it can supply Pittsburgh from its own knowledge, which is the answer actually wanted.
+//
+// ⚠ The scope key is what the batch groups by, so a page with two education entries costs one call
+// per entry rather than one call for the page. That is a deliberate trade against the deferred-AI
+// design's request-count win (CLAUDE.md: 15 requests/minute per key): correctness first, and the
+// entries on one page are few. Unscoped questions still share ONE call.
+function atsGenericAiScopeKey(f) {
+  if (!f) return "";
+  const scope = atsGenericScopeOf(f);
+  if (scope !== "education" && scope !== "work") return "";
+  return scope + "#" + (f.entryOrdinal || 0);
+}
+
+// The profile subset for that scope. Returns the WHOLE profile when the field belongs to no entry,
+// so nothing outside a repeating section changes behaviour.
+function atsGenericProfileForAi(profile, f) {
+  const key = atsGenericAiScopeKey(f);
+  if (!key) return profile;
+  const [scope, nStr] = key.split("#");
+  const n = Number(nStr) || 0;
+  if (scope === "education") {
+    const ordered = atsGenericEducationOrder((profile || {}).education);
+    const entry = ordered[n];
+    if (!entry) return { education: [] };
+    // ⚠ ONLY the entry. Not personal_info, not the other entries — the whole point is that the
+    // home city and a sibling school's city are both invisible here.
+    return { education: [entry] };
+  }
+  const we = Array.isArray((profile || {}).work_experience) ? (profile || {}).work_experience : [];
+  const entry = we[n];
+  return { work_experience: entry ? [entry] : [] };
+}
+
 const ATS_GENERIC_EDUCATION_FIELDS = [
   { rx: /^(other\s+)?school$|university|college|institution|school name/i, prop: "school_or_university" },
   { rx: /^degree|degree (level|type|earned)|qualification/i, prop: "degree" },
@@ -4732,6 +4848,10 @@ const ATS_PAIRED_FILTER_MS = 8000;
 // page (the fill lands on rows the postback then replaces). The poll exits as soon as two
 // consecutive scans agree, so a portal that does not re-render pays only one extra scan.
 const ATS_GENERIC_PARSE_SETTLE_MS = 20000;
+// How many verify+repair rounds a page may take. 2, because the measured need is exactly one extra:
+// a repair that re-selects a PARENT dropdown resets its dependant's option list, and the dependant
+// needs one further round once that list reloads. More rounds would be a fill loop, not a repair.
+const ATS_GENERIC_REPAIR_ROUNDS = 2;
 async function atsFillPairedCombo(act, f, ref, rec, candidates) {
   const probe = await act.eval(atsInjPairedComboProbe, ref.inputSel).catch(() => null);
   if (!probe || !probe.ok || !probe.triggerSel) return { handled: false };
@@ -4907,6 +5027,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjLoginGate, atsPassLoginGate, atsGenericCredentialRecheck, atsGenericVerifyAndRepair,
+    atsGenericAiScopeKey, atsGenericProfileForAi, atsGenericEntryScopeNote,
     atsInjFormFrameBox, atsInjElBox, atsInjScrollTopTo, atsInjLoginGateDiag, atsInjSubmitLoginForm, atsInjReadFieldsMatching,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
