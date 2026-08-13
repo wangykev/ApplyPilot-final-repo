@@ -1407,6 +1407,83 @@ test("isolation: atsFormUrl leaves a generic/unknown URL untouched", () => {
   assert.strictEqual(ats.atsFormUrl("generic", u), u);
 });
 
+// ── THE EMAIL-ONLY LOGIN GATE (Astrion iCIMS, live 2026-08-12) ──────────────────────────────
+// `careers.astrion.us/jobs/24615?mode=apply` → Apply → `…icims.com/jobs/24615/login`, which asks for
+// an email and nothing else, → the form. That middle page halted the run `unknown-page`.
+// This types a stored credential and SUBMITS, so the guards are the whole design.
+function loginGateAct(page) {
+  const calls = [];
+  return { calls, delayFull: async () => {},
+    eval: async (fn, ...args) => {
+      const name = fn.name || "anon";
+      calls.push([name, ...args]);
+      const h = page[name] || (name === "anon" ? page.anon : null);
+      if (!h) throw new Error("no handler for " + name);
+      return h(...args);
+    } };
+}
+
+test("login gate: types the STORED email, submits, and reports passing once the page advances", async () => {
+  let advanced = false, typed = null, clicked = null;
+  const act = loginGateAct({
+    atsInjLoginGate: () => (advanced
+      ? { ok: true, isGate: false, reason: "12 fillable field(s) — a login gate has exactly one" }
+      : { ok: true, isGate: true, emailSel: '[id="email"]', submitSel: 'input[type="submit"]', submitLabel: "Next" }),
+    atsInjSetText: (sel, v) => { if (v) typed = v; return { ok: true, after: v }; },
+    atsInjReadValue: () => ({ ok: true, value: typed }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    anon: (sel) => { clicked = sel; advanced = true; return { ok: true }; },
+  });
+  const r = await ats.atsPassLoginGate(act, { email: "me@example.com", password: "pw" });
+  assert.strictEqual(r.passed, true);
+  assert.strictEqual(typed, "me@example.com", "the STORED login email is what gets typed");
+  assert.strictEqual(clicked, 'input[type="submit"]');
+  // the box is CLEARED before the write, same rule the credential tier follows
+  const sets = act.calls.filter((c) => c[0] === "atsInjSetText");
+  assert.strictEqual(sets[0][2], "", "the field is cleared first");
+});
+
+test("⚠ login gate: NO stored credentials means needs_operator — never a blank or guessed login", async () => {
+  let wrote = false;
+  const act = loginGateAct({
+    atsInjLoginGate: () => ({ ok: true, isGate: true, emailSel: '[id="email"]', submitSel: "#go", submitLabel: "Next" }),
+    atsInjSetText: () => { wrote = true; return { ok: true }; },
+  });
+  const r = await ats.atsPassLoginGate(act, null);
+  assert.strictEqual(r.passed, false);
+  assert.strictEqual(r.needsOperator, true);
+  assert.strictEqual(wrote, false, "nothing may be written without stored credentials");
+});
+
+test("⚠ login gate: a read-back that disagrees NEVER submits", async () => {
+  let clicked = false;
+  const act = loginGateAct({
+    atsInjLoginGate: () => ({ ok: true, isGate: true, emailSel: '[id="email"]', submitSel: "#go", submitLabel: "Next" }),
+    atsInjSetText: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: "" }),        // the write did not take
+    atsInjScrollIntoView: () => ({ ok: true }),
+    anon: () => { clicked = true; return { ok: true }; },
+  });
+  const r = await ats.atsPassLoginGate(act, { email: "me@example.com", password: "pw" });
+  assert.strictEqual(r.passed, false);
+  assert.strictEqual(clicked, false, "a login we could not verify must never be submitted");
+});
+
+test("login gate: a page that is NOT a one-field login is declined, and the caller carries on", async () => {
+  const act = loginGateAct({ atsInjLoginGate: () => ({ ok: true, isGate: false, reason: "a password field is present — not an email-only gate" }) });
+  const r = await ats.atsPassLoginGate(act, { email: "me@example.com", password: "pw" });
+  assert.strictEqual(r.passed, false);
+  assert.ok(!r.needsOperator, "declining is not an operator stop — the run continues its ladder");
+});
+
+test("⚠ login gate: the injected probe demands ONE fillable field, no password, and a named email box", () => {
+  const src = ats.atsInjLoginGate.toString();
+  assert.ok(/fillable\.length !== 1/.test(src), "exactly one fillable control");
+  assert.ok(/pw\.length/.test(src), "a password field must disqualify it");
+  assert.ok(/email\|login\|user/.test(src), "the field must name itself an email/login");
+  assert.ok(/no submit control/.test(src), "a submit control is required");
+});
+
 // ── RÉSUMÉ PARSE POSTBACK (iCIMS, live 2026-08-12) ──────────────────────────────────────────
 // The portal parses the attached résumé server-side and posts the result back into the SAME panel,
 // re-creating the repeating entries under server-assigned ids. That landed MID-FILL and blanked

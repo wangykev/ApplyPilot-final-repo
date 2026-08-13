@@ -1373,6 +1373,98 @@ function atsInjClickApplyButton() {
   return { ok: true, clicked: uniq[0], hiddenLayout: shown.length === 0 };
 }
 
+// ── THE EMAIL-ONLY LOGIN GATE (generic, 2026-08-12) ──────────────────────────────────────────
+// Astrion's LinkedIn link starts at `careers.astrion.us/jobs/24615?mode=apply&iis=LinkedIn`, whose
+// Apply goes to `astrioncareers-astrion.icims.com/jobs/24615/login`, and THAT page asks for an email
+// and nothing else: `<input type="email" id="email" name="css_loginName">` plus a `Next` submit,
+// inside `icims_content_iframe`. Enter the email and it hands you the real application form, whose
+// first fields are the Create-a-login block (operator, 2026-08-12: "it is still part of the login
+// path", so the same stored credentials must serve both).
+//
+// The run previously halted `unknown-page` here — nothing in either pipeline recognises a one-field
+// login page: it is not an application form (one field), not a Workday auth screen, and carries no
+// apply affordance to follow.
+//
+// ⚠ THE GUARD IS THE WHOLE DESIGN. This types a stored credential and SUBMITS, so it must be
+// impossible to mistake a real application for it. All four must hold:
+//   1. exactly ONE fillable control on the page — an application form has many;
+//   2. that control is a text/email input whose id/name/type actually names a login or email;
+//   3. NO password field — a password login is a different flow and is deliberately not handled here
+//      (it would also mean the account exists, which is the operator's call, not ours);
+//   4. a submit control exists to advance with.
+// Anything else returns `isGate:false` with a reason, and the caller carries on exactly as before.
+function atsInjLoginGate() {
+  const vis = (el) => {
+    if (typeof el.checkVisibility === "function") return el.checkVisibility({ checkVisibilityCSS: true });
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const BUTTONISH = /^(submit|button|image|reset)$/i;
+  const all = [...document.querySelectorAll("input:not([type=hidden]),textarea,select")].filter(vis);
+  const fillable = all.filter((e) => !(e.tagName === "INPUT" && BUTTONISH.test(e.type || "")));
+  const pw = fillable.filter((e) => e.type === "password");
+  if (pw.length) return { ok: true, isGate: false, reason: "a password field is present — not an email-only gate" };
+  if (fillable.length !== 1) return { ok: true, isGate: false, reason: fillable.length + " fillable field(s) — a login gate has exactly one", fillable: fillable.length };
+  const el = fillable[0];
+  if (el.tagName !== "INPUT" || !/^(email|text)$/i.test(el.type || "text")) {
+    return { ok: true, isGate: false, reason: "the one field is a " + el.tagName.toLowerCase() + "/" + (el.type || "?") + ", not a text or email box" };
+  }
+  const idname = ((el.id || "") + " " + (el.name || "") + " " + (el.getAttribute("autocomplete") || "")).toLowerCase();
+  const named = /email|login|user(name)?|e-mail/.test(idname) || String(el.type).toLowerCase() === "email";
+  if (!named) return { ok: true, isGate: false, reason: "the one field does not name itself an email/login: " + idname.trim() };
+  const submit = [...document.querySelectorAll('input[type="submit"],button[type="submit"],button:not([type])')].filter(vis)[0];
+  if (!submit) return { ok: true, isGate: false, reason: "no submit control to advance with" };
+  const selOf = (e) => (e.id ? '[id="' + e.id + '"]' : (e.name ? '[name="' + e.name + '"]' : null));
+  const emailSel = selOf(el);
+  const submitSel = selOf(submit) || (submit.tagName === "INPUT" ? 'input[type="submit"]' : 'button[type="submit"]');
+  if (!emailSel) return { ok: true, isGate: false, reason: "the email field has no id or name to address it by" };
+  return { ok: true, isGate: true, emailSel, submitSel,
+    submitLabel: (submit.value || submit.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30) };
+}
+
+// Drive the gate above: type the stored login email, submit, and wait for the page to become
+// something other than a one-field login. The email comes from the SAME stored credentials the
+// Create-a-login block uses, which is what keeps the account this application creates consistent
+// with the one used to sign in — the operator's "it is still part of the login path".
+//
+// ⚠ The value is never logged, exactly as in the credential fill tier.
+// A gate we cannot pass is NOT an error: it returns `passed:false` with a reason and the caller
+// continues down its existing ladder, so this can only ever add reach.
+async function atsPassLoginGate(act, credentials) {
+  const g = await act.eval(atsInjLoginGate).catch(() => null);
+  if (!g || !g.ok) return { passed: false, reason: "the login-gate probe did not run" };
+  if (!g.isGate) return { passed: false, reason: g.reason };
+  const email = credentials && credentials.email;
+  if (!email) return { passed: false, reason: "this page is an email-only login, but no credentials are stored (Sign-in page)", needsOperator: true };
+
+  await act.eval(atsInjSetText, g.emailSel, "").catch(() => null);   // clear first, same rule as the credential tier
+  const set = await act.eval(atsInjSetText, g.emailSel, email).catch(() => null);
+  const back = await act.eval(atsInjReadValue, "generic", g.emailSel, "text").catch(() => null);
+  const got = back && back.ok ? String(back.value == null ? "" : back.value) : "";
+  if (!(set && set.ok) || got.length !== String(email).length) {
+    return { passed: false, reason: "the login email would not enter the field", needsOperator: true };
+  }
+  await act.eval(atsInjScrollIntoView, g.submitSel).catch(() => null);
+  const clicked = await act.eval(function (sel) {
+    const el = document.querySelector(sel);
+    if (!el) return { ok: false, reason: "submit vanished" };
+    el.click();
+    return { ok: true };
+  }, g.submitSel).catch(() => null);
+  if (!clicked || !clicked.ok) return { passed: false, reason: "could not activate " + g.submitLabel, needsOperator: true };
+
+  // Poll for the page to stop being a one-field login. Generous, and on the CONDITION rather than a
+  // fixed sleep: this is a server round trip that may also re-render into a frame.
+  for (let i = 0; i < 20; i++) {
+    await act.delayFull(1000);
+    const now = await act.eval(atsInjLoginGate).catch(() => null);
+    if (now && now.ok && !now.isGate) {
+      return { passed: true, submitLabel: g.submitLabel, landed: now.reason || "advanced" };
+    }
+  }
+  return { passed: false, reason: "the login page did not advance after entering the email", needsOperator: true };
+}
+
 // An employer page can EMBED the ATS form in an iframe rather than link to it (Greenhouse's
 // "#grnhse_app" widget and its `?gh_jid=` pages are the common case; Lever and Ashby ship the
 // same kind of widget). The iframe SRC is the exact URL the employer itself uses, so reading it
@@ -4565,6 +4657,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
+    atsInjLoginGate, atsPassLoginGate,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,

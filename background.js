@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "generic-parse-settle-8";
+const AP_BUILD_MARKER = "login-gate-10";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4617,6 +4617,41 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // Bounded to ONE hop, and `atsPickFormFrame` refuses unless the top page is clearly poorer than
     // the frame — so a page that already shows its own form is never abandoned for a marketing or
     // captcha iframe.
+    // ── THE EMAIL-ONLY LOGIN GATE (generic, 2026-08-12) ──────────────────────────────────────
+    // The operator's LinkedIn link for this posting reaches the form through THREE pages:
+    // `careers.astrion.us/jobs/24615?mode=apply` → Apply → `…icims.com/jobs/24615/login`, which asks
+    // for an email and nothing else → the application form. That middle page halted the run
+    // `unknown-page`: one field is not an application form, it is not a Workday auth screen, and it
+    // carries no apply affordance to follow.
+    //
+    // Runs BEFORE the form frame-hop below and does its own arm at a floor of ONE control, because
+    // that hop's floor of 4 is calibrated for an application form and correctly refuses a login page.
+    // On success the frame pin is cleared so the hop can re-choose against the page we actually
+    // wanted — the form.
+    //
+    // Bounded to one attempt per run by `loginHops`; a gate that cannot be passed reports
+    // `needs_operator` with the reason rather than pressing on into a form that is not there.
+    if (!ready.ready && ats === "generic" && !(opts0.loginHops >= 1)) {
+      const gateAct = { eval: (fn, ...a) => cdpEval(fn, ...a), delayFull: (ms) => cdpDelay(ms) };
+      let gate = await atsPassLoginGate(gateAct, store.credentials).catch((e) => ({ passed: false, reason: String((e && e.message) || e) }));
+      if (!gate.passed) {
+        const armedLogin = await cdpUseFormFrame(1);
+        if (armedLogin.ok) gate = await atsPassLoginGate(gateAct, store.credentials).catch((e) => ({ passed: false, reason: String((e && e.message) || e) }));
+        if (!gate.passed) cdpClearFormFrame();
+      }
+      if (gate.passed) {
+        LOG(`passed an email-only login gate ("${gate.submitLabel}") using your stored login — the form should follow`);
+        emitRunProgress("Signing in", "email login");
+        cdpClearFormFrame();
+        opts0 = Object.assign({}, opts0, { loginHops: (opts0.loginHops || 0) + 1 });
+        ready = await waitAtsFormReady(ats, LOG);
+      } else if (gate.needsOperator) {
+        return { ok: true, needs_operator: true, stopped: "login-gate", submitted: false, detail: gate.reason };
+      } else {
+        LOG(`not an email-only login page (${gate.reason})`);
+      }
+    }
+
     if (!ready.ready && ats === "generic") {
       const probe = await cdpEval(atsInjFindFormFrame).catch(() => null);
       const worth = atsPickFormFrame(probe);
@@ -4676,6 +4711,20 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
             detail: "The application lives at " + after + " — a Workday requisition; run that link instead." };
         }
         if (!afterAts) {
+          // ⚠ A GENERIC RUN MUST KEEP DRIVING ITS OWN HOP (2026-08-12). `genericOk()` is false here for
+          // the very run that should continue — it requires `ats !== "generic"` and `!genericTried`,
+          // both of which a generic attempt has already spent — so the generic driver followed an apply
+          // link onto another unrecognized host and then declared the application off-pipeline.
+          // Live: the operator's LinkedIn link `careers.astrion.us/jobs/24615?mode=apply` links to
+          // `…icims.com/jobs/24615/login`, an unrecognized host; the run bailed here, fell through to
+          // the Workday onboarding, and halted `auth-form-not-rendered` on a page one email away from
+          // the form. Recursing keeps the whole generic ladder — the login gate, the frame hop, the
+          // form check — available on the landing, and `applyHops` bounds it exactly as before.
+          if (ats === "generic") {
+            await cdpDetach(); // the recursive call re-attaches; ONE tracked client per tab
+            return await runAtsApplicationRun(tabId, "generic", store, after,
+              { chase: opts0.chase || 0, applyHops: (opts0.applyHops || 0) + 1, genericTried: true, originUrl, loginHops: opts0.loginHops || 0 });
+          }
           if (genericOk()) return await tryGeneric(after, "the apply link landed on an unrecognized host");
           return { ok: true, needs_operator: true, stopped: "apply-off-pipeline", jd, redirectUrl: after,
             detail: "The application lives at " + after + " — a host this pipeline can't drive yet; apply there yourself." };
