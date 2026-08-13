@@ -867,6 +867,21 @@ async function cdpEval(fn, ...args) {
   return res && res.result ? res.result.value : undefined;
 }
 
+// Evaluate in the TOP frame even while a form frame is pinned. Needed whenever the answer belongs to
+// the top document rather than the frame — notably the frame's own on-screen box, because `Input.*`
+// dispatches into the TOP-LEVEL viewport while an element inside a frame reports a frame-relative
+// rect, so a trusted coordinate click has to add the two (2026-08-12, the iCIMS login gate).
+// Deliberately does NOT disturb `_frameCtxId`: the pin is restored for the caller's next cdpEval.
+async function cdpEvalTop(fn, ...args) {
+  const saved = _frameCtxId;
+  _frameCtxId = null;
+  try {
+    return await cdpEval(fn, ...args);
+  } finally {
+    _frameCtxId = saved;
+  }
+}
+
 // ── Foreground-adaptive pacing ───────────────────────────────────────────────
 // The fill's budgets are GENEROUS — tuned for the hidden-tab ~1Hz throttle (the
 // page's debounced REACTION runs page-side + throttled). When the tab is VISIBLE

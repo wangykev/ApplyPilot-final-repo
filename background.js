@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "cred-recheck-13";
+const AP_BUILD_MARKER = "gate-url-watch-16";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4500,6 +4500,105 @@ async function waitAtsPostingSettled(ceilingMs = 8000, intervalMs = 300) {
   return { settled: false, reason: "ceiling", chars: last ? last.len : 0, waitedMs: Date.now() - t0 };
 }
 
+// ── PASS THE EMAIL-ONLY LOGIN GATE WITH TRUSTED INPUT (2026-08-12) ───────────────────────────
+// The first version of this gate typed and clicked page-side (native setter + `el.click()`), and it
+// advanced the page only SOMETIMES — "the login page did not advance after entering the email" on two
+// runs out of three, while the identical steps by hand advanced every time.
+//
+// That is not a mystery, it is this codebase's oldest input lesson, applied to a surface I had not
+// classified as auth: synthetic input is the fill repertoire, and **the auth form is the one place it
+// is known to fail** — CLAUDE.md, "fields read back OK but Sign In never fired", which is why the
+// Workday onboarding runs TRUSTED and never arms synthetic. An ATS run *does* arm synthetic
+// (`cdpSynthInput()` is true throughout), so the gate inherited exactly the mode that does not work
+// on a login form. It is forced back to trusted here and restored afterwards, the same way
+// `act.clickSubmit` is.
+//
+// The wrinkle trusted input brings: `Input.*` dispatches into the TOP-LEVEL viewport, while the login
+// field lives inside `icims_content_iframe` and its own rect is frame-relative. So the iframe's box
+// (read from the top document) and the element's box (read inside the frame) are ADDED, and the top
+// window is scrolled when the result would land outside the viewport — a coordinate click that lands
+// off-screen is the silent no-op this pipeline has been bitten by before.
+async function passLoginGateTrusted(credentials, LOG) {
+  const gate = await cdpEval(atsInjLoginGate).catch(() => null);
+  if (!gate || !gate.ok) return { passed: false, reason: "the login-gate probe did not run" };
+  if (!gate.isGate) return { passed: false, reason: gate.reason };
+  const email = credentials && credentials.email;
+  if (!email) return { passed: false, reason: "this page is an email-only login, but no credentials are stored (Sign-in page)", needsOperator: true };
+
+  // Absolute (top-viewport) centre of a control inside the form frame, scrolling the top window when
+  // the point would be off-screen. Returns null when it cannot be made visible.
+  const absCentre = async (sel) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const inFrame = await cdpEval(atsInjElBox, sel).catch(() => null);
+      if (!inFrame || !inFrame.ok) return null;
+      const box = await cdpEvalTop(atsInjFormFrameBox).catch(() => null);
+      if (!box || !box.ok) return null;
+      const x = box.x + inFrame.x + inFrame.w / 2;
+      const y = box.y + inFrame.y + inFrame.h / 2;
+      if (y > 4 && y < box.viewportH - 4) return { x, y };
+      await cdpEvalTop(atsInjScrollTopTo, Math.round(box.scrollY + y)).catch(() => null);
+      await cdpDelay(250);
+    }
+    return null;
+  };
+
+  const wasSynthetic = cdpSyntheticInputEnabled();
+  cdpSetSyntheticInput(false);                      // AUTH ⇒ trusted, always
+  try {
+    const emailPt = await absCentre(gate.emailSel);
+    if (!emailPt) return { passed: false, reason: "could not bring the login field on screen", needsOperator: true };
+    await cdpClickAt(emailPt.x, emailPt.y);
+    await cdpDelay(150);
+    await cdpSelectAllDelete();                     // clear whatever the page or a password manager put there
+    await cdpTypeChars(email, 25);                  // real keystrokes — the login form watches them
+
+    const back = await cdpEval(atsInjReadValue, "generic", gate.emailSel, "text").catch(() => null);
+    const got = back && back.ok ? String(back.value == null ? "" : back.value) : "";
+    if (got !== email) {
+      return { passed: false, reason: `the login email did not land in the field (${got.length} of ${email.length} chars)`, needsOperator: true };
+    }
+
+    const submitPt = await absCentre(gate.submitSel);
+    if (!submitPt) return { passed: false, reason: `could not bring "${gate.submitLabel}" on screen`, needsOperator: true };
+    await cdpClickAt(submitPt.x, submitPt.y);
+    if (LOG) LOG(`login gate: typed the stored login and clicked "${gate.submitLabel}" (trusted input)`);
+
+    // ⚠ WATCH THE TOP-LEVEL URL, NOT THE FRAME (2026-08-12). The first version polled
+    // `cdpEval(atsInjLoginGate)`, which runs in the form frame's ISOLATED WORLD — and that world DIES
+    // the moment the login succeeds and the document is replaced. Every poll then threw, the
+    // `.catch(() => null)` swallowed it, and the gate reported "did not advance" for a login that had
+    // in fact gone through. The tell was the stall diagnostic never printing: it uses the same pinned
+    // eval, so it threw too. Trials 2 and 3 both failed this way while trial 1 happened to be read
+    // before the swap.
+    //
+    // The top-level URL is immune to that: it is read without a pinned context and changes from
+    // `/login` to the candidate form. Keep the frame check as a SECOND signal for a portal that
+    // advances in place without a navigation.
+    const startUrl = await cdpEvalTop(function () { return location.href; }).catch(() => null);
+    for (let i = 0; i < 25; i++) {
+      await cdpDelay(1000);
+      const nowUrl = await cdpEvalTop(function () { return location.href; }).catch(() => null);
+      if (nowUrl && startUrl && nowUrl !== startUrl && !/\/login\b/i.test(nowUrl)) {
+        if (LOG) LOG(`login gate: advanced to ${String(nowUrl).slice(0, 90)}`);
+        cdpClearFormFrame();          // the old frame's world is gone; let the caller re-choose
+        return { passed: true, submitLabel: gate.submitLabel };
+      }
+      const now = await cdpEval(atsInjLoginGate).catch(() => null);
+      if (now && now.ok && !now.isGate) return { passed: true, submitLabel: gate.submitLabel };
+    }
+    const diag = await cdpEval(atsInjLoginGateDiag).catch(() => null);
+    if (diag && diag.ok && LOG) {
+      LOG(`login gate STALLED — url=${diag.url} title="${diag.title}" field=${diag.fieldValue} errors=[${(diag.errors || []).join(" | ")}]`);
+      LOG(`login gate STALLED — page says: ${diag.bodyText}`);
+    }
+    return { passed: false, needsOperator: true,
+      reason: "the login page did not advance after entering the email" +
+        (diag && diag.errors && diag.errors.length ? " — the page says: " + diag.errors.join("; ") : "") };
+  } finally {
+    cdpSetSyntheticInput(wasSynthetic);
+  }
+}
+
 async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // THE JOB IDENTITY IS THE LINK WE WERE GIVEN, not wherever the form turned out to live. A
   // landing hop (employer redirect, embedded frame, apply link) changes the URL, and keying the
@@ -4639,13 +4738,25 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // Bounded to one attempt per run by `loginHops`; a gate that cannot be passed reports
     // `needs_operator` with the reason rather than pressing on into a form that is not there.
     if (!ready.ready && ats === "generic" && !(opts0.loginHops >= 1)) {
-      const gateAct = { eval: (fn, ...a) => cdpEval(fn, ...a), delayFull: (ms) => cdpDelay(ms) };
-      let gate = await atsPassLoginGate(gateAct, store.credentials).catch((e) => ({ passed: false, reason: String((e && e.message) || e) }));
-      if (!gate.passed) {
+      // TRUSTED first (the auth-form rule), on the top document and then inside the form frame —
+      // the login field is inside `icims_content_iframe`, and the frame-hop below uses a floor of 4
+      // that correctly refuses a one-field login page, so this arms its own at a floor of 1.
+      let gate = await passLoginGateTrusted(store.credentials, LOG).catch((e) => ({ passed: false, reason: String((e && e.message) || e) }));
+      if (!gate.passed && !gate.needsOperator) {
         const armedLogin = await cdpUseFormFrame(1);
-        if (armedLogin.ok) gate = await atsPassLoginGate(gateAct, store.credentials).catch((e) => ({ passed: false, reason: String((e && e.message) || e) }));
-        if (!gate.passed) cdpClearFormFrame();
+        if (armedLogin.ok) gate = await passLoginGateTrusted(store.credentials, LOG).catch((e) => ({ passed: false, reason: String((e && e.message) || e) }));
       }
+      // Synthetic fallback: trusted is right for an auth form, but a coordinate click depends on
+      // layout being measurable, which a hidden or oddly-scrolled tab can defeat. Page-side actuation
+      // needs no coordinates at all, so it covers precisely the cases trusted cannot reach. It is the
+      // FALLBACK, never the default — on this page it advanced only intermittently.
+      if (!gate.passed) {
+        const gateAct = { eval: (fn, ...a) => cdpEval(fn, ...a), delayFull: (ms) => cdpDelay(ms) };
+        const synth = await atsPassLoginGate(gateAct, store.credentials).catch((e) => ({ passed: false, reason: String((e && e.message) || e) }));
+        if (synth.passed) { LOG("login gate: trusted input did not advance it; the page-side fallback did"); gate = synth; }
+        else if (!gate.needsOperator) gate = synth;
+      }
+      if (!gate.passed) cdpClearFormFrame();
       if (gate.passed) {
         LOG(`passed an email-only login gate ("${gate.submitLabel}") using your stored login — the form should follow`);
         emitRunProgress("Signing in", "email login");

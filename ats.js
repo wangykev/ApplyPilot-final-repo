@@ -1465,6 +1465,53 @@ async function atsPassLoginGate(act, credentials) {
   return { passed: false, reason: "the login page did not advance after entering the email", needsOperator: true };
 }
 
+// Coordinates for a TRUSTED click on a control that lives inside the form iframe. `Input.*` targets
+// the TOP-LEVEL viewport, while an element's own `getBoundingClientRect()` is relative to its frame —
+// so the two have to be added. Read the iframe's box from the TOP document (this fn), the element's
+// from inside the frame (`atsInjElBox`), and click at the sum.
+function atsInjFormFrameBox() {
+  let best = null, bestN = -1;
+  for (const f of document.querySelectorAll("iframe")) {
+    let n = 0;
+    try { n = f.contentDocument.querySelectorAll("input:not([type=hidden]),textarea,select").length; } catch (e) { continue; }
+    if (n > bestN) { bestN = n; best = f; }
+  }
+  if (!best) return { ok: false, reason: "no same-origin iframe" };
+  const r = best.getBoundingClientRect();
+  return { ok: true, x: r.left, y: r.top, h: r.height, controls: bestN,
+    viewportH: window.innerHeight, scrollY: window.scrollY };
+}
+
+// The element's box within its own frame, after bringing it into view.
+function atsInjElBox(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, reason: "not found: " + sel };
+  try { el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) { /* best effort */ }
+  const r = el.getBoundingClientRect();
+  if (!r.width || !r.height) return { ok: false, reason: "zero-sized" };
+  return { ok: true, x: r.left, y: r.top, w: r.width, h: r.height };
+}
+
+// What is the login page SHOWING when it refuses to advance? Two runs in three stalled with nothing
+// to look at but "did not advance", which is a symptom, not a cause — and the same steps by hand
+// advance every time. Capture the page's own account of itself so the next stall is diagnosable.
+function atsInjLoginGateDiag() {
+  const T = (e) => (e && e.textContent ? e.textContent.replace(/\s+/g, " ").trim() : "");
+  const errSel = ".iCIMS_Error,.error,[role=alert],.iCIMS_Validation,.field-error,.alert,.message";
+  const errors = [...document.querySelectorAll(errSel)].map(T).filter(Boolean).slice(0, 4);
+  const el = document.querySelector('input[type="email"],input[name*="login" i],input[id*="email" i]');
+  return { ok: true, url: String(location.href).slice(0, 120), title: String(document.title).slice(0, 70),
+    errors, fieldValue: el ? String(el.value || "").length + " chars" : "(no field)",
+    bodyText: T(document.body).slice(0, 260) };
+}
+
+// Scroll the TOP window so a point sits comfortably inside the viewport, then report the new offset.
+function atsInjScrollTopTo(absY) {
+  const want = absY - window.innerHeight / 2;
+  window.scrollTo(0, Math.max(0, want));
+  return { ok: true, scrollY: window.scrollY, viewportH: window.innerHeight };
+}
+
 // An employer page can EMBED the ATS form in an iframe rather than link to it (Greenhouse's
 // "#grnhse_app" widget and its `?gh_jid=` pages are the common case; Lever and Ashby ship the
 // same kind of widget). The iframe SRC is the exact URL the employer itself uses, so reading it
@@ -4722,6 +4769,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjLoginGate, atsPassLoginGate, atsGenericCredentialRecheck,
+    atsInjFormFrameBox, atsInjElBox, atsInjScrollTopTo, atsInjLoginGateDiag,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
