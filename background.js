@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "gate-url-watch-16";
+const AP_BUILD_MARKER = "gate-reload-poll-19";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4558,10 +4558,7 @@ async function passLoginGateTrusted(credentials, LOG) {
       return { passed: false, reason: `the login email did not land in the field (${got.length} of ${email.length} chars)`, needsOperator: true };
     }
 
-    const submitPt = await absCentre(gate.submitSel);
-    if (!submitPt) return { passed: false, reason: `could not bring "${gate.submitLabel}" on screen`, needsOperator: true };
-    await cdpClickAt(submitPt.x, submitPt.y);
-    if (LOG) LOG(`login gate: typed the stored login and clicked "${gate.submitLabel}" (trusted input)`);
+    if (LOG) LOG(`login gate: typed the stored login; activating "${gate.submitLabel}"`);
 
     // ⚠ WATCH THE TOP-LEVEL URL, NOT THE FRAME (2026-08-12). The first version polled
     // `cdpEval(atsInjLoginGate)`, which runs in the form frame's ISOLATED WORLD — and that world DIES
@@ -4575,22 +4572,122 @@ async function passLoginGateTrusted(credentials, LOG) {
     // `/login` to the candidate form. Keep the frame check as a SECOND signal for a portal that
     // advances in place without a navigation.
     const startUrl = await cdpEvalTop(function () { return location.href; }).catch(() => null);
-    for (let i = 0; i < 25; i++) {
-      await cdpDelay(1000);
+    const advanced = async () => {
       const nowUrl = await cdpEvalTop(function () { return location.href; }).catch(() => null);
-      if (nowUrl && startUrl && nowUrl !== startUrl && !/\/login\b/i.test(nowUrl)) {
-        if (LOG) LOG(`login gate: advanced to ${String(nowUrl).slice(0, 90)}`);
+      if (nowUrl && startUrl && nowUrl !== startUrl && !/\/login\b/i.test(nowUrl)) return String(nowUrl);
+      const now = await cdpEval(atsInjLoginGate).catch(() => null);
+      return now && now.ok && !now.isGate ? "the page is no longer a one-field login" : null;
+    };
+    const waitAdvance = async (seconds) => {
+      for (let i = 0; i < seconds; i++) {
+        await cdpDelay(1000);
+        const where = await advanced();
+        if (where) return where;
+      }
+      return null;
+    };
+
+    // ── THE ACTIVATION LADDER (the Workday apply-manually shape, operator 2026-08-12) ─────────
+    // One strategy either works or it does not, and this one did not: three runs went reached /
+    // FAILED / reached, and the failure was a genuine refusal (the URL never moved). Workday's
+    // onboarding solved the same problem long ago by laddering — focus+Enter, then an in-page
+    // activate, then the render budget — so the gate does the same. Each rung is a MATERIALLY
+    // different way to submit, not a retry of the last one, and each gets its own wait:
+    //   1. trusted coordinate click — a real click through the browser's input pipeline;
+    //   2. trusted ENTER in the email field — a login form's other native submit path, and it
+    //      needs no coordinates, so it survives a mis-measured or scrolled layout;
+    //   3. in-page activate (`el.click()`) — no coordinates and no input pipeline at all;
+    //   4. `form.requestSubmit()` — asks the FORM itself, running its own validation and submit
+    //      handlers (unlike `.submit()`, which skips them).
+    // The element is re-located for every rung: the page re-renders between attempts.
+    const rungs = [
+      { name: "trusted click", run: async () => {
+          const pt = await absCentre(gate.submitSel);
+          if (!pt) return { ok: false, reason: "could not bring it on screen" };
+          await cdpClickAt(pt.x, pt.y); return { ok: true };
+        } },
+      { name: "Enter in the login field", run: async () => {
+          const pt = await absCentre(gate.emailSel);
+          if (pt) await cdpClickAt(pt.x, pt.y);          // put the caret back in the field
+          await cdpDelay(120);
+          await cdpKeyTap(CDP_KEYS.enter); return { ok: true };
+        } },
+      { name: "in-page activate", run: async () => {
+          const r = await cdpEval(cdpActivateBySelector, gate.submitSel, "click").catch(() => null);
+          return r && r.ok ? { ok: true } : { ok: false, reason: (r && r.reason) || "eval failed" };
+        } },
+      { name: "form.requestSubmit()", run: async () => {
+          const r = await cdpEval(atsInjSubmitLoginForm, gate.submitSel).catch(() => null);
+          return r && r.ok ? { ok: true } : { ok: false, reason: (r && r.reason) || "eval failed" };
+        } },
+      // ⚠ THE LAST RUNG IS NOT ANOTHER WAY TO CLICK — it reloads the page and starts over.
+      // Measured 2026-08-12: on a run immediately following a completed one, ALL FOUR activation
+      // rungs above failed on the same page — a trusted click, a trusted Enter, an in-page
+      // `el.click()` and the form submitting itself. Four materially different paths cannot all
+      // mis-fire, so the page was REFUSING, not mis-activated. The run reaches `/login` by
+      // navigating there twice (the apply-link hop, then the generic recursion), so the second
+      // render can come from cache carrying a CSRF/nonce the server has already retired — every
+      // submit is then rejected and the page re-renders identically, which is exactly what was
+      // observed. A cache-bypassing reload is the only rung that can fix that, and it has to come
+      // last because it throws away the typed value and re-does the whole gate.
+      { name: "hard reload and retype", run: async () => {
+          const rl = await cdpReload();
+          if (!rl.ok) return { ok: false, reason: rl.error || "reload failed" };
+          // ⚠ POLL FOR THE FRAME, DO NOT SLEEP AT IT. This waited a fixed 3s and reported "the login
+          // frame did not come back after the reload" — on a page that measurably takes 7-9s to
+          // populate `icims_content_iframe` (every manual probe of it needed that long). The rescue
+          // rung was therefore giving up before the page returned, which is the whole reason it never
+          // rescued anything. Same rule as everywhere else here: wait on the condition, not a timer.
+          cdpClearFormFrame();
+          let probe = null;
+          for (let t = 0; t < 20; t++) {
+            await cdpDelay(1000);
+            const armed = await cdpUseFormFrame(1);
+            if (!armed.ok) continue;
+            probe = await cdpEval(atsInjLoginGate).catch(() => null);
+            if (probe && probe.ok && probe.isGate) break;
+            probe = null;
+          }
+          if (!probe) return { ok: false, reason: "the login form did not come back within 20s of the reload" };
+          const pt = await absCentre(probe.emailSel);
+          if (!pt) return { ok: false, reason: "could not bring the login field on screen" };
+          await cdpClickAt(pt.x, pt.y);
+          await cdpDelay(150);
+          await cdpSelectAllDelete();
+          await cdpTypeChars(email, 25);
+          const sp = await absCentre(probe.submitSel);
+          if (!sp) return { ok: false, reason: "could not bring the submit on screen" };
+          await cdpClickAt(sp.x, sp.y);
+          return { ok: true };
+        } },
+    ];
+    for (let i = 0; i < rungs.length; i++) {
+      const r = await rungs[i].run().catch((e) => ({ ok: false, reason: String((e && e.message) || e) }));
+      if (!r.ok) { if (LOG) LOG(`login gate: ${rungs[i].name} unavailable — ${r.reason}`); continue; }
+      const where = await waitAdvance(i === 0 ? 12 : 8);
+      if (where) {
+        if (LOG) LOG(`login gate: advanced via ${rungs[i].name} → ${String(where).slice(0, 90)}`);
         cdpClearFormFrame();          // the old frame's world is gone; let the caller re-choose
         return { passed: true, submitLabel: gate.submitLabel };
       }
-      const now = await cdpEval(atsInjLoginGate).catch(() => null);
-      if (now && now.ok && !now.isGate) return { passed: true, submitLabel: gate.submitLabel };
+      if (LOG) LOG(`login gate: ${rungs[i].name} did not advance the page${i + 1 < rungs.length ? " — trying the next way" : ""}`);
     }
-    const diag = await cdpEval(atsInjLoginGateDiag).catch(() => null);
-    if (diag && diag.ok && LOG) {
-      LOG(`login gate STALLED — url=${diag.url} title="${diag.title}" field=${diag.fieldValue} errors=[${(diag.errors || []).join(" | ")}]`);
-      LOG(`login gate STALLED — page says: ${diag.bodyText}`);
+    // ⚠ REPORT BOTH DOCUMENTS. The first version ran one pinned eval, and a rung that had cleared
+    // the pin made it measure the TOP page instead — it printed `title="Careers - Astrion"
+    // field=(no field)`, which reads like "the login form vanished" when the form was simply in the
+    // frame we were no longer pointed at. A diagnostic that can silently change which document it
+    // describes is worse than none.
+    await cdpUseFormFrame(1).catch(() => null);
+    const inFrame = await cdpEval(atsInjLoginGateDiag).catch(() => null);
+    const onTop = await cdpEvalTop(atsInjLoginGateDiag).catch(() => null);
+    if (LOG) {
+      if (onTop && onTop.ok) LOG(`login gate STALLED — TOP: url=${onTop.url} title="${onTop.title}"`);
+      if (inFrame && inFrame.ok) {
+        LOG(`login gate STALLED — FRAME: title="${inFrame.title}" field=${inFrame.fieldValue} errors=[${(inFrame.errors || []).join(" | ")}]`);
+        LOG(`login gate STALLED — FRAME says: ${inFrame.bodyText}`);
+      } else LOG("login gate STALLED — the form frame could not be read at all");
     }
+    const diag = inFrame && inFrame.ok ? inFrame : onTop;
     return { passed: false, needsOperator: true,
       reason: "the login page did not advance after entering the email" +
         (diag && diag.errors && diag.errors.length ? " — the page says: " + diag.errors.join("; ") : "") };

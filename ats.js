@@ -1492,6 +1492,23 @@ function atsInjElBox(sel) {
   return { ok: true, x: r.left, y: r.top, w: r.width, h: r.height };
 }
 
+// Last rung of the login-gate ladder: ask the FORM to submit itself. `requestSubmit()` runs the
+// form's own validation and submit handlers (unlike `.submit()`, which skips them), so it is the
+// closest thing to a real activation that needs no coordinates and no event dispatch at all.
+function atsInjSubmitLoginForm(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, reason: "submit control not found" };
+  const form = el.form || el.closest("form");
+  if (!form) return { ok: false, reason: "the control is not inside a form" };
+  try {
+    if (typeof form.requestSubmit === "function") { form.requestSubmit(el.tagName === "INPUT" || el.tagName === "BUTTON" ? el : undefined); return { ok: true, via: "requestSubmit" }; }
+    form.submit();
+    return { ok: true, via: "submit" };
+  } catch (e) {
+    return { ok: false, reason: String((e && e.message) || e) };
+  }
+}
+
 // What is the login page SHOWING when it refuses to advance? Two runs in three stalled with nothing
 // to look at but "did not advance", which is a symptom, not a cause — and the same steps by hand
 // advance every time. Capture the page's own account of itself so the next stall is diagnosable.
@@ -4769,7 +4786,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjLoginGate, atsPassLoginGate, atsGenericCredentialRecheck,
-    atsInjFormFrameBox, atsInjElBox, atsInjScrollTopTo, atsInjLoginGateDiag,
+    atsInjFormFrameBox, atsInjElBox, atsInjScrollTopTo, atsInjLoginGateDiag, atsInjSubmitLoginForm,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,

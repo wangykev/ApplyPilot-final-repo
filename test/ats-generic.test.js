@@ -1537,6 +1537,15 @@ test("login gate: a page that is NOT a one-field login is declined, and the call
   assert.ok(!r.needsOperator, "declining is not an operator stop — the run continues its ladder");
 });
 
+test("login gate: the last rung asks the FORM to submit, running its own handlers", () => {
+  // requestSubmit() runs validation + submit handlers; .submit() skips them, so it is only the
+  // fallback-of-the-fallback. Needs no coordinates and no event dispatch, which is the point.
+  const src = ats.atsInjSubmitLoginForm.toString();
+  assert.ok(/requestSubmit/.test(src), "requestSubmit is preferred");
+  assert.ok(src.indexOf("requestSubmit") < src.indexOf("form.submit()"), "…and tried BEFORE bare submit()");
+  assert.ok(/not inside a form/.test(src), "a control with no form is reported, not thrown on");
+});
+
 test("⚠ login gate: the injected probe demands ONE fillable field, no password, and a named email box", () => {
   const src = ats.atsInjLoginGate.toString();
   assert.ok(/fillable\.length !== 1/.test(src), "exactly one fillable control");
