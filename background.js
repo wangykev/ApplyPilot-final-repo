@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "prompt-about-27";
+const AP_BUILD_MARKER = "scoped-ordinal-28";
 // How many times Apply may be pressed when it bounces straight back to the page it was pressed on
 // (operator, 2026-08-12: "sometimes clicking apply redirects you to the same page and you need to
 // keep pressing apply until you get redirected"). Low on purpose: a page that has not moved after

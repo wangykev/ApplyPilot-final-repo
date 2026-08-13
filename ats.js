@@ -3870,15 +3870,20 @@ function atsGenericAiScopeKey(f) {
 // turns a bare `"City"` into a question a model can actually answer: the first prompt sent
 // `{"question":"City"}` with the school's name only in a JSON blob and a paragraph of scope prose
 // above it, and the reply was "N/A". Naming the subject IN the question is the difference.
-function atsGenericEntryLabel(profile, f) {
+// ⚠ Reads the ALREADY-SCOPED view it is given — it must not scope again. The batch hands this
+// function the profile it is about to send, which already holds exactly one entry; re-applying the
+// entry ordinal to a one-element list returned undefined for every entry after the first, so those
+// questions lost the very name that makes them answerable. Take entry 0 of whatever it is given, and
+// scope once, at the call site.
+function atsGenericEntryLabel(scopedProfile, f) {
   const key = f ? atsGenericAiScopeKey(f) : "";
   if (!key) return "";
-  const view = atsGenericProfileForAi(profile, f);
+  const p = scopedProfile || {};
   if (key.startsWith("education")) {
-    const e = (view.education || [])[0] || {};
+    const e = (Array.isArray(p.education) ? p.education : [])[0] || {};
     return String(e.school_or_university || e.school || "").trim();
   }
-  const w = (view.work_experience || [])[0] || {};
+  const w = (Array.isArray(p.work_experience) ? p.work_experience : [])[0] || {};
   return String(w.company || w.employer || "").trim();
 }
 
@@ -4189,12 +4194,19 @@ function atsGenericPostProcess(raw) {
   // ⚠ The label alone is NOT unique on real forms: Dayforce repeats "Country" ×3, "City" ×3,
   // "State/Province" ×3, "Start Date"/"End Date" ×2 and "Country dialing code" ×2, and the
   // collisions land precisely on repeating sections.
+  // ⚠ COUNTED AND NUMBERED BY THE SAME KEY. The counter below decides the ordinal and this map
+  // decides whether the identity needs a `#k` suffix — key them differently and a duplicated label
+  // stops getting its suffix, collapsing two fields onto one identity. Both use SCOPE + label, so
+  // "City" in the address block, in education and in each work entry are three separate series.
+  const scopeOfStaged = (s) => atsGenericScopeOf({
+    fieldName: (s.f && s.f.attrId) || "", label: s.label || "", sectionHeading: (s.f && s.f.sectionHeading) || "" });
+  const seriesKey = (s) => (s.label ? scopeOfStaged(s) + "|" + s.label.toLowerCase() : "");
   const labelCount = new Map();
   for (const s of staged) {
-    const k = s.label.toLowerCase();
+    const k = seriesKey(s);
     if (k) labelCount.set(k, (labelCount.get(k) || 0) + 1);
   }
-  out.diag.duplicateLabels = [...labelCount.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+  out.diag.duplicateLabels = [...labelCount.entries()].filter(([, n]) => n > 1).map(([k]) => k.split("|").slice(1).join("|"));
   const labelSeen = new Map();
   for (const s of staged) {
     const f = s.f;
@@ -4218,7 +4230,16 @@ function atsGenericPostProcess(raw) {
     // a durable id — because a repeating section can have perfectly good ids per entry (Dayforce's
     // `..._educationHistory_0_...`) and its entry index is still needed. Counting it here, before the
     // identity branch, is what keeps the two independent.
-    const labelKey = s.label ? s.label.toLowerCase() : "";
+    // ⚠ COUNT WITHIN THE SECTION, NOT THE PAGE (2026-08-12). This counted every field sharing a
+    // label across the WHOLE page, and the limitation noted above turned out to bite hard: "City"
+    // appears in the address block, the education entry AND each work entry, so
+    // `CandProfileFields.EducationCity` was numbered 1 or 2 — and once entry ordinals started
+    // selecting which profile entry the AI may see, that number stopped being cosmetic. It handed
+    // education entry 1 (or an empty one) to a question about education entry 0, which is why the
+    // school's name never reached the prompt and the answer came back "N/A" no matter how the prompt
+    // was worded. Keying the counter by SCOPE + label restarts it per section, so the k-th "City"
+    // inside education is education entry k and nothing else.
+    const labelKey = seriesKey(s);
     const entryOrdinal = labelKey ? (labelSeen.get(labelKey) || 0) : 0;
     if (labelKey) labelSeen.set(labelKey, entryOrdinal + 1);
     if (durable) {

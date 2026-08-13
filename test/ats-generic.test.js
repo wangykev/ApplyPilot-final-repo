@@ -1812,6 +1812,37 @@ test("⚠ AI scope: an entry the profile does not have yields an EMPTY section, 
 // not the model: the question read `{"question":"City"}` with the school's name nowhere in it; the
 // SYSTEM prompt said to answer what "the profile clearly holds" and never permitted public
 // knowledge, so a permission sitting in the USER message lost to it; and nothing forbade "N/A".
+test("⚠ THE ENTRY ORDINAL COUNTS WITHIN ITS SECTION, NOT THE PAGE", () => {
+  // The bug behind the "N/A" that no prompt wording could fix. "City" appears in the address block,
+  // the education entry AND each work entry, and the ordinal counted every one of them: live,
+  // `CandProfileFields.EducationCity` was numbered 1 or 2. Cosmetic until entry ordinals began
+  // SELECTING which profile entry the AI may see — then it handed education entry 1 (or an empty
+  // one) to a question about entry 0, so the school's name never reached the prompt at all.
+  const raw = { fields: [
+    { attrId: "-1_PersonProfileFields.AddressCity", inputSel: "#a", widgetType: "text", domIndex: 0, labelCandidates: { labelFor: "City" }, sectionHeading: "Enter your information" },
+    { attrId: "-1_CandProfileFields.EducationCity", inputSel: "#b", widgetType: "text", domIndex: 1, labelCandidates: { labelFor: "City" }, sectionHeading: "Education" },
+    { attrId: "-1_PersonProfileFields.rcf3216", inputSel: "#c", widgetType: "text", domIndex: 2, labelCandidates: { labelFor: "City" }, sectionHeading: "Experience" },
+  ] };
+  const s = ats.atsGenericPostProcess(raw);
+  const by = (frag) => s.fields.find((f) => f.fieldName.includes(frag));
+  assert.strictEqual(by("EducationCity").entryOrdinal, 0, "the FIRST city inside education is education entry 0");
+  assert.strictEqual(by("rcf3216").entryOrdinal, 0, "…and the first inside experience is work entry 0");
+  assert.strictEqual(ats.atsGenericAiScopeKey(by("EducationCity")), "education#0");
+  assert.strictEqual(ats.atsGenericAiScopeKey(by("rcf3216")), "work#0");
+  // and the school name therefore reaches the prompt
+  assert.strictEqual(ats.atsGenericEntryLabel(ats.atsGenericProfileForAi(SCOPE_PROFILE, by("EducationCity")), by("EducationCity")),
+    "Carnegie Mellon University");
+});
+
+test("⚠ entry label: reads the ALREADY-SCOPED view — it must not scope twice", () => {
+  // The batch hands this the profile it is about to send, which already holds ONE entry. Re-applying
+  // the ordinal to a one-element list returned undefined for every entry after the first, so those
+  // questions lost the very name that makes them answerable.
+  const f1 = { label: "City", sectionHeading: "Education", entryOrdinal: 1 };
+  const scoped = ats.atsGenericProfileForAi(SCOPE_PROFILE, f1);   // {education:[Some Other College]}
+  assert.strictEqual(ats.atsGenericEntryLabel(scoped, f1), "Some Other College");
+});
+
 test("⚠ prompt: the question NAMES what it is about — not just a bare label", () => {
   const f = { fieldName: "x", label: "City", sectionHeading: "Education", entryOrdinal: 0 };
   assert.strictEqual(ats.atsGenericEntryLabel(SCOPE_PROFILE, f), "Carnegie Mellon University");
