@@ -1924,6 +1924,63 @@ async function atsGenericResumePrepass(act, ats, scan, results, profile, default
   return changed ? settled : null;
 }
 
+// ── CREDENTIALS ARE RE-CHECKED LAST (generic, 2026-08-12) ────────────────────────────────────
+// The credential tier verifies its write with an immediate read-back, and that read-back is not
+// enough: the operator's form showed `PersonProfileFields.Login` holding `kevinw4@andrew.cmu.edu`
+// with an EMPTY password, while the run had logged both as `filled` with the read-back passing.
+//
+// Traced rather than guessed. The stored login is `wangykev+2@gmail.com`, so the address on the page
+// was not ours; and signing in fresh shows a form whose Login box is EMPTY (`value=""`), so it was
+// not server-rendered either. Something fills it AFTER the page loads — the field carries
+// `autocomplete="username"` and the address is the operator's real one, i.e. Chrome's own password
+// manager autofilling over our value. Whatever the agent, the shape is the same and is the failure
+// class the safety contract exists to prevent: verified, then reverted, still reported `filled`.
+//
+// ⚠ I made this worse before I found it: `atsFinishFill` was changed to SKIP credential records in
+// the post-fill audit, because their `after` is the placeholder "(stored login)" rather than a value
+// and so could never reconcile. That removed the only second look at these fields. This restores one
+// — comparing against the EXPECTED value, which the audit cannot do because the secret must never
+// reach a record or the bundle. It lives here, inside the fill, where the credentials already are.
+//
+// Runs LAST so anything that re-renders has already done so. A field it cannot hold is reported
+// `needs_review` + `credential-overwritten`: a login we could not keep on the page must never be
+// claimed as filled.
+async function atsGenericCredentialRecheck(act, ats, scan, results, credentials) {
+  if (ats !== "generic") return null;
+  if (!credentials || !credentials.email || !credentials.password) return null;
+  const creds = results.filter((r) => r && r.credential && r.credentialKind && r.status === "filled");
+  if (!creds.length) return null;
+  let held = 0, repaired = 0, lost = 0;
+  for (const rec of creds) {
+    const f = (scan.fields || []).find((x) => x.fieldName === rec.fieldName);
+    if (!f) continue;
+    const want = rec.credentialKind === "login" ? credentials.email : credentials.password;
+    const read = async () => {
+      const b = await atsReadBackSettled(act, ats, f.inputSel, "text").catch(() => null);
+      return b && b.ok ? String(b.value == null ? "" : b.value) : null;
+    };
+    if ((await read()) === want) { held++; continue; }
+    // Something replaced it. Rewrite, clearing first so a partial cannot merge.
+    await act.eval(atsInjSetText, f.inputSel, "").catch(() => null);
+    await act.eval(atsInjSetText, f.inputSel, want).catch(() => null);
+    if ((await read()) === want) {
+      repaired++;
+      rec.detail = (rec.detail || "") + "; the page replaced it after the fill, so it was written again";
+    } else {
+      lost++;
+      rec.status = "needs_review";
+      rec.flag = "credential-overwritten";
+      rec.after = null;
+      rec.detail = "the page kept replacing this " + rec.credentialKind.replace("_", " ") +
+        " after we filled it (a browser password manager will do this) — set it yourself before submitting";
+    }
+  }
+  try {
+    console.log(`[ApplyPilot][ATS-FILL] credential re-check: ${held} held, ${repaired} rewritten, ${lost} still overwritten`);
+  } catch (e) { /* log only */ }
+  return { held, repaired, lost };
+}
+
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
@@ -1975,6 +2032,13 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     }
   } catch (e) {
     try { console.log("[ApplyPilot][ATS-FILL] review-picker capture skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
+  }
+
+  // LAST — after the cascade rounds and the option capture, so anything that re-renders already has.
+  try {
+    await atsGenericCredentialRecheck(act, ats, scan, results, o && o.credentials);
+  } catch (e) {
+    try { console.log("[ApplyPilot][ATS-FILL] credential re-check skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
   }
 
   return await atsFinishFill(act, ats, scan, results);
@@ -4657,7 +4721,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
-    atsInjLoginGate, atsPassLoginGate,
+    atsInjLoginGate, atsPassLoginGate, atsGenericCredentialRecheck,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,

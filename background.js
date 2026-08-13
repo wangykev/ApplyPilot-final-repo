@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "login-gate-10";
+const AP_BUILD_MARKER = "cred-recheck-13";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -135,11 +135,18 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     (async () => {
       let hasResume = false;
       try { hasResume = !!(await getResume()); } catch (e) { /* ignore */ }
-      chrome.storage.local.get("profile", ({ profile }) => {
+      chrome.storage.local.get(["profile", "credentials"], ({ profile, credentials }) => {
         sendResponse({
           ok: true,
           app: "ApplyPilot",
           version: chrome.runtime.getManifest().version,
+          // WHICH login is stored. The operator saw a form Login box holding an address they did not
+          // recognise and had no way to tell whether it came from us or from the portal's own account
+          // (2026-08-12) — the fill log deliberately never prints the value, so the only way to answer
+          // was to guess. The EMAIL is a username the operator supplies and can read back on their own
+          // Sign-in page; the PASSWORD is reported as presence + length only and never leaves storage.
+          credentialEmail: (credentials && credentials.email) || null,
+          credentialPasswordChars: credentials && credentials.password ? String(credentials.password).length : 0,
           // BUILD MARKER (bump when verifying a specific change is live). The service worker only
           // re-reads files when it RESTARTS, and chrome.runtime.reload() is unreliable under repeated
           // use — during 2026-08-06 several runs silently executed pre-edit code while AP_PING answered
@@ -4646,6 +4653,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         opts0 = Object.assign({}, opts0, { loginHops: (opts0.loginHops || 0) + 1 });
         ready = await waitAtsFormReady(ats, LOG);
       } else if (gate.needsOperator) {
+        // LOG the reason as well as returning it: the generic attempt's result is DISCARDED when the
+        // run falls through to the Workday path, so a halt here was invisible in the SW console and
+        // could only be guessed at (2026-08-12).
+        LOG(`login gate could not be passed — ${gate.reason}`);
         return { ok: true, needs_operator: true, stopped: "login-gate", submitted: false, detail: gate.reason };
       } else {
         LOG(`not an email-only login page (${gate.reason})`);

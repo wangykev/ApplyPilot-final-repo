@@ -1407,6 +1407,67 @@ test("isolation: atsFormUrl leaves a generic/unknown URL untouched", () => {
   assert.strictEqual(ats.atsFormUrl("generic", u), u);
 });
 
+// ── CREDENTIALS RE-CHECKED LAST (Astrion iCIMS, live 2026-08-12) ────────────────────────────
+// The operator's form showed Login holding `kevinw4@andrew.cmu.edu` with an EMPTY password while the
+// run had logged both `filled` with the read-back passing. The stored login is a different address
+// and a freshly-signed-in form has an EMPTY Login box, so the value arrived AFTER load — the field
+// is `autocomplete="username"`, i.e. a browser password manager. Verified-then-reverted is the exact
+// failure the safety contract exists to prevent, so it must never end a run reported as filled.
+function credRecheckAct(page) {
+  return { delayFull: async () => {}, delay: async () => {},
+    eval: async (fn, ...args) => { const h = page[fn.name]; if (!h) throw new Error("no handler for " + fn.name); return h(...args); } };
+}
+const RECHECK_CREDS = { email: "wangykev+2@gmail.com", password: "s3cret-pw" };
+const credScan = { fields: [{ fieldName: "PersonProfileFields.Login", inputSel: "#login", widgetType: "text" }] };
+const credRec = () => ([{ fieldName: "PersonProfileFields.Login", credential: true, credentialKind: "login",
+  status: "filled", after: "(stored login)", detail: "filled from your stored login" }]);
+
+test("⚠ credentials: a value REPLACED after the fill is rewritten, not left wrong", async () => {
+  let live = "kevinw4@andrew.cmu.edu";           // the password manager got there first
+  const act = credRecheckAct({
+    atsInjReadValue: () => ({ ok: true, value: live }),
+    atsInjSetText: (sel, v) => { live = v; return { ok: true, after: v }; },
+  });
+  const results = credRec();
+  const out = await ats.atsGenericCredentialRecheck(act, "generic", credScan, results, RECHECK_CREDS);
+  assert.strictEqual(out.repaired, 1);
+  assert.strictEqual(live, RECHECK_CREDS.email, "the stored login must end up on the page");
+  assert.strictEqual(results[0].status, "filled");
+  assert.ok(/written again/.test(results[0].detail), "the repair is stated, not silent");
+});
+
+test("⚠ credentials: one the page KEEPS overwriting ends needs_review — never claimed filled", async () => {
+  const act = credRecheckAct({
+    atsInjReadValue: () => ({ ok: true, value: "kevinw4@andrew.cmu.edu" }),   // our write never sticks
+    atsInjSetText: () => ({ ok: true }),
+  });
+  const results = credRec();
+  const out = await ats.atsGenericCredentialRecheck(act, "generic", credScan, results, RECHECK_CREDS);
+  assert.strictEqual(out.lost, 1);
+  assert.strictEqual(results[0].status, "needs_review");
+  assert.strictEqual(results[0].flag, "credential-overwritten");
+  assert.strictEqual(results[0].after, null, "no placeholder may imply it was filled");
+});
+
+test("credentials: one that HELD is left alone and costs no rewrite", async () => {
+  let writes = 0;
+  const act = credRecheckAct({
+    atsInjReadValue: () => ({ ok: true, value: RECHECK_CREDS.email }),
+    atsInjSetText: () => { writes++; return { ok: true }; },
+  });
+  const results = credRec();
+  const out = await ats.atsGenericCredentialRecheck(act, "generic", credScan, results, RECHECK_CREDS);
+  assert.deepStrictEqual([out.held, out.repaired, out.lost], [1, 0, 0]);
+  assert.strictEqual(writes, 0);
+  assert.strictEqual(results[0].status, "filled");
+});
+
+test("isolation: the credential re-check is generic-only and needs stored credentials", async () => {
+  const act = credRecheckAct({});   // any eval would throw, so a no-op is proven by not throwing
+  assert.strictEqual(await ats.atsGenericCredentialRecheck(act, "greenhouse", credScan, credRec(), RECHECK_CREDS), null);
+  assert.strictEqual(await ats.atsGenericCredentialRecheck(act, "generic", credScan, credRec(), null), null);
+});
+
 // ── THE EMAIL-ONLY LOGIN GATE (Astrion iCIMS, live 2026-08-12) ──────────────────────────────
 // `careers.astrion.us/jobs/24615?mode=apply` → Apply → `…icims.com/jobs/24615/login`, which asks for
 // an email and nothing else, → the form. That middle page halted the run `unknown-page`.
