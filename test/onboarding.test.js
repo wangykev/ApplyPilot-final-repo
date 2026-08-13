@@ -699,3 +699,22 @@ test("onboarding: no post-auth reached-form exit skips the résumé-upload page"
     "consuming Workday's résumé-upload page, so the walk receives that page as page 1 and writes a " +
     "one-field junk bundle page. Consume it (onResumeUploadPage + consumeResumeUploadPage) before returning.");
 });
+
+// ── APPLY CAN BOUNCE BACK TO THE SAME PAGE (operator, 2026-08-12) ───────────────────────────
+// "sometimes clicking apply redirects you to the same page and you need to keep pressing apply until
+// you get redirected to the next page." Apply used to be taken exactly once, and the run is bounded
+// to ONE apply hop, so a bounce ended it — reported as an unreachable application when a second
+// press would have gone through. Source-pinned because the retry lives in the SW's DOM driving.
+test("the apply step retries when it bounces back, and compares host+PATH not the full URL", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
+  assert.match(src, /const APPLY_PRESS_MAX = \d+;/, "the retry must be bounded by a named cap");
+  const cap = Number((src.match(/const APPLY_PRESS_MAX = (\d+);/) || [])[1]);
+  assert.ok(cap >= 2 && cap <= 5, `the cap should be small (got ${cap}) — Apply is the one control here that could have a side effect`);
+
+  // ⚠ THE COMPARISON IS THE LOAD-BEARING PART. A bounce returns to the same page with DIFFERENT
+  // tracking/session params, so comparing full URLs would read that as progress and never retry.
+  const pathHelpers = src.match(/x\.host \+ x\.pathname/g) || [];
+  assert.ok(pathHelpers.length >= 2, "both the link path and the button path must compare host+pathname (query ignored)");
+  // …and both retry loops must be able to give up rather than spin.
+  assert.match(src, /giving up on the retry/, "a page that will not advance must break out, not loop");
+});

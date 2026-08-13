@@ -2110,9 +2110,22 @@ async function atsGenericVerifyAndRepair(act, ats, scan, results, profile, defau
     const back = await atsReadBackSettled(act, ats, f.inputSel, f.widgetType).catch(() => null);
     if (!back || !back.ok) continue;                   // unreadable — leave the record as it stands
     const live = String(back.value == null ? "" : back.value).trim();
-    if (live === "") reverted.push({ rec, f });         // only a BLANK counts: a page that reformats a
-    // value ("United States" → "United States (US)") has not lost it, and re-actuating that would be a
-    // second fill pass on every page — the mistake the cascade fix already had to unlearn.
+    if (live === "") { reverted.push({ rec, f, how: "blanked" }); continue; }
+    // ⚠ BLANK IS NOT THE ONLY WAY TO LOSE A VALUE (operator, 2026-08-12): "email somehow fills
+    // kevinw4@gmail.com but it should be the login". That address is neither the profile's email nor
+    // the stored login, so an outside agent — the same browser password manager that put
+    // `kevinw4@andrew.cmu.edu` in the Login box — REPLACED a value we had committed and verified. A
+    // replaced field is not empty, so the blank-only test walked straight past it.
+    //
+    // Still not "repair on any difference": a page is entitled to REFORMAT what it stored
+    // ("United States" → "United States (US)"), and re-actuating those would be a second fill pass on
+    // every page, which is the mistake the cascade fix had to unlearn. So a value counts as lost only
+    // when the live text neither normalize-EQUALS nor CONTAINS what we committed — the same
+    // containment-as-recognition rule the typeahead autocommit path uses, in the same spirit: we are
+    // recognising the page's own rendering of OUR value, not guessing at a new one.
+    const want = atsLib.normalize(String(rec.after));
+    const got = atsLib.normalize(live);
+    if (want && got !== want && got.indexOf(want) === -1) reverted.push({ rec, f, how: "replaced with " + JSON.stringify(live.slice(0, 40)) });
   }
   if (!reverted.length) {
     try { console.log(`[ApplyPilot][ATS-FILL] post-fill verify: all ${candidates.length} filled field(s) still hold their value`); } catch (e) { /* log */ }
@@ -2120,7 +2133,7 @@ async function atsGenericVerifyAndRepair(act, ats, scan, results, profile, defau
   }
 
   try {
-    console.log(`[ApplyPilot][ATS-FILL] ⚠ post-fill verify: ${reverted.length} of ${candidates.length} filled field(s) came back EMPTY — the page reset them; repairing: ${reverted.map((x) => x.rec.fieldName).slice(0, 8).join(", ")}`);
+    console.log(`[ApplyPilot][ATS-FILL] ⚠ post-fill verify: ${reverted.length} of ${candidates.length} filled field(s) LOST their value — repairing: ${reverted.map((x) => x.rec.fieldName + " (" + x.how + ")").slice(0, 8).join(", ")}`);
   } catch (e) { /* log */ }
 
   // Re-run the ordinary fill for exactly those fields, then replace their records with the new ones.
@@ -2132,7 +2145,7 @@ async function atsGenericVerifyAndRepair(act, ats, scan, results, profile, defau
   await atsFillFields(act, ats, fresh, reverted.map((x) => x.f), redo, profile, defaults, jc, bucketIndex, opts);
   let repaired = 0, lost = 0;
   for (const r of redo) {
-    if (r.status === "filled" || r.status === "filled_review") { repaired++; r.detail = (r.detail || "") + "; the page had reset this field after the first fill, so it was filled again"; }
+    if (r.status === "filled" || r.status === "filled_review") { repaired++; r.detail = (r.detail || "") + "; this field had lost its value after the first fill (the page or a browser password manager replaced it), so it was filled again"; }
     else { lost++; r.flag = r.flag || "reverted-after-fill"; }
     results.push(r);
   }

@@ -68,7 +68,13 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "verify-repair-22";
+const AP_BUILD_MARKER = "apply-retry-24";
+// How many times Apply may be pressed when it bounces straight back to the page it was pressed on
+// (operator, 2026-08-12: "sometimes clicking apply redirects you to the same page and you need to
+// keep pressing apply until you get redirected"). Low on purpose: a page that has not moved after
+// three presses is not a page that needs a fourth, and Apply is the one control on this path that
+// could plausibly have a side effect, so the cap is the guard against pressing it indefinitely.
+const APPLY_PRESS_MAX = 3;
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4962,7 +4968,34 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         emitRunProgress("Following the apply link", linkAts || "off-ATS host");
         await cdpNavigate(link);
         await cdpDelay(2500);
-        const after = await cdpEval(function () { return location.href; }).catch(() => link);
+        let after = await cdpEval(function () { return location.href; }).catch(() => link);
+        // ── APPLY CAN BOUNCE BACK TO THE SAME PAGE (operator, 2026-08-12) ─────────────────────
+        // "sometimes clicking apply redirects you to the same page and you need to keep pressing
+        // apply until you get redirected to the next page." Taking Apply once was all this ever did,
+        // and the run is bounded to ONE apply hop, so a bounce ended it — reported as though the
+        // application were unreachable when a second press would have gone through.
+        //
+        // Compares host+PATH, deliberately ignoring the query string: the bounce returns to the same
+        // page carrying different tracking/session params, so a full-URL comparison would call that
+        // progress. Re-finds the affordance each round (the bounced page is a fresh document, and it
+        // may offer a BUTTON where the first offered a link), and tries the button when no link is
+        // there. Bounded, and every round is logged — a page that simply refuses to advance must not
+        // become a silent spin.
+        const pathOf = (u) => { try { const x = new URL(u); return x.host + x.pathname; } catch (e) { return String(u || ""); } };
+        const stuckOn = pathOf(here2);
+        for (let press = 2; press <= APPLY_PRESS_MAX && pathOf(after) === stuckOn; press++) {
+          LOG(`apply bounced back to the same page (${pathOf(after)}) — pressing Apply again (${press}/${APPLY_PRESS_MAX})`);
+          emitRunProgress("Apply bounced back — pressing it again", `attempt ${press}`);
+          const re = await cdpEval(atsInjFindApplyLinks).catch(() => null);
+          const reLink = re && atsPickApplyLink(re.links, detectAts);
+          if (reLink) await cdpNavigate(reLink);
+          else {
+            const clicked2 = await cdpEval(atsInjClickApplyButton).catch(() => null);
+            if (!clicked2 || !clicked2.ok) { LOG(`  no apply affordance to press this round (${(clicked2 && clicked2.reason) || "none found"}) — giving up on the retry`); break; }
+          }
+          await cdpDelay(3000);
+          after = await cdpEval(function () { return location.href; }).catch(() => after);
+        }
         const afterAts = detectAts(after);
         LOG(`apply link landed on ${after} (${afterAts || "unsupported host"})`);
         if (afterAts === "workday") {
@@ -5002,15 +5035,30 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         // that and the URL never changed, so a url-only re-check called it off-pipeline and
         // abandoned a fillable application. Poll for EITHER outcome, then classify the same way
         // the first landing is classified (url, then embedded frame).
+        // …and a press that BOUNCES BACK to the same page gets pressed again (operator,
+        // 2026-08-12) — the same defect as the link path above. The poll below already tolerates a
+        // reveal-in-place, so the retry only fires when nothing at all changed: the URL is still the
+        // same host+path (query ignored — a bounce comes back with different tracking params) AND no
+        // embedded form appeared. `progressed()` is what distinguishes the two.
+        const pathOf2 = (u) => { try { const x = new URL(u); return x.host + x.pathname; } catch (e) { return String(u || ""); } };
+        const startedAt = pathOf2(await cdpEval(function () { return location.href; }).catch(() => ""));
         let after2 = null, afterAts2 = null, embAfter = null;
-        for (let i = 0; i < 8; i++) {
-          await cdpDelay(1000);
-          after2 = await cdpEval(function () { return location.href; }).catch(() => null);
-          afterAts2 = detectAts(after2);
-          if (afterAts2 && afterAts2 !== "workday") break;
-          const e = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
-          embAfter = e && atsPickEmbeddedForm(e.srcs, detectAts);
-          if (embAfter) break;
+        for (let press = 1; press <= APPLY_PRESS_MAX; press++) {
+          for (let i = 0; i < 8; i++) {
+            await cdpDelay(1000);
+            after2 = await cdpEval(function () { return location.href; }).catch(() => null);
+            afterAts2 = detectAts(after2);
+            if (afterAts2 && afterAts2 !== "workday") break;
+            const e = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
+            embAfter = e && atsPickEmbeddedForm(e.srcs, detectAts);
+            if (embAfter) break;
+          }
+          const progressed = !!embAfter || (after2 && pathOf2(after2) !== startedAt);
+          if (progressed || press === APPLY_PRESS_MAX) break;
+          LOG(`the apply button bounced back to the same page (${pathOf2(after2)}) — pressing it again (${press + 1}/${APPLY_PRESS_MAX})`);
+          emitRunProgress("Apply bounced back — pressing it again", `attempt ${press + 1}`);
+          const again = await cdpEval(atsInjClickApplyButton).catch(() => null);
+          if (!again || !again.ok) { LOG(`  the apply button is no longer pressable (${(again && again.reason) || "not found"}) — giving up on the retry`); break; }
         }
         LOG(`apply button landed on ${after2} (${afterAts2 || (embAfter ? "embedded form revealed in place" : "unsupported host")})`);
         if (afterAts2 && afterAts2 !== "workday") {

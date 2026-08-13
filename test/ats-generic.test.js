@@ -10,6 +10,7 @@
 const { test } = require("node:test");
 const assert = require("node:assert");
 const ats = require("../ats.js");
+const fd = require("../fill-driver.js");
 
 // ── identity durability ─────────────────────────────────────────────────────────────────
 test("generic identity: real durable ids pass, real per-render ids are rejected", () => {
@@ -1452,11 +1453,44 @@ test("post-fill verify: a page that held everything costs no re-actuation", asyn
   assert.strictEqual(writes, 0, "nothing is re-written when nothing was lost");
 });
 
-test("⚠ post-fill verify: only a BLANK counts — a reformatted value is not re-actuated", () => {
-  // A page that renders "United States" as "United States (US)" has not lost the value, and
-  // re-actuating on any difference would be a second fill pass on every page.
-  const src = ats.atsGenericVerifyAndRepair.toString();
-  assert.ok(/live === ""/.test(src), "the revert test is emptiness, not inequality");
+test("⚠ post-fill verify: a value REPLACED by something else is repaired too", async () => {
+  // Operator: "email somehow fills kevinw4@gmail.com but it should be the login". That address is
+  // neither the profile's nor the stored login — an outside agent (the browser password manager that
+  // also filled the Login box) replaced a committed, verified value. Not blank, so the blank-only
+  // test walked past it.
+  const live = { "#email": "kevinw4@gmail.com" };
+  const scanFields = [{ fieldName: "Email", inputSel: "#email", widgetType: "text", labelCandidates: { labelFor: "Email" } }];
+  const act = genericFakeAct({
+    atsInjScanGeneric: () => ({ fields: scanFields.map((f) => Object.assign({ attrId: f.fieldName, domIndex: 0 }, f)) }),
+    atsInjReadValue: (a, sel) => ({ ok: true, value: live[sel] }),
+    atsInjSetText: (sel, v) => { live[sel] = v; return { ok: true, after: v }; },
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const results = [{ fieldName: "Email", status: "filled", after: "wangykev@gmail.com", widgetType: "text" }];
+  const profile = { personal_info: { email: "wangykev@gmail.com" } };
+  const buckets = [{ id: "be", profile_path: "personal_info.email", questions: ["Email"] }];
+  const out = await ats.atsGenericVerifyAndRepair(act, "generic", { fields: scanFields }, results,
+    profile, {}, {}, fd.buildBucketIndex(buckets), { buckets });
+  assert.strictEqual(out.reverted, 1, "a replaced value counts as lost");
+  assert.strictEqual(live["#email"], "wangykev@gmail.com", "…and the profile value goes back");
+});
+
+test("⚠ post-fill verify: a page REFORMATTING our value is left alone", async () => {
+  // A page is entitled to render "United States" as "United States (US)". Repairing on any
+  // difference would be a second fill pass on every page — the mistake the cascade fix unlearned.
+  let writes = 0;
+  const scanFields = [{ fieldName: "Country", inputSel: "#ctry", widgetType: "dropdown", labelCandidates: { labelFor: "Country" } }];
+  const act = genericFakeAct({
+    atsInjScanGeneric: () => ({ fields: scanFields.map((f) => Object.assign({ attrId: f.fieldName, domIndex: 0 }, f)) }),
+    atsInjReadValue: () => ({ ok: true, value: "United States (US)" }),
+    atsInjSelectNative: () => { writes++; return { ok: true }; },
+    atsInjSetText: () => { writes++; return { ok: true }; },
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const results = [{ fieldName: "Country", status: "filled", after: "United States", widgetType: "dropdown" }];
+  const out = await ats.atsGenericVerifyAndRepair(act, "generic", { fields: scanFields }, results, {}, {}, {}, null, {});
+  assert.strictEqual(out.reverted, 0, "a rendering of our own value is not a loss");
+  assert.strictEqual(writes, 0);
 });
 
 test("isolation: the post-fill verify is generic-only", async () => {
