@@ -1806,6 +1806,40 @@ test("⚠ AI scope: an entry the profile does not have yields an EMPTY section, 
   assert.deepStrictEqual(view, { education: [] }, "blank is the correct answer, not another entry's city");
 });
 
+// ── THE PROMPT ITSELF (operator: "the prompt you gave it is not good") ──────────────────────
+// Scoping stopped the WRONG answer (Tallahassee) but produced a USELESS one: "N/A" written into a
+// required field. Dumping the actual prompt showed three faults, and all three were in the prompt,
+// not the model: the question read `{"question":"City"}` with the school's name nowhere in it; the
+// SYSTEM prompt said to answer what "the profile clearly holds" and never permitted public
+// knowledge, so a permission sitting in the USER message lost to it; and nothing forbade "N/A".
+test("⚠ prompt: the question NAMES what it is about — not just a bare label", () => {
+  const f = { fieldName: "x", label: "City", sectionHeading: "Education", entryOrdinal: 0 };
+  assert.strictEqual(ats.atsGenericEntryLabel(SCOPE_PROFILE, f), "Carnegie Mellon University");
+  const items = [{ id: "q1", kind: "text", question: "City", about: ats.atsGenericEntryLabel(SCOPE_PROFILE, f) }];
+  const p = ats.atsBuildBatchPrompt(items, ats.atsGenericProfileForAi(SCOPE_PROFILE, f), {}, ats.atsGenericEntryScopeNote(f));
+  const qline = p.user.split("\n")[0];
+  assert.match(qline, /"about":"Carnegie Mellon University"/, "the subject must be IN the question JSON");
+  assert.ok(!p.user.includes("Tallahassee"), "and the home city still cannot appear anywhere");
+});
+
+test("⚠ prompt: the public-knowledge permission and the no-placeholder rule are in the SYSTEM prompt", () => {
+  // Where they live is the point: a permission that contradicts a system instruction has to sit
+  // beside it. As a user-message note it was ignored and the answer came back "N/A".
+  const p = ats.atsBuildBatchPrompt([{ id: "q1", kind: "text", question: "City", about: "X University" }], {}, {}, "");
+  assert.match(p.system, /"about" field asks for a property of THAT named organization/);
+  assert.match(p.system, /ANSWER IT from your own knowledge/);
+  assert.match(p.system, /Facts about the APPLICANT still may not be invented/, "the limit travels with the permission");
+  assert.match(p.system, /NEVER write "N\/A", "Unknown", "None"/);
+  assert.match(p.system, /use null/, "declining must mean null, not a placeholder string");
+});
+
+test("prompt: a question with no entry scope carries no `about` and is unchanged", () => {
+  const plain = { fieldName: "Email", label: "Email", sectionHeading: "Enter your information", entryOrdinal: 0 };
+  assert.strictEqual(ats.atsGenericEntryLabel(SCOPE_PROFILE, plain), "");
+  const p = ats.atsBuildBatchPrompt([{ id: "q1", kind: "text", question: "Email", about: "" }], SCOPE_PROFILE, {}, "");
+  assert.ok(!p.user.split("\n")[0].includes('"about"'), "an unscoped question gains no about field");
+});
+
 test("isolation: AI scoping is generic-only at the call sites", () => {
   const src = require("fs").readFileSync(require("path").join(__dirname, "..", "ats.js"), "utf8");
   assert.ok((src.match(/ats === "generic" \? atsGenericProfileForAi/g) || []).length >= 1,

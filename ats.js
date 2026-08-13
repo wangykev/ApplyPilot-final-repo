@@ -2361,12 +2361,24 @@ function atsBuildBatchPrompt(items, profile, jobContext, scopeNote) {
     "Each question has a \"kind\":\n" +
     "  • \"choice\" — put EXACTLY ONE of that question's \"options\", VERBATIM, in the \"choice\" field. These are REQUIRED questions: always choose the most likely option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education or enrollment dates, criminal/background answers from the ABSENCE of any such record). NEVER refuse, never answer UNKNOWN, and never write an option that is not in that question's list.\n" +
     "  • \"text\" — write the answer as free text in the \"answer\" field, in the applicant's own plain, professional first-person voice. If the question wants a factual answer the profile clearly holds, give it concisely. Use null for \"answer\" ONLY if you have no basis at all.\n" +
-    "For every answer give a SHORT justification — one terse phrase, about 12 words, no preamble, no restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give confidence: High, Medium, or Low. " +
+    // ⚠ THESE TWO RULES HAVE TO LIVE IN THE SYSTEM PROMPT. They were first written as a note in the
+    // USER message and the model ignored them: the system prompt tells it to answer what "the profile
+    // clearly holds", the cut-down entry profile holds no city, so "City" for a named university came
+    // back "N/A". A permission that contradicts a system instruction has to sit BESIDE it, not under it.
+    "  • A question carrying an \"about\" field asks for a property of THAT named organization. When the answer is a well-known public fact about the organization — the city or state a named university or employer sits in, for example — ANSWER IT from your own knowledge even though the profile does not state it: that is a fact about the ORGANIZATION, not a guess about the applicant. (Facts about the APPLICANT still may not be invented.)\n" +
+    "  • NEVER write \"N/A\", \"Unknown\", \"None\" or any placeholder into \"answer\" — that is junk in a form field. If you genuinely cannot answer, use null, which leaves the field for the applicant to complete.\n" +
     "ALSO map each question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
   const style = ((profile || {}).application_questions || {}).writing_style || "";
-  const qs = items.map((it) => (it.kind === "choice"
-    ? { id: it.id, kind: "choice", question: it.question, options: it.options }
-    : { id: it.id, kind: "text", question: it.question }));
+  // ⚠ THE ENTITY GOES IN THE QUESTION, not only in the surrounding prose. The model was sent
+  // `{"question":"City"}` for a school's city — the school's NAME appeared nowhere in the question
+  // it was answering, only in a JSON blob and a paragraph of scope text above it — and it replied
+  // "N/A". `about` names the thing the question is asking about, which is what makes "City" mean
+  // "Carnegie Mellon University's city".
+  const qs = items.map((it) => Object.assign(
+    it.kind === "choice"
+      ? { id: it.id, kind: "choice", question: it.question, options: it.options }
+      : { id: it.id, kind: "text", question: it.question },
+    it.about ? { about: it.about } : {}));
   const user = "QUESTIONS: " + JSON.stringify(qs) +
     "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
@@ -2466,7 +2478,7 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
     // an id that comes back paraphrased is an answer we throw away.
     const id = "q" + (items.length + 1);
     idToKey.set(id, d.qKey);
-    items.push({ id, kind: d.kind, question: d.label, options: d.kind === "choice" ? d.options : null });
+    items.push({ id, kind: d.kind, question: d.label, options: d.kind === "choice" ? d.options : null, about: atsGenericEntryLabel(profile, d.f) });
   }
   if (capped) {
     try { console.log(`[ApplyPilot][ATS-FILL] AI batch capped at ${ATS_AI_BATCH_MAX} — ${capped} question(s) will make their own call`); } catch (e) { /* log only */ }
@@ -3854,6 +3866,22 @@ function atsGenericAiScopeKey(f) {
 
 // The profile subset for that scope. Returns the WHOLE profile when the field belongs to no entry,
 // so nothing outside a repeating section changes behaviour.
+// The NAME of the thing an entry-scoped question is about — the school, or the employer. This is what
+// turns a bare `"City"` into a question a model can actually answer: the first prompt sent
+// `{"question":"City"}` with the school's name only in a JSON blob and a paragraph of scope prose
+// above it, and the reply was "N/A". Naming the subject IN the question is the difference.
+function atsGenericEntryLabel(profile, f) {
+  const key = f ? atsGenericAiScopeKey(f) : "";
+  if (!key) return "";
+  const view = atsGenericProfileForAi(profile, f);
+  if (key.startsWith("education")) {
+    const e = (view.education || [])[0] || {};
+    return String(e.school_or_university || e.school || "").trim();
+  }
+  const w = (view.work_experience || [])[0] || {};
+  return String(w.company || w.employer || "").trim();
+}
+
 function atsGenericProfileForAi(profile, f) {
   const key = atsGenericAiScopeKey(f);
   if (!key) return profile;
@@ -5027,7 +5055,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjLoginGate, atsPassLoginGate, atsGenericCredentialRecheck, atsGenericVerifyAndRepair,
-    atsGenericAiScopeKey, atsGenericProfileForAi, atsGenericEntryScopeNote,
+    atsGenericAiScopeKey, atsGenericProfileForAi, atsGenericEntryScopeNote, atsGenericEntryLabel,
     atsInjFormFrameBox, atsInjElBox, atsInjScrollTopTo, atsInjLoginGateDiag, atsInjSubmitLoginForm, atsInjReadFieldsMatching,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
