@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "no-worker-overrides-20";
+const AP_BUILD_MARKER = "verify-repair-22";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -787,6 +787,37 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           }
         }
         sendResponse({ ok: true, url: (await new Promise((r) => chrome.tabs.get(tabId, r))).url, steps });
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e) });
+      } finally { await cdpDetach(); }
+    })();
+    return true;
+  }
+  // DEV, READ-ONLY: what does a live tab's form ACTUALLY hold? Attaches, hops into the form frame
+  // the generic driver uses, and returns every control matching `pattern`. The run's tab opens
+  // outside the operator's tab group, so this is the only way to compare the fill log's claims
+  // against the page itself — the difference between those two is where every bug in this area has
+  // lived (2026-08-12). Never writes.
+  if (type === "AP_DEV_READ_FIELDS") {
+    (async () => {
+      if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }
+      let tabId = Number(message.tabId) || 0;
+      if (!tabId && message.urlContains) {
+        const tabs = await new Promise((r) => chrome.tabs.query({}, r));
+        const hit = (tabs || []).find((t) => t.url && t.url.includes(String(message.urlContains)));
+        if (hit) tabId = hit.id;
+      }
+      if (!tabId) { sendResponse({ ok: false, error: "need tabId or urlContains" }); return; }
+      try {
+        const attached = await cdpAttach(tabId);
+        if (!attached.ok) { sendResponse({ ok: false, error: "attach-failed:" + attached.error }); return; }
+        const top = await cdpEval(atsInjReadFieldsMatching, String(message.pattern || ".")).catch((e) => ({ ok: false, error: String(e) }));
+        const armed = await cdpUseFormFrame(4);
+        const frame = armed.ok
+          ? await cdpEval(atsInjReadFieldsMatching, String(message.pattern || ".")).catch((e) => ({ ok: false, error: String(e) }))
+          : { ok: false, error: "no form frame: " + armed.reason };
+        cdpClearFormFrame();
+        sendResponse({ ok: true, tabId, top, frame });
       } catch (e) {
         sendResponse({ ok: false, error: String((e && e.message) || e) });
       } finally { await cdpDetach(); }

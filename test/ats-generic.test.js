@@ -1407,6 +1407,63 @@ test("isolation: atsFormUrl leaves a generic/unknown URL untouched", () => {
   assert.strictEqual(ats.atsFormUrl("generic", u), u);
 });
 
+// ── WHOLE-PAGE VERIFY + REPAIR (Astrion iCIMS, live 2026-08-12) ─────────────────────────────
+// "addresses (1) still is not filled — it never fills." The log said six fields `filled` with
+// read-backs passing; reading the run's own tab afterwards showed every address box empty and
+// AddressState back at "Please select a country", i.e. the block had been RE-RENDERED after the fill.
+// The credential re-check was masking the same event for its three fields ("0 held, 3 rewritten").
+test("⚠ post-fill verify: a field the page RESET to empty is re-filled", async () => {
+  const live = { "#street": "715 Middlebrooks Circle", "#city": "" };   // the page blanked city
+  const scanFields = [
+    { fieldName: "AddressStreet1", inputSel: "#street", widgetType: "text", labelCandidates: { labelFor: "Street Address" } },
+    { fieldName: "AddressCity", inputSel: "#city", widgetType: "text", labelCandidates: { labelFor: "City" } },
+  ];
+  let refilled = null;
+  const act = genericFakeAct({
+    atsInjScanGeneric: () => ({ fields: scanFields.map((f) => Object.assign({ attrId: f.fieldName, domIndex: 0 }, f)) }),
+    atsInjReadValue: (a, sel) => ({ ok: true, value: live[sel] != null ? live[sel] : null }),
+    atsInjSetText: (sel, v) => { live[sel] = v; refilled = sel; return { ok: true, after: v }; },
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const results = [
+    { fieldName: "AddressStreet1", status: "filled", after: "715 Middlebrooks Circle", widgetType: "text" },
+    { fieldName: "AddressCity", status: "filled", after: "Tallahassee", widgetType: "text" },
+  ];
+  const profile = { personal_info: { address_line_1: "715 Middlebrooks Circle", city: "Tallahassee" } };
+  const out = await ats.atsGenericVerifyAndRepair(act, "generic", { fields: scanFields }, results,
+    profile, {}, {}, ats.atsFd ? null : null, {});
+  assert.strictEqual(out.reverted, 1, "only the blanked field counts as reverted");
+  assert.strictEqual(refilled, "#city", "…and it is the one re-actuated");
+  assert.strictEqual(live["#city"], "Tallahassee");
+});
+
+test("post-fill verify: a page that held everything costs no re-actuation", async () => {
+  let writes = 0;
+  const scanFields = [{ fieldName: "AddressCity", inputSel: "#city", widgetType: "text", labelCandidates: { labelFor: "City" } }];
+  const act = genericFakeAct({
+    atsInjScanGeneric: () => ({ fields: scanFields.map((f) => Object.assign({ attrId: f.fieldName, domIndex: 0 }, f)) }),
+    atsInjReadValue: () => ({ ok: true, value: "Tallahassee" }),
+    atsInjSetText: () => { writes++; return { ok: true }; },
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const results = [{ fieldName: "AddressCity", status: "filled", after: "Tallahassee", widgetType: "text" }];
+  const out = await ats.atsGenericVerifyAndRepair(act, "generic", { fields: scanFields }, results, {}, {}, {}, null, {});
+  assert.deepStrictEqual([out.reverted, out.repaired], [0, 0]);
+  assert.strictEqual(writes, 0, "nothing is re-written when nothing was lost");
+});
+
+test("⚠ post-fill verify: only a BLANK counts — a reformatted value is not re-actuated", () => {
+  // A page that renders "United States" as "United States (US)" has not lost the value, and
+  // re-actuating on any difference would be a second fill pass on every page.
+  const src = ats.atsGenericVerifyAndRepair.toString();
+  assert.ok(/live === ""/.test(src), "the revert test is emptiness, not inequality");
+});
+
+test("isolation: the post-fill verify is generic-only", async () => {
+  const act = genericFakeAct({});   // any eval would throw; a no-op proves the gate
+  assert.strictEqual(await ats.atsGenericVerifyAndRepair(act, "greenhouse", { fields: [] }, [{ status: "filled", after: "x" }], {}, {}, {}, null, {}), null);
+});
+
 // ── CREDENTIALS RE-CHECKED LAST (Astrion iCIMS, live 2026-08-12) ────────────────────────────
 // The operator's form showed Login holding `kevinw4@andrew.cmu.edu` with an EMPTY password while the
 // run had logged both `filled` with the read-back passing. The stored login is a different address

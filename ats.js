@@ -1509,6 +1509,33 @@ function atsInjSubmitLoginForm(sel) {
   }
 }
 
+// READ-ONLY ground truth: every control whose id/name matches `pattern`, with what it currently
+// holds and whether it is on screen. Exists because the run's tab opens outside the operator's tab
+// group, so "what does the page ACTUALLY say at the end" could not be answered from outside the
+// extension — and this whole investigation has repeatedly turned on the difference between what the
+// fill log claims and what the page holds (2026-08-12).
+function atsInjReadFieldsMatching(pattern) {
+  const rx = new RegExp(pattern, "i");
+  const vis = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  return {
+    ok: true,
+    url: String(location.href).slice(0, 110),
+    fields: [...document.querySelectorAll("input:not([type=hidden]),textarea,select")]
+      .filter((el) => rx.test(el.id || "") || rx.test(el.name || ""))
+      .slice(0, 40)
+      .map((el) => ({
+        id: (el.id || el.name || "").slice(0, 52),
+        tag: el.tagName, type: el.type || "",
+        value: String(el.value == null ? "" : el.value).slice(0, 40),
+        selectedText: el.tagName === "SELECT" && el.selectedIndex >= 0 ? String(el.options[el.selectedIndex].text).slice(0, 30) : null,
+        visible: vis(el),
+      })),
+  };
+}
+
 // What is the login page SHOWING when it refuses to advance? Two runs in three stalled with nothing
 // to look at but "did not advance", which is a symptom, not a cause — and the same steps by hand
 // advance every time. Capture the page's own account of itself so the next stall is diagnosable.
@@ -2045,6 +2072,74 @@ async function atsGenericCredentialRecheck(act, ats, scan, results, credentials)
   return { held, repaired, lost };
 }
 
+// ── VERIFY THE WHOLE PAGE AND REPAIR WHAT REVERTED (generic, 2026-08-12) ─────────────────────
+// The operator: "addresses (1) still is not filled — it never fills". The fill log said otherwise,
+// six fields `filled` with read-backs passing. Ground truth from the run's own tab, read after it
+// finished, settles it: AddressStreet1/City/Zip empty, AddressCountry empty, and AddressState sitting
+// at `-999` / "Please select a country" — which is the state that dropdown shows when Country was
+// NEVER selected. The block had not merely been cleared, it had been RE-RENDERED.
+//
+// The same event is what the credential re-check had been quietly papering over: it reported
+// "0 held, 3 rewritten" — not one credential survived either. So this was never an address bug or a
+// credential bug; it is one page-wide reset landing after the fill, and the only reason credentials
+// looked fixed is that they were the only fields with a second pass.
+//
+// So the second pass becomes general. This is the generic path's missing M40 audit — Workday has had
+// one since M40 and it is exactly the "a verification that cannot be made is needs_review, never a
+// silent pass" rule — with the addition that a reverted field is REPAIRED rather than only reported,
+// because the page reverting our work is not the operator's mistake to fix by hand.
+//
+// Reads through the SAME `atsInjReadValue` the commit path uses, and repairs by re-running the
+// ordinary fill for just those fields against a FRESH scan, so a re-rendered element is re-resolved
+// rather than written through a stale selector. A field that will not hold after the repair ends
+// `needs_review` + `reverted-after-fill`: still never a false claim of success.
+async function atsGenericVerifyAndRepair(act, ats, scan, results, profile, defaults, jc, bucketIndex, opts) {
+  if (ats !== "generic") return null;
+  const candidates = results.filter((r) => r && !r.credential && (r.status === "filled" || r.status === "filled_review") &&
+    r.widgetType !== "file_upload" && r.after != null && String(r.after).trim() !== "");
+  if (!candidates.length) return null;
+
+  let fresh = null;
+  try { fresh = await atsScanFor(act, ats); } catch (e) { return null; }
+  if (!fresh || !fresh.fields) return null;
+
+  const reverted = [];
+  for (const rec of candidates) {
+    const f = fresh.fields.find((x) => x.fieldName === rec.fieldName);
+    if (!f) continue;                                  // absent is reported by the caller, not repaired blind
+    const back = await atsReadBackSettled(act, ats, f.inputSel, f.widgetType).catch(() => null);
+    if (!back || !back.ok) continue;                   // unreadable — leave the record as it stands
+    const live = String(back.value == null ? "" : back.value).trim();
+    if (live === "") reverted.push({ rec, f });         // only a BLANK counts: a page that reformats a
+    // value ("United States" → "United States (US)") has not lost it, and re-actuating that would be a
+    // second fill pass on every page — the mistake the cascade fix already had to unlearn.
+  }
+  if (!reverted.length) {
+    try { console.log(`[ApplyPilot][ATS-FILL] post-fill verify: all ${candidates.length} filled field(s) still hold their value`); } catch (e) { /* log */ }
+    return { checked: candidates.length, reverted: 0, repaired: 0, lost: 0 };
+  }
+
+  try {
+    console.log(`[ApplyPilot][ATS-FILL] ⚠ post-fill verify: ${reverted.length} of ${candidates.length} filled field(s) came back EMPTY — the page reset them; repairing: ${reverted.map((x) => x.rec.fieldName).slice(0, 8).join(", ")}`);
+  } catch (e) { /* log */ }
+
+  // Re-run the ordinary fill for exactly those fields, then replace their records with the new ones.
+  const redo = [];
+  for (const { rec } of reverted) {
+    const i = results.indexOf(rec);
+    if (i >= 0) results.splice(i, 1);
+  }
+  await atsFillFields(act, ats, fresh, reverted.map((x) => x.f), redo, profile, defaults, jc, bucketIndex, opts);
+  let repaired = 0, lost = 0;
+  for (const r of redo) {
+    if (r.status === "filled" || r.status === "filled_review") { repaired++; r.detail = (r.detail || "") + "; the page had reset this field after the first fill, so it was filled again"; }
+    else { lost++; r.flag = r.flag || "reverted-after-fill"; }
+    results.push(r);
+  }
+  try { console.log(`[ApplyPilot][ATS-FILL] post-fill repair: ${repaired} re-filled, ${lost} still not holding`); } catch (e) { /* log */ }
+  return { checked: candidates.length, reverted: reverted.length, repaired, lost };
+}
+
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
@@ -2094,6 +2189,13 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // else — but ordering the visible actuation like the page reads is worth more than the handful of
   // extra seconds of settling that came from sitting behind the option scrape, which touches no
   // credential field and so cannot be what clobbers one.
+  // WHOLE-PAGE verify + repair FIRST — it re-fills anything the page reset, and that re-fill can
+  // itself disturb neighbours — then the credential re-check has the last word on the credentials.
+  try {
+    await atsGenericVerifyAndRepair(act, ats, scan, results, profile, defaults, jc, bucketIndex, fillOpts);
+  } catch (e) {
+    try { console.log("[ApplyPilot][ATS-FILL] post-fill verify skipped:", String((e && e.message) || e)); } catch (e2) { /* log */ }
+  }
   try {
     await atsGenericCredentialRecheck(act, ats, scan, results, o && o.credentials);
   } catch (e) {
@@ -4791,8 +4893,8 @@ if (typeof module !== "undefined" && module.exports) {
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
-    atsInjLoginGate, atsPassLoginGate, atsGenericCredentialRecheck,
-    atsInjFormFrameBox, atsInjElBox, atsInjScrollTopTo, atsInjLoginGateDiag, atsInjSubmitLoginForm,
+    atsInjLoginGate, atsPassLoginGate, atsGenericCredentialRecheck, atsGenericVerifyAndRepair,
+    atsInjFormFrameBox, atsInjElBox, atsInjScrollTopTo, atsInjLoginGateDiag, atsInjSubmitLoginForm, atsInjReadFieldsMatching,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
