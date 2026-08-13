@@ -1850,6 +1850,16 @@ test("⚠ work tier: a CURRENT job leaves End Date empty, and a missing entry yi
   assert.ok(!v("Employer", 7), "an entry the profile lacks is BLANK, never borrowed");
 });
 
+test("⚠ work tier: one stored date serves a THREE-control composite and a single input alike", () => {
+  // Live, `rcf3214_Year` received the whole "2024-09" because the tier returned the raw value.
+  const v = (label) => { const r = ats.atsGenericWorkValue(WORK_PROFILE, label, 0); return r && r.value; };
+  assert.strictEqual(v("Start Date Year"), "2024");
+  assert.deepStrictEqual(v("Start Date Month"), ["September", "09", "9", "Sep"]);
+  // …and a form with ONE date box still gets the whole date: `atsGenericDatePart` reads the label to
+  // pick a piece, and a bare "Start Date" contains "date", so it is taken for a day-of-month control.
+  assert.strictEqual(v("Start Date"), "2024-09", "a single date input must not be starved by the splitter");
+});
+
 test("⚠ work tier is SCOPE-GATED — it may not answer a field outside an experience entry", () => {
   // "Title"/"Employer"/"City" are not self-evidently employment the way "School"/"Degree" are.
   const inWork = { fieldName: "-1_PersonProfileFields.rcf3213", label: "City", sectionHeading: "Experience", entryOrdinal: 0 };

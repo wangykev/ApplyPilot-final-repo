@@ -3986,7 +3986,20 @@ function atsGenericWorkValue(profile, label, ordinal) {
   if (hit.prop === "__current") return out(entry.currently_work_here === true, "currently_work_here");
   if (hit.prop === "__startDate" || hit.prop === "__endDate") {
     if (hit.prop === "__endDate" && entry.currently_work_here === true) return null; // present ⇒ leave it
-    return out(entry[hit.prop === "__startDate" ? "from" : "to"], hit.prop === "__startDate" ? "from" : "to");
+    // ⚠ SPLIT THE DATE, exactly as the education tier does. iCIMS renders one date as THREE controls
+    // (`rcf3214_Month` / `_Date` / `_Year`), and the profile stores one "2024-09" string — live, the
+    // Year box received the whole "2024-09" because this returned the raw value. `atsGenericDatePart`
+    // is the same helper education uses, keyed off the control's own label.
+    const key = hit.prop === "__startDate" ? "from" : "to";
+    const part = atsGenericDatePart(entry[key], clean);
+    if (part) return { value: part, path: path + "." + key };
+    // ⚠ A SINGLE date input must still get the whole date. `atsGenericDatePart` reads the control's
+    // label to decide which PIECE is wanted, and a bare "Start Date" contains the word "date", so it
+    // is taken for a day-of-month box and yields nothing when the profile stores only "2024-09".
+    // That is right for iCIMS' three-control composite and wrong for a form with one date field, so
+    // when the label names no piece explicitly, hand back the stored value whole.
+    if (!/\b(month|day|year)\b/i.test(clean)) return out(entry[key], key);
+    return null;
   }
   return out(entry[hit.prop], hit.prop);
 }
