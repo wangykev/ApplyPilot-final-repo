@@ -28,6 +28,11 @@ const atsLib = (typeof module !== "undefined" && module.exports)
   : { normalize: normalize, matchCandidates: matchCandidates, normalizeLabel: normalizeLabel,
       ensureHttps: ensureHttps, canonicalJobUrl: canonicalJobUrl, isAiPlaceholder: isAiPlaceholder,
       AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV,
+      // ⚠ ADDED WITH THE WORK TIER. `test/sw-globals.test.js` caught these missing, which is exactly
+      // the failure CLAUDE.md warns about: Node gets all of lib.js, the service worker gets this
+      // hand-written literal, so `atsLib.sortWorkExperienceByRecency is not a function` would have
+      // thrown in the browser with all 1500 Node tests green.
+      sortWorkExperienceByRecency: sortWorkExperienceByRecency, joinBullets: joinBullets,
       isSignatureDateQuestion: isSignatureDateQuestion };
 const atsFd = (typeof module !== "undefined" && module.exports)
   ? require("./fill-driver.js")
@@ -1864,6 +1869,16 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
     if (edu) {
       return { raw: edu.value, path: edu.path, source: "education",
         detail: "education entry " + ((f.entryOrdinal || 0) + 1) + (f.entryOrdinal ? "" : " (your most recent)") };
+    }
+    // GENERIC WORK EXPERIENCE — same tier, same reason, but SCOPE-GATED: "Title"/"Employer"/"City"
+    // are not self-evidently employment the way "School"/"Degree" are, so only a field the section
+    // scope already places inside an experience entry may be answered from the work history.
+    if (atsGenericScopeOf(f) === "work") {
+      const work = atsGenericWorkValue(profile, f.label, f.entryOrdinal || 0);
+      if (work) {
+        return { raw: work.value, path: work.path, source: "work",
+          detail: "work experience " + ((f.entryOrdinal || 0) + 1) + (f.entryOrdinal ? "" : " (your most recent)") };
+      }
     }
   }
 
@@ -3910,6 +3925,95 @@ function atsGenericProfileForAi(profile, f) {
   return { work_experience: entry ? [entry] : [] };
 }
 
+// ── THE WORK-EXPERIENCE TIER (PURE) — the education tier's twin ──────────────────────────────
+// Operator, 2026-08-12: "now do the experience repeating sections. they should be similar to
+// education… It is currently filled wrong, either you or was an incorrect parse. the employer is
+// somehow rivian and volkswagon technologies, The title is also always characterization."
+//
+// The AI SCOPING for work already existed and demonstrably worked — the batch splits into work#0/1/2
+// and the justifications name the right company per entry ("Started Carnegie Mellon Racing in
+// September 2024"). What did NOT exist was the deterministic half: education had a value tier and
+// work had none, so EVERY employer/title/date was an `ai-choice`/`ai-text` guess against whatever
+// the model could see. That is the difference the operator is looking at — a stored fact answered by
+// inference, which is precisely the inversion the match ladder exists to prevent.
+//
+// ⚠ SCOPE-GATED, unlike education. Education's labels ("School", "Degree", "GPA") are self-evidently
+// education; work's are not — "Title", "Employer", "City" appear all over a form — so this tier only
+// answers a field the section scope already places inside an experience entry.
+//
+// ⚠ ORDERED BY RECENCY, using the same helper the rest of the codebase uses, because entry 0 of an
+// employment section means "most recent" and a profile's own array order is not a promise of that.
+const ATS_GENERIC_WORK_FIELDS = [
+  { rx: /^employer$|^company$|company name|employer name|organi[sz]ation/i, prop: "company" },
+  { rx: /^(job\s*)?title$|position( title)?|role$/i, prop: "job_title" },
+  { rx: /^city$|^town$/i, prop: "__city" },
+  { rx: /state|province|region/i, prop: "__state" },
+  { rx: /responsibilit|duties|description|what did you do/i, prop: "__bullets" },
+  { rx: /start date|from\b.*(year|date)|began/i, prop: "__startDate" },
+  { rx: /end date|to\b.*(year|date)|last day|finished/i, prop: "__endDate" },
+  { rx: /current(ly)?( employed| position| job)?\??$|still work|present(ly)? (employed|work)/i, prop: "__current" },
+];
+
+function atsGenericWorkOrder(list) {
+  const arr = (Array.isArray(list) ? list : []).filter((e) => e && typeof e === "object");
+  try { return atsLib.sortWorkExperienceByRecency(arr) || arr; } catch (e) { return arr; }
+}
+
+function atsGenericWorkValue(profile, label, ordinal) {
+  const clean = atsGenericCleanLabel(String(label == null ? "" : label));
+  if (!clean) return null;
+  const hit = ATS_GENERIC_WORK_FIELDS.find((x) => x.rx.test(clean));
+  if (!hit) return null;
+  const entry = atsGenericWorkOrder((profile || {}).work_experience)[ordinal || 0];
+  if (!entry) return null;                     // no such entry ⇒ BLANK, never another entry's job
+  const path = "work_experience[" + (ordinal || 0) + "]";
+  const out = (v, p) => {
+    if (v === undefined || v === null) return null;
+    if (Array.isArray(v) ? !v.length : String(v).trim() === "") return null;
+    return { value: v, path: path + "." + p };
+  };
+  if (hit.prop === "__city" || hit.prop === "__state") {
+    // The profile stores one "Tallahassee, FL" string; the form wants the halves separately.
+    const parts = String(entry.location || entry.city || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (!parts.length) return null;
+    if (hit.prop === "__city") return out(parts[0], "location");
+    return parts.length > 1 ? out(atsGenericExpandRegion(parts[parts.length - 1]), "location") : null;
+  }
+  if (hit.prop === "__bullets") {
+    const b = entry.bullets;
+    return out(Array.isArray(b) ? (atsLib.joinBullets ? atsLib.joinBullets(b) : b.join("\n")) : b, "bullets");
+  }
+  if (hit.prop === "__current") return out(entry.currently_work_here === true, "currently_work_here");
+  if (hit.prop === "__startDate" || hit.prop === "__endDate") {
+    if (hit.prop === "__endDate" && entry.currently_work_here === true) return null; // present ⇒ leave it
+    return out(entry[hit.prop === "__startDate" ? "from" : "to"], hit.prop === "__startDate" ? "from" : "to");
+  }
+  return out(entry[hit.prop], hit.prop);
+}
+
+// "FL" → "Florida": the profile abbreviates a state inside a location string while a form's dropdown
+// lists full names, and an abbreviation is exactly the kind of 2-char token the match ladder REFUSES
+// to guess with (the "PA" → "Armed Forces Pacific" lesson). Expanding it here keeps that refusal
+// intact — the candidate offered is the full name, matched exactly.
+function atsGenericExpandRegion(abbr) {
+  const s = String(abbr || "").trim();
+  if (s.length !== 2) return s;
+  try {
+    // ⚠ REGION_ABBREV runs FULL NAME → abbreviation, so this is a reverse lookup. Returning the
+    // abbreviation unchanged is not harmless: a 2-char token is exactly what `matchCandidates`
+    // refuses to guess with (the "PA" → "Armed Forces Pacific" lesson), so an unexpanded state
+    // would reach a dropdown and correctly fail to match, leaving the field empty.
+    const map = atsLib.REGION_ABBREV || {};
+    const want = s.toUpperCase();
+    for (const full of Object.keys(map)) {
+      if (String(map[full]).toUpperCase() === want) {
+        return full.replace(/\b\w/g, (c) => c.toUpperCase());
+      }
+    }
+    return s;
+  } catch (e) { return s; }
+}
+
 const ATS_GENERIC_EDUCATION_FIELDS = [
   { rx: /^(other\s+)?school$|university|college|institution|school name/i, prop: "school_or_university" },
   { rx: /^degree|degree (level|type|earned)|qualification/i, prop: "degree" },
@@ -5089,6 +5193,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjLoginGate, atsPassLoginGate, atsGenericCredentialRecheck, atsGenericVerifyAndRepair,
     atsGenericAiScopeKey, atsGenericProfileForAi, atsGenericEntryScopeNote, atsGenericEntryLabel,
+    atsGenericWorkValue, atsGenericWorkOrder, ATS_GENERIC_WORK_FIELDS,
     atsInjFormFrameBox, atsInjElBox, atsInjScrollTopTo, atsInjLoginGateDiag, atsInjSubmitLoginForm, atsInjReadFieldsMatching,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,

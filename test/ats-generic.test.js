@@ -1812,6 +1812,54 @@ test("⚠ AI scope: an entry the profile does not have yields an EMPTY section, 
 // not the model: the question read `{"question":"City"}` with the school's name nowhere in it; the
 // SYSTEM prompt said to answer what "the profile clearly holds" and never permitted public
 // knowledge, so a permission sitting in the USER message lost to it; and nothing forbade "N/A".
+// ── THE WORK-EXPERIENCE TIER (operator, 2026-08-12) ─────────────────────────────────────────
+// "the employer is somehow rivian and volkswagon technologies, The title is also always
+// characterization." The AI SCOPING for work already worked — the batch splits work#0/1/2 and the
+// justifications name the right company. What was missing was the deterministic half: education had
+// a value tier and work had none, so every employer/title/date was an AI guess. A stored fact
+// answered by inference is the inversion the match ladder exists to prevent.
+const WORK_PROFILE = { work_experience: [
+  { job_title: "CISCOR Robotics Lab Intern", company: "Florida State University / L3Harris", location: "Tallahassee, FL", from: "2025-05", to: "2025-08" },
+  { job_title: "Firmware Team Member", company: "Carnegie Mellon Racing", location: "Pittsburgh, PA", from: "2024-09", currently_work_here: true },
+] };
+
+test("⚠ work tier: each entry answers from ITS OWN job — never one value repeated", () => {
+  const v = (label, ord) => { const r = ats.atsGenericWorkValue(WORK_PROFILE, label, ord); return r && r.value; };
+  // ordered by RECENCY, so entry 0 is the current job — not the profile's array order
+  assert.strictEqual(v("Employer", 0), "Carnegie Mellon Racing");
+  assert.strictEqual(v("Title", 0), "Firmware Team Member");
+  assert.strictEqual(v("Employer", 1), "Florida State University / L3Harris");
+  assert.strictEqual(v("Title", 1), "CISCOR Robotics Lab Intern");
+  assert.notStrictEqual(v("Title", 0), v("Title", 1), "the defect was every entry sharing one title");
+});
+
+test("work tier: one 'City, ST' string serves the form's separate City and State controls", () => {
+  const v = (label, ord) => { const r = ats.atsGenericWorkValue(WORK_PROFILE, label, ord); return r && r.value; };
+  assert.strictEqual(v("City", 0), "Pittsburgh");
+  // ⚠ expanded, because a 2-char token is what matchCandidates refuses to guess with (the "PA" →
+  // "Armed Forces Pacific" lesson) — an unexpanded "PA" would reach a dropdown and match nothing.
+  assert.strictEqual(v("State/Province", 0), "Pennsylvania");
+  assert.strictEqual(v("State", 1), "Florida");
+});
+
+test("⚠ work tier: a CURRENT job leaves End Date empty, and a missing entry yields nothing", () => {
+  const v = (label, ord) => { const r = ats.atsGenericWorkValue(WORK_PROFILE, label, ord); return r && r.value; };
+  assert.strictEqual(v("Start Date", 0), "2024-09");
+  assert.ok(!v("End Date", 0), "still employed ⇒ no end date, not a guessed one");
+  assert.strictEqual(v("End Date", 1), "2025-08");
+  assert.ok(!v("Employer", 7), "an entry the profile lacks is BLANK, never borrowed");
+});
+
+test("⚠ work tier is SCOPE-GATED — it may not answer a field outside an experience entry", () => {
+  // "Title"/"Employer"/"City" are not self-evidently employment the way "School"/"Degree" are.
+  const inWork = { fieldName: "-1_PersonProfileFields.rcf3213", label: "City", sectionHeading: "Experience", entryOrdinal: 0 };
+  const inAddr = { fieldName: "-1_PersonProfileFields.AddressCity", label: "City", sectionHeading: "Enter your information", entryOrdinal: 0 };
+  assert.strictEqual(ats.atsGenericScopeOf(inWork), "work");
+  assert.notStrictEqual(ats.atsGenericScopeOf(inAddr), "work");
+  const src = ats.atsRouteField.toString();
+  assert.match(src, /atsGenericScopeOf\(f\) === "work"/, "the router must gate the work tier on scope");
+});
+
 test("⚠ 'graduated' needs no question mark — a stored fact must not lose to a guess", () => {
   // Live: iCIMS names the field `IsGraduated` and labels it without a "?", so the old
   // /graduated\?/ never matched, the deterministic tier never saw it, and the AI answered "Yes" from
