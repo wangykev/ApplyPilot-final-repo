@@ -1812,6 +1812,24 @@ test("⚠ AI scope: an entry the profile does not have yields an EMPTY section, 
 // not the model: the question read `{"question":"City"}` with the school's name nowhere in it; the
 // SYSTEM prompt said to answer what "the profile clearly holds" and never permitted public
 // knowledge, so a permission sitting in the USER message lost to it; and nothing forbade "N/A".
+test("⚠ 'graduated' needs no question mark — a stored fact must not lose to a guess", () => {
+  // Live: iCIMS names the field `IsGraduated` and labels it without a "?", so the old
+  // /graduated\?/ never matched, the deterministic tier never saw it, and the AI answered "Yes" from
+  // a 2028 graduation date for someone still enrolled.
+  const enrolled = { education: [{ school_or_university: "Carnegie Mellon University", currently_enrolled: true, graduation_date: "2028-05" }] };
+  for (const label of ["Graduated", "Is Graduated", "Did You Graduate?", "Graduated?"]) {
+    const v = ats.atsGenericEducationValue(enrolled, label, 0);
+    assert.ok(v, `"${label}" must be recognised by the education tier`);
+    assert.strictEqual(v.value, false, `"${label}" → currently enrolled means NO`);
+  }
+  // …and a finished degree still answers YES
+  const done = { education: [{ school_or_university: "X", to_year: "2020" }] };
+  assert.strictEqual(ats.atsGenericEducationValue(done, "Graduated", 0).value, true);
+  // ⚠ "Graduation Date" must NOT be captured by it — that is a date question, not a yes/no
+  const gd = ats.atsGenericEducationValue(enrolled, "Graduation Date", 0);
+  assert.ok(!gd || gd.value !== false, "'Graduation Date' is a date, not the graduated flag");
+});
+
 test("⚠ THE ENTRY ORDINAL COUNTS WITHIN ITS SECTION, NOT THE PAGE", () => {
   // The bug behind the "N/A" that no prompt wording could fix. "City" appears in the address block,
   // the education entry AND each work entry, and the ordinal counted every one of them: live,
@@ -1853,15 +1871,19 @@ test("⚠ prompt: the question NAMES what it is about — not just a bare label"
   assert.ok(!p.user.includes("Tallahassee"), "and the home city still cannot appear anywhere");
 });
 
-test("⚠ prompt: the public-knowledge permission and the no-placeholder rule are in the SYSTEM prompt", () => {
-  // Where they live is the point: a permission that contradicts a system instruction has to sit
+test("⚠ prompt: the public-knowledge permission lives in the SYSTEM prompt, and N/A is WANTED", () => {
+  // Where the permission lives is the point: one that contradicts a system instruction has to sit
   // beside it. As a user-message note it was ignored and the answer came back "N/A".
   const p = ats.atsBuildBatchPrompt([{ id: "q1", kind: "text", question: "City", about: "X University" }], {}, {}, "");
   assert.match(p.system, /"about" field asks for a property of THAT named organization/);
   assert.match(p.system, /ANSWER IT from your own knowledge/);
   assert.match(p.system, /Facts about the APPLICANT still may not be invented/, "the limit travels with the permission");
-  assert.match(p.system, /NEVER write "N\/A", "Unknown", "None"/);
-  assert.match(p.system, /use null/, "declining must mean null, not a placeholder string");
+  // ⚠ I had banned "N/A" as junk; the operator overruled it (2026-08-12) and the reasons stick:
+  // a MULTI-PAGE form cannot advance past an empty required field, so the walk never reaches the
+  // rest of the form to review it; and a visible "N/A" gets corrected where a blank reads as
+  // "nothing to do". An honest placeholder beats both a blank and a guess.
+  assert.match(p.system, /write "N\/A" rather than inventing something/);
+  assert.ok(!/NEVER write "N\/A"/.test(p.system), "the ban must be gone, not merely contradicted");
 });
 
 test("prompt: a question with no entry scope carries no `about` and is unchanged", () => {

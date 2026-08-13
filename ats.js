@@ -2366,7 +2366,12 @@ function atsBuildBatchPrompt(items, profile, jobContext, scopeNote) {
     // clearly holds", the cut-down entry profile holds no city, so "City" for a named university came
     // back "N/A". A permission that contradicts a system instruction has to sit BESIDE it, not under it.
     "  • A question carrying an \"about\" field asks for a property of THAT named organization. When the answer is a well-known public fact about the organization — the city or state a named university or employer sits in, for example — ANSWER IT from your own knowledge even though the profile does not state it: that is a fact about the ORGANIZATION, not a guess about the applicant. (Facts about the APPLICANT still may not be invented.)\n" +
-    "  • NEVER write \"N/A\", \"Unknown\", \"None\" or any placeholder into \"answer\" — that is junk in a form field. If you genuinely cannot answer, use null, which leaves the field for the applicant to complete.\n" +
+    // ⚠ "N/A" IS WANTED, NOT BANNED (operator, 2026-08-12). I had banned it as junk. The operator
+    // overruled with two reasons worth keeping: on a MULTI-PAGE application every required field must
+    // carry something or the walk cannot advance to see the rest of the form, and a visible "N/A" on
+    // the review page is MORE likely to get corrected than a blank, which reads as "nothing to do".
+    // So an honest placeholder beats both a blank and a guess.
+    "  • If you genuinely cannot answer, write \"N/A\" rather than inventing something — a placeholder the applicant can see and correct is better than a wrong answer, and better than a blank that blocks a multi-page form from advancing.\n" +
     "ALSO map each question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
   const style = ((profile || {}).application_questions || {}).writing_style || "";
   // ⚠ THE ENTITY GOES IN THE QUESTION, not only in the surrounding prose. The model was sent
@@ -3911,7 +3916,14 @@ const ATS_GENERIC_EDUCATION_FIELDS = [
   { rx: /^major|field of study|area of study|concentration|discipline/i, prop: "field_of_study" },
   { rx: /^minor/i, prop: "minor" },
   { rx: /^gpa\b|grade point/i, prop: "gpa" },
-  { rx: /did you graduate|graduated\?/i, prop: "__graduated" },
+  // ⚠ `graduated` ALONE, no question mark required (operator, 2026-08-12: "it is filling did you
+  // graduate as yes. not sure where that came from"). It came from this regex not matching: iCIMS
+  // calls the field `IsGraduated` and labels it without a "?", so the deterministic tier — which
+  // knows the applicant is currently enrolled and would have answered NO — never saw it, and the
+  // question fell through to the AI, which saw a graduation date of 2028 and said Yes. A stored fact
+  // losing to a guess because of a punctuation mark is the failure this ladder exists to prevent.
+  // Safe against "Graduation Date": that contains "graduation", not "graduated".
+  { rx: /did you graduate|graduated|graduation status/i, prop: "__graduated" },
   { rx: /graduation date|date of graduation|end date|completion date|to\b.*year/i, prop: "__endDate" },
   { rx: /start date|from\b.*year|attended from/i, prop: "__startDate" },
 ];
