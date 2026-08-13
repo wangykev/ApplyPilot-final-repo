@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { explainFill, orderForReview, reviewPriority, isBecameRequired, normalizeDateOrder, todayForDateOrder } from "../lib/review-model";
+import { explainFill, aiJustification, orderForReview, reviewPriority, isBecameRequired, normalizeDateOrder, todayForDateOrder } from "../lib/review-model";
 import type { ReviewEntry } from "../lib/review-summary";
 
 // explainFill turns the engine's terse `detail` log line into intuitive, applicant-facing copy on the
@@ -61,6 +61,60 @@ test("ai-eeo-guess: says you didn't state it and to verify/clear", () => {
   const msg = explainFill(mk({ flag: "ai-eeo-guess", current_value: "Prefer not to say" }))!;
   assert.match(msg, /didn’t state this/);
   assert.match(msg, /Verify or clear/);
+});
+
+// The card's job is WHY, not WHAT — the value is already in the editor beside it. Every AI prompt
+// already asks for a short justification and the engine already stored it; these fixtures are the REAL
+// `detail` strings off a live Linear/Ashby bundle (2026-08-12).
+test("an AI fill explains ITSELF — the model's reason, not a re-quote of the value", () => {
+  const msg = explainFill(
+    mk({ flag: "ai-text", current_value: "2 weeks", detail: "AI: Standard professional notice period inferred from profile context." })
+  )!;
+  assert.match(msg, /Standard professional notice period inferred from profile context/);
+  assert.doesNotMatch(msg, /AI filled this as/, "the old value-repeating phrasing is gone");
+  assert.doesNotMatch(msg, /“2 weeks”/, "the value is NOT repeated — the editor shows it");
+  assert.match(msg, /Verify/, "still tells them to check it");
+});
+
+test("no usable reason ⇒ a plain line, still never a value re-quote", () => {
+  const msg = explainFill(mk({ flag: "ai-text", current_value: "United States of America", detail: null }))!;
+  assert.doesNotMatch(msg, /United States/);
+  assert.match(msg, /AI answered this from your profile/);
+});
+
+test("aiJustification REFUSES engine strings — `detail` must never leak to the card", () => {
+  // The represented-typeahead path writes `AI: "<value>" (engine note)`: an AI: prefix, but jargon
+  // about the MATCH rather than a reason.
+  assert.equal(aiJustification(mk({ detail: 'AI: "Electrical Engineering" (genuinely represented in the list)' })), null);
+  assert.equal(aiJustification(mk({ detail: "audit-mismatch before=X after=Y auditLoc=div[data-automation-id]" })), null);
+  assert.equal(aiJustification(mk({ detail: "no profile mapping for this question" })), null, "not an AI: line at all");
+  // The "no reason given" fallbacks every AI path writes when the model returned none.
+  assert.equal(aiJustification(mk({ detail: "AI: generated answer" })), null);
+  assert.equal(aiJustification(mk({ detail: "AI: inferred — commit failed" })), null);
+  // A reason that merely restates the value is the duplication this exists to remove.
+  assert.equal(aiJustification(mk({ current_value: "Remote", detail: "AI: Remote" })), null);
+});
+
+test("aiJustification strips the engine scaffolding around a real reason", () => {
+  // Workday's choice path appends ` → \"<value>\"`; the value must not come back in through the reason.
+  assert.equal(
+    aiJustification(mk({ current_value: "No", detail: 'AI: no criminal record in profile → "No" — LEGALLY-LOADED, verify' })),
+    "no criminal record in profile"
+  );
+  assert.equal(
+    aiJustification(mk({ detail: "AI: Country listed in personal_info address profile." })),
+    "Country listed in personal_info address profile"
+  );
+});
+
+test("ai-eeo-guess keeps its loud framing but carries the reason instead of the value", () => {
+  const msg = explainFill(
+    mk({ flag: "ai-eeo-guess", current_value: "Prefer not to say", detail: "AI: profile states no gender" })
+  )!;
+  assert.match(msg, /didn’t state this/);
+  assert.match(msg, /Verify or clear/);
+  assert.match(msg, /profile states no gender/);
+  assert.doesNotMatch(msg, /“Prefer not to say”/);
 });
 
 test("bucket: reads as a taught answer, not an AI guess", () => {

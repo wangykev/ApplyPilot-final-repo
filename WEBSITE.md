@@ -121,9 +121,15 @@ handoff contract).
 ### 2. Extension → Backend (report application status) — P2 (credential plumbed in v1)
 
 After a fill/walk, the SW POSTs to `{ingestUrl}` with `Bearer {ingestKey}`:
-`{ company, role, url, job_key, status, needs_review_count, captured_at, review_bundle, login }`. A Next.js
+`{ company, role, url, job_key, status, needs_review_count, captured_at, job_description, review_bundle, login }`. A Next.js
 route validates the per-user ingest key (an `api_keys` row) and upserts-by-`job_key` an `applications` row.
-**A report never NULLS a column it wasn't given** (`lib/report-fields.ts`, PURE + unit-tested): `company` / `role` / `url` / `job_key` / `applied_at` are OMITTED from the write when absent, so an UPDATE can't erase them. `reportApplication` sends `role: null` on every report (the extension doesn't know the job title) and a null `company` when the run has no jobContext — which wiped the tracker row's company + role after a Rehearse run (the FILL path only survived because `saveRunJob` rewrites them afterwards from the scraped JD). The report's OWN payload — status / needs_review_count / review_bundle_json — is always written. `login` = `{ email, tenant, host, created, verified, at }`, the account that run actually signed in as →
+**`job_description` = the posting text the RUN scraped (2026-08-12).** Until then `saveRunJob` — a website
+server action — was its only writer, so the column was filled ONLY when the website launched the run and the
+tracker's "Job description" button was dark on every application driven straight from the extension. Both
+pipelines already scrape a JD, so the scraper's own report carries it (from `jobContext.description`, the
+per-run object already in scope at every `reportApplication` call site). Capped at 100k here, 20k at the
+scrape.
+**A report never NULLS a column it wasn't given** (`lib/report-fields.ts`, PURE + unit-tested): `company` / `role` / `url` / `job_key` / `applied_at` / `job_description` are OMITTED from the write when absent, so an UPDATE can't erase them. ⚠ `job_description` is the sharpest case: a SUBMIT run reports with the per-USER `jobContext` slot, which carries no description, so writing an absent value would blank the JD on exactly the run that confirms an application was filed. `reportApplication` sends `role: null` on every report (the extension doesn't know the job title) and a null `company` when the run has no jobContext — which wiped the tracker row's company + role after a Rehearse run (the FILL path only survived because `saveRunJob` rewrites them afterwards from the scraped JD). The report's OWN payload — status / needs_review_count / review_bundle_json — is always written. `login` = `{ email, tenant, host, created, verified, at }`, the account that run actually signed in as →
 the `login_*` columns (migration `0011`). It is MATCH-GATED extension-side (see CLAUDE.md → Onboarding), and
 an absent/emailless `login` leaves any previously-recorded account untouched — never blanked.
 Per-user API key avoids extension-side OAuth token refresh. **Both** the single-page CDP fill

@@ -49,6 +49,24 @@ test("reportColumns: an unknown status falls back to needs_review, never through
   assert.equal(reportColumns({}, "u1").status, "needs_review");
 });
 
+// The JD column joined this rule on 2026-08-12, when the extension started reporting the posting text
+// it had always scraped. It is the case where clobbering would bite hardest: a SUBMIT run reports with
+// the per-USER jobContext slot, which carries no description at all — so writing an absent value would
+// blank the JD on precisely the run that confirms an application was filed.
+test("reportColumns: a report with NO job_description leaves the column alone (a submit run must not erase it)", () => {
+  const cols = reportColumns({ url: "https://x", status: "submitted" }, "u1");
+  assert.equal("job_description" in cols, false);
+  assert.equal(reportColumns({ job_description: "   " }, "u1").job_description, undefined, "whitespace is absence");
+  assert.equal(reportColumns({ job_description: 42 }, "u1").job_description, undefined, "a non-string is absence");
+});
+
+test("reportColumns: a carried job_description is written, capped at the 100k saveRunJob uses", () => {
+  const cols = reportColumns({ job_description: "  Build turbines. Requires a Bachelor's.  " }, "u1");
+  assert.equal(cols.job_description, "Build turbines. Requires a Bachelor's.");
+  const huge = reportColumns({ job_description: "x".repeat(250000) }, "u1");
+  assert.equal((huge.job_description as string).length, 100000, "a runaway page can't blow up the row");
+});
+
 test("loginFields: an absent or emailless login writes NOTHING (never blanks the account on file)", () => {
   assert.deepEqual(loginFields(undefined), {});
   assert.deepEqual(loginFields(null), {});

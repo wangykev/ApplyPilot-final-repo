@@ -1491,6 +1491,43 @@ test("AI routing: a DATE is a short factual answer, so it goes to FILL, never th
   assert.ok(String(out.results[0].after || "").length, "and it still fills: " + out.results[0].detail);
 });
 
+test("cascade: a late field that filled DETERMINISTICALLY is not made to demand approval", async () => {
+  // `requiresApproval` (web/lib/review-approval.ts) is `needs_review || cascade_revealed`, so tagging
+  // every late-discovered row demanded a HUMAN SIGN-OFF for it. Live on Shield AI: the self-ID
+  // signature `Name` ("Kevin Wang", composed from the profile) and `Date` ("08/12/2026", the
+  // signature-date rule) both came back filled / needs_review:false / confidence:high and still sat
+  // in the review pile. The ATS re-scan mostly catches fields that were still MOUNTING during the
+  // first scan — a scan-timing artifact — so a clean verified fill clears the same bar every other
+  // auto-approved field clears. Anything NOT cleanly filled keeps the flag.
+  let scans = 0;
+  const first = [{ fieldName: "last_name", inputSel: "#last_name", widgetType: "text", label: "Last Name", isRequired: true, value: null, domIndex: 0 }];
+  const late = [
+    // fills deterministically from the profile → must NOT be flagged
+    { fieldName: "first_name", inputSel: "#first_name", widgetType: "text", label: "First Name", isRequired: true, value: null, domIndex: 1 },
+    // nothing answers this and the form offers no options → ends needs_review → KEEPS the flag
+    { fieldName: "sig_unknown", inputSel: "#sig_unknown", widgetType: "select", label: "Some late question", isRequired: false, value: null, domIndex: 2, options: [] },
+  ];
+  const values = {};
+  const act = fakeAct({
+    atsInjScan: () => { scans++; return { ats: "greenhouse", url: "https://job-boards.greenhouse.io/x/jobs/1", title: "t", fields: scans === 1 ? first : first.concat(late) }; },
+    atsInjSetText: (sel, v) => { values[sel] = v; return { ok: true, after: v }; },
+    atsInjReadValue: (a, sel) => ({ ok: true, value: values[sel] || null }),
+    atsInjOpenAndReadOptions: () => ({ ok: true, opened: true }),
+    atsInjReadOptions: () => ({ ok: true, open: true, options: [] }),
+    atsInjCloseCombo: () => ({ ok: true }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+  });
+  const out = await ats.driveAtsPageFill(act, "greenhouse", PROFILE, {}, {}, {});
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+
+  assert.strictEqual(by.first_name.status, "filled", "precondition: it filled deterministically");
+  assert.ok(!by.first_name.cascadeRevealed,
+    "a late field that filled AND verified must not be made to demand approval just for being late");
+  assert.notStrictEqual(by.sig_unknown.status, "filled");
+  assert.strictEqual(by.sig_unknown.cascadeRevealed, true,
+    "a late field that did NOT cleanly fill still carries the flag and still faces the gate");
+});
+
 test("atsBatchMaxTokens: a free-text answer is budgeted as a paragraph, a pick as a line", () => {
   const choice = { id: "q1", kind: "choice" }, text = { id: "q2", kind: "text" };
   assert.strictEqual(ats.atsBatchMaxTokens([choice, choice]), 512 + 800);

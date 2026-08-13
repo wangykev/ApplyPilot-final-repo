@@ -1,3 +1,4 @@
+import { clsx } from "@/lib/clsx";
 import { CheckCircle2, FileCheck2, AlertTriangle, Clock } from "lucide-react";
 
 /**
@@ -52,9 +53,22 @@ export function SubmittedRecord({
   const rehearsal = !!submission && !submission.armed;
   const blockers = submission?.blockers ?? [];
 
+  // A FILED APPLICATION IS THE LOUDEST STATE ON THIS PAGE, so it gets the whole card, not a 16px
+  // icon: green border + wash for a real submit, amber when something blocked it, neutral for a
+  // rehearsal (which deliberately files nothing and must never be mistaken for one that did).
   return (
-    <section className="bezel overflow-hidden">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-hairline px-6 py-4">
+    <section
+      className={clsx(
+        "bezel overflow-hidden",
+        submitted ? "border-verified/40 bg-verified/[0.06]" : blockers.length ? "border-amber/40" : ""
+      )}
+    >
+      <header
+        className={clsx(
+          "flex flex-wrap items-center justify-between gap-3 border-b px-6 py-4",
+          submitted ? "border-verified/25 bg-verified/[0.05]" : "border-hairline"
+        )}
+      >
         <div className="flex items-center gap-2.5">
           {submitted ? (
             <CheckCircle2 className="h-4 w-4 text-verified" />
@@ -63,8 +77,13 @@ export function SubmittedRecord({
           ) : (
             <Clock className="h-4 w-4 text-ink-faint" />
           )}
-          <span className="font-mono text-[11px] uppercase tracking-label text-ink-dim">
-            {submitted ? "Submitted to Workday" : rehearsal ? "Rehearsal — nothing was submitted" : "Submit run"}
+          <span
+            className={clsx(
+              "font-mono text-[11px] uppercase tracking-label",
+              submitted ? "text-verified" : "text-ink-dim"
+            )}
+          >
+            {submitted ? "✓ Submitted" : rehearsal ? "Rehearsal — nothing was submitted" : "Submit run"}
           </span>
         </div>
         <span className="font-mono text-[11px] text-ink-faint">{when(submission?.at)}</span>

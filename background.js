@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "deferred-ai-6";
+const AP_BUILD_MARKER = "jd-headings-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -441,6 +441,15 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         const jobContext = { ...(store.jobContext || {}) };
         if (jd && jd.company) jobContext.company = jd.company;
         if (jobContext.company) console.log("[ApplyPilot][RUN] job context company:", jobContext.company);
+        // …and the POSTING TEXT, which the run just scraped and then threw away (2026-08-12). The
+        // tracker's "Job description" button was dark on every application not launched from the
+        // website's Run page, because `saveRunJob` (a WEBSITE server action) was the only writer of
+        // `job_description` — so a run fired any other way scraped the JD, used it, and dropped it.
+        // Carrying it on jobContext is what puts it in scope at the report: jobContext is already the
+        // per-run "which job is this" object and is already threaded to every reportApplication call
+        // site. Nothing on the Workday path READS `description` (only ats.js prompts do, and they
+        // re-slice it themselves), so this is inert here apart from being reported.
+        if (jd && jd.text) jobContext.description = String(jd.text);
 
         // BEFORE the Workday path: does this page EMBED a non-Workday application? An employer
         // careers page matches no ATS host pattern, so it lands here — but it may be serving a
@@ -4155,6 +4164,16 @@ async function reportApplication(bundle, jobContext, extra) {
       status: (extra && extra.status) || "needs_review",
       needs_review_count: needs,
       captured_at: bundle.captured_at || new Date().toISOString(),
+      // THE POSTING TEXT this run scraped, so the tracker's "Job description" viewer works for an
+      // application filled ANY way (2026-08-12). It used to be written by `saveRunJob` alone — a
+      // WEBSITE server action — so only a run launched from the Run page ever persisted one, and every
+      // application driven straight from the extension had the button hidden for want of data. Both
+      // pipelines scrape a JD already; this reports it.
+      //
+      // ABSENT means "I have nothing to say", never "blank it": a submit run reports with the per-USER
+      // jobContext slot (which carries no description), and the route omits an absent column rather
+      // than nulling it — so submitting can never erase the JD the fill run recorded.
+      job_description: (jobContext && jobContext.description) || null,
       review_bundle: bundle
     };
     const res = await fetch(apSession.ingestUrl, {
@@ -4649,8 +4668,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     if (jd && jd.title) jobContext.title = jd.title;
     // The JD text grounds the AI answers (an essay written blind to the posting invents a
     // company theme — live: "Kraken's work in the robotics space" for an ENERGY company).
+    // Carried in FULL (the scrape already caps itself at 20k), not pre-sliced to the prompt budget:
+    // the same field is now also what reaches the tracker's Job description viewer, and a JD cut at
+    // 4000 chars ends mid-sentence for a reader. The three prompt sites in ats.js each slice to 4000
+    // themselves, so the bytes any model sees are UNCHANGED by this.
     const jdText = jd && (jd.description || jd.text);
-    if (jdText) jobContext.description = String(jdText).slice(0, 4000);
+    if (jdText) jobContext.description = String(jdText);
 
     emitRunProgress("Filling the application", "single-page " + ats + " form (never submits)");
     const fillT0 = Date.now();

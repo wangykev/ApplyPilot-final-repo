@@ -422,7 +422,19 @@ export function ReviewEditor({
   );
   const removedCount = entries.length - live.length;
   const editedCount = useMemo(() => live.filter((e) => editKindOf(e)).length, [live]);
-  const reviewCount = useMemo(() => live.filter((e) => e.needs_review).length, [live]);
+  // COUNT WHAT IS LEFT TO DO, not what was ever flagged (2026-08-12). The chip used to hold at its
+  // original number however many you approved, so "Needs review 9" sat directly above
+  // "9 / 9 flagged fields approved" — the one strip a reviewer scans to know whether they are
+  // finished flatly contradicted the approval bar underneath it.
+  // ⚠ COUNT WHAT NEEDS APPROVING, WHICH IS NOT THE SAME SET AS `needs_review` (2026-08-12).
+  // `requiresApproval` is needs_review OR cascade_revealed, and the approval bar has always counted
+  // that set — so a page with 2 cascade-revealed fields showed "7" here and "0 / 9" in the bar, and
+  // those 2 were reachable ONLY by hunting through All fields. You could approve all 7 the section
+  // offered and stay stuck at 7/9 with nothing telling you where the rest were. The section, the
+  // chip and the bar now all count the same thing.
+  const reviewTotal = useMemo(() => live.filter((e) => requiresApproval(e)).length, [live]);
+  const reviewPending = useMemo(() => live.filter((e) => requiresApproval(e) && !e.is_approved).length, [live]);
+  const allReviewed = reviewTotal > 0 && reviewPending === 0;
   const liveCounts = useMemo(
     () =>
       live.reduce<Record<string, number>>((a, e) => {
@@ -441,7 +453,12 @@ export function ReviewEditor({
 
   // NEW items first (questions a submit run sent back), then the pre-existing loudness ordering —
   // see reviewPriority. Stable, so form order still decides within a tier.
-  const flagged = useMemo(() => orderForReview(live.filter((e) => e.needs_review)), [live]);
+  const flagged = useMemo(() => orderForReview(live.filter((e) => requiresApproval(e))), [live]);
+  // PENDING FIRST, APPROVED SUNK BELOW. An approved row must stay visible — you have to be able to
+  // take an approval back — but it is no longer WORK, and leaving it interleaved meant the remaining
+  // questions were scattered between rows that were already done.
+  const flaggedPending = useMemo(() => flagged.filter((e) => !e.is_approved), [flagged]);
+  const flaggedDone = useMemo(() => flagged.filter((e) => e.is_approved), [flagged]);
 
   const groupKeys = useMemo(() => {
     const seen = new Set<string>();
@@ -457,7 +474,9 @@ export function ReviewEditor({
   }, [entries]);
 
   const filterPass = useCallback(
-    (e: ReviewEntry) => (filter === "review" ? !!e.needs_review : filter === "edited" ? !!editKindOf(e) : true),
+    // "review" filters on the SAME predicate the chip counts, or clicking a chip reading 9 would
+    // narrow the list to 7.
+    (e: ReviewEntry) => (filter === "review" ? requiresApproval(e) : filter === "edited" ? !!editKindOf(e) : true),
     [filter]
   );
 
@@ -501,9 +520,9 @@ export function ReviewEditor({
       <div className="flex flex-wrap items-center gap-2 font-mono text-[11px] tracking-label">
         <FilterChip label="All" n={live.length} active={filter === "all"} onClick={() => setFilter("all")} />
         <FilterChip
-          label="Needs review"
-          n={reviewCount}
-          tone="warn"
+          label={allReviewed ? "✓ Reviewed" : "Needs review"}
+          n={allReviewed ? reviewTotal : reviewPending}
+          tone={allReviewed ? "ok" : "warn"}
           active={filter === "review"}
           onClick={() => setFilter(filter === "review" ? "all" : "review")}
         />
@@ -546,9 +565,28 @@ export function ReviewEditor({
       {/* needs review */}
       {flagged.length > 0 && filter !== "edited" && (
         <section>
-          <SectionLabel title="Needs review" count={`${flagged.length} to verify`} tone="warn" />
+          <SectionLabel
+            title="Needs review"
+            count={
+              flaggedPending.length
+                ? `${flaggedPending.length} of ${flagged.length} left to verify`
+                : `all ${flagged.length} approved`
+            }
+            tone={flaggedPending.length ? "warn" : "ok"}
+          />
           <div className="space-y-2">
-            {flagged.map((e) => (
+            {flaggedPending.map((e) => (
+              <FieldRow key={"rev-" + e.field_id} e={e} review ctx={ctx} />
+            ))}
+            {flaggedDone.length > 0 && flaggedPending.length > 0 && (
+              <div className="flex items-center gap-2 pt-2">
+                <span className="font-mono text-[10px] uppercase tracking-label text-verified">
+                  ✓ approved ({flaggedDone.length})
+                </span>
+                <span className="h-px flex-1 bg-verified/20" />
+              </div>
+            )}
+            {flaggedDone.map((e) => (
               <FieldRow key={"rev-" + e.field_id} e={e} review ctx={ctx} />
             ))}
           </div>
@@ -974,15 +1012,20 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
   }, [e.field_id, review, ctx]);
 
   const kind = editKindOf(e);
-  const approvedRow = !!(e.needs_review && e.is_approved);
+  // Keyed on requiresApproval, not needs_review — a cascade-revealed field demands approval too, and
+  // tinting it neutral made it look like settled background while it was still holding up the gate.
+  const approvedRow = !!(requiresApproval(e) && e.is_approved);
+  const pendingApproval = requiresApproval(e) && !e.is_approved;
   // A field the operator CHANGED that was NOT flagged for review → tint it green (a confirmed edit),
   // mirroring the extension viewer's f-edit. The "autofilled: <bot value>" ref shows too (below).
-  const editedRow = !e.needs_review && !!kind;
+  const editedRow = !requiresApproval(e) && !!kind;
+  // An APPROVED flagged row gets the same left-bar treatment a confirmed edit gets — a bare tint was
+  // too close to the amber "still needs you" wash to read as done at a glance.
   const rowTint = approvedRow
-    ? "bg-verified/[0.05]"
-    : e.needs_review && mustReplace(e)
+    ? "border-l-2 border-verified/60 bg-verified/[0.06]"
+    : pendingApproval && mustReplace(e)
       ? "bg-signal/[0.05]"
-      : e.needs_review
+      : pendingApproval
         ? "bg-amber/[0.04]"
         : editedRow
           ? "border-l-2 border-verified/60 bg-verified/[0.07]"
@@ -996,8 +1039,15 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0 sm:w-1/2">
           <div className="flex flex-wrap items-center gap-1.5">
+            {/* Say APPROVED where the reason-for-flagging badges are, so the row states its own
+                outcome instead of leaving the far-right button as the only tell. */}
+            {review && approvedRow && (
+              <span className="inline-block rounded border border-verified/50 px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-label text-verified">
+                ✓ approved
+              </span>
+            )}
             {review && <ReviewBadges e={e} />}
-            <span className="text-sm text-ink">{fmt(e.question_label)}</span>
+            <ClampedText text={fmt(e.question_label)} className="text-sm text-ink" mono />
             {e.is_required && (
               <span className="text-signal" title="required">
                 ✱
@@ -1006,7 +1056,10 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
             <StatusDot e={e} />
           </div>
           {review && explainFill(e) && (
-            <p className="mt-1 text-xs leading-relaxed text-ink-dim">{explainFill(e)}</p>
+            // the explanation quotes the ANSWER back, so a long answer makes this long too
+            <div className="mt-1 text-xs leading-relaxed text-ink-dim">
+              <ClampedText text={explainFill(e) as string} />
+            </div>
           )}
           {review && e.tree_structure?.chosen && (
             <p className="mt-1 text-xs text-ink-faint">
@@ -1030,6 +1083,49 @@ function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: R
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * A question label is usually a sentence. Sometimes it is a 2,000-character base64 blob — Ramp puts
+ * an encoded challenge in the label itself, and a few boards paste an entire policy paragraph there.
+ * Rendered raw that is not "a long label", it is a broken page: one unbroken token has no spaces to
+ * wrap on, so it forces the row wider than the viewport and shoves the value editor off-screen.
+ *
+ * So anything past a sentence-ish length is CLAMPED with an explicit opt-in to see the rest, and
+ * `break-all` is used rather than `break-words` because the pathological case is precisely the one
+ * with no word boundaries to break on. The character count goes in the button: the useful question
+ * about a blob like this is "how much is there", and it also tells you at a glance that the form —
+ * not ApplyPilot — is what put it there.
+ */
+function ClampedText({ text, className, mono }: { text: string; className?: string; mono?: boolean }) {
+  const [open, setOpen] = useState(false);
+  const LONG = 200;
+  if (text.length <= LONG) return <span className={className}>{text}</span>;
+  return (
+    <span className={clsx("block min-w-0", className)}>
+      {/* ⚠ NO `block` HERE while clamped, and it is not a style preference: `line-clamp-2` works by
+          setting `display:-webkit-box`, so a sibling `block` in the same class list SILENTLY KILLS it.
+          Tailwind emits `.block` after `.line-clamp-*`, so `block` wins the cascade regardless of the
+          order they appear in here — the DOM read said `display:block`, `-webkit-line-clamp:2`, and a
+          2,521-char label 893px tall instead of ~36px. Verified rendered, not assumed. */}
+      <span
+        className={clsx(
+          "break-all",
+          mono && "font-mono text-[11px] leading-relaxed",
+          open ? "block" : "line-clamp-2",
+        )}
+      >
+        {text}
+      </span>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="mt-0.5 font-mono text-[10px] uppercase tracking-label text-amber hover:underline"
+      >
+        {open ? "show less" : `show all ${text.length} chars`}
+      </button>
+    </span>
   );
 }
 
@@ -1840,7 +1936,7 @@ function FilterChip({
   label: string;
   n: number;
   active: boolean;
-  tone?: "warn" | "edit";
+  tone?: "warn" | "edit" | "ok";
   onClick: () => void;
 }) {
   return (
@@ -1849,22 +1945,33 @@ function FilterChip({
       onClick={onClick}
       className={clsx(
         "rounded-full border px-3 py-1 transition-colors",
-        active ? "border-ink-dim bg-panel-raised text-ink" : "border-hairline text-ink-dim hover:border-ink-dim"
+        active
+          ? "border-ink-dim bg-panel-raised text-ink"
+          : tone === "ok"
+            ? "border-verified/40 text-ink-dim hover:border-verified"
+            : "border-hairline text-ink-dim hover:border-ink-dim"
       )}
     >
-      <span className={clsx(tone === "warn" && "text-amber", tone === "edit" && "text-ink")}>{label}</span>{" "}
+      <span className={clsx(tone === "warn" && "text-amber", tone === "edit" && "text-ink", tone === "ok" && "text-verified")}>
+        {label}
+      </span>{" "}
       <span className="text-ink-faint">{n}</span>
     </button>
   );
 }
 
-function SectionLabel({ title, count, tone }: { title: string; count: string; tone?: "warn" }) {
+function SectionLabel({ title, count, tone }: { title: string; count: string; tone?: "warn" | "ok" }) {
   return (
     <div className="mb-3 flex items-center gap-2">
-      <h3 className={clsx("font-mono text-[11px] uppercase tracking-label", tone === "warn" ? "text-amber" : "text-ink-dim")}>
+      <h3
+        className={clsx(
+          "font-mono text-[11px] uppercase tracking-label",
+          tone === "warn" ? "text-amber" : tone === "ok" ? "text-verified" : "text-ink-dim"
+        )}
+      >
         {title}
       </h3>
-      <span className="font-mono text-[10px] text-ink-faint">{count}</span>
+      <span className={clsx("font-mono text-[10px]", tone === "ok" ? "text-verified/80" : "text-ink-faint")}>{count}</span>
       <span className="h-px flex-1 bg-hairline/60" />
     </div>
   );

@@ -83,10 +83,16 @@ export function reportColumns(body: ReportBody, userId: string): Record<string, 
   const url = str(body.url);
   const jobKey = str(body.job_key);
   const appliedAt = str(body.captured_at);
+  // The scraped posting text (extension reportApplication, 2026-08-12). The clobbering rule matters
+  // more here than anywhere else: a SUBMIT run reports from the per-user jobContext slot, which holds
+  // no description, so writing an absent value would erase the JD on exactly the run that confirms an
+  // application. Capped at the same 100k as saveRunJob, the website-side writer of this column.
+  const jobDescription = str(body.job_description);
   if (company) cols.company = company;
   if (role) cols.role = role;
   if (url) cols.url = url;
   if (jobKey) cols.job_key = jobKey;
   if (appliedAt) cols.applied_at = appliedAt;
+  if (jobDescription) cols.job_description = jobDescription.slice(0, 100000);
   return cols;
 }

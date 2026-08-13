@@ -1649,7 +1649,23 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     try { console.log(`[ApplyPilot][ATS-FILL] cascade round ${round + 1}: ${fresh.length} late-mounted field(s) — ${fresh.map((f) => f.fieldName).slice(0, 6).join(", ")}`); } catch (e) { /* log */ }
     const before = results.length;
     await atsFillFields(act, ats, rescan, fresh, results, profile, defaults, jc, bucketIndex, fillOpts);
-    for (let i = before; i < results.length; i++) results[i].cascadeRevealed = true;
+    // ⚠ ONLY FLAG WHAT THE LATE DISCOVERY ACTUALLY LEFT OPEN (operator, 2026-08-12).
+    // `cascadeRevealed` is not decoration: `requiresApproval` is `needs_review || cascade_revealed`,
+    // so tagging every late row DEMANDS A HUMAN APPROVAL for it. Blanket-tagging made the Shield AI
+    // self-ID signature — `Name` "Kevin Wang" (composed from the profile) and `Date` "08/12/2026"
+    // (the signature-date rule) — both `filled`, `needs_review:false`, `confidence:high`, sit in the
+    // review pile demanding sign-off on answers the profile had already given deterministically.
+    // WHY THIS PATH DIFFERS FROM WORKDAY'S, which keeps its blanket flag: there, cascadeRevealed
+    // means the form REVEALED or PROMOTED a field in reaction to a value we committed, and
+    // re-checking that is the point. Here the re-scan mostly catches fields that were still MOUNTING
+    // during the first scan (see the burst note above) — a SCAN-TIMING artifact, not a form reaction,
+    // and one the field itself cannot be held responsible for.
+    // So a late row that filled DETERMINISTICALLY AND VERIFIED (`filled` — the AI paths all end
+    // `filled_review`) clears the same bar every other auto-approved field on the page clears, and is
+    // approved by default like them. Anything else keeps the flag and still faces the gate.
+    for (let i = before; i < results.length; i++) {
+      if (results[i].status !== "filled") results[i].cascadeRevealed = true;
+    }
   }
 
   return await atsFinishFill(act, ats, scan, results);

@@ -1729,13 +1729,106 @@ function scrapeJobPosting() {
     }
   }
 
-  let body = pick([
+  const BODY_SELS = [
     '[data-automation-id="jobPostingDescription"]', '[data-automation-id="richTextArea"]',
     "#content .job__description", ".job__description", "#job-description",
     '[class*="job-description"]', '[class*="jobDescription"]',
     ".posting-page .section-wrapper", ".ashby-job-posting-content",
     '[data-testid*="description"]', "article", "main",
-  ]);
+  ];
+
+  // KEEP THE STRUCTURE THE DOM ALREADY KNOWS (2026-08-12). `innerText` flattens a posting into
+  // blank-line-separated lines, and the heading/list distinction is GONE — not merely hard to recover,
+  // genuinely absent: on Linear's posting the heading "What we offer" (13 chars, 3 words) is
+  // indistinguishable by length, wording or punctuation from the bullet "GitHub, Slack, Notion" (21, 3).
+  // Any render-time guess is therefore a coin flip on every short line, so the reader got one
+  // undifferentiated wall of text. The DOM has <h2> and <li> right there, so read them instead of
+  // discarding the information and trying to infer it back.
+  //
+  // Markers are deliberately markdown-ish and minimal — `## ` for a heading, `- ` for a list item — so
+  // the value stays a plain string everywhere it already flows (LLM prompts, the summary regexes, the
+  // queue's JD, `atsPostingGone`), and only the viewer parses them.
+  const structured = (root) => {
+    if (!root) return "";
+    const out = [];
+    const line = (s) => String(s || "").replace(/\s+/g, " ").trim();
+    const SKIP = { script: 1, style: 1, svg: 1, noscript: 1, button: 1, nav: 1, form: 1 };
+
+    // ⚠ A REAL POSTING DOES NOT PUT ITS SECTION HEADINGS IN <h*> TAGS (measured on Linear/Ashby,
+    // 2026-08-12). Tag-only detection got this exactly BACKWARDS there: Ashby marks its sidebar
+    // metadata labels ("Location", "Department") as <h2>, while the actual body headings — "What you'll
+    // do", "What we're looking for", "Our tech", "What we offer" — are styled divs, so 5 of 5 headings
+    // captured were the wrong ones and 5 of 5 real ones were missed.
+    //
+    // So ask the DOM how the text is RENDERED, which is where the answer actually lives: a short block
+    // set in bold or at a larger size than the body IS a heading, whatever tag it uses. Guards keep it
+    // from swallowing prose: short only, and never something that ends like a sentence (a bold sentence
+    // is emphasis, not a heading).
+    let baseSize = 16;
+    try { baseSize = parseFloat(getComputedStyle(root).fontSize) || 16; } catch (e) { /* keep 16 */ }
+    const boldish = (el) => {
+      try {
+        const cs = getComputedStyle(el);
+        return (parseInt(cs.fontWeight, 10) || 400) >= 600 || (parseFloat(cs.fontSize) || baseSize) > baseSize * 1.1;
+      } catch (e) { return false; }
+    };
+    const looksHeading = (el, t) => {
+      if (!t || t.length > 80 || /[.!?,;:]$/.test(t)) return false;
+      if (boldish(el)) return true;
+      // ⚠ THE BOLD IS ON THE CHILD, NOT THE BLOCK — measured on Linear/Ashby, and testing the block
+      // alone is why the first attempt found 0 of 5 real headings. An ATS description is a RICH-TEXT
+      // field, so its headings are `<p><strong>What you'll do</strong></p>`: the <p> computes
+      // font-weight 400 and the <strong> inside it 600. A block whose ENTIRE text is one bold run is
+      // that shape, and it is the usual way a heading survives a rich-text editor.
+      if (el.children.length === 1) {
+        const k = el.children[0];
+        if (line(txt(k)) === t && boldish(k)) return true;
+      }
+      return false;
+    };
+
+    const walk = (node, depth) => {
+      if (depth > 12) return; // pathological nesting — the length guard below still catches a short read
+      for (let i = 0; i < node.children.length; i++) {
+        const el = node.children[i];
+        const tag = (el.tagName || "").toLowerCase();
+        if (SKIP[tag]) continue;
+        if (/^h[1-6]$/.test(tag)) { const t = line(txt(el)); if (t) out.push("## " + t); continue; }
+        if (tag === "ul" || tag === "ol") {
+          const items = el.querySelectorAll(":scope > li");
+          for (let k = 0; k < items.length; k++) { const t = line(txt(items[k])); if (t) out.push("- " + t); }
+          continue;
+        }
+        if (tag === "p" || tag === "blockquote" || tag === "td" || tag === "dd" || tag === "dt") {
+          const t = line(txt(el));
+          if (t) out.push(looksHeading(el, t) ? "## " + t : t);
+          continue;
+        }
+        if (el.children.length) { walk(el, depth + 1); continue; }
+        const t = line(txt(el));
+        if (t) out.push(looksHeading(el, t) ? "## " + t : t);
+      }
+    };
+    try { walk(root, 0); } catch (e) { return ""; }
+    return out.join("\n\n");
+  };
+
+  // The element, not just its text — `structured` needs the nodes.
+  const pickEl = (sels) => {
+    for (const s of sels) {
+      try { const el = document.querySelector(s); if (el && txt(el)) return el; } catch (e) { /* skip */ }
+    }
+    return null;
+  };
+
+  // ⚠ NEVER let the structured read LOSE the posting. A container we walk wrongly (text parked in
+  // attributes, an exotic custom-element tree) would silently yield a fraction of the words, and a
+  // half-scraped JD is far worse than an ugly one — it also feeds the AI's grounding. So the flat
+  // innerText is measured too, and wins whenever the walk came back meaningfully shorter.
+  const bodyEl = pickEl(BODY_SELS);
+  const flat = txt(bodyEl);
+  const shaped = structured(bodyEl);
+  let body = shaped.replace(/[#\-\s]/g, "").length >= flat.replace(/\s/g, "").length * 0.6 ? shaped : flat;
 
   // Fallback: the largest text block on the page. An SPA that renders its JD into
   // an unrecognized wrapper still yields the description this way; a page that
@@ -1743,12 +1836,18 @@ function scrapeJobPosting() {
   // best-effort (a thin/absent JD never blocks queueing the job).
   if (!body || body.length < 200) {
     let best = "";
+    let bestEl = null;
     const cands = document.querySelectorAll("main, article, section, div");
     for (let i = 0; i < cands.length && i < 4000; i++) {
       const t = txt(cands[i]);
-      if (t.length > best.length && t.length < 60000) best = t;
+      if (t.length > best.length && t.length < 60000) { best = t; bestEl = cands[i]; }
     }
-    if (best.length > body.length) body = best;
+    // Structure this one too, under the same never-lose-text guard — an SPA that lands here is exactly
+    // the kind of page whose JD is worth reading, so it should not be the one that renders as a wall.
+    if (best.length > body.length) {
+      const shapedBest = structured(bestEl);
+      body = shapedBest.replace(/[#\-\s]/g, "").length >= best.replace(/\s/g, "").length * 0.6 ? shapedBest : best;
+    }
   }
 
   // The EMPLOYER's application link, when this page is itself a board wrapper
