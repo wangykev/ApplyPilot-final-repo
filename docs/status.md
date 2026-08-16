@@ -29,6 +29,26 @@ discover branch).
 repopulate the login box after the fill. The run to watch for ends `needs_review` +
 `credential-overwritten`, not a silent `filled`.
 
+**Step 3 (Education + entry scoping) is written and unit-pinned, PARTLY live-verified.** Live on build
+`icims-edu-1`: `OtherSchool → filled "Carnegie Mellon University"`, `Degree → filled "Bachelor of
+Science"`, `Minor → skipped` (empty in profile), `GraduationDate_Month → filled`. **Two open items,
+neither yet re-run — browser automation was disabled mid-session before a confirming run:**
+
+- ⚠ **THE SEARCH FIX IS NOT LIVE-VERIFIED.** School fell back to "Other" and Major ended
+  `needs_review`, both reporting "no option matched … (after searching)" while typing the same text by
+  hand returns the school as the first hit. Two settle strategies have now failed for the SAME reason —
+  every "has the search finished?" proxy is already satisfied by the PRE-SEARCH list (it is non-zero
+  and stable, and the list is often still loading at OPEN time so a "changed since open" baseline is
+  empty). The current code polls for a MATCH on every read instead, with "No Results" as the terminal
+  no. **Unit-pinned, including a fixture where the result arrives late — but the live proof is owed.**
+  If it fails again, instrument what `atsInjIcimsSearch` actually does to the box (a synthetic `input`
+  may not be starting iCIMS' AJAX at all) before touching the poll a third time.
+- ⚠ **`IsGraduated` filled "Yes" where the local seed profile says `currently_enrolled: true`** (which
+  should give "No"). The unit test pins true→"No", so either the entry rung did not fire on that field
+  or **the EXTENSION's synced profile differs from `data/profile.json`** — the local file is only a
+  seed; the extension syncs from the website. **Check the synced profile first**; do not "fix" the
+  resolver until the input is known.
+
 Remaining, in rough order:
 1. **Education** — the one `needs_review` left: `CandProfileFields.School` found no match for
    `"Carnegie Mellon University"` *after searching* the AJAX list. That is the new widget behaving

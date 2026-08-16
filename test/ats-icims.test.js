@@ -469,6 +469,177 @@ test("icims_dropdown: its option list is always recorded PARTIAL (it pages + sea
   assert.ok(Array.isArray(c.captured_options) && c.captured_options.length > 0);
 });
 
+// ── repeating sections are SEALED to their own entry ────────────────────────────────────
+//
+// Operator's rule: a field inside a repeating section may only be answered from THAT section's
+// data. The example that makes it obvious — a "State/Province" inside an Education entry is the
+// COLLEGE's state, so answering it from the applicant's home address is a different fact, not a
+// near-miss. The seal binds the LLM too: an entry field is shown only its own entry.
+
+const EDU_PROFILE = {
+  personal_info: { city: "Tallahassee", state_province: "Florida", country: ["United States"] },
+  education: [{
+    school_or_university: "Carnegie Mellon University",
+    degree: ["Bachelor of Science", "Bachelor's Degree", "Bachelors"],
+    field_of_study: ["Electrical and Computer Engineering", "Electrical Engineering"],
+    minor: "", gpa: "3.95", from_year: "2024", graduation_date: "2028-05",
+    currently_enrolled: true,
+  }],
+};
+
+const EDU_FIELDS = [
+  { fieldName: "-1_CandProfileFields.School", inputSel: "#school", widgetType: "icims_dropdown", label: "School", isRequired: true, value: null, domIndex: 0 },
+  { fieldName: "-1_CandProfileFields.OtherSchool", inputSel: "#other", widgetType: "text", inputType: "text", label: "Other School", isRequired: true, value: null, domIndex: 1 },
+  { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown", label: "Degree", isRequired: true, value: null, domIndex: 2 },
+  { fieldName: "-1_CandProfileFields.Major", inputSel: "#major", widgetType: "icims_dropdown", label: "Major", isRequired: false, value: null, domIndex: 3 },
+  { fieldName: "-1_CandProfileFields.GPA", inputSel: "#gpa", widgetType: "text", inputType: "text", label: "GPA", isRequired: false, value: null, domIndex: 4 },
+  { fieldName: "-1_CandProfileFields.IsGraduated", inputSel: "#grad", widgetType: "dropdown_native", label: "Did You Graduate", isRequired: true, value: null, options: ["Yes", "No"], domIndex: 5 },
+  { fieldName: "-1_CandProfileFields.GraduationDate_Month", inputSel: "#gm", widgetType: "dropdown_native", label: "Month", isRequired: false, value: null, options: ["January", "May", "December"], domIndex: 6 },
+  { fieldName: "-1_CandProfileFields.GraduationDate_Year", inputSel: "#gy", widgetType: "text", inputType: "text", label: "Year", isRequired: false, value: null, domIndex: 7 },
+  { fieldName: "-1_CandProfileFields.EducationState", inputSel: "#estate", widgetType: "icims_dropdown", label: "State/Province", isRequired: false, value: null, domIndex: 8 },
+];
+
+// `schoolList` controls whether the typeahead can find the school.
+function eduPage(schoolList, over) {
+  const committed = {}, searched = [];
+  const LISTS = {
+    "#school": schoolList,
+    "#degree": ["Bachelor of Science", "Master of Science", "Other"],
+    "#major": ["Electrical and Computer Engineering", "Mechanical Engineering"],
+    "#estate": ["Alabama", "Florida", "Pennsylvania"],
+  };
+  const shown = {};
+  const page = {
+    atsInjScan: () => ({ ats: "icims", url: "https://x.icims.com/jobs/1/candidate", title: "t", fields: EDU_FIELDS.map(f => ({ ...f })) }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSetText: (sel, v) => { committed[sel] = v; return { ok: true, after: v }; },
+    atsInjSelectNative: (sel, t) => { committed[sel] = t; return { ok: true }; },
+    atsInjIcimsOpen: (sel) => ({ ok: true, open: true, options: (LISTS[sel] || []).slice(0, 3) }),
+    atsInjIcimsSearch: (sel, q) => { searched.push([sel, q]); shown[sel] = (LISTS[sel] || []).filter(o => o.toLowerCase().includes(String(q).toLowerCase())); return { ok: true }; },
+    atsInjIcimsReadOptions: (sel) => {
+      const l = shown[sel];
+      if (l === undefined) return { ok: true, options: (LISTS[sel] || []).slice(0, 3), awaitingParent: false, noResults: false };
+      return { ok: true, options: l, awaitingParent: false, noResults: l.length === 0 };
+    },
+    atsInjIcimsCommit: (sel, t) => { committed[sel] = t; return { ok: true }; },
+    atsInjIcimsRead: (sel) => ({ ok: true, value: committed[sel] || null }),
+    atsInjIcimsClose: () => ({ ok: true, closed: true }),
+    atsInjReadValue: (a, sel) => ({ ok: true, value: committed[sel] != null ? committed[sel] : null }),
+    _c: committed, _searched: searched,
+  };
+  return Object.assign(page, over || {});
+}
+
+test("scoping: an Education field sees ONLY its own entry — never the profile root", () => {
+  const f = { fieldName: "-1_CandProfileFields.EducationState", entryIndex: 0 };
+  const scoped = ats.atsScopeForField("icims", f, EDU_PROFILE);
+  assert.deepStrictEqual(Object.keys(scoped), ["education_entry"]);
+  assert.strictEqual(scoped.education_entry.school_or_university, "Carnegie Mellon University");
+  assert.strictEqual(scoped.personal_info, undefined, "the home address must not be visible to an education question");
+  // a NON-entry field still sees the whole profile
+  assert.strictEqual(ats.atsScopeForField("icims", { fieldName: "PersonProfileFields.FirstName" }, EDU_PROFILE), EDU_PROFILE);
+});
+
+test("scoping: an Education State is NOT answered 'Florida' from the home address", async () => {
+  const page = eduPage(["Carnegie Mellon University", "Other"]);
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, {});
+  const s = out.results.find(r => r.fieldName === "-1_CandProfileFields.EducationState");
+  assert.notStrictEqual(s.after, "Florida", "THE BUG THIS RULE EXISTS FOR — that is the applicant's home state, not the college's");
+  assert.notStrictEqual(s.status, "filled");
+  assert.strictEqual(page._c["#estate"], undefined, "nothing may be committed to it deterministically");
+});
+
+test("education: degree / major / GPA / dates all fill from the ENTRY", async () => {
+  const page = eduPage(["Carnegie Mellon University", "Other"]);
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, {});
+  const by = Object.fromEntries(out.results.map(r => [r.fieldName, r]));
+  assert.strictEqual(by["-1_CandProfileFields.Degree"].after, "Bachelor of Science");
+  assert.strictEqual(by["-1_CandProfileFields.Major"].after, "Electrical and Computer Engineering");
+  assert.strictEqual(by["-1_CandProfileFields.GPA"].after, "3.95");
+  // currently_enrolled:true ⇒ has NOT graduated
+  assert.strictEqual(by["-1_CandProfileFields.IsGraduated"].after, "No");
+  // graduation_date "2028-05" → May / 2028
+  assert.strictEqual(by["-1_CandProfileFields.GraduationDate_Month"].after, "May");
+  assert.strictEqual(by["-1_CandProfileFields.GraduationDate_Year"].after, "2028");
+  for (const n of ["-1_CandProfileFields.Degree", "-1_CandProfileFields.GPA", "-1_CandProfileFields.IsGraduated"]) {
+    assert.strictEqual(by[n].status, "filled", n + " should be deterministic");
+  }
+});
+
+test("school pair: FOUND in the list ⇒ pick it, and Other School gets N/A", async () => {
+  const page = eduPage(["Carnegie Mellon University", "Other"]);
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, {});
+  assert.strictEqual(page._c["#school"], "Carnegie Mellon University");
+  assert.strictEqual(page._c["#other"], "N/A");
+});
+
+test("school pair: NOT in the list ⇒ pick 'Other', and the NAME goes in Other School", async () => {
+  const page = eduPage(["Some Other College", "Other"]);   // no Carnegie Mellon
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, {});
+  assert.strictEqual(page._c["#school"], "Other");
+  assert.strictEqual(page._c["#other"], "Carnegie Mellon University");
+  const s = out.results.find(r => r.fieldName === "-1_CandProfileFields.School");
+  assert.strictEqual(s.flag, "school-not-listed");
+  assert.match(s.detail, /Other School/);
+});
+
+// ⚠ THE REGRESSION THAT CAUSED THE LIVE MISS. The pre-search list is already non-zero AND stable, so
+// a stability-only settle accepts it and matches against the unfiltered page — reporting "no option
+// matched Carnegie Mellon University (after searching)" while typing it by hand returns it first.
+test("school search: the settle waits for the list to CHANGE, not merely to hold still", async () => {
+  const page = eduPage(["Carnegie Mellon University", "Other"]);
+  // the search result arrives LATE: three reads still show the unfiltered first page
+  let reads = 0;
+  const realRead = page.atsInjIcimsReadOptions;
+  page.atsInjIcimsReadOptions = (sel) => {
+    if (sel === "#school" && ++reads <= 3) return { ok: true, options: ["Some College", "Another College", "Other"], awaitingParent: false, noResults: false };
+    return realRead(sel);
+  };
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, {});
+  assert.strictEqual(page._c["#school"], "Carnegie Mellon University",
+    "a slow search must not be resolved against the pre-search list");
+  assert.strictEqual(page._c["#other"], "N/A");
+});
+
+test("school search: the widget's own 'No Results' is a terminal state → the Other branch", async () => {
+  const page = eduPage(["Other"]);
+  page.atsInjIcimsSearch = (sel, q) => { page._searched.push([sel, q]); return { ok: true }; };
+  page.atsInjIcimsReadOptions = (sel) => sel === "#school"
+    ? { ok: true, options: [], awaitingParent: false, noResults: true }
+    : { ok: true, options: ["Bachelor of Science", "Other"], awaitingParent: false, noResults: false };
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, {});
+  assert.strictEqual(page._c["#school"], "Other");
+  assert.strictEqual(page._c["#other"], "Carnegie Mellon University");
+});
+
+test("AI batching is grouped PER ENTRY — an entry question never sees the whole profile", async () => {
+  const prompts = [];
+  const page = eduPage(["Carnegie Mellon University", "Other"], {
+    aiEnabled: true,
+    llm: async (a) => { prompts.push(a); return { ok: true, text: JSON.stringify({ answers: [] }) }; },
+  });
+  // make the unanswerable entry field REQUIRED so it reaches the AI at all
+  page.atsInjScan = () => ({ ats: "icims", url: "https://x.icims.com/jobs/1/candidate", title: "t",
+    fields: EDU_FIELDS.map(f => f.fieldName.endsWith("EducationState") ? { ...f, isRequired: true } : { ...f }) });
+  await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, {});
+  const blob = prompts.map(p => JSON.stringify(p)).join(" ");
+  if (blob) {
+    assert.ok(!/Tallahassee/.test(blob), "the home city must never appear in an education question's prompt");
+    assert.ok(!/personal_info/.test(blob), "the profile root must not be sent for an entry field");
+  }
+});
+
+test("atsAssignEntryIndexes: entries are ordered by FIRST APPEARANCE, not by ordinal value", () => {
+  const fields = [
+    { fieldName: "-1_CandProfileFields.School" },
+    { fieldName: "-1_CandProfileFields.Degree" },
+    { fieldName: "-6489344_CandProfileFields.School" },   // a SAVED entry's server id
+    { fieldName: "-6489344_CandProfileFields.Degree" },
+  ];
+  ats.atsAssignEntryIndexes("icims", fields);
+  assert.deepStrictEqual(fields.map(f => f.entryIndex), [0, 0, 1, 1]);
+});
+
 // ── the injected credential fns obey the same contracts as the rest ─────────────────────
 
 test("the credential injected fns are self-contained and return NO value", () => {

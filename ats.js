@@ -298,6 +298,153 @@ function atsMapKey(ats, fieldName) {
   return n.replace(/^-?\d+_/, "");
 }
 
+// ── REPEATING SECTIONS ARE SCOPED TO THEIR OWN ENTRY (operator, 2026-08-16) ──────────────
+// A field inside a repeating section may ONLY be answered from THAT section's data. The rule was
+// asked for with the example that makes it obvious: a "State/Province" inside an Education entry is
+// the COLLEGE's state, so answering it "Florida" from the applicant's home address is not a slightly
+// wrong guess — it is a different fact. The same holds for a work-history address (the EMPLOYER's).
+//
+// Two consequences, and the second is the one worth stating:
+//   • deterministic fills read `profile.<source>[entryIndex]`, never the profile root;
+//   • when the entry does not hold the answer, the field is NOT answered from the root as a
+//     fallback. It goes to the AI — which is likewise shown ONLY that entry (see atsScopeForField).
+//     Live here: the single education entry carries no location at all, so Country/State have no
+//     in-section source and must not borrow one.
+const ATS_ICIMS_ENTRY_MAPS = {
+  education: {
+    source: "education",                  // the profile ARRAY this section's entries come from
+    idPrefix: "CandProfileFields.",
+    match: /^CandProfileFields\.(School|OtherSchool|Degree|Major|Minor|GPA|IsGraduated|GraduationDate_|EducationStartDate_|EducationEndDate_|EducationCountry|EducationState)/,
+    fields: {
+      "CandProfileFields.School": { kind: "school" },
+      "CandProfileFields.OtherSchool": { kind: "other_school" },
+      "CandProfileFields.Degree": { path: "degree" },
+      "CandProfileFields.Major": { path: "field_of_study" },
+      "CandProfileFields.Minor": { path: "minor" },
+      "CandProfileFields.GPA": { path: "gpa" },
+      "CandProfileFields.IsGraduated": { kind: "is_graduated" },
+      "CandProfileFields.GraduationDate_Month": { kind: "date_month", from: "graduation_date" },
+      "CandProfileFields.GraduationDate_Year": { kind: "date_year", from: "graduation_date" },
+      "CandProfileFields.EducationStartDate_Month": { kind: "date_month", from: "from_year" },
+      "CandProfileFields.EducationStartDate_Year": { kind: "date_year", from: "from_year" },
+      // location-derived; absent from this profile's entry, so they honestly reach the scoped AI
+      "CandProfileFields.EducationCountry": { kind: "entry_country" },
+      "CandProfileFields.EducationState": { kind: "entry_state" },
+    },
+  },
+};
+
+// Which repeating section (if any) does a field belong to, and which ENTRY of it?
+// `entryIndex` is stamped onto the scan by atsAssignEntryIndexes — the ordinal in the id (`-1_`) is
+// an iCIMS internal, NOT an array index, so it is never used as one.
+function atsEntrySpec(ats, f) {
+  if (ats !== "icims" || !f) return null;
+  const bare = atsMapKey(ats, f.fieldName);
+  for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
+    if (!def.match.test(bare)) continue;
+    return { section, source: def.source, bare, spec: def.fields[bare] || null,
+      entryIndex: typeof f.entryIndex === "number" ? f.entryIndex : 0 };
+  }
+  return null;
+}
+
+// Stamp `entryIndex` on every field of a repeating section. Entries are ordered by FIRST DOM
+// APPEARANCE of their ordinal, not by the ordinal's numeric value — iCIMS uses `-1` for the entry it
+// renders by default and opaque SERVER ids for saved ones, so sorting numerically would reorder them.
+function atsAssignEntryIndexes(ats, fields) {
+  if (ats !== "icims" || !Array.isArray(fields)) return fields;
+  const order = {}; // section → [ordinal, …] in first-seen order
+  for (const f of fields) {
+    const bare = atsMapKey(ats, f.fieldName);
+    const m = /^(-?\d+)_/.exec(String(f.fieldName || ""));
+    if (!m) continue;
+    for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
+      if (!def.match.test(bare)) continue;
+      const list = (order[section] = order[section] || []);
+      if (list.indexOf(m[1]) === -1) list.push(m[1]);
+      f.entryIndex = list.indexOf(m[1]);
+      f.entrySection = section;
+    }
+  }
+  return fields;
+}
+
+// The ONLY profile a field is allowed to be answered from — including by the LLM.
+// A repeating-entry field sees its own entry and nothing else; everything else sees the profile.
+function atsScopeForField(ats, f, profile) {
+  const es = atsEntrySpec(ats, f);
+  if (!es) return profile;
+  const arr = (profile || {})[es.source];
+  const entry = Array.isArray(arr) ? arr[es.entryIndex] : null;
+  // Named so the model knows what it is looking at, and deliberately NOTHING else from the profile.
+  return entry ? { [es.section + "_entry"]: entry } : { [es.section + "_entry"]: {} };
+}
+
+// Month names as the form spells them (its Month select is a native <select> of full names).
+const ATS_MONTHS = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+
+// Resolve ONE repeating-entry field from ITS OWN entry. Returns a route, or null to fall through
+// (which, for an entry field, means the scoped AI — never the profile root).
+function atsResolveEntryField(es, entry, f) {
+  const spec = es.spec;
+  if (!spec || !entry) return null;
+  const val = (k) => { const v = entry[k]; return v === undefined || v === null || (typeof v === "string" && !v.trim()) ? null : v; };
+  if (spec.path) { const v = val(spec.path); return v == null ? null : { raw: v, path: es.section + "[" + es.entryIndex + "]." + spec.path, source: "entry" }; }
+
+  if (spec.kind === "school") {
+    const s = val("school_or_university");
+    return s == null ? null : { candidates: [String(s)], source: "entry", kind: "school",
+      path: es.section + "[" + es.entryIndex + "].school_or_university" };
+  }
+  if (spec.kind === "other_school") {
+    // Decided by the SCHOOL field's outcome, not here — see the pairing in atsFillFields.
+    const s = val("school_or_university");
+    return { kind: "other_school", source: "entry", schoolName: s == null ? null : String(s),
+      path: es.section + "[" + es.entryIndex + "].school_or_university" };
+  }
+  if (spec.kind === "is_graduated") {
+    // "Did You Graduate?" — currently enrolled means NOT yet. A stored boolean, so deterministic.
+    const enrolled = entry.currently_enrolled;
+    if (enrolled === true) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].currently_enrolled" };
+    if (enrolled === false) return { candidates: ["Yes"], source: "entry", path: es.section + "[" + es.entryIndex + "].currently_enrolled" };
+    return null;
+  }
+  if (spec.kind === "date_month" || spec.kind === "date_year") {
+    const raw = val(spec.from);
+    if (raw == null) return null;
+    const s = String(raw);
+    const ym = /^(\d{4})-(\d{1,2})$/.exec(s);          // "2028-05"
+    const yOnly = /^(\d{4})$/.exec(s);                  // "2024"
+    if (spec.kind === "date_year") {
+      const y = ym ? ym[1] : (yOnly ? yOnly[1] : null);
+      return y == null ? null : { value: y, source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from };
+    }
+    if (!ym) return null;                               // a year-only value says nothing about the month
+    const mi = parseInt(ym[2], 10) - 1;
+    return mi >= 0 && mi < 12
+      ? { candidates: [ATS_MONTHS[mi]], source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from }
+      : null;
+  }
+  if (spec.kind === "entry_country" || spec.kind === "entry_state") {
+    // ⚠ The ENTRY's own location, and nothing else. This profile's education entry has none, so both
+    // correctly return null and go to the scoped AI rather than inheriting the home address.
+    const loc = val("location");
+    if (loc == null) return null;
+    const parts = String(loc).split(",").map((x) => x.trim()).filter(Boolean);
+    if (spec.kind === "entry_state") {
+      const st = parts.length > 1 ? parts[parts.length - 1] : null;
+      if (!st) return null;
+      // "PA" → ["PA", "Pennsylvania"] so either spelling can match the form's list
+      const full = Object.keys(atsLib.REGION_ABBREV || {}).find((n) => atsLib.REGION_ABBREV[n] === st.toLowerCase());
+      const cands = full ? [full.replace(/\b\w/g, (c) => c.toUpperCase()), st] : [st];
+      return { candidates: cands, source: "entry", path: es.section + "[" + es.entryIndex + "].location" };
+    }
+    return null; // a "City, ST" location does not state a country
+  }
+  return null;
+}
+
 // Which stored credential, if any, does this field want? → "login" | "password" |
 // "password_confirm" | null.
 //
@@ -926,10 +1073,14 @@ function atsInjIcimsReadOptions(inputSel) {
   if (!ul) return { ok: false, error: "no-results-list" };
   const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
   const all = [...ul.children].map(txt);
-  return { ok: true, options: all.filter((t) => t && !/^—\s*make a selection/i.test(t)),
+  return { ok: true,
+    options: all.filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^no results/i.test(t)),
     // a child whose parent is unset says so in its own list — report it rather than calling it empty
     awaitingParent: all.some((t) => /^please select a /i.test(t)),
-    noChildren: all.some((t) => /^no .* available$/i.test(t)) };
+    noChildren: all.some((t) => /^no .* available$/i.test(t)),
+    // the widget's own "nothing matched" row. A TERMINAL state for a search: it means keep waiting
+    // is pointless, and (for the school pair) that the form's "Other" branch is the right answer.
+    noResults: all.some((t) => /^no results/i.test(t)) };
 }
 
 // Commit by clicking the row whose text matches EXACTLY (the caller has already run the match ladder).
@@ -1990,6 +2141,19 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
     }
     return { kind: "credential", credentialKind: ck, value, source: "credentials", credential: true, overwrite: true };
   }
+  // ── REPEATING-ENTRY FIELDS ARE SEALED TO THEIR OWN ENTRY ───────────────────────────────
+  // Above the static map, buckets and labels, and it RETURNS EVEN WHEN IT HAS NO ANSWER — that
+  // early return is the point. Falling through would let the label ladder answer an Education
+  // "State/Province" from the home address, which is a different fact, not a near-miss. An entry
+  // field the entry cannot answer goes to the AI, which sees only that entry (atsScopeForField).
+  const es = atsEntrySpec(ats, f);
+  if (es && es.spec) {
+    const arr = (profile || {})[es.source];
+    const entry = Array.isArray(arr) ? arr[es.entryIndex] : null;
+    const r = atsResolveEntryField(es, entry, f);
+    if (r) return r;
+    return { kind: "entry-unanswered", source: "entry", section: es.section, entryIndex: es.entryIndex };
+  }
   const map = (ATS_STATIC_MAPS[ats] || {})[atsMapKey(ats, f.fieldName)];
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
@@ -2050,6 +2214,8 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
   const scan = await act.eval(atsInjScan, ats);
+  // Stamp which ENTRY of a repeating section each field belongs to, before anything routes it.
+  if (scan && scan.fields) atsAssignEntryIndexes(ats, scan.fields);
   const results = [];
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
@@ -2070,6 +2236,7 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     let rescan = null;
     try { rescan = await act.eval(atsInjScan, ats); } catch (e) { break; }
     if (!rescan || !rescan.fields) break;
+    atsAssignEntryIndexes(ats, rescan.fields);
     const seen = new Set(results.map((r) => r.fieldName));
     const fresh = rescan.fields.filter((f) => !seen.has(f.fieldName));
     if (!fresh.length) break;
@@ -2297,7 +2464,29 @@ const ATS_BATCH_ACTION = { choice: "fill", text: "essay" };
 // Fire the batched call(s) for everything the deterministic pass deferred, and fold the answers into
 // the page-level cache (key = normalized QUESTION). Never throws: every failure mode simply leaves the
 // cache without that question, and the commit pass then makes its own per-field call.
+// ⚠ ONE BATCH PER SCOPE (operator, 2026-08-16). A repeating-entry field may only be answered from
+// its OWN entry, and that rule binds the LLM exactly as it binds the deterministic tiers — so an
+// entry field cannot share a prompt with page-level questions (it would be shown the whole profile)
+// nor with a DIFFERENT entry of the same section. Group first, batch within a group. Batching is
+// preserved where it matters: all of one entry's questions still go in one call.
 async function atsRunAiBatch(act, deferred, profile, jc, cache) {
+  const groups = new Map();
+  for (const d of deferred) {
+    const k = d.scopeKey || "";
+    if (!groups.has(k)) groups.set(k, { items: [], profile: d.scopeProfile || profile });
+    groups.get(k).items.push(d);
+  }
+  let fired = false, items = 0, answers = 0;
+  for (const g of groups.values()) {
+    const r = await atsRunAiBatchGroup(act, g.items, g.profile, jc, cache);
+    fired = fired || !!(r && r.fired);
+    items += (r && r.items) || 0;
+    answers += (r && r.answers) || 0;
+  }
+  return { fired, items, answers };
+}
+
+async function atsRunAiBatchGroup(act, deferred, profile, jc, cache) {
   const byKind = { choice: [], text: [] };
   const idToKey = new Map();
   const seen = new Set();
@@ -2447,6 +2636,12 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       } else {
         route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, o.credentials);
       }
+      const es0 = atsEntrySpec(ats, f);
+      // An entry field its own entry cannot answer falls through to the AI/blank path exactly like an
+      // unrouted field — the difference is that the AI is handed ONLY that entry (see the deferral).
+      // It must NOT fall back to the profile root, which is what the early return in atsRouteField
+      // prevents and what this preserves.
+      if (route && route.kind === "entry-unanswered") route = null;
 
       // ── CREDENTIALS ────────────────────────────────────────────────────────────────────
       // Handled before every other kind, and it `continue`s out before `rec.rawValue` /
@@ -2475,6 +2670,49 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
         rec.status = w.matches ? "filled" : "needs_review";
         if (!w.matches) { rec.after = null; rec.detail = "the box did not take the value (" + w.len + " characters present afterwards)"; }
         else if (w.hadLength) rec.detail = "replaced a value the page had prefilled";
+        results.push(fin()); continue;
+      }
+
+      // ── SCHOOL / OTHER SCHOOL — one decision spanning two REQUIRED fields (operator) ────
+      // The form pairs a school typeahead with a free-text "Other School", and both are required.
+      // The rule: if the school IS in the list, pick it and put "N/A" in Other School; if it is NOT,
+      // pick the list's own "Other" and put the school's name in Other School. DOM order puts School
+      // first, so the pair's outcome is recorded there and read by the text field below.
+      const pairKey = es0 ? es0.section + ":" + es0.entryIndex : null;
+      if (route && route.kind === "school") {
+        const store = (o._icimsSchool = o._icimsSchool || {});
+        const name = (route.candidates || [])[0] || null;
+        await atsActuateField(act, ats, f, ref, rec, route.candidates || [], null, jc, profile, { containment: false });
+        if (rec.status === "filled" || rec.status === "filled_review") {
+          store[pairKey] = { matched: true, schoolName: name };
+        } else {
+          // Not listed — take the form's own escape hatch rather than leaving a REQUIRED field empty.
+          // The record is REBUILT rather than patched: the failed attempt's detail/tier/after describe
+          // a different commit, and leaving them would report the "Other" pick as if it were the miss.
+          rec.status = null; rec.after = null; rec.detail = null; rec.matchTier = null; rec.verified = null; rec.flag = null;
+          await atsActuateField(act, ats, f, ref, rec, ["Other"], null, jc, profile, { containment: false });
+          store[pairKey] = { matched: false, schoolName: name };
+          if (rec.status === "filled" || rec.status === "filled_review") {
+            rec.status = "filled_review";
+            rec.flag = "school-not-listed";
+            rec.detail = "this form's school list does not offer " + JSON.stringify(String(name || "")) +
+              " — chose its own \"Other\" and put the name in Other School";
+          }
+        }
+        rec.mappedPath = route.path || null;
+        results.push(fin()); continue;
+      }
+      if (route && route.kind === "other_school") {
+        const st = (o._icimsSchool || {})[pairKey] || null;
+        // ⚠ UNKNOWN ≠ MATCHED. If School never produced an outcome (an error, or a form that renders
+        // Other School first), writing "N/A" would silently drop the school entirely — the one
+        // outcome that loses information. Write the NAME and flag it instead.
+        const useName = !st || st.matched === false;
+        const value = useName ? (st && st.schoolName) || route.schoolName || null : "N/A";
+        if (value == null) { rec.status = "needs_review"; rec.detail = "no school in this education entry"; results.push(fin()); continue; }
+        rec.mappedPath = route.path || null;
+        await atsActuateField(act, ats, f, ref, rec, null, String(value), jc, profile, {});
+        if (!st) { rec.flag = rec.flag || "school-pair-unresolved"; rec.detail = "the School field produced no outcome, so the name was written here rather than \"N/A\""; }
         results.push(fin()); continue;
       }
 
@@ -2583,6 +2821,13 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
               } catch (e) { d.options = []; }   // the commit pass re-reads and reports it honestly
             }
           }
+          // The ONLY profile this question may be answered from. For a repeating-entry field that is
+          // its own entry and nothing else — same seal the deterministic tier obeys.
+          const scope = atsEntrySpec(ats, f);
+          if (scope) {
+            d.scopeKey = scope.section + ":" + scope.entryIndex;
+            d.scopeProfile = atsScopeForField(ats, f, profile);
+          }
           deferred.push(d);
           // PROVISIONAL — phase 3 overwrites both, so neither ever reaches a review bundle. The
           // record is pushed HERE, in the loop, so REVIEW ORDER stays FORM ORDER.
@@ -2643,7 +2888,9 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
     const t0 = Date.now();
     try { await act.eval(atsInjScrollIntoView, d.ref.inputSel); } catch (e) { /* a field we cannot scroll to still fills */ }
     try {
-      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, profile, answer);
+      // scoped profile when this field belongs to a repeating entry — a solo call must obey the
+      // same seal the batch does, or the scoping is only as good as whether a batch happened to fire
+      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, d.scopeProfile || profile, answer);
     } catch (e) {
       d.rec.status = "needs_review";
       d.rec.detail = "AI commit pass exception: " + String((e && e.message) || e);
@@ -2832,22 +3079,34 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // option doesn't exist, so the search box is tried before anything is reported — otherwise a
     // candidate in Texas fails on a list that stops at Michigan.
     if (!m || m.targetIndex < 0) {
+      const beforeKey = opts.join("");
       const s = await act.eval(atsInjIcimsSearch, ref.inputSel, String(candidates[0]));
       if (s && s.ok) {
         searched = true;
-        // settle-poll the filtered list: consecutive equal, non-zero reads (the standing rule —
-        // a live-filtering list races a fixed delay).
-        let prev = -1, stable = 0, read = null;
-        for (let i = 0; i < 12; i++) {
-          await act.delay(160);
+        // POLL FOR SUCCESS, NOT FOR STILLNESS. Two settles failed live for the SAME underlying
+        // reason: every "has the search finished?" proxy is already satisfied by the PRE-SEARCH
+        // list. Stability alone accepts it (it is non-zero and perfectly stable). "Changed since we
+        // opened" accepts it too, because the list is frequently still loading at open time, so the
+        // baseline is empty and the ordinary unfiltered page reads as the change — which is what
+        // made School report `no option matched "Carnegie Mellon University" (after searching)` and
+        // fall to "Other" in 675ms, while typing the same text by hand returns it as the first hit.
+        //
+        // A MATCH is unambiguous, so match on EVERY read and stop at the first hit; "No Results" is
+        // the widget's own terminal no. Otherwise keep looking for the whole budget rather than
+        // deciding that a still list is a finished one. Only the timeout path can be wrong now, and
+        // it errs toward looking longer.
+        let read = null, hit = null;
+        for (let i = 0; i < 22; i++) {
+          await act.delay(180);
           read = await act.eval(atsInjIcimsReadOptions, ref.inputSel);
-          const n = read && read.ok ? (read.options || []).length : 0;
-          stable = n > 0 && n === prev ? stable + 1 : 0;
-          if (stable >= 1) break;
-          prev = n;
+          if (!read || !read.ok) continue;
+          if (read.noResults) { opts = []; break; }
+          const list = read.options || [];
+          if (list.length) opts = list;
+          const tryM = atsLib.matchCandidates(candidates, list, { containment: allowContainment });
+          if (tryM && tryM.targetIndex >= 0) { opts = list; hit = tryM; break; }
         }
-        if (read && read.ok) opts = read.options || [];
-        m = atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
+        m = hit || atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
       }
     }
     // ALWAYS partial: this widget renders one page and offers a search box, so even an unsearched
@@ -3751,6 +4010,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
+    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
