@@ -314,7 +314,15 @@ const ATS_ICIMS_ENTRY_MAPS = {
   education: {
     source: "education",                  // the profile ARRAY this section's entries come from
     idPrefix: "CandProfileFields.",
-    match: /^CandProfileFields\.(School|OtherSchool|Degree|Major|Minor|GPA|IsGraduated|GraduationDate_|EducationStartDate_|EducationEndDate_|EducationCountry|EducationState)/,
+    // ⚠ MEMBERSHIP, NOT AN ALLOWLIST — this was a hole, and it filled a real wrong answer.
+    // The first version listed the field names it knew, so `EducationCity` (which it did not) escaped
+    // the seal entirely, reached the label ladder, and was answered "Tallahassee" from the HOME
+    // address — exactly the class of error the seal exists to prevent. A seal that only covers the
+    // fields you remembered is not a seal. `sectionTitle` matches the section's own heading so any
+    // field the section contains is covered, mapped or not; the name regex stays as the fast path
+    // (and for fixtures that carry no heading).
+    sectionTitle: /^education$/i,
+    match: /^CandProfileFields\.(School|OtherSchool|Degree|Major|Minor|GPA|IsGraduated|Graduation|Education)/,
     fields: {
       "CandProfileFields.School": { kind: "school" },
       "CandProfileFields.OtherSchool": { kind: "other_school" },
@@ -327,9 +335,10 @@ const ATS_ICIMS_ENTRY_MAPS = {
       "CandProfileFields.GraduationDate_Year": { kind: "date_year", from: "graduation_date" },
       "CandProfileFields.EducationStartDate_Month": { kind: "date_month", from: "from_year" },
       "CandProfileFields.EducationStartDate_Year": { kind: "date_year", from: "from_year" },
-      // location-derived; absent from this profile's entry, so they honestly reach the scoped AI
+      // derived from the ENTRY's own location ("Pittsburgh, PA"), never the home address
       "CandProfileFields.EducationCountry": { kind: "entry_country" },
       "CandProfileFields.EducationState": { kind: "entry_state" },
+      "CandProfileFields.EducationCity": { kind: "entry_city" },
     },
   },
 };
@@ -340,8 +349,15 @@ const ATS_ICIMS_ENTRY_MAPS = {
 function atsEntrySpec(ats, f) {
   if (ats !== "icims" || !f) return null;
   const bare = atsMapKey(ats, f.fieldName);
+  const hasOrdinal = /^-?\d+_/.test(String(f.fieldName || ""));
   for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
-    if (!def.match.test(bare)) continue;
+    // Either signal is enough: the field's NAME is one we know, or the field SITS IN the section
+    // (its own heading says so). The second is what closes the allowlist hole — an unmapped field
+    // inside the section is still sealed, it simply has no deterministic value and reaches the
+    // scoped AI instead of the profile root.
+    const byName = def.match.test(bare);
+    const bySection = hasOrdinal && def.sectionTitle && def.sectionTitle.test(String(f.section || "").trim());
+    if (!byName && !bySection) continue;
     return { section, source: def.source, bare, spec: def.fields[bare] || null,
       entryIndex: typeof f.entryIndex === "number" ? f.entryIndex : 0 };
   }
@@ -447,6 +463,14 @@ function atsResolveEntryField(es, entry, f, now) {
     return mi >= 0 && mi < 12
       ? { candidates: [ATS_MONTHS[mi]], source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from }
       : null;
+  }
+  if (spec.kind === "entry_city") {
+    // The city half of the entry's own "City, ST". Deterministic when the entry states it — better
+    // than asking the model to remember where a university sits, and it cannot drift to the home city.
+    const loc = val("location");
+    if (loc == null) return null;
+    const city = String(loc).split(",")[0].trim();
+    return city ? { value: city, source: "entry", path: es.section + "[" + es.entryIndex + "].location" } : null;
   }
   if (spec.kind === "entry_country" || spec.kind === "entry_state") {
     // ⚠ The ENTRY's own location, and nothing else. This profile's education entry has none, so both
@@ -2179,8 +2203,12 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   // early return is the point. Falling through would let the label ladder answer an Education
   // "State/Province" from the home address, which is a different fact, not a near-miss. An entry
   // field the entry cannot answer goes to the AI, which sees only that entry (atsScopeForField).
+  // ⚠ `es` ALONE SEALS IT — deliberately not `es && es.spec`. A field inside a repeating section
+  // that we have NO mapping for must still be sealed: with the `.spec` condition, an unmapped
+  // `EducationCity` fell straight through to the label ladder and was answered "Tallahassee" from
+  // the home address. No mapping means "no deterministic answer", never "answer it from anywhere".
   const es = atsEntrySpec(ats, f);
-  if (es && es.spec) {
+  if (es) {
     const arr = (profile || {})[es.source];
     const entry = Array.isArray(arr) ? arr[es.entryIndex] : null;
     const r = atsResolveEntryField(es, entry, f);

@@ -637,6 +637,50 @@ test("AI batching is grouped PER ENTRY — an entry question never sees the whol
   }
 });
 
+// ⚠ THE ALLOWLIST HOLE, live 2026-08-16. The seal originally listed the field names it knew, so
+// `EducationCity` — which it did not — escaped it, reached the label ladder, and was answered
+// "Tallahassee" from the HOME address. A seal that only covers the fields you remembered is not a
+// seal, so membership in the section is now enough on its own.
+test("seal: an UNMAPPED field inside the section is still sealed from the profile root", async () => {
+  const page = eduPage(["Carnegie Mellon University", "Other"]);
+  page.atsInjScan = () => ({ ats: "icims", url: "https://x.icims.com/jobs/1/candidate", title: "t", fields: [
+    ...EDU_FIELDS.map(f => ({ ...f, section: "Education" })),
+    // ⚠ BOTH of these must be genuinely UNMAPPED, or the test proves nothing — the first version
+    // used `EducationCity`, which had just been GIVEN a mapping, so it passed with the seal removed.
+    // (a) name matches the section's id family, but there is no spec for it
+    { fieldName: "-1_CandProfileFields.EducationSomethingElse", inputSel: "#ecity", widgetType: "text",
+      inputType: "text", label: "City", isRequired: false, value: null, section: "Education", domIndex: 20 },
+    // (b) a per-customer id the family regex cannot match — only SECTION MEMBERSHIP can seal this one
+    { fieldName: "-1_rcf9999", inputSel: "#rcity", widgetType: "text",
+      inputType: "text", label: "City", isRequired: false, value: null, section: "Education", domIndex: 21 },
+  ] });
+  // ⚠ THE BUCKET IS WHAT MAKES THIS REPRODUCE. A bare "City" label matches no recognizer in the
+  // label ladder, so the ladder alone cannot answer it — the live "Tallahassee" came through a
+  // TAUGHT BUCKET pointing at personal_info.city, which sits ABOVE the label ladder and would gladly
+  // answer any field carrying that wording, wherever on the form it sits. Without this the fixture
+  // passes with the seal removed and proves nothing.
+  const buckets = [{ questions: ["City"], profile_path: "personal_info.city" }];
+  await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, { buckets });
+  assert.notStrictEqual(page._c["#ecity"], "Tallahassee",
+    "an unmapped education field must never be answered from the applicant's home address");
+  assert.notStrictEqual(page._c["#rcity"], "Tallahassee",
+    "a per-customer field inside the section is sealed by MEMBERSHIP alone");
+});
+
+test("seal: the entry's own location fills city / state / country — none of them from home", async () => {
+  const withLoc = { ...EDU_PROFILE, education: [{ ...EDU_PROFILE.education[0], location: "Pittsburgh, PA" }] };
+  const es = { section: "education", source: "education", entryIndex: 0, spec: null };
+  const city = ats.atsResolveEntryField({ ...es, spec: { kind: "entry_city" } }, withLoc.education[0], {});
+  const state = ats.atsResolveEntryField({ ...es, spec: { kind: "entry_state" } }, withLoc.education[0], {});
+  const ctry = ats.atsResolveEntryField({ ...es, spec: { kind: "entry_country" } }, withLoc.education[0], {});
+  assert.strictEqual(city.value, "Pittsburgh");
+  assert.deepStrictEqual(state.candidates, ["Pennsylvania", "PA"]);
+  // a US state implies the country — which is what fills State's declared PARENT in the same pass
+  assert.deepStrictEqual(ctry.candidates, ["United States", "United States of America"]);
+  // no location ⇒ nothing is invented
+  assert.strictEqual(ats.atsResolveEntryField({ ...es, spec: { kind: "entry_city" } }, { school_or_university: "X" }, {}), null);
+});
+
 test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {
   const now = new Date("2026-08-16T00:00:00Z").getTime();
   assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true);
