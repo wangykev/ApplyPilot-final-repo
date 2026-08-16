@@ -511,6 +511,40 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
 - **A CREDENTIAL IS NEVER REPLAYED FROM THE BUNDLE.** The bundle holds the placeholder by design, so the
   submit run re-reads `chrome.storage.local.credentials` and routes these fields through the credential
   tier — otherwise it would type `"(stored login)"` into the account's login box and submit it.
+- **NOT EVERY `<select>` ON THIS FORM IS A SELECT — the `icims_dropdown` widget (2026-08-16).** iCIMS
+  replaces many of them with its own AJAX combobox ("IdDropDown"), and when it does the `<select>` is
+  left **permanently empty** (one blank `<option>`) while its `value` holds an **opaque numeric id**
+  (`12781`), never text. The real choices are `<li role="option">` rows in a sibling
+  `<ul id="<id>_dropdown-results">`. The tell is the element's own attribute,
+  `icimsdropdown-enabled="1"` — not a guess. Anatomy: `<a id="<id>_icimsDropdown">` opens it,
+  `<span id="<id>_fakeSelected_icimsDropdown">` is the READ-BACK, `input.dropdown-search` is the search
+  box, and the container's `dropdown-invisible` class is the open/closed gate — **`aria-expanded` stays
+  `"false"` even while open.** Reading `select.options` there returns NOTHING, which is exactly how the
+  required Country and State/Province reached review as *"no live options to choose from"* while the
+  page was plainly showing a list.
+  - **ONE PAGE AT A TIME** — measured 26 countries / 25 states (Alabama…Michigan, so Minnesota→Wyoming
+    are absent). A first-page miss is NOT proof the option is absent: **search before reporting**, or
+    everyone past Michigan fails. Its option list is therefore recorded **always partial**.
+  - **A NEW CHOICE WIDGET MUST BE REGISTERED IN FOUR PLACES**, and missing one fails silently and
+    differently each time: `ATS_REVIEW_WIDGET`, the `isChoice` list feeding `resolve()` (miss it and a
+    TIERED profile array is coerced as free text, so the fallback tier that matches the form's wording
+    is never tried), `atsAiBatchKind`, and `atsAiFallback`'s option-read + commit switches.
+  - **`atsInjReadValue` needs a branch too** — otherwise the post-fill audit flags every one of these
+    as `audit-mismatch` on a correct fill, because `selectedIndex` says "nothing selected".
+- **A PARENT→CHILD DEPENDENCY IS DECLARED IN THE DOM, so report it rather than guessing.** Country
+  carries `data-ddd-child-link="PersonProfileFields.AddressState"` and an `onchange` calling
+  `icimsChangeParent`; the child's list reads `"Please select a country"` until the parent commits.
+  DOM order already puts parent before child, so the natural fill order works — but a child whose
+  parent is unset must say **that**, not "no options": the generic message sent a debugging round to
+  the option read instead of to the unset parent.
+- **The address block is a REPEATING section** (`a.iCIMS_Anchor` "Add More (Addresses)"), and every
+  field carries an entry ordinal: `-1_PersonProfileFields.AddressCity`. `atsMapKey` strips a leading
+  `<digits>_` **for iCIMS only** before the static-map lookup, so the map is keyed on the bare platform
+  id. Keying by id is safe here precisely because `PersonProfileFields.Address*` is iCIMS' own
+  vocabulary for the CANDIDATE's address — a work-history employer address is a per-customer
+  `rcf<NNNN>` group and cannot collide. ⚠ It does NOT yet tell entry 1 from entry 2: with one address
+  in the profile and one entry on the form there is nothing to disambiguate, but a SECOND entry would
+  map to the same address. Multi-entry repeating sections are open work.
 - **`atsInjSubmitState` needs its iCIMS branch**: the control is `<input type="submit"
   id="cp_form_submit_i" value="Submit Profile">`, and the generic finder queries only `button`s and
   matches `textContent`, which an `<input>` lacks. Measured: without it `hasSubmit:false` and

@@ -188,6 +188,20 @@ const ATS_STATIC_MAPS = {
     "PersonProfileFields.MiddleName": { path: "personal_info.middle_name" },
     "PersonProfileFields.LastName": { path: "personal_info.last_name" },
     "PersonProfileFields.Email": { path: "personal_info.email" },
+    // ── The candidate's own address (a REPEATING section: "Add More (Addresses)") ──────────
+    // Keyed WITHOUT the entry ordinal — the live ids are `-1_PersonProfileFields.AddressCity`, and
+    // the ordinal is stripped before this lookup (see atsMapKey). Safe to key by id here precisely
+    // because `PersonProfileFields.Address*` is iCIMS' own vocabulary for the CANDIDATE's address:
+    // a work-history employer address is a per-customer `rcf<NNNN>` group, so it cannot collide.
+    // ⚠ Country is TIERED in the profile (an array), which resolve() passes through as a ready-made
+    // candidate ladder — that is what lets "United States of America" fall back to "United States",
+    // which is the text this form actually offers.
+    "PersonProfileFields.AddressStreet1": { path: "personal_info.address_line_1" },
+    "PersonProfileFields.AddressStreet2": { path: "personal_info.address_line_2" },
+    "PersonProfileFields.AddressCity": { path: "personal_info.city" },
+    "PersonProfileFields.AddressZip": { path: "personal_info.postal_code" },
+    "PersonProfileFields.AddressCountry": { path: "personal_info.country" },
+    "PersonProfileFields.AddressState": { path: "personal_info.state_province" },
     // ── Résumé — SKIPPED ON PURPOSE (operator, 2026-08-16) ─────────────────────────────────
     // iCIMS parses an uploaded résumé SERVER-SIDE and posts the results back into the panel seconds
     // after the attach reports success, re-rendering entries under new ids and blanking everything
@@ -267,6 +281,23 @@ function atsWebsiteValue(profile, type) {
 }
 
 // ── CREDENTIAL RECOGNITION (pure) ────────────────────────────────────────────────────────
+// ── REPEATING-ENTRY ORDINALS (pure) ──────────────────────────────────────────────────────
+// iCIMS prefixes every field of a repeating section with its entry ordinal:
+// `-1_PersonProfileFields.AddressCity`. `-1` is the entry the form renders by default; "Add More"
+// mints further ones, and a saved application comes back with SERVER ids (`-6489344_`). The static
+// map is keyed on the bare platform id, so the ordinal is stripped for the lookup.
+//
+// ⚠ SCOPED DELIBERATELY, AND THE SCOPE IS THE SAFETY. Only the leading `<digits>_` is removed, and
+// only iCIMS uses this — a Greenhouse field named `2_foo` keeps its name. It does NOT attempt to
+// tell entry 1 from entry 2: with one address in the profile and one entry on the form there is
+// nothing to disambiguate, but a SECOND address entry would map to the same profile address, so
+// multi-entry repeating sections are still open work (docs/status.md).
+function atsMapKey(ats, fieldName) {
+  const n = String(fieldName == null ? "" : fieldName);
+  if (ats !== "icims") return n;
+  return n.replace(/^-?\d+_/, "");
+}
+
 // Which stored credential, if any, does this field want? → "login" | "password" |
 // "password_confirm" | null.
 //
@@ -283,7 +314,7 @@ function atsWebsiteValue(profile, type) {
 // positive there would overwrite an ordinary answer with an account name.
 function atsCredentialKind(ats, f) {
   if (!f) return null;
-  const map = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
+  const map = (ATS_STATIC_MAPS[ats] || {})[atsMapKey(ats, f.fieldName)];
   if (map && map.kind === "credential") return map.credentialKind || null;
   const idLabel = String((f.fieldName || "") + " " + (f.label || "")).toLowerCase();
   if (f.inputType === "password") {
@@ -600,6 +631,7 @@ function atsInjScan(ats) {
     const req = (el) => {
       if (/iCIMS_Forms_RequiredField/.test(String(el.className || ""))) return true;
       if (el.getAttribute("aria-required") === "true" || el.required === true) return true;
+      if (el.getAttribute("i_required") === "true") return true; // iCIMS' own marker, on its dropdowns
       const row = el.closest(".iCIMS_TableRow") || el.parentElement;
       if (row && row.querySelector(".Field_Required, .Field_RequiredStar")) return true;
       return /[*✱]\s*$/.test(labelFor(el) || "");
@@ -646,6 +678,36 @@ function atsInjScan(ats) {
       const base = { fieldName: id, inputSel: sel, label: label || id, isRequired: req(el), section: sectionOf(el) };
       if (el.type === "file") { push(Object.assign(base, { widgetType: "file_upload", isRequired: req(el), value: (el.files && el.files[0] && el.files[0].name) || null })); continue; }
       if (el.tagName === "SELECT") {
+        // ⚠ NOT EVERY <select> HERE IS A SELECT. iCIMS replaces many of them with its own AJAX
+        // combobox ("IdDropDown"), and when it does, the <select> element is left PERMANENTLY EMPTY —
+        // one blank <option> — while the real choices live in a sibling `<ul id="<id>_dropdown-results">`
+        // of `<li role="option">`. Reading `el.options` there yields NOTHING, which is exactly how the
+        // required Country and State/Province fields reached review as "no live options to choose
+        // from" (live 2026-08-16) while the page was showing a perfectly good list.
+        // The tell is the element's own attribute, not a guess: `icimsdropdown-enabled="1"`.
+        // ⚠ The backing <select> stays empty even AFTER a successful commit — it holds an opaque id
+        // (`12781`), never the text — so both the option read and the read-back must use the widget.
+        if (el.getAttribute("icimsdropdown-enabled") === "1") {
+          const ul = document.getElementById(el.id + "_dropdown-results");
+          const items = ul ? [...ul.children].map((li) => txt(li)).filter((t) => t && !/^—\s*make a selection/i.test(t)) : [];
+          const shown = document.getElementById(el.id + "_fakeSelected_icimsDropdown");
+          const cur = shown ? txt(shown) : "";
+          push(Object.assign(base, {
+            widgetType: "icims_dropdown",
+            value: cur && !/^—\s*make a selection/i.test(cur) && !/^please select/i.test(cur) ? cur : null,
+            options: items,
+            // ⚠ PROVENANCE, NOT A GUESS: this widget renders ONE PAGE and offers a search box —
+            // measured at 26 countries and 25 states (Alabama…Michigan, so Minnesota→Wyoming are
+            // absent). Marking it partial is what stops review presenting a 25-row list as the
+            // complete set of US states, and what tells the actuator to search before giving up.
+            optionsPartial: !!(ul && ul.getAttribute("data-ap-complete") !== "1"),
+            // The parent→child dependency, DECLARED by the page: picking this field's value is what
+            // populates the named child (Country → State/Province). Carried so the driver can order
+            // them and explain an empty child honestly instead of guessing.
+            childLink: el.getAttribute("data-ddd-child-link") || null,
+          }));
+          continue;
+        }
         push(Object.assign(base, { widgetType: "dropdown_native",
           value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null,
           // iCIMS' placeholder row is "— Make a Selection —"; drop it and any bare "Select…"
@@ -807,6 +869,113 @@ function atsInjVerifyCredential(inputSel, value) {
   return { ok: true, len: v.length, empty: v === "", matches: v === value };
 }
 
+// ── iCIMS "IdDropDown" — an AJAX combobox wearing a <select> ─────────────────────────────
+// Anatomy, traced live 2026-08-16 (astrion), all ids derived from the <select>'s own id:
+//   <select id="X" icimsdropdown-enabled="1" data-ddd-child-link="…">  ← ALWAYS EMPTY; value is an
+//                                                                        opaque id ("12781"), never text
+//   <a  id="X_icimsDropdown" class="dropdown-select">                  ← the OPENER
+//   <span id="X_fakeSelected_icimsDropdown">                           ← what the user SEES = read-back
+//   <div id="X_icimsDropdown_ctnr" class="dropdown-container[ dropdown-invisible]">
+//        <input class="dropdown-search" placeholder="— Type to Search —">
+//   <ul id="X_dropdown-results"> <li role="option" class="dropdown-result result-selectable">
+//
+// ⚠ `aria-expanded` STAYS "false" even while open — gate on the container's `dropdown-invisible`
+// class, never on aria (the same lesson Workday's dropdown close taught).
+// ⚠ ONE PAGE ONLY: 26 countries / 25 states. Anything past it needs the search box.
+
+// Open the widget. Returns the option texts it is showing.
+function atsInjIcimsOpen(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const opener = document.getElementById(el.id + "_icimsDropdown");
+  const ctnr = document.getElementById(el.id + "_icimsDropdown_ctnr");
+  if (!opener || !ctnr) return { ok: false, error: "no-widget" };
+  if (/dropdown-invisible/.test(String(ctnr.className))) {
+    for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) {
+      opener.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+    }
+  }
+  const ul = document.getElementById(el.id + "_dropdown-results");
+  const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+  const opts = ul ? [...ul.children].map(txt).filter((t) => t && !/^—\s*make a selection/i.test(t)) : [];
+  return { ok: true, open: !/dropdown-invisible/.test(String(ctnr.className)), options: opts };
+}
+
+// Type into the widget's own search box. iCIMS filters/fetches on input; the caller re-reads after.
+function atsInjIcimsSearch(inputSel, query) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const ctnr = document.getElementById(el.id + "_icimsDropdown_ctnr");
+  const box = ctnr ? ctnr.querySelector("input.dropdown-search") : null;
+  if (!box) return { ok: false, error: "no-search-box" };
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  box.focus();
+  setter.call(box, "");
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+  setter.call(box, String(query));
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+  box.dispatchEvent(new Event("keyup", { bubbles: true }));
+  return { ok: true };
+}
+
+// Read whatever the widget is currently showing (after a search, or to settle-poll it).
+function atsInjIcimsReadOptions(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const ul = document.getElementById(el.id + "_dropdown-results");
+  if (!ul) return { ok: false, error: "no-results-list" };
+  const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+  const all = [...ul.children].map(txt);
+  return { ok: true, options: all.filter((t) => t && !/^—\s*make a selection/i.test(t)),
+    // a child whose parent is unset says so in its own list — report it rather than calling it empty
+    awaitingParent: all.some((t) => /^please select a /i.test(t)),
+    noChildren: all.some((t) => /^no .* available$/i.test(t)) };
+}
+
+// Commit by clicking the row whose text matches EXACTLY (the caller has already run the match ladder).
+function atsInjIcimsCommit(inputSel, optionText) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const ul = document.getElementById(el.id + "_dropdown-results");
+  if (!ul) return { ok: false, error: "no-results-list" };
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const row = [...ul.children].find((li) => norm(li.textContent) === norm(optionText));
+  if (!row) return { ok: false, error: "option-not-found" };
+  for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) {
+    row.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  }
+  return { ok: true };
+}
+
+// Read-back: the widget's OWN displayed text. Never `select.value` — that is an opaque numeric id.
+function atsInjIcimsRead(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const shown = document.getElementById(el.id + "_fakeSelected_icimsDropdown");
+  const t = shown && shown.textContent ? shown.textContent.replace(/\s+/g, " ").trim() : "";
+  const placeholder = !t || /^—\s*make a selection/i.test(t) || /^please select/i.test(t);
+  return { ok: true, value: placeholder ? null : t, rawId: el.value || null };
+}
+
+// Close, and CONFIRM it closed. Same rule as the Workday dropdown close: a list left mounted over
+// the next field's opener is how a stray click commits the wrong value.
+function atsInjIcimsClose(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const ctnr = document.getElementById(el.id + "_icimsDropdown_ctnr");
+  if (!ctnr) return { ok: true, closed: true };
+  if (!/dropdown-invisible/.test(String(ctnr.className))) {
+    document.body.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    const opener = document.getElementById(el.id + "_icimsDropdown");
+    if (opener && !/dropdown-invisible/.test(String(ctnr.className))) {
+      for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) {
+        opener.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+      }
+    }
+  }
+  return { ok: true, closed: /dropdown-invisible/.test(String(ctnr.className)) };
+}
+
 // Read one field's CURRENT live value (verify/audit) — same read rules as the scan.
 function atsInjReadValue(ats, inputSel, widgetType) {
   const el = document.querySelector(inputSel);
@@ -829,6 +998,15 @@ function atsInjReadValue(ats, inputSel, widgetType) {
     return { ok: true, value: el.value || null };
   }
   if (widgetType === "dropdown_native") return { ok: true, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null };
+  // ⚠ iCIMS' AJAX combobox: its <select> is empty and holds an opaque numeric id, so BOTH the usual
+  // reads (`selectedIndex`/`el.value`) lie about it — one says "nothing selected", the other returns
+  // "12781". The truth is the text the widget displays. Without this the post-fill audit would flag
+  // every one of these as audit-mismatch on a correct fill.
+  if (widgetType === "icims_dropdown") {
+    const shown = el.id ? document.getElementById(el.id + "_fakeSelected_icimsDropdown") : null;
+    const t = shown ? txt(shown) : "";
+    return { ok: true, value: (!t || /^—\s*make a selection/i.test(t) || /^please select/i.test(t)) ? null : t };
+  }
   if (widgetType === "radio" || widgetType === "checkbox_group") {
     const list = [...document.querySelectorAll(inputSel)];
     const on = list.filter((r) => r.checked);
@@ -1374,6 +1552,7 @@ const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_ty
   text: "text", textarea: "textarea", select: "dropdown", dial: "dropdown", location: "typeahead",
   dropdown_native: "dropdown", radio: "radio", checkbox: "checkbox", checkbox_group: "checkbox_group",
   yesno: "radio", file_upload: "file_upload", date: "date", unknown: "unknown",
+  icims_dropdown: "dropdown",
 };
 
 // Options for a dial-code select carry a trailing "+<digits>" ("United States +1") that no
@@ -1811,7 +1990,7 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
     }
     return { kind: "credential", credentialKind: ck, value, source: "credentials", credential: true, overwrite: true };
   }
-  const map = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
+  const map = (ATS_STATIC_MAPS[ats] || {})[atsMapKey(ats, f.fieldName)];
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
     if (map.kind === "skip") return { kind: "skip", source: "map", detail: map.detail };
@@ -1963,7 +2142,7 @@ function atsAiBatchKind(f) {
   // it in the "essay" group and bill it to the operator's essay model. Workday's `aiFillDate` routes a
   // date to "fill" for the same reason; this keeps the two paths saying the same thing.
   if (wt === "date") return "date";
-  if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location"].includes(wt)) return "choice";
+  if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location", "icims_dropdown"].includes(wt)) return "choice";
   return null;
 }
 
@@ -2262,7 +2441,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           // Read the KIND straight from the static map: it describes the widget's SHAPE, which is
           // true regardless of whether the profile happens to hold a value for it (atsRouteField
           // returns nothing when the mapped value is empty, and the shape would be lost with it).
-          const shape = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
+          const shape = (ATS_STATIC_MAPS[ats] || {})[atsMapKey(ats, f.fieldName)];
           if (shape && shape.kind === "dial") route.kind = "dial";
         }
       } else {
@@ -2350,7 +2529,11 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       if (route) {
         if (route.candidates) candidates = route.candidates.slice();
         else if (route.raw !== undefined) {
-          const isChoice = ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location"].includes(f.widgetType);
+          // ⚠ A NEW CHOICE WIDGET MUST BE LISTED HERE. resolve() coerces per KIND, and a widget
+          // missing from this list is treated as free text — which silently drops a TIERED profile
+          // array (the country ladder) instead of passing it through as candidates, so the fallback
+          // tier that actually matches the form's wording never gets tried.
+          const isChoice = ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location", "icims_dropdown"].includes(f.widgetType);
           const rr = atsFd.resolve(route.raw, isChoice ? "dropdown" : "text");
           if (rr.skip) { /* falls through to AI/blank */ }
           else if (rr.candidates) candidates = rr.candidates;
@@ -2628,6 +2811,81 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     rec.matchTier = tier; rec.verified = okv;
     if (!okv) rec.detail = "location commit did not persist (selectedLocation empty)";
     else if (tier === "containment") { rec.flag = rec.flag || "non-exact-match"; rec.detail = "picked the first city match — verify the state"; }
+    return true;
+  }
+
+  // iCIMS' AJAX combobox. Its own widget, because none of the react-select helpers fit: the opener,
+  // the results list, the search box and the read-back are all iCIMS-specific, and its <select> is
+  // decorative. Shape: open → (search if the page we can see doesn't hold it) → match through the
+  // SAME ladder → click the row → read back the DISPLAYED text → close CONFIRMED.
+  if (wt === "icims_dropdown") {
+    if (!candidates || !candidates.length) return false;
+    rec.resolved = candidates;
+    const open = await act.eval(atsInjIcimsOpen, ref.inputSel);
+    await act.delay(180);
+    if (!open || !open.ok) { rec.status = "needs_review"; rec.detail = "could not open the dropdown: " + ((open && open.error) || "unknown"); return true; }
+
+    let opts = open.options || [];
+    let searched = false;
+    let m = atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
+    // ⚠ ONE PAGE AT A TIME (26 countries / 25 states measured live). A miss here is NOT proof the
+    // option doesn't exist, so the search box is tried before anything is reported — otherwise a
+    // candidate in Texas fails on a list that stops at Michigan.
+    if (!m || m.targetIndex < 0) {
+      const s = await act.eval(atsInjIcimsSearch, ref.inputSel, String(candidates[0]));
+      if (s && s.ok) {
+        searched = true;
+        // settle-poll the filtered list: consecutive equal, non-zero reads (the standing rule —
+        // a live-filtering list races a fixed delay).
+        let prev = -1, stable = 0, read = null;
+        for (let i = 0; i < 12; i++) {
+          await act.delay(160);
+          read = await act.eval(atsInjIcimsReadOptions, ref.inputSel);
+          const n = read && read.ok ? (read.options || []).length : 0;
+          stable = n > 0 && n === prev ? stable + 1 : 0;
+          if (stable >= 1) break;
+          prev = n;
+        }
+        if (read && read.ok) opts = read.options || [];
+        m = atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
+      }
+    }
+    // ALWAYS partial: this widget renders one page and offers a search box, so even an unsearched
+    // read is a VIEW of the list, never the whole of it. Review then gets a type-to-filter editor
+    // and an honest note instead of a 25-row list presented as every US state.
+    atsAttachOptions(rec, opts, true);
+
+    if (!m || m.targetIndex < 0) {
+      const st = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
+      await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+      rec.status = "needs_review";
+      // A CHILD WHOSE PARENT IS UNSET SAYS SO, and that is a different fact from "your answer isn't
+      // offered" — reporting them the same way is what produced "no live options to choose from" on
+      // a State field whose Country simply hadn't been chosen yet.
+      rec.detail = st && st.awaitingParent
+        ? "this list only fills in once its parent field is chosen, and that hadn't happened yet"
+        : st && st.noChildren
+          ? "the form offers no options here for the parent value chosen"
+          : "no option matched " + JSON.stringify(String(candidates[0])) + (searched ? " (after searching)" : "") +
+            (opts.length ? " — offered: " + opts.slice(0, 4).join(" | ") : " — the list was empty");
+      return true;
+    }
+
+    const chosen = opts[m.targetIndex];
+    const c = await act.eval(atsInjIcimsCommit, ref.inputSel, chosen);
+    await act.delay(250);
+    const back = await act.eval(atsInjIcimsRead, ref.inputSel);
+    rec.after = back && back.ok ? back.value : null;
+    // ⚠ close BEFORE reporting: a results list left mounted sits over the next field's opener, and
+    // this page stacks these widgets directly above one another (Country → State/Province).
+    await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+    const okv = !!(c && c.ok) && String(rec.after || "").trim() !== "" &&
+      atsLib.normalize(String(rec.after || "")) === atsLib.normalize(String(chosen));
+    rec.matchTier = m.matchTier;
+    rec.verified = okv;
+    rec.status = okv ? (m.matchTier === "exact-normalized" ? "filled" : "filled_review") : "needs_review";
+    if (!okv) rec.detail = "the pick did not persist (the widget shows " + JSON.stringify(String(rec.after || "")) + ")";
+    else if (m.matchTier !== "exact-normalized") { rec.flag = rec.flag || "non-exact-match"; rec.detail = rec.detail || ("matched at the " + m.matchTier + " tier"); }
     return true;
   }
 
@@ -3392,6 +3650,24 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       // anyway, and the answer must be matched against what the form is showing NOW.
       if (wt !== "dropdown_native") texts = await atsOpenAndPollOptions(act, ref);
     }
+    // ⚠ THIS IS WHAT PRODUCED "AI fallback: no live options to choose from" ON A PAGE THAT WAS
+    // PLAINLY SHOWING A LIST (live 2026-08-16, the required Country field). The AI path read options
+    // through the react-select helpers, which find nothing on an iCIMS widget — so the field was
+    // reported as offering no choices at all, and the message sent debugging to the option read
+    // rather than to the widget. It has its own opener; use it.
+    if (wt === "icims_dropdown") {
+      const o = await act.eval(atsInjIcimsOpen, ref.inputSel).catch(() => null);
+      texts = (o && o.ok && o.options) || [];
+      if (!texts.length) {
+        const st = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
+        if (st && st.ok && st.awaitingParent) {
+          await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+          rec.status = "needs_review";
+          rec.detail = "this list only fills in once its parent field is chosen, and that hadn't happened yet";
+          return;
+        }
+      }
+    }
     if (!texts.length) { rec.status = "needs_review"; rec.detail = "AI fallback: no live options to choose from"; return; }
     // ATTACH THE LIVE OPTIONS NOW, before any early return. A choice field that reaches review
     // must carry the form's real list so the editor renders a PICKER — whatever the AI did with
@@ -3408,6 +3684,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       if (wt === "radio" || wt === "checkbox_group") c = await act.eval(atsInjCheckOption, ref.inputSel, dec, true);
       else if (wt === "yesno") c = await act.eval(atsInjClickYesNo, ref.inputSel, dec);
       else if (wt === "dropdown_native") c = await act.eval(atsInjSelectNative, ref.inputSel, dec);
+      else if (wt === "icims_dropdown") c = await act.eval(atsInjIcimsCommit, ref.inputSel, dec);
       else c = await act.eval(atsInjCommitOption, ref.inputSel, dec);
       const b = await atsReadBackSettled(act, ats, ref.inputSel, wt);
       rec.after = b && b.ok ? b.value : null;
@@ -3443,6 +3720,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     if (wt === "radio" || wt === "checkbox_group") committed = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
     else if (wt === "yesno") committed = await act.eval(atsInjClickYesNo, ref.inputSel, pick);
     else if (wt === "dropdown_native") committed = await act.eval(atsInjSelectNative, ref.inputSel, pick);
+    else if (wt === "icims_dropdown") committed = await act.eval(atsInjIcimsCommit, ref.inputSel, pick);
     else committed = await act.eval(atsInjCommitOption, ref.inputSel, pick);
     const back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
@@ -3472,7 +3750,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
-    atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill,
+    atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
@@ -3484,6 +3762,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
+    atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };

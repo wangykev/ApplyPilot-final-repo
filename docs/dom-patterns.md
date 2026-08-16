@@ -37,7 +37,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
-| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it` |
+| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select` |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
 | **Host / URL shapes** | `2026-07-22 — logged-in host is` |
 
@@ -4140,3 +4140,59 @@ upload SERVER-SIDE and posts results back into the panel seconds after the attac
 re-rendering entries under new ids and blanking what was written. The form offers its own
 `#resume_skip_checkbox` ("Upload Resume at a later time"), left UNTICKED — an operator's choice about
 their own application.
+
+## 2026-08-16 (b) — Astrion iCIMS: the `<select>` that is not a select, and its declared parent→child
+
+Traced after a live run reported the REQUIRED Country as `needs_review · AI fallback: no live options
+to choose from` and State as `needs_review`, on a page that was plainly showing both lists.
+
+**The cause: iCIMS replaces many `<select>`s with its own AJAX combobox ("IdDropDown").** When it does:
+
+- the `<select>` is **permanently empty** — exactly one blank `<option>` — and stays empty even AFTER a
+  successful commit;
+- its `value` becomes an **opaque numeric id** (`"12781"` for United States), never the text;
+- so BOTH usual reads lie: `selectedIndex` says "nothing selected", `el.value` says `"12781"`.
+
+The tell is the element's own attribute, not a heuristic: `icimsdropdown-enabled="1"` (plus
+`icimsdropdown-ajax="1"`, `icimsdropdown-search="1"`). On this form 12+ of the 34 selects are these,
+including Address + Education country/state and several `rcf<NNNN>` questions; the rest are ordinary
+native selects with real options, so the branch must be per-element, never per-page.
+
+**Anatomy** — every id derived from the `<select>`'s own id:
+
+```
+<select id="X" icimsdropdown-enabled="1" data-ddd-child-link="…" i_required="true">  ← empty, opaque id
+<a     id="X_icimsDropdown" class="dropdown-select">                                 ← THE OPENER
+<span  id="X_fakeSelected_icimsDropdown" class="dropdown-text">                      ← THE READ-BACK
+<div   id="X_icimsDropdown_ctnr" class="dropdown-container[ dropdown-invisible]">    ← open/closed gate
+   <input class="dropdown-search" placeholder="— Type to Search —">
+<ul    id="X_dropdown-results"> <li role="option" class="dropdown-result result-selectable">
+```
+
+⚠ **`aria-expanded` STAYS `"false"` even while open** — gate on the container's `dropdown-invisible`
+class. (Same shape of trap as Workday's dropdown close, which is gated on options-GONE rather than aria.)
+
+⚠ **ONE PAGE AT A TIME.** Measured: 26 countries, 25 states — Alabama…**Michigan**, so Minnesota→Wyoming
+are simply absent from the initial list. A first-page miss is NOT evidence the option doesn't exist;
+the search box is the rest of the list. Florida happened to be in range, which is exactly the kind of
+luck that hides this until someone in Texas applies. The option list is therefore recorded **always
+partial**, so review renders a type-to-filter editor rather than presenting 25 rows as every US state.
+
+**The parent→child dependency is DECLARED, so it never has to be inferred.** Country carries
+`data-ddd-child-link="PersonProfileFields.AddressState"`, `data-ddd-message="Please select a country"`,
+`data-ddd-no-children="No states available"`, and an `onchange` calling `icimsChangeParent(...)`.
+Verified live: clicking the "United States" row set `select.value="12781"`, put "United States" in the
+fakeSelected span, and **populated the State list with 25 rows (Alabama, Alaska, …)** — while the State
+`<select>` itself stayed at 1 option. DOM order already places parent before child, so a plain in-order
+fill works; the value of the declaration is that a child whose parent is unset can be REPORTED as such
+("this list only fills in once its parent field is chosen") instead of being called empty. That
+distinction is not cosmetic — the generic "no live options" message sent a debugging round at the option
+read rather than at the unset parent.
+
+**Also observed:** `i_required="true"` is a fourth required marker on these widgets, and `data-label`
+carries the field's own label ("Country", "State/Province").
+
+**Result on the next live run:** Country `filled · exact-normalized · "United States"`, State
+`filled · exact-normalized · "Florida"`, both deterministic and unflagged; the page's `needs_review`
+count went 9 → 1. The tiered profile country (`["United States of America", "United States"]`) is what
+lands it — the form offers the short form only, so the second tier is the one that matches.

@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "jd-headings-3";
+const AP_BUILD_MARKER = "icims-addr-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -776,6 +776,11 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       try {
         const attached = await cdpAttach(tabId);
         if (!attached.ok) { sendResponse({ ok: false, error: "attach-failed:" + attached.error }); return; }
+        // ⚠ iCIMS serves its form inside a same-origin iframe, and cdpAttach RESETS the frame pin —
+        // so without this the "go look at the tab" probe reads the (empty) top document and reports
+        // 0 fields, which reads exactly like a broken fill on the one tenant where you most need a
+        // second opinion. Same arming as waitAtsFormReady.
+        if (ats === "icims") await cdpUseFormFrame(4).catch(() => null);
         const scan = await cdpEval(atsInjScan, ats);
         const state = await cdpEval(atsInjSubmitState, ats).catch(() => null);
         sendResponse({ ok: true, scan, submitState: state });

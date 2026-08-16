@@ -327,6 +327,148 @@ test("iCIMS résumé is SKIPPED — its server-side parse blanks the form mid-fi
   assert.match(out.results[0].detail, /re-parses and blanks the form/);
 });
 
+// ── the iCIMS AJAX combobox ("IdDropDown") + the address block ──────────────────────────
+//
+// The <select> is decorative: permanently empty, and its `value` is an opaque numeric id. The real
+// options are `<li>` rows in a sibling `<ul id="<id>_dropdown-results">`, one PAGE at a time, with a
+// search box for the rest. Live 2026-08-16 the required Country and State/Province both reached
+// review as "no live options to choose from" because the scan read `select.options`.
+
+const ICIMS_ADDR_SCAN = {
+  ats: "icims", url: "https://astrioncareers-astrion.icims.com/jobs/24615/x/candidate", title: "t",
+  fields: [
+    { fieldName: "-1_PersonProfileFields.AddressCity", inputSel: "#city", widgetType: "text", inputType: "text",
+      label: "City", isRequired: true, value: null, domIndex: 0 },
+    { fieldName: "-1_PersonProfileFields.AddressCountry", inputSel: "#country", widgetType: "icims_dropdown",
+      label: "Country", isRequired: true, value: null, optionsPartial: true,
+      childLink: "PersonProfileFields.AddressState", domIndex: 1 },
+    { fieldName: "-1_PersonProfileFields.AddressState", inputSel: "#state", widgetType: "icims_dropdown",
+      label: "State/Province", isRequired: true, value: null, optionsPartial: true, domIndex: 2 },
+  ],
+};
+
+// A fake iCIMS widget: one page of options, a search that reveals the rest, and a child list that
+// stays "Please select a country" until the parent commits — exactly the live behaviour.
+function icimsWidgetPage(over) {
+  const FIRST_PAGE = { "#country": ["United States", "Afghanistan", "Åland Islands"],
+                       "#state": ["Alabama", "Alaska", "Arizona", "Florida", "Michigan"] };
+  const FULL = { "#country": ["United States", "Afghanistan", "Åland Islands", "Zimbabwe"],
+                 "#state": ["Alabama", "Alaska", "Arizona", "Florida", "Michigan", "Texas", "Washington"] };
+  const st = { shown: {}, committed: {}, parentSet: false, searches: [], opened: [] };
+  const listFor = (sel) => {
+    if (sel === "#state" && !st.parentSet) return { awaitingParent: true, options: [] };
+    return { awaitingParent: false, options: st.shown[sel] || FIRST_PAGE[sel] || [] };
+  };
+  const page = {
+    atsInjScan: () => ICIMS_ADDR_SCAN,
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSetText: (sel, v) => { st.committed[sel] = v; return { ok: true, after: v }; },
+    atsInjIcimsOpen: (sel) => { st.opened.push(sel); const l = listFor(sel); return { ok: true, open: true, options: l.options }; },
+    atsInjIcimsSearch: (sel, q) => {
+      st.searches.push([sel, q]);
+      const hits = (FULL[sel] || []).filter(o => o.toLowerCase().includes(String(q).toLowerCase()));
+      st.shown[sel] = hits;
+      return { ok: true };
+    },
+    atsInjIcimsReadOptions: (sel) => { const l = listFor(sel); return { ok: true, options: l.options, awaitingParent: l.awaitingParent, noChildren: false }; },
+    atsInjIcimsCommit: (sel, text) => {
+      const l = listFor(sel);
+      if (!l.options.includes(text)) return { ok: false, error: "option-not-found" };
+      st.committed[sel] = text;
+      if (sel === "#country") st.parentSet = true;   // the page's own parent→child cascade
+      return { ok: true };
+    },
+    atsInjIcimsRead: (sel) => ({ ok: true, value: st.committed[sel] || null, rawId: st.committed[sel] ? "12781" : null }),
+    atsInjIcimsClose: () => ({ ok: true, closed: true }),
+    atsInjReadValue: (a, sel, wt) => ({ ok: true, value: st.committed[sel] != null ? st.committed[sel] : null }),
+    _st: st,
+  };
+  return Object.assign(page, over || {});
+}
+
+test("atsMapKey: the entry ordinal is stripped for iCIMS only", () => {
+  assert.strictEqual(ats.atsMapKey("icims", "-1_PersonProfileFields.AddressCity"), "PersonProfileFields.AddressCity");
+  assert.strictEqual(ats.atsMapKey("icims", "0_PersonProfileFields.AddressCity"), "PersonProfileFields.AddressCity");
+  // a saved application comes back with SERVER ids, not -1
+  assert.strictEqual(ats.atsMapKey("icims", "-6489344_PersonProfileFields.AddressCity"), "PersonProfileFields.AddressCity");
+  assert.strictEqual(ats.atsMapKey("icims", "PersonProfileFields.Login"), "PersonProfileFields.Login");
+  // scoped: no other tenant has its field names rewritten
+  assert.strictEqual(ats.atsMapKey("greenhouse", "2_foo"), "2_foo");
+  assert.strictEqual(ats.atsMapKey("lever", "-1_bar"), "-1_bar");
+});
+
+test("routeField: the address block maps through the stripped ordinal", () => {
+  const P = { personal_info: { address_line_1: "123 Oak St", city: "Tallahassee",
+    state_province: "Florida", postal_code: "32312", country: ["United States of America", "United States"] } };
+  const r = (n) => ats.atsRouteField("icims", { fieldName: n, label: "x", widgetType: "text" }, P, {}, {}, new Map(), null);
+  assert.strictEqual(r("-1_PersonProfileFields.AddressCity").raw, "Tallahassee");
+  assert.strictEqual(r("-1_PersonProfileFields.AddressZip").raw, "32312");
+  assert.strictEqual(r("-1_PersonProfileFields.AddressStreet1").raw, "123 Oak St");
+  assert.strictEqual(r("-1_PersonProfileFields.AddressState").raw, "Florida");
+  assert.deepStrictEqual(r("-1_PersonProfileFields.AddressCountry").raw, ["United States of America", "United States"]);
+});
+
+test("icims_dropdown: country + state fill, and the state waits for its parent", async () => {
+  const P = { personal_info: { city: "Tallahassee", state_province: "Florida",
+    country: ["United States of America", "United States"] } };
+  const page = icimsWidgetPage();
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", P, {}, {}, {});
+  const by = Object.fromEntries(out.results.map(r => [r.fieldName, r]));
+
+  // the TIERED country ladder is what makes this land: the form offers "United States", the
+  // profile's first tier is "United States of America"
+  const c = by["-1_PersonProfileFields.AddressCountry"];
+  assert.strictEqual(c.status, "filled", "country should fill deterministically");
+  assert.strictEqual(c.after, "United States");
+  assert.strictEqual(c.matchTier, "exact-normalized");
+
+  const s = by["-1_PersonProfileFields.AddressState"];
+  assert.strictEqual(s.status, "filled", "state fills once its parent committed");
+  assert.strictEqual(s.after, "Florida");
+  // and the parent really was committed first
+  assert.ok(page._st.opened.indexOf("#country") < page._st.opened.indexOf("#state"));
+});
+
+test("icims_dropdown: an option past the FIRST PAGE is found via the search box", async () => {
+  // "Texas" is not in the first page — the widget pages at 25 and offers "— Type to Search —"
+  const P = { personal_info: { state_province: "Texas", country: ["United States"] } };
+  const page = icimsWidgetPage();
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", P, {}, {}, {});
+  const s = out.results.find(r => r.fieldName === "-1_PersonProfileFields.AddressState");
+  assert.ok(page._st.searches.some(([sel, q]) => sel === "#state" && /texas/i.test(q)),
+    "a first-page miss must SEARCH before reporting — otherwise everyone past Michigan fails");
+  assert.strictEqual(s.status, "filled");
+  assert.strictEqual(s.after, "Texas");
+});
+
+test("icims_dropdown: a child whose parent is unset says SO — not 'no options'", async () => {
+  const P = { personal_info: { state_province: "Florida" } };  // no country → parent never commits
+  const page = icimsWidgetPage();
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", P, {}, {}, {});
+  const s = out.results.find(r => r.fieldName === "-1_PersonProfileFields.AddressState");
+  assert.strictEqual(s.status, "needs_review");
+  assert.match(s.detail, /parent field is chosen/,
+    "the live run reported 'no live options to choose from', which sent debugging at the option read " +
+    "instead of at the unset parent");
+});
+
+test("icims_dropdown: a commit the widget does not display is NOT reported filled", async () => {
+  const P = { personal_info: { country: ["United States"] } };
+  const page = icimsWidgetPage({ atsInjIcimsRead: () => ({ ok: true, value: null }) }); // click 'worked', nothing shown
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", P, {}, {}, {});
+  const c = out.results.find(r => r.fieldName === "-1_PersonProfileFields.AddressCountry");
+  assert.strictEqual(c.status, "needs_review");
+  assert.match(c.detail, /did not persist/);
+});
+
+test("icims_dropdown: its option list is always recorded PARTIAL (it pages + searches)", async () => {
+  const P = { personal_info: { country: ["United States"] } };
+  const out = await ats.driveAtsPageFill(fakeAct(icimsWidgetPage()), "icims", P, {}, {}, {});
+  const c = out.results.find(r => r.fieldName === "-1_PersonProfileFields.AddressCountry");
+  assert.strictEqual(c.optionsPartial, true, "25 rows must never be presented as the complete list");
+  assert.ok(Array.isArray(c.captured_options) && c.captured_options.length > 0);
+});
+
 // ── the injected credential fns obey the same contracts as the rest ─────────────────────
 
 test("the credential injected fns are self-contained and return NO value", () => {

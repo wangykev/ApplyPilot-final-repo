@@ -4989,3 +4989,69 @@ pre-existing and unrelated.
 
 **NOT yet live-verified** — this is a fill built from recon and unit pins; no run has been driven through
 the extension yet. The credential re-check in particular has never fired against a real page.
+
+## 2026-08-16 (b) — iCIMS LIVE: the login block verified, and the `<select>` that is not a select
+
+Two live runs on `astrioncareers-astrion.icims.com/jobs/24615`.
+
+**Run 1 (build `icims-login-1`) verified step 1.** `the application is inside an iframe — driving it
+there (112 controls)`, then Login / Password / Password (Re-enter) each `filled` with
+`after="(stored login)"` etc. — the placeholder, never a value. Page: `filled 12 · filled_review 9 ·
+needs_review 9 · skipped 42`.
+
+⚠ **Getting there cost two environment findings worth writing down.** The extension was running build
+`skip-resume-34` — the ABANDONED generic-filler branch's marker — because that worktree FOLDER had its
+branch switched underneath a running service worker. The marker check is what caught it; `AP_PING`
+answering `{ok:true}` proves nothing. And re-adding the unpacked extension **wipes
+`chrome.storage.local`**: profile, résumé and credentials all had to be re-pushed (Connect → Sync
+everything, then Credentials → Save) before a fill could mean anything. Note `AP_PING` on this branch
+does NOT report credential state — that field existed only on the abandoned branch, so its absence is
+not evidence of missing credentials.
+
+**Run 1 also exposed the real bug the operator asked about next:** the REQUIRED Country reached review as
+`AI fallback: no live options to choose from` and State as `needs_review`, on a page plainly showing both
+lists. Recon (`docs/dom-patterns.md` 2026-08-16 (b)) found the cause: **iCIMS replaces many `<select>`s
+with its own AJAX combobox, leaving the `<select>` permanently empty and its `value` an opaque numeric
+id.** Reading `select.options` there returns nothing. The tell is `icimsdropdown-enabled="1"`; the real
+rows are `<li role="option">` in `<ul id="<id>_dropdown-results">`, the read-back is the widget's
+`_fakeSelected` span, and `aria-expanded` stays `"false"` even while open.
+
+Two properties of that widget shaped the handler more than the plumbing did:
+- **it pages** — 26 countries, 25 states (Alabama…**Michigan**), with a `— Type to Search —` box. A
+  first-page miss is not proof of absence, so the handler searches before reporting. Florida was in
+  range, which is exactly the luck that would have hidden this until someone in Texas applied. Its
+  option list is recorded **always partial**.
+- **the parent→child link is DECLARED** (`data-ddd-child-link`), and the child reads "Please select a
+  country" until the parent commits. So a child whose parent is unset now says that, rather than
+  reporting "no options" — the generic message is what sent debugging to the option read instead of to
+  the unset parent.
+
+**A new choice widget must be registered in FOUR places, and each omission fails differently.** Missing
+`ATS_REVIEW_WIDGET` leaks the raw name into the bundle; missing the `isChoice` list feeding `resolve()`
+coerces a TIERED profile array as free text — caught by a unit test, and it is what would have stopped
+`["United States of America", "United States"]` from ever trying the second tier the form actually
+offers; missing `atsAiBatchKind` mis-routes the AI call; missing `atsAiFallback`'s option-read and
+commit switches reproduces the original "no live options" for AI-answered fields. `atsInjReadValue`
+needs a branch too, or the post-fill audit flags every correct fill as `audit-mismatch`.
+
+The address block itself is a REPEATING section, so `atsMapKey` strips the entry ordinal
+(`-1_PersonProfileFields.AddressCity` → `PersonProfileFields.AddressCity`) for iCIMS only. Keying by id
+is safe because `PersonProfileFields.Address*` is iCIMS' own vocabulary for the CANDIDATE's address — a
+work-history employer address is a per-customer `rcf<NNNN>` group and cannot collide. It does not yet
+tell entry 1 from entry 2; with one profile address and one form entry there is nothing to
+disambiguate, and that limit is recorded rather than hidden.
+
+**Run 2 (build `icims-addr-1`) verified it live:** Street1 `"715 Middlebrooks Circle"`, City
+`"Tallahassee"`, Zip `"32312"` (deterministic now — it had been an `ai-text` guess), **Country `filled ·
+exact-normalized · "United States"`**, **State `filled · exact-normalized · "Florida"`**. Page totals
+`filled 21 · filled_review 8 · needs_review 1 · skipped 43` — `needs_review` 9 → 1. The one left is
+`CandProfileFields.School`, which searched the AJAX list for "Carnegie Mellon University", found no
+match, and said so: the new widget working, and the next step's problem.
+
+Suite 1413/1414 (`db.test.js` needs `fake-indexeddb`, absent in this worktree — pre-existing).
+
+⚠ **The independent page re-read did not complete.** `AP_DEV_ATS_SCAN` was taught to arm the frame (a
+fresh `cdpAttach` resets the pin, so it had been reading the empty top document and reporting 0 fields),
+but a client-side timeout left its debugger attached and the retry wedged. The verification therefore
+rests on the two reads inside the run — `atsInjIcimsRead` after the commit, and the M40-lite audit's
+independent re-read after the page settled, which flagged nothing — not on a third outside opinion.
