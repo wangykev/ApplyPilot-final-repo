@@ -29,25 +29,36 @@ discover branch).
 repopulate the login box after the fill. The run to watch for ends `needs_review` +
 `credential-overwritten`, not a silent `filled`.
 
-**Step 3 (Education + entry scoping) is written and unit-pinned, PARTLY live-verified.** Live on build
-`icims-edu-1`: `OtherSchool → filled "Carnegie Mellon University"`, `Degree → filled "Bachelor of
-Science"`, `Minor → skipped` (empty in profile), `GraduationDate_Month → filled`. **Two open items,
-neither yet re-run — browser automation was disabled mid-session before a confirming run:**
+**Step 3 (Education + entry scoping) is LIVE-VERIFIED** on build `icims-edu-3`. The whole education
+section fills deterministically and `needs_review` on the page is **0**:
 
-- ⚠ **THE SEARCH FIX IS NOT LIVE-VERIFIED.** School fell back to "Other" and Major ended
-  `needs_review`, both reporting "no option matched … (after searching)" while typing the same text by
-  hand returns the school as the first hit. Two settle strategies have now failed for the SAME reason —
-  every "has the search finished?" proxy is already satisfied by the PRE-SEARCH list (it is non-zero
-  and stable, and the list is often still loading at OPEN time so a "changed since open" baseline is
-  empty). The current code polls for a MATCH on every read instead, with "No Results" as the terminal
-  no. **Unit-pinned, including a fixture where the result arrives late — but the live proof is owed.**
-  If it fails again, instrument what `atsInjIcimsSearch` actually does to the box (a synthetic `input`
-  may not be starting iCIMS' AJAX at all) before touching the poll a third time.
-- ⚠ **`IsGraduated` filled "Yes" where the local seed profile says `currently_enrolled: true`** (which
-  should give "No"). The unit test pins true→"No", so either the entry rung did not fire on that field
-  or **the EXTENSION's synced profile differs from `data/profile.json`** — the local file is only a
-  seed; the extension syncs from the website. **Check the synced profile first**; do not "fix" the
-  resolver until the input is known.
+| field | result |
+|---|---|
+| School | `filled` · exact · "Carnegie Mellon University" |
+| Other School | `filled` · "N/A" |
+| Degree / Major | `filled` · exact · "Bachelor of Science" / "Electrical and computer engineering" |
+| Minor | `skipped` (empty in profile) |
+| Did You Graduate | `filled` · exact · **"No"** |
+| Graduation Month / Year · Start Year | `filled` · "May" / "2028" · "2024" |
+| Country / State | `filled` · exact · "United States" / **"Pennsylvania"** |
+
+Page totals across the three steps: `filled 12 → 21 → 29`, `needs_review 9 → 1 → 0`.
+
+**The seal is demonstrated, not just asserted:** the only "Florida" anywhere in that run is
+`PersonProfileFields.AddressState` (the home address, where it belongs), while `EducationState` is
+Pennsylvania — derived from the education entry's OWN location.
+
+Three faults were fixed in this round, each of which had produced a confidently wrong or missing
+answer, and each worth remembering:
+- the search settle polled for STILLNESS; the pre-search list satisfies every such proxy. Measured:
+  the school search takes **~4s**, and a 675ms give-up said "no option matched". Now it matches on
+  every read and stops at the first hit.
+- `currently_enrolled` is **not exposed by the website's education editor**, so a synced profile
+  carries the default `false` and a 2028 graduand was answered "Yes, graduated". A future graduation
+  date now decides first.
+- Country is State's declared PARENT and had no deterministic source, so it was deferred to the AI —
+  and the deterministic "Pennsylvania" ran against an empty child list. A US state in the entry's
+  location now implies the country, filling the parent in the same pass ahead of the child.
 
 Remaining, in rough order:
 1. **Education** — the one `needs_review` left: `CandProfileFields.School` found no match for

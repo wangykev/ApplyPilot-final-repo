@@ -537,6 +537,38 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   DOM order already puts parent before child, so the natural fill order works — but a child whose
   parent is unset must say **that**, not "no options": the generic message sent a debugging round to
   the option read instead of to the unset parent.
+- **A REPEATING-SECTION FIELD IS SEALED TO ITS OWN ENTRY (operator, 2026-08-16).** A "State/Province"
+  inside an Education entry is the COLLEGE's state, so answering it from the applicant's home address
+  is a DIFFERENT FACT, not a near-miss. `atsEntrySpec` / `atsResolveEntryField` read
+  `profile.<source>[entryIndex]` and the rung **returns even when it has no answer**
+  (`entry-unanswered`) — that early return is the seal; falling through would let the label ladder
+  reach the profile root. **The LLM obeys the same seal:** `atsScopeForField` hands an entry field
+  ONLY its own entry, and `atsRunAiBatch` groups deferred questions **by scope**, so an entry question
+  never shares a prompt with page-level ones (which carry the whole profile) or with a different
+  entry. A solo call uses the scoped profile too — otherwise the seal would hold only when a batch
+  happened to fire. Entry indexes are stamped by **first DOM appearance** of the ordinal, never its
+  numeric value (`-1` is the default entry; saved ones carry opaque server ids).
+- **SCHOOL / OTHER SCHOOL is ONE decision across TWO required fields.** In the list ⇒ pick it and put
+  `"N/A"` in Other School; not in the list ⇒ pick the list's own `"Other"` and put the name in Other
+  School. Two non-obvious parts: on the fallback the record is **rebuilt, not patched** (the failed
+  attempt's tier/detail describe a different commit), and an **UNKNOWN** School outcome writes the
+  NAME, not `"N/A"` — treating unknown as matched is the one branch that silently loses the school.
+- **`currently_enrolled` IS NOT TRUSTWORTHY ALONE — a FUTURE graduation date wins.** The website's
+  education editor does not expose that checkbox, so a synced profile carries the schema default
+  (`false`) and a student graduating in 2028 was answered **"Yes, graduated"** deterministically and
+  unflagged on 2026-08-16. Reading an absent field as a positive assertion was the fault, not the
+  matching. `atsIsFutureYearMonth` decides first; the flag is consulted only when the dates say
+  nothing. A US state in the entry's `location` also implies the country — which is what fills the
+  declared PARENT (Country) in the same pass, ahead of its child (State).
+- **THE SEARCH SETTLE POLLS FOR A MATCH, NOT FOR STILLNESS — three attempts, one cause.** Every
+  "has the search finished?" proxy is already satisfied by the PRE-SEARCH list: stability accepts it
+  (non-zero and stable), and "changed since we opened" accepts it too, because the list is often
+  still loading at open time so the baseline is empty. Measured: the school search takes **~4s** to
+  return, and a 675ms give-up reported `no option matched "Carnegie Mellon University" (after
+  searching)` while typing the same text by hand returns it first. Now: match on EVERY read, stop at
+  the first hit, `"No Results"` is the widget's own terminal no, ~8s budget. **Check "awaiting
+  parent" BEFORE searching** — searching replaces the widget's "Please select a country" row, which
+  destroys the evidence and misreports the cause.
 - **The address block is a REPEATING section** (`a.iCIMS_Anchor` "Add More (Addresses)"), and every
   field carries an entry ordinal: `-1_PersonProfileFields.AddressCity`. `atsMapKey` strips a leading
   `<digits>_` **for iCIMS only** before the static-map lookup, so the map is keyed on the bare platform

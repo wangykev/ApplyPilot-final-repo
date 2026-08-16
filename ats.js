@@ -384,9 +384,22 @@ function atsScopeForField(ats, f, profile) {
 const ATS_MONTHS = ["January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December"];
 
+// Is a "YYYY" or "YYYY-MM" strictly in the future? null when it is neither shape.
+// `now` is a parameter so the rule is unit-testable without freezing the clock.
+function atsIsFutureYearMonth(s, now) {
+  const t = now == null ? new Date() : new Date(now);
+  const ym = /^(\d{4})-(\d{1,2})$/.exec(String(s).trim());
+  const y = /^(\d{4})$/.exec(String(s).trim());
+  if (!ym && !y) return null;
+  const yr = parseInt((ym ? ym[1] : y[1]), 10);
+  const mo = ym ? parseInt(ym[2], 10) : 12;          // a bare year is only past once the year is over
+  const nowYr = t.getFullYear(), nowMo = t.getMonth() + 1;
+  return yr > nowYr || (yr === nowYr && mo > nowMo);
+}
+
 // Resolve ONE repeating-entry field from ITS OWN entry. Returns a route, or null to fall through
 // (which, for an entry field, means the scoped AI — never the profile root).
-function atsResolveEntryField(es, entry, f) {
+function atsResolveEntryField(es, entry, f, now) {
   const spec = es.spec;
   if (!spec || !entry) return null;
   const val = (k) => { const v = entry[k]; return v === undefined || v === null || (typeof v === "string" && !v.trim()) ? null : v; };
@@ -404,10 +417,19 @@ function atsResolveEntryField(es, entry, f) {
       path: es.section + "[" + es.entryIndex + "].school_or_university" };
   }
   if (spec.kind === "is_graduated") {
-    // "Did You Graduate?" — currently enrolled means NOT yet. A stored boolean, so deterministic.
-    const enrolled = entry.currently_enrolled;
-    if (enrolled === true) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].currently_enrolled" };
-    if (enrolled === false) return { candidates: ["Yes"], source: "entry", path: es.section + "[" + es.entryIndex + "].currently_enrolled" };
+    // ⚠ `currently_enrolled` IS NOT TRUSTWORTHY ON ITS OWN, and this cost a wrong live answer.
+    // The website's education editor does not expose that checkbox at all, so a synced profile
+    // carries the schema DEFAULT (false) — and a student graduating in 2028 was confidently
+    // answered "Yes, graduated" on 2026-08-16, deterministically and unflagged. An absent field
+    // read as a positive assertion is the failure here, not the matching.
+    // A graduation date in the FUTURE is the harder fact and wins: you have not graduated if the
+    // date has not happened yet. The checkbox is only consulted when the dates say nothing.
+    const grad = val("graduation_date") || val("to_year");
+    const path = es.section + "[" + es.entryIndex + "]." + (val("graduation_date") ? "graduation_date" : "to_year");
+    const fut = grad == null ? null : atsIsFutureYearMonth(String(grad), now);
+    if (fut === true) return { candidates: ["No"], source: "entry", path };
+    if (entry.currently_enrolled === true) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].currently_enrolled" };
+    if (fut === false) return { candidates: ["Yes"], source: "entry", path };
     return null;
   }
   if (spec.kind === "date_month" || spec.kind === "date_year") {
@@ -440,7 +462,18 @@ function atsResolveEntryField(es, entry, f) {
       const cands = full ? [full.replace(/\b\w/g, (c) => c.toUpperCase()), st] : [st];
       return { candidates: cands, source: "entry", path: es.section + "[" + es.entryIndex + "].location" };
     }
-    return null; // a "City, ST" location does not state a country
+    // ⚠ A US STATE IMPLIES THE UNITED STATES, and deriving it is what keeps the PAIR fillable.
+    // Country is this field's declared PARENT: until it commits, the child's list reads "Please
+    // select a country" and no state can be chosen. Live, Country had no deterministic source, was
+    // deferred to the AI, and the deterministic "Pennsylvania" for State therefore ran against an
+    // empty list and was lost. Recognising "Pittsburgh, PA" as US is a grounded fact — not a guess —
+    // and it fills the parent in the SAME pass, ahead of the child.
+    const tail = parts.length > 1 ? parts[parts.length - 1].toLowerCase() : "";
+    const isUsState = !!tail && (Object.prototype.hasOwnProperty.call(atsLib.REGION_ABBREV || {}, tail) ||
+      Object.keys(atsLib.REGION_ABBREV || {}).some((n) => atsLib.REGION_ABBREV[n] === tail));
+    if (!isUsState) return null;
+    return { candidates: ["United States", "United States of America"], source: "entry",
+      path: es.section + "[" + es.entryIndex + "].location" };
   }
   return null;
 }
@@ -3074,6 +3107,20 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
 
     let opts = open.options || [];
     let searched = false;
+    // ⚠ ASK ABOUT THE PARENT FIRST, BEFORE ANY SEARCH. A child whose parent is unset shows only the
+    // widget's own "Please select a country" row; searching REPLACES that row, so by the time the
+    // no-match branch re-read the list the evidence was gone and the field reported the generic
+    // "no option matched \"Pennsylvania\"" — naming the wrong cause. Searching a list that cannot
+    // contain the answer is also pure latency.
+    {
+      const pre = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
+      if (pre && pre.ok && pre.awaitingParent) {
+        await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+        rec.status = "needs_review";
+        rec.detail = "this list only fills in once its parent field is chosen, and that hadn't happened yet";
+        return true;
+      }
+    }
     let m = atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
     // ⚠ ONE PAGE AT A TIME (26 countries / 25 states measured live). A miss here is NOT proof the
     // option doesn't exist, so the search box is tried before anything is reported — otherwise a
@@ -3096,8 +3143,8 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // deciding that a still list is a finished one. Only the timeout path can be wrong now, and
         // it errs toward looking longer.
         let read = null, hit = null;
-        for (let i = 0; i < 22; i++) {
-          await act.delay(180);
+        for (let i = 0; i < 40; i++) {
+          await act.delay(200);
           read = await act.eval(atsInjIcimsReadOptions, ref.inputSel);
           if (!read || !read.ok) continue;
           if (read.noResults) { opts = []; break; }
@@ -4010,7 +4057,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
-    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
+    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsIsFutureYearMonth, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,

@@ -476,14 +476,21 @@ test("icims_dropdown: its option list is always recorded PARTIAL (it pages + sea
 // COLLEGE's state, so answering it from the applicant's home address is a different fact, not a
 // near-miss. The seal binds the LLM too: an entry field is shown only its own entry.
 
+// ⚠ The graduation year is computed, not hard-coded: this profile must stay "still studying"
+// whenever the suite runs, or the IsGraduated assertions would silently invert in a few years.
+const FUTURE_YEAR = String(new Date().getFullYear() + 2);
+const PAST_YEAR = String(new Date().getFullYear() - 2);
+
 const EDU_PROFILE = {
   personal_info: { city: "Tallahassee", state_province: "Florida", country: ["United States"] },
   education: [{
     school_or_university: "Carnegie Mellon University",
     degree: ["Bachelor of Science", "Bachelor's Degree", "Bachelors"],
     field_of_study: ["Electrical and Computer Engineering", "Electrical Engineering"],
-    minor: "", gpa: "3.95", from_year: "2024", graduation_date: "2028-05",
-    currently_enrolled: true,
+    minor: "", gpa: "3.95", from_year: "2024", graduation_date: FUTURE_YEAR + "-05",
+    // ⚠ DELIBERATELY ABSENT, because that is what a real synced profile looks like: the website's
+    // education editor does not expose this checkbox, so zod fills in the default. A rule that
+    // reads the default as "has graduated" answers a student "Yes" — which is what happened live.
   }],
 };
 
@@ -556,11 +563,12 @@ test("education: degree / major / GPA / dates all fill from the ENTRY", async ()
   assert.strictEqual(by["-1_CandProfileFields.Degree"].after, "Bachelor of Science");
   assert.strictEqual(by["-1_CandProfileFields.Major"].after, "Electrical and Computer Engineering");
   assert.strictEqual(by["-1_CandProfileFields.GPA"].after, "3.95");
-  // currently_enrolled:true ⇒ has NOT graduated
+  // ⚠ A FUTURE graduation date means NOT graduated — and it must win WITHOUT `currently_enrolled`,
+  // which this profile does not carry (see the fixture). Live, the missing flag defaulted to false
+  // and answered a student "Yes".
   assert.strictEqual(by["-1_CandProfileFields.IsGraduated"].after, "No");
-  // graduation_date "2028-05" → May / 2028
   assert.strictEqual(by["-1_CandProfileFields.GraduationDate_Month"].after, "May");
-  assert.strictEqual(by["-1_CandProfileFields.GraduationDate_Year"].after, "2028");
+  assert.strictEqual(by["-1_CandProfileFields.GraduationDate_Year"].after, FUTURE_YEAR);
   for (const n of ["-1_CandProfileFields.Degree", "-1_CandProfileFields.GPA", "-1_CandProfileFields.IsGraduated"]) {
     assert.strictEqual(by[n].status, "filled", n + " should be deterministic");
   }
@@ -627,6 +635,31 @@ test("AI batching is grouped PER ENTRY — an entry question never sees the whol
     assert.ok(!/Tallahassee/.test(blob), "the home city must never appear in an education question's prompt");
     assert.ok(!/personal_info/.test(blob), "the profile root must not be sent for an entry field");
   }
+});
+
+test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {
+  const now = new Date("2026-08-16T00:00:00Z").getTime();
+  assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true);
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026-05", now), false);   // earlier this year
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026-11", now), true);    // later this year
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026", now), true);       // the year has not ended
+  assert.strictEqual(ats.atsIsFutureYearMonth("2025", now), false);
+  assert.strictEqual(ats.atsIsFutureYearMonth("whenever", now), null);
+});
+
+// The exact live wrong answer: no `currently_enrolled` on the entry (the website editor does not
+// expose it), a graduation date two years out, and the run said "Yes, graduated".
+test("is_graduated: a FUTURE graduation date beats a missing currently_enrolled flag", () => {
+  const now = new Date("2026-08-16T00:00:00Z").getTime();
+  const es = { section: "education", source: "education", entryIndex: 0, spec: { kind: "is_graduated" } };
+  assert.deepStrictEqual(ats.atsResolveEntryField(es, { graduation_date: "2028-05" }, {}, now).candidates, ["No"]);
+  assert.deepStrictEqual(ats.atsResolveEntryField(es, { to_year: "2028" }, {}, now).candidates, ["No"]);
+  // a past date with no flag does mean graduated
+  assert.deepStrictEqual(ats.atsResolveEntryField(es, { graduation_date: "2020-05" }, {}, now).candidates, ["Yes"]);
+  // the flag still wins when the dates say nothing at all
+  assert.deepStrictEqual(ats.atsResolveEntryField(es, { currently_enrolled: true }, {}, now).candidates, ["No"]);
+  // and nothing to go on stays unanswered rather than guessing
+  assert.strictEqual(ats.atsResolveEntryField(es, {}, {}, now), null);
 });
 
 test("atsAssignEntryIndexes: entries are ordered by FIRST APPEARANCE, not by ordinal value", () => {
