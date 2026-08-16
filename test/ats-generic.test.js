@@ -1888,6 +1888,47 @@ test("⚠ 'graduated' needs no question mark — a stored fact must not lose to 
   assert.ok(!gd || gd.value !== false, "'Graduation Date' is a date, not the graduated flag");
 });
 
+test("⚠ skipResume: the résumé is NOT attached, and the record says so out loud", async () => {
+  // Operator, 2026-08-12: "skip the resume upload for now. that parser gets a lot of things wrong,
+  // first I want to make sure you can fill the form correctly." A TEST LEVER, not a fix — on iCIMS
+  // the upload triggers a parse that re-renders the panel and rewrites filled fields. A run that
+  // quietly stopped attaching the résumé would be a serious silent change to what the employer
+  // receives, so the field must end up flagged, never merely absent.
+  const RESUME = { attrId: "PortalProfileFields.Resume_File", inputSel: "#resume", widgetType: "file_upload",
+    domIndex: 0, labelCandidates: { labelFor: "Resume" } };
+  let attached = 0;
+  const act = genericFakeAct({
+    atsInjScanGeneric: () => ({ fields: [JSON.parse(JSON.stringify(RESUME))] }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSubmitState: () => ({ ok: true, hasSubmit: true, multiStep: false, captchaChallenge: false, confirmed: false }),
+    atsInjErrors: () => ({ ok: true, errors: [] }),
+    attachResume: async () => { attached++; return { ok: true, name: "resume.pdf", verified: true }; },
+  });
+  const out = await ats.driveAtsPageFill(act, "generic", GENERIC_PROFILE, {}, {}, { skipResume: true });
+  assert.strictEqual(attached, 0, "nothing may be uploaded when the skip is on");
+  const rec = (out.results || []).find((r) => /Resume/i.test(r.fieldName));
+  assert.strictEqual(rec.status, "skipped");
+  assert.strictEqual(rec.flag, "resume-skipped", "flagged, so it cannot pass for a normal run");
+  assert.match(rec.detail, /attach it yourself/);
+});
+
+test("skipResume OFF (the default) still attaches — the lever must be opt-in", async () => {
+  const RESUME = { attrId: "PortalProfileFields.Resume_File", inputSel: "#resume", widgetType: "file_upload",
+    domIndex: 0, labelCandidates: { labelFor: "Resume" } };
+  let attached = 0;
+  const act = genericFakeAct({
+    atsInjScanGeneric: () => ({ fields: [JSON.parse(JSON.stringify(RESUME))] }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjSubmitState: () => ({ ok: true, hasSubmit: true, multiStep: false, captchaChallenge: false, confirmed: false }),
+    atsInjErrors: () => ({ ok: true, errors: [] }),
+    attachResume: async () => { attached++; return { ok: true, name: "resume.pdf", verified: true }; },
+  });
+  await ats.driveAtsPageFill(act, "generic", GENERIC_PROFILE, {}, {}, {});
+  assert.strictEqual(attached, 1, "absent flag ⇒ the résumé is attached exactly as before");
+});
+
 test("⚠ THE ENTRY CONTAINER decides the ordinal — city and state cannot disagree", () => {
   // Live: the three experience blocks appear in DOM order -7560267, -7560269, -7560268, so a
   // POSITIONAL counter gave the k-th "City" and the k-th "State" different entries. Every value was

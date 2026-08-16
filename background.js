@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "entry-id-ordinal-32";
+const AP_BUILD_MARKER = "skip-resume-34";
 // How many times Apply may be pressed when it bounces straight back to the page it was pressed on
 // (operator, 2026-08-12: "sometimes clicking apply redirects you to the same page and you need to
 // keep pressing apply until you get redirected"). Low on purpose: a page that has not moved after
@@ -353,7 +353,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           // genericFillDisabled — the generic-driver kill switch (docs/generic-filler-plan.md). Absent
           // ⇒ enabled, which is safe because the generic path only ever engages where this pipeline
           // would otherwise have HALTED.
-          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets", "genericFillDisabled"], r)
+          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets", "genericFillDisabled", "skipResumeUpload"], r)
         );
         if (!store.profile) {
           sendResponse({ ok: false, error: "no-profile", detail: "Sync your profile to the extension first (the Connect page)." });
@@ -711,7 +711,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace"];
+    const ALLOWED = ["skipResumeUpload", "skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -5119,8 +5119,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // the credentials block is just another section of the form. Consulted ONLY for a field the
     // generic scanner tagged `credentialKind`, and never reachable by a profile value, a bucket or
     // the AI — see atsRouteField.
+    if (store.skipResumeUpload === true) LOG("\u26a0 RESUME UPLOAD SKIPPED for this run (skipResumeUpload) \u2014 the form is filled without attaching it; attach it yourself before submitting.");
     let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext,
-      { buckets: store.buckets || [], credentials: store.credentials || null });
+      { buckets: store.buckets || [], credentials: store.credentials || null,
+        // TEST LEVER (operator, 2026-08-12): skip the resume upload so the iCIMS parse cannot
+        // re-render the panel mid-fill. Logged loudly because a run that quietly stopped
+        // attaching the resume would be a serious silent change to what the employer receives.
+        skipResume: store.skipResumeUpload === true });
 
     // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
     // here, added when Greenhouse forms would land in a state where every server-backed combobox returned

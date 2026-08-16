@@ -1533,6 +1533,13 @@ function atsInjReadFieldsMatching(pattern) {
       .slice(0, 40)
       .map((el) => ({
         id: (el.id || el.name || "").slice(0, 52),
+        // the LABEL as well as the value: "why did this field not fill" is usually a label question,
+        // and without it the answer can only be guessed at (2026-08-12, the work description).
+        label: (() => {
+          const t = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+          const byFor = el.id && document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id) + '"]');
+          return (t(byFor) || t(el.closest("label")) || el.getAttribute("aria-label") || "").slice(0, 46);
+        })(),
         tag: el.tagName, type: el.type || "",
         value: String(el.value == null ? "" : el.value).slice(0, 40),
         selectedText: el.tagName === "SELECT" && el.selectedIndex >= 0 ? String(el.options[el.selectedIndex].text).slice(0, 30) : null,
@@ -1997,6 +2004,9 @@ async function atsScanFor(act, ats) {
 // Deliberately NOT a generic "re-fill anything that went blank": that would be a second fill pass on
 // every page. The trigger is known and specific, so the wait is too.
 async function atsGenericResumePrepass(act, ats, scan, results, profile, defaults, jc, bucketIndex, opts) {
+  // Nothing to settle for when nothing is uploaded — the whole point of the pre-pass is to wait out
+  // the parse, and there is no parse without an attach.
+  if (opts && opts.skipResume) return null;
   const resumeField = (scan.fields || []).find((f) => {
     if (!f || f.widgetType !== "file_upload") return false;
     const r = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, opts && opts.credentials);
@@ -2608,6 +2618,18 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
         route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, o && o.credentials);
       }
 
+      // ⚠ SKIP THE RÉSUMÉ ENTIRELY when asked (operator, 2026-08-12: "skip the resume upload for
+      // now. that parser gets a lot of things wrong, first I want to make sure you can fill the form
+      // correctly"). This is a TEST LEVER, not a fix: on iCIMS the upload triggers a server-side
+      // parse that re-renders the whole panel and rewrites fields we already filled — the single
+      // event behind the blanked address block, the replaced Email, and the entries appearing under
+      // new ids mid-run. Removing it isolates the filler from the parser so the fill can be judged on
+      // its own. The résumé still reaches the employer on a real submit, so this must not be left on
+      // silently: it is logged on every run and named in the record.
+      if (route && route.kind === "resume" && o && o.skipResume) {
+        Object.assign(rec, { status: "skipped", detail: "résumé upload skipped for this run (the parse re-renders the form) — attach it yourself before submitting", flag: "resume-skipped" });
+        results.push(fin()); continue;
+      }
       if (route && route.kind === "resume") {
         const att = await act.attachResume(ref);
         Object.assign(rec, att.ok
