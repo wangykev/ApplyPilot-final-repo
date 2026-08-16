@@ -1888,6 +1888,28 @@ test("⚠ 'graduated' needs no question mark — a stored fact must not lose to 
   assert.ok(!gd || gd.value !== false, "'Graduation Date' is a date, not the graduated flag");
 });
 
+test("⚠ THE ENTRY CONTAINER decides the ordinal — city and state cannot disagree", () => {
+  // Live: the three experience blocks appear in DOM order -7560267, -7560269, -7560268, so a
+  // POSITIONAL counter gave the k-th "City" and the k-th "State" different entries. Every value was
+  // real and the record was nonsense: Carnegie Mellon Racing in Pittsburgh, FLORIDA; FSU in
+  // Tallahassee, PENNSYLVANIA. The entry id is on the page — use it.
+  const mk = (id, label, i) => ({ attrId: id + "_PersonProfileFields." + (label === "City" ? "rcf3216" : "rcf3217"),
+    inputSel: "#" + i, widgetType: "text", domIndex: i, labelCandidates: { labelFor: label }, sectionHeading: "Experience" });
+  const s = ats.atsGenericPostProcess({ fields: [
+    mk("-7560267", "City", 0), mk("-7560267", "State", 1),
+    mk("-7560269", "City", 2), mk("-7560268", "State", 3),
+    mk("-7560268", "City", 4), mk("-7560269", "State", 5),
+  ] });
+  const ord = (id, rcf) => s.fields.find((f) => f.fieldName.startsWith(id) && f.fieldName.endsWith(rcf)).entryOrdinal;
+  for (const id of ["-7560267", "-7560268", "-7560269"]) {
+    assert.strictEqual(ord(id, "rcf3216"), ord(id, "rcf3217"), `${id}: city and state must be the SAME entry`);
+  }
+  // first appearance order, so the first block on the page is entry 0
+  assert.strictEqual(ord("-7560267", "rcf3216"), 0);
+  assert.strictEqual(ord("-7560269", "rcf3216"), 1);
+  assert.strictEqual(ord("-7560268", "rcf3216"), 2);
+});
+
 test("⚠ THE ENTRY ORDINAL COUNTS WITHIN ITS SECTION, NOT THE PAGE", () => {
   // The bug behind the "N/A" that no prompt wording could fix. "City" appears in the address block,
   // the education entry AND each work entry, and the ordinal counted every one of them: live,

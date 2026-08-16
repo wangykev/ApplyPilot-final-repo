@@ -4337,6 +4337,7 @@ function atsGenericPostProcess(raw) {
   }
   out.diag.duplicateLabels = [...labelCount.entries()].filter(([, n]) => n > 1).map(([k]) => k.split("|").slice(1).join("|"));
   const labelSeen = new Map();
+  const entryOrder = new Map();   // "<scope>#<entryId>" -> ordinal, in first-appearance order
   for (const s of staged) {
     const f = s.f;
     const durable = f.attrId && atsGenericIdDurable(f.attrId);
@@ -4368,9 +4369,28 @@ function atsGenericPostProcess(raw) {
     // school's name never reached the prompt and the answer came back "N/A" no matter how the prompt
     // was worded. Keying the counter by SCOPE + label restarts it per section, so the k-th "City"
     // inside education is education entry k and nothing else.
+    // ⚠ THE ENTRY CONTAINER DECIDES THE ORDINAL WHEN THE ID CARRIES ONE (2026-08-12). Counting
+    // per-label was still positional, and position is not stable ACROSS labels: live, the three
+    // experience blocks appear in DOM order -7560267, -7560269, -7560268, so the k-th "City" and the
+    // k-th "State" belonged to different entries. The result read correctly field-by-field and was
+    // nonsense as a record — Carnegie Mellon Racing in Pittsburgh, FLORIDA; FSU in Tallahassee,
+    // PENNSYLVANIA. Every value was a real value from a real entry, just not from THIS one.
+    // iCIMS names each field `<entryId>_<path>`, so the grouping is already on the page: fields
+    // sharing an entry id are one entry, and its ordinal is the order that id first appears. Falls
+    // back to the label counter for a form whose ids carry no entry (Dayforce's `..._0_...` and the
+    // label-only shapes), which is what the existing tests pin.
+    const entryId = (String(f.attrId || "").match(/^(-?\d+)_/) || [])[1] || "";
+    let entryOrdinal;
+    if (entryId && scopeOfStaged(s) !== "none") {
+      const gkey = scopeOfStaged(s) + "#" + entryId;
+      if (!entryOrder.has(gkey)) entryOrder.set(gkey, entryOrder.size ? [...entryOrder.entries()].filter(([k]) => k.startsWith(scopeOfStaged(s) + "#")).length : 0);
+      entryOrdinal = entryOrder.get(gkey);
+    } else {
+      const lk = seriesKey(s);
+      entryOrdinal = lk ? (labelSeen.get(lk) || 0) : 0;
+      if (lk) labelSeen.set(lk, entryOrdinal + 1);
+    }
     const labelKey = seriesKey(s);
-    const entryOrdinal = labelKey ? (labelSeen.get(labelKey) || 0) : 0;
-    if (labelKey) labelSeen.set(labelKey, entryOrdinal + 1);
     if (durable) {
       // identity is the durable attribute; the ordinal above still describes which entry it is
     } else if (s.label) {
