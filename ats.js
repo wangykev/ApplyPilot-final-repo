@@ -48,6 +48,11 @@ function detectAts(url) {
   if (host === "job-boards.greenhouse.io" || host === "boards.greenhouse.io" || host === "job-boards.eu.greenhouse.io" || host === "boards.eu.greenhouse.io") return "greenhouse";
   if (host === "jobs.lever.co" || host === "jobs.eu.lever.co") return "lever";
   if (host === "jobs.ashbyhq.com") return "ashby";
+  // ⚠ iCIMS is the ONE suffix test here, and it is deliberate: unlike the three above, iCIMS gives
+  // every customer its own subdomain (astrioncareers-astrion.icims.com, careers-acme.icims.com), so
+  // an exact-host allowlist cannot work. ANCHORED at a dot or start so `icims.com.evil.com` and
+  // `fakeicims.com` still return null — the same discipline test/ats.test.js pins for the others.
+  if (/(^|\.)icims\.com$/.test(host)) return "icims";
   return null;
 }
 
@@ -68,6 +73,9 @@ function atsFormUrl(ats, url) {
       u.pathname = /\/application$/i.test(path) ? path : path + "/application";
       return u.origin + u.pathname;
     }
+    // ⚠ iCIMS falls to the default below, and KEEPING THE QUERY IS LOAD-BEARING — not incidental
+    // like greenhouse's gh_jid. An iCIMS apply link carries the one-time magic-link session in
+    // `?eem=…&code=…`; strip it and the run lands on a sign-in page with no form at all.
     return u.origin + u.pathname + u.search; // greenhouse: same page (gh_jid etc. kept — harmless)
   } catch (e) { return String(url == null ? "" : url); }
 }
@@ -78,7 +86,21 @@ function atsFormUrl(ats, url) {
 function atsCompanyFromUrl(url) {
   try {
     const u = new URL(String(url));
-    if (!detectAts(url) || detectAts(url) === "workday") return null;
+    const kind = detectAts(url);
+    if (!kind || kind === "workday") return null;
+    // ⚠ iCIMS puts the company in the SUBDOMAIN, not the path — path segment 0 is the literal
+    // "jobs", which would hand the safety-critical employment recognizer the anchor "Jobs" and make
+    // every "have you worked for us before?" question compare against a word no employer is called.
+    // The subdomain is `<portal>-<tenant>` (astrioncareers-astrion) or a bare tenant; the LAST
+    // hyphen segment is the tenant, and a trailing careers/jobs token is portal naming, not a name.
+    if (kind === "icims") {
+      let label = (u.hostname.toLowerCase().split(".")[0] || "");
+      const parts = label.split("-").filter(Boolean);
+      let seg = parts.length > 1 ? parts[parts.length - 1] : label;
+      seg = seg.replace(/(careers|jobs|portal)$/i, "").trim();
+      if (!seg) return null;
+      return seg[0].toUpperCase() + seg.slice(1);
+    }
     const seg = (u.pathname.split("/").filter(Boolean)[0] || "").replace(/[-_]+/g, " ").trim();
     if (!seg || seg === "embed") return null;
     return seg.split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
@@ -137,6 +159,42 @@ const ATS_STATIC_MAPS = {
     "_systemfield_email": { path: "personal_info.email" },
     "_systemfield_resume": { kind: "resume" },
     "_systemfield_location": { kind: "location", compose: "city_state" },
+  },
+  // iCIMS (traced live 2026-08-16 — astrioncareers-astrion.icims.com, 118 controls inside
+  // `#icims_content_iframe`). Unlike the three above, these ids are PLATFORM fields, not per-customer
+  // ones: `PersonProfileFields.*` / `PortalProfileFields.*` are iCIMS' own vocabulary and should hold
+  // on every tenant. Per-customer questions are the `rcf<NNNN>` ids, which are deliberately NOT mapped
+  // — they route through the label ladder like every other custom question.
+  //
+  // ⚠ Only the UN-PREFIXED fields are mapped. Address/phone arrive as `-1_PersonProfileFields.*`,
+  // where the leading integer is a REPEATING-ENTRY ordinal, and the same ids recur inside work-history
+  // entries — where an "address" is the EMPLOYER's, not the applicant's. Mapping them by bare id would
+  // put the candidate's home address into a past job. Left to a later round, deliberately.
+  icims: {
+    // ── The "Create a login" block. THIS ACCOUNT IS CREATED BY THE SUBMISSION ──────────────
+    // Not a sign-in form and not a profile edit: on this class of application the account is created
+    // as part of submitting, so the credential block is simply another section of the form and must
+    // be filled like any other. A prepopulated value is REPLACED — the account this application
+    // creates has to use the credentials stored on the website. See the credential tier in
+    // atsRouteField for the safety properties that make that safe.
+    "PersonProfileFields.Login": { kind: "credential", credentialKind: "login" },
+    "PersonProfileFields.Password": { kind: "credential", credentialKind: "password" },
+    "PersonProfileFields.Password_Confirm": { kind: "credential", credentialKind: "password_confirm" },
+    // ── Identity ──────────────────────────────────────────────────────────────────────────
+    // ⚠ Email is the PROFILE's address and is deliberately NOT the login above: the two are allowed to
+    // differ (a plus-addressed account login against a plain contact address), and conflating them
+    // would silently file the application under the wrong contact.
+    "PersonProfileFields.FirstName": { path: "personal_info.first_name" },
+    "PersonProfileFields.MiddleName": { path: "personal_info.middle_name" },
+    "PersonProfileFields.LastName": { path: "personal_info.last_name" },
+    "PersonProfileFields.Email": { path: "personal_info.email" },
+    // ── Résumé — SKIPPED ON PURPOSE (operator, 2026-08-16) ─────────────────────────────────
+    // iCIMS parses an uploaded résumé SERVER-SIDE and posts the results back into the panel seconds
+    // after the attach reports success, re-rendering entries under new ids and blanking everything
+    // written so far. Until that postback is handled, attaching the résumé destroys the fill it is
+    // supposed to help. The form's own "Upload Resume at a later time" box is left UNTICKED — that is
+    // an operator's choice about their own application, not ours to make.
+    "PortalProfileFields.Resume_File": { kind: "skip", detail: "résumé upload deferred — iCIMS re-parses and blanks the form mid-fill (attach it yourself, or wait for the postback fix)" },
   },
 };
 
@@ -206,6 +264,43 @@ function atsWebsiteValue(profile, type) {
   const ws = Array.isArray(profile && profile.websites) ? profile.websites : [];
   const hit = ws.find((w) => w && String(w.type || "").toLowerCase() === type && String(w.url || "").trim());
   return hit ? atsLib.ensureHttps(hit.url) : null;
+}
+
+// ── CREDENTIAL RECOGNITION (pure) ────────────────────────────────────────────────────────
+// Which stored credential, if any, does this field want? → "login" | "password" |
+// "password_confirm" | null.
+//
+// Two sources, in order:
+//   1. the static map — the known iCIMS platform ids. This is the authority.
+//   2. an INPUT-TYPE fallback, for a tenant whose ids the map does not know.
+//
+// ⚠ THE FALLBACK EXISTS FOR SAFETY, NOT COVERAGE. Recognizing a field as a credential is what
+// keeps buckets, the label ladder and the LLM away from it — so an UNRECOGNIZED password box is
+// the dangerous outcome, not an unfilled one: it would reach the AI rescue as an ordinary required
+// text field and be answered with a guess. Hence `type="password"` alone is enough to claim a
+// field, while claiming a LOGIN needs two agreeing signals (an `autocomplete="username"` hint AND
+// login/username wording), because a bare text box is not self-evidently a credential and a false
+// positive there would overwrite an ordinary answer with an account name.
+function atsCredentialKind(ats, f) {
+  if (!f) return null;
+  const map = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
+  if (map && map.kind === "credential") return map.credentialKind || null;
+  const idLabel = String((f.fieldName || "") + " " + (f.label || "")).toLowerCase();
+  if (f.inputType === "password") {
+    return /confirm|re-?enter|re-?type|verify|again|repeat/.test(idLabel) ? "password_confirm" : "password";
+  }
+  if (f.autocomplete === "username" && /\blogin\b|\busername\b|\buser id\b/.test(idLabel)) return "login";
+  return null;
+}
+
+// The value for a recognized credential field. Returns null when the credentials are absent or
+// incomplete — the caller then reports the field to review rather than making half an account.
+function atsCredentialValue(kind, credentials) {
+  const c = credentials || null;
+  if (!c || !c.email || !c.password) return null;
+  if (kind === "login") return String(c.email);
+  if (kind === "password" || kind === "password_confirm") return String(c.password);
+  return null;
 }
 
 // ── The LABEL ladder (pure) — custom questions (question_* / cards[*] / uuid fields) ─────
@@ -491,6 +586,87 @@ function atsInjScan(ats) {
     return out;
   }
 
+  // iCIMS — a classic server-rendered form (jQuery, NO React: there are no fiber keys on its
+  // inputs, traced 2026-08-16), so plain native-setter writes are enough and there is no
+  // controlled-component state to re-sync. Structure is a table of `.iCIMS_TableRow` inside
+  // `.iCIMS_ProfileFormTable`, each section preceded by an `h2.iCIMS_SubHeader`.
+  //
+  // ⚠ THIS RUNS INSIDE THE FORM IFRAME, not the top document — see cdpUseFormFrame. `document`
+  // here IS the frame's document, which is why nothing below reaches through a frame boundary.
+  if (ats === "icims") {
+    // Required is marked three independent ways and they do not always agree; detect all of them.
+    // Over-flagging is the safe direction (CLAUDE.md: a required field reading FALSE is the
+    // dangerous one — it hides an unfilled field that will block advancement).
+    const req = (el) => {
+      if (/iCIMS_Forms_RequiredField/.test(String(el.className || ""))) return true;
+      if (el.getAttribute("aria-required") === "true" || el.required === true) return true;
+      const row = el.closest(".iCIMS_TableRow") || el.parentElement;
+      if (row && row.querySelector(".Field_Required, .Field_RequiredStar")) return true;
+      return /[*✱]\s*$/.test(labelFor(el) || "");
+    };
+    // The nearest preceding section heading ("Create a login", "Enter your information") — carried
+    // for logs and review grouping. ⚠ A required repeating block titles itself with a <legend>, not
+    // a heading, so a heading is a HINT about where a field sits, never an identity.
+    const sectionOf = (el) => {
+      const table = el.closest(".iCIMS_ProfileFormTable");
+      let p = table ? table.previousElementSibling : null;
+      for (let i = 0; i < 4 && p; i++) { if (/^H[1-4]$/.test(p.tagName)) return txt(p); p = p.previousElementSibling; }
+      const lg = el.closest("fieldset") ? el.closest("fieldset").querySelector("legend") : null;
+      return lg ? stripReq(txt(lg)) : null;
+    };
+    // GROUPED CONTROLS FIRST (radio + checkbox, by shared name), so the general loop below can skip
+    // their members. Same shape as the Greenhouse and Lever branches, and for the same reason: a box
+    // classified by the general loop becomes a phantom REQUIRED text field over the same control,
+    // and a text write to a checkbox sets the string that option would SUBMIT.
+    const optLabel = (r) => (r.id && txt(document.querySelector('label[for="' + esc(r.id) + '"]'))) || txt(r.closest("label")) || r.value;
+    const groups = {};
+    for (const r of document.querySelectorAll('input[type="radio"], input[type="checkbox"]')) {
+      if (!vis(r.closest("label") || r.closest(".iCIMS_TableRow") || r)) continue;
+      const nm = r.name || r.id || ""; if (!nm) continue;
+      (groups[nm] = groups[nm] || []).push(r);
+    }
+    for (const [nm, list] of Object.entries(groups)) {
+      seen.add(nm);
+      const kind = list[0].type === "radio" ? "radio" : (list.length > 1 ? "checkbox_group" : "checkbox");
+      const rec = { fieldName: nm, inputSel: 'input[name="' + esc(nm) + '"]', widgetType: kind,
+        label: stripReq(labelFor(list[0]) || nm), isRequired: list.some(req), section: sectionOf(list[0]) };
+      if (kind === "checkbox") { push(Object.assign(rec, { value: list[0].checked ? "true" : null })); continue; }
+      push(Object.assign(rec, {
+        value: (list.filter((r) => r.checked).map(optLabel).join(", ")) || null,
+        options: list.map(optLabel).filter(Boolean), group: list[0].type }));
+    }
+    for (const el of document.querySelectorAll("input, textarea, select")) {
+      if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox") continue;
+      const id = el.id || el.name || ""; if (!id || seen.has(id)) continue;
+      // file inputs are styled invisible on this theme (the visible control is a sibling button row)
+      if (el.type !== "file" && !vis(el)) continue;
+      seen.add(id);
+      const sel = el.id ? "#" + esc(el.id) : el.tagName.toLowerCase() + '[name="' + esc(el.name) + '"]';
+      const label = stripReq(labelFor(el) || id);
+      const base = { fieldName: id, inputSel: sel, label: label || id, isRequired: req(el), section: sectionOf(el) };
+      if (el.type === "file") { push(Object.assign(base, { widgetType: "file_upload", isRequired: req(el), value: (el.files && el.files[0] && el.files[0].name) || null })); continue; }
+      if (el.tagName === "SELECT") {
+        push(Object.assign(base, { widgetType: "dropdown_native",
+          value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null,
+          // iCIMS' placeholder row is "— Make a Selection —"; drop it and any bare "Select…"
+          options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^(select|—\s*make a selection)/i.test(t)) }));
+        continue;
+      }
+      if (el.tagName === "TEXTAREA") { push(Object.assign(base, { widgetType: "textarea", value: el.value || null })); continue; }
+      // ⚠ `inputType` is carried for ONE reason: a password box must be recognizable as a secret
+      // even on a tenant whose field ids the static map does not know. See atsCredentialKind.
+      push(Object.assign(base, { widgetType: "text", inputType: el.type || "text",
+        autocomplete: el.getAttribute("autocomplete") || null,
+        value: el.type === "password" ? null : (el.value || null) }));
+    }
+    return out;
+  }
+
+  // ⚠ THE ASHBY BLOCK BELOW IS THE FALL-THROUGH, NOT A GUARDED BRANCH. Without this line a fifth
+  // tenant added above would silently run Ashby's selectors and return a plausible-looking 0-field
+  // scan instead of failing. An empty scan is refused by atsLooksLikeApplicationForm — an honest stop.
+  if (ats !== "ashby") return out;
+
   // ashby — field units: the semantic .ashby-application-form-field-entry PLUS the
   // hashed `_fieldEntry_*` css-module class. The EEOC survey's entries and the consent
   // checkboxes carry ONLY the hashed one (live 2026-07-31, OpenAI) — the semantic class
@@ -591,6 +767,44 @@ function atsInjSetText(inputSel, value) {
   el.blur();
   el.dispatchEvent(new Event("focusout", { bubbles: true }));
   return { ok: true, after: el.value };
+}
+
+// ── CREDENTIAL WRITE / VERIFY ────────────────────────────────────────────────────────────
+// Deliberately separate from atsInjSetText for two reasons, each earned:
+//
+// 1. ⚠ IT NEVER RETURNS THE VALUE. atsInjSetText answers `{after: el.value}`, which for a password
+//    box hands the secret back across the CDP boundary into a record, a log line and ultimately the
+//    review bundle POSTed to the website. These return a LENGTH and a MATCH BOOLEAN — everything
+//    needed to verify the write, nothing that carries it.
+// 2. ⚠ IT CLEARS FIRST. The setter SETS a value, it does not replace a selection, so rewriting a
+//    prepopulated login produced "someone.else@old-account.comkevin@example.com". iCIMS renders the
+//    session's own login into that box, so a rewrite is the NORMAL case here, not an edge one.
+//    Same "clear before typing" rule the typeahead path already follows.
+function atsInjSetCredential(inputSel, value) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+  const had = (el.value || "").length;
+  el.focus();
+  setter.call(el, "");
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  setter.call(el, value);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  el.blur();
+  el.dispatchEvent(new Event("focusout", { bubbles: true }));
+  return { ok: true, hadLength: had, len: (el.value || "").length, matches: el.value === value };
+}
+
+// Independent re-read of a credential box. Same no-value contract as the write.
+// `matches` is the whole point: it answers "does the page still hold what we put there?" without
+// anyone outside the page ever seeing either string.
+function atsInjVerifyCredential(inputSel, value) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const v = el.value || "";
+  return { ok: true, len: v.length, empty: v === "", matches: v === value };
 }
 
 // Read one field's CURRENT live value (verify/audit) — same read rules as the scan.
@@ -926,6 +1140,15 @@ function atsInjSubmitState(ats) {
   const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   let btn = null;
   if (ats === "lever") btn = document.querySelector("#btn-submit");
+  // ⚠ iCIMS NEEDS ITS OWN BRANCH, and without it the form is REFUSED rather than filled. Its control
+  // is `<input type="submit" id="cp_form_submit_i" value="Submit Profile">`, which the generic finder
+  // below cannot see twice over: it queries only `button`s, and it matches on `textContent`, which an
+  // <input> does not have (its caption is `.value`). `hasSubmit:false` makes
+  // atsLooksLikeApplicationForm reject a perfectly good page as "not an application form".
+  // Scoped to iCIMS so the other three tenants' detection stays byte-identical.
+  // Detection only — nothing here clicks anything; the fill run never submits, and the submit run
+  // clicks only behind the arm gate.
+  if (ats === "icims") btn = [...document.querySelectorAll('#cp_form_submit_i, input[type="submit"], button[type="submit"]')].find((b) => vis(b)) || null;
   if (!btn) btn = [...document.querySelectorAll('button[type="submit"], button')].find((b) => /submit application|submit$/i.test((b.textContent || "").trim()) && vis(b));
   const r = btn ? btn.getBoundingClientRect() : null;
   // a VISIBLE captcha challenge. ⚠ Lever's DORMANT invisible-mode hCaptcha container is a
@@ -1562,7 +1785,32 @@ async function atsAiWriteText(act, f, profile, jobContext) {
 // Order: static map → bucket (exact wording) → label recognizers → employment recognizer →
 // null (the driver then tries AI for REQUIRED fields, else leaves blank). Same tiering as
 // the Workday driver: deterministic tiers run for optional fields too, AI is required-only.
-function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
+function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, credentials) {
+  // ── CREDENTIALS — the TOP rung, above the static map, buckets, labels and AI ────────────
+  // This is the only way a credential is ever filled, and being FIRST is a safety property, not
+  // an ordering preference: every rung below it could otherwise reach a login box (a taught bucket
+  // wording, a label recognizer, or the AI rescue on a required field), and each of those would put
+  // a value into an account credential that the operator never chose.
+  //
+  // The properties this tier guarantees:
+  //   • the value comes ONLY from `store.credentials` — the same slot the website's Credentials page
+  //     writes and the Workday onboarding signs in with. Never a profile value, never a bucket, never
+  //     an LLM. There is no path from any of those to a field recognized here.
+  //   • it never enters a log line, a record or the review bundle. The record carries `credential:true`
+  //     + `credentialKind` so review can name WHICH credential was used without carrying it.
+  //   • `overwrite:true` — a prepopulated box is REPLACED. iCIMS renders the session's own login into
+  //     it, and the account this application creates must use the stored credentials.
+  //   • absent or incomplete credentials ⇒ needs_review, never a blank guess and never half an account.
+  const ck = atsCredentialKind(ats, f);
+  if (ck) {
+    const value = atsCredentialValue(ck, credentials);
+    const pretty = ck.replace(/_/g, " ");
+    if (!value) {
+      return { kind: "credential-missing", credentialKind: ck, review: true, flag: "credentials-not-stored",
+        detail: "this form asks for a " + pretty + ", but no complete sign-in credentials are stored — set them on the website's Credentials page, or type it here" };
+    }
+    return { kind: "credential", credentialKind: ck, value, source: "credentials", credential: true, overwrite: true };
+  }
   const map = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
@@ -1668,7 +1916,7 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     }
   }
 
-  return await atsFinishFill(act, ats, scan, results);
+  return await atsFinishFill(act, ats, scan, results, o.credentials);
 }
 
 // ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
@@ -1982,7 +2230,12 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // Replay mode: the value comes from the APPROVED bundle, not the profile (the submit
       // run re-fills a blank form). Everything else — actuation + verify — is identical.
       let route = null;
-      if (o.valueFor) {
+      // ⚠ A CREDENTIAL IS NEVER REPLAYED FROM THE BUNDLE — note the `&& !atsCredentialKind(...)`.
+      // The bundle deliberately carries a PLACEHOLDER for these ("(stored login)"), never the value,
+      // so a replay that treated them like any other approved field would type that placeholder
+      // string into the account's login box and submit it. They re-route through the credential
+      // tier instead, which reads the stored credentials directly — the same source the fill used.
+      if (o.valueFor && !atsCredentialKind(ats, f)) {
         const v = o.valueFor(f);
         if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(fin()); continue; }
         if (f.widgetType === "file_upload") {
@@ -1993,7 +2246,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           // only re-checks approved VALUES, and a bundle never carries a file for a field we
           // deliberately skipped. Route it through the same router the fill uses — which maps
           // exactly one field to the résumé — and leave any other file field alone.
-          const fr = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
+          const fr = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, o.credentials);
           route = fr && fr.kind === "resume"
             ? { kind: "resume", source: "replay" }
             : { kind: "skip", detail: (fr && fr.detail) || "a file field that is not the résumé — left to the operator" };
@@ -2013,7 +2266,37 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           if (shape && shape.kind === "dial") route.kind = "dial";
         }
       } else {
-        route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
+        route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, o.credentials);
+      }
+
+      // ── CREDENTIALS ────────────────────────────────────────────────────────────────────
+      // Handled before every other kind, and it `continue`s out before `rec.rawValue` /
+      // `rec.resolved` are assigned further down — which is exactly how the value stays out of the
+      // record, and therefore out of the review bundle and the report POSTed to the website.
+      if (route && route.kind === "credential-missing") {
+        rec.status = "needs_review";
+        rec.credential = true; rec.credentialKind = route.credentialKind;
+        rec.flag = route.flag || "credentials-not-stored";
+        rec.detail = route.detail;
+        results.push(fin()); continue;
+      }
+      if (route && route.kind === "credential") {
+        const w = await act.eval(atsInjSetCredential, ref.inputSel, route.value);
+        await act.delay(120);
+        rec.credential = true; rec.credentialKind = route.credentialKind;
+        rec.mappedPath = "(credentials." + (route.credentialKind === "login" ? "email" : "password") + ")";
+        // ⚠ A PLACEHOLDER, NEVER THE VALUE — `fin()` logs `rec.after`, and the bundle carries it.
+        rec.after = "(stored " + route.credentialKind.replace(/_/g, " ") + ")";
+        if (!w || !w.ok) {
+          rec.status = "needs_review"; rec.after = null;
+          rec.detail = "could not write the " + route.credentialKind.replace(/_/g, " ") + ": " + ((w && w.error) || "unknown");
+          results.push(fin()); continue;
+        }
+        rec.verified = !!w.matches;
+        rec.status = w.matches ? "filled" : "needs_review";
+        if (!w.matches) { rec.after = null; rec.detail = "the box did not take the value (" + w.len + " characters present afterwards)"; }
+        else if (w.hadLength) rec.detail = "replaced a value the page had prefilled";
+        results.push(fin()); continue;
       }
 
       if (route && route.kind === "resume") {
@@ -2195,8 +2478,65 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
   } catch (e) { /* log only */ }
 }
 
+// ── CREDENTIALS ARE RE-CHECKED LAST ──────────────────────────────────────────────────────
+// The credential tier verifies its write with an immediate read-back, and that read-back is NOT
+// enough. Observed live on iCIMS: `PersonProfileFields.Login` ended up holding an address that was
+// neither the profile's nor the stored one, with an empty password, on a run whose log said both
+// were filled and verified. The box carries `autocomplete="username"`, and the address was the
+// operator's real one — the browser's own password manager writes into it AFTER the page settles.
+// Written, verified, reverted, still reported `filled`: the exact false-verify class the safety
+// contract exists to prevent.
+//
+// ⚠ THE POST-FILL AUDIT STRUCTURALLY CANNOT COVER THIS, which is why this exists rather than a
+// tweak to it. `atsFinishFill` compares the live page against `rec.after`, and `rec.after` is
+// deliberately the placeholder "(stored login)" rather than a value — so the audit can only ever
+// mismatch on a credential, which is why credential records are skipped there. This check compares
+// against the EXPECTED value instead, which has to stay out of records and the bundle, so it lives
+// where the credentials already are: inside the fill.
+//
+// It runs LAST, after the cascade rounds and the audit, so anything that was going to re-render or
+// autofill already has. A field that has been replaced is rewritten once; one the page keeps taking
+// back ends `needs_review` + `credential-overwritten` with its placeholder cleared — a login we
+// could not keep on the page must never be reported as filled.
+async function atsCredentialRecheck(act, ats, scan, results, credentials) {
+  if (!credentials || !credentials.email || !credentials.password) return null;
+  const creds = results.filter((r) => r && r.credential && r.credentialKind && r.status === "filled");
+  if (!creds.length) return null;
+  let repaired = 0, lost = 0;
+  for (const rec of creds) {
+    const f = scan.fields.find((x) => x.fieldName === rec.fieldName);
+    if (!f) continue;
+    const want = atsCredentialValue(rec.credentialKind, credentials);
+    if (!want) continue;
+    let v = null;
+    try { v = await act.eval(atsInjVerifyCredential, f.inputSel, want); } catch (e) { v = null; }
+    if (v && v.ok && v.matches) continue;
+    let w = null;
+    try { w = await act.eval(atsInjSetCredential, f.inputSel, want); } catch (e) { w = null; }
+    await act.delay(150);
+    let after = null;
+    try { after = await act.eval(atsInjVerifyCredential, f.inputSel, want); } catch (e) { after = null; }
+    if (after && after.ok && after.matches) {
+      repaired++;
+      rec.detail = (rec.detail ? rec.detail + "; " : "") + "the page replaced this after the fill — rewritten";
+      continue;
+    }
+    lost++;
+    rec.status = "needs_review";
+    rec.flag = "credential-overwritten";
+    rec.verified = false;
+    rec.after = null;
+    rec.detail = "the page kept replacing this " + rec.credentialKind.replace(/_/g, " ") +
+      " after we wrote it (the browser's own password manager is the usual cause) — set it yourself before submitting";
+  }
+  if (repaired || lost) {
+    try { console.log(`[ApplyPilot][ATS-FILL] credential re-check: ${repaired} rewritten, ${lost} could not be kept on the page`); } catch (e) { /* log only */ }
+  }
+  return { repaired, lost };
+}
+
 // The audit + envelope — extracted with the loop (see atsFillFields).
-async function atsFinishFill(act, ats, scan, results) {
+async function atsFinishFill(act, ats, scan, results, credentials) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
   await act.delayFull(600);
@@ -2204,6 +2544,12 @@ async function atsFinishFill(act, ats, scan, results) {
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
     const f = scan.fields.find((x) => x.fieldName === rec.fieldName);
     if (!f || f.widgetType === "file_upload") continue;
+    // ⚠ CREDENTIALS ARE NOT AUDITABLE HERE, AND SKIPPING THEM IS NOT A HOLE — atsCredentialRecheck
+    // below is the second look they get, and it is a STRONGER one. This loop compares the page
+    // against `rec.after`, which for a credential is the placeholder "(stored login)" rather than a
+    // value, so it could only ever produce a false audit-mismatch. Auditing them here would also
+    // read a password out of the page and into `rec.after` — the one thing this path must not do.
+    if (rec.credential) continue;
     try {
       const live = await act.eval(atsInjReadValue, ats, f.inputSel, f.widgetType);
       if (!live || !live.ok) { rec.flag = rec.flag || "audit-unverifiable"; continue; }
@@ -2228,6 +2574,10 @@ async function atsFinishFill(act, ats, scan, results) {
       }
     } catch (e) { rec.flag = rec.flag || "audit-unverifiable"; }
   }
+
+  // Genuinely last, and BEFORE counts — a credential the page took back becomes `needs_review`
+  // here, and the envelope must report that, not the status it held a moment earlier.
+  await atsCredentialRecheck(act, ats, scan, results, credentials);
 
   const counts = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
   // DID THIS PAGE'S ASYNC WIDGETS EVER ANSWER? Greenhouse forms sometimes load in a state where their
@@ -3122,6 +3472,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
+    atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
@@ -3132,7 +3483,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
-    atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
+    atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };

@@ -12,6 +12,36 @@ discover branch).
 
 ## Active
 
+### NEXT (0) — iCIMS: LIVE-VERIFY the fill, then take the next section (operator 2026-08-16)
+
+Step 1 landed (see `docs/progress-log.md` `2026-08-16 — iCIMS routed`): iCIMS is routed, the same-origin
+form frame is driven, and the "Create a login" trio fills deterministically from the website's stored
+credentials. **Built from recon + unit pins — NOT yet live-verified.** Nothing has been driven through the
+extension against a real iCIMS page yet.
+
+The first live run should confirm, in order: the frame arms (`the application is inside an iframe —
+driving it there (N controls)`), the form is identified rather than refused, and the login trio reports
+`filled` with `after="(stored login)"` — never a real value. **The credential re-check has never fired
+live**; the run to watch for is one where Chrome's password manager repopulates the login box after the
+fill, which should end `needs_review` + `credential-overwritten`, not a silent `filled`.
+
+Deferred on purpose, in rough order:
+1. **The résumé parse postback.** iCIMS parses server-side and re-renders the panel under new ids seconds
+   after the attach reports success, blanking the fill. Until that is handled the résumé is `kind:"skip"`.
+   This is the single biggest remaining piece and the reason the operator asked to skip it for now.
+2. **Repeating sections** — Addresses / Phones / Education / Certifications / Experience, each with an
+   `a.iCIMS_Anchor` "Add More (…)" and a `-1_` entry ordinal. ⚠ The same field ids recur inside work
+   history, where an "address" is the EMPLOYER's — do not map them by bare id.
+3. **The `rcf<NNNN>` custom questions** (32 native selects on the Astrion form) — these route through the
+   label ladder today; check what falls to AI and what wants a bucket.
+4. **Multi-step.** The Astrion form is step 1 of 4 (a progress rail reads 1·2·3·4). `runAtsSubmitRun`
+   assumes one page, one click, one confirmation — that assumption does not hold here.
+
+⚠ There is ~6000 lines of earlier iCIMS work on the unmerged branch `worktree-generic-filler-design`
+(education tier, work-experience tier, address tier, the parse-postback round, a login gate the author
+would not call reliable). It was NOT ported — this branch restarted from main deliberately — but it is
+worth mining before building any of the four above, the way the credential tier was mined for this step.
+
 ### NEXT (1) — BATCH the questions page into ONE AI call (operator 2026-08-05)
 
 A screening page can hold many AI-answered questions and today each one is its OWN `act.llm` round trip,

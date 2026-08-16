@@ -33,6 +33,7 @@ For current state and open work, see **`docs/status.md`**.
 | **AI batching / stray clicks** | `2026-08-06 — one AI call per page, and the stray click that was blamed on Workday` |
 | **Résumé attach** | `2026-07-29 (later) - ` (the `role="alert"` status-channel fix) |
 | **Service-worker breakage (the two Node-invisible classes)** | `2026-07-28 — Dead service worker: two files declaring one name`, `2026-07-28 — The replay walk never settled the page` |
+| **iCIMS / credentials tier** | `2026-08-16 — iCIMS routed, the form frame, and the Create-a-login block` |
 | **Latest live sweeps** | `2026-08-09 — live sweep: marvell + moog verified`, `2026-08-09 (b) — the non-Workday merge did NOT regress Workday` |
 
 ## Progress log
@@ -4931,3 +4932,60 @@ and nothing re-evaluated it.
 
 Reverted immediately (`git checkout -- fill-driver.js background.js`), suite re-run, and the extension
 reloaded so the running build matches the committed one — the experiment flag was never committed.
+
+## 2026-08-16 — iCIMS routed, the form frame, and the Create-a-login block
+
+First step of expanding the non-Workday pipeline to iCIMS, against Astrion
+(`astrioncareers-astrion.icims.com/jobs/24615`). Operator's ask: the "Create a login" section — Login,
+Password, Password (Re-enter) — fills DETERMINISTICALLY from the website's stored sign-in credentials.
+Résumé deliberately left alone this round (its server-side parse re-renders the panel and blanks the fill).
+
+**Recon first, read-only, before a line of code** — the standing rule, and it paid twice. Two findings
+would each have made the first live run fail in a way that looks like a broken detector:
+
+1. **The whole form is inside a same-origin `<iframe id="icims_content_iframe">`.** Top document: 0
+   controls. Frame: 118 (70 scannable). A top-frame scan reads an empty page.
+2. **The submit control is `<input type="submit" value="Submit Profile">`.** `atsInjSubmitState`'s generic
+   finder queries only `button`s and matches on `textContent`, which an `<input>` does not have. Measured
+   on the live page: old finder `hasSubmit:false` → `atsLooksLikeApplicationForm` REFUSES the form. Now
+   `hasSubmit:true`, `looksLikeForm_ok:true`, both verified against the real DOM.
+
+**What landed.** `detectAts` gains an anchored `icims.com` SUFFIX test (the first non-exact-host tenant —
+iCIMS gives every customer a subdomain); `atsCompanyFromUrl` reads that subdomain, because path segment 0
+is the literal `jobs` and that string anchors the employment recognizer; `atsFormUrl` keeps the query,
+since `?eem=…&code=…` is a one-time magic-link session, not tracking cruft. `cdpUseFormFrame` /
+`cdpEvalTop` (lifted from the abandoned `worktree-generic-filler-design` branch, which had already earned
+them live) pin `Runtime.evaluate` to the frame's isolated world, armed in `waitAtsFormReady` so both the
+fill and the submit run get it; `_frameCtxId` defaults null, so Workday / GH / Lever / Ashby are
+byte-identical. A new `atsInjScan` iCIMS branch reads the tenant's conventions (label[for], three
+independent required markers, `h2.iCIMS_SubHeader` sections, native selects) — its predicates were run
+verbatim against all 118 live controls and resolve 70 fields, 22 required, with the login trio correctly
+labelled and sectioned.
+
+**The credential tier, and why it is the TOP rung.** Above the static map, buckets, labels and AI — being
+first is the safety property, since every rung below could otherwise reach a login box. The value comes
+only from `store.credentials`; it never enters a log line, a record or the review bundle (`rec.after` is
+the placeholder `"(stored login)"` + `credential:true` + `credentialKind`); `atsInjSetCredential` /
+`atsInjVerifyCredential` return a length and a boolean, never a value; the box is cleared before typing;
+incomplete credentials yield `needs_review`, never half an account.
+
+**Four failure modes were imported rather than re-earned**, from the abandoned branch's live rounds:
+the value reaching Supabase via `buildReviewBundle`; a rewrite merging into `old@x.comnew@y.com`; the
+post-fill audit flagging every credential once `after` became a placeholder; and — the important one —
+Chrome's own password manager writing the `autocomplete="username"` box back AFTER the fill, on a run
+that still reported `filled`. The audit structurally cannot catch that, so `atsCredentialRecheck` runs
+last and compares against the EXPECTED value inside the fill: a replaced field is rewritten once, one the
+page keeps taking back ends `needs_review` + `credential-overwritten`.
+
+Also fixed while it was cheap: the submit run would have replayed the placeholder string into the login
+box, because the bundle carries `"(stored login)"` by design. Credentials are now re-read from storage on
+the replay path instead of being taken from the bundle.
+
+**Tests:** 20 new in `test/ats-icims.test.js`. The load-bearing one greps the entire result set for the
+password and the login. Per the project's own "a test that passes both ways proves nothing" rule, it was
+verified to FAIL when `rec.after` is changed back to the real value ("THE PASSWORD LEAKED INTO A RECORD").
+Full suite 1406 pass / 1 fail — `db.test.js`, a missing `fake-indexeddb` devDependency in this worktree,
+pre-existing and unrelated.
+
+**NOT yet live-verified** — this is a fill built from recon and unit pins; no run has been driven through
+the extension yet. The credential re-check in particular has never fired against a real page.

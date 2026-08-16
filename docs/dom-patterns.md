@@ -37,6 +37,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
+| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it` |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
 | **Host / URL shapes** | `2026-07-22 — logged-in host is` |
 
@@ -4070,3 +4071,72 @@ remediation, so error-name→field matching on this label is worth re-checking i
 DOMContentLoaded 793ms · load event 1484ms · posting content on screen **~13s**. cat.wd5 renders nothing
 until it renders everything, so a poll that samples early sees a completely empty page (`formFields 0 ·
 markers [none]`), not a partial one — do not read that as "the control is missing".
+
+## 2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it
+
+Read-only recon of `astrioncareers-astrion.icims.com/jobs/24615/…/candidate`, reached with a magic-link
+apply URL (`?from=login&eem=…&code=…`). First iCIMS tenant observed. Everything below was traced against
+the live DOM, not inferred.
+
+**THE WHOLE APPLICATION IS INSIDE `<iframe id="icims_content_iframe">`, SAME-ORIGIN.** The top document
+holds **0** form controls; the frame holds **118** (70 visible/scannable). Every other ATS this codebase
+drives is a top-frame form, so a top-frame scan reads an empty page and the run refuses it as "not an
+application form" — the failure looks like a broken detector, not a missing frame. `cdpUseFormFrame`
+(cdp.js) pins `Runtime.evaluate` to the frame's isolated world; `_frameCtxId` defaults null so every
+other tenant stays byte-identical.
+
+⚠ **Re-opening the frame's `src` as a top-level page is NOT a substitute.** The magic link is one-time:
+the first navigation consumes `eem`/`code`, so a second lands on a sign-in page with 0 fields. The form
+has to be driven where it is. For the same reason `atsFormUrl` must KEEP the query for iCIMS — unlike
+greenhouse's `gh_jid`, it is the session.
+
+**NOT React.** No `__reactProps$`/fiber keys on any input; jQuery is present; markup is server-rendered.
+A plain native-setter write + `input`/`change` is sufficient — there is no controlled-component state to
+re-sync, and none of the React value-setter care Workday requires.
+
+**Field identity is two vocabularies.** `PersonProfileFields.*` / `CandProfileFields.*` /
+`PortalProfileFields.*` are iCIMS PLATFORM ids and should be stable across tenants — worth mapping.
+`rcf<NNNN>` (e.g. `rcf3077`, `rcf2010`) are per-customer configured questions — never map these, route
+them by label. A leading `-1_` is a REPEATING-ENTRY ORDINAL (`-1_PersonProfileFields.AddressCity`), and
+the same ids recur inside work-history entries, where an "address" is the EMPLOYER's, not the
+applicant's — so a bare-id map entry for those would file the candidate's home address under a past job.
+
+**Conventions:**
+- labels — `label[for="<id>"]`, itself carrying `id="label_<id>"`. Clean; no heuristics needed.
+- required — THREE independent markers, which do not always agree: `iCIMS_Forms_RequiredField` on the
+  input, `aria-required="true"`, and a `span.Field_Required` / `span.Field_RequiredStar` (`*`) in the row.
+  Detect all three. 22 of 70 fields are required here.
+- rows/sections — `.iCIMS_TableRow` inside `.iCIMS_ProfileFormTable`, each table preceded by an
+  `h2.iCIMS_SubHeader`. Observed sections: Resume · Attachments · **Create a login** · Preferences ·
+  Enter your information · Education · Skills · Experience.
+- choice widgets are native `<select>` (32 of the 70); placeholder row is `— Make a Selection —`.
+- repeating sections expose `a.iCIMS_Anchor` "Add More (Addresses|Phones|Education|…)" with ids like
+  `PersonProfileFields.AddressesButton_-1`.
+
+**"Create a login" is INSIDE the application form** — `PersonProfileFields.Login` (text,
+`autocomplete="username"`), `PersonProfileFields.Password` and `PersonProfileFields.Password_Confirm`
+(both `type=password`, `autocomplete="new-password"`, labels "Password" / "Password (Re-enter)").
+On this class of application **the account is created BY the submission** — there is no separate
+onboarding — so this block is simply another section of the form. Note all three render **OPTIONAL** (no
+required marker) while `FirstName`/`Email` render required; that is convenient rather than a problem,
+because the AI rescue is required-only and therefore structurally cannot reach a password.
+
+⚠ **`autocomplete="username"` INVITES CHROME'S OWN PASSWORD MANAGER INTO THAT BOX.** Observed on an
+earlier round: the login held an address that was neither the profile's nor the stored one, with an empty
+password, on a run whose log said both were filled and read-back verified — written, verified, reverted,
+still reported `filled`. An immediate read-back cannot catch this; only a re-check after the page has
+settled can. See `atsCredentialRecheck`.
+
+⚠ **THE SUBMIT CONTROL IS `<input type="submit" id="cp_form_submit_i" value="Submit Profile">`.** The
+generic finder in `atsInjSubmitState` could not see it twice over — it queries only `button`s, and it
+matches on `textContent`, which an `<input>` does not have (its caption is `.value`). Measured on this
+page: the old finder returns `hasSubmit:false`, which makes `atsLooksLikeApplicationForm` reject a
+perfectly good form. Its rect is FRAME-RELATIVE (`cy≈4356`) while `Input.*` dispatches into the
+top-level viewport, so any future trusted click here must add the frame's own box (`cdpEvalTop`).
+
+**The résumé is a trap, and is deliberately not attached yet.** The page says so itself — "Provide your
+resume below to pre-fill your profile. Existing data in the form will be replaced." iCIMS parses the
+upload SERVER-SIDE and posts results back into the panel seconds after the attach reports success,
+re-rendering entries under new ids and blanking what was written. The form offers its own
+`#resume_skip_checkbox` ("Upload Resume at a later time"), left UNTICKED — an operator's choice about
+their own application.

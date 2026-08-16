@@ -274,6 +274,8 @@ function cdpAttach(tabId) {
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
       _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
       _pageClockOn = false;                    // page-clock pacing is per-run opt-in (FILL/REPLAY only) — onboarding/auth/recon stay SW-timed
+      _frameCtxId = null;                      // frame-scoped eval is per-run opt-in (iCIMS only) — everything else evaluates in the top frame
+      _frameCtxUrl = null;
       _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
       try {
         await cdpSend("Runtime.enable", {});
@@ -782,14 +784,106 @@ function cdpAuthButtonReady(selector) {
 // discipline as chrome.scripting injections). CDP-injected evaluation executes
 // promptly even hidden (it is not timer-driven) — this is the DOM-READ channel;
 // all WAITING between reads stays SW-side (cdpDelay).
+// ── FRAME-SCOPED EVAL (iCIMS and any other iframe-hosted form) ──────────────────────────
+// iCIMS serves its whole application inside a same-origin iframe (`#icims_content_iframe`):
+// the top document holds ZERO form controls and the frame holds ~118 (traced 2026-08-16 on
+// astrioncareers-astrion.icims.com). Every other ATS this file drives is a top-frame form, so
+// without this a scan reads an empty page and the run reports "not a form".
+//
+// Re-opening that frame's src as a top-level page is NOT a substitute: when the session was
+// established by a one-time magic link the first navigation consumes the `eem`/`code` token, so
+// the second lands on a login page with 0 fields. The form has to be driven WHERE IT IS.
+//
+// Discovery is request/response — `Page.getFrameTree` then `Page.createIsolatedWorld` — because
+// cdp.js deliberately registers NO event listener, which rules out `Runtime.executionContextCreated`.
+//
+// ⚠ An ISOLATED world is the right world here, and it is not a compromise: it shares the DOM with
+// the page, so the native-setter + dispatchEvent pattern every injected function uses works
+// identically (that is exactly how a content script fills a controlled input). It only lacks the
+// page's own JS globals, which no injected function here touches.
+//
+// ⚠ DEFAULTS TO NULL, AND ONLY AN OPT-IN CALLER SETS IT. With `_frameCtxId === null` this is
+// byte-identical to the previous `Runtime.evaluate` call, so Workday / Greenhouse / Lever / Ashby
+// are untouched. Reset on every attach.
+let _frameCtxId = null;
+let _frameCtxUrl = null;
+
+// Point subsequent cdpEval calls at the richest same-origin CHILD frame. Returns
+// {ok, url, controls} or {ok:false, reason}. Re-resolving is cheap, and a navigation invalidates
+// the world, so callers re-arm after any navigation.
+async function cdpUseFormFrame(minControls) {
+  const floor = minControls == null ? 4 : minControls;
+  _frameCtxId = null; _frameCtxUrl = null;
+  let tree = null;
+  try { tree = await cdpSend("Page.getFrameTree", {}); } catch (e) { return { ok: false, reason: "no-frame-tree" }; }
+  const kids = (tree && tree.frameTree && tree.frameTree.childFrames) || [];
+  if (!kids.length) return { ok: false, reason: "no-child-frames" };
+  let best = null;
+  for (const k of kids) {
+    const frameId = k.frame && k.frame.id;
+    if (!frameId) continue;
+    let ctx = null;
+    try { ctx = await cdpSend("Page.createIsolatedWorld", { frameId, worldName: "apFormFrame", grantUniversalAccess: false }); } catch (e) { continue; }
+    const contextId = ctx && ctx.executionContextId;
+    if (!contextId) continue;
+    let n = 0;
+    try {
+      const r = await cdpSend("Runtime.evaluate", {
+        expression: "document.querySelectorAll('input:not([type=hidden]),textarea,select,[role=combobox]').length",
+        returnByValue: true, contextId,
+      });
+      n = (r && r.result && r.result.value) || 0;
+    } catch (e) { n = 0; }
+    if (!best || n > best.controls) best = { contextId, controls: n, url: (k.frame && k.frame.url) || "" };
+  }
+  if (!best || best.controls < floor) return { ok: false, reason: "no-frame-with-a-form", controls: best ? best.controls : 0 };
+  _frameCtxId = best.contextId; _frameCtxUrl = best.url;
+  return { ok: true, url: best.url, controls: best.controls };
+}
+function cdpClearFormFrame() { _frameCtxId = null; _frameCtxUrl = null; }
+function cdpFormFrameUrl() { return _frameCtxUrl; }
+function cdpFormFrameArmed() { return _frameCtxId != null; }
+
 async function cdpEval(fn, ...args) {
   const expression = "(" + String(fn) + ")(" + args.map((a) => JSON.stringify(a)).join(",") + ")";
-  const res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+  const params = { expression, returnByValue: true, awaitPromise: true };
+  if (_frameCtxId != null) params.contextId = _frameCtxId;
+  let res;
+  try {
+    res = await cdpSend("Runtime.evaluate", params);
+  } catch (e) {
+    // ⚠ AN ISOLATED WORLD DIES WITH ITS DOCUMENT. iCIMS does partial postbacks, and mid-fill the
+    // frame can re-create its context: `Cannot find context with specified id` (-32000), which
+    // surfaces as `error` records on otherwise-good fields. Re-arm ONCE and retry — a stale world is
+    // a recoverable condition, not a failed field.
+    // Only ever taken when a frame context is armed, so the top-frame path is untouched.
+    const msg = String((e && e.message) || e);
+    if (_frameCtxId == null || !/Cannot find context with specified id/i.test(msg)) throw e;
+    const again = await cdpUseFormFrame(1).catch(() => ({ ok: false }));
+    if (!again.ok) { _frameCtxId = null; throw e; }
+    console.log("[ApplyPilot][CDP] the frame's isolated world was replaced (a postback) — re-armed and retrying");
+    res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true, contextId: _frameCtxId });
+  }
   if (res && res.exceptionDetails) {
     const d = res.exceptionDetails;
     throw new Error("cdpEval: " + ((d.exception && d.exception.description) || d.text || "page exception"));
   }
   return res && res.result ? res.result.value : undefined;
+}
+
+// Evaluate in the TOP frame even while a form frame is pinned. Needed whenever the answer belongs
+// to the top document rather than the frame — notably the frame's own on-screen box, because
+// `Input.*` dispatches into the TOP-LEVEL viewport while an element inside a frame reports a
+// frame-relative rect, so a trusted coordinate click has to add the two.
+// Deliberately does NOT disturb `_frameCtxId`: the pin is restored for the caller's next cdpEval.
+async function cdpEvalTop(fn, ...args) {
+  const saved = _frameCtxId;
+  _frameCtxId = null;
+  try {
+    return await cdpEval(fn, ...args);
+  } finally {
+    _frameCtxId = saved;
+  }
 }
 
 // ── Foreground-adaptive pacing ───────────────────────────────────────────────

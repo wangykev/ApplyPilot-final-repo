@@ -4346,6 +4346,16 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
   let prev = -1, stable = 0;
   while (Date.now() < deadline) {
     await cdpWakePage();
+    // ⚠ iCIMS SERVES ITS WHOLE FORM INSIDE A SAME-ORIGIN IFRAME — the top document holds ZERO
+    // controls, so without this every poll below reads 0 fields, the settle times out, and the run
+    // reports "not an application form" on a perfectly good page. Armed HERE rather than at the
+    // call sites because both the fill and the submit run come through this function.
+    // Re-tried while unarmed (the frame can mount after the first poll); once armed, cdpEval
+    // re-arms itself if a postback replaces the world.
+    if (ats === "icims" && !cdpFormFrameArmed()) {
+      const fr = await cdpUseFormFrame(4).catch(() => ({ ok: false }));
+      if (fr && fr.ok) LOG(`the application is inside an iframe — driving it there (${fr.controls} controls)`);
+    }
     let n = 0;
     try { const s = await cdpEval(atsInjScan, ats); n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; }
     // THREE consecutive equal non-zero reads AND ≥2.5s elapsed — two reads 450ms apart
@@ -4679,7 +4689,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
     const prepared = prepareProfile(store.profile);
-    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+    // ⚠ `credentials` reaches the ATS driver ONLY here, and only the credential tier can consume it
+    // (atsRouteField claims a recognized credential field before any other rung sees it). It is the
+    // same {email, password} the website's Credentials page writes and the Workday onboarding signs
+    // in with — iCIMS asks for it as part of the application itself, because the account is created
+    // by the submission rather than beforehand.
+    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], credentials: store.credentials || null });
 
     // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
     // here, added when Greenhouse forms would land in a state where every server-backed combobox returned
@@ -4821,7 +4836,12 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // AI stays out of a submit run entirely: valueFor covers every field the human approved;
     // anything else is deliberately blank. aiEnabled=false regardless of the popup toggle.
     act.aiEnabled = false;
-    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor });
+    // ⚠ CREDENTIALS ARE READ FRESH HERE, NOT TAKEN FROM THE BUNDLE. On a form whose account is
+    // created by the submission, the login block has to be filled on this visit too — and the bundle
+    // holds only a placeholder for it, by design. Without this the replay would type "(stored login)"
+    // into the login box. Same slot, same {email, password} the fill used.
+    const subStore = await new Promise((r) => chrome.storage.local.get(["credentials"], r));
+    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, credentials: (subStore && subStore.credentials) || null });
 
     // CASCADE RE-REPLAY (2026-08-01). A value committed during the replay can REVEAL more
     // questions — live on an Ashby form, two work-authorization questions mount only after an
@@ -4838,7 +4858,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (missingAfter(out.results).length) {
       const before = out.results.length;
       LOG(`${missingAfter(out.results).length} approved value(s) had no field yet — re-scanning for questions the replay revealed`);
-      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor });
+      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, credentials: (subStore && subStore.credentials) || null });
       // Keep the LATER record for any field seen twice: it reflects the form as it stands now.
       const merged = new Map(out.results.map((r) => [durable(r.fieldName), r]));
       for (const r of again.results) merged.set(durable(r.fieldName), r);

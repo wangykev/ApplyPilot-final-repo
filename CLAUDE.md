@@ -11,7 +11,7 @@ This file holds **standing rules, invariants and safety contracts only** — eve
 | `workday-walk` skill | the N-page walk, `clickPageNext`, nav-timeout halts, AI-4 remediation, phantom duplicates, repeating sections + the `*_MAP` maps, résumé attach |
 | `review-and-submit` skill | the `reviewSummary` schema, accumulation, the viewer/editor, the approval envelope, replay re-verify, review-page reconcile, `submitPrecondition` |
 | `answers-and-ai` skill | the full match ladder, answer buckets + answer ladders, `llm.js` / AI-0…AI-4, employer-match + employment-status recognizers |
-| `ats-tenants` skill | Greenhouse / Lever / Ashby (`ats.js`) — routing, the option poll, per-ATS traps, the dev loop |
+| `ats-tenants` skill | Greenhouse / Lever / Ashby (`ats.js`) — routing, the option poll, per-ATS traps, the dev loop. ⚠ Assumes a top-frame, login-free form: for **iCIMS** read the iCIMS section below first (iframe-hosted, and it creates an account), then use this skill's dev loop |
 | `workday-onboarding` skill | pre-form: JD → Apply → sign-in → Gmail verify → the form |
 | `job-discovery` skill | the LinkedIn / Handshake / Simplify sweep (`discover.js`) |
 | `live-testing` skill | driving a real end-to-end run through Chrome |
@@ -464,6 +464,63 @@ The full schema, accumulation, the viewer/editor, replay re-verify and the revie
 - **Review-page CHECK is READ-ONLY: attach → read → detach, never clicks Next/Submit.** Only **DISAGREE**
   blocks the gate (positive evidence the page CONTRADICTS what was approved); **MISSING is absence of evidence
   and is INFORMATIONAL** — Workday legitimately doesn't render every field. A scrape FAILURE still blocks.
+
+## iCIMS — an IFRAME-hosted form whose ACCOUNT IS CREATED BY THE SUBMISSION (2026-08-16)
+
+Observed DOM (ids, required markers, section shape, the résumé postback): `docs/dom-patterns.md`
+`2026-08-16 — Astrion iCIMS`. The standing rules:
+
+- **The whole application is inside a same-origin `<iframe id="icims_content_iframe">`** — the top
+  document has ZERO controls. `cdpUseFormFrame` pins `Runtime.evaluate` to the frame's isolated world
+  (`Page.getFrameTree` → `Page.createIsolatedWorld`), armed in `waitAtsFormReady` so BOTH the fill and
+  the submit run get it. **`_frameCtxId` defaults null, so Workday / GH / Lever / Ashby are byte-identical.**
+  An isolated world is not a compromise: it shares the DOM, and iCIMS is server-rendered jQuery, not React.
+  ⚠ A postback can replace the world (`Cannot find context with specified id`) — `cdpEval` re-arms ONCE
+  and retries; a stale world is recoverable, not a failed field. **`atsFormUrl` KEEPS the query for
+  iCIMS** — `?eem=…&code=…` is a one-time magic-link session, not tracking cruft, and a second top-level
+  navigation to the frame's src consumes it and lands on a 0-field sign-in page.
+- **`atsCompanyFromUrl` reads the SUBDOMAIN for iCIMS**, not path segment 0 (which is the literal
+  `jobs`) — that string anchors the safety-critical employment recognizer.
+- **CREDENTIALS ARE A TIER, AND IT IS THE TOP ONE** (`atsRouteField`, above the static map, buckets,
+  labels and AI). iCIMS embeds "Create a login" INSIDE the form because **the account is created as part
+  of submitting** — so it is simply another section, and a prepopulated value (iCIMS renders the
+  session's own login) is REPLACED. Being first is the safety property: every rung below could otherwise
+  reach a login box. Invariants, all unit-pinned:
+  - the value comes ONLY from `store.credentials` — the website's Credentials page, the same slot Workday
+    onboarding signs in with. **Never a profile value, never a taught bucket, never an LLM.** The contact
+    email (`personal_info.email`) is deliberately NOT the login: the two may differ.
+  - **it never enters a log line, a record or the review bundle.** `rec.after` is a PLACEHOLDER
+    (`"(stored login)"`) + `credential:true` + `credentialKind`, so review names WHICH credential without
+    carrying it. `atsInjSetCredential` / `atsInjVerifyCredential` return a LENGTH and a MATCH BOOLEAN,
+    never a value — `atsInjSetText`'s `{after: el.value}` would hand the secret to Supabase, because
+    `buildReviewBundle` copies `rec.after` into `current_value` and nothing on that path redacts.
+  - **clear before typing** — the setter SETS rather than replaces, so a rewrite merged into
+    `"old@x.comnew@y.com"`. Write order is pinned `["", value]`.
+  - absent/incomplete credentials ⇒ `needs_review` + `credentials-not-stored`, never a half-made account.
+  - **an unmapped `type=password` box is claimed anyway** — recognition is what keeps the AI rescue away
+    from it, so an UNrecognized password field is the dangerous outcome. Claiming a LOGIN needs two
+    agreeing signals (`autocomplete="username"` AND login/username wording).
+- **THE IMMEDIATE READ-BACK IS NOT ENOUGH — `atsCredentialRecheck` runs LAST.** `autocomplete="username"`
+  invites Chrome's own password manager into the box after the page settles: observed live as written,
+  verified, reverted, still reported `filled`. The post-fill audit **structurally cannot** cover this (it
+  compares against `rec.after`, which is a placeholder — so credential records are SKIPPED there), which
+  is why a dedicated check compares against the EXPECTED value, inside the fill where the credentials
+  already are. A replaced field is rewritten once; one the page keeps taking back ends `needs_review` +
+  `credential-overwritten` with its placeholder cleared. **A login we could not keep on the page must
+  never be reported as filled.**
+- **A CREDENTIAL IS NEVER REPLAYED FROM THE BUNDLE.** The bundle holds the placeholder by design, so the
+  submit run re-reads `chrome.storage.local.credentials` and routes these fields through the credential
+  tier — otherwise it would type `"(stored login)"` into the account's login box and submit it.
+- **`atsInjSubmitState` needs its iCIMS branch**: the control is `<input type="submit"
+  id="cp_form_submit_i" value="Submit Profile">`, and the generic finder queries only `button`s and
+  matches `textContent`, which an `<input>` lacks. Measured: without it `hasSubmit:false` and
+  `atsLooksLikeApplicationForm` REFUSES a perfectly good form.
+- **The résumé is SKIPPED on iCIMS for now** (`kind:"skip"`): iCIMS parses it server-side and posts the
+  result back seconds after the attach reports success, re-rendering entries under new ids and blanking
+  the fill. The form's own "Upload Resume at a later time" box is left UNTICKED — the operator's choice.
+- **Map only PLATFORM ids** (`PersonProfileFields.*` etc.). `rcf<NNNN>` are per-customer questions → the
+  label ladder. A leading `-1_` is a repeating-entry ordinal whose ids recur inside work history, where
+  an "address" is the EMPLOYER's — mapping those by bare id files your home address under a past job.
 
 ## Multi-ATS — Greenhouse / Lever / Ashby (`ats.js`; fill + gated submit, live-verified 2026-07-31)
 
