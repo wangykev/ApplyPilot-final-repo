@@ -1172,6 +1172,35 @@ function websiteDeletionPlan(entries) {
 // Stable per-JOB identity for tracker dedup. A Workday application URL VARIES across runs AND hosts:
 // the POSTING the user pastes is <tenant>.wdN.myworkdayjobs.com (tenant in the SUBDOMAIN), but after
 // login the form is on wdN.myworkdaysite.com (tenant in the PATH, /recruiting/<tenant>/ — NOT the
+// ── SECRET REDACTION — nothing we PERSIST or SEND may carry a session token ───────────────
+// A job description is scraped text, and scraped text can contain a URL that is itself a
+// credential. Live 2026-08-16: an iCIMS candidate page's bootstrap script was stored as the job
+// description, and it embedded the one-time magic-link session token — `?from=login&eem=…&code=…`.
+// That single string then travelled to THREE places, and each is a real exposure:
+//   • the tracker row in Supabase (at rest, indefinitely),
+//   • every AI prompt the JD grounds (the JD is sent to the model provider verbatim),
+//   • the run's own log lines.
+// The scrape no longer picks up script text (see scrapeJobPosting), which removes the way it got in.
+// This is the BELT: the JD is prose from an untrusted page, so any future path that puts a token in
+// it is caught here rather than discovered later. Cheap, pure and unit-pinned.
+//
+// Deliberately REDACTS THE VALUE AND KEEPS THE KEY: "eem=<redacted>" still shows a reader that a
+// magic link was present, which is exactly what you want to see when diagnosing a leak, while
+// carrying nothing usable. Names cover the iCIMS pair plus the usual credential-ish query keys; the
+// match is on the KEY, so a token whose value merely looks random is never guessed at.
+var SECRET_QUERY_KEYS = /\b(eem|code|token|access[_-]?token|id[_-]?token|refresh[_-]?token|auth|apikey|api[_-]?key|key|sig|signature|password|passwd|pwd|secret|session|sessionid|jsessionid|validitytoken)\b/i;
+function redactSecrets(text) {
+  const s = String(text == null ? "" : text);
+  if (!s) return s;
+  // Query/fragment pairs: `key=value` where the value runs to the next separator. Anchored on a URL
+  // separator — `?` or `&`, `;` (which iCIMS uses), and `#` — so a bare `code=` inside prose ("use
+  // code=X in your build") is left alone; only something already shaped like a URL parameter is
+  // rewritten. `#` is in the set because an OAuth implicit-flow token lives in the FRAGMENT, which a
+  // query-only pattern misses entirely (caught by this file's own test, not by review).
+  return s.replace(/([?&;#])([A-Za-z0-9_-]{2,24})=([^\s&;#"'<>)\]]+)/g, (m, sep, key, val) =>
+    (SECRET_QUERY_KEYS.test(key) && val.length >= 6 ? sep + key + "=<redacted>" : m));
+}
+
 // subdomain), with a per-application-instance tail. The one token common to BOTH hosts is the
 // data-center (wd3, wd5, …); combined with the requisition id (…_R00244793, present in both paths) it
 // gives a key — "<dc>:r<reqid>" — that collapses the posting + every form/instance/query variant to
@@ -2378,5 +2407,5 @@ if (typeof module !== "undefined" && module.exports) {
   skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthRefusal, BLANK_PAGE_BOILERPLATE_MAX, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, redactSecrets, SECRET_QUERY_KEYS, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthRefusal, BLANK_PAGE_BOILERPLATE_MAX, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

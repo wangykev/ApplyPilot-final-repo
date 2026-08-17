@@ -1688,6 +1688,21 @@ function discoverLocationStep(step, arg) {
 // (it's on the live-verified run path).
 function scrapeJobPosting() {
   const txt = (el) => ((el && (el.innerText || el.textContent)) || "").trim();
+  // The whole page's text with every <script>/<style>/<template> body removed. Used ONLY as the
+  // last-resort fallback for a document that reported no rendered text at all, so it runs at most
+  // once per scrape. Removal is by exact-substring subtraction, which is enough here: textContent
+  // concatenates each node's text verbatim, so a script's own source appears in it literally.
+  const bodyTextNoScripts = () => {
+    if (!document.body) return "";
+    let t = document.body.textContent || "";
+    try {
+      for (const n of document.querySelectorAll("script, style, template, noscript")) {
+        const s = n.textContent || "";
+        if (s.length > 20) t = t.split(s).join(" ");
+      }
+    } catch (e) { /* best effort */ }
+    return t.replace(/\s+/g, " ").trim();
+  };
   const pick = (sels) => {
     for (const s of sels) {
       try {
@@ -1839,9 +1854,22 @@ function scrapeJobPosting() {
     let bestEl = null;
     const cands = document.querySelectorAll("main, article, section, div");
     for (let i = 0; i < cands.length && i < 4000; i++) {
-      const t = txt(cands[i]);
+      // ⚠ RENDERED TEXT ONLY HERE — `innerText`, never txt()'s `|| textContent` fallback.
+      // `textContent` INCLUDES <script> source, and this loop is a "largest block wins" contest, so on
+      // a server-rendered portal whose page is mostly bootstrap JS the winner is the JS. Live
+      // 2026-08-16 an iCIMS candidate page stored 3009 characters of `icims_handlePostMessage` as the
+      // job description — and that text contained the one-time magic-link session token twice, which
+      // then reached Supabase AND every AI prompt the JD grounds. A <script> is never a job
+      // description, so the fallback must not be able to pick one.
+      // The hidden-tab case `|| textContent` existed for is handled once, below, on the body.
+      const t = (cands[i].innerText || "").trim();
       if (t.length > best.length && t.length < 60000) { best = t; bestEl = cands[i]; }
     }
+    // A NON-RENDERED document (a hidden tab that skipped layout) reports empty innerText for
+    // everything, which is what the textContent fallback was for. Pay for it ONCE, on the body, with
+    // script/style source removed — rather than per-candidate, where it both costs 4000 sanitizations
+    // and lets a script win the contest above.
+    if (!best) best = bodyTextNoScripts();
     // Structure this one too, under the same never-lose-text guard — an SPA that lands here is exactly
     // the kind of page whose JD is worth reading, so it should not be the one that renders as a wall.
     if (best.length > body.length) {

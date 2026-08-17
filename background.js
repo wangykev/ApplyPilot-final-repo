@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "ats-options-recon-5";
+const AP_BUILD_MARKER = "jd-redact-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -449,7 +449,9 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // per-run "which job is this" object and is already threaded to every reportApplication call
         // site. Nothing on the Workday path READS `description` (only ats.js prompts do, and they
         // re-slice it themselves), so this is inert here apart from being reported.
-        if (jd && jd.text) jobContext.description = String(jd.text);
+        // Redacted here for the same reason the ATS path does it (see runAtsApplicationRun): this
+        // string reaches Supabase, the AI prompts and the logs, so a token in it leaks three ways.
+        if (jd && jd.text) jobContext.description = redactSecrets(String(jd.text));
 
         // BEFORE the Workday path: does this page EMBED a non-Workday application? An employer
         // careers page matches no ATS host pattern, so it lands here — but it may be serving a
@@ -4206,7 +4208,12 @@ async function reportApplication(bundle, jobContext, extra) {
       // ABSENT means "I have nothing to say", never "blank it": a submit run reports with the per-USER
       // jobContext slot (which carries no description), and the route omits an absent column rather
       // than nulling it — so submitting can never erase the JD the fill run recorded.
-      job_description: (jobContext && jobContext.description) || null,
+      // ⚠ REDACTED AGAIN HERE, on purpose. The assignment sites already scrub it, so this is the belt
+      // for any path that sets a description without going through them — including an OLD value
+      // already sitting in `jobContext` from a previous build. This is the ONE choke point through
+      // which everything reaches the tracker, so it is the right place to be certain rather than
+      // hopeful. Idempotent: redacting redacted text is a no-op.
+      job_description: (jobContext && jobContext.description) ? redactSecrets(jobContext.description) : null,
       review_bundle: bundle
     };
     const res = await fetch(apSession.ingestUrl, {
@@ -5006,7 +5013,15 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // 4000 chars ends mid-sentence for a reader. The three prompt sites in ats.js each slice to 4000
     // themselves, so the bytes any model sees are UNCHANGED by this.
     const jdText = jd && (jd.description || jd.text);
-    if (jdText) jobContext.description = String(jdText);
+    // ⚠ REDACTED AT THE POINT OF ASSIGNMENT, not just before reporting. `jobContext.description` has
+    // THREE consumers and each is a separate exposure: the tracker row (Supabase, at rest), every AI
+    // prompt the JD grounds (sent verbatim to the model provider), and the run's log lines. Scrubbing
+    // only at the report boundary would leave the other two leaking. See redactSecrets — live, an
+    // iCIMS page's bootstrap script became the JD and carried the one-time magic-link session token.
+    // (bare global call, not `apMatch.` — importScripts shares one scope, and adding a name to that
+    // hand-written literal is the lockstep trap CLAUDE.md documents: it passes every Node test and
+    // throws in the browser.)
+    if (jdText) jobContext.description = redactSecrets(String(jdText));
 
     emitRunProgress("Filling the application", "single-page " + ats + " form (never submits)");
     const fillT0 = Date.now();
