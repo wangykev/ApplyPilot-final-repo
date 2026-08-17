@@ -863,7 +863,6 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                         {p.replaces && p.replaces !== p.label && (
                           <span className="text-ink-faint"> — replaces “{p.replaces}”</span>
                         )}
-                        {p.reason && <div className="ml-12 text-xs text-ink-faint">{p.reason}</div>}
                         {/* WHAT ACTUALLY CHANGES. Without this the row states only the matching
                             decision, so adding three role descriptions looked like a no-op. */}
                         {p.fields && p.fields.length > 0 && (
@@ -894,8 +893,15 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                   </p>
                 )}
 
+                {/* ⚠ ONE RENDERING PER CHANGE. This block used to repeat every entry the rows above
+                    already show — the same edit twice, once with values and once as a bare field
+                    name ("entry 1 … role_description"), which is what made a 10-change preview read
+                    as an unreadable wall. The ROWS own entry-level changes, because they show the
+                    actual before/after. What only lives here is what has no row: scalar sections
+                    like personal info, and flat value lists like skills. `s.entries` is therefore
+                    deliberately not rendered, and a section with nothing else in it is dropped. */}
                 <div className="mt-3 space-y-4">
-                  {pending.diff.sections.map((s) => (
+                  {pending.diff.sections.filter((s) => s.fields || s.values).map((s) => (
                     <div key={s.section}>
                       <div className="font-mono text-[11px] uppercase tracking-label text-amber">
                         {s.section.replace(/_/g, " ")}
@@ -907,39 +913,6 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                               <span className="font-mono text-[11px] text-ink-faint">{f.field}</span>{" "}
                               <span className="text-ink-faint line-through">{f.before}</span>{" "}
                               <span className="text-ink-faint">→</span> <span className="text-ink">{f.after}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                      {s.entries && (
-                        <ul className="mt-1.5 space-y-1 text-sm">
-                          {s.entries.map((e, i) => (
-                            <li key={i}>
-                              {e.kind === "add" && (
-                                <>
-                                  <span className="mr-2 font-mono text-[10px] uppercase text-verified">add</span>
-                                  <span className="text-ink">{e.label}</span>
-                                </>
-                              )}
-                              {e.kind === "remove" && (
-                                <>
-                                  <span className="mr-2 font-mono text-[10px] uppercase text-signal">remove</span>
-                                  <span className="text-ink-faint line-through">{e.label}</span>
-                                </>
-                              )}
-                              {e.kind === "change" && (
-                                <>
-                                  <span className="mr-2 font-mono text-[10px] uppercase text-amber">
-                                    entry {e.index + 1}
-                                  </span>
-                                  <span className="text-ink-faint line-through">{e.before}</span>{" "}
-                                  <span className="text-ink-faint">→</span>{" "}
-                                  <span className="text-ink">{e.after}</span>
-                                  <div className="ml-12 font-mono text-[11px] text-ink-faint">
-                                    {e.fields.join(", ")}
-                                  </div>
-                                </>
-                              )}
                             </li>
                           ))}
                         </ul>
