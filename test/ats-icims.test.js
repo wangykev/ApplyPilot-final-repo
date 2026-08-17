@@ -777,12 +777,57 @@ test("experience: a role you STILL HOLD leaves its end date blank, never AI-gues
   assert.match(route.detail, /still work here/);
 });
 
-test("experience: unmapped fields are sealed — supervisor/address are skipped, not guessed", () => {
-  const f = weField("rcf3264", "Address");
+// "May we contact this employer?" governs whether a recruiter may ring a past employer. Releasing
+// the contact details IS that consequence, so they are gated on the ANSWER — never on whether the
+// profile happens to hold them.
+test("employer contact details are withheld unless may_contact is an explicit YES", () => {
+  const es = { section: "work_experience", source: "work_experience", entryIndex: 0 };
+  const entry = (may) => ({ may_contact: may, employer_email: "hr@acme.com", employer_phone: "555-0100" });
+  const ask = (may, kind, path) => ats.atsResolveEntryField({ ...es, spec: { kind, path } }, entry(may), {});
+
+  // YES → released
+  assert.strictEqual(ask(true, "contact_if_allowed", "employer_email").raw, "hr@acme.com");
+  assert.strictEqual(ask(true, "contact_if_allowed", "employer_phone").raw, "555-0100");
+  // NO → withheld, and says why
+  assert.strictEqual(ask(false, "contact_if_allowed", "employer_email").kind, "skip");
+  assert.match(ask(false, "contact_if_allowed", "employer_email").detail, /answered No/);
+  // UNANSWERED → also withheld. A tri-state must not be read as consent by omission.
+  assert.strictEqual(ask(null, "contact_if_allowed", "employer_phone").kind, "skip");
+  assert.match(ask(null, "contact_if_allowed", "employer_phone").detail, /unanswered/);
+
+  // the question itself is deterministic when answered, and unanswered when not
+  assert.deepStrictEqual(ask(true, "may_contact").candidates, ["Yes"]);
+  assert.deepStrictEqual(ask(false, "may_contact").candidates, ["No"]);
+  assert.strictEqual(ask(null, "may_contact"), null, "an unanswered tri-state must not pick a side");
+});
+
+test("experience: the new employer fields route from the entry", () => {
+  const P = { work_experience: [{
+    employer_address: "1 Rivian Way", employer_postal_code: "92602",
+    supervisor_name: "Dana Lee", supervisor_title: "Staff Engineer",
+    reason_for_leaving: "Internship ended", may_contact: true,
+  }] };
+  const f = (label) => { const x = { fieldName: "-1_PersonProfileFields.rcfX", inputSel: "#x",
+    widgetType: "text", label, isRequired: false, value: null, section: "Experience" };
+    ats.atsAssignEntryIndexes("icims", [x]); return x; };
+  const r = (label) => ats.atsRouteField("icims", f(label), P, {}, {}, new Map(), null);
+  assert.strictEqual(r("Address").raw, "1 Rivian Way");
+  assert.strictEqual(r("Zip").raw, "92602");
+  assert.strictEqual(r("Supervisor's Name").raw, "Dana Lee");
+  assert.strictEqual(r("Supervisor's Title").raw, "Staff Engineer");
+  assert.strictEqual(r("Reason for Leaving").raw, "Internship ended");
+  assert.deepStrictEqual(r("May We Contact").candidates, ["Yes"]);
+});
+
+test("experience: a field with no mapping is still SEALED — unanswered, never borrowed", () => {
+  // Address/supervisor used to be `skip`; they are mapped now, so this uses a label with no mapping
+  // at all. The point is unchanged: membership seals it, so it reaches the scoped AI rather than the
+  // profile root — it must never be answered from personal_info.
+  const f = weField("rcf9999", "Badge Number");
   ats.atsAssignEntryIndexes("icims", [f]);
   const route = ats.atsRouteField("icims", f, WE_PROFILE, {}, {}, new Map(), null);
-  assert.strictEqual(route.kind, "skip");
-  assert.match(route.detail, /not in the profile/);
+  assert.strictEqual(route.kind, "entry-unanswered");
+  assert.strictEqual(route.section, "experience", "the section KEY, not the profile array it reads");
 });
 
 test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {

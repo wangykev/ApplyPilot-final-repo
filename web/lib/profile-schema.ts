@@ -142,6 +142,24 @@ export const workExperienceSchema = z.object({
   to: str, // "YYYY-MM"
   role_description: str, // one textarea — how Workday renders the role description
   tech_stack: z.array(z.string()).default([]),
+  // ── Employer detail some ATSs ask for and a resume never states (operator, 2026-08-16) ──
+  // iCIMS' experience block asks for all of these. They are HUMAN-ENTERED only: a resume cannot
+  // state a supervisor or why you left, so the resume parse must never populate them — which is why
+  // they are absent from the parse template in resume-prompt.ts.
+  employer_address: str,
+  employer_postal_code: str,
+  supervisor_name: str,
+  supervisor_title: str,
+  reason_for_leaving: str,
+  // ⚠ TRI-STATE, not a checkbox. "may we contact this employer?" is a QUESTION with a real
+  // consequence — a false yes hands a recruiter a reference you did not agree to — so an unanswered
+  // one must stay unanswered rather than defaulting to either polarity. `triBool` is the same type
+  // the work-authorization questions use for exactly this reason.
+  may_contact: triBool,
+  // Only meaningful when may_contact is true; the filler enforces that, and gates on the ANSWER
+  // rather than on whether these happen to be filled in.
+  employer_email: str,
+  employer_phone: str,
 });
 
 export const languageSchema = z.object({

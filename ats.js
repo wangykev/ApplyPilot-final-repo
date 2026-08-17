@@ -364,14 +364,25 @@ const ATS_ICIMS_ENTRY_MAPS = {
       "province": { kind: "entry_state" },
       "state/province": { kind: "entry_state" },
       "country": { kind: "entry_country" },
-      // Deliberately unmapped, and left to the operator rather than guessed: the profile holds no
-      // employer street address, no supervisor, and no reason for leaving. They are sealed all the
-      // same, so nothing answers them from elsewhere in the profile.
-      "address": { kind: "skip", detail: "employer street address — not in the profile" },
-      "zip": { kind: "skip", detail: "employer postal code — not in the profile" },
-      "supervisor's name": { kind: "skip", detail: "supervisor — operator-supplied" },
-      "supervisor's title": { kind: "skip", detail: "supervisor — operator-supplied" },
-      "reason for leaving": { kind: "skip", detail: "reason for leaving — operator's own words" },
+      // Employer detail the profile now carries (operator, 2026-08-16). Human-entered only — a
+      // resume states none of it — so an empty one simply stays empty rather than reaching the AI.
+      "address": { path: "employer_address" },
+      "zip": { path: "employer_postal_code" },
+      "postal code": { path: "employer_postal_code" },
+      "supervisor's name": { path: "supervisor_name" },
+      "supervisor name": { path: "supervisor_name" },
+      "supervisor's title": { path: "supervisor_title" },
+      "supervisor title": { path: "supervisor_title" },
+      "reason for leaving": { path: "reason_for_leaving" },
+      "may we contact": { kind: "may_contact" },
+      "may we contact this employer": { kind: "may_contact" },
+      // ⚠ GATED ON THE ANSWER, NOT ON WHETHER THEY HAPPEN TO BE FILLED IN. Handing an employer's
+      // email or phone to a recruiter is the whole substance of "may we contact?" — so a `no`, or an
+      // unanswered question, must withhold them even when the profile holds them.
+      "employer email": { kind: "contact_if_allowed", path: "employer_email" },
+      "employer e-mail": { kind: "contact_if_allowed", path: "employer_email" },
+      "employer phone": { kind: "contact_if_allowed", path: "employer_phone" },
+      "employer phone number": { kind: "contact_if_allowed", path: "employer_phone" },
     },
     // Month/Day/Year repeat per date, so the LABEL cannot say which date it is. The scan stamps
     // `dateGroup` by DOM order within the entry: group 0 is the start, group 1 the end.
@@ -500,7 +511,12 @@ function atsResolveEntryField(es, entry, f, now) {
   if (!spec || !entry) return null;
   const val = (k) => { const v = entry[k]; return v === undefined || v === null || (typeof v === "string" && !v.trim()) ? null : v; };
   if (spec.kind === "skip") return { kind: "skip", source: "entry", detail: spec.detail || "left to the operator" };
-  if (spec.path) { const v = val(spec.path); return v == null ? null : { raw: v, path: es.section + "[" + es.entryIndex + "]." + spec.path, source: "entry" }; }
+  // ⚠ A SPEC CARRYING A `kind` IS NOT A PLAIN PATH, even when it also carries a `path`. This branch
+  // ran FIRST and returned the value directly, silently bypassing the may_contact gate below — so
+  // the employer's email and phone would have been released on a "no", and on an UNANSWERED
+  // question. Caught by the test, not by review. Only a BARE path short-circuits here; every kind
+  // is handled below, where its own rule applies.
+  if (spec.path && !spec.kind) { const v = val(spec.path); return v == null ? null : { raw: v, path: es.section + "[" + es.entryIndex + "]." + spec.path, source: "entry" }; }
   // ⚠ A ROLE YOU STILL HOLD HAS NO END DATE. Without this the empty `to` reads as "unanswered" and
   // the sealed AI is asked to invent one — on a REQUIRED field it would have to produce something,
   // and any date it picks is a claim that you left a job you are still doing.
@@ -556,6 +572,26 @@ function atsResolveEntryField(es, entry, f, now) {
     return mi >= 0 && mi < 12
       ? { candidates: atsMonthCandidates(mi), source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from }
       : null;
+  }
+  if (spec.kind === "may_contact") {
+    // A tri-state: unanswered stays UNANSWERED. Defaulting either way decides on the operator's
+    // behalf whether a recruiter may ring a past employer, which is not a default anyone should own.
+    const v = entry.may_contact;
+    if (v === true) return { candidates: ["Yes"], source: "entry", path: es.section + "[" + es.entryIndex + "].may_contact" };
+    if (v === false) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].may_contact" };
+    return null;
+  }
+  if (spec.kind === "contact_if_allowed") {
+    // ⚠ WITHHELD UNLESS THE ANSWER IS AN EXPLICIT YES. Releasing an employer's email or phone IS
+    // the consequence the "may we contact?" question governs, so `no` and UNANSWERED both withhold.
+    if (entry.may_contact !== true) {
+      return { kind: "skip", source: "entry",
+        detail: entry.may_contact === false
+          ? "withheld — you answered No to contacting this employer"
+          : "withheld — \"may we contact this employer?\" is unanswered for this role" };
+    }
+    const v = val(spec.path);
+    return v == null ? null : { raw: v, path: es.section + "[" + es.entryIndex + "]." + spec.path, source: "entry" };
   }
   if (spec.kind === "entry_city") {
     // The city half of the entry's own "City, ST". Deterministic when the entry states it — better
