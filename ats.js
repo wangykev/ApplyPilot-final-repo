@@ -516,7 +516,14 @@ function atsEntrySpec(ats, f) {
     // date groups — a Month/Day/Year label says nothing about WHICH date without its group.
     let spec = (def.fields || {})[bare] || null;
     if (!spec && def.byLabel) {
-      const key = String(f.label || "").toLowerCase().replace(/\s+/g, " ").replace(/[*✱:]\s*$/, "").trim();
+      // ⚠ KEY ON THE PART LABEL FOR A COMPOSITE, NOT THE COMPOSED DISPLAY LABEL. The scan now renders a
+      // composite part's label as "<question> — <part>" ("Start Date — Month") so review reads
+      // properly — and that BROKE this lookup, which tests `/^month$/i` to decide a date group. The
+      // spec stopped matching, the field fell through to the AI, and it INVENTED work-experience dates
+      // that the profile already answers ("Jun 1 2026", reasoned from "typical summer internship start
+      // date"). A display change must not be able to reach the matching layer: `partLabel` is the raw
+      // name of the control, which is what this has always meant.
+      const key = String(f.partLabel || f.label || "").toLowerCase().replace(/\s+/g, " ").replace(/[*✱:]\s*$/, "").trim();
       spec = def.byLabel[key] || null;
       if (!spec && def.dateGroups && typeof f.dateGroup === "number") {
         const g = def.dateGroups[f.dateGroup];
@@ -2968,6 +2975,17 @@ async function atsAiWriteText(act, f, profile, jobContext) {
 // Order: static map → bucket (exact wording) → label recognizers → employment recognizer →
 // null (the driver then tries AI for REQUIRED fields, else leaves blank). Same tiering as
 // the Workday driver: deterministic tiers run for optional fields too, AI is required-only.
+// ⚠ DISPLAY LABEL vs MATCH LABEL. `f.label` is what the REVIEW PAGE shows, and for a composite part
+// the scan composes it as "<question> — <part>" ("Start Date — Month") so the row reads properly. The
+// MATCHING layer must keep seeing the control's own raw name, which is what it saw before that display
+// change — otherwise a date part stops matching its date-group spec and falls through to the AI, which
+// then invents a work-experience date the profile already answers (observed live 2026-08-17: "Jun 1
+// 2026", reasoned from "typical summer internship start date"). One helper, used at every label-keyed
+// rung, so a future display tweak cannot reach the matcher again.
+function atsMatchLabel(f) {
+  return String((f && (f.partLabel || f.label)) || "");
+}
+
 function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, credentials) {
   // ── CREDENTIALS — the TOP rung, above the static map, buckets, labels and AI ────────────
   // This is the only way a credential is ever filled, and being FIRST is a safety property, not
@@ -3045,8 +3063,11 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   }
   // Buckets — the operator's own taught wordings, exact-normalized (no fuzzy; misses fall
   // through). Mode A (profile_path) + Mode B (value list) both become candidates/value.
-  if (bucketIndex && f.label) {
-    const b = bucketIndex.get ? bucketIndex.get(atsLib.normalizeLabel(f.label)) : bucketIndex[atsLib.normalizeLabel(f.label)];
+  // A taught wording is matched against the control's own name too (atsMatchLabel), so the display
+  // composition cannot silently orphan every bucket on a composite question.
+  if (bucketIndex && atsMatchLabel(f)) {
+    const bk = atsLib.normalizeLabel(atsMatchLabel(f));
+    const b = bucketIndex.get ? bucketIndex.get(bk) : bucketIndex[bk];
     if (b) {
       if (b.profile_path) {
         const raw = String(b.profile_path).split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
@@ -3062,16 +3083,16 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
       if (vals.length) return { candidates: vals, source: "bucket", kind: ATS_LOCATION_LABEL_RE.test(String(f.label || "")) ? "location" : undefined };
     }
   }
-  const routed = atsRouteLabel(f.label, f, profile, defaults);
+  const routed = atsRouteLabel(atsMatchLabel(f), f, profile, defaults);
   if (routed) return routed;
   // Employment-status recognizer (the "have you worked for «company» before?" class) —
   // the same deterministic tier the Workday driver runs, sentence-scoped + bail-guarded.
   // Contract (fill-driver): recognize → {tense, company} | null; decide → {fill, review,
   // detail} where fill:null = unevaluable → blank + review, NEVER a guess.
   const company = (jobContext && jobContext.company) || null;
-  const er = atsFd.recognizeEmploymentQuestion(f.label, company);
+  const er = atsFd.recognizeEmploymentQuestion(atsMatchLabel(f), company);
   if (er) {
-    const dec = atsFd.decideEmploymentStatus(er.tense, company, profile, f.label);
+    const dec = atsFd.decideEmploymentStatus(er.tense, company, profile, atsMatchLabel(f));
     if (dec && dec.fill) return { candidates: [dec.fill], source: "employment", review: !!dec.review, flag: dec.review ? "employer-match" : null, detail: dec.detail || "employment-status recognizer" };
     return { kind: "employment-blank", review: true, flag: "employer-match", detail: (dec && dec.detail) || "employment question unevaluable — left blank" };
   }
@@ -3549,6 +3570,18 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       question_key: f.questionKey != null ? f.questionKey : null,
       question_label_full: f.questionLabel != null ? f.questionLabel : null,
       part_label: f.partLabel != null ? f.partLabel : null,
+      // ⚠ WHICH REPEATING ENTRY THIS FIELD BELONGS TO. atsAssignEntryIndexes already works this out
+      // from the id's ordinal, but nothing carried it, so a per-customer Experience field (Start Date,
+      // Supervisor's Name, Employer Phone Number — all `rcf<NNNN>`, so no profile path either) had
+      // nothing placing it in a job. Review therefore listed all 27 of them AFTER the three entry
+      // blocks instead of inside them, which is what the operator saw (2026-08-17).
+      // ⚠ EMITTED AS THE SECTION KEY, because that is what `canonical_field` is built from
+      // ("experience[0].company", not "work_experience[0].company"). A first cut sent the profile
+      // ARRAY name instead and the two disagreed, so Experience split into `experience[i]` (the mapped
+      // fields) and `work_experience[i]` (these) — two groups per job. Education hid the bug, because
+      // its section key and its profile array happen to share a name.
+      entry_section: f.entrySection != null ? f.entrySection : null,
+      entry_index: typeof f.entryIndex === "number" ? f.entryIndex : null,
     };
     const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
     // show the operator what we are filling (see atsInjScrollIntoView) — best effort, never fatal

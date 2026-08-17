@@ -44,6 +44,18 @@ export function sectionOf(e: ReviewEntry): SectionInfo {
   // education[1], and a form heading cannot express that (both sit under one "Education").
   let m = cf.match(/^([A-Za-z_]+)\s*\[(\d+)\]/);
   if (m) return { key: m[1], label: humanize(m[1]), index: +m[2] };
+  // ⚠ A FIELD WITH NO PROFILE PATH CAN STILL BELONG TO A REPEATING ENTRY. Every per-customer question
+  // inside a work-history entry (Start Date, Supervisor's Name, Employer Phone Number — all
+  // `rcf<NNNN>`) has no canonical_field, so the branch above cannot place it, and it used to be listed
+  // AFTER the three entry blocks instead of inside them. The fill now carries the entry the scan
+  // worked out from the id's ordinal; using it puts the field in its job — and dissolves the duplicate
+  // "EXPERIENCE" heading, because these fields join experience[i] instead of forming a section of
+  // their own. Keyed on the SAME profile base the mapped fields use, so an entry stays one group and
+  // `sectionKey` keeps building valid canonical_fields for a newly added entry.
+  // `entry_section` arrives as the SAME base canonical_field uses, so it needs no translation.
+  if (e.entry_section && typeof e.entry_index === "number") {
+    return { key: e.entry_section, label: humanize(e.entry_section), index: e.entry_index };
+  }
   // ⚠ THE FORM'S OWN HEADING WINS for a flat field, because the review page is read next to the form
   // (operator, 2026-08-17: "display the same order as the form"). Grouping by PROFILE SHAPE instead
   // reordered the page relative to the form and — worse — collapsed every question with no profile

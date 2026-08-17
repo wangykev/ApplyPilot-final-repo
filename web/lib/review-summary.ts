@@ -88,6 +88,11 @@ export type ReviewEntry = {
   question_key?: string | null;        // shared by the parts of one question
   question_label_full?: string | null; // "What are your salary requirements?"
   part_label?: string | null;          // "Currency" / "Month"
+  // Which repeating ENTRY a field belongs to, for a field the profile does not map (a per-customer
+  // question inside a work-history entry). Carried as the SAME base `canonical_field` uses
+  // ("experience"), so sectionOf lands it in the group its mapped siblings already form.
+  entry_section?: string | null;
+  entry_index?: number | null;
   tree_structure?: TreeStructure; // cert/source tree-AI (chosen category + leaves)
   date_order?: string[] | null; // segment order for the segmented date editor
   tiers?: string[] | null; // ordered candidate list for a hierarchical/tree field

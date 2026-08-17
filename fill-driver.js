@@ -8269,6 +8269,11 @@ function buildReviewBundle(results, meta) {
       question_key: rec.question_key != null ? String(rec.question_key) : null,
       question_label_full: rec.question_label_full != null ? String(rec.question_label_full) : null,
       part_label: rec.part_label != null ? String(rec.part_label) : null,
+      // Which repeating ENTRY a field belongs to, for a field the profile does not map (a per-customer
+      // `rcf<NNNN>` question inside a work-history entry). Without it review has nothing placing the
+      // field in a job, and lists them all after the entry blocks.
+      entry_section: rec.entry_section != null ? String(rec.entry_section) : null,
+      entry_index: typeof rec.entry_index === "number" ? rec.entry_index : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
       remembered_fields: Array.isArray(rec.remembered_fields) ? rec.remembered_fields : null, // Phase 2: removed_entry → what filled (per field + how) so add-back PREFILLS them
