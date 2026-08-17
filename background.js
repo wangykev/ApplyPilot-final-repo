@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "credential-display-1";
+const AP_BUILD_MARKER = "review-structure-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -813,7 +813,44 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         if (ats === "icims") await cdpUseFormFrame(4).catch(() => null);
         const scan = await cdpEval(atsInjScan, ats);
         const state = await cdpEval(atsInjSubmitState, ats).catch(() => null);
-        sendResponse({ ok: true, scan, submitState: state });
+        // `rowsFor: [fieldName, …]` — READ-ONLY structural trace of the row a control sits in, so a
+        // label/grouping question can be answered from the real markup instead of guessed at. Added
+        // for the iCIMS composites (Salary = Currency/Amount/Time Frame in one row), which carry no
+        // <label for> at all and so reached review labelled with their raw field id.
+        let rows = null;
+        if (Array.isArray(message.rowsFor) && message.rowsFor.length) {
+          rows = await cdpEval(function (names) {
+            const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+            const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+            return names.map((n) => {
+              const el = document.getElementById(n) || document.querySelector('[name="' + esc(n) + '"]');
+              if (!el) return { name: n, found: false };
+              const row = el.closest(".iCIMS_TableRow") || el.closest("tr") || el.parentElement;
+              const controls = row ? [...row.querySelectorAll("input:not([type=hidden]), select, textarea")]
+                .map((c) => ({ id: c.id || c.name || "", tag: c.tagName, type: c.type || "" })) : [];
+              // Where does the QUESTION text live, if not inside the row? Walk outward and back so the
+              // answer comes from the markup rather than a guess.
+              const prevs = [];
+              let p = row ? row.previousElementSibling : null;
+              for (let i = 0; i < 3 && p; i++, p = p.previousElementSibling) {
+                prevs.push({ tag: p.tagName, cls: clean(p.className).slice(0, 60), text: clean(p.innerText).slice(0, 120) });
+              }
+              const up = [];
+              let a = row ? row.parentElement : null;
+              for (let i = 0; i < 3 && a; i++, a = a.parentElement) {
+                up.push({ tag: a.tagName, cls: clean(a.className).slice(0, 60),
+                  ownText: clean([...a.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent).join(" ")).slice(0, 120),
+                  firstLabel: clean((a.querySelector("label, .iCIMS_FormLabel, th, legend") || {}).textContent).slice(0, 120) });
+              }
+              return { name: n, found: true,
+                rowClass: row ? clean(row.className).slice(0, 90) : null,
+                rowText: row ? clean(row.innerText).slice(0, 200) : null,
+                prevSiblings: prevs, ancestors: up,
+                controlsInRow: controls };
+            });
+          }, message.rowsFor).catch((e) => ({ error: String((e && e.message) || e) }));
+        }
+        sendResponse({ ok: true, scan, submitState: state, rows });
       } catch (e) {
         sendResponse({ ok: false, error: String((e && e.message) || e) });
       } finally {

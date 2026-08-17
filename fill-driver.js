@@ -8264,6 +8264,11 @@ function buildReviewBundle(results, meta) {
       // Supabase on the application row, which is the leak the placeholder exists to prevent.
       credential: rec.credential === true ? true : null,
       credential_kind: rec.credentialKind != null ? String(rec.credentialKind) : null,
+      // One form question rendered as SEVERAL controls (salary = currency/amount/timeframe, a date =
+      // month/day/year). Detected from the page, never enumerated — see the scan's questionRowOf.
+      question_key: rec.question_key != null ? String(rec.question_key) : null,
+      question_label_full: rec.question_label_full != null ? String(rec.question_label_full) : null,
+      part_label: rec.part_label != null ? String(rec.part_label) : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
       remembered_fields: Array.isArray(rec.remembered_fields) ? rec.remembered_fields : null, // Phase 2: removed_entry → what filled (per field + how) so add-back PREFILLS them

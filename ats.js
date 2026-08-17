@@ -1147,15 +1147,113 @@ function atsInjScan(ats) {
         value: (list.filter((r) => r.checked).map(optLabel).join(", ")) || null,
         options: list.map(optLabel).filter(Boolean), group: list[0].type }));
     }
+    // ── ONE QUESTION, SEVERAL CONTROLS — detected, not enumerated ────────────────────────
+    // "What are your salary requirements? (Currency / Amount / Time Frame)" is ONE question that
+    // iCIMS renders as three controls, and so is "End Date (Month / Day / Year)". Traced 2026-08-17:
+    //
+    //   DIV.iCIMS_FieldRow                    ← the QUESTION; its label is the question text
+    //    └ DIV.iCIMS_TableCell
+    //       └ DIV.iCIMS_Table
+    //          └ DIV.iCIMS_TableRow           ← the PARTS
+    //             ├ …Salary_Currency   label "Currency"
+    //             ├ …Salary            label "Amount (Numbers only)"
+    //             └ …Salary_Timeframe  label "Time Frame"
+    //
+    // ⚠ `iCIMS_FieldRow` IS THE DISCRIMINATOR, and using it is what keeps this free of hardcoding
+    // (operator's standing ask): no list of composite field names, no suffix vocabulary
+    // (_Currency/_Month/_Year), no per-tenant table. The page says "these controls answer one
+    // question" and we read that. Any composite iCIMS invents is covered for free, and the inner
+    // `.iCIMS_TableRow` alone is NOT enough — it also matches the outer field row, which is exactly
+    // why the question and its parts have to be told apart by the FieldRow class.
+    const questionRowOf = (el) => el.closest(".iCIMS_FieldRow") || null;
+    const questionTextOf = (el) => {
+      const qr = questionRowOf(el);
+      if (!qr) return null;
+      // The FIRST label in the question row is the question; the parts' own labels come after it,
+      // inside the nested table.
+      const l = qr.querySelector("label, .iCIMS_FormLabel, legend");
+      const t = l ? stripReq(txt(l)) : null;
+      return t || null;
+    };
+    // A stable key for "these controls belong to the same question", derived from the question row
+    // itself rather than from any field's name — so it holds even when the parts share no id stem.
+    const qrKeys = new Map();
+    const questionKeyOf = (el) => {
+      const qr = questionRowOf(el);
+      if (!qr) return null;
+      if (!qrKeys.has(qr)) qrKeys.set(qr, "q" + qrKeys.size);
+      return qrKeys.get(qr);
+    };
+    // ⚠ COUNT ONLY WHAT THE LOOP BELOW WILL ACTUALLY EMIT. Counting every control in the row marked
+    // single-question rows as composites whenever the row also held a radio or checkbox — which this
+    // loop skips (they are handled by the grouping pass) — so "Time Zone" and the SMS-consent
+    // dropdown arrived flagged as composites with one part each.
+    const emittable = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=radio]):not([type=checkbox]), select, textarea';
+    // ⚠ AND ONLY THE VISIBLE ONES. An `icims_dropdown` keeps its own `input.dropdown-search` inside
+    // the same field row, hidden until the widget is opened — so a plain one-question row counted TWO
+    // controls and was mis-marked a composite ("Time Zone", the SMS-consent question). The loop below
+    // already skips invisible controls; the count has to agree with it or the two disagree about what
+    // a question contains.
+    const controlsInQuestion = (el) => {
+      const qr = questionRowOf(el);
+      if (!qr) return 1;
+      return [...qr.querySelectorAll(emittable)].filter(vis).length;
+    };
+    // The container that holds THIS control and no other — its own cell within the question. Found by
+    // walking outward while the ancestor still contains exactly one emittable control, which needs no
+    // class names at all and so survives any markup iCIMS uses. That cell's label is the part's name
+    // ("Currency", "Month"): those labels are SIBLINGS of the control, not `label[for=…]` and not
+    // ancestors, which is why labelFor found nothing and every part inherited the question text.
+    const partLabelOf = (el) => {
+      let cell = el;
+      for (let i = 0; i < 5; i++) {
+        const up = cell.parentElement;
+        if (!up || up.querySelectorAll(emittable).length !== 1) break;
+        cell = up;
+      }
+      const l = cell.querySelector("label, .iCIMS_FormLabel, legend");
+      if (l) { const t = stripReq(txt(l)); if (t) return t; }
+      // No label element — take the cell's own text, minus anything the control itself renders (a
+      // <select>'s option list would otherwise come back as the "label").
+      const own = [...cell.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join(" ");
+      const t = stripReq(String(own || "").replace(/\s+/g, " ").trim());
+      return t || null;
+    };
+
     for (const el of document.querySelectorAll("input, textarea, select")) {
       if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox") continue;
+      // ⚠ A BUTTON IS NOT A FIELD. `<input type="submit" id="cp_form_submit_i">` was being scanned as
+      // a text field, so "cp_form_submit_i" appeared in review as a question with a raw id for a label
+      // (operator, 2026-08-17) — and, worse, it was a writable target: atsInjSetText on a submit input
+      // rewrites its caption. Detected by the element's own type, so it needs no per-tenant id.
+      if (/^(submit|button|reset|image)$/.test(String(el.type || ""))) continue;
       const id = el.id || el.name || ""; if (!id || seen.has(id)) continue;
       // file inputs are styled invisible on this theme (the visible control is a sibling button row)
       if (el.type !== "file" && !vis(el)) continue;
       seen.add(id);
       const sel = el.id ? "#" + esc(el.id) : el.tagName.toLowerCase() + '[name="' + esc(el.name) + '"]';
-      const label = stripReq(labelFor(el) || id);
-      const base = { fieldName: id, inputSel: sel, label: label || id, isRequired: req(el), section: sectionOf(el) };
+      // ⚠ NEVER FALL BACK TO THE RAW ID FOR A LABEL. `labelFor` only knows `label[for=…]` and an
+      // ancestor <label>, and an iCIMS composite part has neither — so review showed
+      // "CandProfileFields.Salary_Currency" AS THE QUESTION (operator, 2026-08-17). Three sources
+      // now, in order of how well they describe the field to a human:
+      //   own label  → the part's name inside the question ("Currency", "Month")
+      //   question   → the FieldRow's label ("What are your salary requirements?")
+      //   the id     → last resort, and now visibly a last resort rather than the norm
+      const question = questionTextOf(el);
+      const parts = controlsInQuestion(el);
+      // For a composite the part's name comes from its own cell (partLabelOf); for a lone control the
+      // ordinary label association is right, and cheaper.
+      const own = parts > 1 ? (partLabelOf(el) || stripReq(labelFor(el) || "") || null)
+        : (stripReq(labelFor(el) || "") || null);
+      // A question rendered as SEVERAL controls needs both halves to read properly; a lone control
+      // just takes whichever it has, because "Currency — Currency" is noise.
+      const label = (parts > 1 && question && own && own !== question) ? question + " — " + own
+        : (question || own || id);
+      const base = { fieldName: id, inputSel: sel, label, isRequired: req(el), section: sectionOf(el),
+        // Carried so review can GROUP the parts of one question instead of listing them as peers.
+        questionKey: parts > 1 ? questionKeyOf(el) : null,
+        questionLabel: parts > 1 ? question : null,
+        partLabel: parts > 1 ? own : null };
       if (el.type === "file") { push(Object.assign(base, { widgetType: "file_upload", isRequired: req(el), value: (el.files && el.files[0] && el.files[0].name) || null })); continue; }
       if (el.tagName === "SELECT" && el.multiple) {
         // A native <select multiple> is a MULTI-answer control: committing it by selectedIndex (what
@@ -3428,6 +3526,19 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       fieldName: f.fieldName, label: f.label, widgetType: ATS_REVIEW_WIDGET[f.widgetType] || f.widgetType,
       isRequired: !!f.isRequired, mappedPath: null, rawValue: null, resolved: null,
       status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
+      // ⚠ CARRY THE SECTION THROUGH. The scan reads it (`sectionOf` — the nearest preceding heading)
+      // and the bundle has a slot for it, but nothing joined the two, so every iCIMS field arrived
+      // with `section_heading: null` and the review page filed all 108 of them under "Other fields".
+      // That is why "Supervisor's Name" and "Employer Phone Number" read as context-free questions:
+      // they are Experience fields that lost the only thing saying so (operator, 2026-08-17).
+      section_heading: f.section != null ? f.section : null,
+      section_known: f.section != null ? true : null,
+      // One question rendered as several controls — see the scan's questionRowOf. Carried so the
+      // review page can show ONE row per question with its parts inside, instead of three peers
+      // whose labels ("Month", "Year") say nothing about which date they belong to.
+      question_key: f.questionKey != null ? f.questionKey : null,
+      question_label_full: f.questionLabel != null ? f.questionLabel : null,
+      part_label: f.partLabel != null ? f.partLabel : null,
     };
     const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
     // show the operator what we are filling (see atsInjScrollIntoView) — best effort, never fatal
