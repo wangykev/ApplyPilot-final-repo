@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured } from "@/lib/env";
 import { coerceAiConfig, totalUsableKeys } from "@/lib/ai-config";
 import { callLLMTracked } from "@/lib/llm-server";
+import { bulletizeRoleDescriptions } from "@/lib/resume-prompt";
 import { buildResumePrompt, parseProfileFromReply } from "@/lib/resume-prompt";
 
 export const runtime = "nodejs";
@@ -64,8 +65,9 @@ export async function POST(req: Request) {
   const profile = parseProfileFromReply(res.text);
   if (!profile) return bad("The model's reply wasn't valid JSON. Try parsing again.", 502);
 
-  return NextResponse.json({ ok: true, profile });
+  return NextResponse.json({ ok: true, profile: bulletizeRoleDescriptions(profile) });
 }
+
 
 function bad(error: string, status: number) {
   return NextResponse.json({ ok: false, error }, { status });
