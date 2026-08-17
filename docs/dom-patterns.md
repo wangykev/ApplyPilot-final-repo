@@ -37,7 +37,8 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
-| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select` |
+| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
+| **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
 | **Host / URL shapes** | `2026-07-22 — logged-in host is` |
 
@@ -4196,3 +4197,91 @@ carries the field's own label ("Country", "State/Province").
 `filled · exact-normalized · "Florida"`, both deterministic and unflagged; the page's `needs_review`
 count went 9 → 1. The tiered profile country (`["United States of America", "United States"]`) is what
 lands it — the form offers the short form only, so the second tier is the one that matches.
+
+## 2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage — the employer portal, the email gate, and its invisible hCaptcha
+
+Traced live from the LinkedIn-provided link `careers.astrion.us/jobs/24615?mode=apply&iis=LinkedIn`,
+then driven end to end by the pipeline (hidden and visible). This is the stage BEFORE everything in the
+two entries above: how a run gets from an employer careers link to the form those entries describe.
+
+**The employer portal is a separate host with no ATS in its name.** `careers.astrion.us` is an iCIMS
+career portal served under the employer's own domain — AngularJS (`html#ng-app`), **zero iframes**, and
+exactly ONE Apply affordance: a plain `<a href="https://astrioncareers-astrion.icims.com/jobs/24615/login?iis=LinkedIn">Apply</a>`.
+`?mode=apply` is INERT — the page is byte-identical with and without it (measured at 0ms and 3s), so
+there is no auto-hop to detect and no query to preserve on the employer side.
+
+⚠ `chrome.scripting` CANNOT READ THIS HOST — it is not in `host_permissions` and deliberately never will
+be (the whole point of driving these through the debugger). So `waitJobPageSettled` and
+`scrapeJobDescription` both fail on their first read with *"Cannot access contents of url … Extension
+manifest must request permission to access this host"*, and the settle returns **instantly with 0 chars**.
+Anything downstream that assumed the page had settled was racing the Angular render. Over CDP the same
+page settles in ~1.3–1.9s at **4598 chars**.
+
+**The apply link lands on a LOGIN page, and that login page passes the form identifier.** The gate is at
+`<tenant>.icims.com/jobs/<id>/login`, and it is inside the SAME `#icims_content_iframe` the application
+form uses (top document: 159 chars, zero controls). Its content:
+
+```html
+<h2>Enter Your Information</h2>
+<input type="email" id="email" name="css_loginName" autocomplete="email">
+<input type="submit" id="enterEmailSubmitButton" value="Next">
+<textarea id="h-captcha-response-<rand>" name="h-captcha-response">   <!-- hidden -->
+```
+
+⚠ **A submit control + an email field is exactly `atsLooksLikeApplicationForm`'s positive test**, so
+without an auth check running FIRST this page classifies as the application form. Note also that the frame
+holds only **3** controls, so `cdpUseFormFrame(4)` — the floor `waitAtsFormReady` uses — REFUSES to arm on
+it; the pre-form stage arms with a floor of 1.
+
+**The gate's submit is preventDefault-ed and gated on INVISIBLE hCaptcha.** Verbatim from the frame's own
+inline script (sitekey `94fee806-…`, `data-size="invisible"`):
+
+```js
+form.addEventListener("submit", (e) => {
+  e.preventDefault();   // Stops the form from submitting until we can call hcaptcha
+  if (typeof icimsInvisibleRecaptchaBeforeSubmit === 'undefined' || icimsInvisibleRecaptchaBeforeSubmit())
+    hcaptcha.execute(widgetId);
+});
+// hcaptcha callback: append <input name="h-captcha-response" value=token>, then form.submit()
+```
+
+and the form's own `onsubmit` attribute is
+`icimsDisableSaveAndSubmitButtons('enterEmailSubmitButton','','enterEmailForm')`.
+
+**Two consequences, both load-bearing.** (1) The button DISABLES ITSELF on submit and only the captcha
+callback ever unlocks it — so a captcha that never answers leaves a page that cannot be retried in place;
+a second press reports `submit-disabled`, which reads like an unrelated fault. Only a reload restores it.
+(2) The pair (`submitLocked`, `captchaToken`) is what tells the two failure modes apart, and nothing else
+does: **submitLocked true + captchaToken false = the form fired and the captcha never came back**;
+captchaToken true = the POST is in flight.
+
+**✅ MEASURED CAUSE — OUR blob-worker timer polyfill stops hCaptcha initialising.** Under a run:
+`submitLocked true · captchaToken false · captchaFrames 0 · challengeVisible false`. By hand on the same
+page in the same session, an `newassets.hcaptcha.com/captcha/v1/…` iframe is present. So hCaptcha was not
+*refusing* us — it never loaded. Isolated to the **worker polyfill alone, not the CSP bypass**, by
+splitting the two switches: with `Page.setBypassCSP` still ON and only the worker declined, the gate
+passes on the FIRST submit. iCIMS runs therefore pass `{noWorkerTimers:true}` to
+`cdpInstallPageOverrides`. ⚠ This is not captcha handling and must never become it — it removes our own
+tampering so the page's check can run and judge the session; a refusal still halts for the operator.
+Cost: a hidden iCIMS run reports `hidden-SLOW (no worker timers)`. Measured price on this form: **28.7s
+for 108 fields (265ms/field)** — iCIMS is server-rendered jQuery, so it leans on page timers far less
+than Workday does.
+
+**⚠ THE IFRAME MOUNTS AFTER THE DOCUMENT, and the race is VISIBLE-ONLY.** A scan arriving before
+`#icims_content_iframe` exists reads the empty top document and concludes there is neither a gate nor an
+Apply control. A HIDDEN run is slow enough to lose the race and never sees it — so "it worked in the
+background" is NOT evidence here; the visible run is the one that reproduces it.
+
+**⚠ `login.icims.com` IS THE RECRUITER LOGIN, NOT THE CANDIDATE'S.** `/jobs/intro` on this tenant
+redirects to `login.icims.com/u/login/identifier?state=…` — an Auth0 universal login carrying the
+customer's org name. It renders an email box, so an auth classifier will happily offer the candidate's
+address to a STAFF login. It is an `icims.com` host, so a `detectAts`-based SSO exemption cannot catch
+it: it needs its own host check, ahead of everything.
+
+**The JD scrape's company is a PAGE TITLE on this host.** With no ATS markup to key on,
+`scrapeJobPosting` returned `"Engineering Directorate Support Intern in Mountain View, California |
+Astrion"` as the *company*. That string anchors the safety-critical employment recognizer. The iCIMS
+subdomain is the reliable source (`astrioncareers-astrion` → `"Astrion"`).
+
+**Result:** `careers.astrion.us` → Apply → the email gate → the form, then **108 fields, 67 filled ·
+40 skipped · 6 needing review**, reported to the tracker. Verified hidden AND visible.

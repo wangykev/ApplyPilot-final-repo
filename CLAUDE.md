@@ -581,6 +581,40 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   id="cp_form_submit_i" value="Submit Profile">`, and the generic finder queries only `button`s and
   matches `textContent`, which an `<input>` lacks. Measured: without it `hasSubmit:false` and
   `atsLooksLikeApplicationForm` REFUSES a perfectly good form.
+- **A RUN STARTS FROM AN EMPLOYER-HOSTED PORTAL, AND ITS LOGIN PAGE LOOKS LIKE A FORM (2026-08-16).**
+  `careers.astrion.us` is an iCIMS portal on the EMPLOYER's domain, so `detectAts` (host-based, and it
+  must stay that way) returns null. Detection is by PAGE EVIDENCE — `atsPortalAts` reads the hosts the
+  page itself references and refuses when two ATSs are named. ⚠ Then the Apply link lands on
+  `/jobs/<id>/login`, whose email box + submit control **PASS `atsLooksLikeApplicationForm`** — so
+  `runIcimsPreForm` runs BEFORE the form wait, never as a fallback after it. Reaching the gate and calling
+  it "the form" would type profile data into a login box. `icimsAuthView`'s control bound is what separates
+  them, and it is unit-pinned in the direction that bites: **the application form carries its OWN
+  Login/Password block, so a password box is NOT evidence of a sign-in page.** The stage carries
+  `runCdpOnboard`'s invariants verbatim (credentials only from storage and written through
+  `atsInjSetCredential`, so the password cannot reach a log line; SSO refused on URL evidence ONLY;
+  federated and account-creation controls REPORTED, never pressed; every stop `needs_operator`; it stops at
+  the form and submits nothing) and runs on the SUBMIT path too, which meets the same gate on a fresh tab.
+  `login.icims.com` is the **RECRUITER** login and needs its own refusal — it is an `icims.com` host, so
+  the SSO test exempts it. Settle before scanning: the frame mounts after the document, and that race is
+  **VISIBLE-ONLY** (a hidden run is slow enough to miss it, so "it worked in the background" is not
+  evidence). The flaky Apply control is retried against the page's own IDENTITY (`atsSignatureChanged`
+  over top **and** frame — a postback changes only the frame), never a click count.
+- **⚠ THE SIGN-IN GATE IS INVISIBLE hCAPTCHA, AND OUR OWN TIMER POLYFILL BREAKS IT (2026-08-16).** The
+  gate's submit is `preventDefault`-ed and only proceeds on `hcaptcha.execute`'s callback; measured,
+  hCaptcha **never initialises** under the blob-worker timer polyfill (`captchaFrames 0` under a run vs a
+  rendered iframe by hand). Isolated to the WORKER alone, not the CSP bypass, so iCIMS runs pass
+  `{noWorkerTimers:true}` to `cdpInstallPageOverrides` and accept `hidden-SLOW` pacing (measured price:
+  28.7s/108 fields — iCIMS is server-rendered jQuery, so it leans on page timers far less than Workday).
+  **This is NOT captcha handling and must never become it:** it removes OUR tampering so the page's own
+  check can run and judge the session — nothing is solved, forged or hidden, and a refusal still halts for
+  the operator. The gate also **disables its own button** on submit (`icimsDisableSaveAndSubmitButtons`) and
+  only the captcha callback unlocks it, so a stall cannot be retried in place — one bounded reload, then
+  `captcha-unanswered`. Diagnose with the pair `submitLocked` (the submit FIRED) + `captchaToken` (the
+  captcha RESOLVED); nothing else tells the two apart.
+- **A JD-scraped COMPANY can be a PAGE TITLE, and that string is safety-critical.** On an employer page
+  there is no ATS markup to key on, so the scrape returned the document title as the company — the anchor
+  for "have you worked for us before?". `atsPlausibleCompany` is a NEGATIVE test; what it rejects falls back
+  to the iCIMS tenant subdomain (evidence), what it cannot judge is KEPT (so GH/Lever/Ashby are unchanged).
 - **The résumé is SKIPPED on iCIMS for now** (`kind:"skip"`): iCIMS parses it server-side and posts the
   result back seconds after the attach reports success, re-rendering entries under new ids and blanking
   the fill. The form's own "Upload Resume at a later time" box is left UNTICKED — the operator's choice.

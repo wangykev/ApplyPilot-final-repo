@@ -20,7 +20,8 @@ For current state and open work, see **`docs/status.md`**.
 |---|---|
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — MULTI-ATS: Greenhouse / Lever / Ashby end-to-end` (the landing milestone), then `2026-07-31 (b)`…`(f)`, `2026-08-04 — the async combobox`, `2026-08-05 — multi-ATS end to end`, `2026-08-07 — the dead first fill` |
 | **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
-| **Onboarding / auth / already-applied** | `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
+| **iCIMS pre-form (employer portal → gate → form)** | `2026-08-16 (c) — iCIMS PRE-FORM` |
+| **Onboarding / auth / already-applied** | `2026-08-16 (c) — iCIMS PRE-FORM` (the non-Workday one), `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
 | **Autofill with résumé** | `2026-08-08 — Autofill-with-Resume end to end`, `2026-08-07 (e) — the flow a first application should take` |
 | **SKILLS field** | `2026-08-07 (d) — SKILLS: the multi-value typeahead` |
 | **Replay walk / submit gate** | `2026-07-28 — The replay walk never settled the page`, `2026-07-28 — Submit gate relaxed`, `2026-07-28 — Background submit runs`, `2026-07-27 — Page-5 replay`, `2026-07-26 — Per-application LOGIN on the backend` |
@@ -5055,3 +5056,83 @@ fresh `cdpAttach` resets the pin, so it had been reading the empty top document 
 but a client-side timeout left its debugger attached and the retry wedged. The verification therefore
 rests on the two reads inside the run — `atsInjIcimsRead` after the commit, and the M40-lite audit's
 independent re-read after the page settled, which flagged nothing — not on a third outside opinion.
+
+## 2026-08-16 (c) — iCIMS PRE-FORM: an employer careers link now reaches the form signed in
+
+**What:** the stage before everything in the two entries above. A run started from an employer-hosted
+careers link (`careers.astrion.us/jobs/24615?mode=apply&iis=LinkedIn`, the LinkedIn-provided link) now
+scrapes the JD, follows Apply, gets past iCIMS' email gate with the stored credentials, and hands the
+application form to the existing fill. **Live-verified end to end, hidden AND visible** —
+`signed in and on the application form — 70 field(s)` → `fill complete — 108 field(s), 6 need review.
+Reported to the website.` Hidden: **28.7s, 265ms/field**.
+
+**Why it did not work before:** `detectAts` is host-based and must stay that way, so `careers.astrion.us`
+returned null and nothing iCIMS-aware ever saw the URL. And once a run *did* reach the tenant host it met
+a sign-in card no stage knew how to pass.
+
+**The dangerous half was not the missing feature.** iCIMS' login page PASSES
+`atsLooksLikeApplicationForm` — a submit control plus an email field is exactly that function's positive
+test — so a run reaching the gate would classify it as the application form and start writing profile data
+into a login box. The auth check therefore runs BEFORE the form wait, not as a fallback after it, and
+`icimsAuthView` is what stands between the two. Its control bound is unit-pinned in both directions,
+including the case that matters most: the application form carries its OWN Login/Password/Password_Confirm
+block (the account is created by the submission), so a password box is NOT evidence of a sign-in page.
+
+**`runIcimsPreForm`** (background.js) carries `runCdpOnboard`'s invariants verbatim: credentials only from
+`chrome.storage.local`, written through `atsInjSetCredential` (returns a LENGTH and a match boolean, so the
+password cannot reach a log line); SSO refused on URL evidence only; a federated button reported, never
+clicked; an account-creation control never pressed; every human-needed stop `needs_operator` with a
+self-explaining reason. It stops at the form and submits nothing. It also runs on the SUBMIT path, which
+opens a fresh tab and meets the same gate.
+
+**The Apply retry watches the page's IDENTITY, not a click count** (`atsInjPageSignature` /
+`atsSignatureChanged`): url, the iCIMS frame src, the heading, and the rendered control set, read across
+BOTH the top document and the frame, since a postback changes only the second. An unreadable read scores as
+NO change, so a failed probe can never look like progress.
+
+**Three faults found by running it** — each measured, not reasoned about; full DOM detail in
+`docs/dom-patterns.md` `2026-08-16 (c)`:
+
+1. **The gate's submit is gated on INVISIBLE hCAPTCHA, and OUR blob-worker timer polyfill stopped hCaptcha
+   initialising.** Measured `captchaFrames 0` under a run against a rendered hcaptcha iframe by hand.
+   Isolated to the worker polyfill *alone*, not the CSP bypass, by splitting the two switches —
+   `cdpInstallPageOverrides` now takes `{noWorkerTimers}` for a caller, while the storage kill-switch keeps
+   its old meaning (it simulates a CSP-blocked tenant, so it still disables the bypass too). ⚠ This is NOT
+   captcha handling and must never become it: it removes our own tampering so the page's own check can run
+   and judge the session; a refusal still halts for the operator. Two new read-backs (`submitLocked`,
+   `captchaToken`) are what tell "the form fired and the captcha never came back" from "the POST is in
+   flight" — without them the two are indistinguishable. The gate also DISABLES ITS OWN BUTTON on submit,
+   so a stall cannot be retried in place; one bounded reload restores it, a second stall halts
+   `captcha-unanswered`.
+2. **The scan outran iCIMS' iframe mount — and only when VISIBLE.** A hidden run is slow enough to lose the
+   race, so "it worked in the background" was not evidence. Settle before scanning, polled against the
+   page's own readiness (the standing rule this stage had broken).
+3. **The company was a page title.** With no ATS markup to key on, the JD scrape returned *"Engineering
+   Directorate Support Intern in Mountain View, California | Astrion"* as the COMPANY — the string that
+   anchors the safety-critical "have you worked for us before?" recognizer. `atsPlausibleCompany` is a
+   NEGATIVE test with loud tells rather than a cleverer parser; what it rejects falls back to the iCIMS
+   tenant subdomain (evidence, not a heuristic), and what it cannot judge is KEPT, so Greenhouse / Lever /
+   Ashby are unchanged.
+
+**Also fixed on the way:** the employer-domain probe in `AP_RUN_APPLICATION` settles over CDP instead of
+racing the render (`waitJobPageSettled` reads through host-gated `chrome.scripting`, which fails instantly
+on an employer domain); it learned a third tier, `atsPortalAts`, which asks who runs a careers site from
+the hosts the page itself references and refuses when two ATSs are named; and it no longer overwrites the
+run's CDP-scraped `jd` with its own null one, which had emptied the tracker's job description for every
+employer-hosted posting. `login.icims.com` — iCIMS' Auth0 login for RECRUITERS, one path off the candidate
+portal — gets its own refusal, because it is an `icims.com` host and the SSO test deliberately exempts
+those.
+
+**Tests:** 29 new in `test/ats-icims-onboard.test.js`; suite 1468/1469 (`db.test.js` needs `fake-indexeddb`,
+absent from this worktree's `node_modules` — pre-existing, unrelated).
+
+**Verified alongside:** the review editor renders real pickers, carrying their live options, for choice
+fields left blank (phone Type, currency, rate unit, month/day) — eyeballed on the tracker. And
+certifications did NOT report `skipped · no profile mapping` on this requisition; that string appears
+nowhere in the bundle, so the earlier report is either fixed or belongs to a different req. Not chased
+further.
+
+**Open:** `runIcimsPreForm` has met only the EMAIL step live — this tenant's account already existed, and
+the gate let it through without a password. The `password`, `code`, `blocked` and `verification-emailed`
+branches are unit-pinned but not live-exercised. The submit/rehearse path through the gate is likewise
+unexercised.
