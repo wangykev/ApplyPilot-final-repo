@@ -53,6 +53,60 @@ test("jd summary: degree words only — 'BS'/'MS' collide with too much else", (
   assert.strictEqual(val("Experience with MS Office and BS EN standards", "Degree"), undefined);
 });
 
+test("⚠ jd summary: SEVERAL degree levels is an eligibility RANGE, never the top of it", () => {
+  // Verbatim from the live Astrion posting (careers.astrion.us/jobs/24615, read 2026-08-17). Reporting
+  // "PhD" told an undergraduate they were under-qualified for a job that explicitly invites them —
+  // the one outcome this file exists to avoid.
+  assert.strictEqual(
+    val("Astrion seeks undergraduate, graduate and PhD students for support to spaceflight engineering efforts at NASA Ames Research Center.", "Degree"),
+    "Bachelor's – PhD",
+  );
+  // The other common shape, wrong the same way: the REQUIREMENT is the bachelor's, not the preference.
+  assert.strictEqual(val("Bachelor's degree required; Master's preferred.", "Degree"), "Bachelor's – Master's");
+  assert.strictEqual(val("Associate's degree or Bachelor's degree in a technical field.", "Degree"), "Associate's – Bachelor's");
+  // ONE level named is still reported flatly — the range only appears when the posting offers one.
+  assert.strictEqual(val("Doctorate required.", "Degree"), "PhD");
+});
+
+test("jd summary: 'undergraduate' is the BACHELOR'S rung, so both words are not a fake range", () => {
+  assert.strictEqual(val("Open to undergraduate students.", "Degree"), "Bachelor's");
+  assert.strictEqual(val("Undergraduate coursework toward a Bachelor's degree.", "Degree"), "Bachelor's");
+  // A bare "associate" is a JOB TITLE, not a degree — it needs the word "degree" to count.
+  assert.strictEqual(val("You will join as an Associate Engineer on our platform team.", "Degree"), undefined);
+});
+
+test("⚠ jd summary: a posting that DECLARES no clearance must not be reported as requiring one", () => {
+  // The live Astrion posting says both of these, and the old code answered "Security clearance".
+  const astrion =
+    "CLEARANCE: N/A CERTIFICATION: N/A TRAVEL: As Needed. " +
+    "Applicants for positions which require a US government security clearance must meet eligibility requirements to include US citizenship.";
+  assert.strictEqual(val(astrion, "Clearance"), undefined);
+  // 1. the header declaration on its own
+  assert.strictEqual(val("CLEARANCE: N/A", "Clearance"), undefined);
+  assert.strictEqual(val("Security clearance: None", "Clearance"), undefined);
+  assert.strictEqual(val("No security clearance is required for this role.", "Clearance"), undefined);
+  assert.strictEqual(val("This position does not require a security clearance.", "Clearance"), undefined);
+  // 2. the CONDITIONAL boilerplate on its own — a claim about postings in general, not this one
+  assert.strictEqual(
+    val("Applicants for positions which require a US government security clearance must meet eligibility requirements.", "Clearance"),
+    undefined,
+  );
+  assert.strictEqual(val("If the position requires a security clearance, you must be eligible.", "Clearance"), undefined);
+});
+
+test("jd summary: a GENUINE clearance requirement still surfaces alongside the boilerplate", () => {
+  // The negative must not become a blanket mute: a real requirement in one sentence still counts even
+  // when a conditional clause sits in another.
+  const both =
+    "Must hold an active TS/SCI clearance. " +
+    "Applicants for positions which require a US government security clearance must meet eligibility requirements.";
+  assert.strictEqual(val(both, "Clearance"), "Ts/sci");
+  assert.strictEqual(val("An active Secret Clearance is required for this role.", "Clearance"), "Secret clearance");
+  // ITAR gets the same sentence-level treatment.
+  assert.strictEqual(val("Where required, ITAR restrictions may apply.", "Clearance"), undefined);
+  assert.strictEqual(val("This role is subject to ITAR; applicants must be a U.S. Person.", "Clearance"), "ITAR / US person");
+});
+
 test("jd summary: type, travel and deadline", () => {
   assert.strictEqual(val("This is a full-time position based in Denver.", "Type"), "Full-time");
   assert.strictEqual(val("Summer 2026 Internship — apply early!", "Type"), "Internship");

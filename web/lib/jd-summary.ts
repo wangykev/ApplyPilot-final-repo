@@ -66,12 +66,36 @@ function experience(t: string): string | null {
   return flat ? `${flat[1]}+ years` : null;
 }
 
-/** DEGREE — spelled-out words only. "BS"/"MS" collide with too much else to be worth the risk. */
+/**
+ * DEGREE — spelled-out words only. "BS"/"MS" collide with too much else to be worth the risk.
+ *
+ * ⚠ A POSTING THAT NAMES SEVERAL LEVELS IS STATING WHO MAY APPLY, NOT WHAT IT REQUIRES — so report
+ * the RANGE, never the top of it. This used to return the highest level it could find anywhere, which
+ * inverted the two commonest shapes in the wild:
+ *   "Astrion seeks undergraduate, graduate and PhD students…"  → claimed "PhD"
+ *   "Bachelor's required, Master's preferred"                   → claimed "Master's"
+ * Both told the reader they were under-qualified for a job explicitly open to them, which is the one
+ * outcome this file exists to avoid ("a MISS is free, a WRONG ANSWER is not"): the summary sits above
+ * the full posting, so saying less costs nothing while saying the wrong thing loses them the job.
+ *
+ * `undergraduate` feeds the BACHELOR'S rung because it is the same level, so a posting using both
+ * words does not report a nonsense one-rung "range". `graduate` deliberately has NO rung of its own:
+ * a bare "graduate" is as often "a graduate of an accredited program" or "recent graduate" as it is
+ * the student level, and it is spanned by the range anyway whenever it is genuinely meant.
+ */
+const DEGREE_RUNGS: Array<[string, RegExp]> = [
+  // Associate's REQUIRES the word "degree" — a bare "associate" is a job title ("Associate Engineer").
+  ["Associate's", /\bassociate'?s?\s+degree\b/i],
+  ["Bachelor's", /\b(?:bachelor'?s?|undergraduate)\b/i],
+  ["Master's", /\bmaster'?s?\b/i],
+  ["PhD", /\b(?:ph\.?\s?d|doctorate)\b/i],
+];
+
 function degree(t: string): string | null {
-  if (/\b(ph\.?\s?d|doctorate)\b/i.test(t)) return "PhD";
-  if (/\bmaster'?s?\b/i.test(t)) return "Master's";
-  if (/\bbachelor'?s?\b/i.test(t)) return "Bachelor's";
-  return null;
+  const found = DEGREE_RUNGS.filter(([, re]) => re.test(t)).map(([label]) => label);
+  if (!found.length) return null;
+  if (found.length === 1) return found[0];
+  return `${found[0]} – ${found[found.length - 1]}`; // ascending: DEGREE_RUNGS is ordered
 }
 
 /** SPONSORSHIP — the negative is the one that changes whether you bother applying, so it wins. */
@@ -81,11 +105,40 @@ function sponsorship(t: string): string | null {
   return null;
 }
 
-/** CLEARANCE / EXPORT CONTROL — a hard gate on eligibility, so worth surfacing verbatim-ish. */
+/**
+ * CLEARANCE / EXPORT CONTROL — a hard gate on eligibility, so worth surfacing verbatim-ish.
+ *
+ * ⚠ THE MERE PRESENCE OF THE WORDS IS NOT A REQUIREMENT, and this used to treat it as one. Two ways
+ * a posting says "no clearance" while still containing the phrase, both live on one real posting:
+ *   1. it DECLARES none in its own header — "CLEARANCE: N/A";
+ *   2. its legal boilerplate is CONDITIONAL — "Applicants for positions WHICH REQUIRE a US government
+ *      security clearance must meet eligibility requirements to include US citizenship" — a statement
+ *      about postings in general, not about this one.
+ * Reporting "Security clearance" there tells the reader they are ineligible for a job open to them.
+ * So the NEGATIVE WINS, exactly as it already does for sponsorship() above.
+ */
+const CLEARANCE_KINDS = /\b(top secret\/sci|ts\/sci|top secret|secret clearance|security clearance|public trust)\b/i;
+/** An explicit declaration of NONE. Outranks everything else in the text. */
+const CLEARANCE_NONE =
+  /\bclearance\b\s*[:\-–]\s*(?:n\/?a|none|not required|no)\b|\b(?:no|without(?: a)?)\b[^.]{0,30}\bclearance\b|\bclearance\b[^.]{0,30}\b(?:is )?not required\b|\b(?:does not|do not|doesn't)\s+requir\w*[^.]{0,40}\bclearance\b/i;
+/** A sentence that only speaks about postings that MIGHT require one — evidence about nothing. */
+const CLEARANCE_CONDITIONAL =
+  /\b(?:for|to)\s+positions?\s+(?:which|that)\s+requir|\bif\s+(?:the|this)\s+(?:position|role|job)\s+requir|\bshould\s+(?:the|this)\s+(?:position|role|job)\s+requir|\bwhere\s+(?:required|applicable)\b/i;
+
 function clearance(t: string): string | null {
-  const m = t.match(/\b(top secret\/sci|ts\/sci|top secret|secret clearance|security clearance|public trust)\b/i);
-  if (m) return tidy(m[1]);
-  if (/\b(itar|export[- ]control(?:led)?|u\.?s\.? person)\b/i.test(t)) return "ITAR / US person";
+  if (CLEARANCE_NONE.test(t)) return null;                       // the posting said no — believe it
+  // Judge SENTENCE BY SENTENCE, so one conditional boilerplate clause cannot speak for the posting
+  // while a genuine requirement elsewhere still counts.
+  const sentences = t.split(/(?<=[.!?])\s+|\n+/);
+  for (const s of sentences) {
+    if (CLEARANCE_CONDITIONAL.test(s)) continue;
+    const m = s.match(CLEARANCE_KINDS);
+    if (m) return tidy(m[1]);
+  }
+  for (const s of sentences) {
+    if (CLEARANCE_CONDITIONAL.test(s)) continue;
+    if (/\b(itar|export[- ]control(?:led)?|u\.?s\.? person)\b/i.test(s)) return "ITAR / US person";
+  }
   return null;
 }
 
