@@ -563,14 +563,16 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   attempt's tier/detail describe a different commit), and an **UNKNOWN** School outcome writes the
   NAME, not `"N/A"` — treating unknown as matched is the one branch that silently loses the school.
 - **A FORM CAN REQUIRE A DAY THE PROFILE DOES NOT STORE (operator, 2026-08-17).** Profile dates are
-  month-precision (`"2025-05"`), so every required Day reached review and nagged. Two sources, and the
+  month-precision (`"2025-05"`), so every required Day reached review BLANK. Two sources, and the
   distinction is the point: the profile's OWN day when it stores one (`"2025-05-12"` → a stated FACT,
-  unflagged, no detail), else `defaults.date_day` (`data/application_defaults.json`, built-in **1**) —
-  an APPROXIMATION whose `detail` names the month-precision value it came from. ⚠ Deliberately ONE
+  `filled`, unflagged), else `defaults.date_day` (`data/application_defaults.json`, built-in **1**) —
+  an APPROXIMATION, so it is **`filled_review` + `default-value`** and faces the human gate like any
+  value the operator did not state (operator, 2026-08-17). It still FILLS, which is the point: the
+  field went from blank-and-flagged (type a value) to filled-and-flagged (approve it). ⚠ Deliberately ONE
   default, not first-of-month/last-of-month cleverness: that invents precision the operator never gave,
   and a date on an application is a factual claim. `atsDefaultDay` accepts only **1–31** so a typo
-  cannot reach a form, an explicit `null` OPTS OUT (back to review), and a **year-only** value gets no
-  day at all — a day off `"2024"` is two guesses stacked. Measured: needs_review 4 → 1.
+  cannot reach a form, an explicit `null` OPTS OUT (nothing filled), and a **year-only** value gets no
+  day at all — a day off `"2024"` is two guesses stacked.
 - **`currently_enrolled` IS NOT TRUSTWORTHY ALONE — a FUTURE graduation date wins.** The website's
   education editor does not expose that checkbox, so a synced profile carries the schema default
   (`false`) and a student graduating in 2028 was answered **"Yes, graduated"** deterministically and

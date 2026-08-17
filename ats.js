@@ -721,8 +721,14 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
     if (!/^\d{4}-\d{1,2}$/.test(String(raw))) return null;
     const d = atsDefaultDay(defaults);
     if (d == null) return null;
-    return { value: String(d), source: "default",
-      detail: 'day-of-month is not in your profile (it stores "' + String(raw) + '") — used your default of ' + d };
+    // ⚠ FLAGGED FOR REVIEW (operator, 2026-08-17). A default is an APPROXIMATION, not something the
+    // operator stated, so it faces the human gate like every other value we did not get from them —
+    // the same rule that flags an AI answer and a non-exact match. It still FILLS, which is the point:
+    // the field went from blank-and-flagged (type a value) to filled-and-flagged (approve it), so the
+    // nag costs one click instead of a lookup, and a wrong default can never be submitted unnoticed.
+    // A day the profile actually STATES is a fact and stays unflagged — see the branch above.
+    return { value: String(d), source: "default", review: true, flag: "default-value",
+      detail: 'day-of-month is not in your profile (it stores "' + String(raw) + '") — used your default of ' + d + '; approve it or set the real day' };
   }
   if (spec.kind === "date_month" || spec.kind === "date_year") {
     const raw = val(spec.from);

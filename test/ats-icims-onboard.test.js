@@ -299,14 +299,29 @@ test("⚠ a day STATED in the profile beats the default — the default is only 
   assert.strictEqual(stated.detail, undefined, "and it needs no explaining");
 });
 
-test("month precision ⇒ the default, and it SAYS it is an approximation", () => {
+test("⚠ month precision ⇒ the default, FLAGGED for review because it is an approximation", () => {
   const es = { section: "experience", source: "work_experience", entryIndex: 0,
     spec: { kind: "date_day", from: "from" } };
   const r = ats.atsResolveEntryField(es, { from: "2025-05" }, {}, undefined, { date_day: 1 });
   assert.strictEqual(r.value, "1");
   assert.strictEqual(r.source, "default");
+  // The gate: a value the operator did not state faces the human, same as an AI answer or a
+  // non-exact match. It still FILLS, so the nag is one click rather than a lookup.
+  assert.strictEqual(r.review, true, "a default must reach review");
+  assert.strictEqual(r.flag, "default-value");
+  assert.ok(!/^ai-/.test(r.flag), "not an AI guess — it must not pick up the AI styling");
   assert.match(r.detail, /not in your profile/i);
   assert.match(r.detail, /2025-05/, "names the value it could not get a day from");
+});
+
+test("⚠ a STATED day is a fact — filled, and NOT flagged", () => {
+  // The asymmetry is the whole point: only the approximation is reviewable.
+  const es = { section: "experience", source: "work_experience", entryIndex: 0,
+    spec: { kind: "date_day", from: "from" } };
+  const r = ats.atsResolveEntryField(es, { from: "2025-05-12" }, {}, undefined, { date_day: 1 });
+  assert.strictEqual(r.value, "12");
+  assert.strictEqual(r.review, undefined);
+  assert.strictEqual(r.flag, undefined);
 });
 
 test("⚠ a YEAR-ONLY value gets no day — that would be doubly invented", () => {
