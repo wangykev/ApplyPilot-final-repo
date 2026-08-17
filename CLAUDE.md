@@ -721,6 +721,32 @@ walk still refills the page as if blank.
 Mechanism (the auth loop + which-view discrimination, Gmail auto-verify, hidden-tab render budgets, the
 wait-predicate rules, the cover-check re-measure, per-tenant traps): **load the `workday-onboarding` skill.**
 
+## A SCRAPED JOB DESCRIPTION IS UNTRUSTED TEXT, AND IT LEAKS THREE WAYS (2026-08-16)
+
+`jobContext.description` is not just display data. One string reaches **Supabase** (the tracker row,
+at rest), **every AI prompt it grounds** (sent to the model provider verbatim), and **the run's log
+lines** — so anything secret inside it leaks three times over, and fixing only the report boundary
+fixes one third of the problem.
+
+- **⚠ `textContent` INCLUDES `<script>` SOURCE.** `scrapeJobPosting`'s reader is
+  `innerText || textContent`, and its last-resort "largest text block on the page" loop is a
+  CONTEST — so on a server-rendered portal whose page is mostly bootstrap JS, the winner is the JS
+  (`innerText` of a script-wrapping div is empty, so every candidate fell through). Live on iCIMS
+  that stored 3009 chars of `icims_handlePostMessage` as the description, carrying the **one-time
+  magic-link session token** (`?from=login&eem=…&code=…`). That loop reads **rendered text only**;
+  the hidden-tab case the fallback existed for is paid ONCE, on the body, with script/style
+  subtracted. A `<script>` is never a job description.
+- **`redactSecrets` (lib.js, pure) is the belt**, applied where `description` is ASSIGNED (both the
+  ATS and Workday paths) **and** at `reportApplication`, the single choke point to the tracker. It
+  rewrites credential-shaped URL params to `key=<redacted>` — **keeping the KEY**, so a leak stays
+  diagnosable while carrying nothing usable. Anchored on a URL separator (`? & ; #` — `#` because an
+  OAuth token lives in the FRAGMENT) so prose like "use code=ALPHA" is untouched: a JD is prose, and
+  over-redacting corrupts what the operator reads and the model is grounded on. 6-char floor keeps
+  `?code=US`. ⚠ Called as a **bare global** from background.js — never through the `apMatch` literal.
+- **Remediation for data already written:** `web/scripts/scrub-job-description-secrets.mjs` — imports
+  the same helper, dry-runs by default, idempotent, and never prints a token (key names + counts
+  only). Re-run it after any new leak class is found.
+
 ## Job discovery (find work → the website queue; reads only, NEVER applies)
 
 SAFETY INVARIANTS (always apply): discovery **only READS** — it never applies, never clicks an Apply button

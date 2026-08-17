@@ -22,6 +22,7 @@ For current state and open work, see **`docs/status.md`**.
 | **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
 | **iCIMS pre-form (employer portal → gate → form)** | `2026-08-16 (c) — iCIMS PRE-FORM` |
 | **Option lists reaching review (pickers vs free text)** | `2026-08-16 (d) — an OPTIONAL dropdown reaches review as a real picker` |
+| **Secrets / redaction / scraped-text hygiene** | `2026-08-16 (e) — a session token reached Supabase and the AI providers` |
 | **Onboarding / auth / already-applied** | `2026-08-16 (c) — iCIMS PRE-FORM` (the non-Workday one), `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
 | **Autofill with résumé** | `2026-08-08 — Autofill-with-Resume end to end`, `2026-08-07 (e) — the flow a first application should take` |
 | **SKILLS field** | `2026-08-07 (d) — SKILLS: the multi-value typeahead` |
@@ -5201,3 +5202,58 @@ renders an editor for some rows, so a DOM count is a poor proxy. `options_partia
 correctly (`fill-driver.js` → `options_partial`, read by `ReviewEditor.tsx`), and the note has two
 other trigger clauses (a radio/checkbox_group with no options, a typeahead with captured options),
 so the extra captions are most likely those. A web-side check, not an extension one.
+
+## 2026-08-16 (e) — a session token reached Supabase and the AI providers inside a job description
+
+Found while checking the JD-summary bug above. An iCIMS candidate page's **bootstrap script** had
+been stored as a job description — 3009 chars of `icims_handlePostMessage` — and that script embeds
+the one-time magic-link session URL, so the `eem`/`code` pair was sitting in
+`applications.job_description` at rest.
+
+**Three exposures from one string, and only the first is obvious:** the tracker row in Supabase
+(indefinitely); every AI prompt the JD grounds (the description is sent to the model provider
+verbatim, to stop essays inventing a company theme); and the run's own log lines. Fixing only the
+report boundary would have fixed one third of it.
+
+**How it got in.** `scrapeJobPosting`'s reader is `innerText || textContent`, and `textContent`
+INCLUDES `<script>` source. Its last-resort "largest text block on the page" loop is a CONTEST, so on
+a page that is mostly bootstrap JS the winner is the JS: `innerText` of a script-wrapping div is
+empty, so every candidate fell through to `textContent`. Measured on the live iCIMS shell, old reader
+vs new, same page:
+
+```
+OLD -> DIV.parent_width_fix, 2597 chars, isScript TRUE
+NEW -> DIV.site-wrapper,      145 chars, isScript false
+```
+
+That loop now reads **rendered text only**. The hidden-tab case the fallback existed for is paid
+ONCE, on the body, with `script`/`style`/`template` source subtracted — rather than per-candidate,
+where it both cost 4000 sanitizations and let a script win the contest.
+
+**The belt.** `redactSecrets` (lib.js, pure) rewrites credential-shaped URL parameters to
+`key=<redacted>`, **keeping the key** so a reader diagnosing a leak still sees that a magic link was
+there while carrying nothing usable. Applied where `jobContext.description` is ASSIGNED — both the
+ATS and Workday paths — and again at `reportApplication`, the one choke point everything reaches the
+tracker through, so a stale value already in `jobContext` cannot slip past. Anchored on a URL
+separator so ordinary prose is left exactly as written; `#` is in the set because an OAuth
+implicit-flow token lives in the FRAGMENT — a gap caught by the new test file, not by review. A
+6-char floor keeps a short value like a country code readable. Called as a **bare global** from
+background.js, deliberately not via the `apMatch` literal (the lockstep trap: passes every Node test,
+throws in the browser).
+
+**Remediation of what was already written:** `web/scripts/scrub-job-description-secrets.mjs` imports
+the same `redactSecrets` rather than reimplementing it, DRY-RUNS by default, is idempotent, and never
+prints a token (findings are key NAMES and counts — printing the leak would just move it). Scanned 9
+rows with a description; exactly **1** contained secrets, no other tenant affected. Applied and
+re-verified: **0 rows still leaking**.
+
+**Live regression check:** a fresh careers-page run still scrapes 2622 chars of real posting text, no
+script, no redaction needed, filling 108 fields / 6 to review.
+
+**Tests:** 8 new in `test/redact-secrets.test.js`, written in BOTH directions — a real token never
+survives, and ordinary prose is never mangled. Suite 1485/1486 (`db.test.js` needs `fake-indexeddb`).
+
+**Open:** the polluted row's description is still that bootstrap script, now merely token-free — a
+duplicate row whose JD is worthless, so nulling it is cleanup rather than security. Also: that run
+produced a SECOND tracker row for this posting, because it started from the iCIMS magic link rather
+than the careers page, so its `job_key` differed.
