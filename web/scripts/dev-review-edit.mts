@@ -36,11 +36,27 @@ const admin = createClient(env.NEXT_PUBLIC_SUPABASE_URL, env.SUPABASE_SERVICE_RO
 // three previously-EMPTY salary parts (so a value appearing proves review-supplied data reaches the
 // form) and one CHANGED value (Mobile -> Home, so an override is proven too). Deliberately nothing
 // legally loaded — no EEO, no employment history, no consent.
+// Round 2 — every one is an OVERWRITE of a value the form already holds, which is the harder case:
+//   PhoneType   Home  -> Work      a filled select, replaced
+//   Currency    USD $ -> CAD $     moves OFF index 0 (the index-0 read-back fix, other direction)
+//   Time Frame  Hr.   -> Yr.       same
+//   Salary      30    -> 45        filled text, replaced
+//   employment  {Internship, Part-time} -> {Full-time, Temporary}   a DISJOINT set: if the replay
+//               only ADDED, both originals would survive and the verify must catch it
+// ⚠ SCRATCH CONFIG — edit this map per test; it is not a fixture anything depends on.
+//
+// Rounds run so far, and what each proved:
+//   1  blank -> value on 4 fields          review-supplied values reach the form
+//   2  every value CHANGED (overwrites)    the replay REPLACES, including a disjoint multi-select set
+//                                          ({Internship,Part-time} -> {Full-time,Temporary}) and a
+//                                          select moving off index 0 (USD $ -> CAD $)
+//   3  "ZZZ Dollars" (not an option)       the gate REFUSES: stated-value-unmatched -> verify-failed,
+//                                          submitted:false. It never picks something near it.
+//      "" (cleared)                        the replay writes NOTHING for a blank approved value, so the
+//                                          field keeps whatever the freshly-loaded form has.
 const EDITS: Record<string, string> = {
   "CandProfileFields.Salary_Currency": "USD $",
-  "CandProfileFields.Salary": "30",
-  "CandProfileFields.Salary_Timeframe": "Hr.",
-  "-1_PersonProfileFields.PhoneType": "Home",
+  "CandProfileFields.Salary": "45",
 };
 
 const { data, error } = await admin
@@ -65,6 +81,12 @@ for (const e of entries) {
     const to = EDITS[suffix];
     console.log(`EDIT   ${suffix}  ${JSON.stringify(e.current_value)} -> ${JSON.stringify(to)}`);
     e.current_value = to;
+    // A GROUP carries the authoritative ARRAY as well, and groupSelection prefers it — setting only
+    // the joined string would leave the old set in place and the edit would be half-applied.
+    if (Array.isArray(e.selected_options)) {
+      e.selected_options = to.split("; ").map((s) => s.trim()).filter(Boolean);
+      console.log(`       selected_options -> ${JSON.stringify(e.selected_options)}`);
+    }
     e.is_edited = true;
     e.edited_at = now;
     edited++;

@@ -4333,3 +4333,39 @@ vocabulary and reaches the review editor as the single value the operator is all
 18 filter-or-type before, **28 picker / 12 filter-or-type** after. The remaining 12 are the genuinely
 paged 25-row lists. 6 records carry no options at all. No page contact was added, and the fill's wall
 clock did not move (28.7s → 25.9s across runs, noise).
+
+## 2026-08-17 (b) — Astrion iCIMS: the REHEARSAL, and what a `<select>` with no placeholder submits
+
+Five consecutive dry rehearsals (`arm` absent throughout; nothing ever submitted). Three clean passes
+either side of two deliberately adversarial rounds.
+
+**The form loads FRESH on every rehearsal.** Nothing is persisted server-side, because the application
+is never submitted — so each run re-writes every approved value from scratch, and a field the replay
+does not write shows the form's OWN default rather than the previous run's value. Worth knowing before
+reading any "did my change stick?" result: the evidence is the CURRENT run's writes, not leftovers.
+
+**⚠ A `<select>` WITH NO PLACEHOLDER SUBMITS ITS FIRST OPTION WHETHER OR NOT ANYONE CHOSE IT.** The
+salary selects have no blank first row — raw options begin at `0:USD $` and `0:Hr.`. HTML selects
+option 0 by default, so an untouched Currency reads (and would SUBMIT) `"USD $"`. Two consequences:
+
+- a `selectedIndex > 0` read is wrong twice over — it calls a legitimately-chosen first option blank
+  (the false negative that failed two rehearsal verifies) AND it describes an untouched select as
+  empty when the form would in fact submit its first option;
+- so reporting `"USD $"` for an untouched Currency is the TRUTHFUL reading, not a bug. These salary
+  fields will go out as USD / Hr. unless the operator changes them, and review now shows that.
+
+**Measured, round by round:**
+
+| round | change | outcome |
+|---|---|---|
+| 1 | 4 blank fields given values | all reached the form |
+| 2 | every value CHANGED | replay REPLACES: Home to Work, USD $ to CAD $ (off index 0), 30 to 45, Hr. to Yr., and a DISJOINT multi-select set {Internship,Part-time} to {Full-time,Temporary} — verified by an independent scan, not the replay's own read-back |
+| 3 | `"ZZZ Dollars"` (not an option) | `stated-value-unmatched` then `verify-failed`, `submitted:false`. It never picked a near match. |
+| 3 | `""` (cleared) | `skipped · no approved entry for this field` — the replay writes NOTHING, so the field keeps whatever the fresh form has. A cleared value is "leave alone", NOT "erase". |
+
+**A verify failure is per-FIELD and blocks the whole gate**, which is the point: one unmatched approved
+value out of 109 stopped the run at `verify-failed`.
+
+**Entry growing is what makes 109 fields possible** — the submit run grows repeating sections from the
+approved bundle (`the approved bundle holds 3 entr(ies), form now shows 3`). Without it the form
+carries one work-history entry and 28 approved values have nowhere to go.
