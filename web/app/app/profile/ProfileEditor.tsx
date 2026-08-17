@@ -298,23 +298,30 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
               </div>
               {/* ── Employer detail some ATSs ask for (iCIMS asks for all of it) ────────────── */}
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
-                <TextField label="Employer address" value={w.employer_address} onChange={(v) => update((p) => { p.work_experience[i].employer_address = v; })} />
-                <TextField label="Employer ZIP / postal code" value={w.employer_postal_code} onChange={(v) => update((p) => { p.work_experience[i].employer_postal_code = v; })} />
-                <TextField label="Supervisor's name" value={w.supervisor_name} onChange={(v) => update((p) => { p.work_experience[i].supervisor_name = v; })} />
-                <TextField label="Supervisor's title" value={w.supervisor_title} onChange={(v) => update((p) => { p.work_experience[i].supervisor_title = v; })} />
+                <TextField label="Employer address" bucketPath={i === 0 ? "work_experience.0.employer_address" : undefined} value={w.employer_address} onChange={(v) => update((p) => { p.work_experience[i].employer_address = v; })} />
+                <TextField label="Employer ZIP / postal code" bucketPath={i === 0 ? "work_experience.0.employer_postal_code" : undefined} value={w.employer_postal_code} onChange={(v) => update((p) => { p.work_experience[i].employer_postal_code = v; })} />
+                <TextField label="Supervisor's name" bucketPath={i === 0 ? "work_experience.0.supervisor_name" : undefined} value={w.supervisor_name} onChange={(v) => update((p) => { p.work_experience[i].supervisor_name = v; })} />
+                <TextField label="Supervisor's title" bucketPath={i === 0 ? "work_experience.0.supervisor_title" : undefined} value={w.supervisor_title} onChange={(v) => update((p) => { p.work_experience[i].supervisor_title = v; })} />
               </div>
               <div className="mt-4 space-y-4">
-                <TextAreaField label="Reason for leaving" value={w.reason_for_leaving} rows={2} onChange={(v) => update((p) => { p.work_experience[i].reason_for_leaving = v; })} />
+                <TextAreaField label="Reason for leaving" bucketPath={i === 0 ? "work_experience.0.reason_for_leaving" : undefined} value={w.reason_for_leaving} rows={2} onChange={(v) => update((p) => { p.work_experience[i].reason_for_leaving = v; })} />
                 {/* ⚠ TRI-STATE, and the two contact boxes appear ONLY on an explicit Yes. Answering
                     this is what authorises a recruiter to ring a past employer, so an unanswered
                     question must not look the same as "no" — and the details must not sit there
                     inviting entry when nothing has been agreed to. The filler applies the same gate,
                     so clearing this back to unanswered withholds them again. */}
-                <TriBoolField label="May we contact this employer?" value={w.may_contact} onChange={(v) => update((p) => { p.work_experience[i].may_contact = v; })} />
+                <TriBoolField
+                  label="May we contact this employer?"
+                  bucketPath={i === 0 ? "work_experience.0.may_contact" : undefined}
+                  value={w.may_contact}
+                  onChange={(v) => update((p) => { p.work_experience[i].may_contact = v; })}
+                  ladder={profile.answer_ladders?.["work_experience.0.may_contact"]}
+                  onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_experience.0.may_contact"] = n; })}
+                />
                 {w.may_contact === true && (
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                    <TextField label="Employer email" value={w.employer_email} onChange={(v) => update((p) => { p.work_experience[i].employer_email = v; })} />
-                    <TextField label="Employer phone number" value={w.employer_phone} onChange={(v) => update((p) => { p.work_experience[i].employer_phone = v; })} />
+                    <TextField label="Employer email" bucketPath={i === 0 ? "work_experience.0.employer_email" : undefined} value={w.employer_email} onChange={(v) => update((p) => { p.work_experience[i].employer_email = v; })} />
+                    <TextField label="Employer phone number" bucketPath={i === 0 ? "work_experience.0.employer_phone" : undefined} value={w.employer_phone} onChange={(v) => update((p) => { p.work_experience[i].employer_phone = v; })} />
                   </div>
                 )}
               </div>
