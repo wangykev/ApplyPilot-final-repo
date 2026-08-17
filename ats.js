@@ -715,10 +715,18 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
     if (raw == null) return null;
     const ymd = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(raw));
     const path = es.section + "[" + es.entryIndex + "]." + spec.from;
+    // A day the profile STATES is a fact, so it fills whether the form requires it or not.
     if (ymd) return { value: String(parseInt(ymd[3], 10)), source: "entry", path };
     // Month precision — fall back to the default, but only for a value that IS a date. A year-only
     // "2024" says nothing about a month either, so a day off it would be doubly invented.
     if (!/^\d{4}-\d{1,2}$/.test(String(raw))) return null;
+    // ⚠ THE DEFAULT IS FOR REQUIRED FIELDS ONLY (operator, 2026-08-17). An optional blank blocks
+    // nothing — it does not hold up Save, it does not hold up the submit gate, and it is not a review
+    // item — so putting an APPROXIMATION there buys nothing and adds an unasked-for claim to the
+    // application. The default exists to unblock a field the form insists on, and that is the only
+    // place it belongs. Same rule the AI tier already obeys: required gets a fallback, optional fills
+    // deterministically or stays blank.
+    if (!f || !f.isRequired) return null;
     const d = atsDefaultDay(defaults);
     if (d == null) return null;
     // ⚠ FLAGGED FOR REVIEW (operator, 2026-08-17). A default is an APPROXIMATION, not something the

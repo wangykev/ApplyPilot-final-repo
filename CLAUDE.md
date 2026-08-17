@@ -572,7 +572,10 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   default, not first-of-month/last-of-month cleverness: that invents precision the operator never gave,
   and a date on an application is a factual claim. `atsDefaultDay` accepts only **1–31** so a typo
   cannot reach a form, an explicit `null` OPTS OUT (nothing filled), and a **year-only** value gets no
-  day at all — a day off `"2024"` is two guesses stacked.
+  day at all — a day off `"2024"` is two guesses stacked. ⚠ **REQUIRED ONLY:** an optional blank blocks
+  nothing (not Save, not the submit gate, and it is not a review item), so an approximation there buys
+  nothing and adds an unasked-for claim — the same rule the AI tier obeys. A **stated** day ignores
+  required-ness, because a fact has no downside.
 - **`currently_enrolled` IS NOT TRUSTWORTHY ALONE — a FUTURE graduation date wins.** The website's
   education editor does not expose that checkbox, so a synced profile carries the schema default
   (`false`) and a student graduating in 2028 was answered **"Yes, graduated"** deterministically and

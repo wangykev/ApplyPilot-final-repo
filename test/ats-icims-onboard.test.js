@@ -302,7 +302,7 @@ test("⚠ a day STATED in the profile beats the default — the default is only 
 test("⚠ month precision ⇒ the default, FLAGGED for review because it is an approximation", () => {
   const es = { section: "experience", source: "work_experience", entryIndex: 0,
     spec: { kind: "date_day", from: "from" } };
-  const r = ats.atsResolveEntryField(es, { from: "2025-05" }, {}, undefined, { date_day: 1 });
+  const r = ats.atsResolveEntryField(es, { from: "2025-05" }, { isRequired: true }, undefined, { date_day: 1 });
   assert.strictEqual(r.value, "1");
   assert.strictEqual(r.source, "default");
   // The gate: a value the operator did not state faces the human, same as an AI answer or a
@@ -336,7 +336,23 @@ test("⚠ a YEAR-ONLY value gets no day — that would be doubly invented", () =
 test("opting out leaves a month-precision day unanswered rather than assumed", () => {
   const es = { section: "experience", source: "work_experience", entryIndex: 0,
     spec: { kind: "date_day", from: "from" } };
-  assert.strictEqual(ats.atsResolveEntryField(es, { from: "2025-05" }, {}, undefined, { date_day: null }), null);
+  assert.strictEqual(ats.atsResolveEntryField(es, { from: "2025-05" }, { isRequired: true }, undefined, { date_day: null }), null);
+});
+
+test("⚠ the default is for REQUIRED fields only — an optional day stays blank", () => {
+  // An optional blank blocks nothing: not Save, not the submit gate, and it is not a review item. So
+  // an approximation there buys nothing and adds an unasked-for claim to the application.
+  const es = { section: "experience", source: "work_experience", entryIndex: 0,
+    spec: { kind: "date_day", from: "from" } };
+  const opts = { date_day: 1 };
+  assert.strictEqual(ats.atsResolveEntryField(es, { from: "2025-05" }, { isRequired: false }, undefined, opts), null);
+  assert.strictEqual(ats.atsResolveEntryField(es, { from: "2025-05" }, {}, undefined, opts), null, "absent isRequired is not required");
+  // …but REQUIRED still fills, which is the whole reason the default exists.
+  assert.strictEqual(
+    ats.atsResolveEntryField(es, { from: "2025-05" }, { isRequired: true }, undefined, opts).value, "1");
+  // ⚠ AND A STATED DAY IGNORES REQUIREDNESS — it is a fact, so there is no downside to filling it.
+  assert.strictEqual(
+    ats.atsResolveEntryField(es, { from: "2025-05-12" }, { isRequired: false }, undefined, opts).value, "12");
 });
 
 test("the shipped defaults file carries a valid day", () => {
