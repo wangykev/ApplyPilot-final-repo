@@ -1108,7 +1108,13 @@ function atsInjScan(ats) {
         // (`12781`), never the text — so both the option read and the read-back must use the widget.
         if (el.getAttribute("icimsdropdown-enabled") === "1") {
           const ul = document.getElementById(el.id + "_dropdown-results");
-          const items = ul ? [...ul.children].map((li) => txt(li)).filter((t) => t && !/^—\s*make a selection/i.test(t)) : [];
+          // ⚠ DROP THE AWAITING-PARENT ROW TOO, not just the placeholder. A child whose parent is
+          // unset renders exactly one row — "Please select a country" — and that is not an option:
+          // left in, it is a one-item list, which reads as a COMPLETE vocabulary and would reach the
+          // review editor as the single thing the operator may pick. The unset parent is explained
+          // by the record's own detail (see awaitingParent); the option list must simply be empty.
+          const items = ul ? [...ul.children].map((li) => txt(li))
+            .filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^please select a /i.test(t)) : [];
           const shown = document.getElementById(el.id + "_fakeSelected_icimsDropdown");
           const cur = shown ? txt(shown) : "";
           push(Object.assign(base, {
@@ -2032,12 +2038,69 @@ function atsAttachOptions(rec, texts, partial) {
   rec.captured_options = null;
 }
 
+// ── IS AN iCIMS DROPDOWN'S LIST COMPLETE, OR JUST THE FIRST PAGE? ────────────────────────
+// The widget serves ONE page and offers a search box, so its rows may be a prefix of a longer
+// list. Until now EVERY icims_dropdown was marked partial UNCONDITIONALLY: the flag read a
+// `data-ap-complete` attribute that nothing in this codebase has ever written. And a partial list
+// is attached as `captured_options` with widgetType "typeahead" — review renders a type-it-yourself
+// box with an honest caveat instead of a picker. So a two-option "May We Contact" question reached
+// the operator as FREE TEXT. Measured on the Astrion form: 14 of 25 dropdowns were provably
+// complete and mislabelled, including all ten Yes/No screening questions and a 6-row Availability.
+//
+// The form reveals its own page size when you look at every dropdown at once: unrelated
+// vocabularies do not stop at the same exact length by chance. Measured there — Time Zone, Country,
+// State/Province and Degree all stop at exactly 25 while nothing else comes near it. That is a
+// pager, not a coincidence. Derived rather than hardcoded because the cap is a tenant setting: a
+// constant 25 would silently mislabel a tenant that pages at 50.
+var ATS_ICIMS_CAP_MIN = 10; // below this a repeated length is a vocabulary, not a page size
+
+function atsIcimsPageCap(lengths) {
+  const counts = new Map();
+  for (const n of lengths || []) {
+    if (!Number.isFinite(n) || n < ATS_ICIMS_CAP_MIN) continue;
+    counts.set(n, (counts.get(n) || 0) + 1);
+  }
+  let cap = null;
+  for (const [n, c] of counts) if (c >= 2 && (cap == null || n > cap)) cap = n;
+  return cap;
+}
+
+// A pager that returned FEWER rows than a full page has reached its end — the same inference any
+// paged API invites. With no cap proven the only safe claim is "nothing on this form is even
+// page-sized, so truncation is not in play at all"; everything else stays UNPROVEN, which is
+// exactly today's behaviour.
+// ⚠ THE ASYMMETRY IS DELIBERATE. Calling a truncated list complete shows the operator a picker
+// that is MISSING their answer — they conclude the form does not offer it. Calling a complete list
+// partial merely costs them a typed value. So this errs toward under-claiming, every time.
+function atsIcimsListComplete(n, cap, maxLen) {
+  if (!Number.isFinite(n) || n <= 0) return false;
+  if (cap != null) return n < cap;
+  return Number.isFinite(maxLen) && maxLen > 0 && maxLen < ATS_ICIMS_CAP_MIN;
+}
+
+// THE choice-widget list, in ONE place. It was inlined identically at three call sites, which is
+// exactly the trap CLAUDE.md already warns about for this vocabulary ("a new choice widget must be
+// registered in FOUR places, and missing one fails silently and differently each time") — a
+// copy-paste list makes the fourth miss inevitable.
+var ATS_CHOICE_WIDGETS = ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native",
+  "location", "icims_dropdown", "multiselect_native"];
+
 const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_type vocabulary
   text: "text", textarea: "textarea", select: "dropdown", dial: "dropdown", location: "typeahead",
   dropdown_native: "dropdown", radio: "radio", checkbox: "checkbox", checkbox_group: "checkbox_group",
   yesno: "radio", file_upload: "file_upload", date: "date", unknown: "unknown",
   icims_dropdown: "dropdown", multiselect_native: "checkbox_group",
 };
+
+// The same set of widgets under their REVIEW-side names. A record's `widgetType` is rewritten to
+// this vocabulary the moment it is built (`ATS_REVIEW_WIDGET[f.widgetType]`), so anything looking at
+// a RESULT must match on these, not on the scan's names — checking the scan vocabulary against a
+// built record silently matches almost nothing. DERIVED from the two tables above rather than
+// written out a third time, so a new choice widget cannot be missed here. `typeahead` is added
+// explicitly because `atsAttachOptions` rewrites a partial-list record to it.
+var ATS_CHOICE_REVIEW_WIDGETS = [...new Set(
+  ATS_CHOICE_WIDGETS.map((w) => ATS_REVIEW_WIDGET[w] || w).concat(["typeahead"])
+)];
 
 // Options for a dial-code select carry a trailing "+<digits>" ("United States +1") that no
 // profile value will ever contain — strip it for matching, commit by the FULL text.
@@ -2857,6 +2920,44 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // history — the worst kind of miss, because the page looks completely filled. Reconcile UP only:
   // never delete an entry the operator may have typed themselves.
   if (ats === "icims" && !o.valueFor) scan = await atsGrowIcimsEntries(act, ats, scan, profile);
+  // RECON THE LISTS BEFORE FILLING — including the OPTIONAL ones (operator, 2026-08-16). On these
+  // one-page forms a field we never fill still has to be ANSWERABLE in review, and that means a
+  // real picker, not a picker-shaped text box. The scan already carries every list, so the work is
+  // not fetching them: it is deciding which ones are COMPLETE, because a list flagged partial is
+  // rendered as free text. See atsIcimsPageCap — the form's own dropdowns reveal its page size, and
+  // a list shorter than a page has reached its end. Zero extra page contact, so this costs nothing.
+  if (ats === "icims") {
+    const idd = ((scan && scan.fields) || []).filter((f) => f.widgetType === "icims_dropdown");
+    const lens = idd.map((f) => (f.options || []).length);
+    const cap = atsIcimsPageCap(lens);
+    const maxLen = lens.length ? Math.max.apply(null, lens) : 0;
+    let proven = 0;
+    for (const f of idd) {
+      if (f.optionsPartial === true && atsIcimsListComplete((f.options || []).length, cap, maxLen)) {
+        f.optionsPartial = false;
+        proven++;
+      }
+    }
+    if (idd.length) console.log(`[ApplyPilot][ATS-OPTIONS] iCIMS page cap ${cap == null ? "NOT proven" : cap} — ${proven}/${idd.length} dropdown list(s) proven COMPLETE (these reach review as real pickers), ${idd.length - proven} stay partial`);
+  }
+  // WHAT DID THE SCAN ALREADY SEE? Printed BEFORE anything actuates, because that is the only
+  // moment the answer is uncontaminated: once a dropdown has been opened its result list stays
+  // populated, so a probe of a finished run reports full coverage no matter what the fresh page
+  // served. This line is what tells "the scan carries the list, attaching it is free" apart from
+  // "the list is only there after we open it" — and those want opposite implementations.
+  try {
+    const per = {};
+    for (const f of (scan && scan.fields) || []) {
+      if (!ATS_CHOICE_WIDGETS.includes(f.widgetType)) continue;
+      const k = f.widgetType;
+      per[k] = per[k] || { total: 0, withOpts: 0, partial: 0 };
+      per[k].total++;
+      if ((f.options || []).length) per[k].withOpts++;
+      if (f.optionsPartial === true) per[k].partial++;
+    }
+    const parts = Object.entries(per).map(([k, v]) => `${k} ${v.withOpts}/${v.total}${v.partial ? ` (${v.partial} partial)` : ""}`);
+    if (parts.length) console.log(`[ApplyPilot][ATS-OPTIONS] scan-time coverage — ${parts.join(" · ")}`);
+  } catch (e) { /* diagnostic only */ }
   const results = [];
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
@@ -2903,6 +3004,21 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     }
   }
 
+  // DID EVERY CHOICE FIELD ACTUALLY REACH REVIEW AS A PICKER? The scan-time line above says what we
+  // KNEW; this says what the operator will SEE, which is the thing that was asked for and the only
+  // one worth measuring. A record with `options` renders a picker; one holding `captured_options`
+  // was flagged partial and renders a type-it-yourself box instead. They diverge for a real reason —
+  // a field filled through a SEARCH records only the filtered rows it matched against — so keeping
+  // both numbers visible is what stops "16 proven complete" being mistaken for "16 pickers".
+  try {
+    // ⚠ REVIEW-side names. A result's widgetType is already rewritten by ATS_REVIEW_WIDGET, so
+    // matching the scan vocabulary here counted almost nothing (measured: 19 of 46 choice fields).
+    const ch = results.filter((r) => r && (ATS_CHOICE_REVIEW_WIDGETS.includes(r.widgetType) || (r.captured_options || []).length));
+    const picker = ch.filter((r) => Array.isArray(r.options) && r.options.length).length;
+    const freeText = ch.filter((r) => !(Array.isArray(r.options) && r.options.length) && (r.captured_options || []).length).length;
+    const bare = ch.length - picker - freeText;
+    if (ch.length) console.log(`[ApplyPilot][ATS-OPTIONS] review editors — ${picker} picker · ${freeText} filter-or-type (list unproven) · ${bare} with no options at all, of ${ch.length} choice record(s)`);
+  } catch (e) { /* diagnostic only */ }
   return await atsFinishFill(act, ats, scan, results, o.credentials);
 }
 
@@ -2950,7 +3066,7 @@ function atsAiBatchKind(f) {
   // it in the "essay" group and bill it to the operator's essay model. Workday's `aiFillDate` routes a
   // date to "fill" for the same reason; this keeps the two paths saying the same thing.
   if (wt === "date") return "date";
-  if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location", "icims_dropdown", "multiselect_native"].includes(wt)) return "choice";
+  if (ATS_CHOICE_WIDGETS.includes(wt)) return "choice";
   return null;
 }
 
@@ -3435,7 +3551,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           // missing from this list is treated as free text — which silently drops a TIERED profile
           // array (the country ladder) instead of passing it through as candidates, so the fallback
           // tier that actually matches the form's wording never gets tried.
-          const isChoice = ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location", "icims_dropdown", "multiselect_native"].includes(f.widgetType);
+          const isChoice = ATS_CHOICE_WIDGETS.includes(f.widgetType);
           const rr = atsFd.resolve(route.raw, isChoice ? "dropdown" : "text");
           if (rr.skip) { /* falls through to AI/blank */ }
           else if (rr.candidates) candidates = rr.candidates;
@@ -3532,6 +3648,19 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // list it matched against, which is the better of the two.
       if (!rec.options && !rec.captured_options && Array.isArray(f.options) && f.options.length) {
         atsAttachOptions(rec, f.options, f.optionsPartial === true);
+      } else if (rec.captured_options && !rec.options && Array.isArray(f.options)
+                 && f.optionsPartial !== true && f.options.length >= (rec.captured_options || []).length) {
+        // …AND A COMPLETE LIST BEATS A FILTERED ONE. The rule above — "a field that actuated already
+        // recorded the live list it matched against, which is the better of the two" — holds only
+        // while the actuation list is FULLER. It is not: a field filled through the widget's SEARCH
+        // records just the rows that search returned, so the record lands partial (a filter-or-type
+        // box) even when the scan's own list for that field is proven COMPLETE. Measured on the
+        // Astrion form: 18 of 46 choice records were filter-or-type, and most were dropdowns the
+        // fill had answered by searching.
+        // Both guards are load-bearing: the scan list must be PROVEN complete (never a first page
+        // standing in for a longer list), and it must not be SHORTER than what the actuation saw —
+        // otherwise a stale scan could narrow a list the widget had already shown us in full.
+        atsAttachOptions(rec, f.options);
       }
       // Route-level review force (employment "Yes" etc.).
       if (route && route.review && rec.status === "filled") rec.status = "filled_review";
@@ -4748,7 +4877,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
-    atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
+    atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,

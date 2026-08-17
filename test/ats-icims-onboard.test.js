@@ -260,3 +260,79 @@ test("atsInjClickAuthSubmit refuses a disabled control rather than reporting a p
   assert.ok(/submit-disabled/.test(src));
   assert.ok(/no-submit-control/.test(src));
 });
+
+// ── option-list completeness: which optional dropdowns reach review as real PICKERS ─────
+// Every icims_dropdown used to be marked partial UNCONDITIONALLY — the flag read a
+// `data-ap-complete` attribute nothing in the codebase has ever written. A partial list is attached
+// as captured_options + widgetType "typeahead", i.e. review renders a type-it-yourself box, so a
+// two-option "May We Contact" question reached the operator as FREE TEXT.
+
+test("atsIcimsPageCap: the live Astrion form's own dropdowns reveal a page size of 25", () => {
+  // Measured 2026-08-16, scan-time on a FRESH form (before any actuation, the only uncontaminated
+  // moment): 2x1, 10x2, 1x6, 1x17, 11x25. Time Zone / Country / State/Province / Degree all
+  // stopping at exactly 25 is a pager — four unrelated vocabularies do not share a length by chance.
+  const lengths = [1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 6, 17, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25, 25];
+  assert.strictEqual(ats.atsIcimsPageCap(lengths), 25);
+});
+
+test("atsIcimsPageCap: a length must REPEAT to be a cap, and be big enough to be a page", () => {
+  assert.strictEqual(ats.atsIcimsPageCap([17, 6, 2]), null);   // nothing repeats
+  assert.strictEqual(ats.atsIcimsPageCap([17, 17, 6]), 17);    // repeated and at/above the floor
+  // ⚠ ten Yes/No dropdowns all holding 2 options must NOT be read as "the page size is 2" —
+  // every list on the form would then be at-or-above the cap and nothing could ever be proven.
+  assert.strictEqual(ats.atsIcimsPageCap([2, 2, 2, 2, 2]), null);
+  assert.strictEqual(ats.atsIcimsPageCap([]), null);
+  assert.strictEqual(ats.atsIcimsPageCap(null), null);
+});
+
+test("atsIcimsPageCap: the LARGEST repeated length wins (a smaller one is a vocabulary)", () => {
+  assert.strictEqual(ats.atsIcimsPageCap([12, 12, 25, 25, 25]), 25);
+});
+
+test("atsIcimsListComplete: a page that came back SHORT has reached its end", () => {
+  assert.ok(ats.atsIcimsListComplete(2, 25, 25));    // May We Contact — a real picker now
+  assert.ok(ats.atsIcimsListComplete(6, 25, 25));    // Availability
+  assert.ok(ats.atsIcimsListComplete(17, 25, 25));   // School's first page
+  assert.ok(ats.atsIcimsListComplete(24, 25, 25));
+});
+
+test("⚠ atsIcimsListComplete: a FULL page is unproven, and stays free text rather than lying", () => {
+  // The asymmetry is the point. A picker MISSING the operator's answer makes them conclude the form
+  // does not offer it; a complete list called partial only costs them a typed value.
+  assert.strictEqual(ats.atsIcimsListComplete(25, 25, 25), false);
+  assert.strictEqual(ats.atsIcimsListComplete(26, 25, 26), false);
+});
+
+test("atsIcimsListComplete: no cap proven means complete only when nothing is even page-sized", () => {
+  // A form of small dropdowns cannot be suffering truncation at all, so they are pickers…
+  assert.ok(ats.atsIcimsListComplete(3, null, 6));
+  // …but once anything on the form IS page-sized, an unproven cap means UNPROVEN — today's
+  // behaviour, not a guess in either direction.
+  assert.strictEqual(ats.atsIcimsListComplete(3, null, 25), false);
+  assert.strictEqual(ats.atsIcimsListComplete(3, null, ats.ATS_ICIMS_CAP_MIN), false);
+});
+
+test("atsIcimsListComplete: an EMPTY list is never complete (there is nothing to pick)", () => {
+  // The awaiting-parent State dropdown lands here: its only row is the "Please select a country"
+  // placeholder, which the scan now drops, so it has no options and must not become a picker.
+  assert.strictEqual(ats.atsIcimsListComplete(0, 25, 25), false);
+  assert.strictEqual(ats.atsIcimsListComplete(null, 25, 25), false);
+});
+
+test("⚠ the scan drops BOTH placeholder rows — a one-row child is not a one-option vocabulary", () => {
+  const src = String(ats.atsInjScan);
+  assert.ok(/make a selection/i.test(src), "the placeholder row must be filtered");
+  assert.ok(/please select a /i.test(src), "the awaiting-parent row must be filtered too");
+});
+
+test("ATS_CHOICE_WIDGETS is the single list the call sites share", () => {
+  // CLAUDE.md: a new choice widget must be registered in FOUR places and a miss fails silently and
+  // differently each time. The list was inlined identically three times, which makes the fourth
+  // miss inevitable.
+  for (const w of ["icims_dropdown", "dropdown_native", "radio", "yesno", "checkbox_group",
+    "multiselect_native", "select", "dial", "location"]) {
+    assert.ok(ats.ATS_CHOICE_WIDGETS.includes(w), w + " missing from ATS_CHOICE_WIDGETS");
+  }
+  assert.ok(!/"select",\s*"dial",\s*"radio",\s*"yesno"/.test(String(ats.driveAtsPageFill)),
+    "the choice-widget list is inlined again inside driveAtsPageFill");
+});
