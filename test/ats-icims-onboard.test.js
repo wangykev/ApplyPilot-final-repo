@@ -261,6 +261,54 @@ test("atsInjClickAuthSubmit refuses a disabled control rather than reporting a p
   assert.ok(/no-submit-control/.test(src));
 });
 
+// ── a <select> need not have a placeholder, so index 0 is a real answer ───────────────────
+// Live 2026-08-17: a rehearsal reported `native select commit failed` on iCIMS' salary Currency and
+// Time Frame. The commit had WORKED — probed on the form, selectedIndex 0 holding "USD $" — but the
+// read-back tested `selectedIndex > 0`, and those selects start straight at a real option with no
+// blank first row. A FALSE NEGATIVE on a verify gate, which blocks a submit that should pass.
+
+test("⚠ both select readers agree that index 0 can be a real answer", () => {
+  // Two injected functions cannot share code, so this pins them together — the drift is invisible
+  // until a form whose first option is real reads as blank.
+  // Comments are stripped first — these functions DOCUMENT the old `selectedIndex > 0` shape in prose,
+  // and a naive grep matches the explanation instead of the code (it did, on the first run).
+  const codeOf = (fn) => String(fn).replace(/\/\*[\s\S]*?\*\//g, "").replace(/^[ \t]*\/\/.*$/gm, "");
+  for (const fn of [ats.atsInjScan, ats.atsInjReadValue]) {
+    assert.ok(!/selectedIndex\s*>\s*0/.test(codeOf(fn)),
+      `${fn.name} still treats index 0 as unselected`);
+  }
+  // …and both use the same placeholder vocabulary to decide "nothing chosen".
+  for (const fn of [ats.atsInjScan, ats.atsInjReadValue]) {
+    assert.match(String(fn), /make a selection/i, `${fn.name} must recognise the placeholder row`);
+  }
+});
+
+test("atsInjReadValue: a native select reports its first option, and a placeholder as blank", () => {
+  const mk = (opts, idx) => ({
+    tagName: "SELECT", selectedIndex: idx,
+    options: opts.map((t) => ({ textContent: t })),
+  });
+  const read = (el) => {
+    // Exercise the branch with a stub document, the way the injected fn sees the DOM.
+    const g = globalThis;
+    const prevDoc = g.document;
+    g.document = { querySelector: () => el };
+    try { return ats.atsInjReadValue("icims", "#x", "dropdown_native"); }
+    finally { g.document = prevDoc; }
+  };
+  // No placeholder — the FIRST option is a legitimate answer (the salary currency case).
+  assert.strictEqual(read(mk(["USD $", "EUR €"], 0)).value, "USD $");
+  assert.strictEqual(read(mk(["Hr.", "Da.", "Yr."], 0)).value, "Hr.");
+  // A real placeholder at 0 still reads as nothing chosen…
+  assert.strictEqual(read(mk(["", "Work", "Home"], 0)).value, null);
+  assert.strictEqual(read(mk(["— Make a Selection —", "Work"], 0)).value, null);
+  assert.strictEqual(read(mk(["Select one", "Work"], 0)).value, null);
+  // …and a chosen row past it reads normally.
+  assert.strictEqual(read(mk(["", "Work", "Home"], 2)).value, "Home");
+  // Nothing selected at all.
+  assert.strictEqual(read(mk(["USD $"], -1)).value, null);
+});
+
 // ── DAY-OF-MONTH: a form requires it, the profile stores months ───────────────────────────
 // Every date on the iCIMS form nagged for a day, because a required field we cannot answer reaches
 // review. The profile stores "2025-05", so the day comes from the operator's default — and the tests

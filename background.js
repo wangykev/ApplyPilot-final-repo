@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "date-day-3";
+const AP_BUILD_MARKER = "replay-fixes-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -828,6 +828,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
               const row = el.closest(".iCIMS_TableRow") || el.closest("tr") || el.parentElement;
               const controls = row ? [...row.querySelectorAll("input:not([type=hidden]), select, textarea")]
                 .map((c) => ({ id: c.id || c.name || "", tag: c.tagName, type: c.type || "" })) : [];
+              // RAW option list WITH INDEXES for the named element itself — the scan filters
+              // placeholders out, so its list cannot answer "is the wanted option at index 0?", which
+              // is what a `selectedIndex > 0` read-back turns on.
+              const rawOptions = el.tagName === "SELECT"
+                ? [...el.options].slice(0, 6).map((o, i) => i + ":" + clean(o.textContent).slice(0, 24))
+                : null;
               // Where does the QUESTION text live, if not inside the row? Walk outward and back so the
               // answer comes from the markup rather than a guess.
               const prevs = [];
@@ -845,7 +851,8 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
               return { name: n, found: true,
                 rowClass: row ? clean(row.className).slice(0, 90) : null,
                 rowText: row ? clean(row.innerText).slice(0, 200) : null,
-                prevSiblings: prevs, ancestors: up,
+                prevSiblings: prevs, ancestors: up, rawOptions,
+                selectedIndex: el.tagName === "SELECT" ? el.selectedIndex : null,
                 controlsInRow: controls };
             });
           }, message.rowsFor).catch((e) => ({ error: String((e && e.message) || e) }));
@@ -5224,7 +5231,30 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // holds only a placeholder for it, by design. Without this the replay would type "(stored login)"
     // into the login box. Same slot, same {email, password} the fill used.
     const subStore = await new Promise((r) => chrome.storage.local.get(["credentials"], r));
-    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, credentials: (subStore && subStore.credentials) || null });
+    // HOW MANY REPEATING ENTRIES THE APPROVED BUNDLE HOLDS. The replay passes `profile: {}` by design
+    // (every value comes from the bundle), so the entry-growing pass had nothing to size itself from
+    // and left the form with the single entry it renders — 28 of a rehearsal's 32 verify failures were
+    // work-history entries 2 and 3 "having no matching field on the live form" because they were never
+    // added. Counted from BOTH shapes an entry field can carry: a profile-mapped one names its section
+    // in `canonical_field` ("experience[2].company"), and a per-customer one carries `entry_section` +
+    // `entry_index` instead. Same section key either way (see the entry_section note in ats.js).
+    const entryCounts = (() => {
+      const seen = {};
+      for (const e of bundle.entries || []) {
+        if (!e || e.is_deleted) continue;
+        let section = null, index = null;
+        const m = /^([A-Za-z_]+)\s*\[(\d+)\]/.exec(String(e.canonical_field || ""));
+        if (m) { section = m[1]; index = Number(m[2]); }
+        else if (e.entry_section && typeof e.entry_index === "number") { section = e.entry_section; index = e.entry_index; }
+        if (section == null || !Number.isFinite(index)) continue;
+        (seen[section] = seen[section] || new Set()).add(index);
+      }
+      const out = {};
+      for (const k of Object.keys(seen)) out[k] = seen[k].size;
+      return out;
+    })();
+    if (Object.keys(entryCounts).length) LOG(`the approved bundle holds repeating entries: ${Object.entries(entryCounts).map(([k, v]) => k + "×" + v).join(", ")} — the form will be grown to fit`);
+    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null });
 
     // CASCADE RE-REPLAY (2026-08-01). A value committed during the replay can REVEAL more
     // questions — live on an Ashby form, two work-authorization questions mount only after an
@@ -5241,7 +5271,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (missingAfter(out.results).length) {
       const before = out.results.length;
       LOG(`${missingAfter(out.results).length} approved value(s) had no field yet — re-scanning for questions the replay revealed`);
-      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, credentials: (subStore && subStore.credentials) || null });
+      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null });
       // Keep the LATER record for any field seen twice: it reflects the form as it stands now.
       const merged = new Map(out.results.map((r) => [durable(r.fieldName), r]));
       for (const r of again.results) merged.set(durable(r.fieldName), r);

@@ -1055,6 +1055,19 @@ function atsInjScan(ats) {
     const wrap = el.closest("label"); if (wrap) return txt(wrap);
     return null;
   };
+  // ⚠ WHAT A <select> ACTUALLY HOLDS — and index 0 is NOT "unselected". A select need not carry a
+  // placeholder row: iCIMS' salary currency starts straight at "USD $" and its timeframe at "Hr.", so a
+  // `selectedIndex > 0` test read a legitimately-chosen FIRST option as blank. Live 2026-08-17 that made
+  // a rehearsal report `native select commit failed` on two fields whose values were on the form the
+  // whole time — a false negative on a verify gate, which blocks a submit that should pass.
+  // "Unselected" is: nothing selected, or the selected row is a PLACEHOLDER (same vocabulary the option
+  // filter below uses). LOCKSTEP with atsInjReadValue's dropdown_native branch — two injected functions
+  // cannot share code, so a test pins them together.
+  const selectedTextOf = (el) => {
+    if (!el || el.selectedIndex < 0) return null;
+    const t = txt(el.options[el.selectedIndex]);
+    return (!t || /^(select|choose|—\s*make a selection)/i.test(t)) ? null : t;
+  };
   const out = { ats, url: location.href, title: document.title, fields: [] };
   const push = (d) => { d.domIndex = out.fields.length; out.fields.push(d); };
   const seen = new Set();
@@ -1153,7 +1166,7 @@ function atsInjScan(ats) {
       const label = stripReq(qLabel(el) || nm);
       const required = el.required === true || /[*✱]\s*$/.test(qLabel(el) || "");
       if (el.type === "file") { push({ fieldName: nm, inputSel: el.id ? "#" + esc(el.id) : 'input[name="' + esc(nm) + '"]', widgetType: "file_upload", label, isRequired: required, value: (el.files && el.files[0] && el.files[0].name) || null }); continue; }
-      if (el.tagName === "SELECT") { push({ fieldName: nm, inputSel: 'select[name="' + esc(nm) + '"]', widgetType: "dropdown_native", label, isRequired: required, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null, options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^select/i.test(t)) }); continue; }
+      if (el.tagName === "SELECT") { push({ fieldName: nm, inputSel: 'select[name="' + esc(nm) + '"]', widgetType: "dropdown_native", label, isRequired: required, value: selectedTextOf(el), options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^select/i.test(t)) }); continue; }
       push({ fieldName: nm, inputSel: el.id ? "#" + esc(el.id) : (el.tagName === "TEXTAREA" ? "textarea" : "input") + '[name="' + esc(nm) + '"]',
         widgetType: el.tagName === "TEXTAREA" ? "textarea" : (nm === "location" ? "location" : "text"),
         label, isRequired: required, value: el.value || null });
@@ -1384,7 +1397,10 @@ function atsInjScan(ats) {
           continue;
         }
         push(Object.assign(base, { widgetType: "dropdown_native",
-          value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null,
+          // Same "index 0 is not unselected" rule as atsInjReadValue — a select whose first row is a
+          // REAL option (iCIMS' salary currency starts at "USD $") would otherwise scan as blank, so a
+          // value already on the form is invisible to the fill and to the post-fill audit.
+          value: selectedTextOf(el),
           // iCIMS' placeholder row is "— Make a Selection —"; drop it and any bare "Select…"
           options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^(select|—\s*make a selection)/i.test(t)) }));
         continue;
@@ -1743,7 +1759,19 @@ function atsInjReadValue(ats, inputSel, widgetType) {
     const picked = [...el.selectedOptions].map(txt).filter(Boolean);
     return { ok: true, values: picked, value: picked.join("; ") || null };
   }
-  if (widgetType === "dropdown_native") return { ok: true, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null };
+  // ⚠ INDEX 0 IS NOT "UNSELECTED" — a select need not have a placeholder. This read used
+  // `selectedIndex > 0`, so on iCIMS' salary selects (raw options start at "USD $" and "Hr." with NO
+  // blank first row) choosing the FIRST option read back as null, and a rehearsal reported `native
+  // select commit failed` on two fields whose values were sitting on the form the whole time
+  // (measured 2026-08-17: selectedIndex 0, value "USD $"). A FALSE NEGATIVE on a verify gate blocks a
+  // submit that should pass, which is why it is worth the extra care.
+  // "Unselected" is: nothing selected at all, or the selected row is a PLACEHOLDER — the same
+  // vocabulary the scan uses to filter placeholders out of its option list.
+  if (widgetType === "dropdown_native") {
+    if (el.selectedIndex < 0) return { ok: true, value: null };
+    const t = txt(el.options[el.selectedIndex]);
+    return { ok: true, value: (!t || /^(select|choose|—\s*make a selection)/i.test(t)) ? null : t };
+  }
   // ⚠ iCIMS' AJAX combobox: its <select> is empty and holds an opaque numeric id, so BOTH the usual
   // reads (`selectedIndex`/`el.value`) lie about it — one says "nothing selected", the other returns
   // "12781". The truth is the text the widget displays. Without this the post-fill audit would flag
@@ -3162,11 +3190,20 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
 // Bounded twice over: never more than the profile has, and never more than ATS_ENTRY_MAX clicks —
 // a section whose Add button does not actually mount anything must cost a few seconds, not a loop.
 const ATS_ENTRY_MAX = 8;
-async function atsGrowIcimsEntries(act, ats, scan, profile) {
+// ⚠ `wantBySection` OVERRIDES the profile count, and the SUBMIT run cannot work without it. A submit
+// run replays an APPROVED BUNDLE and deliberately passes `profile: {}` — every value comes from the
+// bundle, never the profile — so counting profile rows here yields 0 and the form keeps the ONE entry
+// it renders by default. Live 2026-08-17 that produced 28 of a rehearsal's 32 verify failures: every
+// field of work-history entries 2 and 3 reported "approved value has NO matching field on the live
+// form", because those entries had never been added. A multi-entry history could not be replayed at
+// all. The bundle knows how many entries it holds, so the caller counts them and says so.
+async function atsGrowIcimsEntries(act, ats, scan, profile, wantBySection) {
   let current = scan;
   for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
     if (!def.addButton) continue;
-    const want = Array.isArray((profile || {})[def.source]) ? profile[def.source].length : 0;
+    const asked = wantBySection && typeof wantBySection[section] === "number" ? wantBySection[section] : null;
+    const want = asked != null ? asked
+      : (Array.isArray((profile || {})[def.source]) ? profile[def.source].length : 0);
     if (want < 2) continue;                       // one entry is what the form already renders
     const countEntries = (s) => {
       const seen = new Set();
@@ -3187,7 +3224,7 @@ async function atsGrowIcimsEntries(act, ats, scan, profile) {
       if (now <= have) break;                     // the click mounted nothing — stop rather than spin
       have = now;
     }
-    try { console.log(`[ApplyPilot][ATS-FILL] ${section}: profile has ${want} entr(ies), form now shows ${have}`); } catch (e) { /* log only */ }
+    try { console.log(`[ApplyPilot][ATS-FILL] ${section}: ${asked != null ? "the approved bundle holds" : "profile has"} ${want} entr(ies), form now shows ${have}`); } catch (e) { /* log only */ }
   }
   return current;
 }
@@ -3202,7 +3239,10 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // mints the rest on demand, so without this a three-role history silently becomes a one-role
   // history — the worst kind of miss, because the page looks completely filled. Reconcile UP only:
   // never delete an entry the operator may have typed themselves.
-  if (ats === "icims" && !o.valueFor) scan = await atsGrowIcimsEntries(act, ats, scan, profile);
+  // Grown on BOTH paths now: a fill sizes the sections from the profile, a submit run from the counts
+  // the caller derived from the approved bundle (see atsGrowIcimsEntries — it used to be skipped
+  // whenever `valueFor` was present, which is exactly the submit run).
+  if (ats === "icims") scan = await atsGrowIcimsEntries(act, ats, scan, profile, o.entryCounts);
   // RECON THE LISTS BEFORE FILLING — including the OPTIONAL ones (operator, 2026-08-16). On these
   // one-page forms a field we never fill still has to be ANSWERABLE in review, and that means a
   // real picker, not a picker-shaped text box. The scan already carries every list, so the work is
@@ -3864,7 +3904,19 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           if (rr.skip) { /* falls through to AI/blank */ }
           else if (rr.candidates) candidates = rr.candidates;
           else if (rr.value !== undefined) { textValue = String(rr.value); candidates = [String(rr.value)]; }
-        } else if (route.value != null) { textValue = String(route.value); candidates = [String(route.value)]; }
+        } else if (route.value != null) {
+          textValue = String(route.value);
+          // ⚠ A MULTI-ANSWER WIDGET'S APPROVED VALUE IS A SET, AND ARRIVES JOINED. `current_value` for a
+          // checkbox group / native multi-select is the display string ("Internship; Part-time"), so a
+          // replay that passes it through as ONE candidate asks the form for an option by that whole
+          // name — live 2026-08-17 the rehearsal reported `your profile answer ("Internship; Part-time")
+          // isn't one of this form's options`. Split it back into the set it represents, using the same
+          // shared vocabulary the fill joined it with (GROUP_JOIN), so the multi-select handler matches
+          // each answer against the live options exactly as it does on a fill.
+          candidates = (f.widgetType === "multiselect_native" || f.widgetType === "checkbox_group")
+            ? atsLib.splitGroupValue(route.value)
+            : [String(route.value)];
+        }
         if (route.path && candidates) candidates = atsFd.appendFieldVariants(profile, route.path, candidates);
       }
 
@@ -4894,8 +4946,13 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     }
     if (!m || m.targetIndex < 0) { rec.detail = "no candidate matched " + texts.length + " option(s)"; atsAttachOptions(rec, texts); return false; }
     const r = await act.eval(atsInjSelectNative, ref.inputSel, texts[m.targetIndex]);
-    await act.delay(120);
-    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    // ⚠ POLL THE READ-BACK, don't sample it once after a fixed beat. `act.delay` is ADAPTIVE and
+    // collapses to ~20ms when page timers measure fast, so "delay(120) then read once" could sample
+    // before the widget had settled — the exact trap atsReadBackSettled exists for and which the other
+    // commit paths already use. Live 2026-08-17 two iCIMS salary selects reported `native select commit
+    // failed` on a rehearsal; polling is the honest read, and a genuinely blank field still reports
+    // blank — it just costs the window to say so.
+    const back = await atsReadBackSettled(act, ats, ref.inputSel, wt, 2000);
     rec.after = back && back.ok ? back.value : null;
     atsAttachOptions(rec, texts);
     const okv = atsLib.normalize(String(rec.after || "")) === atsLib.normalize(texts[m.targetIndex]);

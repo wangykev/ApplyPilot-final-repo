@@ -616,6 +616,26 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   (`rcf3271` "Employer Phone Number" at -1/-2/-3 is three real jobs, not one value three times).
   A repeat is left **BLANK with a note**: the profile holds one phone, so a copy is a fabricated second
   number and the AI's would be a guessed one, and the extra entry is optional so blank blocks nothing.
+- **⚠ THE SUBMIT RUN MUST GROW REPEATING ENTRIES FROM THE *BUNDLE*, NOT THE PROFILE (2026-08-17).** A
+  replay passes `profile: {}` by design (every value comes from the approved bundle), so the
+  entry-growing pass counted 0 rows and the form kept the ONE entry it renders. Live that was **28 of a
+  rehearsal's 32 verify failures** — every field of work-history entries 2 and 3 reported *"approved
+  value has NO matching field on the live form"*, and a multi-entry history could not be replayed at
+  all. `runAtsSubmitRun` counts entries from the bundle (BOTH shapes: `canonical_field`'s
+  `experience[2]…` and the `entry_section`/`entry_index` a per-customer field carries) and passes
+  `opts.entryCounts`.
+- **⚠ INDEX 0 IS NOT "UNSELECTED" — a `<select>` need not have a placeholder (2026-08-17).** Both select
+  readers used `selectedIndex > 0`, so iCIMS' salary Currency and Time Frame (raw options start at
+  `"USD $"` / `"Hr."`, no blank first row) read a legitimately-chosen FIRST option as blank — a
+  rehearsal reported `native select commit failed` on two fields whose values were on the form the whole
+  time. **A false negative on a verify gate blocks a submit that should pass.** "Unselected" is: nothing
+  selected, or the selected row is a PLACEHOLDER. LOCKSTEP in `atsInjScan` + `atsInjReadValue` (two
+  injected fns cannot share code) — pinned by a test that strips comments first, because both functions
+  now *document* the old shape in prose and a naive grep matches the explanation.
+- **A MULTI-ANSWER value arrives JOINED, and the replay must split it.** `current_value` for a
+  checkbox group / native multi-select is the display string (`"Internship; Part-time"`), so passing it
+  through as one candidate asks the form for an option by that whole name. Split with
+  `atsLib.splitGroupValue` — the same vocabulary the fill joined it with.
 - **`atsInjSubmitState` needs its iCIMS branch**: the control is `<input type="submit"
   id="cp_form_submit_i" value="Submit Profile">`, and the generic finder queries only `button`s and
   matches `textContent`, which an `<input>` lacks. Measured: without it `hasSubmit:false` and
