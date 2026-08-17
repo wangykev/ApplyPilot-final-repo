@@ -531,32 +531,6 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
         />
       </SectionCard>
 
-      {/* Employment types considered — a MULTI-answer question several ATSs ask */}
-      <SectionCard
-        title="Employment types you'd consider"
-        subtitle="Asked as a multi-select — “Please select the employment options you would consider”. Tick every kind you'd take; a form offering only some of them selects those and says which it could not."
-      >
-        <div className="flex flex-wrap gap-x-8 gap-y-2">
-          {EMPLOYMENT_TYPES.map((t) => (
-            <CheckboxField
-              key={t}
-              label={t}
-              bucketPath={t === EMPLOYMENT_TYPES[0] ? "employment_types_considered" : undefined}
-              checked={profile.employment_types_considered.includes(t)}
-              onChange={(on) => update((p) => {
-                // Kept in the canonical order above rather than click order, so the fill tries them
-                // in a stable sequence and two profiles with the same ticks are the same answer.
-                const next = EMPLOYMENT_TYPES.filter((x) => (x === t ? on : p.employment_types_considered.includes(x)));
-                p.employment_types_considered = next;
-              })}
-            />
-          ))}
-        </div>
-        <p className="mt-3 text-xs text-ink-faint">
-          Leaving all of them unticked leaves the question unanswered rather than guessing a default.
-        </p>
-      </SectionCard>
-
       {/* Employment history companies — safety-critical */}
       <SectionCard
         title="Employer history"
@@ -602,6 +576,30 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <DateField label="Earliest start date" granularity="month-day-year" bucketPath="screening.earliest_start_date" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
           <TextField label="Total years of experience" bucketPath="screening.years_of_experience_total" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />
           <TextField label="Salary expectation" bucketPath="screening.salary_expectation" value={profile.screening.salary_expectation} onChange={(v) => update((p) => { p.screening.salary_expectation = v; })} />
+        </div>
+        {/* Employment types considered — a MULTI-answer preference, so it lives with the other
+            screening preferences rather than in a card of its own. */}
+        <div className="mt-4">
+          <FieldLabel>Employment types you'd consider</FieldLabel>
+          <div className="flex flex-wrap gap-x-8 gap-y-2">
+          {EMPLOYMENT_TYPES.map((t) => (
+            <CheckboxField
+              key={t}
+              label={t}
+              bucketPath={t === EMPLOYMENT_TYPES[0] ? "employment_types_considered" : undefined}
+              checked={profile.employment_types_considered.includes(t)}
+              onChange={(on) => update((p) => {
+                // Kept in the canonical order above rather than click order, so the fill tries them
+                // in a stable sequence and two profiles with the same ticks are the same answer.
+                const next = EMPLOYMENT_TYPES.filter((x) => (x === t ? on : p.employment_types_considered.includes(x)));
+                p.employment_types_considered = next;
+              })}
+            />
+          ))}
+        </div>
+        <p className="mt-3 text-xs text-ink-faint">
+          Leaving all of them unticked leaves the question unanswered rather than guessing a default.
+        </p>
         </div>
         <SectionRemembered items={rememberedFor("Screening")} {...fieldRowProps} />
       </SectionCard>
