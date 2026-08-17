@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-exp-1";
+const AP_BUILD_MARKER = "icims-exp-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4404,6 +4404,10 @@ function makeAtsActuation(llmConfig) {
     delay: cdpAdaptiveDelay,
     delayFull: cdpDelay,
     eval: (fn, ...args) => cdpEval(fn, ...args),
+    // Evaluate in the TOP document even while a form frame is pinned. Only the top frame knows
+    // where the iframe sits on screen, which is what makes "scroll to the field being filled"
+    // possible on iCIMS — inside a content-sized frame there is nothing to scroll.
+    evalTop: (fn, ...args) => cdpEvalTop(fn, ...args),
     wakePage: () => cdpWakePage(), // hidden-tab unfreeze between polls (the discover rule)
     // ⚠ FORWARD THE SHARED PROBES. This object is hand-built, so anything added to makeCdpActuation
     // is invisible here — which silently disabled two fixes: the quiescence watch (the ATS poll fell

@@ -467,6 +467,19 @@ function atsScopeForField(ats, f, profile) {
 const ATS_MONTHS = ["January", "February", "March", "April", "May", "June",
   "July", "August", "September", "October", "November", "December"];
 
+// A month as the tenant might spell it, most specific first: full name, then the 3-letter
+// abbreviation, then "Sept" for the one month whose short form is commonly four letters. May is
+// already three letters, so it yields a single candidate rather than a duplicate.
+function atsMonthCandidates(mi) {
+  const full = ATS_MONTHS[mi];
+  if (!full) return [];
+  const out = [full];
+  const abbr = full.slice(0, 3);
+  if (abbr !== full) out.push(abbr);
+  if (full === "September") out.push("Sept");
+  return out;
+}
+
 // Is a "YYYY" or "YYYY-MM" strictly in the future? null when it is neither shape.
 // `now` is a parameter so the rule is unit-testable without freezing the clock.
 function atsIsFutureYearMonth(s, now) {
@@ -534,8 +547,14 @@ function atsResolveEntryField(es, entry, f, now) {
     }
     if (!ym) return null;                               // a year-only value says nothing about the month
     const mi = parseInt(ym[2], 10) - 1;
+    // ⚠ TIERED, because a month dropdown's VOCABULARY is the tenant's choice, not a fact about the
+    // date. Live 2026-08-16 two end-date months reached review as `stated-value-unmatched` —
+    // "August" against a list that spells it "Aug" — while the education date control on the SAME
+    // page lists Jan…Dec. Most specific first, so a form offering full names still matches exactly
+    // and only an abbreviating one falls to the second tier. "Sept" is included because it is the
+    // one abbreviation that is commonly four letters.
     return mi >= 0 && mi < 12
-      ? { candidates: [ATS_MONTHS[mi]], source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from }
+      ? { candidates: atsMonthCandidates(mi), source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from }
       : null;
   }
   if (spec.kind === "entry_city") {
@@ -1261,6 +1280,33 @@ function atsInjIcimsClose(inputSel) {
 // Click a repeating section's "Add More" anchor. Anchored by the anchor's OWN TEXT rather than its
 // id (`rcf3211Button_-1` is per-customer) — every one of them reads "Add More (<section name>)".
 // Returns the control count before/after so the caller can tell a real mount from a no-op.
+// Where does this field sit inside the FRAME's document? (absolute, not viewport-relative)
+function atsInjFrameFieldY(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false };
+  const r = el.getBoundingClientRect();
+  return { ok: true, y: Math.round(r.top + (window.scrollY || 0)), h: Math.round(r.height) };
+}
+
+// ⚠ SCROLLING INSIDE THE FRAME MOVES NOTHING WHEN THE FRAME IS FULL-HEIGHT. iCIMS sizes its iframe
+// to its content, so the frame's document has no scrollbar of its own — the TOP window is the
+// scroller. `atsInjScrollIntoView` therefore ran per field and the operator still saw a motionless
+// page. This runs in the TOP frame and scrolls it to the field's position PLUS the iframe's own
+// offset, which is the only place that arithmetic is available.
+function atsInjScrollTopToFrameY(y, h) {
+  const fr = document.getElementById("icims_content_iframe") ||
+    document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
+  if (!fr) return { ok: false };
+  const fy = fr.getBoundingClientRect().top + (window.scrollY || 0);
+  const target = fy + y - Math.max(120, (window.innerHeight || 800) / 2 - (h || 0) / 2);
+    // ⚠ INSTANT, NEVER SMOOTH. A smooth scroll is still ANIMATING when the next widget is opened and
+  // clicked, and these comboboxes portal their menu at a fixed screen position — so the page slid
+  // under the menu and three fields that had filled cleanly came back "no option matched". Watching
+  // the fill must never move the page while the fill is touching it.
+  window.scrollTo({ top: Math.max(0, Math.round(target)), behavior: "auto" });
+  return { ok: true };
+}
+
 function atsInjIcimsAddEntry(labelPattern) {
   const re = new RegExp(labelPattern, "i");
   const anchors = [...document.querySelectorAll("a, button")].filter((a) => {
@@ -2772,6 +2818,16 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
     const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
     // show the operator what we are filling (see atsInjScrollIntoView) — best effort, never fatal
     try { await act.eval(atsInjScrollIntoView, f.inputSel); } catch (e) { /* a field we cannot scroll to still fills */ }
+    // ⚠ AND SCROLL THE TOP PAGE TOO (operator, 2026-08-16). iCIMS sizes its iframe to its content,
+    // so the frame has no scroller of its own and the line above moves nothing — the run looked
+    // motionless while it filled. Best-effort and never fatal: a fill that cannot be watched is
+    // still a fill. Only when a frame is pinned, so the other tenants are untouched.
+    if (ats === "icims" && act.evalTop) {
+      try {
+        const at = await act.eval(atsInjFrameFieldY, f.inputSel);
+        if (at && at.ok) await act.evalTop(atsInjScrollTopToFrameY, at.y, at.h);
+      } catch (e) { /* watching is a nicety, never a requirement */ }
+    }
     // Per-field wall clock, so [ATS-TIME] can name what a slow fill actually spent its time on
     // (the Workday [CDP-TIME] habit). A record is finalized at several `continue`s below, so the
     // stamp is applied by `fin()` rather than at one exit.
@@ -4216,7 +4272,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
-    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsIsFutureYearMonth, atsGrowIcimsEntries, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
+    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
@@ -4228,7 +4284,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };

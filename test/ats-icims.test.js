@@ -717,8 +717,23 @@ test("experience: routed by LABEL, and each field answers from its OWN entry", (
   // ⚠ the two date triples carry IDENTICAL labels; only their group tells start from end
   assert.deepStrictEqual(r(fields[4]).candidates, ["May"]);
   assert.strictEqual(r(fields[5]).value, "2025");
-  assert.deepStrictEqual(r(fields[6]).candidates, ["August"]);
+  // tiered: the form may spell it "Aug" (see the month-vocabulary test)
+  assert.deepStrictEqual(r(fields[6]).candidates, ["August", "Aug"]);
   assert.strictEqual(r(fields[7]).value, "2025");
+});
+
+// A month dropdown's VOCABULARY is the tenant's choice, not a fact about the date. Live, two
+// end-date months reached review as `stated-value-unmatched` — "August" against a list spelling it
+// "Aug" — while the education date control on the SAME page listed Jan…Dec.
+test("months are tiered: full name first, then the abbreviation the form may use", () => {
+  assert.deepStrictEqual(ats.atsMonthCandidates(7), ["August", "Aug"]);
+  assert.deepStrictEqual(ats.atsMonthCandidates(0), ["January", "Jan"]);
+  // May is already three letters — one candidate, not a duplicate
+  assert.deepStrictEqual(ats.atsMonthCandidates(4), ["May"]);
+  // the one month whose short form is commonly FOUR letters
+  assert.deepStrictEqual(ats.atsMonthCandidates(8), ["September", "Sep", "Sept"]);
+  // full name stays FIRST, so a form offering full names still matches exactly
+  assert.strictEqual(ats.atsMonthCandidates(11)[0], "December");
 });
 
 test("experience: a role you STILL HOLD leaves its end date blank, never AI-guessed", () => {
