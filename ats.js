@@ -28,7 +28,10 @@ const atsLib = (typeof module !== "undefined" && module.exports)
   : { normalize: normalize, matchCandidates: matchCandidates, normalizeLabel: normalizeLabel,
       ensureHttps: ensureHttps, canonicalJobUrl: canonicalJobUrl, isAiPlaceholder: isAiPlaceholder,
       AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV,
-      isSignatureDateQuestion: isSignatureDateQuestion };
+      isSignatureDateQuestion: isSignatureDateQuestion,
+      // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
+      // join/split exactly the way groups do — see the multiselect commit path.
+      joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN };
 const atsFd = (typeof module !== "undefined" && module.exports)
   ? require("./fill-driver.js")
   : { resolve: resolve, buildReviewBundle: buildReviewBundle, buildBucketIndex: buildBucketIndex,
@@ -1157,8 +1160,17 @@ function atsInjScan(ats) {
       if (el.tagName === "SELECT" && el.multiple) {
         // A native <select multiple> is a MULTI-answer control: committing it by selectedIndex (what
         // dropdown_native does) would answer one option and silently discard the rest.
+        // ⚠ JOINED WITH "; " — the shared group separator (`GROUP_JOIN`, lib.js), NOT ", ".
+        // A multi-select's selection reaches review the same way a checkbox GROUP's does: the joined
+        // string is `current_value` and the array is `selected_options`, and the review editor ticks
+        // its boxes by splitting the joined string on GROUP_JOIN. Joining with ", " here meant
+        // `splitGroupValue` could not split it, so `"Internship, Part-time"` arrived as ONE unmatched
+        // option and the editor rendered the question BLANK while the form plainly held both answers
+        // (operator, live 2026-08-17). Hardcoded because an injected function cannot import — pinned
+        // against GROUP_JOIN by test.
         push(Object.assign(base, { widgetType: "multiselect_native",
-          value: [...el.selectedOptions].map((o) => txt(o)).join(", ") || null,
+          values: [...el.selectedOptions].map((o) => txt(o)).filter(Boolean),
+          value: [...el.selectedOptions].map((o) => txt(o)).join("; ") || null,
           options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^(select|—s*make a selection)/i.test(t)) }));
         continue;
       }
@@ -1552,7 +1564,13 @@ function atsInjReadValue(ats, inputSel, widgetType) {
     }
     return { ok: true, value: el.value || null };
   }
-  if (widgetType === "multiselect_native") return { ok: true, value: [...el.selectedOptions].map(txt).join(", ") || null };
+  // `values` is the AUTHORITATIVE array; `value` is the joined display string, and it joins on the
+  // shared group separator "; " (GROUP_JOIN, lib.js) so the review editor can split it back into
+  // ticked options. See the scan's multiselect branch for what joining on ", " cost.
+  if (widgetType === "multiselect_native") {
+    const picked = [...el.selectedOptions].map(txt).filter(Boolean);
+    return { ok: true, values: picked, value: picked.join("; ") || null };
+  }
   if (widgetType === "dropdown_native") return { ok: true, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null };
   // ⚠ iCIMS' AJAX combobox: its <select> is empty and holds an opaque numeric id, so BOTH the usual
   // reads (`selectedIndex`/`el.value`) lie about it — one says "nothing selected", the other returns
@@ -4062,8 +4080,15 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     const r = await act.eval(atsInjSelectNativeMulti, ref.inputSel, picks);
     await act.delay(140);
     const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
-    rec.after = back && back.ok ? back.value : (r && r.selected ? r.selected.join(", ") : null);
-    const got = String(rec.after || "").split(/,\s*/).filter(Boolean).map((x) => atsLib.normalize(x));
+    // ⚠ CARRY THE ARRAY, don't re-split a string. A multi-select reaches review as a checkbox GROUP,
+    // whose contract is `selected_options` = the authoritative array + `current_value` = the joined
+    // display. Setting only the joined string left the editor splitting on the wrong separator and
+    // rendering the question BLANK on a form that held both answers (live 2026-08-17).
+    const chosen = (back && back.ok && Array.isArray(back.values)) ? back.values
+      : (r && Array.isArray(r.selected) ? r.selected : []);
+    rec.selected_options = chosen;
+    rec.after = chosen.length ? atsLib.joinGroupValue(chosen) : null;
+    const got = chosen.map((x) => atsLib.normalize(x));
     const okv = !!(r && r.ok) && picks.every((p) => got.indexOf(atsLib.normalize(p)) !== -1);
     rec.verified = okv;
     // ⚠ A STORED ANSWER THIS FORM DOES NOT OFFER IS REPORTED, never dropped in silence: the operator

@@ -891,17 +891,27 @@ test("multiselect: EVERY offered answer is selected in ONE commit, and misses ar
     // ⚠ mirrors the real widget: a fresh selection REPLACES the previous one, so a per-option loop
     // would leave only the last pick — the bug the one-shot commit exists to avoid.
     atsInjSelectNativeMulti: (s, texts) => { sel[s] = [...texts]; return { ok: true, missed: [], selected: [...texts] }; },
-    atsInjReadValue: (a, s) => ({ ok: true, value: (sel[s] || []).join(", ") || null }),
+    // ⚠ MIRRORS THE REAL atsInjReadValue: `values` is the authoritative array and `value` joins on the
+    // shared group separator "; ". It used to join on ", ", and once the real function was corrected
+    // that stale fixture made the post-fill AUDIT compare "A; B" against "A, B" and flip a correct
+    // fill to audit-mismatch — a fixture taking a different path than the page, which is exactly what
+    // the live-testing skill warns produces false results.
+    atsInjReadValue: (a, s) => ({ ok: true, values: [...(sel[s] || [])], value: (sel[s] || []).join("; ") || null }),
   };
   const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
     { employment_types_considered: ["Internship", "Full-time"] }, {}, {}, {});
   assert.deepStrictEqual(sel["#et"], ["Internship", "Full-time"], "both, in one commit");
   assert.strictEqual(out.results[0].status, "filled");
+  // The GROUP contract, which is what the review editor ticks its boxes from: the authoritative array
+  // plus a joined display string that splitGroupValue can split back apart. Without the array the
+  // question rendered BLANK on a form holding both answers (live 2026-08-17).
+  assert.deepStrictEqual(out.results[0].selected_options, ["Internship", "Full-time"]);
+  assert.strictEqual(out.results[0].after, "Internship; Full-time");
 
   // a stored answer the form does not offer is REPORTED, never silently dropped
   const sel2 = {};
   const page2 = { ...page, atsInjSelectNativeMulti: (s, texts) => { sel2[s] = [...texts]; return { ok: true, missed: [], selected: [...texts] }; },
-    atsInjReadValue: (a, s) => ({ ok: true, value: (sel2[s] || []).join(", ") || null }) };
+    atsInjReadValue: (a, s) => ({ ok: true, values: [...(sel2[s] || [])], value: (sel2[s] || []).join("; ") || null }) };
   const out2 = await ats.driveAtsPageFill(fakeAct(page2), "icims",
     { employment_types_considered: ["Internship", "Contract"] }, {}, {}, {});
   assert.deepStrictEqual(sel2["#et"], ["Internship"]);

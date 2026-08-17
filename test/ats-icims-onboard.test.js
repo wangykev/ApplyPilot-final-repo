@@ -261,6 +261,58 @@ test("atsInjClickAuthSubmit refuses a disabled control rather than reporting a p
   assert.ok(/no-submit-control/.test(src));
 });
 
+// ── a native multi-select reaches review as a checkbox GROUP ─────────────────────────────
+// Live 2026-08-17: "Please select the following employment options you would consider" rendered
+// BLANK in review while the form plainly held two answers. `current_value` was right
+// ("Internship, Part-time") but the group vocabulary joins and splits on GROUP_JOIN ("; "), so
+// splitGroupValue could not split a comma-joined string — it became ONE option matching nothing,
+// and the editor ticked no boxes.
+
+const lib = require("../lib.js");
+
+test("⚠ the multi-select join separator IS the shared group separator, in both injected reads", () => {
+  // Injected functions cannot import, so the separator is hardcoded in two places. This is the pin
+  // that stops them drifting from GROUP_JOIN again — drift is invisible until a form renders blank.
+  assert.strictEqual(lib.GROUP_JOIN, "; ");
+  for (const fn of [ats.atsInjScan, ats.atsInjReadValue]) {
+    const src = String(fn);
+    const multi = /multiselect_native[\s\S]{0,400}?selectedOptions[\s\S]{0,200}?join\((["'])(.*?)\1\)/.exec(src)
+      || /selectedOptions[\s\S]{0,200}?join\((["'])(.*?)\1\)/.exec(src);
+    assert.ok(multi, `${fn.name}: no multi-select join found`);
+    assert.strictEqual(multi[2], lib.GROUP_JOIN,
+      `${fn.name} joins a multi-select with ${JSON.stringify(multi[2])}, not GROUP_JOIN`);
+  }
+});
+
+test("splitGroupValue round-trips what the multi-select now produces", () => {
+  const picked = ["Internship", "Part-time"];
+  const joined = lib.joinGroupValue(picked);
+  assert.strictEqual(joined, "Internship; Part-time");
+  assert.deepStrictEqual(lib.splitGroupValue(joined), picked);
+  // …and the OLD comma form is exactly what could not be split — the bug, pinned so the reason stays
+  // legible: one unmatched element is why the editor showed nothing.
+  assert.deepStrictEqual(lib.splitGroupValue("Internship, Part-time"), ["Internship, Part-time"]);
+});
+
+test("groupSelection prefers the authoritative ARRAY over re-splitting the string", () => {
+  // Which is why the commit path now sets `selected_options` from the read-back array rather than
+  // letting the far side reverse-engineer a display string.
+  assert.deepStrictEqual(
+    lib.groupSelection({ selected_options: ["Internship", "Part-time"], current_value: "anything at all" }),
+    ["Internship", "Part-time"],
+  );
+  // An older bundle carries no array, so its joined value is the only record of the set.
+  assert.deepStrictEqual(lib.groupSelection({ current_value: "Internship; Part-time" }), ["Internship", "Part-time"]);
+});
+
+test("a multi-select record carries BOTH halves of the group contract", () => {
+  // `selected_options` (authoritative) + `current_value` (joined display) — the same shape a Workday
+  // checkbox group produces, so the review editor needs no multi-select-specific branch.
+  const src = String(ats.driveAtsPageFill) + String(ats.atsActuateField || "");
+  assert.ok(/rec\.selected_options\s*=/.test(src), "the multiselect commit must set selected_options");
+  assert.ok(/joinGroupValue/.test(src), "current_value must be joined with the shared joiner");
+});
+
 // ── the candidate's phone, and REPEATED entries of a single-value field ──────────────────
 // Live 2026-08-16: `-1_PersonProfileFields.PhoneNumber` / `.PhoneType` were both REQUIRED, both
 // unmapped, and their labels are only "Number" and "Type" — so both fell through the label ladder to
