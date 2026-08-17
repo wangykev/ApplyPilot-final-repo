@@ -14,6 +14,7 @@ import { ResumeButton } from "./ResumeButton";
 import type { ReviewBundle } from "@/lib/review-summary";
 import { prettyCompany } from "@/lib/company-name";
 import { resumeById } from "@/lib/resume-store";
+import { getCredentialsSyncSlice } from "@/app/app/credentials/actions";
 import type { Application } from "../shared";
 import { SAMPLE_APPS, SAMPLE_BUNDLE_BY_ID } from "../sample";
 
@@ -107,6 +108,13 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
   const loaded = await loadApp(id);
   if (!loaded) notFound();
   const { app, bundle, persistable, jobDescription, resumeName } = loaded;
+  // A form whose account is created by the submission (iCIMS) has login/password FIELDS, and the
+  // bundle deliberately carries only a placeholder for them — the secret must not sit on the
+  // application row. So the review page reads the account's own stored credential here, server-side,
+  // purely to DISPLAY it (login as text, password as dots). Only fetched when the bundle actually
+  // contains such a field, so no other application pays for it or has it in its payload.
+  const wantsCredentials = !!bundle?.entries?.some((e) => e.credential);
+  const credentials = wantsCredentials ? (await getCredentialsSyncSlice().then((r) => (r.ok ? r.slice : null)).catch(() => null)) : null;
 
   return (
     <div className="space-y-8">
@@ -145,7 +153,7 @@ export default async function ApplicationDetail({ params }: { params: Promise<{ 
       />
 
       {bundle ? (
-        <ReviewEditor appId={id} initialBundle={bundle} canPersist={persistable} />
+        <ReviewEditor appId={id} initialBundle={bundle} canPersist={persistable} credentials={credentials} />
       ) : (
         <div className="bezel px-6 py-12 text-center">
           <p className="text-sm text-ink-dim">No review summary captured yet.</p>

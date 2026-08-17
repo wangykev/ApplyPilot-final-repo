@@ -497,6 +497,15 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   - **clear before typing** — the setter SETS rather than replaces, so a rewrite merged into
     `"old@x.comnew@y.com"`. Write order is pinned `["", value]`.
   - absent/incomplete credentials ⇒ `needs_review` + `credentials-not-stored`, never a half-made account.
+  - **REVIEW SHOWS IT LIKE A LOGIN FORM, and reads the value from the ACCOUNT, not the bundle
+    (operator, 2026-08-17).** The bundle carries `credential: true` + `credential_kind` — FLAGS ONLY —
+    so the review editor renders the login as text and the password as dots with a reveal toggle,
+    sourcing the actual value server-side from `credentials_json` (the same row the Credentials page
+    edits). ⚠ **Read-only, and that is the safe direction, not a shortcut:** an editable box would
+    write what was typed into `current_value`, which is precisely how the secret would reach the
+    application row. Changing it belongs on the Credentials page — the submit run re-reads it there
+    anyway. Regression-checked live: the stored bundle contains neither the password nor the login
+    email, only the placeholders.
   - **an unmapped `type=password` box is claimed anyway** — recognition is what keeps the AI rescue away
     from it, so an UNrecognized password field is the dangerous outcome. Claiming a LOGIN needs two
     agreeing signals (`autocomplete="username"` AND login/username wording).

@@ -74,6 +74,13 @@ export type ReviewEntry = {
   // on PSECU's ethnicityMulti — two options checked, both saved). current_value stays the joined
   // display string so the blank tests / submit gate / review reconcile keep reading one value.
   selected_options?: string[] | null;
+  // ⚠ A CREDENTIAL FIELD CARRIES NO VALUE. On a form whose account is created by the submission
+  // (iCIMS), the login/password are ordinary fields, but `current_value` is the placeholder
+  // "(stored login)" — the secret is never put in the bundle, because the bundle lives on the
+  // application row in Supabase. These two say WHICH credential the field wants, so the editor can
+  // render it as a login box and read the real value from the account's own credentials record.
+  credential?: boolean | null;
+  credential_kind?: string | null; // "login" | "password" | "password_confirm"
   tree_structure?: TreeStructure; // cert/source tree-AI (chosen category + leaves)
   date_order?: string[] | null; // segment order for the segmented date editor
   tiers?: string[] | null; // ordered candidate list for a hierarchical/tree field

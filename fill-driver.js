@@ -8256,6 +8256,14 @@ function buildReviewBundle(results, meta) {
       // A checkbox GROUP holds a SET; current_value is the joined display string and this is the
       // authoritative array. Absent for every other widget.
       selected_options: Array.isArray(rec.selected_options) ? rec.selected_options : null,
+      // ⚠ FLAGS ONLY — THE VALUE NEVER TRAVELS. A form whose account is created by the submission
+      // (iCIMS) asks for the login and password as ordinary fields, and `current_value` for those is
+      // deliberately the PLACEHOLDER "(stored login)". These two say WHICH credential the field wants
+      // so the review page can render it like a login box — reading the actual value from the site's
+      // own credentials record, not from here. Carrying the secret in the bundle would put it in
+      // Supabase on the application row, which is the leak the placeholder exists to prevent.
+      credential: rec.credential === true ? true : null,
+      credential_kind: rec.credentialKind != null ? String(rec.credentialKind) : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
       remembered_fields: Array.isArray(rec.remembered_fields) ? rec.remembered_fields : null, // Phase 2: removed_entry → what filled (per field + how) so add-back PREFILLS them

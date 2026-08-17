@@ -17,6 +17,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
+import { Eye, EyeOff } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 import type { ReviewBundle, ReviewEntry, FieldShape, WalkStatus } from "@/lib/review-summary";
 import {
@@ -84,10 +85,14 @@ export function ReviewEditor({
   appId,
   initialBundle,
   canPersist,
+  credentials,
 }: {
   appId: string;
   initialBundle: ReviewBundle;
   canPersist: boolean;
+  // The account's OWN stored login, read from `credentials_json` server-side — NOT from the bundle,
+  // which carries only a placeholder for these fields by design. Absent when none is stored.
+  credentials?: { email: string; password: string } | null;
 }) {
   const [bundle, setBundle] = useState<ReviewBundle>(initialBundle);
   const [filter, setFilter] = useState<Filter>("all");
@@ -488,8 +493,8 @@ export function ReviewEditor({
   // shared props threaded into the field renderer — STABLE (memoized over stable callbacks) so a
   // field row's ref-registration effect doesn't re-run on every keystroke elsewhere on the page.
   const ctx = useMemo<RowCtx>(
-    () => ({ commit, setApproved, setTiers, registerRow, jumpTo, addBack: addBackEntry, leaveRemoved }),
-    [commit, setApproved, setTiers, registerRow, jumpTo, addBackEntry, leaveRemoved]
+    () => ({ commit, setApproved, setTiers, registerRow, jumpTo, addBack: addBackEntry, leaveRemoved, credentials }),
+    [commit, setApproved, setTiers, registerRow, jumpTo, addBackEntry, leaveRemoved, credentials]
   );
 
   return (
@@ -629,6 +634,7 @@ type RowCtx = {
   jumpTo: (e: ReviewEntry) => void;
   addBack: (removed: ReviewEntry) => void; // Phase 2: reconstruct a removed_entry PREFILLED
   leaveRemoved: (removed: ReviewEntry) => void; // Phase 2: accept the removal (approve the card)
+  credentials?: { email: string; password: string } | null; // for credential fields — see FieldEditor
 };
 
 // ── the FIELD LIST (grouped by page → section, collapsible, repeating entries + nested) ──
@@ -1167,6 +1173,39 @@ function FieldNotes({ e, review, kind }: { e: ReviewEntry; review?: boolean; kin
   return <>{notes}</>;
 }
 
+// A credential, shown the way a login form shows it: the login as plain text, the password as dots
+// with a reveal toggle (the same control the Credentials page uses, so the two pages behave alike).
+// Read-only — see the FieldEditor branch for why editing here would defeat the placeholder.
+function CredentialDisplay({ kind, value }: { kind: string; value: string }) {
+  const [shown, setShown] = useState(false);
+  const isPassword = kind !== "login";
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        readOnly
+        type={!isPassword || shown ? "text" : "password"}
+        value={value}
+        // autoComplete off + no name: this box exists to SHOW a stored value, and must not invite the
+        // browser's password manager to treat it as a login field and overwrite it (the same hazard
+        // the fill's credential re-check exists for).
+        autoComplete="off"
+        aria-label={isPassword ? "Stored password" : "Stored login"}
+        className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none"
+      />
+      {isPassword && (
+        <button
+          type="button"
+          onClick={() => setShown((s) => !s)}
+          className="btn-ghost shrink-0 px-3 py-2"
+          aria-label={shown ? "Hide password" : "Show password"}
+        >
+          {shown ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── the per-widget EDITOR (buildEditor equivalent) ──
 function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   const wt = e.widget_type;
@@ -1174,6 +1213,37 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   const onCommit = (v: string | null, patch?: Partial<ReviewEntry>) => ctx.commit(e, v, patch ? { patch } : undefined);
   // "Today" writes one self-evident value, so it also approves — see commit()'s approve option.
   const onCommitApproved = (v: string | null) => ctx.commit(e, v, { approve: true });
+
+  // ── CREDENTIAL: show it the way a login form does ─────────────────────────────────────
+  // On a form whose account is created by the submission (iCIMS), the login and password are
+  // ordinary fields — so review should look like a login box: the login as text, the password as
+  // dots you can reveal.
+  //
+  // ⚠ THE VALUE COMES FROM THE ACCOUNT'S CREDENTIALS RECORD, NEVER FROM THE BUNDLE. `current_value`
+  // here is the placeholder "(stored login)" precisely because the bundle is stored on the
+  // application row in Supabase, and a password must not live there. So this reads `ctx.credentials`
+  // (loaded server-side from `credentials_json`, the same row the Credentials page edits).
+  //
+  // READ-ONLY on purpose, and it is the safe direction rather than a shortcut: an editable box here
+  // would write whatever was typed into `current_value`, which is exactly how the secret would end
+  // up in the bundle. Changing it belongs on the Credentials page, which is the one place that
+  // stores it — and the submit run re-reads it from there rather than replaying this row.
+  if (e.credential) {
+    const kind = e.credential_kind ?? "login";
+    const isLogin = kind === "login";
+    const value = isLogin ? (ctx.credentials?.email ?? "") : (ctx.credentials?.password ?? "");
+    if (!value) {
+      return (
+        <div className="text-sm">
+          <span className="text-flagged">no {kind.replace(/_/g, " ")} stored</span>
+          <Link href="/app/credentials" className="ml-2 text-xs text-amber underline-offset-2 hover:underline">
+            Set it on the Credentials page
+          </Link>
+        </div>
+      );
+    }
+    return <CredentialDisplay kind={kind} value={value} />;
+  }
 
   // file_upload: the résumé + top-level Documents are uploaded elsewhere (the profile /
   // attachments manager); per-entry attachments attach on the form. Display-only here.
