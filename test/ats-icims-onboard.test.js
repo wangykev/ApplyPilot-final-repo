@@ -261,6 +261,130 @@ test("atsInjClickAuthSubmit refuses a disabled control rather than reporting a p
   assert.ok(/no-submit-control/.test(src));
 });
 
+// ── the candidate's phone, and REPEATED entries of a single-value field ──────────────────
+// Live 2026-08-16: `-1_PersonProfileFields.PhoneNumber` / `.PhoneType` were both REQUIRED, both
+// unmapped, and their labels are only "Number" and "Type" — so both fell through the label ladder to
+// the AI, which answered "Number" with `24615`, the job's requisition id.
+
+const PHONE_PROFILE = {
+  personal_info: {
+    phone_number: "4125551234", phone_device_type: "Mobile", phone_extension: "204",
+    country_phone_code: ["United States of America (+1)", "United States"],
+    city: "Pittsburgh", state_province: "Pennsylvania",
+  },
+};
+const route = (f, profile) =>
+  ats.atsRouteField("icims", f, profile || PHONE_PROFILE, {}, {}, new Map(), null);
+
+test("⚠ the candidate's phone is MAPPED — it must never reach the AI again", () => {
+  const num = route({ fieldName: "-1_PersonProfileFields.PhoneNumber", label: "Number", widgetType: "text", repeatIndex: 0 });
+  assert.strictEqual(num.source, "map", "the phone NUMBER still routes to the AI");
+  assert.strictEqual(num.path, "personal_info.phone_number");
+  assert.strictEqual(num.raw, "4125551234");
+  const type = route({ fieldName: "-1_PersonProfileFields.PhoneType", label: "Type", widgetType: "dropdown_native", repeatIndex: 0 });
+  assert.strictEqual(type.source, "map", "the phone TYPE still routes to the AI");
+  assert.strictEqual(type.path, "personal_info.phone_device_type");
+  assert.strictEqual(type.raw, "Mobile");
+  // The extension + dial-code halves, when a tenant renders them.
+  const ext = route({ fieldName: "-1_PersonProfileFields.PhoneExtension", label: "Extension", widgetType: "text", repeatIndex: 0 });
+  assert.strictEqual(ext.path, "personal_info.phone_extension");
+  const dial = route({ fieldName: "-1_PersonProfileFields.PhoneCountry", label: "Country", widgetType: "dropdown_native", repeatIndex: 0 });
+  assert.strictEqual(dial.kind, "dial", "the dial-code half must strip the trailing +<digits> for matching");
+  // An EMPTY optional half maps to nothing and simply stays blank — it is not required, so the AI is
+  // not eligible for it either (that gate is REQUIRED-only).
+  const noExt = route({ fieldName: "-1_PersonProfileFields.PhoneExtension", label: "Extension", widgetType: "text", repeatIndex: 0 },
+    { personal_info: { phone_number: "4125551234", phone_extension: "" } });
+  assert.strictEqual(noExt, null);
+});
+
+test("the phone id family is keyed BARE, and cannot collide with an employer's phone", () => {
+  // The candidate's is iCIMS' own platform vocabulary; an employer's phone in a work-history entry is
+  // a per-customer rcf id (rcf3271 on this tenant), which this map deliberately does not contain.
+  const m = ats.ATS_STATIC_MAPS.icims;
+  assert.ok(m["PersonProfileFields.PhoneNumber"], "candidate phone number unmapped");
+  assert.ok(m["PersonProfileFields.PhoneType"], "candidate phone type unmapped");
+  assert.strictEqual(m["PersonProfileFields.rcf3271"], undefined, "a per-customer id must not be mapped");
+});
+
+test("⚠ A REPEAT IS DETECTED FROM THE PAGE, NOT DECLARED — nothing names which blocks repeat", () => {
+  // The point of the design: no family list, so a tenant whose phone block is a single row is
+  // unaffected, and a tenant that repeats something we have never seen is covered for free.
+  const src = String(ats.atsAssignEntryIndexes);
+  assert.ok(!/Address\|Phone|PhoneNumber|AddressCity/.test(src),
+    "atsAssignEntryIndexes must not name specific id families");
+  assert.strictEqual(ats.ATS_ICIMS_FLAT_REPEATING, undefined, "the hardcoded family list must be gone");
+});
+
+test("repeatIndex: one row per field ⇒ index 0 for everything, so the rule never fires", () => {
+  // The common case, and the one that must be untouched: a form with a single address + phone.
+  const fields = [
+    { fieldName: "-1_PersonProfileFields.AddressCity", label: "City" },
+    { fieldName: "-1_PersonProfileFields.PhoneNumber", label: "Number" },
+    { fieldName: "-1_PersonProfileFields.PhoneType", label: "Type" },
+  ];
+  ats.atsAssignEntryIndexes("icims", fields);
+  assert.deepStrictEqual(fields.map((f) => f.repeatIndex), [0, 0, 0]);
+  assert.strictEqual(route(fields[1]).source, "map", "a single row must still be mapped");
+});
+
+test("repeatIndex: a SECOND rendered row is index 1, and is left for the operator", () => {
+  const fields = [
+    { fieldName: "-1_PersonProfileFields.PhoneNumber", label: "Number" },
+    { fieldName: "-1_PersonProfileFields.PhoneType", label: "Type" },
+    { fieldName: "-2_PersonProfileFields.PhoneNumber", label: "Number" },
+    { fieldName: "-2_PersonProfileFields.PhoneType", label: "Type" },
+  ];
+  ats.atsAssignEntryIndexes("icims", fields);
+  assert.deepStrictEqual(fields.map((f) => f.repeatIndex), [0, 0, 1, 1]);
+  assert.strictEqual(route(fields[0]).source, "map", "the first row is still filled");
+  const second = route(fields[2]);
+  assert.strictEqual(second.kind, "skip");
+  assert.strictEqual(second.source, "repeat-entry");
+  // Blank, never a COPY of the first and never an AI guess: the profile holds one phone number, so
+  // either of those would be a fabricated second one.
+  assert.strictEqual(second.value, undefined);
+  assert.match(second.detail, /single value|left for you/i);
+});
+
+test("repeatIndex counts ORDINAL POSITION, not the ordinal's numeric value", () => {
+  // `-1` is iCIMS' default entry; a SAVED entry carries an opaque server id. So the first row the
+  // page renders is index 0 whatever number it happens to carry.
+  const fields = [
+    { fieldName: "4839201_PersonProfileFields.AddressCity", label: "City" },
+    { fieldName: "-1_PersonProfileFields.AddressCity", label: "City" },
+  ];
+  ats.atsAssignEntryIndexes("icims", fields);
+  assert.deepStrictEqual(fields.map((f) => f.repeatIndex), [0, 1]);
+});
+
+test("⚠ a SECTION entry's repeats are NOT this rule — they come from a profile array", () => {
+  // "Employer Phone Number" is rcf3271 at -1/-2/-3 inside Experience. Those are three real jobs, and
+  // the section tier answers them from work_experience[i]; treating them as duplicates of one value
+  // would blank two of them.
+  const fields = [
+    { fieldName: "-1_PersonProfileFields.rcf3271", label: "Employer Phone Number", section: "Experience" },
+    { fieldName: "-2_PersonProfileFields.rcf3271", label: "Employer Phone Number", section: "Experience" },
+    { fieldName: "-3_PersonProfileFields.rcf3271", label: "Employer Phone Number", section: "Experience" },
+  ];
+  ats.atsAssignEntryIndexes("icims", fields);
+  for (const f of fields) {
+    assert.strictEqual(f.entrySection, "experience", "should be claimed by the section tier");
+    assert.strictEqual(f.repeatIndex, undefined, "a section entry must not be stamped as a repeat");
+  }
+  assert.deepStrictEqual(fields.map((f) => f.entryIndex), [0, 1, 2]);
+});
+
+test("repeatIndex is iCIMS-only and needs an ordinal — a plain id is untouched", () => {
+  const fields = [
+    { fieldName: "PersonProfileFields.FirstName", label: "First Name" },
+    { fieldName: "-1_PersonProfileFields.PhoneNumber", label: "Number" },
+  ];
+  ats.atsAssignEntryIndexes("greenhouse", fields);
+  assert.deepStrictEqual(fields.map((f) => f.repeatIndex), [undefined, undefined]);
+  ats.atsAssignEntryIndexes("icims", fields);
+  assert.deepStrictEqual(fields.map((f) => f.repeatIndex), [undefined, 0]);
+});
+
 // ── option-list completeness: which optional dropdowns reach review as real PICKERS ─────
 // Every icims_dropdown used to be marked partial UNCONDITIONALLY — the flag read a
 // `data-ap-complete` attribute nothing in the codebase has ever written. A partial list is attached

@@ -574,9 +574,25 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   `<digits>_` **for iCIMS only** before the static-map lookup, so the map is keyed on the bare platform
   id. Keying by id is safe here precisely because `PersonProfileFields.Address*` is iCIMS' own
   vocabulary for the CANDIDATE's address — a work-history employer address is a per-customer
-  `rcf<NNNN>` group and cannot collide. ⚠ It does NOT yet tell entry 1 from entry 2: with one address
-  in the profile and one entry on the form there is nothing to disambiguate, but a SECOND entry would
-  map to the same address. Multi-entry repeating sections are open work.
+  `rcf<NNNN>` group and cannot collide. **The candidate's PHONE is the same shape and the same rule**
+  (`PersonProfileFields.PhoneNumber` / `.PhoneType` / `.PhoneExtension` / `.PhoneCountry`) — ⚠ both were
+  UNMAPPED until 2026-08-17, and because their labels are only "Number" and "Type" they fell through the
+  label ladder to the AI, which answered the required "Number" with **`24615` — the job's requisition
+  id** (flagged `ai-text`, so the gate held, but it recurred every run). *A required platform field
+  whose label is a bare noun is the shape that silently reaches the AI.*
+- **A REPEATED entry of a single-value field is DETECTED, NOT DECLARED (operator, 2026-08-17).** The
+  static map is keyed on the ordinal-STRIPPED id, so a second rendered address/phone row would be handed
+  a DUPLICATE of the first. Nothing names which blocks repeat — iCIMS is configured per customer, so a
+  family list (`Address*`, `Phone*`) would make the next portal a code change. Instead
+  `atsAssignEntryIndexes` asks what the page can answer: **has this exact BARE id already appeared under
+  a different ordinal?** `repeatIndex` is the position of the field's own ordinal in that id's first-seen
+  ordinal list — so index 0 is the entry the map fills, a form with one row produces 0 for everything and
+  the rule never fires, and a tenant that repeats something we have never seen is covered for free.
+  Ordinals are POSITIONS, never values (`-1` is the default entry; a saved one carries an opaque server
+  id). Fields already claimed by a SECTION are excluded — those repeat legitimately from a profile ARRAY
+  (`rcf3271` "Employer Phone Number" at -1/-2/-3 is three real jobs, not one value three times).
+  A repeat is left **BLANK with a note**: the profile holds one phone, so a copy is a fabricated second
+  number and the AI's would be a guessed one, and the extra entry is optional so blank blocks nothing.
 - **`atsInjSubmitState` needs its iCIMS branch**: the control is `<input type="submit"
   id="cp_form_submit_i" value="Submit Profile">`, and the generic finder queries only `button`s and
   matches `textContent`, which an `<input>` lacks. Measured: without it `hasSubmit:false` and

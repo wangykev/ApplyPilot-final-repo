@@ -191,10 +191,14 @@ const ATS_STATIC_MAPS = {
   // on every tenant. Per-customer questions are the `rcf<NNNN>` ids, which are deliberately NOT mapped
   // — they route through the label ladder like every other custom question.
   //
-  // ⚠ Only the UN-PREFIXED fields are mapped. Address/phone arrive as `-1_PersonProfileFields.*`,
-  // where the leading integer is a REPEATING-ENTRY ordinal, and the same ids recur inside work-history
-  // entries — where an "address" is the EMPLOYER's, not the applicant's. Mapping them by bare id would
-  // put the candidate's home address into a past job. Left to a later round, deliberately.
+  // ⚠ Keys are the id with any REPEATING-ENTRY ORDINAL STRIPPED (`atsMapKey`): the live ids for the
+  // address and phone blocks are `-1_PersonProfileFields.AddressCity`, `-1_PersonProfileFields.PhoneNumber`.
+  // Keying them bare is safe because `PersonProfileFields.Address*` / `.Phone*` are iCIMS' OWN vocabulary
+  // for the CANDIDATE — a work-history employer's address or phone is a per-customer `rcf<NNNN>` and
+  // cannot collide. But the ordinal still matters: the form can render a SECOND entry, and a bare-id
+  // map would hand it a duplicate of the first. The repeat is DETECTED from the page rather than
+  // declared here — see `repeatIndex` in atsAssignEntryIndexes — so only the first entry the form
+  // renders is mapped, on any tenant, whether or not its blocks happen to repeat.
   icims: {
     // ── The "Create a login" block. THIS ACCOUNT IS CREATED BY THE SUBMISSION ──────────────
     // Not a sign-in form and not a profile edit: on this class of application the account is created
@@ -227,6 +231,24 @@ const ATS_STATIC_MAPS = {
     "PersonProfileFields.AddressZip": { path: "personal_info.postal_code" },
     "PersonProfileFields.AddressCountry": { path: "personal_info.country" },
     "PersonProfileFields.AddressState": { path: "personal_info.state_province" },
+    // ── The candidate's phone (also a REPEATING block, same `-1_` ordinal shape) ───────────
+    // ⚠ THESE WERE MISSING, AND THE AI FILLED THE GAP WITH THE REQUISITION NUMBER. Both are
+    // REQUIRED and their labels are just "Number" and "Type", which match nothing in the label
+    // ladder — so both fell through to the AI, and it answered "Number" with `24615`, the job's req
+    // id (live 2026-08-16, flagged `ai-text`). The review gate caught it, but a phone field holding
+    // a requisition id is the confident-wrong-value class, and it recurred on every run.
+    // Safe to key by bare id for exactly the reason the address block is: `PersonProfileFields.Phone*`
+    // is iCIMS' own vocabulary for the CANDIDATE's phone, while an employer's phone in a work-history
+    // entry is a per-customer `rcf<NNNN>` (rcf3271 here) and cannot collide.
+    "PersonProfileFields.PhoneNumber": { path: "personal_info.phone_number" },
+    "PersonProfileFields.PhoneExtension": { path: "personal_info.phone_extension" },
+    // The type is a plain <select> of Work/Home/Mobile/Other/Email — the profile's stored device type
+    // answers it deterministically, and the AI's "Mobile" guess (flagged `ai-choice`) was only ever a
+    // guess that happened to look right.
+    "PersonProfileFields.PhoneType": { path: "personal_info.phone_device_type" },
+    // The dial-code half, when a tenant renders one. Tiered in the profile like country, so resolve()
+    // passes a ready-made candidate ladder; `kind:"dial"` strips the trailing "+<digits>" for matching.
+    "PersonProfileFields.PhoneCountry": { kind: "dial", path: "personal_info.country_phone_code", altPath: "personal_info.country" },
     // ── Résumé — SKIPPED ON PURPOSE (operator, 2026-08-16) ─────────────────────────────────
     // iCIMS parses an uploaded résumé SERVER-SIDE and posts the results back into the panel seconds
     // after the attach reports success, re-rendering entries under new ids and blanking everything
@@ -444,6 +466,34 @@ const ATS_ICIMS_ENTRY_MAPS = {
   },
 };
 
+// ── A REPEATED FIELD IS DETECTED, NOT DECLARED (operator, 2026-08-17) ─────────────────────
+// iCIMS renders the candidate's own address and phone as repeating BLOCKS ("Add More (Addresses)"),
+// and every field in them carries an entry ordinal: `-1_PersonProfileFields.AddressCity`. The static
+// map is keyed on the ordinal-STRIPPED id, so without this a second entry is handed a DUPLICATE of
+// the first — CLAUDE.md already flagged exactly that for addresses, and phone has the same shape.
+//
+// ⚠ THERE IS DELIBERATELY NO LIST OF WHICH BLOCKS REPEAT. A first cut named the families
+// (`Address*`, `Phone*`) and that is wrong for the plain reason that iCIMS is configured per
+// customer: a block that repeats on this tenant may be a single row on the next, and a block that
+// does not repeat here may repeat there. Naming families means the next portal is a code change.
+//
+// So ask the question the PAGE can answer: **has this exact field already appeared under a different
+// ordinal?** Group by the BARE id and take the position of the field's own ordinal in that id's
+// first-seen ordinal list. Index 0 is the entry the map fills; anything above it is a repeat. A form
+// that renders one address row therefore produces index 0 for everything and this never fires at
+// all — which is also why it needs no claim about whether a given tenant's phone block repeats.
+//
+// Ordinals are POSITIONS, never values: `-1` is iCIMS' default entry and a saved one carries an
+// opaque server id, so `-2` is not "the second" and 4839201 is not "the 4839201st".
+//
+// Fields already claimed by a SECTION (Education / Experience / Certifications) are excluded — those
+// repeat legitimately from a profile ARRAY, and their own entry tier answers them before this is
+// reached. `rcf3271` ("Employer Phone Number") appearing as -1/-2/-3 is that case, not this one.
+//
+// Why blank rather than a copy or an AI guess: the profile holds ONE address and ONE phone, so a copy
+// is a fabricated second phone number and the AI's would be a guessed one. Blank plus a note that
+// says why is the honest answer, and the extra entry is optional, so nothing is blocked.
+
 // Which repeating section (if any) does a field belong to, and which ENTRY of it?
 // `entryIndex` is stamped onto the scan by atsAssignEntryIndexes — the ordinal in the id (`-1_`) is
 // an iCIMS internal, NOT an array index, so it is never used as one.
@@ -499,6 +549,22 @@ function atsAssignEntryIndexes(ats, fields) {
       f.entryIndex = list.indexOf(m[1]);
       f.entrySection = section;
     }
+  }
+  // …and stamp REPEATS of a field that is answered from the profile ROOT — the candidate's own
+  // address and phone blocks, and anything else a tenant chooses to make repeatable. DETECTED, not
+  // declared: group by the BARE id and record where this field's ordinal falls in that id's
+  // first-seen ordinal list. See the comment on this block above for why there is no family list.
+  const repeatOrder = {}; // bare id → [ordinal, …] in first-seen order
+  for (const f of fields) {
+    // A section entry is filled from its own profile ARRAY, so its repeats are legitimate and its
+    // own tier answers them. Excluded here so the two ideas can never fight over a field.
+    if (f.entrySection) continue;
+    const m = /^(-?\d+)_/.exec(String(f.fieldName || ""));
+    if (!m) continue;
+    const bare = atsMapKey(ats, f.fieldName);
+    const list = (repeatOrder[bare] = repeatOrder[bare] || []);
+    if (list.indexOf(m[1]) === -1) list.push(m[1]);
+    f.repeatIndex = list.indexOf(m[1]);
   }
   // Stamp WHICH date each Month/Day/Year belongs to. The controls repeat with identical labels, so
   // only their position distinguishes start from end: group by the id base (`rcf3214` vs `rcf3215`)
@@ -2818,6 +2884,17 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
     const r = atsResolveEntryField(es, entry, f);
     if (r) return r;
     return { kind: "entry-unanswered", source: "entry", section: es.section, entryIndex: es.entryIndex };
+  }
+  // A REPEAT of a field the profile answers with a single value — the second address row, the second
+  // phone row. Claimed BEFORE the static map below, because that map is keyed on the ordinal-stripped
+  // id and would otherwise answer every entry identically.
+  // ⚠ Only ever reached when the FORM ACTUALLY RENDERED more than one (see atsAssignEntryIndexes) —
+  // nothing here declares which blocks repeat, so a tenant whose phone is a single row never sees it.
+  if (ats === "icims" && typeof f.repeatIndex === "number" && f.repeatIndex > 0) {
+    const what = String(f.label || "").replace(/[*✱:]\s*$/, "").trim();
+    return { kind: "skip", source: "repeat-entry",
+      detail: "this form renders more than one " + (what ? '"' + what + '"' : "of this field") +
+        " and your profile holds a single value for it — the extra entry is left for you to fill on the form" };
   }
   const map = (ATS_STATIC_MAPS[ats] || {})[atsMapKey(ats, f.fieldName)];
   if (map) {

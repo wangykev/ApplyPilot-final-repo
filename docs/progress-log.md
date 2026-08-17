@@ -5257,3 +5257,50 @@ survives, and ordinary prose is never mangled. Suite 1485/1486 (`db.test.js` nee
 duplicate row whose JD is worthless, so nulling it is cleanup rather than security. Also: that run
 produced a SECOND tracker row for this posting, because it started from the iCIMS magic link rather
 than the careers page, so its `job_key` differed.
+
+## 2026-08-17 — the candidate's phone, and a repeat that is DETECTED rather than declared
+
+**The bug the operator caught on the tracker:** `-1_PersonProfileFields.PhoneNumber` held **`24615`** —
+the job's requisition id — flagged `ai-text`. Both phone fields (`PhoneNumber`, `PhoneType`) are
+REQUIRED and were UNMAPPED, and their labels are only *"Number"* and *"Type"*, which match nothing in
+the label ladder. So both fell through to the AI, and it answered "Number" with the most
+number-shaped thing in the JD. The review gate held — it was flagged, not silently filed — but a phone
+field holding a requisition id is the confident-wrong-value class, and it recurred on every run.
+*The generalisable shape: a REQUIRED platform field whose label is a bare noun silently reaches the AI.*
+
+Mapped `PhoneNumber` / `PhoneType` / `PhoneExtension` / `PhoneCountry` (the last as `kind:"dial"`).
+Safe to key by bare id for exactly the reason the address block is: `PersonProfileFields.Phone*` is
+iCIMS' own vocabulary for the CANDIDATE, while an employer's phone in a work-history entry is a
+per-customer `rcf<NNNN>` (`rcf3271` here) and cannot collide.
+
+**Live: needs-review 6 → 4.** `PhoneType` = "Mobile" (`filled`, `exact-normalized`, unflagged),
+`PhoneNumber` = the profile's real number, unflagged. The remaining four are the résumé skip and three
+empty Experience dates, all pre-existing.
+
+**A REPEAT IS DETECTED, NOT DECLARED.** The static map is keyed on the ordinal-STRIPPED id, so a second
+rendered address/phone row would be handed a DUPLICATE of the first — the hazard CLAUDE.md had already
+flagged for addresses. ⚠ **A first cut hardcoded the families (`Address*`, `Phone*`) and the operator
+rejected it, correctly:** iCIMS is configured per customer, so a block that repeats on this tenant may
+be a single row on the next, and naming families makes the next portal a code change. The rule now asks
+what the PAGE can answer — *has this exact BARE id already appeared under a different ordinal?* —
+and `repeatIndex` is the position of the field's own ordinal in that id's first-seen ordinal list.
+Consequences worth stating: index 0 is the entry the map fills; a form with one row produces 0 for
+everything so the rule **never fires**; and a tenant repeating something never seen before is covered
+without a code change. Ordinals are POSITIONS, never values (`-1` is the default entry, a saved one
+carries an opaque server id, so `-2` is not "the second").
+
+Section entries are excluded, and that exclusion is load-bearing: `rcf3271` at -1/-2/-3 is three real
+jobs filled from `work_experience[i]`, so treating them as one value repeated would blank two of them.
+
+A repeat is left **BLANK with a note** rather than copied or AI-guessed — the profile holds one phone,
+so a copy is a fabricated second number and the AI's would be a guessed one; the extra entry is
+optional, so blank blocks nothing.
+
+**Tests:** 11 new (46 in the file). Both directions are pinned: a single row still maps, a second row
+skips, position-not-value, a section entry is untouched, and `atsAssignEntryIndexes` is asserted to
+contain **no** id-family names so the hardcode cannot creep back. Suite 1493/1494 (`db.test.js` needs
+`fake-indexeddb`).
+
+⚠ **The repeat rule is unit-pinned but NOT live-exercised** — this form renders one address row and one
+phone row, so `repeatIndex` was 0 everywhere and the branch never ran. That is the designed behaviour,
+but it means a real two-entry form has yet to confirm it.
