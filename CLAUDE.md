@@ -611,6 +611,27 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   only the captcha callback unlocks it, so a stall cannot be retried in place — one bounded reload, then
   `captcha-unanswered`. Diagnose with the pair `submitLocked` (the submit FIRED) + `captchaToken` (the
   captcha RESOLVED); nothing else tells the two apart.
+- **AN OPTIONAL DROPDOWN MUST REACH REVIEW AS A REAL PICKER (operator, 2026-08-16).** On these
+  one-page forms a field we never filled still has to be ANSWERABLE, and a picker with no usable
+  options is just a text box. The lists were already being READ — the gap was that
+  `icims_dropdown` was flagged partial **unconditionally** (the flag read a `data-ap-complete`
+  attribute nothing ever wrote), and a partial list is attached as `captured_options` +
+  widgetType `typeahead`, which review renders as type-it-yourself. A two-option "May We Contact"
+  question arrived as FREE TEXT. **The form reveals its own page size when you look at every
+  dropdown at once** (`atsIcimsPageCap`): unrelated vocabularies do not stop at the same exact
+  length by chance, so N dropdowns all ending at 25 is a pager — and a list SHORTER than a page has
+  reached its end. Derived, never hardcoded (the cap is a tenant setting), and a repeated length must
+  clear `ATS_ICIMS_CAP_MIN` or ten Yes/No dropdowns "prove" a page size of 2 and nothing is ever
+  complete again. ⚠ **The asymmetry is the safety property:** a picker MISSING the operator's answer
+  makes them conclude the form doesn't offer it, while a complete list called partial only costs a
+  typed value — so every uncertain case stays partial. A **proven-complete scan list also beats a
+  search-FILTERED actuation list** (the "the actuation list is better" rule holds only while it is
+  fuller). Costs nothing: no page contact, measured same wall clock. Diagnose with the two always-on
+  `[ATS-OPTIONS]` lines — *scan-time coverage* (what we knew, printed BEFORE anything actuates, the
+  only uncontaminated moment) and *review editors* (what the operator will see); reading one as the
+  other is how "16 proven complete" gets mistaken for "16 pickers".
+  ⚠ A result's `widgetType` is rewritten to the **REVIEW** vocabulary as the record is built, so
+  anything inspecting a RESULT must match `ATS_CHOICE_REVIEW_WIDGETS`, not `ATS_CHOICE_WIDGETS`.
 - **A JD-scraped COMPANY can be a PAGE TITLE, and that string is safety-critical.** On an employer page
   there is no ATS markup to key on, so the scrape returned the document title as the company — the anchor
   for "have you worked for us before?". `atsPlausibleCompany` is a NEGATIVE test; what it rejects falls back

@@ -21,6 +21,7 @@ For current state and open work, see **`docs/status.md`**.
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — MULTI-ATS: Greenhouse / Lever / Ashby end-to-end` (the landing milestone), then `2026-07-31 (b)`…`(f)`, `2026-08-04 — the async combobox`, `2026-08-05 — multi-ATS end to end`, `2026-08-07 — the dead first fill` |
 | **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
 | **iCIMS pre-form (employer portal → gate → form)** | `2026-08-16 (c) — iCIMS PRE-FORM` |
+| **Option lists reaching review (pickers vs free text)** | `2026-08-16 (d) — an OPTIONAL dropdown reaches review as a real picker` |
 | **Onboarding / auth / already-applied** | `2026-08-16 (c) — iCIMS PRE-FORM` (the non-Workday one), `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
 | **Autofill with résumé** | `2026-08-08 — Autofill-with-Resume end to end`, `2026-08-07 (e) — the flow a first application should take` |
 | **SKILLS field** | `2026-08-07 (d) — SKILLS: the multi-value typeahead` |
@@ -5136,3 +5137,67 @@ further.
 the gate let it through without a password. The `password`, `code`, `blocked` and `verification-emailed`
 branches are unit-pinned but not live-exercised. The submit/rehearse path through the gate is likewise
 unexercised.
+
+## 2026-08-16 (d) — an OPTIONAL dropdown reaches review as a real picker
+
+**Operator:** on these one-page forms, dropdowns should be reconned even when optional.
+
+They already were being READ. The gap was that the result was discarded as unusable: every
+`icims_dropdown` was flagged partial **unconditionally**, because the flag read a
+`data-ap-complete` attribute nothing in this codebase has ever written. A partial list is attached
+as `captured_options` + widgetType `typeahead`, which the review editor renders as a
+type-it-yourself box plus a caveat — so a two-option "May We Contact" question reached the operator
+as FREE TEXT and they retyped a value the form had been showing us all along.
+
+**The form reveals its own page size if you look at every dropdown at once.** Measured scan-time on
+a fresh Astrion form: `2×1, 10×2, 1×6, 1×17, 11×25`. Time Zone, Country, State/Province and Degree
+all stopping at exactly 25 is a pager — unrelated vocabularies do not share an exact length. So a
+list SHORTER than a page has reached its end (`atsIcimsPageCap` / `atsIcimsListComplete`, both pure
+and unit-pinned). Derived rather than hardcoded because the cap is a tenant setting, and a repeated
+length must clear `ATS_ICIMS_CAP_MIN` — otherwise ten Yes/No dropdowns "prove" a page size of 2 and
+nothing can ever be complete again.
+
+⚠ **The asymmetry is deliberate and is the safety story:** a picker MISSING the operator's answer
+makes them conclude the form does not offer it; a complete list called partial only costs them a
+typed value. Every uncertain case stays partial.
+
+**A complete list also beats a FILTERED one.** The existing rule ("a field that actuated already
+recorded the live list it matched against, which is the better of the two") holds only while that
+list is fuller — and it is not, because a field filled through the widget's own search records just
+the rows the search returned. Both guards on the new branch are load-bearing: the scan list must be
+PROVEN complete, and must not be shorter than what the actuation saw.
+
+**Measured, one form, end to end:** 16/25 dropdown lists proven complete; the review bundle went
+**22 pickers / 18 filter-or-type → 28 pickers / 12 filter-or-type** of 46 choice records. The 12 are
+the genuinely paged 25-row lists, honestly labelled. Zero extra page contact ⇒ zero added cost
+(28.7s before, 25.9s after — noise).
+
+**Two measurement faults found on the way, both producing wrong numbers:**
+1. **The scan kept the AWAITING-PARENT row.** A child whose parent is unset renders exactly one row,
+   `"Please select a country"`; left in, that reads as a one-option COMPLETE vocabulary and would
+   have reached review as the single value the operator may pick. The unset parent is already
+   explained by the record's own detail — the option list must simply be empty.
+2. **A result's `widgetType` is rewritten to the REVIEW vocabulary** as the record is built, so the
+   first outcome diagnostic matched the scan names and counted 19 of 46 choice records.
+   `ATS_CHOICE_REVIEW_WIDGETS` is DERIVED from the two existing tables rather than written a third
+   time.
+
+**Also:** `ATS_CHOICE_WIDGETS` replaces three identical inlined copies of that list — exactly the
+trap CLAUDE.md warns about for this vocabulary (four registration sites, a miss fails silently),
+where a copy-paste list makes the fourth miss inevitable.
+
+**Two always-on diagnostics**, because this question could not be answered from outside the run:
+`[ATS-OPTIONS] scan-time coverage` (what we KNEW, printed before anything actuates — the only
+uncontaminated moment, since an opened dropdown keeps its list) and `[ATS-OPTIONS] review editors`
+(what the operator will SEE). Keeping both visible is what stops "16 proven complete" being read as
+"16 pickers".
+
+**Tests:** 9 new (38 in `test/ats-icims-onboard.test.js`, 200 across the three ATS files); suite
+1477/1478 (`db.test.js` needs `fake-indexeddb`, absent here).
+
+**Open / not chased:** the tracker page still renders the partial caption more often than the bundle
+has partial records, and its inline `<select>` count did not move with the bundle — the editor only
+renders an editor for some rows, so a DOM count is a poor proxy. `options_partial` IS threaded
+correctly (`fill-driver.js` → `options_partial`, read by `ReviewEditor.tsx`), and the note has two
+other trigger clauses (a radio/checkbox_group with no options, a typeahead with captured options),
+so the extra captions are most likely those. A web-side check, not an extension one.

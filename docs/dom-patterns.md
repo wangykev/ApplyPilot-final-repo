@@ -39,6 +39,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
 | **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
 | **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
+| **Option lists: paging, completeness, what review can offer** | `2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE` |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
 | **Host / URL shapes** | `2026-07-22 — logged-in host is` |
 
@@ -4285,3 +4286,50 @@ subdomain is the reliable source (`astrioncareers-astrion` → `"Astrion"`).
 
 **Result:** `careers.astrion.us` → Apply → the email gate → the form, then **108 fields, 67 filled ·
 40 skipped · 6 needing review**, reported to the tracker. Verified hidden AND visible.
+
+## 2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE, measured, and what it proves
+
+Measured **scan-time on a freshly loaded form**, before any actuation. That qualifier is the whole
+entry: an iCIMS dropdown's `<ul id="X_dropdown-results">` STAYS populated once the widget has been
+opened, so probing a finished run reports full coverage no matter what the fresh page served. Every
+number below is from `[ATS-OPTIONS] scan-time coverage`, printed before the first field is touched.
+
+**Coverage on a fresh form:** `icims_dropdown 25/25 · dropdown_native 20/20 · multiselect_native 1/1`
+— i.e. the scan DOES carry a list for every choice widget; none arrive empty. A native `<select>`
+carries its whole vocabulary. An `icims_dropdown` carries only its first page.
+
+**The option-count distribution across the 25 `icims_dropdown`s:**
+
+| rows | count | which |
+|---|---|---|
+| 1 | 2 | State/Province, awaiting its parent — the single row is `"Please select a country"`, NOT an option |
+| 2 | 10 | the Yes/No screening questions (May We Contact, "Have you ever been employed by…", consent, travel, covenant) |
+| 6 | 1 | Availability |
+| 17 | 1 | School (first page) |
+| **25** | **11** | Time Zone, Country, State/Province, Degree, … |
+
+**⇒ THE PAGE SIZE IS 25.** Eleven dropdowns stopping at exactly 25 while nothing else comes near it
+is a pager, not a coincidence — four of those (Time Zone, Country, State/Province, Degree) are
+unrelated vocabularies, and unrelated vocabularies do not share an exact length. It also matches the
+independent observation in the `2026-08-16 (b)` entry that State/Province served Alabama…Michigan
+only. **A list shorter than a page has therefore reached its end** — which is what makes a 2-row
+"May We Contact" or a 6-row Availability a COMPLETE, pickable vocabulary.
+
+⚠ **Do not hardcode 25.** The cap is a tenant setting; derive it from the form's own dropdowns
+(`atsIcimsPageCap`: the largest length two or more of them independently stop at). And note the
+degenerate case that rule has to refuse: ten Yes/No dropdowns all holding 2 options must not "prove"
+a page size of 2, or every list on the form is at-or-above the cap and nothing is ever complete.
+
+**⚠ `data-ap-complete` is READ AND NEVER WRITTEN.** `optionsPartial` was
+`ul.getAttribute("data-ap-complete") !== "1"`, and nothing in the codebase sets that attribute — so
+the answer was unconditionally "partial" for every iCIMS dropdown ever scanned. It is a placeholder
+someone intended to fill in, not a signal.
+
+**⚠ The awaiting-parent row is not an option.** `"Please select a country"` has to be filtered out of
+the scan's list alongside `"— Make a Selection —"`. Left in, the child reads as a ONE-OPTION complete
+vocabulary and reaches the review editor as the single value the operator is allowed to pick.
+
+**Outcome on the review bundle** (`[ATS-OPTIONS] review editors`, of 46 choice records): 22 picker /
+18 filter-or-type before, **28 picker / 12 filter-or-type** after. The remaining 12 are the genuinely
+paged 25-row lists. 6 records carry no options at all. No page contact was added, and the fill's wall
+clock did not move (28.7s → 25.9s across runs, noise).
