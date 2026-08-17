@@ -529,7 +529,7 @@ function atsEntrySpec(ats, f) {
         const g = def.dateGroups[f.dateGroup];
         if (g && /^month$/i.test(key)) spec = { kind: "date_month", from: g.from };
         else if (g && /^year$/i.test(key)) spec = { kind: "date_year", from: g.from };
-        else if (g && /^day$/i.test(key)) spec = { kind: "skip", detail: "day-of-month — the profile stores month precision" };
+        else if (g && /^day$/i.test(key)) spec = { kind: "date_day", from: g.from };
       }
     }
     return { section, source: def.source, bare, spec,
@@ -636,7 +636,25 @@ function atsIsFutureYearMonth(s, now) {
 
 // Resolve ONE repeating-entry field from ITS OWN entry. Returns a route, or null to fall through
 // (which, for an entry field, means the scoped AI — never the profile root).
-function atsResolveEntryField(es, entry, f, now) {
+// The operator's default day-of-month, for a form that REQUIRES a day on a date the profile stores to
+// the month. PURE + validated: only 1–31 is accepted, so a typo cannot put "0" or "45" on a real
+// application; anything else (absent, junk, out of range) means "no default", and the field goes back
+// to reaching review rather than being filled with nonsense.
+var ATS_DEFAULT_DAY = 1;
+function atsDefaultDay(defaults) {
+  const raw = defaults && defaults.date_day;
+  if (Array.isArray(raw)) return null;                // junk config — do not interpret it
+  // `{ value: N, note: "…" }` is the shipped shape; a bare number is accepted too.
+  const v = raw && typeof raw === "object" ? raw.value : raw;
+  if (v === null) return null;                        // an explicit null opts OUT — keep nagging
+  // `undefined` covers both "no `date_day` at all" and `{}` (a wrapper with no value), which are
+  // indistinguishable and mean the same thing: unconfigured, so use the built-in.
+  if (v === undefined) return ATS_DEFAULT_DAY;
+  const n = parseInt(String(v), 10);
+  return Number.isFinite(n) && n >= 1 && n <= 31 ? n : null;
+}
+
+function atsResolveEntryField(es, entry, f, now, defaults) {
   const spec = es.spec;
   if (!spec || !entry) return null;
   const val = (k) => { const v = entry[k]; return v === undefined || v === null || (typeof v === "string" && !v.trim()) ? null : v; };
@@ -680,6 +698,31 @@ function atsResolveEntryField(es, entry, f, now) {
     if (entry.currently_enrolled === true) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].currently_enrolled" };
     if (fut === false) return { candidates: ["Yes"], source: "entry", path };
     return null;
+  }
+  // ── DAY-OF-MONTH (operator, 2026-08-17) ────────────────────────────────────────────────
+  // A form can REQUIRE the day of a date the profile stores to the month ("2025-05"), and a required
+  // field we cannot answer reaches review — so every date on the page nagged for a day. Two sources,
+  // in order, and the distinction is the point:
+  //   • the profile's OWN day, when it stores one ("2025-05-12") — a stated fact;
+  //   • otherwise the operator's configured default (`defaults.date_day`, data/application_defaults
+  //     .json), which is an APPROXIMATION and says so in its detail.
+  // Deliberately ONE default rather than a clever per-side rule (first-of-month for a start,
+  // last-of-month for an end): that would be us inventing precision the operator never gave, and on a
+  // job application a date is a factual claim. One number they can see and change is honest; guessing
+  // differently at each end is not.
+  if (spec.kind === "date_day") {
+    const raw = val(spec.from);
+    if (raw == null) return null;
+    const ymd = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(raw));
+    const path = es.section + "[" + es.entryIndex + "]." + spec.from;
+    if (ymd) return { value: String(parseInt(ymd[3], 10)), source: "entry", path };
+    // Month precision — fall back to the default, but only for a value that IS a date. A year-only
+    // "2024" says nothing about a month either, so a day off it would be doubly invented.
+    if (!/^\d{4}-\d{1,2}$/.test(String(raw))) return null;
+    const d = atsDefaultDay(defaults);
+    if (d == null) return null;
+    return { value: String(d), source: "default",
+      detail: 'day-of-month is not in your profile (it stores "' + String(raw) + '") — used your default of ' + d };
   }
   if (spec.kind === "date_month" || spec.kind === "date_year") {
     const raw = val(spec.from);
@@ -3025,7 +3068,9 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   if (es) {
     const arr = (profile || {})[es.source];
     const entry = Array.isArray(arr) ? arr[es.entryIndex] : null;
-    const r = atsResolveEntryField(es, entry, f);
+    // `defaults` threaded through for the day-of-month fallback (see atsDefaultDay) — the entry seal is
+    // unaffected: a default is the OPERATOR's own setting, not another entry's data.
+    const r = atsResolveEntryField(es, entry, f, undefined, defaults);
     if (r) return r;
     return { kind: "entry-unanswered", source: "entry", section: es.section, entryIndex: es.entryIndex };
   }
@@ -5135,7 +5180,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
-    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
+    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,

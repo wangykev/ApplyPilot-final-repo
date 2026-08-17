@@ -261,6 +261,74 @@ test("atsInjClickAuthSubmit refuses a disabled control rather than reporting a p
   assert.ok(/no-submit-control/.test(src));
 });
 
+// ── DAY-OF-MONTH: a form requires it, the profile stores months ───────────────────────────
+// Every date on the iCIMS form nagged for a day, because a required field we cannot answer reaches
+// review. The profile stores "2025-05", so the day comes from the operator's default — and the tests
+// below are written around the one thing that matters: a default must never become a wrong FACT.
+
+test("atsDefaultDay: absent config ⇒ the built-in default, so dates stop nagging out of the box", () => {
+  assert.strictEqual(ats.atsDefaultDay(undefined), ats.ATS_DEFAULT_DAY);
+  assert.strictEqual(ats.atsDefaultDay({}), ats.ATS_DEFAULT_DAY);
+  assert.strictEqual(ats.ATS_DEFAULT_DAY, 1);
+});
+
+test("atsDefaultDay: an explicit null OPTS OUT — the field goes back to review", () => {
+  // The escape hatch for an operator who would rather pick the day themselves than have one assumed.
+  assert.strictEqual(ats.atsDefaultDay({ date_day: null }), null);
+  assert.strictEqual(ats.atsDefaultDay({ date_day: { value: null } }), null);
+});
+
+test("⚠ atsDefaultDay: only 1–31 is accepted — a typo must not reach a real application", () => {
+  assert.strictEqual(ats.atsDefaultDay({ date_day: 15 }), 15);
+  assert.strictEqual(ats.atsDefaultDay({ date_day: { value: 15 } }), 15);
+  assert.strictEqual(ats.atsDefaultDay({ date_day: "7" }), 7);
+  for (const bad of [0, -1, 32, 45, "", "abc", []]) {
+    assert.strictEqual(ats.atsDefaultDay({ date_day: bad }), null, `${JSON.stringify(bad)} must be refused`);
+  }
+  // `{}` is NOT junk — a wrapper with no `value` is indistinguishable from no `date_day` at all, and
+  // both mean "unconfigured", so it takes the built-in default rather than being refused.
+  assert.strictEqual(ats.atsDefaultDay({ date_day: {} }), ats.ATS_DEFAULT_DAY);
+});
+
+test("⚠ a day STATED in the profile beats the default — the default is only for what is unknown", () => {
+  const es = { section: "experience", source: "work_experience", entryIndex: 0,
+    spec: { kind: "date_day", from: "from" } };
+  const stated = ats.atsResolveEntryField(es, { from: "2025-05-12" }, {}, undefined, { date_day: 1 });
+  assert.strictEqual(stated.value, "12");
+  assert.strictEqual(stated.source, "entry", "a stated day is a FACT, not a default");
+  assert.strictEqual(stated.detail, undefined, "and it needs no explaining");
+});
+
+test("month precision ⇒ the default, and it SAYS it is an approximation", () => {
+  const es = { section: "experience", source: "work_experience", entryIndex: 0,
+    spec: { kind: "date_day", from: "from" } };
+  const r = ats.atsResolveEntryField(es, { from: "2025-05" }, {}, undefined, { date_day: 1 });
+  assert.strictEqual(r.value, "1");
+  assert.strictEqual(r.source, "default");
+  assert.match(r.detail, /not in your profile/i);
+  assert.match(r.detail, /2025-05/, "names the value it could not get a day from");
+});
+
+test("⚠ a YEAR-ONLY value gets no day — that would be doubly invented", () => {
+  // "2024" says nothing about the month either, so a day off it is two guesses stacked.
+  const es = { section: "education", source: "education", entryIndex: 0,
+    spec: { kind: "date_day", from: "from_year" } };
+  assert.strictEqual(ats.atsResolveEntryField(es, { from_year: "2024" }, {}, undefined, { date_day: 1 }), null);
+  // …and an absent date resolves to nothing at all, rather than a day with no date.
+  assert.strictEqual(ats.atsResolveEntryField(es, {}, {}, undefined, { date_day: 1 }), null);
+});
+
+test("opting out leaves a month-precision day unanswered rather than assumed", () => {
+  const es = { section: "experience", source: "work_experience", entryIndex: 0,
+    spec: { kind: "date_day", from: "from" } };
+  assert.strictEqual(ats.atsResolveEntryField(es, { from: "2025-05" }, {}, undefined, { date_day: null }), null);
+});
+
+test("the shipped defaults file carries a valid day", () => {
+  const d = require("../data/application_defaults.json");
+  assert.strictEqual(ats.atsDefaultDay(d), 1);
+});
+
 // ── a native multi-select reaches review as a checkbox GROUP ─────────────────────────────
 // Live 2026-08-17: "Please select the following employment options you would consider" rendered
 // BLANK in review while the form plainly held two answers. `current_value` was right
