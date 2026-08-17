@@ -1253,6 +1253,21 @@ function atsInjSetCredential(inputSel, value) {
   return { ok: true, hadLength: had, len: (el.value || "").length, matches: el.value === value };
 }
 
+// Press an auth form's own submit control. Page-side on purpose: iCIMS is server-rendered jQuery,
+// so `el.click()` on a real `<input type="submit">` runs the browser's native submit algorithm
+// (onsubmit handlers included, which is what invisible hCaptcha hooks into). That is NOT the
+// Workday case where a synthetic auth submit went inert — there the failure was React never seeing
+// a native-setter value, and iCIMS has no controlled-component layer to miss it. The caller still
+// proves the page moved afterwards rather than trusting the click.
+function atsInjClickAuthSubmit(sel) {
+  const btn = (sel ? document.querySelector(sel) : null)
+    || document.querySelector('input[type="submit"], button[type="submit"]');
+  if (!btn) return { ok: false, error: "no-submit-control" };
+  if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return { ok: false, error: "submit-disabled" };
+  btn.click();
+  return { ok: true, caption: String(btn.value || btn.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40) };
+}
+
 // Independent re-read of a credential box. Same no-value contract as the write.
 // `matches` is the whole point: it answers "does the page still hold what we put there?" without
 // anyone outside the page ever seeing either string.
@@ -2280,6 +2295,243 @@ function atsPickApplyLink(links, isAts) {
   const labelled = list.filter((l) => l.kind === "text");
   if (uniq(labelled).length === 1) return labelled[0].href;
   return null;
+}
+
+// ── EMPLOYER-FRONTED PORTALS: the URL names no ATS at all ────────────────────────────────
+// `careers.astrion.us/jobs/24615` is an iCIMS career portal served under the EMPLOYER's own
+// domain, so `detectAts` — which is host-based and must stay that way, because that is what makes
+// `icims.com.evil.com` return null — sees nothing. There is no hostname pattern to widen to:
+// "careers.<anything>" is every ATS and none of them.
+//
+// So the portal is identified the way every other unknown in this codebase is: READ THE PAGE, and
+// decide SW-side. The evidence is the set of hosts the page itself references — iframe srcs, script
+// srcs, stylesheet hrefs, and the hosts its own Apply affordances point at. That is the employer
+// telling us who runs their careers site, not us guessing from a name.
+function atsInjPortalEvidence() {
+  const attr = (sel, name) => [...document.querySelectorAll(sel)].map((e) => e.getAttribute(name) || "").filter(Boolean).slice(0, 60);
+  const hostsOf = (list) => {
+    const out = [];
+    for (const u of list) { try { out.push(new URL(u, location.href).hostname.toLowerCase()); } catch (e) { /* skip */ } }
+    return out;
+  };
+  const applyHrefs = [...document.querySelectorAll("a[href]")]
+    .filter((a) => /\bapply\b/i.test(a.textContent || "") || /\/(apply|login)\b|apply\?/i.test(a.getAttribute("href") || ""))
+    .map((a) => a.href).slice(0, 20);
+  return {
+    ok: true, url: location.href,
+    frameHosts: hostsOf(attr("iframe", "src")),
+    scriptHosts: hostsOf(attr("script[src]", "src")),
+    linkHosts: hostsOf(attr("link[href]", "href")),
+    applyHosts: hostsOf(applyHrefs),
+    frameIds: [...document.querySelectorAll("iframe")].map((f) => f.id || "").filter(Boolean).slice(0, 10),
+  };
+}
+
+// Which ATS does the page's own evidence name? `isAts` is injected (detectAts) so host knowledge
+// stays in ONE place. Refuses ambiguity exactly like atsPickApplyLink / atsPickEmbeddedForm: a page
+// referencing two different ATSs is not a situation to guess through.
+function atsPortalAts(ev, isAts) {
+  if (!ev || !ev.ok) return null;
+  const kinds = new Set();
+  for (const hosts of [ev.frameHosts, ev.scriptHosts, ev.applyHosts, ev.linkHosts]) {
+    for (const h of hosts || []) {
+      const k = isAts("https://" + h + "/");
+      if (k && k !== "workday") kinds.add(k);
+    }
+  }
+  if (kinds.size === 1) return [...kinds][0];
+  if (kinds.size > 1) return null;
+  // iCIMS' own frame id, which only exists on a page iCIMS rendered. Kept as a LAST tier rather
+  // than a first one: a host reference is harder evidence than an element id.
+  if ((ev.frameIds || []).some((id) => /^icims_content_iframe$/i.test(id))) return "icims";
+  return null;
+}
+
+// ── PAGE SIGNATURE — "did that click actually do anything?" ──────────────────────────────
+// The iCIMS Apply control is FLAKY: a click can be swallowed and the page simply stays put
+// (operator, observed). A fixed click COUNT is the wrong remedy — it either under-clicks a slow
+// page or over-clicks a page that already moved. So the retry polls the page's own IDENTITY, the
+// same rule the Workday walk's transition wait uses: url || the rendered control set || the
+// heading. Any one of them differing means we advanced.
+function atsInjPageSignature() {
+  const q = "input:not([type=hidden]), select, textarea";
+  const ids = [...document.querySelectorAll(q + ", button")].map((e) => e.id || e.name || "").filter(Boolean).sort().join("|");
+  const fr = document.getElementById("icims_content_iframe") || document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
+  const h = document.querySelector("h1, h2");
+  return {
+    url: String(location.href).split("#")[0],
+    frameSrc: fr ? String(fr.getAttribute("src") || fr.src || "").split("#")[0] : null,
+    controls: document.querySelectorAll(q).length,
+    heading: String((h && h.textContent) || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    ids: ids.slice(0, 600),
+  };
+}
+
+// PURE. Deliberately conservative in ONE direction: an unreadable side is "no change", so a read
+// that failed can never be mistaken for progress — the caller keeps waiting or gives up saying so.
+function atsSignatureChanged(a, b) {
+  if (!a || !b) return false;
+  if (String(a.url) !== String(b.url)) return true;
+  if (String(a.frameSrc || "") !== String(b.frameSrc || "")) return true;
+  if (String(a.heading || "") !== String(b.heading || "")) return true;
+  if (Number(a.controls || 0) !== Number(b.controls || 0)) return true;
+  return String(a.ids || "") !== String(b.ids || "");
+}
+
+// Click an Apply control the existing `atsInjClickApplyButton` cannot see. That one queries
+// `button, [role=button], a[href="#"]` and matches on `textContent` — so an `<input type="submit"
+// value="Apply">` (no textContent) and an ordinary `<a href="…">Apply</a>` (a real href) both miss.
+// Kept SEPARATE rather than widening the original, so Greenhouse / Lever / Ashby keep the exact
+// affordance-finding they were live-verified with. Same refusals: invisible-preferred, ambiguity
+// declines rather than guesses.
+function atsInjClickApplyAnchor() {
+  const vis = (el) => {
+    if (typeof el.checkVisibility === "function") return el.checkVisibility({ checkVisibilityCSS: true });
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const cap = (el) => String(el.value || el.textContent || "").replace(/\s+/g, " ").trim();
+  const APPLY_RE = /^apply\b|\bapply (now|here|online|for this)\b/i;
+  const all = [...document.querySelectorAll('a[href], input[type="submit"], input[type="button"]')]
+    .filter((el) => { const t = cap(el); return APPLY_RE.test(t) && t.length <= 40; });
+  const shown = all.filter(vis);
+  const els = shown.length ? shown : all;
+  if (!els.length) return { ok: false, reason: "no-apply-control" };
+  const uniq = [...new Set(els.map(cap))];
+  if (uniq.length > 1) return { ok: false, reason: "ambiguous", offered: uniq.slice(0, 4) };
+  els[0].click();
+  return { ok: true, clicked: uniq[0], href: els[0].tagName === "A" ? String(els[0].href || "").split("?")[0] : null };
+}
+
+// ── iCIMS SIGN-IN GATE ───────────────────────────────────────────────────────────────────
+// Reaching an iCIMS application form means getting past an email gate first (traced live
+// 2026-08-16 on astrioncareers-astrion.icims.com/jobs/<id>/login): step one is an "Enter Your
+// Information" card holding ONE visible control — `<input type="email" id="email"
+// name="css_loginName">` — plus `<input type="submit" id="enterEmailSubmitButton" value="Next">`,
+// inside the same `#icims_content_iframe` the form itself lives in, with hCaptcha in INVISIBLE
+// mode (a corner badge, no checkbox).
+//
+// ⚠ THE LOGIN PAGE PASSES `atsLooksLikeApplicationForm`. It has a submit control and an email
+// field, which is exactly that function's positive test — so without an auth check running FIRST,
+// a run that reaches the gate would classify it as the application form and start filling profile
+// data into a login box. Recognising the gate is therefore a SAFETY property, not a convenience:
+// the same reasoning that makes an UNrecognised password field the dangerous outcome for the
+// credential tier.
+//
+// READ-ONLY. Runs inside the form frame when one is armed and works unchanged on a top-level
+// document, so a tenant that stops framing its login needs no new code.
+function atsInjAuthScan() {
+  const vis = (el) => {
+    if (!el) return false;
+    if (typeof el.checkVisibility === "function") return el.checkVisibility({ checkVisibilityCSS: true });
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+  const labelOf = (e) => {
+    let l = e.id ? document.querySelector('label[for="' + esc(e.id) + '"]') : null;
+    if (!l) l = e.closest("label");
+    if (!l) { const row = e.closest("tr, .iCIMS_TableRow, fieldset, div"); l = row ? row.querySelector("label") : null; }
+    return clean(l && l.textContent).slice(0, 80);
+  };
+  const words = (e) => clean((e.id || "") + " " + (e.name || "") + " " + (e.getAttribute("autocomplete") || "") + " " + labelOf(e));
+  const selOf = (e) => (e.id ? "#" + esc(e.id) : (e.name ? '[name="' + esc(e.name) + '"]' : null));
+  const describe = (e) => (e ? { sel: selOf(e), id: e.id || null, name: e.name || null, label: labelOf(e),
+    type: String(e.type || "").toLowerCase(), prefilled: !!(e.value && String(e.value).length) } : null);
+
+  const shown = [...document.querySelectorAll("input:not([type=hidden]), select, textarea")].filter(vis);
+  const find = (test) => describe(shown.find(test) || null);
+  const password = find((e) => String(e.type || "").toLowerCase() === "password");
+  const email = find((e) => String(e.type || "").toLowerCase() === "email" || /\b(e-?mail|loginname|login_?name|username|user_?id)\b/i.test(words(e)));
+  // A one-time code box. iCIMS can mail a code instead of showing a password step; recognising it
+  // is what lets the run say so instead of halting on "an unknown page".
+  const code = find((e) => /one-time-code/i.test(e.getAttribute("autocomplete") || "")
+    || /\b(otp|one[ _-]?time|verification[ _-]?code|access[ _-]?code|security[ _-]?code|passcode)\b/i.test(words(e)));
+
+  const clickables = [...document.querySelectorAll('input[type="submit"], input[type="button"], button, a.iCIMS_Anchor, [role="button"]')].filter(vis);
+  const cap = (b) => clean(b.value || b.textContent).slice(0, 60);
+  const submitEl = clickables.find((b) => /^input$/i.test(b.tagName) && /^submit$/i.test(String(b.type || "")))
+    || clickables.find((b) => /^(next|continue|sign in|log ?in|submit|go|send)\b/i.test(cap(b)));
+  const submit = submitEl ? { sel: submitEl.id ? "#" + esc(submitEl.id) : null, id: submitEl.id || null, caption: cap(submitEl) } : null;
+
+  // FEDERATED buttons are REPORTED and never clicked — the Workday `sso` rule, carried over.
+  const federated = clickables.map(cap).filter((t) => /\b(with|using)\s+(google|linkedin|apple|microsoft|facebook)\b|\b(sso|single sign[ -]?on)\b/i.test(t)).slice(0, 5);
+  // An account-CREATION control is likewise reported, never pressed: on iCIMS the account is made
+  // by the SUBMISSION (the form's own "Create a login" block, behind the review gate), so a
+  // standalone register button here is a flow we have not traced and must not press blind.
+  const createAccount = clickables.map(cap).filter((t) => /\b(create (an? )?account|register|sign ?up)\b/i.test(t)).slice(0, 5);
+
+  // Same VISIBLE-challenge rule as atsInjSubmitState (a dormant invisible-mode container is a
+  // full-viewport hidden iframe and must not read as a challenge).
+  const captchaChallenge = [...document.querySelectorAll('iframe[src*="hcaptcha"], iframe[src*="recaptcha"]')].some((f) => {
+    const cs = getComputedStyle(f);
+    if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) < 0.1) return false;
+    const r = f.getBoundingClientRect();
+    return r.width > 60 && r.height > 60 && r.width < 700;
+  });
+
+  const errors = [...document.querySelectorAll('.iCIMS_Error, .iCIMS_Validation_Error, .error, [role="alert"], .alert-danger')]
+    .filter(vis).map((e) => clean(e.textContent)).filter(Boolean).slice(0, 4);
+
+  return { ok: true, url: location.href, title: document.title, readyState: document.readyState,
+    controlCount: shown.length, email, password, code, submit, federated, createAccount,
+    captchaChallenge, errors, bodyText: clean(document.body ? document.body.innerText : "").slice(0, 1200) };
+}
+
+// How many visible controls before a page stops being a sign-in card and starts being a form. The
+// gate renders ONE (measured); the application form renders ~118. Nothing real sits between, and
+// the caller ALSO requires the positive form identity (atsLooksLikeApplicationForm) before it
+// treats a page as the form — this bound only stops the auth classifier claiming a page it should
+// keep its hands off.
+var ICIMS_AUTH_MAX_CONTROLS = 5;
+
+// PURE. What auth view is this? Ordered so a BLOCKING state outranks page shape, and so the
+// classifier never claims a page that is too big to be a sign-in card.
+//   captcha    — a visible challenge; the bot never solves one
+//   code       — iCIMS mailed a one-time code
+//   password   — the credential step
+//   email      — the "Enter Your Information" gate
+//   blocked    — an auth-shaped page whose only way on is a control we refuse to press
+//   none       — not an auth view (the caller decides whether it is the form)
+function icimsAuthView(s) {
+  if (!s || !s.ok) return "unreadable";
+  if (s.captchaChallenge) return "captcha";
+  if (Number(s.controlCount || 0) > ICIMS_AUTH_MAX_CONTROLS) return "none";
+  if (s.code) return "code";
+  if (s.password) return "password";
+  if (s.email) return "email";
+  // No field we can fill, but the page is offering federated sign-in or account creation — that is
+  // an auth wall, and saying so beats "unknown page".
+  if ((s.federated || []).length || (s.createAccount || []).length) return "blocked";
+  return "none";
+}
+
+// SSO refusal is URL-EVIDENCED ONLY (the Workday invariant, verbatim): a real federated login
+// LEAVES the portal host. Field-absence proves nothing — a still-rendering auth widget looks
+// identical to a provider redirect, and that mistake produced a flat-wrong `sso` halt on Workday.
+var ICIMS_SSO_HOST_RE = /(^|\.)(okta(preview)?\.com|onelogin\.com|pingidentity\.com|auth0\.com|accounts\.google\.com|login\.microsoftonline\.com|login\.live\.com|appleid\.apple\.com|www\.linkedin\.com)$/i;
+var ICIMS_SSO_PATH_RE = /\/(saml2?|sso|openid|oauth2?|idp)(\/|$)/i;
+function icimsLooksLikeSso(url, portalHost) {
+  let u = null;
+  try { u = new URL(String(url == null ? "" : url)); } catch (e) { return false; }
+  const host = u.hostname.toLowerCase();
+  // Still on the portal ⇒ never SSO, whatever the path says. iCIMS' own routes include `/login`,
+  // and a tenant vanity path must not be read as a federation hop.
+  if (portalHost && host === String(portalHost).toLowerCase()) return false;
+  if (ICIMS_SSO_HOST_RE.test(host)) return true;
+  return ICIMS_SSO_PATH_RE.test(u.pathname);
+}
+
+// iCIMS can answer the email gate by MAILING you a one-time link instead of showing a password
+// box — that is where the `?eem=…&code=…` magic-link session this tenant was first driven with
+// came from. Such a page has no field to fill and no button worth pressing, so it must be
+// recognised: without this it lands in the generic "unknown page" halt, which tells the operator
+// nothing about the fact that the next step is sitting in their inbox.
+// Anchored on the SENDING claim, not the word "email" (the gate itself says "Email" as a label).
+var ICIMS_MAILED_LINK_RE = /\b(we('ve| have)? (just )?(sent|emailed|e-mailed)|(an? )?(email|link|code) (has been|was) sent|check your (e-?mail|inbox)|sent you (an? )?(e-?mail|link|code))\b/i;
+function icimsMailedCredential(bodyText) {
+  return ICIMS_MAILED_LINK_RE.test(String(bodyText == null ? "" : bodyText));
 }
 
 // A STATED demographic and the form's option can be the same answer in different words: the profile
@@ -4451,6 +4703,9 @@ if (typeof module !== "undefined" && module.exports) {
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
+    atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
+    atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
+    atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,

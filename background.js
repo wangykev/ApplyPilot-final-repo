@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-recon-1";
+const AP_BUILD_MARKER = "icims-onboard-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -461,6 +461,15 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           try {
             const att = await cdpAttach(tabId);
             if (att.ok) {
+              // ⚠ SETTLE OVER CDP FIRST. waitJobPageSettled above reads through chrome.scripting,
+              // which is HOST-GATED — and an employer careers domain (careers.astrion.us) is
+              // deliberately not in host_permissions, so it fails on its first read and returns
+              // instantly. That left this probe racing the render on exactly the pages it exists
+              // for: careers.astrion.us renders its one Apply anchor from Angular, and a probe that
+              // arrives first sees no apply affordance and falls through to the Workday path. We
+              // are attached here, so ask the way the ATS run already asks.
+              const st = await waitAtsPostingSettled().catch(() => null);
+              if (st) console.log(`[ApplyPilot][RUN] employer page ${st.settled ? "settled" : "did NOT settle (" + st.reason + ")"} after ${st.waitedMs}ms — ${st.chars} chars`);
               const emb = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
               let embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
               let embAts = embUrl && detectAts(embUrl);
@@ -479,11 +488,30 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
                 const linkAts = linkUrl && detectAts(linkUrl);
                 if (linkAts && linkAts !== "workday") { embUrl = linkUrl; embAts = linkAts; }
               }
+              // …and if it neither embeds NOR links to one, WHO RUNS THIS CAREERS SITE? An iCIMS
+              // career portal can be served entirely under the employer's own domain, in which case
+              // the URL names no ATS and the two tiers above can still come up empty — the Apply
+              // affordance may be a scripted button, or render after the settle. The page's own
+              // referenced hosts answer it (atsPortalAts), which is the employer telling us, not a
+              // hostname guess. No URL to hop to here, so the run stays on this page and the ATS
+              // pipeline's own pre-form stage follows the Apply control from where it is.
+              if (!embAts || embAts === "workday") {
+                const ev = await cdpEval(atsInjPortalEvidence).catch(() => null);
+                const portal = atsPortalAts(ev, detectAts);
+                if (portal && portal !== "workday") {
+                  console.log(`[ApplyPilot][RUN] this careers page is a ${portal} portal on the employer's own domain — driving it with that pipeline from here`);
+                  embUrl = startUrl; embAts = portal;
+                }
+              }
               await cdpDetach();
               if (embAts && embAts !== "workday") {
-                console.log(`[ApplyPilot][RUN] this page ${emb && emb.srcs && emb.srcs.length ? "embeds" : "links to"} a ${embAts} application — driving it with that pipeline: ${embUrl}`);
+                if (embUrl !== startUrl) console.log(`[ApplyPilot][RUN] this page ${emb && emb.srcs && emb.srcs.length ? "embeds" : "links to"} a ${embAts} application — driving it with that pipeline: ${embUrl}`);
                 const res = await runAtsApplicationRun(tabId, embAts, store, embUrl, { applyHops: 1, originUrl: startUrl });
-                sendResponse({ ...res, jd, tabId, startUrl });
+                // ⚠ `jd` here is the chrome.scripting scrape, which is NULL on any host outside
+                // host_permissions — every employer careers domain. Overwriting the run's own
+                // CDP-scraped JD with it threw away the description on exactly the pages that
+                // needed the CDP path, so the tracker's Job description came back empty.
+                sendResponse({ ...res, jd: (res && res.jd) || jd, tabId, startUrl });
                 return;
               }
             }
@@ -4493,6 +4521,206 @@ async function waitAtsPostingSettled(ceilingMs = 8000, intervalMs = 300) {
   return { settled: false, reason: "ceiling", chars: last ? last.len : 0, waitedMs: Date.now() - t0 };
 }
 
+// ── iCIMS PRE-FORM STAGE (portal → Apply → the email gate → the form) ────────────────────
+//
+// The stage BEFORE the fill, for the one ATS in this file that has one. Greenhouse / Lever /
+// Ashby serve a login-free form at the posting URL; iCIMS serves a career PORTAL whose
+// application form sits behind an email gate, so a run started from an employer careers link
+// reaches a sign-in card, not a form.
+//
+// Modelled on runCdpOnboard and carrying its invariants VERBATIM:
+//   • credentials come ONLY from chrome.storage.local — never a profile value, never a taught
+//     bucket, never an LLM. The password is written through atsInjSetCredential, which returns a
+//     LENGTH and a match boolean, so it cannot reach a log line even by accident.
+//   • SSO is refused on URL EVIDENCE ONLY (a federated login LEAVES the portal host). A federated
+//     button is REPORTED, never clicked — field-absence is not evidence of anything.
+//   • an account-CREATION control is never pressed: on iCIMS the account is made BY THE
+//     SUBMISSION, from the form's own "Create a login" block, behind the review gate.
+//   • every human-needed stop returns needs_operator + a self-explaining stopped/detail.
+//   • it STOPS at the form. Nothing here submits an application.
+// Contract: `{reached_form:true}` to carry on, or `{halt:{…}}` for the caller to return.
+async function runIcimsPreForm(tabId, credentials, LOG) {
+  const MAX_ROUNDS = 8;
+  const halt = (stopped, detail, extra) => {
+    LOG(`⛔ ${stopped} — ${detail}`);
+    return { halt: { ok: true, needs_operator: true, stopped, detail, ...(extra || {}) } };
+  };
+  let portalHost = null;
+  try { portalHost = new URL(await cdpEval(function () { return location.href; })).hostname; } catch (e) { /* below */ }
+
+  // The composite page identity: iCIMS frames everything, so a change can land in the TOP document
+  // (a navigation) or inside the frame (a postback). Reading only one of them makes the other look
+  // like a swallowed click.
+  const signature = async () => {
+    const top = await cdpEvalTop(atsInjPageSignature).catch(() => null);
+    const frame = cdpFormFrameArmed() ? await cdpEval(atsInjPageSignature).catch(() => null) : null;
+    if (!top && !frame) return null;
+    return {
+      url: (top && top.url) || (frame && frame.url) || "",
+      frameSrc: (top && top.frameSrc) || null,
+      heading: (frame && frame.heading) || (top && top.heading) || "",
+      controls: ((top && top.controls) || 0) + ((frame && frame.controls) || 0),
+      ids: [(top && top.ids) || "", (frame && frame.ids) || ""].join("#"),
+    };
+  };
+  // Wait for the page to actually MOVE. Poll-based against the page's own identity — never a fixed
+  // delay, and never a click count (see atsInjPageSignature).
+  const waitForChange = async (before, budgetMs) => {
+    const t0 = Date.now();
+    const deadline = t0 + (budgetMs || 8000);
+    while (Date.now() < deadline) {
+      await cdpDelay(400);
+      await cdpWakePage();
+      // A navigation kills the frame's isolated world; re-arm so the frame half of the signature
+      // is read from the NEW document rather than reported missing.
+      if (!cdpFormFrameArmed()) await cdpUseFormFrame(1).catch(() => null);
+      const now = await signature();
+      if (atsSignatureChanged(before, now)) return { changed: true, waitedMs: Date.now() - t0 };
+    }
+    return { changed: false, waitedMs: Date.now() - t0 };
+  };
+  // THE APPLY CONTROL IS FLAKY (operator, observed): a click can be swallowed and the page simply
+  // stays put. The remedy is NOT a fixed number of clicks — that either under-clicks a slow page or
+  // over-clicks one that already moved. Click, then watch the page's identity; retry only when it
+  // provably did not move.
+  const clickApplyRetrying = async (attempts) => {
+    for (let i = 1; i <= (attempts || 3); i++) {
+      const before = await signature();
+      // The existing finder first (proven on Greenhouse/Lever/Ashby landings), then the widened one
+      // for affordances it structurally cannot see: an <input type=submit value="Apply"> has no
+      // textContent, and a plain <a href>Apply</a> is not `a[href="#"]`.
+      let r = await cdpEval(atsInjClickApplyButton).catch(() => null);
+      if (!r || !r.ok) {
+        const r2 = await cdpEval(atsInjClickApplyAnchor).catch(() => null);
+        if (r2 && r2.ok) r = r2; else if (!r) r = r2;
+      }
+      if (!r || !r.ok) return { ok: false, reason: (r && r.reason) || "no-apply-control", offered: r && r.offered };
+      LOG(`clicked Apply ("${r.clicked}") — attempt ${i}/${attempts || 3}; watching whether the page moves`);
+      if ((await waitForChange(before, 7000)).changed) return { ok: true, clicked: r.clicked, attempts: i };
+      LOG(`that Apply click changed nothing — the control is known to swallow clicks; retrying`);
+    }
+    return { ok: false, reason: "click-had-no-effect" };
+  };
+
+  let lastView = null, sameViewRounds = 0;
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    await cdpWakePage();
+    // Re-arm every round: the gate's card holds ONE visible control, so the floor is 1 here rather
+    // than waitAtsFormReady's 4 (which is tuned to refuse a page that has no form on it at all).
+    if (!cdpFormFrameArmed()) await cdpUseFormFrame(1).catch(() => null);
+
+    const url = await cdpEval(function () { return location.href; }).catch(() => null);
+    // TWO hosts are legitimately ours during this stage — the employer's careers domain we started
+    // on, and the iCIMS tenant host the Apply control hands us to. `portalHost` covers the first;
+    // detectAts covers the second, and without it a tenant whose vanity path happens to contain an
+    // SSO-ish segment would be refused on its own portal.
+    if (url && detectAts(url) !== "icims" && icimsLooksLikeSso(url, portalHost)) {
+      return halt("sso", "This portal handed the sign-in to a federated identity provider (" + url.split("?")[0] +
+        "). Sign in yourself in the tab, then re-run — the pipeline never drives an SSO login.");
+    }
+
+    const auth = await cdpEval(atsInjAuthScan).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    const view = icimsAuthView(auth);
+
+    // NOT an auth view — so is it the form? Asked with the SAME positive identifier the rest of the
+    // pipeline uses, never by absence.
+    if (view === "none") {
+      const scan = await cdpEval(atsInjScan, "icims").catch(() => null);
+      const sub = await cdpEval(atsInjSubmitState, "icims").catch(() => null);
+      const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
+      if (id.ok) {
+        LOG(`signed in and on the application form — ${(scan.fields || []).length} field(s). Handing over to the fill.`);
+        return { reached_form: true, fields: (scan.fields || []).length };
+      }
+      // A mailed link/code is the one "no field to fill" page worth naming: the next step is in the
+      // operator's inbox, and the generic unknown-page halt would hide that completely.
+      if (icimsMailedCredential(auth && auth.bodyText)) {
+        return halt("verification-emailed", "iCIMS emailed a sign-in link or code to the stored account instead of asking for a password. " +
+          "Open it in this tab to finish signing in, then re-run — auto-fetching an iCIMS verification mail is not built yet.");
+      }
+      // Still on a portal/JD page: the way on is the Apply control.
+      const applied = await clickApplyRetrying(3);
+      if (applied.ok) { LOG(`Apply took after ${applied.attempts} attempt(s)`); continue; }
+      if (round === 1 && applied.reason === "no-apply-control") {
+        // Nothing to click and nothing to fill on the FIRST look is usually a page still rendering.
+        LOG("no Apply control and no auth fields yet — giving the page another beat");
+        await cdpDelay(1500);
+        continue;
+      }
+      return halt("apply-not-followable",
+        applied.reason === "ambiguous"
+          ? "Several different Apply controls are on this page (" + (applied.offered || []).join(" | ") + ") — the run refuses to guess which one is the application."
+          : applied.reason === "click-had-no-effect"
+            ? "The Apply control was clicked 3 times and the page never changed. Open the tab and press it yourself, then re-run."
+            : "This page is neither an iCIMS sign-in nor an application form, and it offers no Apply control to follow (" + (url || "?") + ").",
+        { redirectUrl: url || null });
+    }
+
+    // Same view twice with nothing moving means the step is not working — say so rather than
+    // burning the round budget re-typing into a box that is not listening.
+    sameViewRounds = view === lastView ? sameViewRounds + 1 : 0;
+    lastView = view;
+    if (sameViewRounds >= 2) {
+      return halt("auth-stalled", "The iCIMS sign-in stayed on the same '" + view + "' step across three attempts" +
+        ((auth.errors || []).length ? " — the page says: " + auth.errors.join(" / ") : " and showed no error") +
+        ". Sign in yourself in the tab, then re-run.");
+    }
+
+    if (view === "unreadable") {
+      LOG(`could not read the page (${(auth && auth.error) || "no reason given"}) — retrying`);
+      await cdpDelay(1200);
+      continue;
+    }
+    if (view === "captcha") {
+      return halt("captcha-challenge", "A captcha challenge is showing on the iCIMS sign-in. Solve it yourself in the tab, then re-run — the bot never solves or bypasses one.");
+    }
+    if (view === "code") {
+      return halt("verification-code-required", "iCIMS is asking for a one-time code it mailed to the stored account. " +
+        "Enter it yourself in the tab, then re-run — auto-fetching an iCIMS verification mail is not built yet.");
+    }
+    if (view === "blocked") {
+      const offered = [...(auth.federated || []), ...(auth.createAccount || [])].join(" | ");
+      return halt("auth-blocked", "The iCIMS sign-in offers only controls this pipeline refuses to press (" + offered + "). " +
+        "A federated login is never driven, and an account is never created outside the application's own review-gated submit. Sign in yourself, then re-run.");
+    }
+
+    // ── the two fillable steps ──────────────────────────────────────────────────────────
+    const wantPassword = view === "password";
+    const target = wantPassword ? auth.password : auth.email;
+    const value = wantPassword ? (credentials && credentials.password) : (credentials && credentials.email);
+    const what = wantPassword ? "password" : "account email";
+    if (!value) {
+      return halt("no-credentials", "This iCIMS portal asks for the " + what + " of your candidate account, and none is stored. " +
+        "Set it on the website's Credentials page (or the popup), then re-run. The pipeline never invents a login.");
+    }
+    if (!target || !target.sel) {
+      return halt("auth-field-unaddressable", "The iCIMS sign-in shows a " + what + " box with neither an id nor a name, so it cannot be targeted safely.");
+    }
+    // The write returns a LENGTH and a match boolean — never the string (atsInjSetCredential).
+    const w = await cdpEval(atsInjSetCredential, target.sel, value).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    if (!w || !w.ok || !w.matches) {
+      return halt("auth-field-not-written", "Could not put the " + what + " into the iCIMS sign-in box (" + ((w && w.error) || "the field did not keep the value") + ").");
+    }
+    LOG(`wrote the ${what} into ${target.sel} (${w.len} chars) — submitting "${(auth.submit && auth.submit.caption) || "the form"}"`);
+    emitRunProgress("Signing in to " + (portalHost || "the careers portal"), wantPassword ? "password step" : "email step");
+
+    const before = await signature();
+    const clicked = await cdpEval(atsInjClickAuthSubmit, (auth.submit && auth.submit.sel) || null).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    if (!clicked || !clicked.ok) {
+      return halt("auth-submit-unavailable", "The iCIMS sign-in's " + ((auth.submit && auth.submit.caption) || "submit") +
+        " control could not be pressed (" + ((clicked && clicked.error) || "not found") + ").");
+    }
+    const moved = await waitForChange(before, 15000);
+    if (!moved.changed) {
+      // NOT a halt: the next round re-reads the page, and the same-view guard above ends it if the
+      // step really is inert. A submit whose response is merely slow must not be called a failure.
+      LOG(`the ${what} submit has not changed the page yet — re-reading`);
+    }
+  }
+  return { halt: { ok: true, needs_operator: true, stopped: "auth-rounds-exhausted",
+    detail: "The iCIMS sign-in did not reach the application form within " + MAX_ROUNDS + " steps. Sign in yourself in the tab, then re-run." } };
+}
+
 async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // THE JOB IDENTITY IS THE LINK WE WERE GIVEN, not wherever the form turned out to live. A
   // landing hop (employer redirect, embedded frame, apply link) changes the URL, and keying the
@@ -4586,6 +4814,17 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       LOG(`navigating to the application form: ${formUrl}`);
       await cdpNavigate(formUrl);
       await cdpDelay(1200);
+      cdpClearFormFrame(); // the pinned world died with the old document
+    }
+    // ⚠ iCIMS PUTS AN EMAIL GATE IN FRONT OF THE FORM, and its login page PASSES the form
+    // identifier (a submit control + an email field is exactly atsLooksLikeApplicationForm's
+    // positive test). So the pre-form stage runs BEFORE the form wait, not as a fallback after it:
+    // reaching the gate and calling it "the application form" would start typing profile data into
+    // a login box. Never submits; stops at the form.
+    if (ats === "icims") {
+      emitRunProgress("Signing in to the careers portal", "iCIMS");
+      const pre = await runIcimsPreForm(tabId, store.credentials || null, LOG);
+      if (pre.halt) return { ...pre.halt, jd, ats };
     }
     emitRunProgress("Waiting for the form", ats);
     let ready = await waitAtsFormReady(ats, LOG);
@@ -4683,7 +4922,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
 
     const jobContext = { ...(store.jobContext || {}) };
     if (jd && jd.company) jobContext.company = jd.company;
-    if (!jobContext.company) jobContext.company = atsCompanyFromUrl(startUrl);
+    // …and if the START url was the employer's own domain, it names no company this helper can read
+    // (atsCompanyFromUrl needs a recognized ATS host). The page we ACTUALLY landed on does — an
+    // iCIMS portal carries the tenant in its subdomain. Worth the extra read: this string anchors
+    // the safety-critical "have you worked for us before?" recognizer.
+    if (!jobContext.company) jobContext.company = atsCompanyFromUrl(startUrl)
+      || atsCompanyFromUrl(await cdpEval(function () { return location.href; }).catch(() => null));
     if (jd && jd.title) jobContext.title = jd.title;
     // The JD text grounds the AI answers (an essay written blind to the posting invents a
     // company theme — live: "Kraken's work in the robotics space" for an ENERGY company).
@@ -4789,7 +5033,15 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // The caller's URL stays the fallback for bundles written before this was recorded.
     const formUrl = atsFormUrl(ats, bundle.url || (opts && opts.startUrl));
     const here = await cdpEval(function () { return location.href; }).catch(() => null);
-    if (here && formUrl && here.split("#")[0] !== formUrl) { await cdpNavigate(formUrl); await cdpDelay(1200); }
+    if (here && formUrl && here.split("#")[0] !== formUrl) { await cdpNavigate(formUrl); await cdpDelay(1200); cdpClearFormFrame(); }
+    // The submit run opens a FRESH tab, so it meets the same iCIMS email gate the fill did — and
+    // the gate would otherwise be replayed into as if it were the form. Signing in is all this
+    // does; the submit itself stays behind its own gates below.
+    if (ats === "icims") {
+      const preCreds = await new Promise((r) => chrome.storage.local.get(["credentials"], r));
+      const pre = await runIcimsPreForm(tabId, (preCreds && preCreds.credentials) || null, LOG);
+      if (pre.halt) return { ...pre.halt, submitted: false, replayed: false, ats };
+    }
     let ready = await waitAtsFormReady(ats, LOG);
     // Same landing recovery the FILL run has: the form may be EMBEDDED on this page.
     if (!ready.ready) {
