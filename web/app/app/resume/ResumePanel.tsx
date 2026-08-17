@@ -36,7 +36,11 @@ type Pending = {
   fingerprint: string;
   decisions?: unknown[];
   corrections?: string[];
-  aiPlan?: { section: string; action: "update" | "add"; label: string; replaces: string | null; reason: string }[];
+  aiPlan?: {
+    section: string; action: "update" | "add"; label: string; replaces: string | null; reason: string;
+    // per-row field changes — what the merge actually edits inside a matched entry
+    fields?: { key: string; kind: "added" | "changed"; before: string; after: string }[];
+  }[];
 } | null;
 
 // Draft persistence: the editor survives navigating away and coming back, even
@@ -851,8 +855,32 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                           {p.action}
                         </span>
                         <span className="text-ink">{p.label}</span>
-                        {p.replaces && <span className="text-ink-faint"> — replaces “{p.replaces}”</span>}
+                        {p.replaces && p.replaces !== p.label && (
+                          <span className="text-ink-faint"> — replaces “{p.replaces}”</span>
+                        )}
                         {p.reason && <div className="ml-12 text-xs text-ink-faint">{p.reason}</div>}
+                        {/* WHAT ACTUALLY CHANGES. Without this the row states only the matching
+                            decision, so adding three role descriptions looked like a no-op. */}
+                        {p.fields && p.fields.length > 0 ? (
+                          <ul className="ml-12 mt-1 space-y-0.5">
+                            {p.fields.map((f, k) => (
+                              <li key={k} className="text-xs">
+                                <span className={clsx("mr-1.5 font-mono", f.kind === "added" ? "text-verified" : "text-amber")}>
+                                  {f.kind === "added" ? "+" : "~"} {f.key}
+                                </span>
+                                {f.kind === "changed" && f.before && (
+                                  <span className="text-ink-faint line-through">{f.before}</span>
+                                )}
+                                {f.kind === "changed" && f.before && <span className="text-ink-faint"> → </span>}
+                                <span className="text-ink-faint">{f.after}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        ) : (
+                          p.action === "update" && (
+                            <div className="ml-12 text-xs text-ink-faint">no field changes — this entry is already up to date</div>
+                          )
+                        )}
                       </li>
                     ))}
                   </ul>

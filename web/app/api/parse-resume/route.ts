@@ -54,7 +54,11 @@ export async function POST(req: Request) {
   const { system, user: prompt } = buildResumePrompt(text);
   // "resume_parse" picks this action's model (falling back to the default pair), then
   // rotates through that provider's keys.
-  const res = await callLLMTracked(ai, "resume_parse", { system, user: prompt, maxTokens: 4096 });
+  // ⚠ 4096 was sized for SUMMARISED role descriptions. Now that every bullet comes back verbatim the
+  // reply is materially longer, and a truncated reply is indistinguishable from a bad parse — it
+  // simply arrives with the tail missing, which looks exactly like the dropped-bullet bug this
+  // change fixes. Headroom is far cheaper than a silently short profile.
+  const res = await callLLMTracked(ai, "resume_parse", { system, user: prompt, maxTokens: 12000 });
   if (!res.ok) return bad("AI request failed: " + res.error, 502);
 
   const profile = parseProfileFromReply(res.text);

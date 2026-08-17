@@ -14,7 +14,12 @@ export function buildResumePrompt(resumeText: string): { system: string; user: s
     "NEVER invent facts (emails, phone numbers, dates, employers). If it isn't in the resume, leave it blank.",
     "Dates: work_experience.from/to and certifications dates as \"YYYY-MM\" or \"YYYY-MM-DD\"; education from_year/to_year as \"YYYY\".",
     "Tiered fields (degree, field_of_study, country, country_phone_code, certification) are arrays, most-specific first.",
-    "work_experience[].role_description is ONE paragraph (a few sentences) describing the role — how it would fill a single Workday text box, NOT a bulleted list.",
+    // ⚠ EVERY BULLET, VERBATIM — this asked for "one paragraph (a few sentences)" until 2026-08-16,
+    // and a summarising instruction is a LOSSY one: the operator's third bullet was simply dropped on
+    // every role. The field fills a single text box, which is why it must stay plain text — but plain
+    // text and complete are not in tension: newline-separated bullets fill a textarea perfectly well.
+    // Same rule projects[] already had; work experience was the odd one out.
+    "work_experience[].role_description is the role's bullet points VERBATIM — EVERY bullet, none omitted, none summarised or merged, in resume order, one per LINE separated by \\n, with no leading bullet glyphs or dashes. It fills a single plain text box, so no markup — but it must be COMPLETE.",
     "work_experience[].currently_work_here is a boolean: true when the role has no end date or says Present/Current, else false.",
     "education[].graduation_date is \"YYYY-MM\" when the resume shows an (expected) graduation month/year; education[].coursework is the 'Relevant Coursework' course list, one string per course.",
     "projects[] mirror the resume's Projects section: bullets VERBATIM (one string per bullet), tech_stack from the project's tech line.",

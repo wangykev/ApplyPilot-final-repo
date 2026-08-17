@@ -71,6 +71,18 @@ export async function POST(req: Request) {
       d.action === "update" && d.target !== undefined
         ? entryLabel(section, (current[section] as unknown[])[d.target])
         : null;
+    // ⚠ WHAT ACTUALLY CHANGES, PER ROW (operator, 2026-08-16). Without this every update row read
+    // «X — replaces "X" · same role and company», which states the MATCHING decision and hides the
+    // EDIT — so a row that added three role descriptions was indistinguishable from a no-op, and the
+    // operator reasonably read the whole preview as "a bunch of things that were the same".
+    // The diff was already computed for the summary; it just never reached the rows.
+    const fields =
+      d.action === "update" && d.target !== undefined
+        ? entryFieldChanges(
+            (current[section] as unknown[])[d.target],
+            (after[section] as unknown[])[d.target],
+          )
+        : [];
     return {
       section,
       action: d.action,
@@ -79,6 +91,7 @@ export async function POST(req: Request) {
       label: entryLabel(section, inc),
       replaces: from,
       reason: d.reason,
+      fields,
     };
   });
 
@@ -91,6 +104,28 @@ export async function POST(req: Request) {
     // Sections the resume said nothing about — untouched either way, worth stating.
     untouched: RECONCILE_SECTIONS.filter((s) => ((parsedIn.data[s] ?? []) as unknown[]).length === 0),
   });
+}
+
+/** Which keys of ONE entry the merge would touch, and whether each is filling a blank or
+ *  overwriting. "added" vs "changed" is the distinction a reviewer actually cares about: filling an
+ *  empty role_description is safe, replacing a written one deserves a second look. Values are
+ *  truncated — this is a preview, not the editor. */
+export type EntryFieldChange = { key: string; kind: "added" | "changed"; before: string; after: string };
+function entryFieldChanges(before: unknown, after: unknown): EntryFieldChange[] {
+  const b = (before && typeof before === "object" ? before : {}) as Record<string, unknown>;
+  const a = (after && typeof after === "object" ? after : {}) as Record<string, unknown>;
+  const show = (v: unknown) => {
+    const s = Array.isArray(v) ? v.join(", ") : v == null ? "" : String(v);
+    return s.length > 160 ? s.slice(0, 160) + "…" : s;
+  };
+  const empty = (v: unknown) => v == null || (Array.isArray(v) ? v.length === 0 : String(v).trim() === "");
+  const out: EntryFieldChange[] = [];
+  for (const key of new Set([...Object.keys(b), ...Object.keys(a)])) {
+    if (key.startsWith("_")) continue; // internal review notes are not the user's data
+    if (JSON.stringify(b[key] ?? null) === JSON.stringify(a[key] ?? null)) continue;
+    out.push({ key, kind: empty(b[key]) ? "added" : "changed", before: show(b[key]), after: show(a[key]) });
+  }
+  return out;
 }
 
 function bad(error: string, status: number) {
