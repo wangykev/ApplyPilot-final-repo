@@ -597,9 +597,6 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
             />
           ))}
         </div>
-        <p className="mt-3 text-xs text-ink-faint">
-          Leaving all of them unticked leaves the question unanswered rather than guessing a default.
-        </p>
         </div>
         <SectionRemembered items={rememberedFor("Screening")} {...fieldRowProps} />
       </SectionCard>
