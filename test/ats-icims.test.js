@@ -620,6 +620,29 @@ test("school search: the widget's own 'No Results' is a terminal state → the O
   assert.strictEqual(page._c["#other"], "Carnegie Mellon University");
 });
 
+// ⚠ OBSERVED LIVE: School "Other" + Other School "Carnegie Mellon University" on a form that DOES
+// list CMU. The fallback fired on ANY match failure, so a search still in flight — or a menu
+// disturbed by the page moving under it — read identically to an absent school. "Other" is a
+// STATEMENT that the university is not in their system; an unknown must never be answered with one.
+test("school: a miss WITHOUT a 'No Results' verdict must NOT be answered 'Other'", async () => {
+  const page = eduPage(["Carnegie Mellon University", "Other"]);
+  // the search never resolves: the list keeps showing the unfiltered page, and the widget never
+  // reports noResults — exactly what a slow or disturbed search looks like
+  // the school is NOT on the first page (so a search is needed) and the search never resolves
+  page.atsInjIcimsOpen = (sel) => ({ ok: true, open: true,
+    options: sel === "#school" ? ["Some College", "Another College", "Other"] : ["Bachelor of Science", "Other"] });
+  page.atsInjIcimsSearch = (sel, q) => { page._searched.push([sel, q]); return { ok: true }; };
+  page.atsInjIcimsReadOptions = (sel) => sel === "#school"
+    ? { ok: true, options: ["Some College", "Another College", "Other"], awaitingParent: false, noResults: false }
+    : { ok: true, options: ["Bachelor of Science", "Other"], awaitingParent: false, noResults: false };
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", EDU_PROFILE, {}, {}, {});
+  assert.notStrictEqual(page._c["#school"], "Other",
+    "answering 'Other' here asserts the school is absent, which we never established");
+  const s = out.results.find((r) => r.fieldName === "-1_CandProfileFields.School");
+  assert.strictEqual(s.flag, "school-unconfirmed");
+  assert.match(s.detail, /No Results/);
+});
+
 test("AI batching is grouped PER ENTRY — an entry question never sees the whole profile", async () => {
   const prompts = [];
   const page = eduPage(["Carnegie Mellon University", "Other"], {

@@ -2933,8 +2933,21 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
         await atsActuateField(act, ats, f, ref, rec, route.candidates || [], null, jc, profile, { containment: false });
         if (rec.status === "filled" || rec.status === "filled_review") {
           store[pairKey] = { matched: true, schoolName: name };
+        } else if (!rec.listNoResults) {
+          // ⚠ WE COULD NOT CONFIRM THE SCHOOL IS ABSENT, so we must not claim it is (operator,
+          // 2026-08-16). "Other" is only truthful once the widget has SAID "No Results" for the
+          // school we typed. Any other miss — a search still in flight, a menu disturbed by the
+          // page moving under it (which the smooth-scroll bug did), a list that never answered —
+          // is an UNKNOWN, and answering an unknown with "Other" writes a false statement onto the
+          // application: it says this university is not in their system when it is. Observed live:
+          // School "Other" + Other School "Carnegie Mellon University" on a form that lists CMU.
+          store[pairKey] = { matched: false, confirmedAbsent: false, schoolName: name };
+          rec.flag = rec.flag || "school-unconfirmed";
+          rec.detail = "could not confirm whether this form lists " + JSON.stringify(String(name || "")) +
+            " — the search did not report \"No Results\", so it was NOT answered \"Other\"; pick it here";
         } else {
-          // Not listed — take the form's own escape hatch rather than leaving a REQUIRED field empty.
+          // Confirmed absent: the widget itself reported No Results for this school, so the form's
+          // own escape hatch is the truthful answer rather than leaving a REQUIRED field empty.
           // The record is REBUILT rather than patched: the failed attempt's detail/tier/after describe
           // a different commit, and leaving them would report the "Other" pick as if it were the miss.
           rec.status = null; rec.after = null; rec.detail = null; rec.matchTier = null; rec.verified = null; rec.flag = null;
@@ -3362,7 +3375,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
           await act.delay(200);
           read = await act.eval(atsInjIcimsReadOptions, ref.inputSel);
           if (!read || !read.ok) continue;
-          if (read.noResults) { opts = []; break; }
+          if (read.noResults) { opts = []; rec.listNoResults = true; break; }
           const list = read.options || [];
           if (list.length) opts = list;
           const tryM = atsLib.matchCandidates(candidates, list, { containment: allowContainment });
