@@ -68,6 +68,35 @@ test("atsPortalAts: a lookalike host is not evidence (detectAts anchors, and thi
   }, isAts), null);
 });
 
+// ── company plausibility: the employment recognizer's anchor ────────────────────────────
+
+test("⚠ atsPlausibleCompany: the live employer-page scrape returned a TITLE, not a name", () => {
+  // careers.astrion.us, 2026-08-16 — no ATS markup for the JD scrape to key on, so it fell back to
+  // document.title. That string then anchors "have you worked for us before?", which is the one
+  // question where a silently-never-matching anchor is a safety problem.
+  assert.strictEqual(ats.atsPlausibleCompany("Engineering Directorate Support Intern in Mountain View, California | Astrion"), false);
+  assert.strictEqual(ats.atsPlausibleCompany("Software Engineer Intern"), false);   // a role, not an employer
+  assert.strictEqual(ats.atsPlausibleCompany("Staff Analyst - Remote | Acme"), false);
+  assert.strictEqual(ats.atsPlausibleCompany("Data Scientist in Austin, Texas"), false);
+});
+
+test("atsPlausibleCompany: real names are KEPT — the existing ATS behaviour must not move", () => {
+  for (const ok of ["Astrion", "Anthropic", "Kraken", "US Bank", "Cambium Learning",
+    "Analog Devices", "Booz Allen Hamilton", "Magna International"]) {
+    assert.ok(ats.atsPlausibleCompany(ok), `${ok} should be kept`);
+  }
+});
+
+test("atsPlausibleCompany: nothing to judge is not plausible (the caller then uses the URL)", () => {
+  assert.strictEqual(ats.atsPlausibleCompany(""), false);
+  assert.strictEqual(ats.atsPlausibleCompany(null), false);
+  assert.strictEqual(ats.atsPlausibleCompany("   "), false);
+});
+
+test("atsCompanyFromUrl reads the tenant out of the iCIMS subdomain — the fallback's evidence", () => {
+  assert.strictEqual(ats.atsCompanyFromUrl("https://astrioncareers-astrion.icims.com/jobs/24615/login"), "Astrion");
+});
+
 // ── the auth-view classifier ────────────────────────────────────────────────────────────
 
 // The gate as traced live: ONE visible control (`#email` / css_loginName) + `Next`, hCaptcha in
@@ -163,6 +192,18 @@ test("icimsLooksLikeSso: garbage and an ordinary off-portal page are not SSO", (
   assert.strictEqual(ats.icimsLooksLikeSso("not a url", "x.icims.com"), false);
   assert.strictEqual(ats.icimsLooksLikeSso("", "x.icims.com"), false);
   assert.strictEqual(ats.icimsLooksLikeSso("https://www.astrion.us/about", "x.icims.com"), false);
+});
+
+test("⚠ icimsIsAdminLogin: the RECRUITER login is an icims.com host we must never type into", () => {
+  // login.icims.com is iCIMS' Auth0 universal login for STAFF, and it renders an email box — so the
+  // auth classifier would call it `email` and offer the candidate's address to it. The SSO test
+  // cannot catch it, because that one deliberately exempts icims.com hosts.
+  assert.ok(ats.icimsIsAdminLogin("https://login.icims.com/u/login/identifier?state=abc"));
+  assert.strictEqual(ats.detectAts("https://login.icims.com/u/login/identifier"), "icims"); // why SSO misses it
+  assert.strictEqual(ats.icimsIsAdminLogin("https://astrioncareers-astrion.icims.com/jobs/24615/login"), false);
+  assert.strictEqual(ats.icimsIsAdminLogin("https://careers.astrion.us/jobs/24615"), false);
+  assert.strictEqual(ats.icimsIsAdminLogin("login.icims.com.evil.example"), false);
+  assert.strictEqual(ats.icimsIsAdminLogin(null), false);
 });
 
 // ── "iCIMS mailed you the next step" ────────────────────────────────────────────────────

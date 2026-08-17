@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-onboard-1";
+const AP_BUILD_MARKER = "icims-onboard-6";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4602,14 +4602,44 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
     return { ok: false, reason: "click-had-no-effect" };
   };
 
-  let lastView = null, sameViewRounds = 0;
+  // ⚠ SETTLE BEFORE SCANNING — the standing rule, and this stage broke it (live 2026-08-16).
+  // iCIMS mounts #icims_content_iframe a beat AFTER its document loads, so a scan that arrives
+  // first reads the EMPTY top document and concludes "no auth fields and no Apply control here".
+  // What makes it worth a comment: it is invisible on a HIDDEN run, which is slow enough to lose
+  // the race, and reproducible on a VISIBLE one — the opposite of the usual direction, so "it
+  // worked in the background" is not evidence. Polls the page's own readiness; never a fixed delay.
+  const settleAuthPage = async (budgetMs) => {
+    const deadline = Date.now() + (budgetMs || 12000);
+    let prev = null, stable = 0;
+    while (Date.now() < deadline) {
+      await cdpWakePage();
+      // Re-arm every poll: the gate's card holds ONE visible control, so the floor is 1 here rather
+      // than waitAtsFormReady's 4 (which is tuned to refuse a page with no form on it at all).
+      if (!cdpFormFrameArmed()) await cdpUseFormFrame(1).catch(() => null);
+      const sig = await signature();
+      // "Rendered" = something to act on: a control to fill, or a heading (the careers page has a
+      // job title and no controls at all, and must not burn the whole budget waiting for one).
+      const rendered = !!(sig && (sig.controls > 0 || String(sig.heading || "").length > 0));
+      stable = rendered && prev && !atsSignatureChanged(prev, sig) ? stable + 1 : 0;
+      if (stable >= 1) return { settled: true, controls: sig.controls, waitedMs: Date.now() - (deadline - (budgetMs || 12000)) };
+      prev = sig;
+      await cdpDelay(400);
+    }
+    return { settled: false, controls: (prev && prev.controls) || 0 };
+  };
+
+  let lastView = null, sameViewRounds = 0, captchaStalls = 0;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
-    await cdpWakePage();
-    // Re-arm every round: the gate's card holds ONE visible control, so the floor is 1 here rather
-    // than waitAtsFormReady's 4 (which is tuned to refuse a page that has no form on it at all).
-    if (!cdpFormFrameArmed()) await cdpUseFormFrame(1).catch(() => null);
+    const settled = await settleAuthPage(12000);
+    if (!settled.settled) LOG(`the page never settled (${settled.controls} control(s)) — reading it anyway`);
 
     const url = await cdpEval(function () { return location.href; }).catch(() => null);
+    // The RECRUITER login is an icims.com host with an email box on it, so it has to be refused
+    // BEFORE the SSO test (which exempts icims.com hosts) and before the auth scan ever sees it.
+    if (url && icimsIsAdminLogin(url)) {
+      return halt("wrong-login", "This landed on iCIMS' STAFF login (login.icims.com), not the candidate portal — " +
+        "nothing was typed. Open the job's own Apply link and check where it leads.");
+    }
     // TWO hosts are legitimately ours during this stage — the employer's careers domain we started
     // on, and the iCIMS tenant host the Apply control hands us to. `portalHost` covers the first;
     // detectAts covers the second, and without it a tenant whose vanity path happens to contain an
@@ -4641,12 +4671,7 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
       // Still on a portal/JD page: the way on is the Apply control.
       const applied = await clickApplyRetrying(3);
       if (applied.ok) { LOG(`Apply took after ${applied.attempts} attempt(s)`); continue; }
-      if (round === 1 && applied.reason === "no-apply-control") {
-        // Nothing to click and nothing to fill on the FIRST look is usually a page still rendering.
-        LOG("no Apply control and no auth fields yet — giving the page another beat");
-        await cdpDelay(1500);
-        continue;
-      }
+      LOG(`nothing to act on here — url=${(url || "?").split("?")[0]} controls=${settled.controls} frame=${cdpFormFrameArmed() ? "armed" : "none"} apply=${applied.reason}`);
       return halt("apply-not-followable",
         applied.reason === "ambiguous"
           ? "Several different Apply controls are on this page (" + (applied.offered || []).join(" | ") + ") — the run refuses to guess which one is the application."
@@ -4712,9 +4737,32 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
     }
     const moved = await waitForChange(before, 15000);
     if (!moved.changed) {
-      // NOT a halt: the next round re-reads the page, and the same-view guard above ends it if the
-      // step really is inert. A submit whose response is merely slow must not be called a failure.
-      LOG(`the ${what} submit has not changed the page yet — re-reading`);
+      // NOT automatically a halt: the next round re-reads the page, and the same-view guard above
+      // ends it if the step really is inert. A submit whose response is merely slow must not be
+      // called a failure. But SAY WHAT WE SAW — "nothing happened" has two causes here with
+      // opposite fixes, and telling them apart is a whole debugging round each time.
+      const d = await cdpEval(atsInjAuthScan).catch(() => null);
+      LOG(`the ${what} submit has not changed the page after ${moved.waitedMs}ms — submitLocked=${d && d.submitLocked}` +
+        ` captchaToken=${d && d.captchaToken} captchaFrames=${d && d.captchaFrames} challengeVisible=${d && d.captchaChallenge}` +
+        `${(d && d.errors || []).length ? " errors=" + d.errors.join(" / ") : ""}` +
+        ` — ${d && d.submitLocked && !d.captchaToken ? "the form fired and is waiting on the invisible captcha" : d && d.captchaToken ? "the captcha resolved; the POST is in flight" : "the submit handler may not have run at all"}`);
+      // ⚠ THE GATE LOCKS ITS OWN BUTTON and only the captcha callback ever unlocks it
+      // (`icimsDisableSaveAndSubmitButtons` runs in its onsubmit). So a captcha that never answers
+      // leaves a page that CANNOT be retried in place: the next round re-presses and gets
+      // `submit-disabled`, which reads like a different fault entirely. A reload is the only thing
+      // that restores the control — bounded at one, because a second stall is a real refusal.
+      if (d && d.submitLocked && !d.captchaToken) {
+        if (captchaStalls >= 1) {
+          return halt("captcha-unanswered", "The iCIMS sign-in's invisible hCaptcha never answered, twice — the form submitted and its own button locked, " +
+            "but no captcha token ever arrived, so the page cannot move. Sign in yourself in the tab and re-run; the bot never solves or works around a captcha.");
+        }
+        captchaStalls++;
+        LOG("the gate locked its own button and the captcha never answered — reloading the sign-in once to restore it");
+        await cdpReload();
+        await waitTabComplete(tabId, 20000).catch(() => null);
+        cdpClearFormFrame();
+        lastView = null; sameViewRounds = 0; // a reloaded gate is a fresh attempt, not a repeat
+      }
     }
   }
   return { halt: { ok: true, needs_operator: true, stopped: "auth-rounds-exhausted",
@@ -4745,7 +4793,15 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // fetched and every document the run touches starts with it. That costs NOTHING — it is the same
     // single navigation the run always made, just moved to after the install. A reload here would have
     // worked too and was rejected for being a second page load.
-    await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
+    // ⚠ iCIMS DECLINES THE WORKER-TIMER POLYFILL, and the reason is its SIGN-IN GATE, not its form.
+    // That gate's submit is preventDefault-ed and gated on INVISIBLE hCaptcha; under the polyfill
+    // hCaptcha never initialises at all — measured 2026-08-16 on the same page in the same session:
+    // `captchaFrames 0` under a run against a rendered hcaptcha iframe by hand, so the submit event
+    // fired, iCIMS disabled its own button, and no callback ever came. Declining restores the page's
+    // native timers so its own anti-abuse check can run and judge us; it does not solve, forge or
+    // hide anything, and a refusal still halts for the operator. Costs a hidden run its fast timers
+    // on this tenant — the right trade against a gate that cannot be passed at all.
+    await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined);
     await cdpSetFocusEmulation(true).catch(() => {});
     // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
     // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
@@ -4921,13 +4977,27 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     LOG(`form settled — ${ready.fields} field(s).`);
 
     const jobContext = { ...(store.jobContext || {}) };
-    if (jd && jd.company) jobContext.company = jd.company;
-    // …and if the START url was the employer's own domain, it names no company this helper can read
-    // (atsCompanyFromUrl needs a recognized ATS host). The page we ACTUALLY landed on does — an
-    // iCIMS portal carries the tenant in its subdomain. Worth the extra read: this string anchors
-    // the safety-critical "have you worked for us before?" recognizer.
-    if (!jobContext.company) jobContext.company = atsCompanyFromUrl(startUrl)
+    // WHICH COMPANY IS THIS? The string anchors the safety-critical "have you worked for us
+    // before?" recognizer, so it is worth two reads and a sanity test rather than the first
+    // non-empty answer. Two independent sources:
+    //   • the JD scrape — right on a real ATS posting, but on an EMPLOYER-hosted careers page it
+    //     has no ATS markup to key on and can hand back the document TITLE (live 2026-08-16:
+    //     "Engineering Directorate Support Intern in Mountain View, California | Astrion").
+    //   • the URL — atsCompanyFromUrl needs a recognized ATS host, so the START url gives nothing
+    //     on an employer domain. The page we LANDED on does: an iCIMS portal carries its tenant in
+    //     the subdomain ("astrioncareers-astrion" → "Astrion"). That is evidence, not a heuristic.
+    // A scrape that fails the plausibility test is dropped in favour of the URL; if neither is
+    // usable the scrape is still better than nothing, so it is kept as the last resort.
+    const urlCompany = atsCompanyFromUrl(startUrl)
       || atsCompanyFromUrl(await cdpEval(function () { return location.href; }).catch(() => null));
+    const scrapedCompany = (jd && jd.company) || null;
+    if (scrapedCompany && !atsPlausibleCompany(scrapedCompany) && urlCompany) {
+      LOG(`the posting scrape read the company as "${String(scrapedCompany).slice(0, 60)}" — that is a page title, not a name; using "${urlCompany}" from the portal host instead`);
+      jobContext.company = urlCompany;
+    } else if (scrapedCompany) {
+      jobContext.company = scrapedCompany;
+    }
+    if (!jobContext.company) jobContext.company = urlCompany;
     if (jd && jd.title) jobContext.title = jd.title;
     // The JD text grounds the AI answers (an essay written blind to the posting invents a
     // company theme — live: "Kraken's work in the robotics space" for an ENERGY company).
@@ -5022,7 +5092,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
-    await cdpInstallPageOverrides();
+    await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined); // see the fill run: its sign-in gate's invisible hCaptcha will not initialise under the polyfill
     await cdpSetFocusEmulation(true).catch(() => {});
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real

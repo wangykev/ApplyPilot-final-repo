@@ -685,9 +685,24 @@ function buildOverrideSrc(opts) {
 // SPA doc, then read back whether worker-timers took. Best-effort: an install failure
 // logs and is swallowed — it must NEVER abort a run (the fill already works hidden;
 // this helps page-to-page advancement AND, via worker-timers, hidden-run SPEED).
-async function cdpInstallPageOverrides() {
+// `opts.noWorkerTimers` lets a CALLER opt its run out of the blob-worker timer polyfill while
+// leaving everything else in place. Added for iCIMS (2026-08-16): its sign-in gate is guarded by
+// INVISIBLE hCaptcha, and under the polyfill hCaptcha never initialises at all — measured, not
+// theorised (`captchaFrames 0` under a run vs a rendered challenge iframe on the same page by
+// hand), so the gate's submit fired, iCIMS disabled its own button, and nothing ever came back.
+// We are not evading the captcha by turning this off — we are removing OUR OWN tampering so the
+// page's own anti-abuse check can run and judge the session on its merits. If it then refuses us,
+// the pre-form stage halts for the operator; nothing here forges or solves anything.
+// The storage kill-switch still wins, so `forceWorkerTimersOff` behaves exactly as before.
+async function cdpInstallPageOverrides(opts) {
+  // Two separate switches, deliberately NOT merged: the storage kill-switch exists to SIMULATE a
+  // CSP-blocked tenant, so it turns the bypass off too; the caller opt-out only declines the
+  // worker. Keeping them apart is what let the iCIMS cause be narrowed to the worker alone rather
+  // than "something in the override block".
+  const callerNoWorker = !!(opts && opts.noWorkerTimers);
   let forceNoWorker = false;
   try { const { forceWorkerTimersOff } = await new Promise((r) => chrome.storage.local.get("forceWorkerTimersOff", r)); forceNoWorker = !!forceWorkerTimersOff; } catch (e) { /* default OFF */ }
+  const noWorker = forceNoWorker || callerNoWorker;
   // CSP BYPASS (2026-07-25 — the wd3.myworkdaysite.com slow-run diagnosis): a tenant whose CSP blocks
   // blob: workers silently killed the WHOLE fast hidden path — the worker-timers install threw, the
   // readback stayed false, and every page-side debounce/render quantized to the ~1Hz throttle (the
@@ -701,7 +716,7 @@ async function cdpInstallPageOverrides() {
     try { await cdpSend("Page.setBypassCSP", { enabled: true }); cspBypassed = true; } catch (e) { /* stay CSP-bound */ }
   }
   try {
-    const src = buildOverrideSrc({ forceNoWorker });
+    const src = buildOverrideSrc({ forceNoWorker: noWorker });
     await cdpSend("Page.addScriptToEvaluateOnNewDocument", { source: src }); // future loads / re-auth
     await cdpSend("Runtime.evaluate", { expression: src });                  // the current already-loaded SPA doc
     // Read back whether the worker-timers polyfill actually installed on the CURRENT
@@ -710,19 +725,22 @@ async function cdpInstallPageOverrides() {
     // RETRY once (worker-only): the doc may carry __apOverridesInstalled from an EARLIER attach that
     // ran without the bypass (SPA — no reload between runs), so the full override no-ops and the
     // worker stays dead. buildWorkerRetrySrc re-runs JUST the worker block when the worker isn't live.
-    if (!_workerTimersActive && !forceNoWorker && cspBypassed) {
+    if (!_workerTimersActive && !noWorker && cspBypassed) {
       try {
         await cdpSend("Runtime.evaluate", { expression: buildWorkerRetrySrc() });
         _workerTimersActive = !!(await cdpEval(() => !!window.__apWorkerTimers));
       } catch (e) { /* stays slow/safe */ }
     }
-    const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : (cspBypassed ? "OFF (blocked even with CSP bypass)" : "OFF (CSP?)"));
+    const wt = _workerTimersActive ? "ON"
+      : callerNoWorker && !forceNoWorker ? "OFF (declined by this run — it meets a page whose own anti-abuse check the polyfill breaks)"
+      : forceNoWorker ? "OFF (forced)" : (cspBypassed ? "OFF (blocked even with CSP bypass)" : "OFF (CSP?)");
     console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; CSP bypass ${cspBypassed ? "ON" : "unavailable"}; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
-    if (!_workerTimersActive && !forceNoWorker) warnNoWorkerTimers(cspBypassed ? "blocked even with CSP bypass" : "install threw (CSP?)");
+    // A DECLINED worker is a decision, not a fault — the banner would be a false alarm.
+    if (!_workerTimersActive && !noWorker) warnNoWorkerTimers(cspBypassed ? "blocked even with CSP bypass" : "install threw (CSP?)");
   } catch (e) {
     _workerTimersActive = false;
     console.log("[ApplyPilot][CDP] page-override install failed (best-effort, continuing):", String((e && e.message) || e));
-    if (!forceNoWorker) warnNoWorkerTimers("the whole override install failed: " + String((e && e.message) || e));
+    if (!noWorker) warnNoWorkerTimers("the whole override install failed: " + String((e && e.message) || e));
   }
 }
 

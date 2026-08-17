@@ -107,6 +107,31 @@ function atsCompanyFromUrl(url) {
   } catch (e) { return null; }
 }
 
+// IS THIS STRING A COMPANY NAME, OR A PAGE TITLE THE SCRAPE MISTOOK FOR ONE? An employer-hosted
+// careers page has no ATS markup for the JD scrape to key on, so its company heuristic can fall
+// back to the document title — live 2026-08-16 on careers.astrion.us it produced
+// "Engineering Directorate Support Intern in Mountain View, California | Astrion".
+//
+// That is not cosmetic. `jobContext.company` is the anchor for the SAFETY-CRITICAL employment
+// recognizer ("have you worked for us before?"), and comparing a tenant's own question against a
+// job title means the anchor silently never matches. CLAUDE.md already names the same hazard for
+// iCIMS' path segment: hand the recognizer a word no employer is called and every such question
+// misreads.
+//
+// Deliberately a NEGATIVE test with loud tells, not a cleverer parser: a real name is short and
+// carries no title furniture. Anything it rejects falls back to the URL-derived tenant, which is
+// evidence rather than a guess; anything it can't judge is KEPT, so the existing Greenhouse /
+// Lever / Ashby behaviour is unchanged.
+function atsPlausibleCompany(name) {
+  const s = String(name == null ? "" : name).replace(/\s+/g, " ").trim();
+  if (!s) return false;
+  if (s.length > 48) return false;                 // names are short; titles run on
+  if (/[|·—]/.test(s)) return false;               // "<title> | <Company>" separators
+  if (/\bin\s+[A-Z][\w.'-]+,\s*[A-Z]/.test(s)) return false;  // "… in Mountain View, California"
+  if (/\b(intern|engineer|manager|analyst|developer|scientist|director|specialist|technician|associate|architect)\b/i.test(s)) return false;
+  return true;
+}
+
 // ── Static field maps (pure) ─────────────────────────────────────────────────────────────
 // The stable per-ATS identities observed live (dom-patterns 2026-07-31). Everything not
 // named here routes through the LABEL ladder (buckets → recognizers → employment → AI).
@@ -2474,9 +2499,25 @@ function atsInjAuthScan() {
   const errors = [...document.querySelectorAll('.iCIMS_Error, .iCIMS_Validation_Error, .error, [role="alert"], .alert-danger')]
     .filter(vis).map((e) => clean(e.textContent)).filter(Boolean).slice(0, 4);
 
+  // ── the two signals that say WHY a submit went nowhere ──────────────────────────────
+  // The gate's submit is preventDefault-ed and gated on INVISIBLE hCaptcha (traced 2026-08-16):
+  //   form.onsubmit → e.preventDefault() → hcaptcha.execute(widgetId)
+  //   hCaptcha callback → append <input name="h-captcha-response" value=token> → form.submit()
+  // So "the page did not change" has two completely different causes, and without these two reads
+  // they are indistinguishable — which is a whole debugging round each time.
+  //   submitLocked : iCIMS' own onsubmit calls icimsDisableSaveAndSubmitButtons, so a DISABLED
+  //                  button proves the submit event FIRED and we are waiting on the captcha.
+  //   captchaToken : a token present proves hCaptcha RESOLVED and the form was really submitted.
+  // The token's VALUE is never returned — a boolean and a length, the credential discipline.
+  const tokenEl = document.querySelector('[name="h-captcha-response"]');
+  const submitLocked = submitEl ? !!(submitEl.disabled || submitEl.getAttribute("aria-disabled") === "true") : null;
+
   return { ok: true, url: location.href, title: document.title, readyState: document.readyState,
     controlCount: shown.length, email, password, code, submit, federated, createAccount,
-    captchaChallenge, errors, bodyText: clean(document.body ? document.body.innerText : "").slice(0, 1200) };
+    captchaChallenge, submitLocked,
+    captchaPresent: !!tokenEl, captchaToken: !!(tokenEl && tokenEl.value && String(tokenEl.value).length),
+    captchaFrames: document.querySelectorAll('iframe[src*="hcaptcha"]').length,
+    errors, bodyText: clean(document.body ? document.body.innerText : "").slice(0, 1200) };
 }
 
 // How many visible controls before a page stops being a sign-in card and starts being a form. The
@@ -2521,6 +2562,18 @@ function icimsLooksLikeSso(url, portalHost) {
   if (portalHost && host === String(portalHost).toLowerCase()) return false;
   if (ICIMS_SSO_HOST_RE.test(host)) return true;
   return ICIMS_SSO_PATH_RE.test(u.pathname);
+}
+
+// ⚠ NOT EVERY icims.com LOGIN IS THE CANDIDATE'S. `login.icims.com` is iCIMS' Auth0 universal
+// login for RECRUITERS — traced 2026-08-16, `/u/login/identifier` with the customer's own org name
+// on it, reached by wandering one path off the candidate portal (`/jobs/intro` redirects there).
+// It renders an email box, so the auth scan would classify it `email` and type the candidate's
+// account address into a STAFF login. The host is the whole tell, and it is a host we can never
+// have business on: the candidate portal always lives on a TENANT subdomain.
+// Checked ahead of the SSO test, because the SSO test deliberately exempts icims.com hosts.
+function icimsIsAdminLogin(url) {
+  try { return new URL(String(url == null ? "" : url)).hostname.toLowerCase() === "login.icims.com"; }
+  catch (e) { return false; }
 }
 
 // iCIMS can answer the email gate by MAILING you a one-time link instead of showing a password
@@ -4694,7 +4747,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
 // ── UMD-lite export (Node tests) ─────────────────────────────────────────────────────────
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
+    detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
@@ -4705,7 +4758,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
-    atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential,
+    atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
