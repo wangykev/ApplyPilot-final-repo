@@ -388,6 +388,35 @@ const ATS_ICIMS_ENTRY_MAPS = {
     // `dateGroup` by DOM order within the entry: group 0 is the start, group 1 the end.
     dateGroups: [{ from: "from" }, { from: "to" }],
   },
+  // ── Professional Certifications ────────────────────────────────────────────────────────
+  // ⚠ THERE IS NO "CERTIFICATIONS" HEADING — traced 2026-08-16. The section is titled "Skills",
+  // and holds exactly ONE control: a repeating `Certifications` text box (its Add More reads
+  // "Add More (Professional Certifications)"). So the seal keys on the SKILLS heading, which here
+  // is unambiguous precisely because that heading has nothing else under it — worth re-checking on
+  // any tenant that puts a real skills control there.
+  // This form asks only for the certification's NAME: no number, no issued/expiry date, so the
+  // profile's certification_number and dates have nowhere to go and are simply not mapped.
+  certifications: {
+    source: "certifications",
+    sectionTitle: /^skills$/i,
+    match: /^$/,                       // per-customer rcf ids — membership identifies these
+    addButton: /professional certifications/i,
+    byLabel: {
+      "certifications": { kind: "certification_name" },
+      "certification": { kind: "certification_name" },
+      "certification name": { kind: "certification_name" },
+      // Astrion asks only for the name, but the vocabulary is borrowed from the Workday side's
+      // CERTIFICATION_MAP so a tenant that asks for more is already covered.
+      "certification number": { path: "certification_number" },
+      "license number": { path: "certification_number" },
+      // ⚠ ISSUED / EXPIRATION DATES ARE DELIBERATELY NOT MAPPED. The profile stores them as
+      // "YYYY-MM-DD", and the existing date_month/date_year kinds only parse "YYYY-MM" or "YYYY" —
+      // pointing a label at them would resolve to null on every run and look like a broken mapping
+      // rather than a missing one. Left unmapped, such a field is still SEALED (membership covers
+      // it), so it reaches the scoped AI instead of the profile root. Wiring them properly means a
+      // day-precision kind, which no observed tenant has asked for yet.
+    },
+  },
 };
 
 // Which repeating section (if any) does a field belong to, and which ENTRY of it?
@@ -571,6 +600,16 @@ function atsResolveEntryField(es, entry, f, now) {
     // one abbreviation that is commonly four letters.
     return mi >= 0 && mi < 12
       ? { candidates: atsMonthCandidates(mi), source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from }
+      : null;
+  }
+  if (spec.kind === "certification_name") {
+    // `certification` is TIERED (most specific first), the same shape degree and field_of_study use.
+    // This is a free-text box rather than a picker, so the most specific tier is simply written —
+    // there is no list to fall back through. A tier list that arrived as a bare string still works.
+    const raw = entry.certification;
+    const name = Array.isArray(raw) ? raw.find((x) => typeof x === "string" && x.trim()) : raw;
+    return name && String(name).trim()
+      ? { value: String(name).trim(), source: "entry", path: es.section + "[" + es.entryIndex + "].certification" }
       : null;
   }
   if (spec.kind === "may_contact") {

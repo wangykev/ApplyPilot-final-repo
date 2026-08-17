@@ -830,6 +830,33 @@ test("experience: a field with no mapping is still SEALED — unanswered, never 
   assert.strictEqual(route.section, "experience", "the section KEY, not the profile array it reads");
 });
 
+// ⚠ The section is titled "Skills", not "Certifications" — the only control under that heading is
+// the repeating Certifications box. Asked for before the operator had any certifications, so that
+// the section is wired and SEALED in advance rather than discovered wrong on the first one.
+test("certifications: the entry fills from its own row, tiered name, most specific first", () => {
+  const P = { skills: ["Python"], certifications: [
+    { certification: ["Certified Professional Engineer", "PE"], certification_number: "12345" },
+    { certification: "EIT" },                                  // a bare string still works
+    { certification: [] },                                     // nothing to say
+  ] };
+  const ask = (i) => ats.atsResolveEntryField(
+    { section: "certifications", source: "certifications", entryIndex: i, spec: { kind: "certification_name" } },
+    P.certifications[i], {});
+  assert.strictEqual(ask(0).value, "Certified Professional Engineer", "most specific tier, not the abbreviation");
+  assert.strictEqual(ask(1).value, "EIT");
+  assert.strictEqual(ask(2), null, "an empty tier list stays unanswered rather than writing \"\"");
+});
+
+test("certifications: a Skills-section field is SEALED to the certifications entry", () => {
+  const P = { skills: ["Python", "C++"], certifications: [{ certification: ["PE License"] }] };
+  const f = { fieldName: "-1_PersonProfileFields.rcf2062", inputSel: "#c", widgetType: "text",
+    inputType: "text", label: "Certifications", isRequired: false, value: null, section: "Skills" };
+  ats.atsAssignEntryIndexes("icims", [f]);
+  const route = ats.atsRouteField("icims", f, P, {}, {}, new Map(), null);
+  assert.strictEqual(route.value, "PE License");
+  assert.match(route.path, /^certifications\[0\]/);
+});
+
 test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {
   const now = new Date("2026-08-16T00:00:00Z").getTime();
   assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true);
