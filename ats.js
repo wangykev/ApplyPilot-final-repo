@@ -3215,6 +3215,19 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           }
         }
       }
+      // ⚠ EVERY CHOICE FIELD REACHES REVIEW WITH ITS OPTIONS, filled or not (operator, 2026-08-16).
+      // A field we did not fill still has to be ANSWERABLE on the review page, and a picker with no
+      // options is just a text box — the operator ends up retyping a value the form was showing us
+      // all along. The scan already read these (native selects, radios, checkbox groups, and the
+      // first page of an iCIMS dropdown), so attaching them costs NOTHING: no reopening, no page
+      // contact, no added latency. Only the widget families whose list has no end — the big
+      // server-backed typeaheads — are left alone, and they are left alone by construction here,
+      // because the scan does not carry options for them either.
+      // Attached only when the record has none: a field that DID actuate already recorded the live
+      // list it matched against, which is the better of the two.
+      if (!rec.options && !rec.captured_options && Array.isArray(f.options) && f.options.length) {
+        atsAttachOptions(rec, f.options, f.optionsPartial === true);
+      }
       // Route-level review force (employment "Yes" etc.).
       if (route && route.review && rec.status === "filled") rec.status = "filled_review";
       if (route && route.flag && !rec.flag) rec.flag = route.flag;

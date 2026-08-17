@@ -910,6 +910,33 @@ test("multiselect: EVERY offered answer is selected in ONE commit, and misses ar
   assert.match(out2.results[0].detail, /does not offer Contract/);
 });
 
+// A field we did not fill still has to be ANSWERABLE on the review page, and a picker with no
+// options is just a text box — the operator retypes a value the form was showing us all along.
+test("review: an UNFILLED choice field still carries the form's options", async () => {
+  const OPTS = ["Full-time", "Part-time", "Internship", "Temporary"];
+  const page = {
+    atsInjScan: () => ({ ats: "icims", url: "https://x.icims.com/jobs/1/candidate", title: "t", fields: [
+      // nothing in the profile answers either of these
+      { fieldName: "rcf9001", inputSel: "#a", widgetType: "dropdown_native", label: "Shift preference",
+        isRequired: false, value: null, options: OPTS, domIndex: 0 },
+      { fieldName: "rcf9002", inputSel: "#b", widgetType: "radio", label: "Relocation help needed",
+        isRequired: false, value: null, options: ["Yes", "No"], domIndex: 1 },
+      // a text field has no options and must not gain any
+      { fieldName: "rcf9003", inputSel: "#c", widgetType: "text", inputType: "text", label: "Badge",
+        isRequired: false, value: null, domIndex: 2 },
+    ] }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    atsInjReadValue: () => ({ ok: true, value: null }),
+  };
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", { personal_info: {} }, {}, {}, {});
+  const by = Object.fromEntries(out.results.map((r) => [r.fieldName, r]));
+  assert.deepStrictEqual(by.rcf9001.options, OPTS, "an unfilled dropdown must still offer its options");
+  assert.deepStrictEqual(by.rcf9002.options, ["Yes", "No"]);
+  assert.strictEqual(by.rcf9003.options ?? null, null, "a text field gains nothing");
+  // and this costs no page contact — the options came from the scan, not a re-open
+  assert.strictEqual(by.rcf9001.status, "skipped");
+});
+
 test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {
   const now = new Date("2026-08-16T00:00:00Z").getTime();
   assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true);
