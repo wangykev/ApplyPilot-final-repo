@@ -857,6 +857,59 @@ test("certifications: a Skills-section field is SEALED to the certifications ent
   assert.match(route.path, /^certifications\[0\]/);
 });
 
+// "Please select the following employment options you would consider…" — a native <select multiple>
+// offering Full-time / Internship / Part-time / Temporary (iCIMS rcf2010, traced 2026-08-16).
+const ET_FIELD = { fieldName: "rcf2010", inputSel: "#et", widgetType: "multiselect_native",
+  label: "Please select the following employment options you would you consider (please hold down the Ctrl key to select multiple options):",
+  isRequired: false, value: null, options: ["Full-time", "Internship", "Part-time", "Temporary"], domIndex: 0 };
+
+test("employment options: routed deterministically from the stated list", () => {
+  const P = { employment_types_considered: ["Internship", "Full-time"] };
+  const r = ats.atsRouteField("icims", ET_FIELD, P, {}, {}, new Map(), null);
+  assert.deepStrictEqual(r.candidates, ["Internship", "Full-time"]);
+  assert.strictEqual(r.path, "employment_types_considered");
+  // an empty list leaves the question UNANSWERED rather than guessing a default
+  assert.strictEqual(ats.atsRouteField("icims", ET_FIELD, { employment_types_considered: [] }, {}, {}, new Map(), null), null);
+});
+
+test("employment options: the recognizer does not swallow work-AUTHORISATION questions", () => {
+  const P = { employment_types_considered: ["Full-time"] };
+  for (const label of [
+    "Are you legally authorized to work in the United States?",
+    "Will you now or in the future require sponsorship for employment visa status?",
+  ]) {
+    const r = ats.atsRouteLabel(label, { ...ET_FIELD, label }, P, {});
+    assert.notStrictEqual(r && r.path, "employment_types_considered", "eligibility is a different question: " + label);
+  }
+});
+
+test("multiselect: EVERY offered answer is selected in ONE commit, and misses are reported", async () => {
+  const sel = {};
+  const page = {
+    atsInjScan: () => ({ ats: "icims", url: "https://x.icims.com/jobs/1/candidate", title: "t", fields: [ET_FIELD] }),
+    atsInjScrollIntoView: () => ({ ok: true }),
+    // ⚠ mirrors the real widget: a fresh selection REPLACES the previous one, so a per-option loop
+    // would leave only the last pick — the bug the one-shot commit exists to avoid.
+    atsInjSelectNativeMulti: (s, texts) => { sel[s] = [...texts]; return { ok: true, missed: [], selected: [...texts] }; },
+    atsInjReadValue: (a, s) => ({ ok: true, value: (sel[s] || []).join(", ") || null }),
+  };
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { employment_types_considered: ["Internship", "Full-time"] }, {}, {}, {});
+  assert.deepStrictEqual(sel["#et"], ["Internship", "Full-time"], "both, in one commit");
+  assert.strictEqual(out.results[0].status, "filled");
+
+  // a stored answer the form does not offer is REPORTED, never silently dropped
+  const sel2 = {};
+  const page2 = { ...page, atsInjSelectNativeMulti: (s, texts) => { sel2[s] = [...texts]; return { ok: true, missed: [], selected: [...texts] }; },
+    atsInjReadValue: (a, s) => ({ ok: true, value: (sel2[s] || []).join(", ") || null }) };
+  const out2 = await ats.driveAtsPageFill(fakeAct(page2), "icims",
+    { employment_types_considered: ["Internship", "Contract"] }, {}, {}, {});
+  assert.deepStrictEqual(sel2["#et"], ["Internship"]);
+  assert.strictEqual(out2.results[0].status, "filled_review");
+  assert.strictEqual(out2.results[0].flag, "partial-multiselect");
+  assert.match(out2.results[0].detail, /does not offer Contract/);
+});
+
 test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {
   const now = new Date("2026-08-16T00:00:00Z").getTime();
   assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true);

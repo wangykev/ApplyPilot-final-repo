@@ -83,6 +83,11 @@ function withDefaultWebsites(list: { type: string; url: string }[] | undefined) 
 // to a non-empty list keeps theirs. "Other" ships as the last default entry (the catch-all), so
 // there's no separate "last resort" field anymore.
 const DEFAULT_SOURCE_LADDER = ["LinkedIn", "Handshake", "GitHub", "Other"];
+/** The canonical employment-option words, in the order the fill should try them. Kept here so the
+ *  editor and the profile agree on spelling — a form's own wording is matched through the ordinary
+ *  ladder, so these do not have to equal any one tenant's labels. */
+const EMPLOYMENT_TYPES = ["Full-time", "Part-time", "Internship", "Temporary"] as const;
+
 function withDefaultSources(h: Profile["how_did_you_hear"] | undefined) {
   const preferred =
     Array.isArray(h?.preferred) && h!.preferred.length > 0 ? h!.preferred : [...DEFAULT_SOURCE_LADDER];
@@ -524,6 +529,32 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           placeholder="Add a source — e.g. LinkedIn"
           onChange={(v) => update((p) => { p.how_did_you_hear.preferred = v; })}
         />
+      </SectionCard>
+
+      {/* Employment types considered — a MULTI-answer question several ATSs ask */}
+      <SectionCard
+        title="Employment types you'd consider"
+        subtitle="Asked as a multi-select — “Please select the employment options you would consider”. Tick every kind you'd take; a form offering only some of them selects those and says which it could not."
+      >
+        <div className="flex flex-wrap gap-x-8 gap-y-2">
+          {EMPLOYMENT_TYPES.map((t) => (
+            <CheckboxField
+              key={t}
+              label={t}
+              bucketPath={t === EMPLOYMENT_TYPES[0] ? "employment_types_considered" : undefined}
+              checked={profile.employment_types_considered.includes(t)}
+              onChange={(on) => update((p) => {
+                // Kept in the canonical order above rather than click order, so the fill tries them
+                // in a stable sequence and two profiles with the same ticks are the same answer.
+                const next = EMPLOYMENT_TYPES.filter((x) => (x === t ? on : p.employment_types_considered.includes(x)));
+                p.employment_types_considered = next;
+              })}
+            />
+          ))}
+        </div>
+        <p className="mt-3 text-xs text-ink-faint">
+          Leaving all of them unticked leaves the question unanswered rather than guessing a default.
+        </p>
       </SectionCard>
 
       {/* Employment history companies — safety-critical */}

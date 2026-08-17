@@ -295,6 +295,13 @@ export const profileSchema = z.object({
   languages: z.array(languageSchema).default([]),
   certifications: z.array(certificationSchema).default([]),
   work_authorization: workAuthSchema,
+  /**
+   * Which kinds of employment the applicant would consider — a MULTI-answer question several ATSs
+   * ask ("Please select the employment options you would consider…", iCIMS renders it as a native
+   * multi-select). Stored as the canonical option words so a form's own wording is matched through
+   * the ordinary ladder rather than guessed: an empty list simply leaves the question unanswered.
+   */
+  employment_types_considered: z.array(z.string()).default([]),
   how_did_you_hear: howDidYouHearSchema,
   employment_history_companies: z.array(z.string()).default([]),
   self_identification: selfIdentificationSchema,

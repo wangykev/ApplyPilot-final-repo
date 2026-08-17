@@ -835,6 +835,20 @@ function atsRouteLabel(label, f, profile, defaults) {
     if (hdyh && Array.isArray(hdyh.preferred) && hdyh.preferred.length) return { candidates: [...hdyh.preferred], source: "map", path: "how_did_you_hear.preferred", detail: "how_did_you_hear.preferred" };
   }
 
+  // WHICH KINDS OF EMPLOYMENT WOULD YOU CONSIDER — a MULTI-answer question (iCIMS renders it as a
+  // native multi-select: "Please select the following employment options you would consider…", with
+  // Full-time / Internship / Part-time / Temporary). Deterministic from a stated list; every stored
+  // answer still clears the ordinary ladder against the live options, so a form offering different
+  // words commits only what it actually has. Anchored on "employment/position/job" + a
+  // consider/interested/seeking verb, so it cannot swallow the work-AUTHORISATION questions above
+  // (those are about eligibility, and they run first regardless).
+  if (/\b(employment|position|job)\b[^?]*\b(you would|you'd|would you)?\s*(consider|interested in|seeking|looking for|open to)\b/i.test(L) ||
+      /\b(employment|work)\s+(type|options?|status)\b[^?]*\b(consider|interested|seeking|prefer)/i.test(L)) {
+    const et = (profile && profile.employment_types_considered) || (defaults && defaults.employment_types_considered);
+    const list = Array.isArray(et) ? et.filter((x) => typeof x === "string" && x.trim()) : [];
+    if (list.length) return { candidates: list, source: "map", path: "employment_types_considered", detail: "employment_types_considered" };
+  }
+
   // EEO / demographics — deterministic ONLY from stated values (the Workday rule verbatim:
   // a stated demographic fills deterministically; AI never overrides; optional+unstated → blank).
   // containment:true — a STATED long-form demographic against each ATS's own phrasing
@@ -1049,6 +1063,14 @@ function atsInjScan(ats) {
       const label = stripReq(labelFor(el) || id);
       const base = { fieldName: id, inputSel: sel, label: label || id, isRequired: req(el), section: sectionOf(el) };
       if (el.type === "file") { push(Object.assign(base, { widgetType: "file_upload", isRequired: req(el), value: (el.files && el.files[0] && el.files[0].name) || null })); continue; }
+      if (el.tagName === "SELECT" && el.multiple) {
+        // A native <select multiple> is a MULTI-answer control: committing it by selectedIndex (what
+        // dropdown_native does) would answer one option and silently discard the rest.
+        push(Object.assign(base, { widgetType: "multiselect_native",
+          value: [...el.selectedOptions].map((o) => txt(o)).join(", ") || null,
+          options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^(select|—s*make a selection)/i.test(t)) }));
+        continue;
+      }
       if (el.tagName === "SELECT") {
         // ⚠ NOT EVERY <select> HERE IS A SELECT. iCIMS replaces many of them with its own AJAX
         // combobox ("IdDropDown"), and when it does, the <select> element is left PERMANENTLY EMPTY —
@@ -1418,6 +1440,7 @@ function atsInjReadValue(ats, inputSel, widgetType) {
     }
     return { ok: true, value: el.value || null };
   }
+  if (widgetType === "multiselect_native") return { ok: true, value: [...el.selectedOptions].map(txt).join(", ") || null };
   if (widgetType === "dropdown_native") return { ok: true, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null };
   // ⚠ iCIMS' AJAX combobox: its <select> is empty and holds an opaque numeric id, so BOTH the usual
   // reads (`selectedIndex`/`el.value`) lie about it — one says "nothing selected", the other returns
@@ -1973,7 +1996,7 @@ const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_ty
   text: "text", textarea: "textarea", select: "dropdown", dial: "dropdown", location: "typeahead",
   dropdown_native: "dropdown", radio: "radio", checkbox: "checkbox", checkbox_group: "checkbox_group",
   yesno: "radio", file_upload: "file_upload", date: "date", unknown: "unknown",
-  icims_dropdown: "dropdown",
+  icims_dropdown: "dropdown", multiselect_native: "checkbox_group",
 };
 
 // Options for a dial-code select carry a trailing "+<digits>" ("United States +1") that no
@@ -2622,7 +2645,7 @@ function atsAiBatchKind(f) {
   // it in the "essay" group and bill it to the operator's essay model. Workday's `aiFillDate` routes a
   // date to "fill" for the same reason; this keeps the two paths saying the same thing.
   if (wt === "date") return "date";
-  if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location", "icims_dropdown"].includes(wt)) return "choice";
+  if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location", "icims_dropdown", "multiselect_native"].includes(wt)) return "choice";
   return null;
 }
 
@@ -3074,7 +3097,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           const c = f.widgetType === "radio" || f.widgetType === "checkbox_group"
             ? await act.eval(atsInjCheckOption, ref.inputSel, dec, true)
             : f.widgetType === "dropdown_native"
-              ? await act.eval(atsInjSelectNative, ref.inputSel, dec)
+              ? await act.eval(atsInjSelectNative, atsInjSelectNativeMulti, ref.inputSel, dec)
               : await act.eval(atsInjCommitOption, ref.inputSel, dec);
           const b = await atsReadBackSettled(act, ats, ref.inputSel, f.widgetType);
           rec.after = b && b.ok ? b.value : null;
@@ -3107,7 +3130,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           // missing from this list is treated as free text — which silently drops a TIERED profile
           // array (the country ladder) instead of passing it through as candidates, so the fallback
           // tier that actually matches the form's wording never gets tried.
-          const isChoice = ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location", "icims_dropdown"].includes(f.widgetType);
+          const isChoice = ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location", "icims_dropdown", "multiselect_native"].includes(f.widgetType);
           const rr = atsFd.resolve(route.raw, isChoice ? "dropdown" : "text");
           if (rr.skip) { /* falls through to AI/blank */ }
           else if (rr.candidates) candidates = rr.candidates;
@@ -3495,6 +3518,38 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     rec.status = okv ? (m.matchTier === "exact-normalized" ? "filled" : "filled_review") : "needs_review";
     if (!okv) rec.detail = "the pick did not persist (the widget shows " + JSON.stringify(String(rec.after || "")) + ")";
     else if (m.matchTier !== "exact-normalized") { rec.flag = rec.flag || "non-exact-match"; rec.detail = rec.detail || ("matched at the " + m.matchTier + " tier"); }
+    return true;
+  }
+
+  // Native multi-select: EVERY stored answer that the form offers, in one commit.
+  if (wt === "multiselect_native") {
+    if (!candidates || !candidates.length) return false;
+    rec.resolved = candidates;
+    const texts = f.options || [];
+    // Each stored answer goes through the ORDINARY ladder against the live options — a multi-answer
+    // question is still N single matches, so nothing is committed that the form did not offer.
+    const picks = [];
+    for (const c of candidates) {
+      const m = atsLib.matchCandidates([c], texts, { containment: allowContainment });
+      if (m && m.targetIndex >= 0 && picks.indexOf(texts[m.targetIndex]) === -1) picks.push(texts[m.targetIndex]);
+    }
+    atsAttachOptions(rec, texts);
+    if (!picks.length) { rec.detail = "none of " + candidates.length + " stored answer(s) matched " + texts.length + " option(s)"; return false; }
+    const r = await act.eval(atsInjSelectNativeMulti, ref.inputSel, picks);
+    await act.delay(140);
+    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    rec.after = back && back.ok ? back.value : (r && r.selected ? r.selected.join(", ") : null);
+    const got = String(rec.after || "").split(/,\s*/).filter(Boolean).map((x) => atsLib.normalize(x));
+    const okv = !!(r && r.ok) && picks.every((p) => got.indexOf(atsLib.normalize(p)) !== -1);
+    rec.verified = okv;
+    // ⚠ A STORED ANSWER THIS FORM DOES NOT OFFER IS REPORTED, never dropped in silence: the operator
+    // said they would consider it, and a shorter list than they chose is a different answer.
+    const unoffered = candidates.filter((c) => !picks.some((p) => atsLib.normalize(p) === atsLib.normalize(c)));
+    if (!okv) { rec.status = "needs_review"; rec.detail = "the selection did not persist (form shows " + JSON.stringify(String(rec.after || "")) + ")"; }
+    else if (unoffered.length) {
+      rec.status = "filled_review"; rec.flag = rec.flag || "partial-multiselect";
+      rec.detail = "selected " + picks.length + " of your " + candidates.length + " answers — this form does not offer " + unoffered.join(", ");
+    } else { rec.status = "filled"; rec.matchTier = "exact-normalized"; }
     return true;
   }
 
@@ -4196,6 +4251,23 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   }
 
   return false; // unknown widget — AI/blank fallback decides
+}
+
+// Native <select multiple> — select EVERY requested option in one pass.
+// ⚠ Not a loop over the single-select committer: each `selectedIndex =` write REPLACES the whole
+// selection, so committing four options one at a time leaves exactly the last one. The selection is
+// built first and `change` fired ONCE at the end, which is also what a real multi-select does.
+function atsInjSelectNativeMulti(inputSel, optionTexts) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const want = (Array.isArray(optionTexts) ? optionTexts : []).map(norm);
+  const missed = [];
+  for (const w of want) if (![...el.options].some((o) => norm(o.textContent) === w)) missed.push(w);
+  for (const o of el.options) o.selected = want.indexOf(norm(o.textContent)) !== -1;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return { ok: true, missed, selected: [...el.selectedOptions].map((o) => (o.textContent || "").replace(/\s+/g, " ").trim()) };
 }
 
 // Native <select> (Lever custom dropdowns).
