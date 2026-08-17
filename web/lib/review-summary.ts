@@ -81,6 +81,13 @@ export type ReviewEntry = {
   // render it as a login box and read the real value from the account's own credentials record.
   credential?: boolean | null;
   credential_kind?: string | null; // "login" | "password" | "password_confirm"
+  // ONE form question rendered as SEVERAL controls — salary = currency/amount/timeframe, a date =
+  // month/day/year. Detected from the page's own markup by the fill (never a hardcoded list), so the
+  // review page can show one row per question instead of three peers whose labels ("Month", "Year")
+  // say nothing about which date they belong to.
+  question_key?: string | null;        // shared by the parts of one question
+  question_label_full?: string | null; // "What are your salary requirements?"
+  part_label?: string | null;          // "Currency" / "Month"
   tree_structure?: TreeStructure; // cert/source tree-AI (chosen category + leaves)
   date_order?: string[] | null; // segment order for the segmented date editor
   tiers?: string[] | null; // ordered candidate list for a hierarchical/tree field

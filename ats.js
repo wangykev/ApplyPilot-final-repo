@@ -1165,7 +1165,13 @@ function atsInjScan(ats) {
     // question" and we read that. Any composite iCIMS invents is covered for free, and the inner
     // `.iCIMS_TableRow` alone is NOT enough — it also matches the outer field row, which is exactly
     // why the question and its parts have to be told apart by the FieldRow class.
-    const questionRowOf = (el) => el.closest(".iCIMS_FieldRow") || null;
+    // ⚠ MATCH THE FieldRow FAMILY, not one class. A date question wraps its parts in
+    // `iCIMS_FieldRow_Inline` — a DIFFERENT class token, which `.iCIMS_FieldRow` does not match, so
+    // "End Date (Month / Day / Year)" stayed three separate rows while Salary grouped correctly
+    // (traced 2026-08-17: `DIV.rcf3211-1 iCIMS_TableRow iCIMS_FieldRow_Inline`, label "End Date").
+    // A prefix match covers the whole family, including variants no tenant has shown us yet, which is
+    // the point — enumerating `_Inline` would just be the same mistake one class later.
+    const questionRowOf = (el) => el.closest('[class*="iCIMS_FieldRow"]') || null;
     const questionTextOf = (el) => {
       const qr = questionRowOf(el);
       if (!qr) return null;
@@ -1175,14 +1181,18 @@ function atsInjScan(ats) {
       const t = l ? stripReq(txt(l)) : null;
       return t || null;
     };
-    // A stable key for "these controls belong to the same question", derived from the question row
-    // itself rather than from any field's name — so it holds even when the parts share no id stem.
+    // ⚠ GROUP BY THE INNERMOST PARTS ROW, take only the question TEXT from the FieldRow. A composite's
+    // controls always share ONE `.iCIMS_TableRow`; a FieldRow may legitimately hold several distinct
+    // questions, and keying the group on it would merge them into one row on the review page. Using
+    // the nearest row is both tighter and immune to that — and `closest` picks the inner row even
+    // though the FieldRow also carries `iCIMS_TableRow`, because it walks outward and stops first.
+    const partsRowOf = (el) => el.closest(".iCIMS_TableRow") || null;
     const qrKeys = new Map();
     const questionKeyOf = (el) => {
-      const qr = questionRowOf(el);
-      if (!qr) return null;
-      if (!qrKeys.has(qr)) qrKeys.set(qr, "q" + qrKeys.size);
-      return qrKeys.get(qr);
+      const pr = partsRowOf(el);
+      if (!pr) return null;
+      if (!qrKeys.has(pr)) qrKeys.set(pr, "q" + qrKeys.size);
+      return qrKeys.get(pr);
     };
     // ⚠ COUNT ONLY WHAT THE LOOP BELOW WILL ACTUALLY EMIT. Counting every control in the row marked
     // single-question rows as composites whenever the row also held a radio or checkbox — which this
@@ -1195,9 +1205,9 @@ function atsInjScan(ats) {
     // already skips invisible controls; the count has to agree with it or the two disagree about what
     // a question contains.
     const controlsInQuestion = (el) => {
-      const qr = questionRowOf(el);
-      if (!qr) return 1;
-      return [...qr.querySelectorAll(emittable)].filter(vis).length;
+      const pr = partsRowOf(el);
+      if (!pr) return 1;
+      return [...pr.querySelectorAll(emittable)].filter(vis).length;
     };
     // The container that holds THIS control and no other — its own cell within the question. Found by
     // walking outward while the ancestor still contains exactly one emittable control, which needs no

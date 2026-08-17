@@ -835,7 +835,8 @@ function SectionGroup({
         />
       );
       const own = vis.filter((e) => !nestedInfoOf(e));
-      for (const e of own) body.push(<FieldRow key={e.field_id} e={e} ctx={ctx} />);
+      for (const g of groupByQuestion(own))
+        body.push(<QuestionRow key={Array.isArray(g) ? g[0].field_id : g.field_id} g={g} ctx={ctx} />);
       // nested sub-sections (cert ▸ specialties)
       const nestedByChild: Record<string, { e: ReviewEntry; ni: NestedInfo }[]> = {};
       const childOrder: string[] = [];
@@ -865,8 +866,8 @@ function SectionGroup({
         );
     }
   } else {
-    for (const e of items.filter((e) => !e.is_deleted && filterPass(e) && e.widget_type !== "removed_entry"))
-      body.push(<FieldRow key={e.field_id} e={e} ctx={ctx} />);
+    for (const g of groupByQuestion(items.filter((e) => !e.is_deleted && filterPass(e) && e.widget_type !== "removed_entry")))
+      body.push(<QuestionRow key={Array.isArray(g) ? g[0].field_id : g.field_id} g={g} ctx={ctx} />);
   }
 
   // Phase 2 delete-with-memory: an add-back card per removed_entry (prefilled reconstruct, or leave removed).
@@ -992,8 +993,8 @@ function NestedSub({
                 </button>
               )}
             </div>
-            {byCi[ci].map((e) => (
-              <FieldRow key={e.field_id} e={e} ctx={ctx} />
+            {groupByQuestion(byCi[ci]).map((g) => (
+              <QuestionRow key={Array.isArray(g) ? g[0].field_id : g.field_id} g={g} ctx={ctx} />
             ))}
           </div>
         );
@@ -1008,6 +1009,102 @@ function NestedSub({
 }
 
 // ── ONE field row (used in both the review list and the section list) ──
+// ── ONE FORM QUESTION = ONE ROW ────────────────────────────────────────────────────────
+// "What are your salary requirements? (Currency / Amount / Time Frame)" is one question the form
+// renders as three controls, and so is "End Date (Month / Day / Year)". The fill detects that from
+// the page and stamps `question_key` on each part (see the scan's partsRowOf), so here it is purely a
+// question of rendering: emit ONE row carrying the question, with the parts inside it.
+//
+// Grouping is by ADJACENCY as well as key — the parts are contiguous in form order, and requiring
+// that keeps a row from silently swallowing something that merely shares a key from elsewhere.
+function groupByQuestion(list: ReviewEntry[]): (ReviewEntry | ReviewEntry[])[] {
+  const out: (ReviewEntry | ReviewEntry[])[] = [];
+  for (const e of list) {
+    const k = e.question_key;
+    const prev = out.length ? out[out.length - 1] : null;
+    if (k && Array.isArray(prev) && prev[0].question_key === k) { prev.push(e); continue; }
+    if (k && prev && !Array.isArray(prev) && (prev as ReviewEntry).question_key === k) {
+      out[out.length - 1] = [prev as ReviewEntry, e];
+      continue;
+    }
+    out.push(e);
+  }
+  // A "group" of one is just a field — a composite whose siblings were filtered out of this view.
+  return out.map((g) => (Array.isArray(g) && g.length === 1 ? g[0] : g));
+}
+
+// Render a grouped question, or fall through to the ordinary row.
+function QuestionRow({ g, ctx }: { g: ReviewEntry | ReviewEntry[]; ctx: RowCtx }) {
+  if (!Array.isArray(g)) return <FieldRow e={g} ctx={ctx} />;
+  return <CompositeRow parts={g} ctx={ctx} />;
+}
+
+function CompositeRow({ parts, ctx }: { parts: ReviewEntry[]; ctx: RowCtx }) {
+  const rowRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // Registered under EVERY part's id, so "go to field" from the review list still lands on the row
+    // that now contains it.
+    for (const p of parts) ctx.registerRow(p.field_id, rowRef.current);
+    return () => { for (const p of parts) ctx.registerRow(p.field_id, null); };
+  }, [parts, ctx]);
+
+  const question = parts[0].question_label_full || parts[0].question_label || "";
+  const needing = parts.filter((p) => requiresApproval(p));
+  const pending = needing.filter((p) => !p.is_approved);
+  const required = parts.some((p) => p.is_required);
+  // The row states the WORST outcome among its parts: an approved row must not hide a part still
+  // holding up the gate. Approving here approves each pending part individually, so it is exactly
+  // equivalent to approving them one by one — the submit gate counts the same fields either way.
+  const rowTint = pending.length
+    ? (pending.some(mustReplace) ? "bg-signal/[0.05]" : "bg-amber/[0.04]")
+    : needing.length
+      ? "border-l-2 border-verified/60 bg-verified/[0.06]"
+      : "";
+
+  return (
+    <div ref={rowRef} className={clsx("px-4 py-3", rowTint)}>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0 sm:w-1/2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-sm text-ink">{question}</span>
+            {required && <span className="text-signal" title="required on the form">✱</span>}
+            {!pending.length && needing.length > 0 && (
+              <span className="font-mono text-[10px] tracking-label text-verified">APPROVED</span>
+            )}
+          </div>
+          {/* Anything a part wants to say (an AI note, a mismatch) still gets said — attributed to the
+              part it belongs to, so a three-control question does not lose the detail. */}
+          {parts.filter((p) => p.detail).map((p) => (
+            <p key={p.field_id} className="mt-1 text-xs leading-relaxed text-ink-dim">
+              <span className="text-ink-faint">{p.part_label ? p.part_label + ": " : ""}</span>
+              {p.detail}
+            </p>
+          ))}
+        </div>
+        {/* The parts, side by side, each under its own name — the shape the form itself uses. */}
+        <div className="flex flex-wrap items-start gap-3 sm:w-1/2 sm:justify-end">
+          {parts.map((p) => (
+            <div key={p.field_id} className="min-w-[7rem] flex-1">
+              <div className="mb-1 font-mono text-[10px] tracking-label text-ink-faint">
+                {p.part_label || ""}
+              </div>
+              <FieldEditor e={p} ctx={ctx} />
+            </div>
+          ))}
+          {pending.length > 0 && (
+            <button
+              className="btn-ghost mt-5 shrink-0 px-3 py-1.5 font-mono text-[10px] tracking-label"
+              onClick={() => { for (const p of pending) ctx.setApproved(p, true); }}
+            >
+              APPROVE
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: RowCtx }) {
   const rowRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
