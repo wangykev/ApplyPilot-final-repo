@@ -842,9 +842,14 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                   <span className="font-mono text-[10px] text-ink-faint">{changeCount(pending.diff)} change(s)</span>
                 </div>
 
-                {pending.aiPlan && pending.aiPlan.length > 0 && (
+                {/* ⚠ ONLY ROWS THAT ACTUALLY CHANGE SOMETHING (operator, 2026-08-16). The matcher
+                    emits a decision for EVERY entry it recognised, so an untouched entry still
+                    produced a row reading «X — replaces "X" · same role and company» — and a preview
+                    that is mostly no-ops buries the handful of real edits it exists to show. An `add`
+                    is always a change; an `update` only counts once it has field changes. */}
+                {pending.aiPlan && pending.aiPlan.filter((p) => p.action === "add" || (p.fields?.length ?? 0) > 0).length > 0 && (
                   <ul className="mt-3 space-y-2 border-b border-hairline pb-3">
-                    {pending.aiPlan.map((p, i) => (
+                    {pending.aiPlan.filter((p) => p.action === "add" || (p.fields?.length ?? 0) > 0).map((p, i) => (
                       <li key={i} className="text-sm">
                         <span
                           className={clsx(
@@ -861,7 +866,7 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                         {p.reason && <div className="ml-12 text-xs text-ink-faint">{p.reason}</div>}
                         {/* WHAT ACTUALLY CHANGES. Without this the row states only the matching
                             decision, so adding three role descriptions looked like a no-op. */}
-                        {p.fields && p.fields.length > 0 ? (
+                        {p.fields && p.fields.length > 0 && (
                           <ul className="ml-12 mt-1 space-y-0.5">
                             {p.fields.map((f, k) => (
                               <li key={k} className="text-xs">
@@ -876,10 +881,6 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                               </li>
                             ))}
                           </ul>
-                        ) : (
-                          p.action === "update" && (
-                            <div className="ml-12 text-xs text-ink-faint">no field changes — this entry is already up to date</div>
-                          )
                         )}
                       </li>
                     ))}
