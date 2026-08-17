@@ -341,6 +341,42 @@ const ATS_ICIMS_ENTRY_MAPS = {
       "CandProfileFields.EducationCity": { kind: "entry_city" },
     },
   },
+  // ── Professional Experience ────────────────────────────────────────────────────────────
+  // ⚠ ROUTED BY LABEL, NOT BY ID. Every field here is a per-customer `rcf<NNNN>` (rcf3212 is
+  // "Employer" on THIS tenant and means nothing on the next one), so an id table would be
+  // write-once-per-customer. Labels are stable vocabulary — and reading a bare "City" as the
+  // EMPLOYER's is only safe because the section seal already scoped it; outside the seal that same
+  // label is the home address, which is exactly the bug the seal exists to stop.
+  experience: {
+    source: "work_experience",
+    sectionTitle: /^(professional\s+)?experience/i,
+    match: /^$/,                       // no id family — membership is what identifies these
+    addButton: /professional experience|employment/i,
+    byLabel: {
+      "employer": { path: "company" },
+      "company": { path: "company" },
+      "title": { path: "job_title" },
+      "job title": { path: "job_title" },
+      "position": { path: "job_title" },
+      "description": { path: "role_description" },
+      "city": { kind: "entry_city" },
+      "state": { kind: "entry_state" },
+      "province": { kind: "entry_state" },
+      "state/province": { kind: "entry_state" },
+      "country": { kind: "entry_country" },
+      // Deliberately unmapped, and left to the operator rather than guessed: the profile holds no
+      // employer street address, no supervisor, and no reason for leaving. They are sealed all the
+      // same, so nothing answers them from elsewhere in the profile.
+      "address": { kind: "skip", detail: "employer street address — not in the profile" },
+      "zip": { kind: "skip", detail: "employer postal code — not in the profile" },
+      "supervisor's name": { kind: "skip", detail: "supervisor — operator-supplied" },
+      "supervisor's title": { kind: "skip", detail: "supervisor — operator-supplied" },
+      "reason for leaving": { kind: "skip", detail: "reason for leaving — operator's own words" },
+    },
+    // Month/Day/Year repeat per date, so the LABEL cannot say which date it is. The scan stamps
+    // `dateGroup` by DOM order within the entry: group 0 is the start, group 1 the end.
+    dateGroups: [{ from: "from" }, { from: "to" }],
+  },
 };
 
 // Which repeating section (if any) does a field belong to, and which ENTRY of it?
@@ -358,8 +394,21 @@ function atsEntrySpec(ats, f) {
     const byName = def.match.test(bare);
     const bySection = hasOrdinal && def.sectionTitle && def.sectionTitle.test(String(f.section || "").trim());
     if (!byName && !bySection) continue;
-    return { section, source: def.source, bare, spec: def.fields[bare] || null,
-      entryIndex: typeof f.entryIndex === "number" ? f.entryIndex : 0 };
+    // id table first (stable platform ids), then the LABEL table (per-customer rcf ids), then the
+    // date groups — a Month/Day/Year label says nothing about WHICH date without its group.
+    let spec = (def.fields || {})[bare] || null;
+    if (!spec && def.byLabel) {
+      const key = String(f.label || "").toLowerCase().replace(/\s+/g, " ").replace(/[*✱:]\s*$/, "").trim();
+      spec = def.byLabel[key] || null;
+      if (!spec && def.dateGroups && typeof f.dateGroup === "number") {
+        const g = def.dateGroups[f.dateGroup];
+        if (g && /^month$/i.test(key)) spec = { kind: "date_month", from: g.from };
+        else if (g && /^year$/i.test(key)) spec = { kind: "date_year", from: g.from };
+        else if (g && /^day$/i.test(key)) spec = { kind: "skip", detail: "day-of-month — the profile stores month precision" };
+      }
+    }
+    return { section, source: def.source, bare, spec,
+      entryIndex: typeof f.entryIndex === "number" ? f.entryIndex : 0, def };
   }
   return null;
 }
@@ -375,12 +424,30 @@ function atsAssignEntryIndexes(ats, fields) {
     const m = /^(-?\d+)_/.exec(String(f.fieldName || ""));
     if (!m) continue;
     for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
-      if (!def.match.test(bare)) continue;
+      // Same dual signal atsEntrySpec uses — name OR section membership. Matching on the name
+      // alone left every per-customer rcf field unstamped, so its date groups never formed and
+      // start/end dates resolved to nothing.
+      const bySec = def.sectionTitle && def.sectionTitle.test(String(f.section || '').trim());
+      if (!def.match.test(bare) && !bySec) continue;
       const list = (order[section] = order[section] || []);
       if (list.indexOf(m[1]) === -1) list.push(m[1]);
       f.entryIndex = list.indexOf(m[1]);
       f.entrySection = section;
     }
+  }
+  // Stamp WHICH date each Month/Day/Year belongs to. The controls repeat with identical labels, so
+  // only their position distinguishes start from end: group by the id base (`rcf3214` vs `rcf3215`)
+  // and number those bases in DOM order within the entry. Keyed on the BASE rather than on a count
+  // of fields, so a form that omits Day — or orders Year first — still groups correctly.
+  const seenBases = {};
+  for (const f of fields) {
+    if (typeof f.entryIndex !== "number" || !f.entrySection) continue;
+    const m = /^(.*)_(Month|Date|Day|Year)$/i.exec(atsMapKey(ats, f.fieldName));
+    if (!m) continue;
+    const entryKey = f.entrySection + ":" + f.entryIndex;
+    const bases = (seenBases[entryKey] = seenBases[entryKey] || []);
+    if (bases.indexOf(m[1]) === -1) bases.push(m[1]);
+    f.dateGroup = bases.indexOf(m[1]);
   }
   return fields;
 }
@@ -419,7 +486,14 @@ function atsResolveEntryField(es, entry, f, now) {
   const spec = es.spec;
   if (!spec || !entry) return null;
   const val = (k) => { const v = entry[k]; return v === undefined || v === null || (typeof v === "string" && !v.trim()) ? null : v; };
+  if (spec.kind === "skip") return { kind: "skip", source: "entry", detail: spec.detail || "left to the operator" };
   if (spec.path) { const v = val(spec.path); return v == null ? null : { raw: v, path: es.section + "[" + es.entryIndex + "]." + spec.path, source: "entry" }; }
+  // ⚠ A ROLE YOU STILL HOLD HAS NO END DATE. Without this the empty `to` reads as "unanswered" and
+  // the sealed AI is asked to invent one — on a REQUIRED field it would have to produce something,
+  // and any date it picks is a claim that you left a job you are still doing.
+  if ((spec.kind === "date_month" || spec.kind === "date_year") && spec.from === "to" && entry.currently_work_here === true) {
+    return { kind: "skip", source: "entry", detail: "you still work here — the end date is deliberately left blank" };
+  }
 
   if (spec.kind === "school") {
     const s = val("school_or_university");
@@ -1182,6 +1256,24 @@ function atsInjIcimsClose(inputSel) {
     }
   }
   return { ok: true, closed: /dropdown-invisible/.test(String(ctnr.className)) };
+}
+
+// Click a repeating section's "Add More" anchor. Anchored by the anchor's OWN TEXT rather than its
+// id (`rcf3211Button_-1` is per-customer) — every one of them reads "Add More (<section name>)".
+// Returns the control count before/after so the caller can tell a real mount from a no-op.
+function atsInjIcimsAddEntry(labelPattern) {
+  const re = new RegExp(labelPattern, "i");
+  const anchors = [...document.querySelectorAll("a, button")].filter((a) => {
+    const t = (a.textContent || "").replace(/\s+/g, " ").trim();
+    return /^add more/i.test(t) && re.test(t);
+  });
+  if (!anchors.length) return { ok: false, error: "no-add-button" };
+  const before = document.querySelectorAll("input, select, textarea").length;
+  const a = anchors[anchors.length - 1]; // the LAST one is the live section's, after any prior adds
+  for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) {
+    a.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  }
+  return { ok: true, before, label: (a.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60) };
 }
 
 // Read one field's CURRENT live value (verify/audit) — same read rules as the scan.
@@ -2271,12 +2363,51 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   return null;
 }
 
+// Add entries to each repeating section until it can hold every profile row it maps to.
+// Bounded twice over: never more than the profile has, and never more than ATS_ENTRY_MAX clicks —
+// a section whose Add button does not actually mount anything must cost a few seconds, not a loop.
+const ATS_ENTRY_MAX = 8;
+async function atsGrowIcimsEntries(act, ats, scan, profile) {
+  let current = scan;
+  for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
+    if (!def.addButton) continue;
+    const want = Array.isArray((profile || {})[def.source]) ? profile[def.source].length : 0;
+    if (want < 2) continue;                       // one entry is what the form already renders
+    const countEntries = (s) => {
+      const seen = new Set();
+      for (const f of (s && s.fields) || []) if (f.entrySection === section && typeof f.entryIndex === "number") seen.add(f.entryIndex);
+      return seen.size;
+    };
+    let have = countEntries(current);
+    let guard = 0;
+    while (have < Math.min(want, ATS_ENTRY_MAX) && guard++ < ATS_ENTRY_MAX) {
+      const r = await act.eval(atsInjIcimsAddEntry, def.addButton.source).catch(() => null);
+      if (!r || !r.ok) break;
+      await act.delayFull(900);                   // the new entry is server-rendered into the panel
+      const rescan = await act.eval(atsInjScan, ats).catch(() => null);
+      if (!rescan || !rescan.fields) break;
+      atsAssignEntryIndexes(ats, rescan.fields);
+      const now = countEntries(rescan);
+      current = rescan;
+      if (now <= have) break;                     // the click mounted nothing — stop rather than spin
+      have = now;
+    }
+    try { console.log(`[ApplyPilot][ATS-FILL] ${section}: profile has ${want} entr(ies), form now shows ${have}`); } catch (e) { /* log only */ }
+  }
+  return current;
+}
+
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
-  const scan = await act.eval(atsInjScan, ats);
+  let scan = await act.eval(atsInjScan, ats);
   // Stamp which ENTRY of a repeating section each field belongs to, before anything routes it.
   if (scan && scan.fields) atsAssignEntryIndexes(ats, scan.fields);
+  // ⚠ GROW REPEATING SECTIONS TO FIT THE PROFILE, BEFORE FILLING. The form renders ONE entry and
+  // mints the rest on demand, so without this a three-role history silently becomes a one-role
+  // history — the worst kind of miss, because the page looks completely filled. Reconcile UP only:
+  // never delete an entry the operator may have typed themselves.
+  if (ats === "icims" && !o.valueFor) scan = await atsGrowIcimsEntries(act, ats, scan, profile);
   const results = [];
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
@@ -4085,7 +4216,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
-    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsIsFutureYearMonth, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
+    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsIsFutureYearMonth, atsGrowIcimsEntries, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
@@ -4097,7 +4228,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };

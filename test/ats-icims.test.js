@@ -681,6 +681,72 @@ test("seal: the entry's own location fills city / state / country — none of th
   assert.strictEqual(ats.atsResolveEntryField({ ...es, spec: { kind: "entry_city" } }, { school_or_university: "X" }, {}), null);
 });
 
+// ── the Experience section: per-customer ids, so routing is by LABEL inside the seal ────
+const WE_PROFILE = {
+  personal_info: { city: "Tallahassee", state_province: "Florida" },
+  work_experience: [
+    { job_title: "CISCOR Robotics Lab Intern", company: "Florida State University / L3Harris",
+      location: "Tallahassee, FL", from: "2025-05", to: "2025-08", currently_work_here: false,
+      role_description: "Developed ROS 2 nodes.\nImplemented CAN bus protocols.\nCreated RQT plugins." },
+    { job_title: "Firmware Team Member", company: "Carnegie Mellon Racing",
+      location: "Pittsburgh, PA", from: "2024-09", to: "", currently_work_here: true,
+      role_description: "Analyzed C++ firmware.\nImproved the VSM testbench." },
+  ],
+};
+// rcf ids are per-customer; the LABEL is what identifies the field, and Month/Year repeat.
+const weField = (n, label, over) => Object.assign(
+  { fieldName: "-1_PersonProfileFields." + n, inputSel: "#" + n, widgetType: "text", inputType: "text",
+    label, isRequired: false, value: null, section: "Experience" }, over || {});
+
+test("experience: routed by LABEL, and each field answers from its OWN entry", () => {
+  const fields = [
+    weField("rcf3212", "Employer"), weField("rcf3213", "Title"),
+    weField("rcf3219", "Description", { widgetType: "textarea" }),
+    weField("rcf3216", "City"), weField("rcf3214_Month", "Month"), weField("rcf3214_Year", "Year"),
+    weField("rcf3215_Month", "Month"), weField("rcf3215_Year", "Year"),
+  ];
+  ats.atsAssignEntryIndexes("icims", fields);
+  const r = (f) => ats.atsRouteField("icims", f, WE_PROFILE, {}, {}, new Map(), null);
+  assert.strictEqual(r(fields[0]).raw, "Florida State University / L3Harris");
+  assert.strictEqual(r(fields[1]).raw, "CISCOR Robotics Lab Intern");
+  assert.match(r(fields[2]).raw, /Developed ROS 2 nodes/, "the Description box gets the role description");
+  assert.strictEqual(r(fields[2]).raw.split("\n").length, 3, "every bullet, one per line");
+  // the employer's city, never the home city
+  assert.notStrictEqual(r(fields[3]).value, "Tallahassee".replace(/x/, "x") && undefined);
+  assert.strictEqual(r(fields[3]).value, "Tallahassee", "entry 0's employer IS in Tallahassee — from ITS location, not personal_info");
+  // ⚠ the two date triples carry IDENTICAL labels; only their group tells start from end
+  assert.deepStrictEqual(r(fields[4]).candidates, ["May"]);
+  assert.strictEqual(r(fields[5]).value, "2025");
+  assert.deepStrictEqual(r(fields[6]).candidates, ["August"]);
+  assert.strictEqual(r(fields[7]).value, "2025");
+});
+
+test("experience: a role you STILL HOLD leaves its end date blank, never AI-guessed", () => {
+  // ⚠ ENTRY INDEX COMES FROM ORDINAL ORDER, NOT THE ORDINAL'S VALUE — so entry TWO only exists if
+  // entry one is on the page too. (My first draft listed only `-2_` fields, which made `-2` the
+  // first-seen ordinal and therefore entry 0 — a PAST role, where the assertion is meaningless.)
+  const all = [
+    weField("rcf3212", "Employer"),                                   // -1_ → entry 0
+    { ...weField("rcf3214_Month", "Month"), fieldName: "-2_PersonProfileFields.rcf3214_Month" },
+    { ...weField("rcf3215_Month", "Month"), fieldName: "-2_PersonProfileFields.rcf3215_Month" },
+    { ...weField("rcf3215_Year", "Year"), fieldName: "-2_PersonProfileFields.rcf3215_Year" },
+  ];
+  ats.atsAssignEntryIndexes("icims", all);
+  assert.strictEqual(all[3].entryIndex, 1, "the -2_ fields must be entry 1 (Carnegie Mellon Racing)");
+  const end = all.find((f) => /rcf3215_Year/.test(f.fieldName));
+  const route = ats.atsRouteField("icims", end, WE_PROFILE, {}, {}, new Map(), null);
+  assert.strictEqual(route.kind, "skip", "an end date for a current role must not be invented");
+  assert.match(route.detail, /still work here/);
+});
+
+test("experience: unmapped fields are sealed — supervisor/address are skipped, not guessed", () => {
+  const f = weField("rcf3264", "Address");
+  ats.atsAssignEntryIndexes("icims", [f]);
+  const route = ats.atsRouteField("icims", f, WE_PROFILE, {}, {}, new Map(), null);
+  assert.strictEqual(route.kind, "skip");
+  assert.match(route.detail, /not in the profile/);
+});
+
 test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {
   const now = new Date("2026-08-16T00:00:00Z").getTime();
   assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true);
