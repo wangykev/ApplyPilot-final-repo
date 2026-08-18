@@ -826,13 +826,33 @@ function cdpAuthButtonReady(selector) {
 // are untouched. Reset on every attach.
 let _frameCtxId = null;
 let _frameCtxUrl = null;
+// How the current pin was obtained ({floor, identifyUrl}), so cdpEval's re-arm reproduces it rather
+// than falling back to a hardcoded floor that may not accept the very frame we are pinned to.
+let _frameArmSpec = null;
 
 // Point subsequent cdpEval calls at the richest same-origin CHILD frame. Returns
 // {ok, url, controls} or {ok:false, reason}. Re-resolving is cheap, and a navigation invalidates
 // the world, so callers re-arm after any navigation.
-async function cdpUseFormFrame(minControls) {
+// ⚠ A FRAME CAN BE THE ONE WE WANT BEFORE IT HOLDS A FORM (live 2026-08-18).
+// The control-count floor below is the right test for "which frame has the application form", and the
+// wrong one for "which frame is this tenant's content". On an `<tenant>.icims.com` POSTING page the
+// content frame holds the job description and a single `<a>Apply for this job online</a>` — ZERO form
+// controls — so a floored call refuses it, nothing is pinned, and every subsequent eval lands in the
+// TOP document, which on iCIMS is 13 characters of branding. Measured: the pre-form stage reported
+// `controls 0 frame none apply no-apply-button` and halted `apply-not-followable` on a page whose Apply
+// link was plainly there by hand. Astrion hid this for two days because its run ARRIVES from an
+// employer portal, where the Apply link really is in the top document.
+//
+// So `minControls: 0` is now reachable — but "any child frame will do" is not safe: pinning an
+// analytics iframe would make the caller blind in a NEW way, and silently. A 0-floor call must
+// therefore say HOW the frame identifies itself (`opts.identifyUrl`, tested against the frame's own
+// URL), an identified frame outranks a fuller one, and a 0-floor call with no identity is refused
+// outright rather than guessing.
+async function cdpUseFormFrame(minControls, opts) {
   const floor = minControls == null ? 4 : minControls;
-  _frameCtxId = null; _frameCtxUrl = null;
+  const idRe = (opts && opts.identifyUrl) || null;
+  if (floor <= 0 && !idRe) return { ok: false, reason: "0-floor-needs-an-identity" };
+  _frameCtxId = null; _frameCtxUrl = null; _frameArmSpec = null;
   let tree = null;
   try { tree = await cdpSend("Page.getFrameTree", {}); } catch (e) { return { ok: false, reason: "no-frame-tree" }; }
   const kids = (tree && tree.frameTree && tree.frameTree.childFrames) || [];
@@ -853,13 +873,26 @@ async function cdpUseFormFrame(minControls) {
       });
       n = (r && r.result && r.result.value) || 0;
     } catch (e) { n = 0; }
-    if (!best || n > best.controls) best = { contextId, controls: n, url: (k.frame && k.frame.url) || "" };
+    const furl = (k.frame && k.frame.url) || "";
+    const identified = idRe ? idRe.test(furl) : false;
+    // An IDENTIFIED frame outranks a fuller one — that ordering is what lets a 0-floor call pin the
+    // tenant's own content frame rather than whichever child frame happened to come first.
+    const better = !best || (identified && !best.identified)
+      || (identified === best.identified && n > best.controls);
+    if (better) best = { contextId, controls: n, url: furl, identified };
   }
-  if (!best || best.controls < floor) return { ok: false, reason: "no-frame-with-a-form", controls: best ? best.controls : 0 };
+  if (!best) return { ok: false, reason: "no-frame-with-a-form", controls: 0 };
+  if (best.controls < floor) return { ok: false, reason: "no-frame-with-a-form", controls: best.controls };
+  if (floor <= 0 && !best.identified) return { ok: false, reason: "no-identified-frame", controls: best.controls };
   _frameCtxId = best.contextId; _frameCtxUrl = best.url;
-  return { ok: true, url: best.url, controls: best.controls };
+  // REMEMBER HOW THIS PIN WAS OBTAINED, so the re-arm in cdpEval can reproduce it. Without this a
+  // postback on a 0-control page (an iCIMS JD frame) re-armed at the hardcoded floor of 1, failed, and
+  // dropped the pin back to the top document — the same blindness this function just fixed, arriving
+  // later and looking like a different bug.
+  _frameArmSpec = { floor, identifyUrl: idRe };
+  return { ok: true, url: best.url, controls: best.controls, identified: best.identified };
 }
-function cdpClearFormFrame() { _frameCtxId = null; _frameCtxUrl = null; }
+function cdpClearFormFrame() { _frameCtxId = null; _frameCtxUrl = null; _frameArmSpec = null; }
 function cdpFormFrameUrl() { return _frameCtxUrl; }
 function cdpFormFrameArmed() { return _frameCtxId != null; }
 
@@ -878,7 +911,8 @@ async function cdpEval(fn, ...args) {
     // Only ever taken when a frame context is armed, so the top-frame path is untouched.
     const msg = String((e && e.message) || e);
     if (_frameCtxId == null || !/Cannot find context with specified id/i.test(msg)) throw e;
-    const again = await cdpUseFormFrame(1).catch(() => ({ ok: false }));
+    const spec = _frameArmSpec || { floor: 1, identifyUrl: null };
+    const again = await cdpUseFormFrame(spec.floor, { identifyUrl: spec.identifyUrl }).catch(() => ({ ok: false }));
     if (!again.ok) { _frameCtxId = null; throw e; }
     console.log("[ApplyPilot][CDP] the frame's isolated world was replaced (a postback) — re-armed and retrying");
     res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true, contextId: _frameCtxId });

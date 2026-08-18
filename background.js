@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-resume-4";
+const AP_BUILD_MARKER = "icims-frame-2";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4612,6 +4612,35 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
   let portalHost = null;
   try { portalHost = new URL(await cdpEval(function () { return location.href; })).hostname; } catch (e) { /* below */ }
 
+  // ⚠ ARM THE CONTENT FRAME EVEN ON A PAGE THAT HAS NO FORM YET (live 2026-08-18).
+  // Two shapes reach this stage. From an EMPLOYER PORTAL (careers.<company>.com — how Astrion was
+  // built and tested) the Apply control is in the TOP document, so nothing needed pinning. But a run
+  // started from `<tenant>.icims.com/jobs/<id>/…/job` — which is what most iCIMS links are — has its
+  // ENTIRE page inside `#icims_content_iframe`, including the `<a>Apply for this job online</a>`, and
+  // that frame holds ZERO form controls. The old `cdpUseFormFrame(1)` refused it, so this stage read
+  // the top document (13 characters of branding), found nothing to act on and halted
+  // `apply-not-followable` on a perfectly good posting.
+  // Ladder: the ordinary floored call first, so a gate/form page behaves EXACTLY as before; only if
+  // that refuses do we fall back to a 0-floor call, which is safe because it must match the frame's
+  // own url as read from the top document's <iframe> element (never a hostname guess).
+  const armIcimsFrame = async () => {
+    if (cdpFormFrameArmed()) return true;
+    const floored = await cdpUseFormFrame(1).catch(() => ({ ok: false }));
+    if (floored && floored.ok) return true;
+    const el = await cdpEvalTop(atsInjIcimsFrameSrc).catch(() => null);
+    if (!el || !el.ok || !el.src) return false;
+    // The frame may have navigated since the attribute was written, so identity is the STABLE part of
+    // its url — origin + path, without the query (an iCIMS session query is one-time and changes).
+    let idRe = null;
+    try {
+      const u = new URL(el.src);
+      idRe = new RegExp("^" + (u.origin + u.pathname).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    } catch (e) { return false; }
+    const id = await cdpUseFormFrame(0, { identifyUrl: idRe }).catch(() => ({ ok: false }));
+    if (id && id.ok) LOG(`the posting itself is inside the iCIMS frame — driving it there (${id.controls} control(s), identified by the page's own iframe src)`);
+    return !!(id && id.ok);
+  };
+
   // The composite page identity: iCIMS frames everything, so a change can land in the TOP document
   // (a navigation) or inside the frame (a postback). Reading only one of them makes the other look
   // like a swallowed click.
@@ -4637,7 +4666,7 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
       await cdpWakePage();
       // A navigation kills the frame's isolated world; re-arm so the frame half of the signature
       // is read from the NEW document rather than reported missing.
-      if (!cdpFormFrameArmed()) await cdpUseFormFrame(1).catch(() => null);
+      await armIcimsFrame();
       const now = await signature();
       if (atsSignatureChanged(before, now)) return { changed: true, waitedMs: Date.now() - t0 };
     }
@@ -4678,8 +4707,9 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
     while (Date.now() < deadline) {
       await cdpWakePage();
       // Re-arm every poll: the gate's card holds ONE visible control, so the floor is 1 here rather
-      // than waitAtsFormReady's 4 (which is tuned to refuse a page with no form on it at all).
-      if (!cdpFormFrameArmed()) await cdpUseFormFrame(1).catch(() => null);
+      // than waitAtsFormReady's 4 (which is tuned to refuse a page with no form on it at all) — and a
+      // POSTING page holds none at all, which is what armIcimsFrame's second rung is for.
+      await armIcimsFrame();
       const sig = await signature();
       // "Rendered" = something to act on: a control to fill, or a heading (the careers page has a
       // job title and no controls at all, and must not burn the whole budget waiting for one).
@@ -4771,6 +4801,29 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
       const offered = [...(auth.federated || []), ...(auth.createAccount || [])].join(" | ");
       return halt("auth-blocked", "The iCIMS sign-in offers only controls this pipeline refuses to press (" + offered + "). " +
         "A federated login is never driven, and an account is never created outside the application's own review-gated submit. Sign in yourself, then re-run.");
+    }
+
+    // ── A LEGAL CONSENT ON THE SIGN-IN CARD IS THE OPERATOR'S TO GIVE (live 2026-08-18) ──
+    // ITT's Bogotá posting gates its sign-in behind an unchecked, `aria-required` GDPR box whose own
+    // row says "You must indicate that you have read the privacy notice … before you can continue".
+    // The bot must never tick a legal agreement to get a run further, so this is a HALT — and it halts
+    // BEFORE writing the email and pressing Next, because that press cannot succeed: iCIMS
+    // `preventDefault`s the submit and disables its own button, so the real cause surfaced as
+    // `auth-submit-unavailable … (submit-disabled)`, i.e. "the Next control could not be pressed",
+    // which sends the operator to debug a click that was fine. Named + quoted so the message is
+    // actionable in one read.
+    // Only a BLOCKING consent stops the run (marker-required, or a row that states it is mandatory) —
+    // an optional opt-in is reported and otherwise left strictly alone, unticked.
+    {
+      const blockers = (auth.consents || []).filter((c) => c && !c.checked && c.blocking);
+      if (blockers.length) {
+        const named = blockers.map((c) => JSON.stringify(String(c.label || c.id || "a consent").slice(0, 70))).join(", ");
+        return halt("consent-required",
+          "This iCIMS sign-in requires you to accept " + (auth.consentTitle ? JSON.stringify(auth.consentTitle) : "a data-privacy consent") +
+          " before it will continue (" + named + "), and agreeing to a legal notice on your behalf is not something this pipeline does. " +
+          "Tick it yourself in the tab and sign in, then re-run — nothing was filled or submitted.",
+          { consents: blockers.map((c) => ({ id: c.id, label: c.label, required: c.required })) });
+      }
     }
 
     // ── the two fillable steps ──────────────────────────────────────────────────────────

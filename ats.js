@@ -1706,6 +1706,20 @@ function atsInjFrameFieldY(inputSel) {
   return { ok: true, y: Math.round(r.top + (window.scrollY || 0)), h: Math.round(r.height) };
 }
 
+// WHICH URL IS THE iCIMS CONTENT FRAME? Read from the TOP document, where the <iframe> element lives,
+// so the answer is the tenant's own markup rather than a guess about the frame tree. This is what lets
+// a frame be pinned BEFORE it holds any form control (an `<tenant>.icims.com` posting page: job
+// description + one Apply anchor, zero inputs) without risking a pin on an unrelated iframe — see
+// cdpUseFormFrame's identity rule.
+function atsInjIcimsFrameSrc() {
+  const fr = document.getElementById("icims_content_iframe") ||
+    document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
+  if (!fr) return { ok: false };
+  // `.src` is the attribute as written; the frame's LIVE url can differ once it navigates (a postback,
+  // an Apply click), so both are reported and the caller matches on whichever it can.
+  return { ok: true, src: fr.src || null, id: fr.id || fr.name || null };
+}
+
 // ⚠ SCROLLING INSIDE THE FRAME MOVES NOTHING WHEN THE FRAME IS FULL-HEIGHT. iCIMS sizes its iframe
 // to its content, so the frame's document has no scrollbar of its own — the TOP window is the
 // scroller. `atsInjScrollIntoView` therefore ran per field and the operator still saw a motionless
@@ -2893,6 +2907,33 @@ function atsInjAuthScan() {
   const errors = [...document.querySelectorAll('.iCIMS_Error, .iCIMS_Validation_Error, .error, [role="alert"], .alert-danger')]
     .filter(vis).map((e) => clean(e.textContent)).filter(Boolean).slice(0, 4);
 
+  // ── A LEGAL CONSENT IS A PRECONDITION WE MUST NOT SATISFY OURSELVES (live 2026-08-18) ──────
+  // iCIMS gates postings outside the US behind a data-privacy consent ON THE SIGN-IN CARD: an
+  // UNCHECKED `#accept_gdpr` carrying `aria-required="true"`, a hidden `#consentCaptureTitle` naming
+  // it ("General Data Protection Regulation (GDPR)"), and a row that states the rule itself — "You
+  // must indicate that you have read the privacy notice and consent to the processing of your
+  // personal data before you can continue." (ITT, a Bogotá posting.)
+  // Ticking it is the OPERATOR'S to give and never ours — the same rule as the federated and
+  // account-creation controls above — so it is REPORTED. Why it earns its own signal rather than
+  // riding the existing ones: the submit is `preventDefault`-ed and iCIMS disables its own button on
+  // submit, so an unticked consent surfaced as `submit-disabled`, i.e. "the Next control could not be
+  // pressed" — which sends the operator to debug a click that worked fine.
+  // `blocking` is deliberately two-sourced: the required MARKER, or the row SAYING it is mandatory.
+  // An optional opt-in (a marketing box) is reported but never treated as a blocker.
+  const consentTitle = clean((document.querySelector("#consentCaptureTitle") || {}).value || "").slice(0, 80);
+  const CONSENT_RE = /gdpr|consent|privacy|data.?protection|\bterms\b|acknowledg|i accept/i;
+  const rowTextOf = (e) => clean((e.closest("tr, .iCIMS_TableRow, fieldset, div") || {}).innerText || "").slice(0, 240);
+  const consents = [...document.querySelectorAll('input[type="checkbox"]')].filter(vis)
+    .map((e) => ({ e, row: rowTextOf(e) }))
+    .filter((x) => CONSENT_RE.test(words(x.e)) || CONSENT_RE.test(x.row))
+    .map((x) => ({
+      sel: selOf(x.e), id: x.e.id || null, checked: !!x.e.checked,
+      label: (labelOf(x.e) || consentTitle || clean(x.row).slice(0, 80)) || null,
+      required: x.e.required === true || x.e.getAttribute("aria-required") === "true",
+      blocking: x.e.required === true || x.e.getAttribute("aria-required") === "true"
+        || /must|before you can continue|required/i.test(x.row),
+    })).slice(0, 4);
+
   // ── the two signals that say WHY a submit went nowhere ──────────────────────────────
   // The gate's submit is preventDefault-ed and gated on INVISIBLE hCaptcha (traced 2026-08-16):
   //   form.onsubmit → e.preventDefault() → hcaptcha.execute(widgetId)
@@ -2908,6 +2949,7 @@ function atsInjAuthScan() {
 
   return { ok: true, url: location.href, title: document.title, readyState: document.readyState,
     controlCount: shown.length, email, password, code, submit, federated, createAccount,
+    consents, consentTitle: consentTitle || null,
     captchaChallenge, submitLocked,
     captchaPresent: !!tokenEl, captchaToken: !!(tokenEl && tokenEl.value && String(tokenEl.value).length),
     captchaFrames: document.querySelectorAll('iframe[src*="hcaptcha"]').length,
@@ -5489,7 +5531,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };

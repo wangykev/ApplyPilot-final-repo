@@ -529,6 +529,113 @@ test("atsFormSignature: field SET + which fields hold a value — not the option
   assert.strictEqual(sig(null), "0|", "an unreadable scan is a signature, not a crash");
 });
 
+// ── a legal consent on the sign-in card is REPORTED, never ticked ───────────────────────
+//
+// ITT's Bogotá posting (live 2026-08-18) gates its sign-in behind an unchecked `aria-required`
+// `#accept_gdpr`. Because iCIMS preventDefaults the submit and disables its own button, an unticked
+// consent surfaced as `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be
+// pressed" — which sends the operator to debug a click that was fine.
+
+test("atsInjAuthScan: a required unchecked consent is REPORTED as blocking", () => {
+  const scan = runAuthScan({
+    consentTitle: "General Data Protection Regulation (GDPR)",
+    boxes: [{ id: "accept_gdpr", checked: false, ariaRequired: "true",
+      row: "I accept You must indicate that you have read the privacy notice and consent to the processing of your personal data before you can continue." }],
+  });
+  assert.strictEqual(scan.consentTitle, "General Data Protection Regulation (GDPR)");
+  assert.strictEqual(scan.consents.length, 1);
+  assert.strictEqual(scan.consents[0].checked, false);
+  assert.strictEqual(scan.consents[0].required, true);
+  assert.strictEqual(scan.consents[0].blocking, true);
+});
+
+test("atsInjAuthScan: an OPTIONAL opt-in is reported but never treated as a blocker", () => {
+  // …because halting on it would block a run that would otherwise sign in perfectly well. It is
+  // still left strictly alone — reporting is not ticking.
+  const scan = runAuthScan({ boxes: [{ id: "marketing_consent", checked: false, row: "Email me about similar jobs" }] });
+  assert.strictEqual(scan.consents.length, 1);
+  assert.strictEqual(scan.consents[0].blocking, false);
+  // an already-ticked consent (the operator did it themselves) is not a blocker either
+  const done = runAuthScan({ boxes: [{ id: "accept_gdpr", checked: true, ariaRequired: "true", row: "I accept … you must consent before you can continue" }] });
+  assert.strictEqual(done.consents[0].checked, true);
+});
+
+test("atsInjAuthScan: a row that STATES the rule blocks even with no required marker", () => {
+  // Two independent sources on purpose — a tenant that words the requirement without marking the
+  // input is the case a marker-only test would wave through.
+  const scan = runAuthScan({ boxes: [{ id: "privacy_ack", checked: false, row: "I have read the privacy notice — you must accept before you can continue" }] });
+  assert.strictEqual(scan.consents[0].required, false);
+  assert.strictEqual(scan.consents[0].blocking, true);
+});
+
+// A minimal DOM good enough for atsInjAuthScan: the email box, a Next submit, and the consent rows.
+function runAuthScan(spec) {
+  const mk = (o) => Object.assign({
+    tagName: "INPUT", type: "text", id: "", name: "", value: "", checked: false, className: "",
+    attributes: [], getAttribute: function (k) { return this._attrs && this._attrs[k] != null ? this._attrs[k] : null; },
+    getBoundingClientRect: () => ({ width: 200, height: 20 }),
+    closest: function () { return this._row || null; }, _attrs: {},
+  }, o);
+  const email = mk({ type: "email", id: "email", name: "css_loginName" });
+  const submit = mk({ tagName: "INPUT", type: "submit", id: "next", value: "Next", disabled: false });
+  const boxes = (spec.boxes || []).map((b) => {
+    const el = mk({ type: "checkbox", id: b.id, name: b.id, checked: !!b.checked,
+      _attrs: b.ariaRequired ? { "aria-required": b.ariaRequired } : {} });
+    el._row = { innerText: b.row || "", querySelector: () => null };
+    return el;
+  });
+  const title = spec.consentTitle ? mk({ type: "hidden", id: "consentCaptureTitle", value: spec.consentTitle }) : null;
+  const all = [email, ...boxes];
+  const match = (sel) => {
+    if (/consentCaptureTitle/.test(sel)) return title;
+    return null;
+  };
+  global.window = { CSS: null, getComputedStyle: () => ({ visibility: "visible", display: "block", opacity: "1" }) };
+  global.getComputedStyle = global.window.getComputedStyle;
+  global.document = {
+    title: "Login", readyState: "complete", body: { innerText: "Enter Your Information" },
+    querySelector: match,
+    querySelectorAll: (sel) => {
+      if (/type="checkbox"/.test(sel)) return boxes;
+      if (/input:not\(\[type=hidden\]\)/.test(sel)) return all;
+      if (/type="submit"/.test(sel)) return [submit];
+      return [];
+    },
+  };
+  global.location = { href: "https://careersen-itt-inc.icims.com/jobs/17169/x/login" };
+  try { return ats.atsInjAuthScan(); } finally { delete global.document; delete global.window; delete global.location; delete global.getComputedStyle; }
+}
+
+// ── the content frame is identifiable BEFORE it holds a form ────────────────────────────
+//
+// Live 2026-08-18: a run started from `<tenant>.icims.com/jobs/<id>/…/job` (what most iCIMS links
+// are) halted `apply-not-followable` with `controls 0 frame none`. The whole posting — including its
+// `<a>Apply for this job online</a>` — is inside `#icims_content_iframe`, and that frame holds ZERO
+// form controls, so the control-count floor refused to pin it and every eval read the top document,
+// which is 13 characters of branding. Astrion hid it: that run arrives from an employer portal whose
+// Apply link really is in the top document.
+
+test("atsInjIcimsFrameSrc: the frame's identity comes from the page's own <iframe>, not a guess", () => {
+  const withFrame = (attrs) => {
+    const el = { src: attrs.src, id: attrs.id || "", name: attrs.name || "" };
+    global.document = {
+      getElementById: (id) => (id === "icims_content_iframe" && el.id === "icims_content_iframe" ? el : null),
+      querySelector: (sel) => (/icims/.test(sel) && (/icims/.test(el.id) || /icims/.test(el.name)) ? el : null),
+    };
+    try { return ats.atsInjIcimsFrameSrc(); } finally { delete global.document; }
+  };
+  // the shape observed live on ITT: the posting's own url with ?in_iframe=1
+  const r = withFrame({ id: "icims_content_iframe", src: "https://careersen-itt-inc.icims.com/jobs/17169/intern-co-op-1/job?in_iframe=1" });
+  assert.strictEqual(r.ok, true);
+  assert.match(r.src, /in_iframe=1$/);
+  assert.strictEqual(r.id, "icims_content_iframe");
+  // a tenant that names the frame differently is still found by the id/name fallback
+  assert.strictEqual(withFrame({ id: "icims_content", src: "https://x.icims.com/jobs/1/job" }).ok, true);
+  // …and a page with no iCIMS frame answers honestly rather than inventing one
+  global.document = { getElementById: () => null, querySelector: () => null };
+  try { assert.strictEqual(ats.atsInjIcimsFrameSrc().ok, false); } finally { delete global.document; }
+});
+
 // ── the submit key: a POSITION, because the parse makes ids per-visit ───────────────────
 //
 // Live 2026-08-18: the fill's bundle was keyed on `-8455804/5/6_` and the rehearsal's own parse served
