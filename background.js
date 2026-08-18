@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-resume-1";
+const AP_BUILD_MARKER = "icims-resume-2";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -5246,16 +5246,20 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // prefix ("c4787042-…__systemfield_eeoc_gender" one load, "aa058f67-…" the next), so a
     // full-name match can never survive the fresh form a submit run opens. The
     // __systemfield_* suffix is the stable identity — strip the uuid prefix on BOTH sides.
-    const durable = atsDurableFieldName; // shared + unit-pinned in ats.js (per-session uuid prefixes)
+    // ⚠ KEYED BY POSITION FOR A REPEATING ENTRY, not by the id the form minted — see atsSubmitKey.
+    // iCIMS' résumé parse SAVES the entries it extracts, so their ids are per-visit and a bundle keyed
+    // on them can never match a fresh form (measured: 45/45 Experience fields "NO matching field").
+    // Byte-identical for every other tenant and for every non-entry field.
+    const durable = (x) => atsSubmitKey(ats, x); // shared + unit-pinned in ats.js
     const approved = new Map();
     for (const e of bundle.entries || []) {
       if (!e || e.is_deleted) continue;
       const m = /::formField-(.+)$/.exec(String(e.field_id || ""));
       const name = m ? m[1] : String(e.field_id || "");
-      approved.set(durable(name), e);
+      approved.set(durable({ fieldName: name, entry_section: e.entry_section, entry_index: e.entry_index }), e);
     }
     const valueFor = (f) => {
-      const e = approved.get(durable(f.fieldName));
+      const e = approved.get(durable(f));
       if (!e) return undefined;                       // never in the bundle → leave alone
       if (f.widgetType === "file_upload") return "resume"; // presence = re-attach
       const v = e.current_value;
@@ -5332,7 +5336,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // approved value is actually missing. Re-filling is idempotent (same approved values, and
     // a field already holding its value is left alone), so the second pass can only add.
     const missingAfter = (res) => {
-      const live = new Set(res.map((r) => durable(r.fieldName)));
+      const live = new Set(res.map((r) => durable(r)));
       return [...approved].filter(([n, e]) => !live.has(n) && e.current_value != null && String(e.current_value).trim() !== "");
     };
     if (missingAfter(out.results).length) {
@@ -5340,8 +5344,8 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       LOG(`${missingAfter(out.results).length} approved value(s) had no field yet — re-scanning for questions the replay revealed`);
       const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre });
       // Keep the LATER record for any field seen twice: it reflects the form as it stands now.
-      const merged = new Map(out.results.map((r) => [durable(r.fieldName), r]));
-      for (const r of again.results) merged.set(durable(r.fieldName), r);
+      const merged = new Map(out.results.map((r) => [durable(r), r]));
+      for (const r of again.results) merged.set(durable(r), r);
       out = { ...again, results: [...merged.values()] };
       LOG(`re-scan: ${before} → ${out.results.length} field(s); ${missingAfter(out.results).length} still absent`);
     }
@@ -5349,7 +5353,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // STRICT verify: every approved non-blank value must be ON the form now.
     const failures = [];
     for (const r of out.results) {
-      const e = approved.get(durable(r.fieldName));
+      const e = approved.get(durable(r));
       if (!e) continue;
       const want = e.current_value;
       if (want == null || String(want).trim() === "") continue;
@@ -5357,7 +5361,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       failures.push(`${r.fieldName} ("${(e.question_label || "").slice(0, 60)}"): ${r.status} — ${r.detail || "no detail"}`);
     }
     // Approved entries the live form no longer shows (form changed since the fill).
-    const liveNames = new Set(out.results.map((r) => durable(r.fieldName)));
+    const liveNames = new Set(out.results.map((r) => durable(r)));
     for (const [name, e] of approved) {
       if (liveNames.has(name)) continue;
       if (e.current_value == null || String(e.current_value).trim() === "") continue;

@@ -529,6 +529,45 @@ test("atsFormSignature: field SET + which fields hold a value — not the option
   assert.strictEqual(sig(null), "0|", "an unreadable scan is a signature, not a crash");
 });
 
+// ── the submit key: a POSITION, because the parse makes ids per-visit ───────────────────
+//
+// Live 2026-08-18: the fill's bundle was keyed on `-8455804/5/6_` and the rehearsal's own parse served
+// `-8459967/8/9_`, so all 45 Experience fields reported "approved value has NO matching field on the
+// live form" and the gate refused a submit whose values were every one of them present.
+
+test("atsSubmitKey: a repeating entry keys by POSITION, so per-visit ids still match", () => {
+  const k = ats.atsSubmitKey;
+  // the same field, the same entry, two visits' worth of server-minted ids
+  const fill = { fieldName: "-8455806_PersonProfileFields.rcf3213", entrySection: "experience", entryIndex: 2 };
+  const live = { fieldName: "-8459967_PersonProfileFields.rcf3213", entrySection: "experience", entryIndex: 2 };
+  assert.strictEqual(k("icims", fill), k("icims", live));
+  // …and the bundle's snake_case shape keys IDENTICALLY to the live camelCase one, or the two sides
+  // key differently and nothing matches at all — which is the bug this exists to fix.
+  assert.strictEqual(k("icims", { fieldName: "-1_PersonProfileFields.rcf3213", entry_section: "experience", entry_index: 2 }), k("icims", live));
+  // a DIFFERENT entry must not collide — that would replay job 3's answers into job 1
+  assert.notStrictEqual(k("icims", { ...live, entryIndex: 0 }), k("icims", live));
+  // …nor may two different fields of one entry collide
+  assert.notStrictEqual(k("icims", { ...live, fieldName: "-8459967_PersonProfileFields.rcf3214_Month" }), k("icims", live));
+});
+
+test("atsSubmitKey: everything WITHOUT an entry position keeps the old key exactly", () => {
+  const k = ats.atsSubmitKey, d = ats.atsDurableFieldName;
+  // page-level iCIMS fields
+  assert.strictEqual(k("icims", { fieldName: "PersonProfileFields.Login" }), d("PersonProfileFields.Login"));
+  // the candidate's OWN address block — the parse leaves it positional (`-1_`), and live not one of the
+  // 45 failures was an Address*/Phone* field, so it must not be re-keyed on a guess
+  assert.strictEqual(k("icims", { fieldName: "-1_PersonProfileFields.AddressCity" }), d("-1_PersonProfileFields.AddressCity"));
+  // the other three tenants are byte-identical, uuid stripping included
+  const ash = "aa058f67-1234-4321-abcd-0123456789ab__systemfield_eeoc_gender";
+  for (const t of ["greenhouse", "lever", "ashby"]) {
+    assert.strictEqual(k(t, { fieldName: ash }), d(ash));
+    assert.strictEqual(k(t, { fieldName: "-1_x", entrySection: "experience", entryIndex: 1 }), d("-1_x"),
+      "an entry stamp must not change the key anywhere but iCIMS");
+  }
+  // a bare string still keys like a name rather than collapsing to ""
+  assert.strictEqual(k("icims", "PersonProfileFields.Login"), d("PersonProfileFields.Login"));
+});
+
 test("the iCIMS map routes the résumé as a RÉSUMÉ (one router decides, on every path)", () => {
   const r = ats.atsRouteField("icims", { fieldName: "PortalProfileFields.Resume_File", widgetType: "file_upload", label: "Please upload your resume" }, {}, {}, {}, null, null);
   assert.strictEqual(r && r.kind, "resume");

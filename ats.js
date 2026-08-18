@@ -2619,6 +2619,44 @@ function atsDurableFieldName(name) {
   return n;
 }
 
+// ⚠ AN ENTRY'S SUBMIT KEY IS ITS POSITION, NOT THE ID THE FORM MINTED (live 2026-08-18).
+// `atsDurableFieldName` alone was enough while iCIMS numbered repeating entries POSITIONALLY (`-1_`,
+// `-2_`, `-3_` — an ordinal is a position, and the same form renders the same ordinals every visit).
+// The résumé parse breaks that: it SAVES the entries it extracts, so they come back as server rows
+// carrying opaque ids, and a fresh visit mints fresh ones. Measured on Astrion: a fill wrote its bundle
+// under `-8455804/5/6_` and the rehearsal's form served `-8459967/8/9_`, so all 45 Experience fields
+// reported `approved value has NO matching field on the live form` and the gate refused a submit whose
+// values were all present. An id that changes per visit cannot be a key.
+//
+// The position CAN be, and both sides already carry it: `atsAssignEntryIndexes` stamps `entryIndex`
+// (+`entrySection`) by FIRST DOM APPEARANCE, and the bundle carries them as `entry_section` /
+// `entry_index`. So a section entry keys as `@experience[0]/<bare id>` — stable however the tenant
+// numbers its rows.
+//
+// This is not a NEW trust assumption: matching by ordinal was already positional, so a tenant that
+// reordered its rows between visits could always have mis-aligned them. What changed is only that the
+// position is now read from the stamp instead of from the id. Anything without a section stamp — every
+// page-level field, and the candidate's own address/phone block, which the parse leaves at `-1_` (all 45
+// failures were Experience; not one was `PersonProfileFields.Address*`/`Phone*`) — keeps the old key
+// exactly, so Greenhouse / Lever / Ashby are byte-identical.
+// Accepts BOTH shapes on purpose: live scan fields (camelCase, from atsInjScan) and bundle entries /
+// result records (snake_case). One key function, or the two sides key differently and nothing matches.
+function atsSubmitKey(ats, f) {
+  // A bare string is accepted so a caller that only holds a name still gets the OLD key rather than a
+  // silently empty one — an empty key would match every other keyless field, which is worse than
+  // missing the position.
+  if (typeof f === "string") return atsDurableFieldName(f);
+  const name = String((f && (f.fieldName != null ? f.fieldName : f.name)) || "");
+  if (ats !== "icims" || !f) return atsDurableFieldName(name);
+  const section = f.entrySection != null ? f.entrySection : f.entry_section;
+  const idx = typeof f.entryIndex === "number" ? f.entryIndex
+    : (typeof f.entry_index === "number" ? f.entry_index : null);
+  if (section != null && String(section) !== "" && typeof idx === "number") {
+    return "@" + section + "[" + idx + "]/" + atsMapKey(ats, name);
+  }
+  return atsDurableFieldName(name);
+}
+
 // The form's OWN "no answer" option, if it offers one. A required choice question the profile
 // cannot answer must not be left blank — it blocks the submit and reaches the operator as a
 // dead end. Declining is a real, truthful, submittable answer that asserts nothing false, and a
@@ -5438,7 +5476,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
-    atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
+    atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
