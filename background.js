@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-resume-2";
+const AP_BUILD_MARKER = "icims-resume-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -5195,6 +5195,12 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined); // see the fill run: its sign-in gate's invisible hCaptcha will not initialise under the polyfill
     if (ats === "icims") cdpSetFastWhenHidden(true); // …and the same compensation the fill run makes
     await cdpSetFocusEmulation(true).catch(() => {});
+    // SAY WHICH PACING REGIME THIS RUN GOT — the fill run has logged this since the CDP path existed
+    // and the submit run never did, which leaves a rehearsal unable to state whether it ran visible or
+    // hidden. `background:false` at the call site is an INTENTION, not an observation (the operator can
+    // hide or alt-tab a tab mid-run, and an occluded tab still reports active), so a hidden-vs-visible
+    // claim about a REHEARSAL had no ground truth to cite. Noticed while live-verifying both arms.
+    try { LOG(`[ATS-PACING] ${await cdpPacingLabel()}`); } catch (e) { /* label only */ }
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real
     // form from an embedded frame, and the fill followed it there. Starting from the caller's

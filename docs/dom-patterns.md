@@ -4409,6 +4409,25 @@ uploads on the change event. So the record needs either the widget's own confirm
 back) or a server reaction (a postback happens only to an accepted upload). Neither ⇒ `filled_review` +
 `resume-unconfirmed`. Still churning at the ceiling ⇒ `resume-parse-unsettled`.
 
+**⚠ THE PARSE ALSO CHANGES WHAT AN ENTRY IS CALLED — measured on the first rehearsal after this
+landed.** Before the résumé, this form numbered repeating entries positionally: `-1_`, `-2_`, `-3_`,
+the same on every visit. The parse SAVES the entries it extracts, so they come back as server rows
+with opaque ids — and each visit mints its own:
+
+| visit | Experience entry ids |
+|---|---|
+| the fill (bundle written under these) | `-8455804_` `-8455805_` `-8455806_` |
+| the rehearsal, ~4 min later | `-8459967_` `-8459968_` `-8459969_` |
+
+Result: **45 of 45** Experience fields reported `approved value has NO matching field on the live form`
+and the gate refused a submit whose approved values were, in fact, all on the page. Not one failure was
+a `PersonProfileFields.Address*`/`Phone*` field — the candidate's own address and phone block stays at
+`-1_`, so the parse only re-mints what it SAVES.
+
+The position is the stable name, and both sides already carry it (`entryIndex`/`entrySection`, stamped
+by first DOM appearance; `entry_section`/`entry_index` in the bundle). `atsSubmitKey` keys a section
+entry `@experience[0]/<bare id>`. Verified: the same bundle then replayed `106 field(s), 0 failure(s)`.
+
 **Both visits attach.** Bundle field ids are captured from whatever form the fill saw, so a bundle taken
 from an UNPARSED form and replayed against a PARSED one reproduces the `approved value has NO matching
 field on the live form` failure mode documented in `(b)` above — for every entry field. A required

@@ -735,6 +735,21 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
     server reacted (a postback — only an accepted upload causes one). Neither ⇒ `filled_review` +
     `resume-unconfirmed`; a parse still churning at the ceiling ⇒ `resume-parse-unsettled`.
   - The form's own "Upload Resume at a later time" box is still left UNTICKED — the operator's choice.
+  - **⚠ AND THE PARSE MAKES ENTRY IDS PER-VISIT, SO A SUBMIT KEY MUST BE A POSITION (live 2026-08-18).**
+    `atsDurableFieldName` sufficed while iCIMS numbered repeating entries POSITIONALLY (`-1_`, `-2_`,
+    `-3_` — an ordinal *is* a position, and the same form serves the same ordinals every visit). The
+    parse SAVES the entries it extracts, so they return as server rows with opaque ids and each visit
+    mints its own: measured, a fill wrote its bundle under `-8455804/5/6_` and the rehearsal's form
+    served `-8459967/8/9_`, so **all 45 Experience fields** reported *"approved value has NO matching
+    field on the live form"* and the gate refused a submit whose values were all present.
+    `atsSubmitKey` keys a section entry as `@experience[0]/<bare id>` from the `entryIndex` /
+    `entrySection` stamp (bundle: `entry_section` / `entry_index`) — the pair `entryCounts` already
+    reads. **Not a new trust assumption:** ordinal matching was already positional, so only the SOURCE
+    of the position changed. Anything without a section stamp keeps the old key byte-for-byte (every
+    page-level field, and the candidate's own address/phone block, which the parse leaves at `-1_` —
+    live, not one of the 45 failures was `PersonProfileFields.Address*`/`Phone*`), so GH/Lever/Ashby
+    are untouched. It accepts BOTH shapes (live camelCase, bundle/record snake_case) because the two
+    sides keying differently IS the bug.
 - **Map only PLATFORM ids** (`PersonProfileFields.*` etc.). `rcf<NNNN>` are per-customer questions → the
   label ladder. A leading `-1_` is a repeating-entry ordinal whose ids recur inside work history, where
   an "address" is the EMPLOYER's — mapping those by bare id files your home address under a past job.
