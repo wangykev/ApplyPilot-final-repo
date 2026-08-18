@@ -909,6 +909,41 @@ function atsRouteLabel(label, f, profile, defaults) {
     return { candidates: bool(!!wa.authorized_to_work_in_us), source: "work_auth", path: "work_authorization.authorized_to_work_in_us", detail: "work_authorization.authorized_to_work_in_us" };
   }
 
+  // ── SECURITY CLEARANCE — STATED OR NOT ANSWERED (operator, 2026-08-18) ─────────────────────
+  // A clearance is a FACTUAL claim about the applicant, and claiming one you do not hold is a serious
+  // matter — so this rung answers ONLY from `work_authorization.security_clearance` and refuses in
+  // every other case. Two deliberate asymmetries:
+  //   • it CLAIMS the question even when the profile is empty (`clearance-unstated` → review, blank).
+  //     That is the whole point of claiming it: an unanswered REQUIRED clearance question would
+  //     otherwise reach the AI rescue, which answers by reasoning from absence — and "No" invented for
+  //     someone who holds TS/SCI, or worse a "Yes" invented for someone who holds nothing, is exactly
+  //     the confident-wrong-value class the ladder exists to prevent. Recognition is what keeps the AI
+  //     away from it, so being unable to answer is not a reason to let go of the question.
+  //   • EMPTY ≠ "None". Empty means the operator has not told us; "None" is a stated fact and answers a
+  //     yes/no with No.
+  // ⚠ BAILS on a WILLINGNESS / ELIGIBILITY wording ("are you willing to obtain", "eligible to obtain",
+  // "can you be sponsored for a clearance"). Those ask about the FUTURE, and answering them from a
+  // currently-held level is wrong in both directions — a cleared applicant is not necessarily willing,
+  // and an uncleared one is not necessarily unwilling. Same discipline as the export-control bail above.
+  if (/\bclearance\b|\bcleared\b|\bsci\b|\bpolygraph\b/i.test(L)) {
+    if (/willing|able to obtain|eligible|obtainable|can you (obtain|get)|sponsor/i.test(L)) return null;
+    const sc = String(wa.security_clearance == null ? "" : wa.security_clearance).trim();
+    if (!sc) {
+      return { kind: "clearance-unstated", review: true, flag: "clearance-unstated",
+        detail: "this form asks about a security clearance and your profile does not state one — set it on the Profile page (\"None\" is a valid answer) rather than having it guessed" };
+    }
+    const none = /^none$/i.test(sc);
+    // ONE tiered candidate list serves both shapes the question takes, because the match ladder only
+    // ever commits an exact (or leading-polarity) hit: on a LEVEL list the level matches and the
+    // polarity tokens are ignored; on a YES/NO widget the level matches nothing and the polarity
+    // answers it. A "No clearance"-style option is reached by POLARITY LEAD, not by guessing.
+    const cands = none
+      ? ["None", "No clearance", "No", "False"]
+      : [sc, ...atsClearanceAliases(sc), "Yes", "True"];
+    return { candidates: cands, source: "clearance", path: "work_authorization.security_clearance",
+      detail: "work_authorization.security_clearance = " + JSON.stringify(sc) };
+  }
+
   // Profile links.
   if (/linked\s*in/i.test(L)) { const v = atsWebsiteValue(profile, "linkedin"); if (v) return { value: v, source: "website" }; }
   if (/git\s*hub/i.test(L)) { const v = atsWebsiteValue(profile, "github"); if (v) return { value: v, source: "website" }; }
@@ -2109,6 +2144,35 @@ function atsInjAttachFile(inputSel, base64, filename, mime) {
   } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 }
 
+// Tick an ACCEPT checkbox the operator has authorised (atsConsentKind → "accept"), and prove it took.
+// The LABEL is clicked in preference to the input: iCIMS is server-rendered jQuery whose handlers hang
+// off the row, and native label activation flips `checked` AND fires the change event those handlers
+// listen for — the same reason the Workday radio path clicks labels. Falls back to the input itself,
+// then to a property write + change, so a tenant that hides its box behind CSS still commits.
+// Returns only whether it ended CHECKED: a tick that did not take must never be reported as consent
+// given, because the caller is about to say so in the log on the operator's behalf.
+function atsInjTickConsent(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, error: "not-found:" + sel };
+  if (el.checked) return { ok: true, checked: true, already: true };
+  // Read the escaper OFF window, matching the guard. The sibling readers here write `window.CSS &&
+  // CSS.escape`, which works in a page (bare `CSS` resolves on the global) but throws the moment the
+  // global is anything other than a real window — including under a unit test, which is how a tick
+  // primitive doing something legally meaningful would otherwise go unpinned.
+  const esc = (s) => (window.CSS && window.CSS.escape ? window.CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+  const label = el.id ? document.querySelector('label[for="' + esc(el.id) + '"]') : (el.closest("label") || null);
+  try { if (label) label.click(); } catch (e) { /* fall through */ }
+  if (!el.checked) { try { el.click(); } catch (e) { /* fall through */ } }
+  if (!el.checked) {
+    try {
+      el.checked = true;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+  }
+  return { ok: !!el.checked, checked: !!el.checked };
+}
+
 // The submit control + captcha/confirmation state — READ-ONLY (the click itself is the
 // caller's, trusted, and gated). One reader for everything the gate needs to see.
 function atsInjSubmitState(ats) {
@@ -2918,26 +2982,25 @@ function atsInjAuthScan() {
   // it ("General Data Protection Regulation (GDPR)"), and a row that states the rule itself — "You
   // must indicate that you have read the privacy notice and consent to the processing of your
   // personal data before you can continue." (ITT, a Bogotá posting.)
-  // Ticking it is the OPERATOR'S to give and never ours — the same rule as the federated and
-  // account-creation controls above — so it is REPORTED. Why it earns its own signal rather than
-  // riding the existing ones: the submit is `preventDefault`-ed and iCIMS disables its own button on
-  // submit, so an unticked consent surfaced as `submit-disabled`, i.e. "the Next control could not be
-  // pressed" — which sends the operator to debug a click that worked fine.
-  // `blocking` is deliberately two-sourced: the required MARKER, or the row SAYING it is mandatory.
-  // An optional opt-in (a marketing box) is reported but never treated as a blocker.
+  // This function REPORTS them and classifies NOTHING. Which boxes are an acceptance of a notice,
+  // which are an unrelated opt-in, and what may be done about either is a JUDGEMENT — it lives in
+  // `atsConsentKind` + the caller, so there is exactly one copy of it instead of an injected dup that
+  // could drift from the one the operator authorised.
+  // `blocking` is two-sourced on purpose: the required MARKER, or the row SAYING it is mandatory,
+  // because a tenant can word the requirement without marking the input.
   const consentTitle = clean((document.querySelector("#consentCaptureTitle") || {}).value || "").slice(0, 80);
-  const CONSENT_RE = /gdpr|consent|privacy|data.?protection|\bterms\b|acknowledg|i accept/i;
   const rowTextOf = (e) => clean((e.closest("tr, .iCIMS_TableRow, fieldset, div") || {}).innerText || "").slice(0, 240);
   const consents = [...document.querySelectorAll('input[type="checkbox"]')].filter(vis)
-    .map((e) => ({ e, row: rowTextOf(e) }))
-    .filter((x) => CONSENT_RE.test(words(x.e)) || CONSENT_RE.test(x.row))
-    .map((x) => ({
-      sel: selOf(x.e), id: x.e.id || null, checked: !!x.e.checked,
-      label: (labelOf(x.e) || consentTitle || clean(x.row).slice(0, 80)) || null,
-      required: x.e.required === true || x.e.getAttribute("aria-required") === "true",
-      blocking: x.e.required === true || x.e.getAttribute("aria-required") === "true"
-        || /must|before you can continue|required/i.test(x.row),
-    })).slice(0, 4);
+    .map((e) => {
+      const row = rowTextOf(e);
+      return {
+        sel: selOf(e), id: e.id || null, checked: !!e.checked,
+        label: labelOf(e) || null, rowText: row, title: consentTitle || null,
+        required: e.required === true || e.getAttribute("aria-required") === "true",
+        blocking: e.required === true || e.getAttribute("aria-required") === "true"
+          || /must|before you can continue|required/i.test(row),
+      };
+    }).slice(0, 8);
 
   // ── the two signals that say WHY a submit went nowhere ──────────────────────────────
   // The gate's submit is preventDefault-ed and gated on INVISIBLE hCaptcha (traced 2026-08-16):
@@ -2987,6 +3050,81 @@ function icimsAuthView(s) {
   // an auth wall, and saying so beats "unknown page".
   if ((s.federated || []).length || (s.createAccount || []).length) return "blocked";
   return "none";
+}
+
+// The SAME clearance, worded the way other forms word it. Aliases only — never a promotion: "Secret"
+// must never offer "Top Secret", and an interim grade must never offer the full one, so each entry maps
+// strictly sideways. Tried after the stored wording, so a form offering the exact stored text wins.
+var ATS_CLEARANCE_ALIASES = {
+  "top secret/sci": ["TS/SCI", "Top Secret / SCI", "Top Secret with SCI", "TS SCI"],
+  "top secret/sci with ci polygraph": ["TS/SCI with CI Poly", "TS/SCI CI Poly", "Top Secret/SCI CI Polygraph"],
+  "top secret/sci with full scope polygraph": ["TS/SCI with FSP", "TS/SCI Full Scope Polygraph", "TS/SCI FSP", "TS/SCI with Poly"],
+  "top secret": ["TS", "Top-Secret"],
+  secret: ["S"],
+  confidential: ["C"],
+  "public trust": ["Public Trust (Tier 2)", "MBI", "NACI", "Public Trust/Suitability"],
+  "interim secret": ["Interim Secret Clearance"],
+  "interim top secret": ["Interim Top Secret Clearance", "Interim TS"],
+  "doe l": ["DOE L Clearance", "L Clearance"],
+  "doe q": ["DOE Q Clearance", "Q Clearance"],
+  "yankee white": ["Yankee White Clearance"],
+};
+function atsClearanceAliases(level) {
+  const k = String(level == null ? "" : level).replace(/\s+/g, " ").trim().toLowerCase();
+  return ATS_CLEARANCE_ALIASES[k] || [];
+}
+
+// ── WHAT KIND OF CHECKBOX IS THIS? (operator, 2026-08-18) ────────────────────────────────
+// The operator read ITT's and Peraton's privacy notices themselves and instructed that **accept
+// checkboxes be ticked, now and in the future**. They are the data subject, the notices govern the
+// processing of THEIR data for THEIR application, and refusing them means the application cannot be
+// made at all — so this is theirs to delegate. It replaces the earlier `consent-required` halt.
+//
+// The authorisation is precise, so the recognizer is too. Ticking a box is a legal act, and "all accept
+// checkboxes" is not the same set as "all checkboxes":
+//
+//   "accept"  — I accept / I agree / I acknowledge / I have read <a notice, policy, terms, GDPR>.
+//               This is what was authorised: assent to a document governing the application.
+//   "optin"   — send me jobs, add me to a talent community, contact me about future roles. NOT an
+//               acceptance of anything; ticking it signs the operator up for mail they never asked
+//               for, and leaving it unticked costs them nothing. Never ticked.
+//   null      — anything else (a "still enrolled?" box, "upload résumé later", a screening question).
+//               Untouched, as before.
+//
+// ⚠ Deliberately NOT classed "accept": a TRUTHFULNESS attestation ("I certify the information given is
+// accurate", "I understand falsification is grounds for dismissal"). Those are a factual claim by the
+// applicant rather than assent to a notice, they carry a different consequence when wrong, and the
+// instruction that authorised this was about privacy notices. They stay out until asked for by name.
+// Cookie/consent BANNERS are also out of scope — unrelated to applying, and the standing rule to
+// prefer the privacy-preserving option there is untouched.
+var ATS_CONSENT_ACCEPT_RE = /\b(i\s+(accept|agree|consent|acknowledge|have\s+read)|accept(ing)?\s+the|agree\s+to\s+the|consent\s+to\s+the)\b|\bgdpr\b|privacy\s+(notice|policy|statement)|data\s+protection|terms\s+(of\s+(use|service)|and\s+conditions)/i;
+var ATS_CONSENT_OPTIN_RE = /\b(talent\s+(community|network)|job\s+alerts?|email\s+me|notify\s+me|keep\s+me\s+(informed|posted)|marketing|newsletter|similar\s+(jobs|roles|openings)|future\s+(jobs|roles|opportunities|openings))\b/i;
+// A truthfulness attestation — recognized ONLY so it can be excluded on purpose rather than by
+// accident, and so a future decision about it has a name to refer to.
+var ATS_CONSENT_ATTEST_RE = /\b(i\s+certify|i\s+declare|i\s+affirm|under\s+penalty|falsif(y|ication)|to\s+the\s+best\s+of\s+my\s+knowledge)\b/i;
+// text = whatever describes the box (label, its row, the consent's own title). Most specific wins:
+// an opt-in that merely mentions "privacy" must not read as an acceptance.
+function atsConsentKind(text) {
+  const t = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  if (ATS_CONSENT_OPTIN_RE.test(t)) return "optin";
+  if (ATS_CONSENT_ATTEST_RE.test(t)) return "attestation";
+  if (ATS_CONSENT_ACCEPT_RE.test(t)) return "accept";
+  return null;
+}
+// The gate's boxes, decided. Returns what to TICK and what was deliberately left alone, so the caller
+// can log both — an acceptance made on the operator's behalf must be visible in the run, by name.
+function atsConsentPlan(consents) {
+  const list = Array.isArray(consents) ? consents : [];
+  const out = { tick: [], left: [] };
+  for (const c of list) {
+    if (!c) continue;
+    const kind = atsConsentKind([c.label, c.rowText, c.title].filter(Boolean).join(" · "));
+    const rec = { ...c, kind };
+    if (kind === "accept" && !c.checked) out.tick.push(rec);
+    else out.left.push(rec);
+  }
+  return out;
 }
 
 // SSO refusal is URL-EVIDENCED ONLY (the Workday invariant, verbatim): a real federated login
@@ -4127,6 +4265,10 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       }
       if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(fin()); continue; }
       if (route && route.kind === "employment-blank") { rec.status = "needs_review"; rec.flag = route.flag || "employer-match"; rec.detail = route.detail; results.push(fin()); continue; }
+      // A clearance question we cannot answer from a STATED clearance stops here, blank and flagged —
+      // it must not fall through to the AI, which would answer it by reasoning from absence. Claiming
+      // the question is what keeps that from happening; see the clearance rung in atsRouteLabel.
+      if (route && route.kind === "clearance-unstated") { rec.status = "needs_review"; rec.flag = route.flag || "clearance-unstated"; rec.detail = route.detail; results.push(fin()); continue; }
       if (route && route.eeoUnstated) {
         // OPTIONAL: leave it blank — the operator's own choice, nothing blocks.
         // REQUIRED: blank blocks the submit, so take the form's OWN decline option when it
@@ -5534,6 +5676,9 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
+    atsConsentKind, atsConsentPlan, atsInjTickConsent,
+    atsClearanceAliases, ATS_CLEARANCE_ALIASES,
+    ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,

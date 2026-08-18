@@ -718,19 +718,54 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   - **`cdpEval`'s re-arm reproduces how the pin was obtained** (`_frameArmSpec`) instead of a hardcoded
     floor of 1 — otherwise a postback on a 0-control frame re-armed, failed, dropped the pin back to
     the top document, and the same blindness returned later looking like a different bug.
-- **⚠ A CONSENT ON THE SIGN-IN CARD IS THE OPERATOR'S TO GIVE — `consent-required` (live 2026-08-18).**
-  Many tenants gate the gate: an UNCHECKED `aria-required` privacy box (`#accept_gdpr`), a hidden
-  `#consentCaptureTitle` naming it, and a row stating the rule ("You must indicate that you have read
-  the privacy notice … before you can continue"). Measured 2 of 5 sampled tenants — ITT (one box) and
-  Peraton (**two**: "I accept the Privacy Policy", "I accept the Peraton Job Application Privacy
-  Notice"); Astrion, Cretex and Wieland have none, which is why this never showed up before.
-  **The bot never ticks a legal agreement to get a run further**, so it halts, naming and quoting the
-  consent, BEFORE writing the email or pressing anything. *Why it needs its own signal:* iCIMS
-  `preventDefault`s the submit and disables its own button, so an unticked consent presented as
-  `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be pressed" — sending the
-  operator to debug a click that was fine. Blocking-ness is **two-sourced** (the required marker, or a
-  row that states the requirement) so an optional opt-in is reported and left alone, unticked, rather
-  than stopping a run that would sign in fine.
+- **⚠ AN ACCEPT CHECKBOX IS TICKED — STANDING OPERATOR INSTRUCTION (2026-08-18).** Many tenants gate the
+  gate: an UNCHECKED `aria-required` privacy box (`#accept_gdpr`), a hidden `#consentCaptureTitle` naming
+  it, and a row stating the rule ("You must indicate that you have read the privacy notice … before you
+  can continue"). Measured 2 of 5 sampled tenants — ITT (one box) and Peraton (**two**: "I accept the
+  Privacy Policy", "I accept the Peraton Job Application Privacy Notice"); Astrion, Cretex and Wieland
+  have none. **The operator read those notices themselves and instructed that accept checkboxes be
+  ticked, now and in the future** — they are the data subject, the notice governs the processing of
+  THEIR data for THEIR application, and declining it means the application cannot be made at all. This
+  REPLACED a `consent-required` halt.
+  - **Only `atsConsentKind === "accept"`** — assent to a notice/policy/terms/GDPR. An **OPT-IN** (talent
+    community, job alerts, "email me about similar jobs") is NEVER ticked: it is not an acceptance, and
+    it would sign the operator up for mail they never asked for. An opt-in that merely *mentions*
+    privacy still classifies as an opt-in — pinned by test.
+  - **A truthfulness ATTESTATION is deliberately excluded** ("I certify the information is accurate",
+    "under penalty of perjury"). That is a factual claim by the applicant, not assent to a notice; the
+    consequence of a wrong one differs, and the instruction that authorised this was about privacy
+    notices. Recognized (`ATS_CONSENT_ATTEST_RE`) only so it is skipped ON PURPOSE. **Do not fold these
+    in without asking.**
+  - **Cookie/consent BANNERS are out of scope** — unrelated to applying; the onboarding rule below
+    (never press an affirmative consent-popup control) is untouched, as is preferring the
+    privacy-preserving option on a cookie banner.
+  - **Auditable, not silent:** every acceptance is logged BY NAME with the notice's own title
+    (`✔ ACCEPTED on your instruction: …`) and carried out on the run result as `consents_accepted`. The
+    tick is **verified** — a box that did not end checked halts `consent-not-accepted` rather than being
+    reported as consent given, which also keeps iCIMS' `preventDefault`ed submit from resurfacing as
+    "the Next control could not be pressed". Kill-switch: `chrome.storage.local.declineConsents = true`
+    restores the halt.
+  - The scan REPORTS boxes and classifies nothing (`atsInjAuthScan` returns label + row text + markers);
+    the judgement lives SW-side in `atsConsentKind`/`atsConsentPlan`, so there is one copy of it rather
+    than an injected dup that could drift from what was authorised.
+- **SECURITY CLEARANCE — STATED OR NOT ANSWERED (operator, 2026-08-18).**
+  `work_authorization.security_clearance` (a dropdown of the US clearances +
+  `None` — `SECURITY_CLEARANCE_OPTIONS`, web/lib/profile-fields.ts). A clearance is a FACTUAL claim and
+  claiming one you do not hold is serious, so the rung in `atsRouteLabel` answers ONLY from that field.
+  - **EMPTY ≠ "None".** Empty = the operator has not told us ⇒ `clearance-unstated`, blank + review.
+    "None" = a stated fact ⇒ answers "do you hold an active clearance?" with **No**.
+  - **It CLAIMS the question even when it cannot answer it.** That is the point: an unanswered REQUIRED
+    clearance question would otherwise reach the AI rescue, whose prompt tells it to infer from ABSENCE
+    and never refuse — and an invented "No" for a TS/SCI holder, or an invented "Yes" for someone with
+    nothing, is the confident-wrong-value class. Recognition is what keeps the AI away from it.
+  - **ONE tiered candidate list serves both shapes** (a level dropdown and a yes/no), because the ladder
+    only ever commits an exact or leading-polarity hit. Aliases are strictly SIDEWAYS
+    (`atsClearanceAliases`): a Secret must never offer Top Secret, an interim grade never the full one.
+  - **BAILS on willingness/eligibility** ("willing to obtain", "eligible to obtain", "sponsor a
+    clearance") — those ask about the FUTURE and a held level answers them wrongly in both directions.
+  - ⚠ **WORKDAY IS NOT WIRED YET.** `fill-driver.js` has no label ladder for this, so a Workday clearance
+    question still reaches the AI. Closing that means claiming the question ahead of the AI gate there
+    too — the ATS engine (iCIMS/GH/Lever/Ashby) is done.
 - **A JD-scraped COMPANY can be a PAGE TITLE, and that string is safety-critical.** On an employer page
   there is no ATS markup to key on, so the scrape returned the document title as the company — the anchor
   for "have you worked for us before?". `atsPlausibleCompany` is a NEGATIVE test; what it rejects falls back

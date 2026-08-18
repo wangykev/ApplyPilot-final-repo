@@ -552,6 +552,186 @@ test("atsPostingGone: iCIMS answers a dead job id with notFound=1 on its own sea
 // consent surfaced as `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be
 // pressed" — which sends the operator to debug a click that was fine.
 
+// ── security clearance: STATED OR NOT ANSWERED (operator, 2026-08-18) ───────────────────
+//
+// A clearance is a factual claim about the applicant, and claiming one you do not hold is serious. So
+// the rung answers only from `work_authorization.security_clearance`, and it CLAIMS the question even
+// when it cannot answer — recognition is what keeps the AI rescue (which answers by reasoning from
+// absence) away from inventing one.
+
+const clearanceRoute = (label, clearance, widgetType) =>
+  ats.atsRouteLabel(label, { label, widgetType: widgetType || "dropdown" },
+    { work_authorization: clearance === undefined ? {} : { security_clearance: clearance } }, {});
+
+test("clearance: a STATED level answers a level question, with sideways aliases only", () => {
+  const r = clearanceRoute("What is your current security clearance level?", "Top Secret/SCI");
+  assert.strictEqual(r.path, "work_authorization.security_clearance");
+  assert.strictEqual(r.candidates[0], "Top Secret/SCI", "the stored wording is tried first");
+  assert.ok(r.candidates.includes("TS/SCI"), "a form's own shorthand is reachable");
+  // ⚠ NEVER A PROMOTION: a Secret holder must not be offered Top Secret anywhere in the ladder
+  const sec = clearanceRoute("Security Clearance", "Secret");
+  assert.ok(!sec.candidates.some((c) => /top secret/i.test(c)), "a Secret must never offer Top Secret: " + sec.candidates.join("|"));
+  const interim = clearanceRoute("Clearance level", "Interim Secret");
+  assert.ok(!interim.candidates.some((c) => /^secret$/i.test(c)), "an interim grade is not the full grade");
+});
+
+test("clearance: a stated level also answers a YES/NO clearance question", () => {
+  // One tiered list serves both shapes — the level matches a level list, the polarity token answers a
+  // yes/no, and the ladder only ever commits an exact (or leading-polarity) hit.
+  const r = clearanceRoute("Do you currently hold an active security clearance?", "Secret", "yesno");
+  assert.ok(r.candidates.includes("Yes"));
+  assert.ok(r.candidates.indexOf("Secret") < r.candidates.indexOf("Yes"), "the level is tried before the polarity");
+});
+
+test('clearance: "None" is a STATED fact and answers No — blank is not', () => {
+  const none = clearanceRoute("Do you have an active security clearance?", "None", "yesno");
+  assert.ok(none.candidates.includes("No"));
+  assert.ok(none.candidates.includes("None"));
+  assert.ok(!none.candidates.includes("Yes"));
+  // …and EMPTY claims the question but refuses to answer it, so the AI can never invent a clearance
+  const unset = clearanceRoute("Do you have an active security clearance?", "", "yesno");
+  assert.strictEqual(unset.kind, "clearance-unstated");
+  assert.strictEqual(unset.flag, "clearance-unstated");
+  assert.strictEqual(unset.review, true);
+  assert.ok(!unset.candidates, "it must not answer");
+  // an absent field behaves the same as an empty one
+  assert.strictEqual(clearanceRoute("Security clearance", undefined).kind, "clearance-unstated");
+});
+
+test("clearance: WILLINGNESS and ELIGIBILITY questions are NOT answered from a held level", () => {
+  // These ask about the future. Answering them from a currently-held clearance is wrong in both
+  // directions — a cleared applicant is not necessarily willing, an uncleared one not unwilling.
+  for (const q of [
+    "Are you willing to obtain a security clearance?",
+    "Are you eligible to obtain a US security clearance?",
+    "Can you obtain a clearance if required?",
+    "Would you be able to be sponsored for a clearance?",
+  ]) {
+    assert.strictEqual(clearanceRoute(q, "Secret"), null, q);
+    assert.strictEqual(clearanceRoute(q, ""), null, q);
+  }
+});
+
+test("clearance: the fill loop leaves an unstated clearance BLANK and flagged", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "rcf9001", inputSel: "#rcf9001", widgetType: "dropdown", label: "Active Security Clearance",
+      isRequired: true, value: null, options: ["Yes", "No"], domIndex: 0 },
+  ] });
+  const act = fakeAct(page);
+  act.aiEnabled = true;
+  act.llm = async () => ({ ok: true, text: JSON.stringify({ answer: "No", justification: "assumed" }) });
+  const out = await ats.driveAtsPageFill(act, "icims", { work_authorization: {} }, {}, {}, { credentials: CREDS });
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.strictEqual(out.results[0].flag, "clearance-unstated");
+  assert.strictEqual(out.results[0].after, null, "a clearance must never be invented — not even by the AI");
+});
+
+// ── accept checkboxes are TICKED; opt-ins and attestations are not (operator, 2026-08-18) ──
+//
+// The operator read the notices themselves and instructed that accept checkboxes be ticked, now and in
+// future. "All accept checkboxes" is a narrower set than "all checkboxes", and ticking one is a legal
+// act, so the boundary is pinned here rather than left to a regex nobody re-reads.
+
+test("atsConsentKind: assent to a notice / policy / terms is an ACCEPT", () => {
+  const k = ats.atsConsentKind;
+  for (const t of [
+    "I accept",
+    "I accept the Privacy Policy",
+    "I accept the Peraton Job Application Privacy Notice",
+    "I agree to the terms and conditions",
+    "I acknowledge the data protection notice",
+    "I have read the privacy notice and consent to the processing of my personal data",
+    "General Data Protection Regulation (GDPR)",
+    "Accepting the terms of use is required",
+  ]) assert.strictEqual(k(t), "accept", t);
+});
+
+test("atsConsentKind: an OPT-IN is never an acceptance — ticking it buys mail nobody asked for", () => {
+  const k = ats.atsConsentKind;
+  for (const t of [
+    "Email me about similar jobs",
+    "Join our talent community",
+    "Notify me of future opportunities",
+    "Send me job alerts",
+    "Add me to the talent network for future roles",
+    // ⚠ the one that matters: an opt-in that MENTIONS privacy must still read as an opt-in
+    "Email me about similar jobs — see our privacy policy",
+  ]) assert.strictEqual(k(t), "optin", t);
+});
+
+test("atsConsentKind: a truthfulness ATTESTATION is deliberately not an accept", () => {
+  // A factual claim by the applicant, not assent to a notice — different consequence when wrong, and
+  // outside what was authorised. Recognized only so it is excluded ON PURPOSE.
+  const k = ats.atsConsentKind;
+  assert.strictEqual(k("I certify that the information provided is accurate"), "attestation");
+  assert.strictEqual(k("I declare, under penalty of perjury, that the above is true"), "attestation");
+  assert.strictEqual(k("To the best of my knowledge the information is complete"), "attestation");
+  // and an ordinary form checkbox is still nothing at all
+  assert.strictEqual(k("Upload Resume at a later time"), null);
+  assert.strictEqual(k("I am currently enrolled"), null);
+  assert.strictEqual(k(""), null);
+  assert.strictEqual(k(null), null);
+});
+
+test("atsConsentPlan: ticks only unchecked ACCEPTs, and reports everything it left", () => {
+  const plan = ats.atsConsentPlan([
+    { sel: "#accept_gdpr", id: "accept_gdpr", label: "I accept", rowText: "you must consent before you can continue", checked: false, required: true },
+    { sel: "#pp", id: "pp", label: "I accept the Privacy Policy", checked: false, required: true },
+    { sel: "#already", id: "already", label: "I accept the terms", checked: true, required: true },
+    { sel: "#alerts", id: "alerts", label: "Email me about similar jobs", checked: false, required: false },
+    { sel: "#certify", id: "certify", label: "I certify the information is accurate", checked: false, required: true },
+    { sel: "#skip", id: "skip", label: "Upload Resume at a later time", checked: false, required: false },
+  ]);
+  assert.deepStrictEqual(plan.tick.map((c) => c.id), ["accept_gdpr", "pp"]);
+  // an ALREADY-checked acceptance is not re-clicked (that would untick it)
+  assert.ok(plan.left.some((c) => c.id === "already" && c.kind === "accept"));
+  assert.ok(plan.left.some((c) => c.id === "alerts" && c.kind === "optin"));
+  assert.ok(plan.left.some((c) => c.id === "certify" && c.kind === "attestation"));
+  assert.ok(plan.left.some((c) => c.id === "skip" && c.kind === null));
+});
+
+test("atsInjTickConsent: prefers the LABEL, and reports only whether it ended CHECKED", () => {
+  const mk = (over) => {
+    const box = { type: "checkbox", id: "accept_gdpr", checked: false, events: [], clicks: 0,
+      click() { this.clicks++; if (!over || !over.inputClickDead) this.checked = true; },
+      dispatchEvent(e) { this.events.push(e.type); return true; },
+      closest: () => null };
+    const label = { clicks: 0, click() { this.clicks++; if (!over || !over.labelDead) box.checked = true; } };
+    global.window = { CSS: { escape: (s) => s } };
+    global.Event = function (t) { return { type: t }; };
+    global.document = { querySelector: (s) => (/^label/.test(s) ? label : box) };
+    return { box, label };
+  };
+  try {
+    // the happy path: the label is clicked and the input never is
+    let { box, label } = mk();
+    let r = ats.atsInjTickConsent("#accept_gdpr");
+    assert.deepStrictEqual([r.ok, r.checked], [true, true]);
+    assert.strictEqual(label.clicks, 1);
+    assert.strictEqual(box.clicks, 0, "the label was enough — do not double-click the input and untick it");
+
+    // a label that does nothing falls through to the input
+    ({ box, label } = mk({ labelDead: true }));
+    r = ats.atsInjTickConsent("#accept_gdpr");
+    assert.strictEqual(r.checked, true);
+    assert.strictEqual(box.clicks, 1);
+
+    // …and when neither click takes, the property write fires change so jQuery handlers see it
+    ({ box } = mk({ labelDead: true, inputClickDead: true }));
+    r = ats.atsInjTickConsent("#accept_gdpr");
+    assert.strictEqual(r.checked, true);
+    assert.deepStrictEqual(box.events, ["input", "change"]);
+
+    // ALREADY checked ⇒ untouched, and never re-clicked
+    ({ box, label } = mk());
+    box.checked = true;
+    r = ats.atsInjTickConsent("#accept_gdpr");
+    assert.deepStrictEqual([r.ok, r.checked, r.already], [true, true, true]);
+    assert.strictEqual(label.clicks, 0);
+  } finally { delete global.document; delete global.window; delete global.Event; }
+});
+
 test("atsInjAuthScan: a required unchecked consent is REPORTED as blocking", () => {
   const scan = runAuthScan({
     consentTitle: "General Data Protection Regulation (GDPR)",

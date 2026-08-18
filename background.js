@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-frame-2";
+const AP_BUILD_MARKER = "icims-consent-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4722,6 +4722,9 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
     return { settled: false, controls: (prev && prev.controls) || 0 };
   };
 
+  // What we accepted on the operator's behalf, carried out with the result so the run record — not just
+  // the log ring — says which notices were agreed to.
+  let consentsAccepted = [];
   let lastView = null, sameViewRounds = 0, captchaStalls = 0;
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     const settled = await settleAuthPage(12000);
@@ -4754,7 +4757,7 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
       const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
       if (id.ok) {
         LOG(`signed in and on the application form — ${(scan.fields || []).length} field(s). Handing over to the fill.`);
-        return { reached_form: true, fields: (scan.fields || []).length };
+        return { reached_form: true, fields: (scan.fields || []).length, consentsAccepted };
       }
       // A mailed link/code is the one "no field to fill" page worth naming: the next step is in the
       // operator's inbox, and the generic unknown-page halt would hide that completely.
@@ -4803,26 +4806,61 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
         "A federated login is never driven, and an account is never created outside the application's own review-gated submit. Sign in yourself, then re-run.");
     }
 
-    // ── A LEGAL CONSENT ON THE SIGN-IN CARD IS THE OPERATOR'S TO GIVE (live 2026-08-18) ──
-    // ITT's Bogotá posting gates its sign-in behind an unchecked, `aria-required` GDPR box whose own
-    // row says "You must indicate that you have read the privacy notice … before you can continue".
-    // The bot must never tick a legal agreement to get a run further, so this is a HALT — and it halts
-    // BEFORE writing the email and pressing Next, because that press cannot succeed: iCIMS
-    // `preventDefault`s the submit and disables its own button, so the real cause surfaced as
-    // `auth-submit-unavailable … (submit-disabled)`, i.e. "the Next control could not be pressed",
-    // which sends the operator to debug a click that was fine. Named + quoted so the message is
-    // actionable in one read.
-    // Only a BLOCKING consent stops the run (marker-required, or a row that states it is mandatory) —
-    // an optional opt-in is reported and otherwise left strictly alone, unticked.
+    // ── ACCEPT CHECKBOXES ARE TICKED, BY STANDING OPERATOR INSTRUCTION (2026-08-18) ──────
+    // The operator read ITT's and Peraton's privacy notices themselves and instructed that accept
+    // checkboxes be ticked, now and in the future. They are the data subject, the notice governs the
+    // processing of THEIR data for THEIR application, and declining it means the application cannot be
+    // made — so the decision is theirs to delegate, and this replaces the `consent-required` halt.
+    //
+    // Three things make it auditable rather than silent, and all three are the point:
+    //   • only `atsConsentKind === "accept"` is ticked — assent to a notice/policy/terms. An OPT-IN
+    //     (talent community, job alerts) is never ticked: it is not an acceptance, and it would sign
+    //     the operator up for mail they never asked for. A truthfulness ATTESTATION is also left alone
+    //     (a factual claim, not assent to a notice) until asked for by name.
+    //   • every acceptance is LOGGED BY NAME, with the notice's own title, so the run record says what
+    //     was agreed to on their behalf and when.
+    //   • the tick is VERIFIED. A box that did not end checked is never reported as consent given, and
+    //     the run halts instead — iCIMS `preventDefault`s its submit and disables its own button, so an
+    //     unticked consent would otherwise resurface as "the Next control could not be pressed".
+    // Kill-switch: `chrome.storage.local.declineConsents = true` restores the halt.
     {
-      const blockers = (auth.consents || []).filter((c) => c && !c.checked && c.blocking);
-      if (blockers.length) {
-        const named = blockers.map((c) => JSON.stringify(String(c.label || c.id || "a consent").slice(0, 70))).join(", ");
+      const plan = atsConsentPlan(auth.consents || []);
+      const declineFlag = await new Promise((r) => chrome.storage.local.get(["declineConsents"], (v) => r(!!(v && v.declineConsents))));
+      const optins = plan.left.filter((c) => c.kind === "optin" && !c.checked);
+      if (optins.length) LOG(`leaving ${optins.length} opt-in box(es) UNTICKED (not an acceptance): ${optins.map((c) => JSON.stringify(String(c.label || c.id).slice(0, 40))).join(", ")}`);
+      const attest = plan.left.filter((c) => c.kind === "attestation" && !c.checked);
+      if (attest.length) LOG(`leaving ${attest.length} truthfulness attestation(s) untouched — not a privacy consent: ${attest.map((c) => JSON.stringify(String(c.label || c.id).slice(0, 40))).join(", ")}`);
+      if (plan.tick.length && declineFlag) {
+        const named = plan.tick.map((c) => JSON.stringify(String(c.label || c.id || "a consent").slice(0, 70))).join(", ");
         return halt("consent-required",
-          "This iCIMS sign-in requires you to accept " + (auth.consentTitle ? JSON.stringify(auth.consentTitle) : "a data-privacy consent") +
-          " before it will continue (" + named + "), and agreeing to a legal notice on your behalf is not something this pipeline does. " +
-          "Tick it yourself in the tab and sign in, then re-run — nothing was filled or submitted.",
-          { consents: blockers.map((c) => ({ id: c.id, label: c.label, required: c.required })) });
+          "This iCIMS sign-in requires accepting " + (auth.consentTitle ? JSON.stringify(auth.consentTitle) : "a data-privacy consent") +
+          " (" + named + "), and `declineConsents` is set, so the pipeline will not tick it. Accept it yourself in the tab, then re-run.",
+          { consents: plan.tick.map((c) => ({ id: c.id, label: c.label, required: c.required })) });
+      }
+      const accepted = [];
+      for (const c of plan.tick) {
+        if (!c.sel) { return halt("consent-unaddressable", "This sign-in's consent box (" + JSON.stringify(String(c.label || "unnamed")) + ") has neither an id nor a name, so it cannot be ticked safely."); }
+        const t = await cdpEval(atsInjTickConsent, c.sel).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        if (!t || !t.ok || !t.checked) {
+          return halt("consent-not-accepted",
+            "Could not tick this sign-in's " + JSON.stringify(String(auth.consentTitle || c.label || "consent")) + " box (" +
+            ((t && t.error) || "it did not stay checked") + "). Nothing was signed in or filled — accept it yourself in the tab, then re-run.");
+        }
+        accepted.push({ id: c.id, label: c.label, title: auth.consentTitle || null, required: !!c.required });
+        LOG(`✔ ACCEPTED on your instruction: ${JSON.stringify(String(auth.consentTitle || c.label || "a privacy consent"))}` +
+          (c.label && auth.consentTitle ? ` — the box reads ${JSON.stringify(String(c.label).slice(0, 60))}` : "") +
+          (c.required ? " (required by the form)" : ""));
+      }
+      if (accepted.length) {
+        consentsAccepted = consentsAccepted.concat(accepted);
+        // ⚠ `#consentCaptureTitle` is PAGE-level, not per-box: Peraton renders two acceptances and both
+        // carry the same title, so titling the progress line read "GDPR · GDPR" and named neither of the
+        // two things just agreed to. When the titles do not distinguish them, the box LABELS do.
+        const titles = [...new Set(accepted.map((a) => a.title).filter(Boolean))];
+        const detail = accepted.length > 1 && titles.length < accepted.length
+          ? accepted.map((a) => a.label || a.title).filter(Boolean).join(" · ")
+          : titles.concat(accepted.map((a) => a.label).filter(Boolean)).slice(0, accepted.length).join(" · ");
+        emitRunProgress(accepted.length > 1 ? "Accepted the privacy notices" : "Accepted the privacy notice", detail);
       }
     }
 
@@ -4894,6 +4932,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // 2026-08-02, after a bad fill had been corrected). Every hop carries the origin forward.
   const originUrl = opts0.originUrl || startUrl;
   const LOG = (...a) => console.log("[ApplyPilot][ATS-RUN]", ...a);
+  // Notices accepted by the iCIMS pre-form on the operator's standing instruction (2026-08-18), so the
+  // run's own result says what was agreed to rather than requiring a log dig.
+  let icimsConsentsAccepted = [];
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
@@ -5003,6 +5044,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     if (ats === "icims") {
       emitRunProgress("Signing in to the careers portal", "iCIMS");
       const pre = await runIcimsPreForm(tabId, store.credentials || null, LOG);
+      // WHICH NOTICES WERE ACCEPTED on the operator's standing instruction — carried out of the stage so
+      // it reaches the run record, not just the log ring (see the accept-checkbox block in the pre-form).
+      icimsConsentsAccepted = (pre && pre.consentsAccepted) || [];
       // ⚠ A CLOSED POSTING IS NOT A BROKEN APPLY FINDER. iCIMS answers a dead job id by REDIRECTING to
       // its own job-search page with `notFound=1`, which is a page with no auth fields and no Apply
       // control — so the pre-form correctly finds nothing to act on and says `apply-not-followable`,
@@ -5245,7 +5289,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. ${landed}`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
-    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok), walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
+    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok), consents_accepted: icimsConsentsAccepted, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };
   } finally {
