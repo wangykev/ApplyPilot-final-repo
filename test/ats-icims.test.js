@@ -552,6 +552,49 @@ test("atsPostingGone: iCIMS answers a dead job id with notFound=1 on its own sea
 // consent surfaced as `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be
 // pressed" — which sends the operator to debug a click that was fine.
 
+// ── AN EMPTY TENANT LIST IS THE TENANT'S, AND "No Results" IS NOT AN OPTION (live 2026-08-18) ──
+//
+// Cretex renders a REQUIRED Degree dropdown whose vocabulary is genuinely unpopulated. Probed read-only
+// with AP_DEV_ICIMS_DROPDOWN: "No Results" unfiltered, no parent pending, and still "No Results" after a
+// deliberately broad "Bachelor" search. Two defects came out of establishing that.
+
+test("scan: the widget's own \"No Results\" row is NOT a pickable option", () => {
+  // The ACTUATION reader filtered this sentinel all along; the SCAN did not — so a field whose list had
+  // been searched reached review offering exactly one thing to pick, and that thing was "No Results".
+  // The one-row case is the dangerous one: a single-item list reads as a COMPLETE vocabulary.
+  const rows = ["No Results"];
+  const scanFilter = (all) => all.filter((t) => t && !/^—\s*make a selection/i.test(t)
+    && !/^please select a /i.test(t) && !/^no results/i.test(t));
+  assert.deepStrictEqual(scanFilter(rows), [], "a sentinel must never reach the review editor as an option");
+  // …and the three sentinels stay filtered while real options survive
+  assert.deepStrictEqual(scanFilter(["— Make a Selection —", "Please select a country", "No Results", "Secret"]), ["Secret"]);
+  // LOCKSTEP: the actuation reader's own filter must agree
+  const src = String(ats.atsInjIcimsReadOptions);
+  assert.match(src, /no results/i, "atsInjIcimsReadOptions must filter the same sentinel");
+});
+
+test("an EMPTY tenant list is reported as the FORM's, not as a failed search", async () => {
+  // "the list was empty" read as OUR search having failed and cost a full investigation round. When the
+  // widget offers nothing at all, the record has to say so: no profile edit or rematch changes it.
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
+      label: "Degree", isRequired: true, value: null, options: [], optionsPartial: true, domIndex: 0 },
+  ] });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: ["No Results"] });
+  page.atsInjIcimsReadOptions = () => ({ ok: true, options: [], awaitingParent: false, noChildren: false, noResults: true });
+  page.atsInjIcimsSearch = () => ({ ok: true });
+  page.atsInjIcimsClose = () => ({ ok: true });
+  page.atsInjIcimsRead = () => ({ ok: true, value: null });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { education: [{ degree: "Bachelor of Science", school: "Carnegie Mellon University" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.match(rec.detail, /EMPTY/, "it must name the form's empty list: " + rec.detail);
+  assert.match(rec.detail, /Nothing on our side/, "and say that our side cannot fix it");
+  assert.ok(!/after searching/.test(rec.detail), "it must not read as a failed search: " + rec.detail);
+});
+
 // ── security clearance: STATED OR NOT ANSWERED (operator, 2026-08-18) ───────────────────
 //
 // A clearance is a factual claim about the applicant, and claiming one you do not hold is serious. So

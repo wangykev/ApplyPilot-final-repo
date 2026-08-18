@@ -1417,8 +1417,14 @@ function atsInjScan(ats) {
           // left in, it is a one-item list, which reads as a COMPLETE vocabulary and would reach the
           // review editor as the single thing the operator may pick. The unset parent is explained
           // by the record's own detail (see awaitingParent); the option list must simply be empty.
+          // …AND DROP THE WIDGET'S OWN "No Results" ROW, for exactly the reason above. It was missed
+          // here while the ACTUATION reader (atsInjIcimsReadOptions) filtered it all along, so a field
+          // whose list had been searched reached review offering ONE pickable option — "No Results"
+          // (live 2026-08-18, Cretex's Degree). The operator would have selected a sentinel.
+          // ⚠ LOCKSTEP with atsInjIcimsReadOptions' filter: two injected fns cannot share code.
           const items = ul ? [...ul.children].map((li) => txt(li))
-            .filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^please select a /i.test(t)) : [];
+            .filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^please select a /i.test(t)
+              && !/^no results/i.test(t)) : [];
           const shown = document.getElementById(el.id + "_fakeSelected_icimsDropdown");
           const cur = shown ? txt(shown) : "";
           push(Object.assign(base, {
@@ -4696,8 +4702,18 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         ? "this list only fills in once its parent field is chosen, and that hadn't happened yet"
         : st && st.noChildren
           ? "the form offers no options here for the parent value chosen"
-          : "no option matched " + JSON.stringify(String(candidates[0])) + (searched ? " (after searching)" : "") +
-            (opts.length ? " — offered: " + opts.slice(0, 4).join(" | ") : " — the list was empty");
+          // ⚠ "THE LIST WAS EMPTY" WAS BLAMING THE WRONG SIDE (live 2026-08-18). Cretex renders a
+          // REQUIRED Degree dropdown whose vocabulary is genuinely unpopulated: probed read-only, it
+          // answers "No Results" UNFILTERED, with no parent pending, and still answers "No Results" to
+          // a deliberately broad "Bachelor" search. The old wording ("no option matched X (after
+          // searching) — the list was empty") reads as OUR search having failed, and it cost a full
+          // investigation round to establish that it had not. When the widget offers nothing at all,
+          // say that — the employer's form cannot be completed as configured, and no profile edit or
+          // rematch on our side will change it.
+          : (!opts.length && st && st.noResults)
+            ? "this form's own list for this field is EMPTY — the widget answers \"No Results\" even with no search and no parent pending, so there is nothing here to select. Nothing on our side can fill it: the employer's form offers no options for a field it marks required."
+            : "no option matched " + JSON.stringify(String(candidates[0])) + (searched ? " (after searching)" : "") +
+              (opts.length ? " — offered: " + opts.slice(0, 4).join(" | ") : " — the list came back empty for this search");
       return true;
     }
 
