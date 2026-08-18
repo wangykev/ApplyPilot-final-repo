@@ -35,6 +35,7 @@ import {
   RACE_ETHNICITY_OPTIONS,
   VETERAN_STATUS_OPTIONS,
   DISABILITY_STATUS_OPTIONS,
+  SECURITY_CLEARANCE_OPTIONS,
 } from "@/lib/profile-fields";
 import { saveProfile, saveBuckets } from "./actions";
 import { liveSync } from "@/lib/extension-sync";
@@ -103,6 +104,7 @@ const YES_NO_DECLINE = opt(YES_NO_DECLINE_OPTIONS);
 const RACE_ETHNICITY = opt(RACE_ETHNICITY_OPTIONS);
 const VETERAN_STATUS = opt(VETERAN_STATUS_OPTIONS);
 const DISABILITY_STATUS = opt(DISABILITY_STATUS_OPTIONS);
+const SECURITY_CLEARANCE = opt(SECURITY_CLEARANCE_OPTIONS);
 
 export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; initialBuckets: Bucket[] }) {
   // The seeded baseline (initial + default website/source rows). Used for BOTH the live
@@ -501,8 +503,12 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <TriBoolField label="Permanent resident" bucketPath="work_authorization.permanent_resident" value={profile.work_authorization.permanent_resident} onChange={(v) => update((p) => { p.work_authorization.permanent_resident = v; })} ladder={profile.answer_ladders?.["work_authorization.permanent_resident"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_authorization.permanent_resident"] = n; })} />
           <TextField label="Current visa status" bucketPath="work_authorization.current_visa_status" value={profile.work_authorization.current_visa_status} onChange={(v) => update((p) => { p.work_authorization.current_visa_status = v; })} />
         </div>
-        <div className="mt-4">
+        <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <CandidateField label="Citizenship country" mode="dropdown" bucketPath="work_authorization.citizenship_country" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
+          {/* ⚠ Blank and "None" are DIFFERENT answers: blank leaves a clearance question to you (the
+              extension refuses to guess one and keeps the AI away from it), while "None" is a stated
+              fact that answers "do you hold an active clearance?" with No. */}
+          <SelectField label="Security clearance" bucketPath="work_authorization.security_clearance" value={profile.work_authorization.security_clearance} options={SECURITY_CLEARANCE} onChange={(v) => update((p) => { p.work_authorization.security_clearance = v; })} />
         </div>
         <SectionRemembered items={rememberedFor("Work authorization")} {...fieldRowProps} />
       </SectionCard>

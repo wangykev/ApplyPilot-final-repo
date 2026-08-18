@@ -231,6 +231,14 @@ export const workAuthSchema = z
     permanent_resident: triBool,
     current_visa_status: str,
     citizenship_country: tiered,
+    /**
+     * The applicant's US security clearance, from SECURITY_CLEARANCE_OPTIONS (profile-fields.ts).
+     * ⚠ EMPTY AND "None" ARE DIFFERENT ANSWERS: empty = not told, so the extension refuses to answer a
+     * clearance question at all (and keeps the AI away from it — inventing a clearance is the one wrong
+     * value here that could not be walked back); "None" = a stated fact that answers "do you hold a
+     * clearance?" with No.
+     */
+    security_clearance: str,
   })
   .default({});
 
