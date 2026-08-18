@@ -706,9 +706,35 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   there is no ATS markup to key on, so the scrape returned the document title as the company — the anchor
   for "have you worked for us before?". `atsPlausibleCompany` is a NEGATIVE test; what it rejects falls back
   to the iCIMS tenant subdomain (evidence), what it cannot judge is KEPT (so GH/Lever/Ashby are unchanged).
-- **The résumé is SKIPPED on iCIMS for now** (`kind:"skip"`): iCIMS parses it server-side and posts the
-  result back seconds after the attach reports success, re-rendering entries under new ids and blanking
-  the fill. The form's own "Upload Resume at a later time" box is left UNTICKED — the operator's choice.
+- **THE RÉSUMÉ GOES ON FIRST, AND ITS PARSE IS WAITED OUT — ORDER IS THE WHOLE FIX (operator,
+  2026-08-17).** iCIMS parses the upload SERVER-SIDE and posts the result back into the panel seconds
+  later, re-rendering entries under new ids and blanking what was written ("Existing data in the form
+  will be replaced" — the form's own words). As an ordinary field mid-fill it therefore destroys the fill
+  it is meant to help, which is why it was `kind:"skip"` from 2026-08-16. `atsIcimsResumeStage` attaches
+  it after the form settles and **before a single value is written**, then waits; the parse can only
+  overwrite an empty form, and everything filled afterwards lands on top of whatever it produced.
+  - **The wait is NOT a timer** (the standing pacing rule) — two polled conditions, both required: the
+    form's own IDENTITY changed (`atsFormSignature` = field SET + which fields hold a value; a
+    field-COUNT settle cannot see a re-render that keeps the count), **and then** the panel goes QUIET
+    (the mutation-stamp watch — the only probe here that can say "the DOM is mid-reaction"). A parse
+    that changed NOTHING is indistinguishable from one that has not started, so that branch still spends
+    its whole change budget and requires quiet+stable before filling. Being slow costs latency; being
+    early costs the entire fill.
+  - **The fill loop NEVER attaches on iCIMS** — it records the stage's outcome. A second upload is a
+    second parse, and that one lands *during* the fill (on a submit run, over approved values).
+    A form already carrying a file is left alone, which is what makes the cascade re-replay safe.
+  - **BOTH VISITS ATTACH — fill and rehearsal/submit.** The parse re-renders repeating entries under new
+    ids, so a bundle captured from an UNPARSED form replayed against a PARSED one reports every entry
+    field as *"approved value has NO matching field on the live form"* (the shape that produced 28 of a
+    rehearsal's 32 verify failures when entry counts disagreed). A résumé is also a FILE: the bundle
+    never carries bytes, so it comes from IndexedDB on each visit — like credentials, never from the
+    bundle. A **required** résumé that did not attach **blocks the submit gate** (`resume-not-attached`):
+    the strict verify only re-checks approved VALUES, so nothing else downstream would notice.
+  - **`filled` needs EVIDENCE the file landed, not just that we wrote `input.files`** (a page-side write;
+    iCIMS uploads on the change event). Either the widget confirmed it (filename read back) **or** the
+    server reacted (a postback — only an accepted upload causes one). Neither ⇒ `filled_review` +
+    `resume-unconfirmed`; a parse still churning at the ceiling ⇒ `resume-parse-unsettled`.
+  - The form's own "Upload Resume at a later time" box is still left UNTICKED — the operator's choice.
 - **Map only PLATFORM ids** (`PersonProfileFields.*` etc.). `rcf<NNNN>` are per-customer questions → the
   label ladder. A leading `-1_` is a repeating-entry ordinal whose ids recur inside work history, where
   an "address" is the EMPLOYER's — mapping those by bare id files your home address under a past job.

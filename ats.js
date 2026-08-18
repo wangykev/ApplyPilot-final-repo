@@ -252,13 +252,22 @@ const ATS_STATIC_MAPS = {
     // The dial-code half, when a tenant renders one. Tiered in the profile like country, so resolve()
     // passes a ready-made candidate ladder; `kind:"dial"` strips the trailing "+<digits>" for matching.
     "PersonProfileFields.PhoneCountry": { kind: "dial", path: "personal_info.country_phone_code", altPath: "personal_info.country" },
-    // ── Résumé — SKIPPED ON PURPOSE (operator, 2026-08-16) ─────────────────────────────────
+    // ── Résumé — ATTACHED FIRST, NEVER DURING THE FILL (operator, 2026-08-17) ──────────────
     // iCIMS parses an uploaded résumé SERVER-SIDE and posts the results back into the panel seconds
     // after the attach reports success, re-rendering entries under new ids and blanking everything
-    // written so far. Until that postback is handled, attaching the résumé destroys the fill it is
-    // supposed to help. The form's own "Upload Resume at a later time" box is left UNTICKED — that is
-    // an operator's choice about their own application, not ours to make.
-    "PortalProfileFields.Resume_File": { kind: "skip", detail: "résumé upload deferred — iCIMS re-parses and blanks the form mid-fill (attach it yourself, or wait for the postback fix)" },
+    // written so far — the page says so itself ("Existing data in the form will be replaced"). That is
+    // why this was `kind:"skip"` from 2026-08-16: as an ordinary field mid-fill, the résumé destroys
+    // the fill it is supposed to help.
+    // The fix is ORDER, not avoidance. `atsIcimsResumeStage` attaches the résumé BEFORE a single field
+    // is written and waits the parse out (postback landed → panel quiet), so the parse overwrites
+    // nothing of ours and every value we then write lands on top of whatever it produced. The entry is
+    // `kind:"resume"` so ONE router decides which file field is the résumé on every path — the fill,
+    // the replay and the stage all ask it — but the branch consuming it in `atsFillFields` REFUSES to
+    // attach on iCIMS and records the stage's outcome instead: a second attach is a second parse, and
+    // the second one would blank the fill the first one exists to precede.
+    // The form's own "Upload Resume at a later time" box is still left UNTICKED — that is an operator's
+    // choice about their own application, not ours to make.
+    "PortalProfileFields.Resume_File": { kind: "resume" },
   },
 };
 
@@ -3186,6 +3195,162 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   return null;
 }
 
+// ── THE RÉSUMÉ ON iCIMS: ATTACHED FIRST, AND THE PARSE IS WAITED OUT (operator, 2026-08-17) ─────────
+// iCIMS parses an uploaded résumé SERVER-SIDE and posts the result back into the panel, re-rendering
+// entries under new ids and blanking what was already written — the form says so in its own words
+// ("Existing data in the form will be replaced"). Attaching it as an ordinary field is therefore
+// self-defeating, which is why it was skipped entirely from 2026-08-16.
+//
+// The fix is ORDER: attach BEFORE anything is filled, wait for the parse to land AND the panel to stop
+// churning, and only then fill. The parse then overwrites nothing of ours, and the fill (or the approved
+// replay) writes on top of whatever it produced. Everything after this point in the run is unchanged.
+//
+// ⚠ THE WAIT IS NOT A TIMER (CLAUDE.md: nothing proceeds on a fixed delay — every wait polls the
+// condition it gates). Two independent conditions, both polled on SW wall-clock:
+//   • the form's own IDENTITY changed — the postback re-renders fields under new ids and repopulates
+//     values, so a scan signature is the evidence that the parse actually LANDED. A field-COUNT settle
+//     cannot see this: the count is often identical on both sides of a re-render.
+//   • …and then the panel goes QUIET — the mutation-stamp watch is the only probe here that can say
+//     "the DOM is mid-reaction", which no count settle can (the cdpInstallQuietWatch lesson).
+// A parse that changes NOTHING is indistinguishable from one that has not started yet, so the no-change
+// branch does NOT proceed early — it still requires quiet + a stable signature, spends its whole
+// change budget first, and says which branch it took. Being slow there costs latency; being early
+// costs the whole fill.
+const ATS_ICIMS_PARSE = {
+  pollMs: 900,        // one read-only scan per tick (waitAtsFormReady already polls this at 450ms)
+  quietMs: 1500,      // no mutation for this long ⇒ the postback has finished rendering
+  stableReads: 3,     // …and the signature agreed that many times (the waitAtsFormReady bar)
+  changeMs: 20000,    // how long the postback gets to START before we accept "it changed nothing"
+  ceilingMs: 75000,   // total budget: attach → parse → quiet. Generous by design (see above).
+};
+// The quiet watch observes the PARENT of what it is given, so this hands it the profile panel and gets
+// the whole form. Absent ⇒ cdpInstallQuietWatch falls back to document.body, which inside the iCIMS
+// form frame IS the form — the right answer either way.
+const ATS_ICIMS_QUIET_ROOT = ".iCIMS_ProfileFormTable";
+
+// The form's identity as one comparable string: how many fields, WHICH fields, and which of them hold
+// a value. Deliberately NOT the values themselves and not the option lists — a signature that carries
+// text no postback settles on (a search-filtered list, a re-quoted filename) would never stabilise, and
+// the question here is only "did the form change and has it stopped changing". Pure + unit-pinned.
+function atsFormSignature(scan) {
+  const fields = (scan && scan.fields) || [];
+  return fields.length + "|" + fields
+    .map((f) => String((f && f.fieldName) || "") + ":" + (f && f.value != null && String(f.value).trim() !== "" ? "1" : "0"))
+    .join(",");
+}
+
+// Wait for iCIMS' résumé parse to land and the panel to go quiet. Returns what it OBSERVED — never
+// throws, because a wait that cannot read the page must not abort a run that can still fill it.
+async function atsIcimsAwaitParse(act, ats, opts) {
+  const o = opts || {};
+  const cfg = Object.assign({}, ATS_ICIMS_PARSE, o.parse || {});
+  const log = o.log || (() => {});
+  const t0 = Date.now();
+  const deadline = t0 + cfg.ceilingMs;
+  const readSig = async () => {
+    try { return atsFormSignature(await act.eval(atsInjScan, ats)); } catch (e) { return null; }
+  };
+  const base = o.baseSignature != null ? o.baseSignature : await readSig();
+  let prev = base, stable = 0, changed = false, changedAt = null, idle = 0;
+  while (Date.now() < deadline) {
+    if (act.wakePage) { try { await act.wakePage(); } catch (e) { /* a hidden tab still reads */ } }
+    await act.delayFull(cfg.pollMs);
+    const sig = await readSig();
+    if (sig == null) { stable = 0; continue; } // a read we could not make is not a stable read
+    if (base != null && sig !== base && !changed) { changed = true; changedAt = Date.now() - t0; }
+    stable = sig === prev ? stable + 1 : 0;
+    prev = sig;
+    // QUIET: a missing watch means the postback replaced the world it lived in — i.e. something just
+    // happened — so re-arm and treat this tick as busy rather than as evidence of calm.
+    idle = 0;
+    if (act.quietRead) {
+      let q = null;
+      try { q = await act.quietRead(ATS_ICIMS_QUIET_ROOT); } catch (e) { q = null; }
+      if (q && q.ok) idle = q.idleMs || 0;
+      else if (act.quietInstall) { try { await act.quietInstall(ATS_ICIMS_QUIET_ROOT); } catch (e) { /* best effort */ } }
+    } else {
+      idle = cfg.quietMs; // no quiescence probe (a test act, a substrate without it) ⇒ signature only
+    }
+    const settled = stable >= cfg.stableReads && idle >= cfg.quietMs;
+    if (settled && (changed || Date.now() - t0 >= cfg.changeMs)) {
+      const waitedMs = Date.now() - t0;
+      log(changed
+        ? `the résumé parse landed after ${(changedAt / 1000).toFixed(1)}s and the form settled at ${waitedMs > 0 ? (waitedMs / 1000).toFixed(1) : "0.0"}s — filling now, on top of whatever it wrote`
+        : `no postback changed this form within ${(waitedMs / 1000).toFixed(1)}s — the parse either produced nothing or had already landed before we looked; the form is quiet, filling now`);
+      return { parsed: true, changed, changedAt, waitedMs, quietMs: idle, signature: prev, baseSignature: base };
+    }
+  }
+  const waitedMs = Date.now() - t0;
+  // ⚠ SAY WHAT WE SAW. A parse still churning at the ceiling is the one case where filling can be
+  // overwritten, so the caller flags the résumé for review rather than reporting a clean attach.
+  log(`⚠ the form was STILL changing ${(waitedMs / 1000).toFixed(1)}s after the résumé attach (changed=${changed}, quiet ${idle}ms, ${stable} stable read(s)) — filling anyway, but the parse may overwrite fields; check the résumé section in review`);
+  return { parsed: false, changed, changedAt, waitedMs, quietMs: idle, signature: prev, baseSignature: base, reason: "still-changing" };
+}
+
+// Attach the résumé BEFORE the fill and wait its parse out. Returns an `attachResume`-shaped outcome
+// ({ok, name, verified, detail} | {ok:false, error}) plus what the wait observed, so the fill loop can
+// record it as the résumé field's own result without attaching anything itself.
+async function atsIcimsResumeStage(act, ats, opts) {
+  const o = opts || {};
+  const log = o.log || (() => {});
+  let scan = o.scan || null;
+  if (!scan) { try { scan = await act.eval(atsInjScan, ats); } catch (e) { scan = null; } }
+  const fields = (scan && scan.fields) || [];
+  // ⚠ WHICH FILE FIELD IS THE RÉSUMÉ IS THE ROUTER'S ANSWER, NOT A LABEL GUESS — the same rule the
+  // replay learned on a Greenhouse cover-letter dropzone (attaching to every file field files the
+  // wrong document to the employer, and no gate downstream catches it).
+  const f = fields.find((x) => {
+    if (!x || x.widgetType !== "file_upload") return false;
+    const r = atsRouteField(ats, x, {}, {}, {}, null, null);
+    return !!(r && r.kind === "resume");
+  });
+  if (!f) {
+    log("no résumé field on this form — nothing to attach before the fill");
+    return { ran: false, ok: false, error: "no résumé field on this form", reason: "no-field" };
+  }
+  // ALREADY CARRIES A FILE ⇒ DO NOT ATTACH A SECOND ONE. A second upload is a second parse, and that
+  // one lands DURING the fill — exactly the failure this whole stage exists to avoid.
+  if (f.value) {
+    log(`the form already carries ${JSON.stringify(String(f.value))} — not attaching again (a second upload is a second parse)`);
+    return { ran: false, ok: true, already: true, name: String(f.value), verified: true,
+      detail: "the form already carried this file when the run arrived — not re-attached (a second upload would re-parse and blank the fill)" };
+  }
+  const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
+  // Arm the quiescence watch BEFORE the upload, so the stamp exists while the parse is rendering.
+  if (act.quietInstall) { try { await act.quietInstall(ATS_ICIMS_QUIET_ROOT); } catch (e) { /* signature-only then */ } }
+  log(`attaching the résumé FIRST (${f.fieldName}${f.isRequired ? ", required" : ""}) — its parse rewrites this form, so nothing is filled until the parse is done`);
+  const att = await act.attachResume(ref);
+  if (!att || !att.ok) {
+    // A required résumé we could not attach is a review item, not a silent gap — the fill loop turns
+    // this into needs_review + `resume-attach-failed` from the same shape the other ATSs use.
+    log(`⚠ the résumé did NOT attach: ${(att && att.error) || "unknown"} — the form is untouched, so the fill proceeds without it`);
+    return Object.assign({ ran: true, ok: false, error: "unknown" }, att || {}, { fieldName: f.fieldName, isRequired: !!f.isRequired });
+  }
+  // BASELINE AFTER THE CONFIRMATION, not before the attach: our own upload changes the résumé row, and
+  // a baseline taken before it would count that as "the parse landed". If the postback beat the
+  // confirmation, the no-change branch of the wait covers it (quiet + stable, then proceed).
+  const baseSignature = atsFormSignature(await act.eval(atsInjScan, ats).catch(() => null));
+  const parse = await atsIcimsAwaitParse(act, ats, { log, baseSignature, parse: o.parse });
+  // WHAT EVIDENCE DO WE ACTUALLY HAVE THAT THE FILE LANDED? Setting `input.files` proves nothing on
+  // its own — it is a page-side write, and iCIMS uploads on the change event. Two independent kinds of
+  // positive evidence, and the record is flagged for review when there is NEITHER:
+  //   • the widget CONFIRMED it (attachResume read the filename back), or
+  //   • the server REACTED — a postback re-rendered this form, which only an accepted upload does.
+  // A required résumé reported `filled` on no evidence is the false-verify class CLAUDE.md exists to
+  // prevent, and on this form it would be reported at the one moment it cannot be undone.
+  const flag = !parse.parsed ? "resume-parse-unsettled"
+    : (att.verified || parse.changed) ? null
+      : "resume-unconfirmed";
+  const bits = [att.detail || null,
+    parse.parsed
+      ? (parse.changed ? `the form's own parse re-rendered it ${(parse.changedAt / 1000).toFixed(1)}s later and settled before the fill started` : "no parse postback changed the form")
+      : "the form was still changing when the fill started — the parse may have overwritten fields",
+    flag === "resume-unconfirmed" ? "nothing confirmed the upload — no filename read back and no postback — so check the résumé section on the form" : null].filter(Boolean);
+  return { ran: true, ok: true, name: att.name || null, verified: !!att.verified && parse.parsed,
+    detail: "attached before the fill — " + bits.join("; "), parse,
+    flag, fieldName: f.fieldName, isRequired: !!f.isRequired };
+}
+
 // Add entries to each repeating section until it can hold every profile row it maps to.
 // Bounded twice over: never more than the profile has, and never more than ATS_ENTRY_MAX clicks —
 // a section whose Add button does not actually mount anything must cost a few seconds, not a loop.
@@ -3845,9 +4010,21 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       }
 
       if (route && route.kind === "resume") {
-        const att = await act.attachResume(ref);
+        // ⚠ ON iCIMS THE ATTACH ALREADY HAPPENED, BEFORE THIS LOOP EVER RAN (atsIcimsResumeStage).
+        // Its parse REPLACES the form's contents, so attaching here would blank every field written
+        // above this one — and on a submit run it would blank approved values on their way to a real
+        // submission. So the outcome is RECORDED and the file input is never touched: the pre-attach
+        // is the only attach, and its absence is reported rather than quietly repaired here.
+        const pre = o.resumePreattached || null;
+        const att = pre || (ats === "icims" ? null : await act.attachResume(ref));
+        if (!att) {
+          rec.status = f.isRequired ? "needs_review" : "skipped";
+          rec.flag = "resume-not-attached";
+          rec.detail = "no résumé stage ran for this page — on iCIMS the résumé is attached BEFORE the fill (its parse rewrites the form), never during it";
+          results.push(fin()); continue;
+        }
         Object.assign(rec, att.ok
-          ? { status: "filled", after: att.name || "resume attached", detail: att.detail || null, verified: !!att.verified }
+          ? { status: att.flag ? "filled_review" : "filled", after: att.name || "resume attached", detail: att.detail || null, verified: !!att.verified, flag: att.flag || null }
           : { status: f.isRequired ? "needs_review" : "skipped", detail: "resume attach failed: " + (att.error || "unknown"), flag: "resume-attach-failed" });
         results.push(fin()); continue;
       }
@@ -5252,6 +5429,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
+    atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,

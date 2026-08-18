@@ -21,6 +21,7 @@ For current state and open work, see **`docs/status.md`**.
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — MULTI-ATS: Greenhouse / Lever / Ashby end-to-end` (the landing milestone), then `2026-07-31 (b)`…`(f)`, `2026-08-04 — the async combobox`, `2026-08-05 — multi-ATS end to end`, `2026-08-07 — the dead first fill` |
 | **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
 | **iCIMS pre-form (employer portal → gate → form)** | `2026-08-16 (c) — iCIMS PRE-FORM` |
+| **Résumé attach (iCIMS: attach-then-wait)** | `2026-08-17 (b) — the résumé goes on FIRST, which makes iCIMS' parse harmless` |
 | **Option lists reaching review (pickers vs free text)** | `2026-08-16 (d) — an OPTIONAL dropdown reaches review as a real picker` |
 | **Secrets / redaction / scraped-text hygiene** | `2026-08-16 (e) — a session token reached Supabase and the AI providers` |
 | **Onboarding / auth / already-applied** | `2026-08-16 (c) — iCIMS PRE-FORM` (the non-Workday one), `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
@@ -5304,3 +5305,60 @@ contain **no** id-family names so the hardcode cannot creep back. Suite 1493/149
 ⚠ **The repeat rule is unit-pinned but NOT live-exercised** — this form renders one address row and one
 phone row, so `repeatIndex` was 0 everywhere and the branch never ran. That is the designed behaviour,
 but it means a real two-entry form has yet to confirm it.
+
+## 2026-08-17 (b) — the résumé goes on FIRST, which makes iCIMS' parse harmless
+
+Operator's ask: attach the résumé on the iCIMS rehearsal and the real submission, but make sure the
+parse has FINISHED before the form fill starts, because it re-parses the whole form. That is exactly the
+right framing — the problem was never the upload, it was the order.
+
+**Background.** iCIMS parses an uploaded résumé server-side and posts the result back into the panel
+seconds later, re-rendering repeating entries under new ids and blanking what was already written (the
+form announces it: *"Existing data in the form will be replaced"*). Attaching it as an ordinary field
+mid-fill therefore destroyed the fill, so on 2026-08-16 it was mapped `kind:"skip"` — the résumé, on a
+form that requires one, was left to the operator.
+
+**Now** (`atsIcimsResumeStage`, ats.js): after the form settles and **before a single value is written**,
+the stage finds the résumé field, attaches, and waits the parse out. The parse can then only overwrite an
+empty form, and everything the fill (or the approved replay) writes lands on top of whatever it produced.
+Nothing else in the run changed.
+
+**The wait is polled, never timed** — two independent conditions, both required:
+
+| signal | what it proves | why the other cannot |
+|---|---|---|
+| `atsFormSignature` changed | the postback LANDED | the field COUNT is often identical on both sides of a re-render (entries return under new ids), so a count settle sees nothing happen |
+| the mutation stamp idle ≥1.5s | the panel stopped rendering | a signature can hold still between two bursts of a server-rendered re-render — the `cdpInstallQuietWatch` lesson |
+
+The signature is the field SET plus which fields hold a value — deliberately not the values' text or the
+option lists, which churn (a re-quoted filename, a filtered list) and would never stabilise.
+
+**Three judgement calls worth keeping:**
+- **A parse that changed NOTHING is indistinguishable from one that has not started yet.** So that branch
+  does not exit early: it spends its whole 20s change budget and still requires quiet + a stable
+  signature. Being slow there costs latency; being early costs the entire fill.
+- **`filled` requires EVIDENCE the file landed.** Writing `input.files` is a page-side write and iCIMS
+  uploads on the change event, so the record needs either the widget's own confirmation (filename read
+  back) or a server reaction (a postback only happens to an accepted upload). Neither ⇒ `filled_review` +
+  `resume-unconfirmed`. Still churning at the ceiling ⇒ `resume-parse-unsettled`. A required résumé that
+  did not attach at all HALTS a submit run (`resume-not-attached`) — the strict verify only re-checks
+  approved VALUES, so a missing file is invisible to it.
+- **The FILL run attaches too, not just the rehearsal/submit.** Asked for the submit path only, but a
+  bundle captured from an UNPARSED form and replayed against a PARSED one reports every entry field as
+  *"approved value has NO matching field on the live form"* — the same shape that produced 28 of a
+  rehearsal's 32 verify failures when entry counts disagreed. Both visits must see the same form.
+
+**The fill loop never attaches on iCIMS** — it records the stage's outcome (`opts.resumePreattached`) and
+never touches the file input. A second upload is a second parse, and that one lands *during* the fill; on
+a submit run it would blank approved values between the verify and the click. The stage is also
+idempotent by inspection (a form already carrying a file is left alone), which is what makes the submit
+run's cascade re-replay safe.
+
+**Pinned:** 13 tests in `test/ats-icims.test.js` (never-attach-mid-fill, the record for each outcome,
+attach-once + ordering, no-second-upload, router-decides-which-file-field, no-early-exit on no-change,
+watch re-arm, the signature's identity). Observed DOM + the rejected alternatives:
+`docs/dom-patterns.md` `2026-08-17 (c)`.
+
+⚠ **NOT live-verified yet.** The next live round should watch the postback land, confirm the fill writes
+on top of it, and re-run a rehearsal to confirm it still reaches `WOULD CLICK SUBMIT` with the résumé
+attached — the entry ids are the thing to watch, since the parse re-mints them.

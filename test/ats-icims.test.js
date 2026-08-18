@@ -311,20 +311,230 @@ test("replay: a credential is re-read from storage, NOT replayed from the bundle
   }
 });
 
-// ── the résumé, deliberately deferred ───────────────────────────────────────────────────
+// ── the résumé: attached BEFORE the fill, and the parse is waited out ───────────────────
+//
+// iCIMS parses the upload SERVER-SIDE and re-renders the panel with the result, so the ONLY safe
+// moment to attach is before a single value is written. Everything below pins one half of that:
+// the driver never attaches mid-fill, and the stage that attaches beforehand does not hand control
+// back until the postback has landed and the form has stopped changing.
 
-test("iCIMS résumé is SKIPPED — its server-side parse blanks the form mid-fill", async () => {
+const RESUME_FIELD = { fieldName: "PortalProfileFields.Resume_File", inputSel: "#resume", widgetType: "file_upload",
+  label: "Please upload your resume", isRequired: true, value: null, domIndex: 0 };
+// Fast enough for a test, same code path as the run (see ATS_ICIMS_PARSE for the real budgets).
+const FAST_PARSE = { pollMs: 0, quietMs: 1000, changeMs: 40, ceilingMs: 1500, stableReads: 2 };
+
+test("the FILL LOOP never attaches the résumé on iCIMS — a second upload is a second parse", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [RESUME_FIELD] });
+  let attached = 0;
+  const act = fakeAct(page);
+  act.attachResume = async () => { attached++; return { ok: true, name: "resume.pdf", verified: true }; };
+  // No pre-attach outcome ⇒ the loop must REPORT that, never repair it by uploading here: this call
+  // is the middle of a fill, and a parse landing now blanks every field written above it.
+  const out = await ats.driveAtsPageFill(act, "icims", PROFILE, {}, {}, { credentials: CREDS });
+  assert.strictEqual(attached, 0, "the fill loop must never call attachResume on iCIMS");
+  assert.strictEqual(out.results[0].status, "needs_review", "a required résumé nobody attached is a review item");
+  assert.strictEqual(out.results[0].flag, "resume-not-attached");
+  assert.match(out.results[0].detail, /BEFORE the fill/);
+});
+
+test("the pre-attach outcome is what the résumé RECORD reports", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [RESUME_FIELD] });
+  let attached = 0;
+  const act = fakeAct(page);
+  act.attachResume = async () => { attached++; return { ok: true }; };
+  const out = await ats.driveAtsPageFill(act, "icims", PROFILE, {}, {}, { credentials: CREDS,
+    resumePreattached: { ran: true, ok: true, name: "Kevin Wang.pdf", verified: true, detail: "attached before the fill — settled" } });
+  assert.strictEqual(attached, 0, "the outcome is recorded, not re-created");
+  assert.strictEqual(out.results[0].status, "filled");
+  assert.strictEqual(out.results[0].after, "Kevin Wang.pdf");
+  assert.strictEqual(out.results[0].verified, true);
+});
+
+test("a résumé that did not attach reaches review — required ⇒ needs_review + resume-attach-failed", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [RESUME_FIELD] });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", PROFILE, {}, {}, { credentials: CREDS,
+    resumePreattached: { ran: true, ok: false, error: "no resume stored (upload one in the popup / website)" } });
+  assert.strictEqual(out.results[0].status, "needs_review");
+  assert.strictEqual(out.results[0].flag, "resume-attach-failed");
+  assert.match(out.results[0].detail, /no resume stored/);
+});
+
+test("a parse still churning at the ceiling is FLAGGED, not reported as a clean attach", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [RESUME_FIELD] });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", PROFILE, {}, {}, { credentials: CREDS,
+    resumePreattached: { ran: true, ok: true, name: "resume.pdf", verified: false, flag: "resume-parse-unsettled",
+      detail: "attached before the fill — the form was still changing when the fill started" } });
+  assert.strictEqual(out.results[0].status, "filled_review", "the operator has to look at this one");
+  assert.strictEqual(out.results[0].flag, "resume-parse-unsettled");
+});
+
+// A form whose postback re-renders the panel: the field ids change once the parse lands.
+// `mutatingUntil` counts the scans that still churn afterwards — the quiet watch is what covers that.
+function parsingPage(over) {
+  const st = { scans: 0, attachedAt: null, quietInstalls: [], events: [] };
+  const pre = [RESUME_FIELD, { ...ICIMS_SCAN.fields[3] }];
+  const post = [
+    { ...RESUME_FIELD, value: "resume.pdf" },
+    { ...ICIMS_SCAN.fields[3], value: "Kevin" },                    // the parse filled it in
+    { fieldName: "-1_PersonProfileFields.EducationSchool", inputSel: "#school", widgetType: "text",
+      label: "School", isRequired: true, value: "Carnegie Mellon University", domIndex: 2 }, // …and minted an entry
+  ];
+  const page = icimsPage(Object.assign({
+    atsInjScan: () => {
+      st.scans++;
+      const parsed = st.attachedAt != null && st.scans > st.attachedAt + 1; // the postback lands a tick later
+      st.events.push(parsed ? "scan:post" : "scan:pre");
+      return { ...ICIMS_SCAN, fields: parsed ? post : pre };
+    },
+  }, over || {}));
+  page._st = st;
+  return page;
+}
+
+test("atsIcimsResumeStage: attach ONCE, then wait for the postback AND the panel to go quiet", async () => {
+  const page = parsingPage();
+  const st = page._st;
+  const act = fakeAct(page);
+  let mutatingScans = 3;   // the panel keeps churning for a few ticks after the re-render
+  act.quietInstall = async (sel) => { st.quietInstalls.push(sel); st.events.push("quietInstall"); return { ok: true }; };
+  act.quietRead = async () => ({ ok: true, idleMs: mutatingScans-- > 0 ? 0 : 5000 });
+  act.attachResume = async (ref) => {
+    st.attachedAt = st.scans; st.events.push("attach:" + ref.inputSel);
+    return { ok: true, name: "resume.pdf", verified: true };
+  };
+  const stage = await ats.atsIcimsResumeStage(act, "icims", { parse: FAST_PARSE });
+
+  assert.strictEqual(stage.ok, true);
+  assert.strictEqual(stage.ran, true);
+  assert.strictEqual(stage.name, "resume.pdf");
+  assert.strictEqual(stage.parse.changed, true, "the postback re-rendered the form and the stage saw it");
+  assert.strictEqual(stage.parse.parsed, true);
+  assert.strictEqual(stage.flag, null, "a settled parse is not a review item");
+  assert.strictEqual(st.events.filter((e) => e.startsWith("attach:")).length, 1, "exactly one upload");
+  // THE ORDER IS THE WHOLE POINT: the quiet watch is armed BEFORE the upload (so the stamp exists
+  // while the parse renders), and the wait's scans all come after it.
+  assert.ok(st.events.indexOf("quietInstall") < st.events.findIndex((e) => e.startsWith("attach:")),
+    "the quiescence watch must be armed before the file goes on: " + st.events.join(" → "));
+  assert.ok(st.events.lastIndexOf("scan:post") > st.events.findIndex((e) => e.startsWith("attach:")),
+    "the stage kept reading the form after the attach");
+});
+
+test("atsIcimsResumeStage: NO confirmation and NO postback ⇒ flagged, never a clean 'filled'", async () => {
+  // Setting input.files proves nothing by itself — iCIMS uploads on the change event. With neither a
+  // filename read back nor a server reaction, there is no evidence the file landed, and a required
+  // résumé reported filled on no evidence is the false-verify class.
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [RESUME_FIELD] });   // never changes ⇒ no postback
+  const act = fakeAct(page);
+  act.quietRead = async () => ({ ok: true, idleMs: 99999 });
+  act.attachResume = async () => ({ ok: true, name: "resume.pdf", verified: false, detail: "attached (confirmation not read)" });
+  const stage = await ats.atsIcimsResumeStage(act, "icims", { parse: FAST_PARSE });
+  assert.strictEqual(stage.ok, true, "it did attach — this is about EVIDENCE, not failure");
+  assert.strictEqual(stage.flag, "resume-unconfirmed");
+  assert.strictEqual(stage.verified, false);
+  // …and the server REACTING is evidence enough on its own, even with no filename read back.
+  const page2 = parsingPage();
+  const act2 = fakeAct(page2);
+  act2.quietRead = async () => ({ ok: true, idleMs: 99999 });
+  act2.attachResume = async () => { page2._st.attachedAt = page2._st.scans; return { ok: true, name: "resume.pdf", verified: false }; };
+  const stage2 = await ats.atsIcimsResumeStage(act2, "icims", { parse: FAST_PARSE });
+  assert.strictEqual(stage2.parse.changed, true);
+  assert.strictEqual(stage2.flag, null, "a postback only happens to an upload the server accepted");
+});
+
+test("atsIcimsResumeStage: a form that ALREADY carries a file is not uploaded to again", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [{ ...RESUME_FIELD, value: "resume.pdf" }] });
+  let attached = 0;
+  const act = fakeAct(page);
+  act.attachResume = async () => { attached++; return { ok: true }; };
+  const stage = await ats.atsIcimsResumeStage(act, "icims", { parse: FAST_PARSE });
+  assert.strictEqual(attached, 0, "a second upload is a second parse — and that one lands DURING the fill");
+  assert.strictEqual(stage.ok, true);
+  assert.strictEqual(stage.already, true);
+  assert.strictEqual(stage.ran, false);
+});
+
+test("atsIcimsResumeStage: only the field the ROUTER calls the résumé is uploaded to", async () => {
+  // A per-customer file question (an `rcf<NNNN>` transcript/cover-letter slot) is NOT the résumé —
+  // attaching to it files the wrong document to the employer, and no gate downstream would catch it.
   const page = icimsPage();
   page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
-    { fieldName: "PortalProfileFields.Resume_File", inputSel: "#resume", widgetType: "file_upload", label: "Please upload your resume", isRequired: true, value: null, domIndex: 0 },
+    { fieldName: "rcf7788", inputSel: "#rcf7788", widgetType: "file_upload", label: "Attach anything else", isRequired: false, value: null, domIndex: 0 },
   ] });
   let attached = 0;
   const act = fakeAct(page);
   act.attachResume = async () => { attached++; return { ok: true }; };
-  const out = await ats.driveAtsPageFill(act, "icims", PROFILE, {}, {}, { credentials: CREDS });
-  assert.strictEqual(attached, 0, "the résumé must not be attached on iCIMS yet");
-  assert.strictEqual(out.results[0].status, "skipped");
-  assert.match(out.results[0].detail, /re-parses and blanks the form/);
+  const stage = await ats.atsIcimsResumeStage(act, "icims", { parse: FAST_PARSE });
+  assert.strictEqual(attached, 0);
+  assert.strictEqual(stage.ran, false);
+  assert.strictEqual(stage.reason, "no-field");
+});
+
+test("atsIcimsResumeStage: an attach that FAILED does not wait for a parse that cannot come", async () => {
+  const page = parsingPage();
+  const act = fakeAct(page);
+  let scansAtFailure = 0;
+  act.attachResume = async () => { scansAtFailure = page._st.scans; return { ok: false, error: "no resume stored" }; };
+  const stage = await ats.atsIcimsResumeStage(act, "icims", { parse: FAST_PARSE });
+  assert.strictEqual(stage.ok, false);
+  assert.strictEqual(stage.error, "no resume stored");
+  assert.strictEqual(stage.isRequired, true, "the caller needs this to decide whether it blocks the gate");
+  assert.strictEqual(page._st.scans, scansAtFailure, "nothing was polled after a failed upload");
+});
+
+test("atsIcimsAwaitParse: NO change is not permission to proceed early", async () => {
+  // A parse that changed nothing is indistinguishable from one that has not started, so the
+  // no-change branch spends its whole change budget before it accepts a quiet, stable form.
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [RESUME_FIELD] });
+  const act = fakeAct(page);
+  act.quietRead = async () => ({ ok: true, idleMs: 99999 });   // quiet from the very first tick
+  const t0 = Date.now();
+  const parse = await ats.atsIcimsAwaitParse(act, "icims", { parse: FAST_PARSE });
+  assert.strictEqual(parse.changed, false);
+  assert.strictEqual(parse.parsed, true, "quiet + stable + budget spent ⇒ fill");
+  assert.ok(Date.now() - t0 >= FAST_PARSE.changeMs, "it must not return on the first quiet tick");
+});
+
+test("atsIcimsAwaitParse: a watch the postback destroyed is RE-ARMED, and counts as busy", async () => {
+  // The parse can replace the world the mutation stamp lives in. A missing stamp therefore means
+  // "something just happened", not "the page is calm".
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [RESUME_FIELD] });
+  const act = fakeAct(page);
+  let reads = 0, installs = 0;
+  act.quietInstall = async () => { installs++; return { ok: true }; };
+  act.quietRead = async () => (++reads <= 3 ? { ok: false } : { ok: true, idleMs: 99999 });
+  const parse = await ats.atsIcimsAwaitParse(act, "icims", { parse: FAST_PARSE });
+  assert.strictEqual(parse.parsed, true);
+  assert.strictEqual(installs, 3, "each unreadable stamp is re-armed rather than believed");
+});
+
+test("atsFormSignature: field SET + which fields hold a value — not the option lists", () => {
+  const sig = ats.atsFormSignature;
+  const a = { fields: [{ fieldName: "x", value: null }, { fieldName: "y", value: "v" }] };
+  assert.strictEqual(sig(a), sig({ fields: [{ fieldName: "x", value: "" }, { fieldName: "y", value: "v2" }] }),
+    "a value's TEXT is not part of the identity — a re-quoted filename must not read as a re-render");
+  // …but a field appearing, disappearing or FILLING is exactly what the postback does
+  assert.notStrictEqual(sig(a), sig({ fields: [{ fieldName: "x", value: "now filled" }, { fieldName: "y", value: "v" }] }));
+  assert.notStrictEqual(sig(a), sig({ fields: [{ fieldName: "x", value: null }, { fieldName: "z", value: "v" }] }));
+  assert.notStrictEqual(sig(a), sig({ fields: a.fields.concat([{ fieldName: "w", value: null }]) }));
+  // options never enter it — those churn on every open/search and would never stabilise
+  assert.strictEqual(sig(a), sig({ fields: [{ fieldName: "x", value: null, options: ["A", "B"] }, { fieldName: "y", value: "v", options: [] }] }));
+  assert.strictEqual(sig(null), "0|", "an unreadable scan is a signature, not a crash");
+});
+
+test("the iCIMS map routes the résumé as a RÉSUMÉ (one router decides, on every path)", () => {
+  const r = ats.atsRouteField("icims", { fieldName: "PortalProfileFields.Resume_File", widgetType: "file_upload", label: "Please upload your resume" }, {}, {}, {}, null, null);
+  assert.strictEqual(r && r.kind, "resume");
+  // …and the replay asks the SAME question, which is what keeps a cover-letter dropzone empty
+  const other = ats.atsRouteField("icims", { fieldName: "rcf7788", widgetType: "file_upload", label: "Attach anything else" }, {}, {}, {}, null, null);
+  assert.notStrictEqual(other && other.kind, "resume");
 });
 
 // ── the iCIMS AJAX combobox ("IdDropDown") + the address block ──────────────────────────

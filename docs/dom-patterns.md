@@ -31,13 +31,13 @@ during 2026-08, so a later date can appear above an earlier one.
 | **Multi-page walk + error banners** | `2026-06-15 — Magna wd3: VPS ≠ validation error`, `2026-06-21 — M38 Part 3: the N-page walk loop`, `2026-07-01 — Workday error banner CONCATENATES`, `2026-07-25 — Solar Turbines: a phone-triggered SMS-consent checkbox REFLOWS the footer` |
 | **Session death / maintenance page** | `2026-06-14 — Magna wd3: rect/focus retry`, `2026-06-14 — Magna wd3: session-expiry is NOT statically detectable`, `2026-06-27 — Workday PLANNED-MAINTENANCE page` |
 | **Auth / onboarding / consent** | `2026-07-25 — Caterpillar: create-account consent`, `2026-07-25 — Caterpillar: the auth widget can OPEN on the Create Account view`, `2026-08-02 (d) — the prompt row, the contaminated sign-in box`, `2026-08-07 (d) — AUTOFILL WITH RESUME` |
-| **Résumé attach** | `2026-06-03 — LiveRamp wd5 resume upload`, `2026-06-21 — Resume attach on the CDP path` |
+| **Résumé attach** | `2026-06-03 — LiveRamp wd5 resume upload`, `2026-06-21 — Resume attach on the CDP path`, `2026-08-17 (c) — Astrion iCIMS: the résumé goes on FIRST, and the parse is waited out` |
 | **Review page / reconcile** | `2026-07-07 — Magna wd3 REVIEW page` |
 | **What Workday does NOT persist** | `2026-08-04 — waystar.wd1: what Workday does NOT persist`, `2026-08-04 (c) — HIDDEN runs: Workday rejects synthetic text/date` |
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
-| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
+| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out` |
 | **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
 | **Option lists: paging, completeness, what review can offer** | `2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE` |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
@@ -4136,12 +4136,15 @@ page: the old finder returns `hasSubmit:false`, which makes `atsLooksLikeApplica
 perfectly good form. Its rect is FRAME-RELATIVE (`cy≈4356`) while `Input.*` dispatches into the
 top-level viewport, so any future trusted click here must add the frame's own box (`cdpEvalTop`).
 
-**The résumé is a trap, and is deliberately not attached yet.** The page says so itself — "Provide your
+**The résumé is a trap, and the trap is TIMING.** The page says so itself — "Provide your
 resume below to pre-fill your profile. Existing data in the form will be replaced." iCIMS parses the
 upload SERVER-SIDE and posts results back into the panel seconds after the attach reports success,
 re-rendering entries under new ids and blanking what was written. The form offers its own
 `#resume_skip_checkbox` ("Upload Resume at a later time"), left UNTICKED — an operator's choice about
 their own application.
+⚠ **Superseded 2026-08-17** — see `2026-08-17 (c)` below. The observation above stands unchanged; what
+changed is the ORDER: the résumé is attached BEFORE anything is filled and the postback is waited out,
+so the parse can only overwrite an empty form. It was `kind:"skip"` for one day.
 
 ## 2026-08-16 (b) — Astrion iCIMS: the `<select>` that is not a select, and its declared parent→child
 
@@ -4369,3 +4372,45 @@ value out of 109 stopped the run at `verify-failed`.
 **Entry growing is what makes 109 fields possible** — the submit run grows repeating sections from the
 approved bundle (`the approved bundle holds 3 entr(ies), form now shows 3`). Without it the form
 carries one work-history entry and 28 approved values have nowhere to go.
+
+## 2026-08-17 (c) — Astrion iCIMS: the résumé goes on FIRST, and the parse is waited out
+
+Supersedes the `kind:"skip"` decision in `2026-08-16` (one day old). **Nothing about the observed
+behaviour changed** — iCIMS still parses the upload server-side and re-renders the panel with the
+result. What changed is WHEN we attach: before a single field is written, instead of partway through
+the fill. A parse that lands on an empty form has nothing of ours to destroy.
+
+**Why "just attach it later / re-fill afterwards" was rejected.** Both were considered:
+- *attach last* — the parse would then blank the finished fill, and on a submit run it would blank
+  APPROVED values between the strict verify and the click. That is the one window where a wrong state
+  cannot be caught by anything downstream.
+- *attach, then re-fill from scratch* — a second full fill (and a second AI pass) to repair damage that
+  ordering avoids entirely.
+
+**The wait, and why each half is load-bearing.** `atsIcimsAwaitParse` requires BOTH, polled on SW
+wall-clock (no page timer, no fixed delay):
+
+| signal | what it answers | why the other one cannot |
+|---|---|---|
+| `atsFormSignature` changed | the postback LANDED | the field COUNT is often identical either side of a re-render — entries come back under new ids, so a count settle sees nothing happen |
+| the mutation stamp is idle ≥1.5s | the panel has stopped rendering | a signature can hold still between two bursts of a server-rendered re-render (the same lesson `cdpInstallQuietWatch` was built for) |
+
+Signature = field SET + which fields hold a value. Deliberately **not** the values' text and not the
+option lists: a re-quoted filename or a search-filtered list never stabilises, and the question here is
+only *did it change, and has it stopped*.
+
+**A parse that changes NOTHING is indistinguishable from one that has not started**, so that branch does
+not exit early — it spends its whole 20s change budget first and still requires quiet + a stable
+signature. The mutation watch also lives in the isolated world the postback can REPLACE, so an
+unreadable stamp is treated as "something just happened" (re-arm, keep waiting), never as calm.
+
+**Evidence, not optimism, before reporting `filled`.** Writing `input.files` is a page-side write; iCIMS
+uploads on the change event. So the record needs either the widget's own confirmation (filename read
+back) or a server reaction (a postback happens only to an accepted upload). Neither ⇒ `filled_review` +
+`resume-unconfirmed`. Still churning at the ceiling ⇒ `resume-parse-unsettled`.
+
+**Both visits attach.** Bundle field ids are captured from whatever form the fill saw, so a bundle taken
+from an UNPARSED form and replayed against a PARSED one reproduces the `approved value has NO matching
+field on the live form` failure mode documented in `(b)` above — for every entry field. A required
+résumé that fails to attach halts the submit run at `resume-not-attached`, because the strict verify
+only re-checks approved VALUES and a missing file is not one.

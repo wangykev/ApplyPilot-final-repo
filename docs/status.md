@@ -66,9 +66,14 @@ Remaining, in rough order:
    correctly (it searched, then reported honestly) — the question is what the field actually offers.
    `-1_CandProfileFields.EducationCountry` / `EducationState` are the same declared parent→child pair
    as the address, so they should come along with it.
-2. **The résumé parse postback.** iCIMS parses server-side and re-renders the panel under new ids seconds
-   after the attach reports success, blanking the fill. Until that is handled the résumé is `kind:"skip"`.
-   Still the single biggest remaining piece.
+2. ~~**The résumé parse postback.**~~ **BUILT 2026-08-17 — order, not avoidance.** `atsIcimsResumeStage`
+   attaches the résumé after the form settles and BEFORE any value is written, then waits the postback
+   out (signature changed → panel quiet, both polled) — so the parse can only overwrite an empty form.
+   The fill loop never attaches on iCIMS; it records the stage's outcome. Runs on the FILL and the
+   rehearsal/submit runs, because a bundle captured from an unparsed form cannot be replayed against a
+   parsed one. `kind:"resume"` now. **NOT yet live-verified** — unit-pinned only (12 tests); the next
+   live round should watch the postback land and confirm the fill writes on top of it, then re-run a
+   rehearsal to confirm the verify still reaches `WOULD CLICK SUBMIT` with the résumé attached.
 3. **Multi-entry repeating sections.** `atsMapKey` strips the entry ordinal, which is correct for ONE
    address against one form entry — but a SECOND entry would map to the same profile address. Phones /
    Certifications / Experience all have the same shape (`a.iCIMS_Anchor` "Add More (…)").

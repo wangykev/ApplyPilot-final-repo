@@ -5095,7 +5095,25 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // same {email, password} the website's Credentials page writes and the Workday onboarding signs
     // in with — iCIMS asks for it as part of the application itself, because the account is created
     // by the submission rather than beforehand.
-    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], credentials: store.credentials || null });
+    // ⚠ THE RÉSUMÉ GOES ON FIRST ON iCIMS, AND ITS PARSE IS WAITED OUT (operator, 2026-08-17).
+    // iCIMS parses the upload SERVER-SIDE and re-renders the whole panel with the result, so attaching
+    // it as an ordinary field mid-fill blanks the fill (that is why it was skipped from 2026-08-16).
+    // Attaching HERE — after the form has settled, before a single value is written — makes the parse
+    // harmless: it can only overwrite an empty form, and everything the fill writes lands on top of it.
+    // ⚠ AND THE FILL RUN DOES IT TOO, NOT JUST THE SUBMIT RUN. The parse re-renders repeating entries
+    // under new ids, so a bundle captured from an UNPARSED form would be replayed against a PARSED one
+    // and every entry field would report "approved value has NO matching field on the live form" — the
+    // shape that produced 28 of a rehearsal's 32 verify failures when the entry counts disagreed. Both
+    // visits must see the same form, so both attach.
+    let resumePre = null, resumeStageMs = null;
+    if (ats === "icims") {
+      emitRunProgress("Attaching your résumé", "iCIMS parses it server-side — the fill waits for that to finish");
+      const rsT0 = Date.now();
+      resumePre = await atsIcimsResumeStage(act, ats, { log: (m) => LOG("résumé: " + m) });
+      resumeStageMs = Date.now() - rsT0;
+      LOG(`[ATS-TIME] résumé stage ${(resumeStageMs / 1000).toFixed(1)}s — ${resumePre.ok ? (resumePre.already ? "already on the form" : "attached" + (resumePre.parse ? `, parse ${resumePre.parse.parsed ? "settled" : "STILL CHANGING"}` : "")) : "NOT attached (" + (resumePre.error || "unknown") + ")"}`);
+    }
+    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], credentials: store.credentials || null, resumePreattached: resumePre });
 
     // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
     // here, added when Greenhouse forms would land in a state where every server-backed combobox returned
@@ -5136,8 +5154,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // sitting in two widgets waiting out a ceiling — which is the only thing worth retuning.
     // The résumé is ALWAYS named, whatever it cost: it is the field whose time varies most between a
     // visible and a hidden run, so "it wasn't in the slowest list" is not the same as knowing.
+    // ⚠ ON iCIMS THE RÉSUMÉ'S COST IS NOT IN ITS RECORD. The attach + parse wait happen BEFORE the
+    // fill loop (see the résumé stage above), so its record's own elapsedMs is ~0 and printing that
+    // would report the most expensive stage of the run as free. Prefer the stage's measured time.
     const res = out.results.find((r) => /resume|\bcv\b/i.test(r.fieldName || "") || r.widgetType === "file_upload");
-    const resPart = res ? ` | resume ${((res.elapsedMs || 0) / 1000).toFixed(1)}s` : "";
+    const resPart = resumeStageMs != null ? ` | resume ${(resumeStageMs / 1000).toFixed(1)}s (attach + parse, before the fill)`
+      : res ? ` | resume ${((res.elapsedMs || 0) / 1000).toFixed(1)}s` : "";
     const slow = out.results
       .filter((r) => (r.elapsedMs || 0) >= 1500)
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
@@ -5274,7 +5296,32 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       return out;
     })();
     if (Object.keys(entryCounts).length) LOG(`the approved bundle holds repeating entries: ${Object.entries(entryCounts).map(([k, v]) => k + "×" + v).join(", ")} — the form will be grown to fit`);
-    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null });
+    // ⚠ THE RÉSUMÉ IS ATTACHED BEFORE THE REPLAY, AND ITS PARSE IS WAITED OUT — on the REHEARSAL as
+    // well as the armed run, because a rehearsal that skipped it would be rehearsing a different form
+    // than the one that gets submitted. Two reasons it cannot be an ordinary replay field here:
+    //   • the parse REPLACES the form's contents, so attaching it partway through the replay would
+    //     blank approved values on their way to a real submission — the one place that is unrecoverable;
+    //   • a résumé is a FILE, and the bundle never carries file bytes. It comes from IndexedDB on every
+    //     visit, exactly like the credentials come from storage rather than from the bundle.
+    // The attach is idempotent by inspection (a form already carrying a file is left alone), so the
+    // cascade re-replay below reuses this outcome instead of uploading a second time.
+    let resumePre = null;
+    if (ats === "icims") {
+      emitRunProgress(arm ? "Attaching your résumé (ARMED)" : "Attaching your résumé", "iCIMS parses it server-side — the replay waits for that to finish");
+      const rsT0 = Date.now();
+      resumePre = await atsIcimsResumeStage(act, ats, { log: (m) => LOG("résumé: " + m) });
+      LOG(`[ATS-TIME] résumé stage ${((Date.now() - rsT0) / 1000).toFixed(1)}s — ${resumePre.ok ? (resumePre.already ? "already on the form" : "attached" + (resumePre.parse ? `, parse ${resumePre.parse.parsed ? "settled" : "STILL CHANGING"}` : "")) : "NOT attached (" + (resumePre.error || "unknown") + ")"}`);
+      // ⚠ A REQUIRED RÉSUMÉ THAT DID NOT ATTACH BLOCKS THE GATE RATHER THAN RIDING ALONG. The strict
+      // verify below only re-checks approved VALUES, and a file field's approved "value" is the
+      // filename — so nothing downstream would notice a missing attachment on a form that requires
+      // one, and the submit would go out incomplete.
+      if (!resumePre.ok && resumePre.isRequired) {
+        LOG(`⚠ REFUSING to ${arm ? "submit" : "rehearse"} — this form REQUIRES a résumé and it did not attach: ${resumePre.error || "unknown"}`);
+        return { ok: true, needs_operator: true, submitted: false, replayed: false, stopped: "resume-not-attached", ats,
+          detail: "The form's required résumé upload did not attach (" + (resumePre.error || "unknown") + ") — nothing was replayed or submitted. Upload a résumé in the extension/website, then re-run." };
+      }
+    }
+    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre });
 
     // CASCADE RE-REPLAY (2026-08-01). A value committed during the replay can REVEAL more
     // questions — live on an Ashby form, two work-authorization questions mount only after an
@@ -5291,7 +5338,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (missingAfter(out.results).length) {
       const before = out.results.length;
       LOG(`${missingAfter(out.results).length} approved value(s) had no field yet — re-scanning for questions the replay revealed`);
-      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null });
+      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre });
       // Keep the LATER record for any field seen twice: it reflects the form as it stands now.
       const merged = new Map(out.results.map((r) => [durable(r.fieldName), r]));
       for (const r of again.results) merged.set(durable(r.fieldName), r);
