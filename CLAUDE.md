@@ -702,6 +702,35 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   other is how "16 proven complete" gets mistaken for "16 pickers".
   ⚠ A result's `widgetType` is rewritten to the **REVIEW** vocabulary as the record is built, so
   anything inspecting a RESULT must match `ATS_CHOICE_REVIEW_WIDGETS`, not `ATS_CHOICE_WIDGETS`.
+- **⚠ A RUN USUALLY STARTS FROM THE POSTING ITSELF, AND THEN *EVERYTHING* IS IN THE FRAME (live
+  2026-08-18).** The Astrion flow — employer portal → Apply → gate → form — is the EXCEPTION. Most
+  iCIMS links are `<tenant>.icims.com/jobs/<id>/…/job`, where the job description **and its lone
+  `<a>Apply for this job online</a>`** live inside `#icims_content_iframe` and the top document is ~13
+  characters of branding. `cdpUseFormFrame` refused to pin that frame because it counts **form
+  controls** and a posting page has none, so the pre-form stage read the top document and halted
+  `apply-not-followable` on a page whose Apply link works by hand. A control count answers "which frame
+  has the form"; it cannot answer "which frame is this tenant's content".
+  - `minControls:0` is now reachable but must be **IDENTITY-ANCHORED** (`opts.identifyUrl`, matched
+    against the frame's own url, taken from the page's own `<iframe src>` via `atsInjIcimsFrameSrc`) —
+    an unanchored 0-floor call would happily pin an analytics iframe and blind the caller in a NEW
+    way, silently. An identified frame outranks a fuller one; a 0-floor call with no identity is
+    refused. `runIcimsPreForm` tries the ordinary floored call FIRST, so a gate/form page is unchanged.
+  - **`cdpEval`'s re-arm reproduces how the pin was obtained** (`_frameArmSpec`) instead of a hardcoded
+    floor of 1 — otherwise a postback on a 0-control frame re-armed, failed, dropped the pin back to
+    the top document, and the same blindness returned later looking like a different bug.
+- **⚠ A CONSENT ON THE SIGN-IN CARD IS THE OPERATOR'S TO GIVE — `consent-required` (live 2026-08-18).**
+  Many tenants gate the gate: an UNCHECKED `aria-required` privacy box (`#accept_gdpr`), a hidden
+  `#consentCaptureTitle` naming it, and a row stating the rule ("You must indicate that you have read
+  the privacy notice … before you can continue"). Measured 2 of 5 sampled tenants — ITT (one box) and
+  Peraton (**two**: "I accept the Privacy Policy", "I accept the Peraton Job Application Privacy
+  Notice"); Astrion, Cretex and Wieland have none, which is why this never showed up before.
+  **The bot never ticks a legal agreement to get a run further**, so it halts, naming and quoting the
+  consent, BEFORE writing the email or pressing anything. *Why it needs its own signal:* iCIMS
+  `preventDefault`s the submit and disables its own button, so an unticked consent presented as
+  `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be pressed" — sending the
+  operator to debug a click that was fine. Blocking-ness is **two-sourced** (the required marker, or a
+  row that states the requirement) so an optional opt-in is reported and left alone, unticked, rather
+  than stopping a run that would sign in fine.
 - **A JD-scraped COMPANY can be a PAGE TITLE, and that string is safety-critical.** On an employer page
   there is no ATS markup to key on, so the scrape returned the document title as the company — the anchor
   for "have you worked for us before?". `atsPlausibleCompany` is a NEGATIVE test; what it rejects falls back

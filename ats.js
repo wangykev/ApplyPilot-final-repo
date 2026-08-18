@@ -2261,6 +2261,11 @@ function atsPostingGone(jd, requestedUrl, landedUrl) {
   const title = String((jd && jd.title) || "").trim();
   if (/^(not found|404|page not found|job not found)$/i.test(title)) return 'the posting page reports "' + title + '"';
   if (/^current openings at/i.test(title)) return 'it redirected to the board index ("' + title + '")';
+  // iCIMS says so in the URL, and it is the clearest signal any of these tenants gives: a dead job id
+  // redirects to the tenant's OWN job-search page carrying `notFound=1` (measured 2026-08-18 — three of
+  // four postings taken from a search index were already closed, every one answering this way). Checked
+  // ahead of the id rule below because it names the cause instead of describing the symptom.
+  if (/[?&]notfound=1(&|$)/i.test(String(landedUrl || ""))) return "the tenant's own search page answered notFound=1 for it";
   const idOf = (u) => {
     const t = String(u || "");
     const m = /\/jobs?\/(\d{4,})/.exec(t) ||

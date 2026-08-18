@@ -5003,7 +5003,26 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     if (ats === "icims") {
       emitRunProgress("Signing in to the careers portal", "iCIMS");
       const pre = await runIcimsPreForm(tabId, store.credentials || null, LOG);
-      if (pre.halt) return { ...pre.halt, jd, ats };
+      // ⚠ A CLOSED POSTING IS NOT A BROKEN APPLY FINDER. iCIMS answers a dead job id by REDIRECTING to
+      // its own job-search page with `notFound=1`, which is a page with no auth fields and no Apply
+      // control — so the pre-form correctly finds nothing to act on and says `apply-not-followable`,
+      // which reads exactly like our finder failed on a live posting. Measured 2026-08-18: three of four
+      // postings taken from a search index were already closed, so this is the COMMON case when testing,
+      // not an edge one. atsPostingGone already knew the general rule (the requested id is absent from
+      // the url we landed on) and was simply never consulted here — the iCIMS stage returns before the
+      // form wait, which is where the other tenants check it.
+      if (pre.halt) {
+        if (pre.halt.stopped === "apply-not-followable") {
+          const at = await cdpEval(function () { return location.href; }).catch(() => null);
+          const gone = atsPostingGone(jd, originUrl || startUrl, at);
+          if (gone) {
+            LOG(`this posting is GONE — ${gone}`);
+            return { ok: true, needs_operator: true, stopped: "posting-gone", jd, ats,
+              detail: "This job is no longer posted — " + gone + ". Nothing is wrong with the fill; pick another posting." };
+          }
+        }
+        return { ...pre.halt, jd, ats };
+      }
     }
     emitRunProgress("Waiting for the form", ats);
     let ready = await waitAtsFormReady(ats, LOG);
@@ -5270,7 +5289,20 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (ats === "icims") {
       const preCreds = await new Promise((r) => chrome.storage.local.get(["credentials"], r));
       const pre = await runIcimsPreForm(tabId, (preCreds && preCreds.credentials) || null, LOG);
-      if (pre.halt) return { ...pre.halt, submitted: false, replayed: false, ats };
+      // Same closed-posting rule as the fill run: a job can be pulled between the fill and the submit,
+      // and "we could not find the Apply control" would send the operator to debug a dead requisition.
+      if (pre.halt) {
+        if (pre.halt.stopped === "apply-not-followable") {
+          const at = await cdpEval(function () { return location.href; }).catch(() => null);
+          const gone = atsPostingGone(null, bundle.url || (opts && opts.startUrl), at);
+          if (gone) {
+            LOG(`this posting is GONE — ${gone}`);
+            return { ok: true, needs_operator: true, submitted: false, replayed: false, stopped: "posting-gone", ats,
+              detail: "This job is no longer posted — " + gone + ". Nothing was replayed or submitted." };
+          }
+        }
+        return { ...pre.halt, submitted: false, replayed: false, ats };
+      }
     }
     let ready = await waitAtsFormReady(ats, LOG);
     // Same landing recovery the FILL run has: the form may be EMBEDDED on this page.

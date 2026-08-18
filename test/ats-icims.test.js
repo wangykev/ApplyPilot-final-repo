@@ -529,6 +529,22 @@ test("atsFormSignature: field SET + which fields hold a value — not the option
   assert.strictEqual(sig(null), "0|", "an unreadable scan is a signature, not a crash");
 });
 
+test("atsPostingGone: iCIMS answers a dead job id with notFound=1 on its own search page", () => {
+  // Measured 2026-08-18: three of four postings taken from a search index were already closed, every
+  // one redirecting this way. Without this the run says `apply-not-followable` — "we could not find the
+  // Apply control" — which sends the operator to debug a live-looking page for a job that is gone.
+  const landed = "https://careersen-itt-inc.icims.com/jobs/search?ss=1&notFound=1&mobile=false";
+  const gone = ats.atsPostingGone({ title: "Job Listings at ITT Inc." },
+    "https://careersen-itt-inc.icims.com/jobs/15295/electrical-engineering-intern/job", landed);
+  assert.ok(gone, "a notFound=1 landing is a closed posting");
+  assert.match(gone, /notFound=1/);
+  // a LIVE posting must never read as gone — the id is still in the url we landed on
+  const live = "https://careersen-itt-inc.icims.com/jobs/17169/intern-co-op-1/job";
+  assert.strictEqual(ats.atsPostingGone({ title: "INTERN/Co-op 1 in Bogota" }, live, live), null);
+  // …and the frame's own `in_iframe=1` url is still the same posting, not a redirect away from it
+  assert.strictEqual(ats.atsPostingGone({ title: "INTERN/Co-op 1" }, live, live + "?in_iframe=1"), null);
+});
+
 // ── a legal consent on the sign-in card is REPORTED, never ticked ───────────────────────
 //
 // ITT's Bogotá posting (live 2026-08-18) gates its sign-in behind an unchecked `aria-required`

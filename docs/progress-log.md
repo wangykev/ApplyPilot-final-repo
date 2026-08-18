@@ -5359,6 +5359,58 @@ attach-once + ordering, no-second-upload, router-decides-which-file-field, no-ea
 watch re-arm, the signature's identity). Observed DOM + the rejected alternatives:
 `docs/dom-patterns.md` `2026-08-17 (c)`.
 
+## 2026-08-18 (b) — LIVE: four more iCIMS tenants, and the pipeline was Astrion-shaped
+
+Asked whether iCIMS works for ANY tenant. It did not, and the reasons were structural rather than
+per-tenant quirks. Tenants sampled: **ITT** (`careersen-itt-inc`), **Peraton** (`careers-peraton`),
+**Cretex** (`rms-cretex`), **Wieland/Chase Brass** (`careers-chasebrass`), against **Astrion** as the
+control. Every run a FILL; nothing submitted.
+
+| tenant | outcome |
+|---|---|
+| Cretex | **fill works end to end** — signed in, 81 fields, résumé attached + parse settled, reported 200 |
+| ITT | **externally blocked** — `consent-required` (a GDPR box only the operator may tick) |
+| Peraton | **externally blocked** — `consent-required` ×2 ("I accept the Privacy Policy", "…Job Application Privacy Notice") |
+| Wieland | gate is consent-free (email + hCaptcha), not run further |
+| Astrion | control — unchanged, still passes |
+
+**FAULT 1 — the content frame was unreachable on a POSTING page.** `cdpUseFormFrame` accepts a frame
+only if it holds ≥N *form controls*. That is the right test for "which frame has the application form"
+and the wrong one for "which frame is this tenant's content": an `<tenant>.icims.com/jobs/<id>/…/job`
+page keeps the job description **and its lone `<a>Apply for this job online</a>`** inside
+`#icims_content_iframe`, with zero form controls, so nothing was pinned and every eval read the top
+document — 13 characters of branding. The run reported `controls 0 frame none apply no-apply-button`
+and halted `apply-not-followable` on a page whose Apply link works by hand.
+
+*Why it survived two days of testing:* Astrion is reached from an **employer portal**, where the Apply
+link really is in the top document. The shape we built against is the exception; most iCIMS links are
+the posting page. `minControls:0` is now reachable but must be identity-anchored (the frame's own url,
+read from the page's own `<iframe src>`), an identified frame outranks a fuller one, and an unanchored
+0-floor call is refused — pinning an analytics iframe would blind the caller in a new way, silently.
+`cdpEval`'s re-arm reproduces how the pin was obtained rather than a hardcoded floor.
+
+**FAULT 2 — a legal consent was reported as a broken button.** With the frame reachable, ITT clicked
+Apply, reached the gate, wrote the email, and halted `auth-submit-unavailable … (submit-disabled)`. The
+real cause was an UNCHECKED `aria-required` `#accept_gdpr` whose own row says *"You must indicate that
+you have read the privacy notice … before you can continue"*. iCIMS `preventDefault`s the submit and
+disables its own button, so an unticked consent is indistinguishable from a dead control — and the
+message sent us to debug a click that was fine. Now `consent-required`, named and quoted, halting
+before anything is written. **2 of 5 tenants gate this way**, so it is a normal iCIMS configuration,
+not an oddity — and the bot never ticks a legal agreement to get a run further.
+
+**A THIRD, cheaper finding: three of four postings taken from a search index were already CLOSED**, and
+iCIMS answers a dead job id by redirecting to its own job-search page with `notFound=1`. The pre-form
+stage therefore found nothing to click and said `apply-not-followable` — "we could not find the Apply
+control" — for a job that no longer exists. `atsPostingGone` already knew the general rule and was
+simply never consulted on this path; it now is, on both run paths, and reads iCIMS' explicit signal.
+
+**Open, not fixed:** Cretex's required `-1_CandProfileFields.Degree` reported `no option matched
+"Bachelor of Science" (after searching) — the list was empty`. It reached review honestly, so nothing
+was guessed, but whether the tenant's list is genuinely empty or we read the wrong container is
+UNSETTLED — the session did not outlive the run, so the widget could not be inspected afterwards.
+Worth one signed-in look before assuming either. Cretex's fill also left 42 of 81 fields needing
+review, which is what an unmapped tenant full of per-customer `rcf` questions looks like.
+
 ## 2026-08-18 — LIVE: the résumé round, both arms, and the bug only a rehearsal could find
 
 Six runs on Astrion (`careers.astrion.us/jobs/24615`), extension loaded from this worktree and proven so
