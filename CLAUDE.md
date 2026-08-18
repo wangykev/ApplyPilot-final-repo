@@ -662,8 +662,14 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   gate's submit is `preventDefault`-ed and only proceeds on `hcaptcha.execute`'s callback; measured,
   hCaptcha **never initialises** under the blob-worker timer polyfill (`captchaFrames 0` under a run vs a
   rendered iframe by hand). Isolated to the WORKER alone, not the CSP bypass, so iCIMS runs pass
-  `{noWorkerTimers:true}` to `cdpInstallPageOverrides` and accept `hidden-SLOW` pacing (measured price:
-  28.7s/108 fields — iCIMS is server-rendered jQuery, so it leans on page timers far less than Workday).
+  `{noWorkerTimers:true}` to `cdpInstallPageOverrides` and accept `hidden-SLOW` pacing. **Measured A/B
+  2026-08-17: hidden 37.2s vs visible 16.6s (2.24×), and the whole gap is per-field PAGE CONTACT (26.5s
+  vs 6.5s), NOT SW drift** (~1.1s — and the VISIBLE run's overrun was worse, so Workday's
+  drift-dominates conclusion does not transfer here). ⛔ **DO NOT close that gap by giving the FORM the
+  polyfill: the form carries its OWN captcha** (2 hcaptcha frames + an `h-captcha-response` input), so
+  Submit Profile is captcha-gated exactly like the gate and the failure mode is silent. Round 11 of
+  `docs/fill-speed-log.md`, including the one untested lever (fast pacing on a non-React page, where
+  every pace is read-back gated so a short wait costs a retry, not a miss).
   **This is NOT captcha handling and must never become it:** it removes OUR tampering so the page's own
   check can run and judge the session — nothing is solved, forged or hidden, and a refusal still halts for
   the operator. The gate also **disables its own button** on submit (`icimsDisableSaveAndSubmitButtons`) and

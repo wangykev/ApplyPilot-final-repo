@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "replay-fixes-3";
+const AP_BUILD_MARKER = "captcha-probe-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -857,7 +857,20 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             });
           }, message.rowsFor).catch((e) => ({ error: String((e && e.message) || e) }));
         }
-        sendResponse({ ok: true, scan, submitState: state, rows });
+        // Is there an hCaptcha on THIS document at all? The sign-in gate has one (invisible), which is
+        // why iCIMS runs decline the worker-timer polyfill and pay a ~2.2x hidden penalty. Whether the
+        // FORM also has one decides whether that concession has to cover the whole run or only the gate.
+        let captcha = null;
+        try {
+          captcha = await cdpEval(function () {
+            const q = (s) => document.querySelectorAll(s).length;
+            return { hcaptchaFrames: q('iframe[src*="hcaptcha"]'), recaptchaFrames: q('iframe[src*="recaptcha"]'),
+              widgets: q('.h-captcha,[data-sitekey],#h-captcha'), responseInputs: q('[name="h-captcha-response"],[name="g-recaptcha-response"]'),
+              apiScripts: [...document.querySelectorAll("script[src]")].filter((s) => /hcaptcha|recaptcha/i.test(s.src)).length,
+              hcaptchaGlobal: typeof window.hcaptcha };
+          });
+        } catch (e) { captcha = { error: String((e && e.message) || e) }; }
+        sendResponse({ ok: true, scan, submitState: state, rows, captcha });
       } catch (e) {
         sendResponse({ ok: false, error: String((e && e.message) || e) });
       } finally {
