@@ -5359,6 +5359,43 @@ attach-once + ordering, no-second-upload, router-decides-which-file-field, no-ea
 watch re-arm, the signature's identity). Observed DOM + the rejected alternatives:
 `docs/dom-patterns.md` `2026-08-17 (c)`.
 
-⚠ **NOT live-verified yet.** The next live round should watch the postback land, confirm the fill writes
-on top of it, and re-run a rehearsal to confirm it still reaches `WOULD CLICK SUBMIT` with the résumé
-attached — the entry ids are the thing to watch, since the parse re-mints them.
+## 2026-08-18 — LIVE: the résumé round, both arms, and the bug only a rehearsal could find
+
+Six runs on Astrion (`careers.astrion.us/jobs/24615`), extension loaded from this worktree and proven so
+by a build marker bumped and re-read each time (`icims-resume-1/2/3`). Every run a FILL or a DRY
+rehearsal; `arm` never set; nothing submitted.
+
+**The résumé stage does what it was built to do, and the postback is real.** Every run saw it:
+
+| run | pacing (measured) | parse landed | form settled | stage | outcome |
+|---|---|---|---|---|---|
+| fill | `visible-fast` · `tab VISIBLE, painting (visible)` | 9.0s | 13.8s | 14.1s | 106 fields, 3 review, reported 200 |
+| fill | `hidden-fast (page-clock-independent)` · `tab HIDDEN, painting (hidden)` | 8.4s | 13.6s | 13.7s | 106 fields, 3 review, reported 200 |
+| rehearsal | `visible-fast` | 17.6s | 21.0s | 21.3s | 106 replayed, **0 failures** → WOULD CLICK SUBMIT |
+| rehearsal | `hidden-fast` | 9.4s | 14.2s | 14.3s | 106 replayed, **0 failures** → WOULD CLICK SUBMIT |
+
+Plus one earlier unlabelled rehearsal per arm, also 0 failures — so each arm passed TWICE (the
+rehearse-twice rule). The 3 review items are the pre-existing `default-value` day-of-month flags, and
+the résumé itself reaches review as `filled · Kevin's Resume.pdf`.
+
+**THE BUG: entry ids are per-visit once the parse SAVES entries.** The first rehearsal failed —
+`verify-failed`, **45 of 45** Experience fields reporting `approved value has NO matching field on the
+live form` — on a form whose approved values were all present. The fill's bundle was keyed on the ids
+iCIMS minted for it (`-8455804/5/6_`) and the rehearsal's own parse served fresh ones
+(`-8459967/8/9_`). Before the résumé this could not happen: entries were positional (`-1_`, `-2_`,
+`-3_`), identical every visit. `atsSubmitKey` keys a section entry by POSITION
+(`@experience[0]/<bare id>`) from the stamp both sides already carry. Same bundle, next run:
+`106 field(s) replayed, 0 failure(s)`. Not one of the 45 was an `Address*`/`Phone*` field — the parse
+only re-mints what it saves — so everything unstamped keeps its old key.
+
+*This is the whole argument for live-verifying a change that unit tests already cover.* 13 tests passed
+against the fill path while the submit path could not replay a single work-history field.
+
+**Two things the round changed on evidence, not reasoning:**
+- **The change budget was luck, not headroom.** Parse landings measured 8.4 · 9.0 · 9.4 · 10.5 · 12.9 ·
+  17.6s against a 20s budget — and past that budget a quiet form is taken at face value, which is
+  exactly when a late postback would overwrite a fill in progress. Now 45s (~2.5× the slowest observed),
+  free in the normal case because every run exited early on the change it saw.
+- **A rehearsal now states its own pacing.** The submit run never logged `[ATS-PACING]` while the fill
+  run always has, so two clean rehearsals had no ground truth for "was that hidden?" — `background:false`
+  at the call site is an intention, not an observation.

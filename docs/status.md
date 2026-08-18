@@ -71,9 +71,11 @@ Remaining, in rough order:
    out (signature changed → panel quiet, both polled) — so the parse can only overwrite an empty form.
    The fill loop never attaches on iCIMS; it records the stage's outcome. Runs on the FILL and the
    rehearsal/submit runs, because a bundle captured from an unparsed form cannot be replayed against a
-   parsed one. `kind:"resume"` now. **NOT yet live-verified** — unit-pinned only (12 tests); the next
-   live round should watch the postback land and confirm the fill writes on top of it, then re-run a
-   rehearsal to confirm the verify still reaches `WOULD CLICK SUBMIT` with the résumé attached.
+   parsed one. `kind:"resume"` now. **LIVE-VERIFIED 2026-08-18, both arms** — fill + dry rehearsal,
+   visible and hidden, each rehearsal arm passing twice: `106 field(s) replayed, 0 failure(s)` →
+   `▶▶ WOULD CLICK SUBMIT ◀◀`, with the postback observed landing at 8.4–17.6s every run. That round
+   also found and fixed the entry-id bug below (`atsSubmitKey`) and widened the parse change budget to
+   45s on the measured landings. Details: `docs/progress-log.md` 2026-08-18.
 3. **Multi-entry repeating sections.** `atsMapKey` strips the entry ordinal, which is correct for ONE
    address against one form entry — but a SECOND entry would map to the same profile address. Phones /
    Certifications / Experience all have the same shape (`a.iCIMS_Anchor` "Add More (…)").

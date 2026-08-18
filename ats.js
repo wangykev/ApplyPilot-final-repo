@@ -3258,8 +3258,15 @@ const ATS_ICIMS_PARSE = {
   pollMs: 900,        // one read-only scan per tick (waitAtsFormReady already polls this at 450ms)
   quietMs: 1500,      // no mutation for this long ⇒ the postback has finished rendering
   stableReads: 3,     // …and the signature agreed that many times (the waitAtsFormReady bar)
-  changeMs: 20000,    // how long the postback gets to START before we accept "it changed nothing"
-  ceilingMs: 75000,   // total budget: attach → parse → quiet. Generous by design (see above).
+  // How long the postback gets to START before we accept "it changed nothing". ⚠ THIS IS THE ONE
+  // NUMBER THAT CAN LET A PARSE LAND MID-FILL: past it, a quiet form is taken at face value, so a
+  // postback arriving later would overwrite fields we had already written. Six live runs on Astrion
+  // (2026-08-18) landed the parse at 8.4 · 9.0 · 9.4 · 10.5 · 12.9 · 17.6s — the worst case was only
+  // 2.4s inside the 20000 this shipped with, which is not headroom, it is luck. 45s is ~2.5× the
+  // slowest observed. It costs NOTHING in the normal case: every one of those runs saw the change and
+  // exited on quiet+stable (~14s), so only a form whose parse genuinely produces nothing waits it out.
+  changeMs: 45000,
+  ceilingMs: 120000,  // total budget: attach → parse → quiet. Generous by design (see above).
 };
 // The quiet watch observes the PARENT of what it is given, so this hands it the profile panel and gets
 // the whole form. Absent ⇒ cdpInstallQuietWatch falls back to document.body, which inside the iCIMS
