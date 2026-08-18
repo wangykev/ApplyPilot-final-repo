@@ -274,6 +274,7 @@ function cdpAttach(tabId) {
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
       _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
       _pageClockOn = false;                    // page-clock pacing is per-run opt-in (FILL/REPLAY only) — onboarding/auth/recon stay SW-timed
+      _fastWhenHidden = false;                 // fast-while-hidden is per-run opt-in (a page whose reactions are not page-timer driven)
       _frameCtxId = null;                      // frame-scoped eval is per-run opt-in (iCIMS only) — everything else evaluates in the top frame
       _frameCtxUrl = null;
       _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
@@ -993,8 +994,36 @@ async function cdpTimersFast() {
 // installed → slow (today's behavior; skip the probe). Hidden + worker installed →
 // fast ONLY if timers MEASURE fast (the honest gate against a fast wait on a still-
 // throttled page — the false-verify class the whole design guards against).
+// ── FAST PACING ON A HIDDEN TAB WHOSE PAGE DOES NOT NEED PAGE TIMERS ─────────────────────
+// SCOPED OPT-IN, a sibling of cdpSetSyntheticInput / cdpSetPageClock, and a DIFFERENT AXIS from the
+// page clock: that one chooses WHERE a pace sleeps, this one chooses HOW LONG.
+//
+// The `!_workerTimersActive ⇒ slow` rule below exists because a hidden page's OWN setTimeout rides
+// Chrome's ~1Hz throttle, so the debounced REACT re-renders a Workday fill waits on genuinely take
+// ~1s. iCIMS is not that page: server-rendered jQuery, no React (docs/dom-patterns.md 2026-08-16), so
+// what we wait for is an AJAX reply (network events are not timer-throttled) or a synchronous DOM write
+// after a native setter. Neither needs the page's clock to tick fast.
+//
+// And it declines the worker polyfill on purpose — its captcha will not initialise under it — so
+// without this an iCIMS hidden run pays FULL pacing on every field: measured 37.2s hidden vs 16.6s
+// visible, with the entire gap in per-field time (26.5s vs 6.5s). See round 11 of
+// docs/fill-speed-log.md.
+//
+// ⚠ WHY THIS IS NOT A NEW TIMING REGIME: it applies the SAME FAST_FACTOR every VISIBLE run already
+// uses, to a hidden tab. And it is latency-safe rather than coverage-safe by luck — every adaptive-pace
+// site is gated by a read-back or a poll, so a too-short wait costs a RETRY, never a silent wrong fill
+// (CLAUDE.md's pacing rule, and standing conclusion 3 of the speed log: a monotone or stability
+// predicate can be noticed late, never missed).
+// Reset at every cdpAttach, so it can never leak into a tenant that has not claimed it.
+let _fastWhenHidden = false;
+function cdpSetFastWhenHidden(on) {
+  _fastWhenHidden = !!on;
+  if (on) console.log("[ApplyPilot][CDP] fast pacing allowed while HIDDEN for this run — this page's reactions are AJAX/DOM, not page-timer driven, and every pace site is read-back gated (a short wait costs a retry).");
+}
+
 async function cdpFast() {
   if (await cdpVisible()) return true;
+  if (_fastWhenHidden) return true;
   if (!_workerTimersActive) return false;
   return await cdpTimersFast();
 }
@@ -1018,6 +1047,9 @@ async function cdpVisibilityLabel() { return (await cdpVisible()) ? "visible" : 
 // the whole-run bottleneck class, not something the adaptive budgets can fix. Cheap (TTL-cached reads).
 async function cdpPacingLabel() {
   if (await cdpVisible()) return "visible-fast";
+  // Named distinctly from the worker-timer path so a timing line still says WHY it is fast: this one is
+  // fast because the page does not need its own clock, not because the polyfill is holding it up.
+  if (_fastWhenHidden) return "hidden-fast (page-clock-independent)";
   if (!_workerTimersActive) return "hidden-SLOW (no worker timers)";
   return (await cdpTimersFast()) ? "hidden-fast (worker timers)" : "hidden-SLOW (worker throttled)";
 }

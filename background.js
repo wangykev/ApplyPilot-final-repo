@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "captcha-probe-1";
+const AP_BUILD_MARKER = "fast-hidden-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4866,6 +4866,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // hide anything, and a refusal still halts for the operator. Costs a hidden run its fast timers
     // on this tenant — the right trade against a gate that cannot be passed at all.
     await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined);
+    // …and COMPENSATE for that decline. Declining the polyfill costs a hidden run FULL pacing on every
+    // field (measured 37.2s hidden vs 16.6s visible, the whole gap in per-field time). iCIMS does not
+    // need the page's clock to tick fast — it is server-rendered jQuery, so a pace waits on an AJAX
+    // reply or a synchronous DOM write — so the fast pace is allowed while hidden. See cdpSetFastWhenHidden
+    // for why that is latency-safe rather than lucky: every pace site is read-back or poll gated.
+    if (ats === "icims") cdpSetFastWhenHidden(true);
     await cdpSetFocusEmulation(true).catch(() => {});
     // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
     // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
@@ -5165,6 +5171,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
     await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined); // see the fill run: its sign-in gate's invisible hCaptcha will not initialise under the polyfill
+    if (ats === "icims") cdpSetFastWhenHidden(true); // …and the same compensation the fill run makes
     await cdpSetFocusEmulation(true).catch(() => {});
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real

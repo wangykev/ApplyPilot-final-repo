@@ -667,9 +667,14 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   vs 6.5s), NOT SW drift** (~1.1s — and the VISIBLE run's overrun was worse, so Workday's
   drift-dominates conclusion does not transfer here). ⛔ **DO NOT close that gap by giving the FORM the
   polyfill: the form carries its OWN captcha** (2 hcaptcha frames + an `h-captcha-response` input), so
-  Submit Profile is captcha-gated exactly like the gate and the failure mode is silent. Round 11 of
-  `docs/fill-speed-log.md`, including the one untested lever (fast pacing on a non-React page, where
-  every pace is read-back gated so a short wait costs a retry, not a miss).
+  Submit Profile is captcha-gated exactly like the gate and the failure mode is silent. **The gap is
+  closed the OTHER way instead: `cdpSetFastWhenHidden(true)`** — a scoped per-run opt-in (reset at every
+  attach, so it cannot leak to Workday) that lets `cdpFast()` say yes on a hidden tab because iCIMS'
+  reactions are AJAX/DOM, not page-timer driven. Hidden went **37.2s → 15.1s, parity with visible's
+  16.6s**, with `needs_review` unchanged and the rehearsal still `0 failure(s)`. ⚠ A DIFFERENT AXIS from
+  `cdpSetPageClock`: that chooses WHERE a pace sleeps, this chooses HOW LONG. Safe because it applies the
+  SAME `FAST_FACTOR` every visible run uses and every pace site is read-back gated — a short wait costs a
+  retry, never a silent wrong fill. Rounds 11–12 of `docs/fill-speed-log.md`.
   **This is NOT captcha handling and must never become it:** it removes OUR tampering so the page's own
   check can run and judge the session — nothing is solved, forged or hidden, and a refusal still halts for
   the operator. The gate also **disables its own button** on submit (`icimsDisableSaveAndSubmitButtons`) and
