@@ -5359,6 +5359,41 @@ attach-once + ordering, no-second-upload, router-decides-which-file-field, no-ea
 watch re-arm, the signature's identity). Observed DOM + the rejected alternatives:
 `docs/dom-patterns.md` `2026-08-17 (c)`.
 
+## 2026-08-18 (c) — PRE-MERGE regression: all four pipelines live, six runs, nothing submitted
+
+Before merging the day's work (résumé-first, the submit key, the posting-page frame, consent accept, the
+clearance field) to main. The risk was never iCIMS — it was that `lib.js`, `fill-driver.js` and `cdp.js`
+are loaded by EVERY pipeline, so the clearance rung and the frame-arming change could regress Workday and
+the other three ATSs. Build marker `premerge-regress-1`, every run hidden, every run a FILL or a dry
+rehearsal.
+
+| pipeline | fixture | result |
+|---|---|---|
+| **Workday fill** | cat.wd5 `R0000388155` (fresh req) | ✅ `✓✓ reached the REVIEW page after 5 page(s)`, `audit_flagged 0` on all 5, no nav-timeout |
+| **Workday rehearsal** | same req, approved 2/2 | ✅ 5 pages replayed `0 FAILED` each · `AGREE 49 · DISAGREE 0` · **`SUBMIT GATE PASSED`** |
+| **Greenhouse** | Discord `8625545002` | ✅ 26 fields, 7 review, reported |
+| **Lever** | Shield AI | ✅ 38 fields, 7 review, reported |
+| **Ashby** | Linear | ✅ 14 fields, 7 review, reported |
+| **iCIMS** | Astrion (106-field form) | ✅ 106 fields, 3 review — identical to pre-refactor |
+
+**What each one was actually testing:**
+- The Workday pair is the only thing that exercises `fill-driver.js`'s flat loop with the new clearance
+  rung in place, the `deterministicTierFor` tier (which the AI-batch planner consults), the two rescue
+  exclusions and the backstop exclusion — plus `cdpEval`'s changed re-arm path. The REHEARSAL additionally
+  covers the replay walk and the review-page reconcile, both of which read the `apMatch` literal the
+  clearance helpers were added to.
+- `resume 0.6s` on Greenhouse and `0.1s` on Lever is the signal that the iCIMS résumé STAGE did not leak
+  into the other tenants: those still attach inside the fill loop, as before.
+- iCIMS re-run because the `lib.js` refactor moved the clearance recognizer AFTER the last iCIMS run of
+  the day — the fill had to be re-proven against the shared helper, and came back with the same numbers.
+
+**Pre-existing, not a regression:** Greenhouse's `school--0` async widget never answered (31.4s) — the
+documented Discord/GH combobox limitation, reported honestly rather than retried.
+
+**A second sighting of the slow parse:** Astrion landed its parse at **21.5s** (settled 26.2s), the second
+run today past the 20s budget the code shipped with this morning. Two of ~9 observed parses would have
+been mis-called "no postback" under the old number.
+
 ## 2026-08-18 (b) — LIVE: four more iCIMS tenants, and the pipeline was Astrion-shaped
 
 Asked whether iCIMS works for ANY tenant. It did not, and the reasons were structural rather than
