@@ -28,7 +28,13 @@ const atsLib = (typeof module !== "undefined" && module.exports)
   : { normalize: normalize, matchCandidates: matchCandidates, normalizeLabel: normalizeLabel,
       ensureHttps: ensureHttps, canonicalJobUrl: canonicalJobUrl, isAiPlaceholder: isAiPlaceholder,
       AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV,
-      isSignatureDateQuestion: isSignatureDateQuestion };
+      isSignatureDateQuestion: isSignatureDateQuestion,
+      // Security clearance: recognizer + candidate ladder, shared with the Workday driver's own rung so
+      // the two engines answer a clearance question identically.
+      recognizeClearanceQuestion: recognizeClearanceQuestion, clearanceCandidates: clearanceCandidates,
+      // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
+      // join/split exactly the way groups do — see the multiselect commit path.
+      joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN };
 const atsFd = (typeof module !== "undefined" && module.exports)
   ? require("./fill-driver.js")
   : { resolve: resolve, buildReviewBundle: buildReviewBundle, buildBucketIndex: buildBucketIndex,
@@ -48,6 +54,11 @@ function detectAts(url) {
   if (host === "job-boards.greenhouse.io" || host === "boards.greenhouse.io" || host === "job-boards.eu.greenhouse.io" || host === "boards.eu.greenhouse.io") return "greenhouse";
   if (host === "jobs.lever.co" || host === "jobs.eu.lever.co") return "lever";
   if (host === "jobs.ashbyhq.com") return "ashby";
+  // ⚠ iCIMS is the ONE suffix test here, and it is deliberate: unlike the three above, iCIMS gives
+  // every customer its own subdomain (astrioncareers-astrion.icims.com, careers-acme.icims.com), so
+  // an exact-host allowlist cannot work. ANCHORED at a dot or start so `icims.com.evil.com` and
+  // `fakeicims.com` still return null — the same discipline test/ats.test.js pins for the others.
+  if (/(^|\.)icims\.com$/.test(host)) return "icims";
   return null;
 }
 
@@ -68,6 +79,9 @@ function atsFormUrl(ats, url) {
       u.pathname = /\/application$/i.test(path) ? path : path + "/application";
       return u.origin + u.pathname;
     }
+    // ⚠ iCIMS falls to the default below, and KEEPING THE QUERY IS LOAD-BEARING — not incidental
+    // like greenhouse's gh_jid. An iCIMS apply link carries the one-time magic-link session in
+    // `?eem=…&code=…`; strip it and the run lands on a sign-in page with no form at all.
     return u.origin + u.pathname + u.search; // greenhouse: same page (gh_jid etc. kept — harmless)
   } catch (e) { return String(url == null ? "" : url); }
 }
@@ -78,11 +92,50 @@ function atsFormUrl(ats, url) {
 function atsCompanyFromUrl(url) {
   try {
     const u = new URL(String(url));
-    if (!detectAts(url) || detectAts(url) === "workday") return null;
+    const kind = detectAts(url);
+    if (!kind || kind === "workday") return null;
+    // ⚠ iCIMS puts the company in the SUBDOMAIN, not the path — path segment 0 is the literal
+    // "jobs", which would hand the safety-critical employment recognizer the anchor "Jobs" and make
+    // every "have you worked for us before?" question compare against a word no employer is called.
+    // The subdomain is `<portal>-<tenant>` (astrioncareers-astrion) or a bare tenant; the LAST
+    // hyphen segment is the tenant, and a trailing careers/jobs token is portal naming, not a name.
+    if (kind === "icims") {
+      let label = (u.hostname.toLowerCase().split(".")[0] || "");
+      const parts = label.split("-").filter(Boolean);
+      let seg = parts.length > 1 ? parts[parts.length - 1] : label;
+      seg = seg.replace(/(careers|jobs|portal)$/i, "").trim();
+      if (!seg) return null;
+      return seg[0].toUpperCase() + seg.slice(1);
+    }
     const seg = (u.pathname.split("/").filter(Boolean)[0] || "").replace(/[-_]+/g, " ").trim();
     if (!seg || seg === "embed") return null;
     return seg.split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
   } catch (e) { return null; }
+}
+
+// IS THIS STRING A COMPANY NAME, OR A PAGE TITLE THE SCRAPE MISTOOK FOR ONE? An employer-hosted
+// careers page has no ATS markup for the JD scrape to key on, so its company heuristic can fall
+// back to the document title — live 2026-08-16 on careers.astrion.us it produced
+// "Engineering Directorate Support Intern in Mountain View, California | Astrion".
+//
+// That is not cosmetic. `jobContext.company` is the anchor for the SAFETY-CRITICAL employment
+// recognizer ("have you worked for us before?"), and comparing a tenant's own question against a
+// job title means the anchor silently never matches. CLAUDE.md already names the same hazard for
+// iCIMS' path segment: hand the recognizer a word no employer is called and every such question
+// misreads.
+//
+// Deliberately a NEGATIVE test with loud tells, not a cleverer parser: a real name is short and
+// carries no title furniture. Anything it rejects falls back to the URL-derived tenant, which is
+// evidence rather than a guess; anything it can't judge is KEPT, so the existing Greenhouse /
+// Lever / Ashby behaviour is unchanged.
+function atsPlausibleCompany(name) {
+  const s = String(name == null ? "" : name).replace(/\s+/g, " ").trim();
+  if (!s) return false;
+  if (s.length > 48) return false;                 // names are short; titles run on
+  if (/[|·—]/.test(s)) return false;               // "<title> | <Company>" separators
+  if (/\bin\s+[A-Z][\w.'-]+,\s*[A-Z]/.test(s)) return false;  // "… in Mountain View, California"
+  if (/\b(intern|engineer|manager|analyst|developer|scientist|director|specialist|technician|associate|architect)\b/i.test(s)) return false;
+  return true;
 }
 
 // ── Static field maps (pure) ─────────────────────────────────────────────────────────────
@@ -137,6 +190,87 @@ const ATS_STATIC_MAPS = {
     "_systemfield_email": { path: "personal_info.email" },
     "_systemfield_resume": { kind: "resume" },
     "_systemfield_location": { kind: "location", compose: "city_state" },
+  },
+  // iCIMS (traced live 2026-08-16 — astrioncareers-astrion.icims.com, 118 controls inside
+  // `#icims_content_iframe`). Unlike the three above, these ids are PLATFORM fields, not per-customer
+  // ones: `PersonProfileFields.*` / `PortalProfileFields.*` are iCIMS' own vocabulary and should hold
+  // on every tenant. Per-customer questions are the `rcf<NNNN>` ids, which are deliberately NOT mapped
+  // — they route through the label ladder like every other custom question.
+  //
+  // ⚠ Keys are the id with any REPEATING-ENTRY ORDINAL STRIPPED (`atsMapKey`): the live ids for the
+  // address and phone blocks are `-1_PersonProfileFields.AddressCity`, `-1_PersonProfileFields.PhoneNumber`.
+  // Keying them bare is safe because `PersonProfileFields.Address*` / `.Phone*` are iCIMS' OWN vocabulary
+  // for the CANDIDATE — a work-history employer's address or phone is a per-customer `rcf<NNNN>` and
+  // cannot collide. But the ordinal still matters: the form can render a SECOND entry, and a bare-id
+  // map would hand it a duplicate of the first. The repeat is DETECTED from the page rather than
+  // declared here — see `repeatIndex` in atsAssignEntryIndexes — so only the first entry the form
+  // renders is mapped, on any tenant, whether or not its blocks happen to repeat.
+  icims: {
+    // ── The "Create a login" block. THIS ACCOUNT IS CREATED BY THE SUBMISSION ──────────────
+    // Not a sign-in form and not a profile edit: on this class of application the account is created
+    // as part of submitting, so the credential block is simply another section of the form and must
+    // be filled like any other. A prepopulated value is REPLACED — the account this application
+    // creates has to use the credentials stored on the website. See the credential tier in
+    // atsRouteField for the safety properties that make that safe.
+    "PersonProfileFields.Login": { kind: "credential", credentialKind: "login" },
+    "PersonProfileFields.Password": { kind: "credential", credentialKind: "password" },
+    "PersonProfileFields.Password_Confirm": { kind: "credential", credentialKind: "password_confirm" },
+    // ── Identity ──────────────────────────────────────────────────────────────────────────
+    // ⚠ Email is the PROFILE's address and is deliberately NOT the login above: the two are allowed to
+    // differ (a plus-addressed account login against a plain contact address), and conflating them
+    // would silently file the application under the wrong contact.
+    "PersonProfileFields.FirstName": { path: "personal_info.first_name" },
+    "PersonProfileFields.MiddleName": { path: "personal_info.middle_name" },
+    "PersonProfileFields.LastName": { path: "personal_info.last_name" },
+    "PersonProfileFields.Email": { path: "personal_info.email" },
+    // ── The candidate's own address (a REPEATING section: "Add More (Addresses)") ──────────
+    // Keyed WITHOUT the entry ordinal — the live ids are `-1_PersonProfileFields.AddressCity`, and
+    // the ordinal is stripped before this lookup (see atsMapKey). Safe to key by id here precisely
+    // because `PersonProfileFields.Address*` is iCIMS' own vocabulary for the CANDIDATE's address:
+    // a work-history employer address is a per-customer `rcf<NNNN>` group, so it cannot collide.
+    // ⚠ Country is TIERED in the profile (an array), which resolve() passes through as a ready-made
+    // candidate ladder — that is what lets "United States of America" fall back to "United States",
+    // which is the text this form actually offers.
+    "PersonProfileFields.AddressStreet1": { path: "personal_info.address_line_1" },
+    "PersonProfileFields.AddressStreet2": { path: "personal_info.address_line_2" },
+    "PersonProfileFields.AddressCity": { path: "personal_info.city" },
+    "PersonProfileFields.AddressZip": { path: "personal_info.postal_code" },
+    "PersonProfileFields.AddressCountry": { path: "personal_info.country" },
+    "PersonProfileFields.AddressState": { path: "personal_info.state_province" },
+    // ── The candidate's phone (also a REPEATING block, same `-1_` ordinal shape) ───────────
+    // ⚠ THESE WERE MISSING, AND THE AI FILLED THE GAP WITH THE REQUISITION NUMBER. Both are
+    // REQUIRED and their labels are just "Number" and "Type", which match nothing in the label
+    // ladder — so both fell through to the AI, and it answered "Number" with `24615`, the job's req
+    // id (live 2026-08-16, flagged `ai-text`). The review gate caught it, but a phone field holding
+    // a requisition id is the confident-wrong-value class, and it recurred on every run.
+    // Safe to key by bare id for exactly the reason the address block is: `PersonProfileFields.Phone*`
+    // is iCIMS' own vocabulary for the CANDIDATE's phone, while an employer's phone in a work-history
+    // entry is a per-customer `rcf<NNNN>` (rcf3271 here) and cannot collide.
+    "PersonProfileFields.PhoneNumber": { path: "personal_info.phone_number" },
+    "PersonProfileFields.PhoneExtension": { path: "personal_info.phone_extension" },
+    // The type is a plain <select> of Work/Home/Mobile/Other/Email — the profile's stored device type
+    // answers it deterministically, and the AI's "Mobile" guess (flagged `ai-choice`) was only ever a
+    // guess that happened to look right.
+    "PersonProfileFields.PhoneType": { path: "personal_info.phone_device_type" },
+    // The dial-code half, when a tenant renders one. Tiered in the profile like country, so resolve()
+    // passes a ready-made candidate ladder; `kind:"dial"` strips the trailing "+<digits>" for matching.
+    "PersonProfileFields.PhoneCountry": { kind: "dial", path: "personal_info.country_phone_code", altPath: "personal_info.country" },
+    // ── Résumé — ATTACHED FIRST, NEVER DURING THE FILL (operator, 2026-08-17) ──────────────
+    // iCIMS parses an uploaded résumé SERVER-SIDE and posts the results back into the panel seconds
+    // after the attach reports success, re-rendering entries under new ids and blanking everything
+    // written so far — the page says so itself ("Existing data in the form will be replaced"). That is
+    // why this was `kind:"skip"` from 2026-08-16: as an ordinary field mid-fill, the résumé destroys
+    // the fill it is supposed to help.
+    // The fix is ORDER, not avoidance. `atsIcimsResumeStage` attaches the résumé BEFORE a single field
+    // is written and waits the parse out (postback landed → panel quiet), so the parse overwrites
+    // nothing of ours and every value we then write lands on top of whatever it produced. The entry is
+    // `kind:"resume"` so ONE router decides which file field is the résumé on every path — the fill,
+    // the replay and the stage all ask it — but the branch consuming it in `atsFillFields` REFUSES to
+    // attach on iCIMS and records the stage's outcome instead: a second attach is a second parse, and
+    // the second one would blank the fill the first one exists to precede.
+    // The form's own "Upload Resume at a later time" box is still left UNTICKED — that is an operator's
+    // choice about their own application, not ours to make.
+    "PortalProfileFields.Resume_File": { kind: "resume" },
   },
 };
 
@@ -208,6 +342,540 @@ function atsWebsiteValue(profile, type) {
   return hit ? atsLib.ensureHttps(hit.url) : null;
 }
 
+// ── CREDENTIAL RECOGNITION (pure) ────────────────────────────────────────────────────────
+// ── REPEATING-ENTRY ORDINALS (pure) ──────────────────────────────────────────────────────
+// iCIMS prefixes every field of a repeating section with its entry ordinal:
+// `-1_PersonProfileFields.AddressCity`. `-1` is the entry the form renders by default; "Add More"
+// mints further ones, and a saved application comes back with SERVER ids (`-6489344_`). The static
+// map is keyed on the bare platform id, so the ordinal is stripped for the lookup.
+//
+// ⚠ SCOPED DELIBERATELY, AND THE SCOPE IS THE SAFETY. Only the leading `<digits>_` is removed, and
+// only iCIMS uses this — a Greenhouse field named `2_foo` keeps its name. It does NOT attempt to
+// tell entry 1 from entry 2: with one address in the profile and one entry on the form there is
+// nothing to disambiguate, but a SECOND address entry would map to the same profile address, so
+// multi-entry repeating sections are still open work (docs/status.md).
+function atsMapKey(ats, fieldName) {
+  const n = String(fieldName == null ? "" : fieldName);
+  if (ats !== "icims") return n;
+  return n.replace(/^-?\d+_/, "");
+}
+
+// ── REPEATING SECTIONS ARE SCOPED TO THEIR OWN ENTRY (operator, 2026-08-16) ──────────────
+// A field inside a repeating section may ONLY be answered from THAT section's data. The rule was
+// asked for with the example that makes it obvious: a "State/Province" inside an Education entry is
+// the COLLEGE's state, so answering it "Florida" from the applicant's home address is not a slightly
+// wrong guess — it is a different fact. The same holds for a work-history address (the EMPLOYER's).
+//
+// Two consequences, and the second is the one worth stating:
+//   • deterministic fills read `profile.<source>[entryIndex]`, never the profile root;
+//   • when the entry does not hold the answer, the field is NOT answered from the root as a
+//     fallback. It goes to the AI — which is likewise shown ONLY that entry (see atsScopeForField).
+//     Live here: the single education entry carries no location at all, so Country/State have no
+//     in-section source and must not borrow one.
+const ATS_ICIMS_ENTRY_MAPS = {
+  education: {
+    source: "education",                  // the profile ARRAY this section's entries come from
+    idPrefix: "CandProfileFields.",
+    // ⚠ MEMBERSHIP, NOT AN ALLOWLIST — this was a hole, and it filled a real wrong answer.
+    // The first version listed the field names it knew, so `EducationCity` (which it did not) escaped
+    // the seal entirely, reached the label ladder, and was answered "Tallahassee" from the HOME
+    // address — exactly the class of error the seal exists to prevent. A seal that only covers the
+    // fields you remembered is not a seal. `sectionTitle` matches the section's own heading so any
+    // field the section contains is covered, mapped or not; the name regex stays as the fast path
+    // (and for fixtures that carry no heading).
+    sectionTitle: /^education$/i,
+    match: /^CandProfileFields\.(School|OtherSchool|Degree|Major|Minor|GPA|IsGraduated|Graduation|Education)/,
+    fields: {
+      "CandProfileFields.School": { kind: "school" },
+      "CandProfileFields.OtherSchool": { kind: "other_school" },
+      "CandProfileFields.Degree": { path: "degree" },
+      "CandProfileFields.Major": { path: "field_of_study" },
+      "CandProfileFields.Minor": { path: "minor" },
+      "CandProfileFields.GPA": { path: "gpa" },
+      "CandProfileFields.IsGraduated": { kind: "is_graduated" },
+      "CandProfileFields.GraduationDate_Month": { kind: "date_month", from: "graduation_date" },
+      "CandProfileFields.GraduationDate_Year": { kind: "date_year", from: "graduation_date" },
+      "CandProfileFields.EducationStartDate_Month": { kind: "date_month", from: "from_year" },
+      "CandProfileFields.EducationStartDate_Year": { kind: "date_year", from: "from_year" },
+      // derived from the ENTRY's own location ("Pittsburgh, PA"), never the home address
+      "CandProfileFields.EducationCountry": { kind: "entry_country" },
+      "CandProfileFields.EducationState": { kind: "entry_state" },
+      "CandProfileFields.EducationCity": { kind: "entry_city" },
+    },
+  },
+  // ── Professional Experience ────────────────────────────────────────────────────────────
+  // ⚠ ROUTED BY LABEL, NOT BY ID. Every field here is a per-customer `rcf<NNNN>` (rcf3212 is
+  // "Employer" on THIS tenant and means nothing on the next one), so an id table would be
+  // write-once-per-customer. Labels are stable vocabulary — and reading a bare "City" as the
+  // EMPLOYER's is only safe because the section seal already scoped it; outside the seal that same
+  // label is the home address, which is exactly the bug the seal exists to stop.
+  experience: {
+    source: "work_experience",
+    sectionTitle: /^(professional\s+)?experience/i,
+    match: /^$/,                       // no id family — membership is what identifies these
+    addButton: /professional experience|employment/i,
+    byLabel: {
+      "employer": { path: "company" },
+      "company": { path: "company" },
+      "title": { path: "job_title" },
+      "job title": { path: "job_title" },
+      "position": { path: "job_title" },
+      "description": { path: "role_description" },
+      "city": { kind: "entry_city" },
+      "state": { kind: "entry_state" },
+      "province": { kind: "entry_state" },
+      "state/province": { kind: "entry_state" },
+      "country": { kind: "entry_country" },
+      // Employer detail the profile now carries (operator, 2026-08-16). Human-entered only — a
+      // resume states none of it — so an empty one simply stays empty rather than reaching the AI.
+      "address": { path: "employer_address" },
+      "zip": { path: "employer_postal_code" },
+      "postal code": { path: "employer_postal_code" },
+      "supervisor's name": { path: "supervisor_name" },
+      "supervisor name": { path: "supervisor_name" },
+      "supervisor's title": { path: "supervisor_title" },
+      "supervisor title": { path: "supervisor_title" },
+      "reason for leaving": { path: "reason_for_leaving" },
+      "may we contact": { kind: "may_contact" },
+      "may we contact this employer": { kind: "may_contact" },
+      // ⚠ GATED ON THE ANSWER, NOT ON WHETHER THEY HAPPEN TO BE FILLED IN. Handing an employer's
+      // email or phone to a recruiter is the whole substance of "may we contact?" — so a `no`, or an
+      // unanswered question, must withhold them even when the profile holds them.
+      "employer email": { kind: "contact_if_allowed", path: "employer_email" },
+      "employer e-mail": { kind: "contact_if_allowed", path: "employer_email" },
+      "employer phone": { kind: "contact_if_allowed", path: "employer_phone" },
+      "employer phone number": { kind: "contact_if_allowed", path: "employer_phone" },
+    },
+    // Month/Day/Year repeat per date, so the LABEL cannot say which date it is. The scan stamps
+    // `dateGroup` by DOM order within the entry: group 0 is the start, group 1 the end.
+    dateGroups: [{ from: "from" }, { from: "to" }],
+  },
+  // ── Professional Certifications ────────────────────────────────────────────────────────
+  // ⚠ THERE IS NO "CERTIFICATIONS" HEADING — traced 2026-08-16. The section is titled "Skills",
+  // and holds exactly ONE control: a repeating `Certifications` text box (its Add More reads
+  // "Add More (Professional Certifications)"). So the seal keys on the SKILLS heading, which here
+  // is unambiguous precisely because that heading has nothing else under it — worth re-checking on
+  // any tenant that puts a real skills control there.
+  // This form asks only for the certification's NAME: no number, no issued/expiry date, so the
+  // profile's certification_number and dates have nowhere to go and are simply not mapped.
+  certifications: {
+    source: "certifications",
+    sectionTitle: /^skills$/i,
+    match: /^$/,                       // per-customer rcf ids — membership identifies these
+    addButton: /professional certifications/i,
+    byLabel: {
+      "certifications": { kind: "certification_name" },
+      "certification": { kind: "certification_name" },
+      "certification name": { kind: "certification_name" },
+      // Astrion asks only for the name, but the vocabulary is borrowed from the Workday side's
+      // CERTIFICATION_MAP so a tenant that asks for more is already covered.
+      "certification number": { path: "certification_number" },
+      "license number": { path: "certification_number" },
+      // ⚠ ISSUED / EXPIRATION DATES ARE DELIBERATELY NOT MAPPED. The profile stores them as
+      // "YYYY-MM-DD", and the existing date_month/date_year kinds only parse "YYYY-MM" or "YYYY" —
+      // pointing a label at them would resolve to null on every run and look like a broken mapping
+      // rather than a missing one. Left unmapped, such a field is still SEALED (membership covers
+      // it), so it reaches the scoped AI instead of the profile root. Wiring them properly means a
+      // day-precision kind, which no observed tenant has asked for yet.
+    },
+  },
+};
+
+// ── A REPEATED FIELD IS DETECTED, NOT DECLARED (operator, 2026-08-17) ─────────────────────
+// iCIMS renders the candidate's own address and phone as repeating BLOCKS ("Add More (Addresses)"),
+// and every field in them carries an entry ordinal: `-1_PersonProfileFields.AddressCity`. The static
+// map is keyed on the ordinal-STRIPPED id, so without this a second entry is handed a DUPLICATE of
+// the first — CLAUDE.md already flagged exactly that for addresses, and phone has the same shape.
+//
+// ⚠ THERE IS DELIBERATELY NO LIST OF WHICH BLOCKS REPEAT. A first cut named the families
+// (`Address*`, `Phone*`) and that is wrong for the plain reason that iCIMS is configured per
+// customer: a block that repeats on this tenant may be a single row on the next, and a block that
+// does not repeat here may repeat there. Naming families means the next portal is a code change.
+//
+// So ask the question the PAGE can answer: **has this exact field already appeared under a different
+// ordinal?** Group by the BARE id and take the position of the field's own ordinal in that id's
+// first-seen ordinal list. Index 0 is the entry the map fills; anything above it is a repeat. A form
+// that renders one address row therefore produces index 0 for everything and this never fires at
+// all — which is also why it needs no claim about whether a given tenant's phone block repeats.
+//
+// Ordinals are POSITIONS, never values: `-1` is iCIMS' default entry and a saved one carries an
+// opaque server id, so `-2` is not "the second" and 4839201 is not "the 4839201st".
+//
+// Fields already claimed by a SECTION (Education / Experience / Certifications) are excluded — those
+// repeat legitimately from a profile ARRAY, and their own entry tier answers them before this is
+// reached. `rcf3271` ("Employer Phone Number") appearing as -1/-2/-3 is that case, not this one.
+//
+// Why blank rather than a copy or an AI guess: the profile holds ONE address and ONE phone, so a copy
+// is a fabricated second phone number and the AI's would be a guessed one. Blank plus a note that
+// says why is the honest answer, and the extra entry is optional, so nothing is blocked.
+
+// Which repeating section (if any) does a field belong to, and which ENTRY of it?
+// `entryIndex` is stamped onto the scan by atsAssignEntryIndexes — the ordinal in the id (`-1_`) is
+// an iCIMS internal, NOT an array index, so it is never used as one.
+function atsEntrySpec(ats, f) {
+  if (ats !== "icims" || !f) return null;
+  const bare = atsMapKey(ats, f.fieldName);
+  const hasOrdinal = /^-?\d+_/.test(String(f.fieldName || ""));
+  for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
+    // Either signal is enough: the field's NAME is one we know, or the field SITS IN the section
+    // (its own heading says so). The second is what closes the allowlist hole — an unmapped field
+    // inside the section is still sealed, it simply has no deterministic value and reaches the
+    // scoped AI instead of the profile root.
+    const byName = def.match.test(bare);
+    const bySection = hasOrdinal && def.sectionTitle && def.sectionTitle.test(String(f.section || "").trim());
+    if (!byName && !bySection) continue;
+    // id table first (stable platform ids), then the LABEL table (per-customer rcf ids), then the
+    // date groups — a Month/Day/Year label says nothing about WHICH date without its group.
+    let spec = (def.fields || {})[bare] || null;
+    if (!spec && def.byLabel) {
+      // ⚠ KEY ON THE PART LABEL FOR A COMPOSITE, NOT THE COMPOSED DISPLAY LABEL. The scan now renders a
+      // composite part's label as "<question> — <part>" ("Start Date — Month") so review reads
+      // properly — and that BROKE this lookup, which tests `/^month$/i` to decide a date group. The
+      // spec stopped matching, the field fell through to the AI, and it INVENTED work-experience dates
+      // that the profile already answers ("Jun 1 2026", reasoned from "typical summer internship start
+      // date"). A display change must not be able to reach the matching layer: `partLabel` is the raw
+      // name of the control, which is what this has always meant.
+      const key = String(f.partLabel || f.label || "").toLowerCase().replace(/\s+/g, " ").replace(/[*✱:]\s*$/, "").trim();
+      spec = def.byLabel[key] || null;
+      if (!spec && def.dateGroups && typeof f.dateGroup === "number") {
+        const g = def.dateGroups[f.dateGroup];
+        if (g && /^month$/i.test(key)) spec = { kind: "date_month", from: g.from };
+        else if (g && /^year$/i.test(key)) spec = { kind: "date_year", from: g.from };
+        else if (g && /^day$/i.test(key)) spec = { kind: "date_day", from: g.from };
+      }
+    }
+    return { section, source: def.source, bare, spec,
+      entryIndex: typeof f.entryIndex === "number" ? f.entryIndex : 0, def };
+  }
+  return null;
+}
+
+// Stamp `entryIndex` on every field of a repeating section. Entries are ordered by FIRST DOM
+// APPEARANCE of their ordinal, not by the ordinal's numeric value — iCIMS uses `-1` for the entry it
+// renders by default and opaque SERVER ids for saved ones, so sorting numerically would reorder them.
+function atsAssignEntryIndexes(ats, fields) {
+  if (ats !== "icims" || !Array.isArray(fields)) return fields;
+  const order = {}; // section → [ordinal, …] in first-seen order
+  for (const f of fields) {
+    const bare = atsMapKey(ats, f.fieldName);
+    const m = /^(-?\d+)_/.exec(String(f.fieldName || ""));
+    if (!m) continue;
+    for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
+      // Same dual signal atsEntrySpec uses — name OR section membership. Matching on the name
+      // alone left every per-customer rcf field unstamped, so its date groups never formed and
+      // start/end dates resolved to nothing.
+      const bySec = def.sectionTitle && def.sectionTitle.test(String(f.section || '').trim());
+      if (!def.match.test(bare) && !bySec) continue;
+      const list = (order[section] = order[section] || []);
+      if (list.indexOf(m[1]) === -1) list.push(m[1]);
+      f.entryIndex = list.indexOf(m[1]);
+      f.entrySection = section;
+    }
+  }
+  // …and stamp REPEATS of a field that is answered from the profile ROOT — the candidate's own
+  // address and phone blocks, and anything else a tenant chooses to make repeatable. DETECTED, not
+  // declared: group by the BARE id and record where this field's ordinal falls in that id's
+  // first-seen ordinal list. See the comment on this block above for why there is no family list.
+  const repeatOrder = {}; // bare id → [ordinal, …] in first-seen order
+  for (const f of fields) {
+    // A section entry is filled from its own profile ARRAY, so its repeats are legitimate and its
+    // own tier answers them. Excluded here so the two ideas can never fight over a field.
+    if (f.entrySection) continue;
+    const m = /^(-?\d+)_/.exec(String(f.fieldName || ""));
+    if (!m) continue;
+    const bare = atsMapKey(ats, f.fieldName);
+    const list = (repeatOrder[bare] = repeatOrder[bare] || []);
+    if (list.indexOf(m[1]) === -1) list.push(m[1]);
+    f.repeatIndex = list.indexOf(m[1]);
+  }
+  // Stamp WHICH date each Month/Day/Year belongs to. The controls repeat with identical labels, so
+  // only their position distinguishes start from end: group by the id base (`rcf3214` vs `rcf3215`)
+  // and number those bases in DOM order within the entry. Keyed on the BASE rather than on a count
+  // of fields, so a form that omits Day — or orders Year first — still groups correctly.
+  const seenBases = {};
+  for (const f of fields) {
+    if (typeof f.entryIndex !== "number" || !f.entrySection) continue;
+    const m = /^(.*)_(Month|Date|Day|Year)$/i.exec(atsMapKey(ats, f.fieldName));
+    if (!m) continue;
+    const entryKey = f.entrySection + ":" + f.entryIndex;
+    const bases = (seenBases[entryKey] = seenBases[entryKey] || []);
+    if (bases.indexOf(m[1]) === -1) bases.push(m[1]);
+    f.dateGroup = bases.indexOf(m[1]);
+  }
+  return fields;
+}
+
+// The ONLY profile a field is allowed to be answered from — including by the LLM.
+// A repeating-entry field sees its own entry and nothing else; everything else sees the profile.
+function atsScopeForField(ats, f, profile) {
+  const es = atsEntrySpec(ats, f);
+  if (!es) return profile;
+  const arr = (profile || {})[es.source];
+  const entry = Array.isArray(arr) ? arr[es.entryIndex] : null;
+  // Named so the model knows what it is looking at, and deliberately NOTHING else from the profile.
+  return entry ? { [es.section + "_entry"]: entry } : { [es.section + "_entry"]: {} };
+}
+
+// Month names as the form spells them (its Month select is a native <select> of full names).
+const ATS_MONTHS = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+
+// A month as the tenant might spell it, most specific first: full name, then the 3-letter
+// abbreviation, then "Sept" for the one month whose short form is commonly four letters. May is
+// already three letters, so it yields a single candidate rather than a duplicate.
+function atsMonthCandidates(mi) {
+  const full = ATS_MONTHS[mi];
+  if (!full) return [];
+  const out = [full];
+  const abbr = full.slice(0, 3);
+  if (abbr !== full) out.push(abbr);
+  if (full === "September") out.push("Sept");
+  return out;
+}
+
+// Is a "YYYY" or "YYYY-MM" strictly in the future? null when it is neither shape.
+// `now` is a parameter so the rule is unit-testable without freezing the clock.
+function atsIsFutureYearMonth(s, now) {
+  const t = now == null ? new Date() : new Date(now);
+  const ym = /^(\d{4})-(\d{1,2})$/.exec(String(s).trim());
+  const y = /^(\d{4})$/.exec(String(s).trim());
+  if (!ym && !y) return null;
+  const yr = parseInt((ym ? ym[1] : y[1]), 10);
+  const mo = ym ? parseInt(ym[2], 10) : 12;          // a bare year is only past once the year is over
+  const nowYr = t.getFullYear(), nowMo = t.getMonth() + 1;
+  return yr > nowYr || (yr === nowYr && mo > nowMo);
+}
+
+// Resolve ONE repeating-entry field from ITS OWN entry. Returns a route, or null to fall through
+// (which, for an entry field, means the scoped AI — never the profile root).
+// The operator's default day-of-month, for a form that REQUIRES a day on a date the profile stores to
+// the month. PURE + validated: only 1–31 is accepted, so a typo cannot put "0" or "45" on a real
+// application; anything else (absent, junk, out of range) means "no default", and the field goes back
+// to reaching review rather than being filled with nonsense.
+var ATS_DEFAULT_DAY = 1;
+function atsDefaultDay(defaults) {
+  const raw = defaults && defaults.date_day;
+  if (Array.isArray(raw)) return null;                // junk config — do not interpret it
+  // `{ value: N, note: "…" }` is the shipped shape; a bare number is accepted too.
+  const v = raw && typeof raw === "object" ? raw.value : raw;
+  if (v === null) return null;                        // an explicit null opts OUT — keep nagging
+  // `undefined` covers both "no `date_day` at all" and `{}` (a wrapper with no value), which are
+  // indistinguishable and mean the same thing: unconfigured, so use the built-in.
+  if (v === undefined) return ATS_DEFAULT_DAY;
+  const n = parseInt(String(v), 10);
+  return Number.isFinite(n) && n >= 1 && n <= 31 ? n : null;
+}
+
+function atsResolveEntryField(es, entry, f, now, defaults) {
+  const spec = es.spec;
+  if (!spec || !entry) return null;
+  const val = (k) => { const v = entry[k]; return v === undefined || v === null || (typeof v === "string" && !v.trim()) ? null : v; };
+  if (spec.kind === "skip") return { kind: "skip", source: "entry", detail: spec.detail || "left to the operator" };
+  // ⚠ A SPEC CARRYING A `kind` IS NOT A PLAIN PATH, even when it also carries a `path`. This branch
+  // ran FIRST and returned the value directly, silently bypassing the may_contact gate below — so
+  // the employer's email and phone would have been released on a "no", and on an UNANSWERED
+  // question. Caught by the test, not by review. Only a BARE path short-circuits here; every kind
+  // is handled below, where its own rule applies.
+  if (spec.path && !spec.kind) { const v = val(spec.path); return v == null ? null : { raw: v, path: es.section + "[" + es.entryIndex + "]." + spec.path, source: "entry" }; }
+  // ⚠ A ROLE YOU STILL HOLD HAS NO END DATE. Without this the empty `to` reads as "unanswered" and
+  // the sealed AI is asked to invent one — on a REQUIRED field it would have to produce something,
+  // and any date it picks is a claim that you left a job you are still doing.
+  if ((spec.kind === "date_month" || spec.kind === "date_year") && spec.from === "to" && entry.currently_work_here === true) {
+    return { kind: "skip", source: "entry", detail: "you still work here — the end date is deliberately left blank" };
+  }
+
+  if (spec.kind === "school") {
+    const s = val("school_or_university");
+    return s == null ? null : { candidates: [String(s)], source: "entry", kind: "school",
+      path: es.section + "[" + es.entryIndex + "].school_or_university" };
+  }
+  if (spec.kind === "other_school") {
+    // Decided by the SCHOOL field's outcome, not here — see the pairing in atsFillFields.
+    const s = val("school_or_university");
+    return { kind: "other_school", source: "entry", schoolName: s == null ? null : String(s),
+      path: es.section + "[" + es.entryIndex + "].school_or_university" };
+  }
+  if (spec.kind === "is_graduated") {
+    // ⚠ `currently_enrolled` IS NOT TRUSTWORTHY ON ITS OWN, and this cost a wrong live answer.
+    // The website's education editor does not expose that checkbox at all, so a synced profile
+    // carries the schema DEFAULT (false) — and a student graduating in 2028 was confidently
+    // answered "Yes, graduated" on 2026-08-16, deterministically and unflagged. An absent field
+    // read as a positive assertion is the failure here, not the matching.
+    // A graduation date in the FUTURE is the harder fact and wins: you have not graduated if the
+    // date has not happened yet. The checkbox is only consulted when the dates say nothing.
+    const grad = val("graduation_date") || val("to_year");
+    const path = es.section + "[" + es.entryIndex + "]." + (val("graduation_date") ? "graduation_date" : "to_year");
+    const fut = grad == null ? null : atsIsFutureYearMonth(String(grad), now);
+    if (fut === true) return { candidates: ["No"], source: "entry", path };
+    if (entry.currently_enrolled === true) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].currently_enrolled" };
+    if (fut === false) return { candidates: ["Yes"], source: "entry", path };
+    return null;
+  }
+  // ── DAY-OF-MONTH (operator, 2026-08-17) ────────────────────────────────────────────────
+  // A form can REQUIRE the day of a date the profile stores to the month ("2025-05"), and a required
+  // field we cannot answer reaches review — so every date on the page nagged for a day. Two sources,
+  // in order, and the distinction is the point:
+  //   • the profile's OWN day, when it stores one ("2025-05-12") — a stated fact;
+  //   • otherwise the operator's configured default (`defaults.date_day`, data/application_defaults
+  //     .json), which is an APPROXIMATION and says so in its detail.
+  // Deliberately ONE default rather than a clever per-side rule (first-of-month for a start,
+  // last-of-month for an end): that would be us inventing precision the operator never gave, and on a
+  // job application a date is a factual claim. One number they can see and change is honest; guessing
+  // differently at each end is not.
+  if (spec.kind === "date_day") {
+    const raw = val(spec.from);
+    if (raw == null) return null;
+    const ymd = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(raw));
+    const path = es.section + "[" + es.entryIndex + "]." + spec.from;
+    // A day the profile STATES is a fact, so it fills whether the form requires it or not.
+    if (ymd) return { value: String(parseInt(ymd[3], 10)), source: "entry", path };
+    // Month precision — fall back to the default, but only for a value that IS a date. A year-only
+    // "2024" says nothing about a month either, so a day off it would be doubly invented.
+    if (!/^\d{4}-\d{1,2}$/.test(String(raw))) return null;
+    // ⚠ THE DEFAULT IS FOR REQUIRED FIELDS ONLY (operator, 2026-08-17). An optional blank blocks
+    // nothing — it does not hold up Save, it does not hold up the submit gate, and it is not a review
+    // item — so putting an APPROXIMATION there buys nothing and adds an unasked-for claim to the
+    // application. The default exists to unblock a field the form insists on, and that is the only
+    // place it belongs. Same rule the AI tier already obeys: required gets a fallback, optional fills
+    // deterministically or stays blank.
+    if (!f || !f.isRequired) return null;
+    const d = atsDefaultDay(defaults);
+    if (d == null) return null;
+    // ⚠ FLAGGED FOR REVIEW (operator, 2026-08-17). A default is an APPROXIMATION, not something the
+    // operator stated, so it faces the human gate like every other value we did not get from them —
+    // the same rule that flags an AI answer and a non-exact match. It still FILLS, which is the point:
+    // the field went from blank-and-flagged (type a value) to filled-and-flagged (approve it), so the
+    // nag costs one click instead of a lookup, and a wrong default can never be submitted unnoticed.
+    // A day the profile actually STATES is a fact and stays unflagged — see the branch above.
+    return { value: String(d), source: "default", review: true, flag: "default-value",
+      detail: 'day-of-month is not in your profile (it stores "' + String(raw) + '") — used your default of ' + d + '; approve it or set the real day' };
+  }
+  if (spec.kind === "date_month" || spec.kind === "date_year") {
+    const raw = val(spec.from);
+    if (raw == null) return null;
+    const s = String(raw);
+    const ym = /^(\d{4})-(\d{1,2})$/.exec(s);          // "2028-05"
+    const yOnly = /^(\d{4})$/.exec(s);                  // "2024"
+    if (spec.kind === "date_year") {
+      const y = ym ? ym[1] : (yOnly ? yOnly[1] : null);
+      return y == null ? null : { value: y, source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from };
+    }
+    if (!ym) return null;                               // a year-only value says nothing about the month
+    const mi = parseInt(ym[2], 10) - 1;
+    // ⚠ TIERED, because a month dropdown's VOCABULARY is the tenant's choice, not a fact about the
+    // date. Live 2026-08-16 two end-date months reached review as `stated-value-unmatched` —
+    // "August" against a list that spells it "Aug" — while the education date control on the SAME
+    // page lists Jan…Dec. Most specific first, so a form offering full names still matches exactly
+    // and only an abbreviating one falls to the second tier. "Sept" is included because it is the
+    // one abbreviation that is commonly four letters.
+    return mi >= 0 && mi < 12
+      ? { candidates: atsMonthCandidates(mi), source: "entry", path: es.section + "[" + es.entryIndex + "]." + spec.from }
+      : null;
+  }
+  if (spec.kind === "certification_name") {
+    // `certification` is TIERED (most specific first), the same shape degree and field_of_study use.
+    // This is a free-text box rather than a picker, so the most specific tier is simply written —
+    // there is no list to fall back through. A tier list that arrived as a bare string still works.
+    const raw = entry.certification;
+    const name = Array.isArray(raw) ? raw.find((x) => typeof x === "string" && x.trim()) : raw;
+    return name && String(name).trim()
+      ? { value: String(name).trim(), source: "entry", path: es.section + "[" + es.entryIndex + "].certification" }
+      : null;
+  }
+  if (spec.kind === "may_contact") {
+    // A tri-state: unanswered stays UNANSWERED. Defaulting either way decides on the operator's
+    // behalf whether a recruiter may ring a past employer, which is not a default anyone should own.
+    const v = entry.may_contact;
+    if (v === true) return { candidates: ["Yes"], source: "entry", path: es.section + "[" + es.entryIndex + "].may_contact" };
+    if (v === false) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].may_contact" };
+    return null;
+  }
+  if (spec.kind === "contact_if_allowed") {
+    // ⚠ WITHHELD UNLESS THE ANSWER IS AN EXPLICIT YES. Releasing an employer's email or phone IS
+    // the consequence the "may we contact?" question governs, so `no` and UNANSWERED both withhold.
+    if (entry.may_contact !== true) {
+      return { kind: "skip", source: "entry",
+        detail: entry.may_contact === false
+          ? "withheld — you answered No to contacting this employer"
+          : "withheld — \"may we contact this employer?\" is unanswered for this role" };
+    }
+    const v = val(spec.path);
+    return v == null ? null : { raw: v, path: es.section + "[" + es.entryIndex + "]." + spec.path, source: "entry" };
+  }
+  if (spec.kind === "entry_city") {
+    // The city half of the entry's own "City, ST". Deterministic when the entry states it — better
+    // than asking the model to remember where a university sits, and it cannot drift to the home city.
+    const loc = val("location");
+    if (loc == null) return null;
+    const city = String(loc).split(",")[0].trim();
+    return city ? { value: city, source: "entry", path: es.section + "[" + es.entryIndex + "].location" } : null;
+  }
+  if (spec.kind === "entry_country" || spec.kind === "entry_state") {
+    // ⚠ The ENTRY's own location, and nothing else. This profile's education entry has none, so both
+    // correctly return null and go to the scoped AI rather than inheriting the home address.
+    const loc = val("location");
+    if (loc == null) return null;
+    const parts = String(loc).split(",").map((x) => x.trim()).filter(Boolean);
+    if (spec.kind === "entry_state") {
+      const st = parts.length > 1 ? parts[parts.length - 1] : null;
+      if (!st) return null;
+      // "PA" → ["PA", "Pennsylvania"] so either spelling can match the form's list
+      const full = Object.keys(atsLib.REGION_ABBREV || {}).find((n) => atsLib.REGION_ABBREV[n] === st.toLowerCase());
+      const cands = full ? [full.replace(/\b\w/g, (c) => c.toUpperCase()), st] : [st];
+      return { candidates: cands, source: "entry", path: es.section + "[" + es.entryIndex + "].location" };
+    }
+    // ⚠ A US STATE IMPLIES THE UNITED STATES, and deriving it is what keeps the PAIR fillable.
+    // Country is this field's declared PARENT: until it commits, the child's list reads "Please
+    // select a country" and no state can be chosen. Live, Country had no deterministic source, was
+    // deferred to the AI, and the deterministic "Pennsylvania" for State therefore ran against an
+    // empty list and was lost. Recognising "Pittsburgh, PA" as US is a grounded fact — not a guess —
+    // and it fills the parent in the SAME pass, ahead of the child.
+    const tail = parts.length > 1 ? parts[parts.length - 1].toLowerCase() : "";
+    const isUsState = !!tail && (Object.prototype.hasOwnProperty.call(atsLib.REGION_ABBREV || {}, tail) ||
+      Object.keys(atsLib.REGION_ABBREV || {}).some((n) => atsLib.REGION_ABBREV[n] === tail));
+    if (!isUsState) return null;
+    return { candidates: ["United States", "United States of America"], source: "entry",
+      path: es.section + "[" + es.entryIndex + "].location" };
+  }
+  return null;
+}
+
+// Which stored credential, if any, does this field want? → "login" | "password" |
+// "password_confirm" | null.
+//
+// Two sources, in order:
+//   1. the static map — the known iCIMS platform ids. This is the authority.
+//   2. an INPUT-TYPE fallback, for a tenant whose ids the map does not know.
+//
+// ⚠ THE FALLBACK EXISTS FOR SAFETY, NOT COVERAGE. Recognizing a field as a credential is what
+// keeps buckets, the label ladder and the LLM away from it — so an UNRECOGNIZED password box is
+// the dangerous outcome, not an unfilled one: it would reach the AI rescue as an ordinary required
+// text field and be answered with a guess. Hence `type="password"` alone is enough to claim a
+// field, while claiming a LOGIN needs two agreeing signals (an `autocomplete="username"` hint AND
+// login/username wording), because a bare text box is not self-evidently a credential and a false
+// positive there would overwrite an ordinary answer with an account name.
+function atsCredentialKind(ats, f) {
+  if (!f) return null;
+  const map = (ATS_STATIC_MAPS[ats] || {})[atsMapKey(ats, f.fieldName)];
+  if (map && map.kind === "credential") return map.credentialKind || null;
+  const idLabel = String((f.fieldName || "") + " " + (f.label || "")).toLowerCase();
+  if (f.inputType === "password") {
+    return /confirm|re-?enter|re-?type|verify|again|repeat/.test(idLabel) ? "password_confirm" : "password";
+  }
+  if (f.autocomplete === "username" && /\blogin\b|\busername\b|\buser id\b/.test(idLabel)) return "login";
+  return null;
+}
+
+// The value for a recognized credential field. Returns null when the credentials are absent or
+// incomplete — the caller then reports the field to review rather than making half an account.
+function atsCredentialValue(kind, credentials) {
+  const c = credentials || null;
+  if (!c || !c.email || !c.password) return null;
+  if (kind === "login") return String(c.email);
+  if (kind === "password" || kind === "password_confirm") return String(c.password);
+  return null;
+}
+
 // ── The LABEL ladder (pure) — custom questions (question_* / cards[*] / uuid fields) ─────
 // Ordered, first hit wins; every rung is a HIGH-PRECISION recognizer (a wrong deterministic
 // answer is worse than an AI-flagged one — the Workday matching philosophy). Returns
@@ -242,6 +910,35 @@ function atsRouteLabel(label, f, profile, defaults) {
   }
   if (!/sponsor/i.test(L) && (/(authorized|legally able|eligible|legal right|right)\s.*\bwork\b|work authorization/i.test(L)) && wa.authorized_to_work_in_us != null) {
     return { candidates: bool(!!wa.authorized_to_work_in_us), source: "work_auth", path: "work_authorization.authorized_to_work_in_us", detail: "work_authorization.authorized_to_work_in_us" };
+  }
+
+  // ── SECURITY CLEARANCE — STATED OR NOT ANSWERED (operator, 2026-08-18) ─────────────────────
+  // A clearance is a FACTUAL claim about the applicant, and claiming one you do not hold is a serious
+  // matter — so this rung answers ONLY from `work_authorization.security_clearance` and refuses in
+  // every other case. Two deliberate asymmetries:
+  //   • it CLAIMS the question even when the profile is empty (`clearance-unstated` → review, blank).
+  //     That is the whole point of claiming it: an unanswered REQUIRED clearance question would
+  //     otherwise reach the AI rescue, which answers by reasoning from absence — and "No" invented for
+  //     someone who holds TS/SCI, or worse a "Yes" invented for someone who holds nothing, is exactly
+  //     the confident-wrong-value class the ladder exists to prevent. Recognition is what keeps the AI
+  //     away from it, so being unable to answer is not a reason to let go of the question.
+  //   • EMPTY ≠ "None". Empty means the operator has not told us; "None" is a stated fact and answers a
+  //     yes/no with No.
+  // ⚠ BAILS on a WILLINGNESS / ELIGIBILITY wording ("are you willing to obtain", "eligible to obtain",
+  // "can you be sponsored for a clearance"). Those ask about the FUTURE, and answering them from a
+  // currently-held level is wrong in both directions — a cleared applicant is not necessarily willing,
+  // and an uncleared one is not necessarily unwilling. Same discipline as the export-control bail above.
+  // ⚠ THE JUDGEMENT LIVES IN lib.js, NOT HERE. The WORKDAY driver needs the identical one, and a second
+  // copy in this file could drift from the one the operator authorised — so the wording recognizer, the
+  // future-tense bail and the candidate ladder are all `atsLib.*`, shared with fill-driver's rung.
+  if (atsLib.recognizeClearanceQuestion(L)) {
+    const cl = atsLib.clearanceCandidates(wa.security_clearance);
+    if (cl.unstated) {
+      return { kind: "clearance-unstated", review: true, flag: "clearance-unstated",
+        detail: "this form asks about a security clearance and your profile does not state one — set it on the Profile page (\"None\" is a valid answer) rather than having it guessed" };
+    }
+    return { candidates: cl.candidates, source: "clearance", path: "work_authorization.security_clearance",
+      detail: "work_authorization.security_clearance = " + JSON.stringify(cl.level) };
   }
 
   // Profile links.
@@ -337,6 +1034,20 @@ function atsRouteLabel(label, f, profile, defaults) {
     if (hdyh && Array.isArray(hdyh.preferred) && hdyh.preferred.length) return { candidates: [...hdyh.preferred], source: "map", path: "how_did_you_hear.preferred", detail: "how_did_you_hear.preferred" };
   }
 
+  // WHICH KINDS OF EMPLOYMENT WOULD YOU CONSIDER — a MULTI-answer question (iCIMS renders it as a
+  // native multi-select: "Please select the following employment options you would consider…", with
+  // Full-time / Internship / Part-time / Temporary). Deterministic from a stated list; every stored
+  // answer still clears the ordinary ladder against the live options, so a form offering different
+  // words commits only what it actually has. Anchored on "employment/position/job" + a
+  // consider/interested/seeking verb, so it cannot swallow the work-AUTHORISATION questions above
+  // (those are about eligibility, and they run first regardless).
+  if (/\b(employment|position|job)\b[^?]*\b(you would|you'd|would you)?\s*(consider|interested in|seeking|looking for|open to)\b/i.test(L) ||
+      /\b(employment|work)\s+(type|options?|status)\b[^?]*\b(consider|interested|seeking|prefer)/i.test(L)) {
+    const et = (profile && profile.employment_types_considered) || (defaults && defaults.employment_types_considered);
+    const list = Array.isArray(et) ? et.filter((x) => typeof x === "string" && x.trim()) : [];
+    if (list.length) return { candidates: list, source: "map", path: "employment_types_considered", detail: "employment_types_considered" };
+  }
+
   // EEO / demographics — deterministic ONLY from stated values (the Workday rule verbatim:
   // a stated demographic fills deterministically; AI never overrides; optional+unstated → blank).
   // containment:true — a STATED long-form demographic against each ATS's own phrasing
@@ -384,6 +1095,19 @@ function atsInjScan(ats) {
     if (el.id) { const l = document.querySelector('label[for="' + esc(el.id) + '"]'); if (l) return txt(l); }
     const wrap = el.closest("label"); if (wrap) return txt(wrap);
     return null;
+  };
+  // ⚠ WHAT A <select> ACTUALLY HOLDS — and index 0 is NOT "unselected". A select need not carry a
+  // placeholder row: iCIMS' salary currency starts straight at "USD $" and its timeframe at "Hr.", so a
+  // `selectedIndex > 0` test read a legitimately-chosen FIRST option as blank. Live 2026-08-17 that made
+  // a rehearsal report `native select commit failed` on two fields whose values were on the form the
+  // whole time — a false negative on a verify gate, which blocks a submit that should pass.
+  // "Unselected" is: nothing selected, or the selected row is a PLACEHOLDER (same vocabulary the option
+  // filter below uses). LOCKSTEP with atsInjReadValue's dropdown_native branch — two injected functions
+  // cannot share code, so a test pins them together.
+  const selectedTextOf = (el) => {
+    if (!el || el.selectedIndex < 0) return null;
+    const t = txt(el.options[el.selectedIndex]);
+    return (!t || /^(select|choose|—\s*make a selection)/i.test(t)) ? null : t;
   };
   const out = { ats, url: location.href, title: document.title, fields: [] };
   const push = (d) => { d.domIndex = out.fields.length; out.fields.push(d); };
@@ -483,13 +1207,259 @@ function atsInjScan(ats) {
       const label = stripReq(qLabel(el) || nm);
       const required = el.required === true || /[*✱]\s*$/.test(qLabel(el) || "");
       if (el.type === "file") { push({ fieldName: nm, inputSel: el.id ? "#" + esc(el.id) : 'input[name="' + esc(nm) + '"]', widgetType: "file_upload", label, isRequired: required, value: (el.files && el.files[0] && el.files[0].name) || null }); continue; }
-      if (el.tagName === "SELECT") { push({ fieldName: nm, inputSel: 'select[name="' + esc(nm) + '"]', widgetType: "dropdown_native", label, isRequired: required, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null, options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^select/i.test(t)) }); continue; }
+      if (el.tagName === "SELECT") { push({ fieldName: nm, inputSel: 'select[name="' + esc(nm) + '"]', widgetType: "dropdown_native", label, isRequired: required, value: selectedTextOf(el), options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^select/i.test(t)) }); continue; }
       push({ fieldName: nm, inputSel: el.id ? "#" + esc(el.id) : (el.tagName === "TEXTAREA" ? "textarea" : "input") + '[name="' + esc(nm) + '"]',
         widgetType: el.tagName === "TEXTAREA" ? "textarea" : (nm === "location" ? "location" : "text"),
         label, isRequired: required, value: el.value || null });
     }
     return out;
   }
+
+  // iCIMS — a classic server-rendered form (jQuery, NO React: there are no fiber keys on its
+  // inputs, traced 2026-08-16), so plain native-setter writes are enough and there is no
+  // controlled-component state to re-sync. Structure is a table of `.iCIMS_TableRow` inside
+  // `.iCIMS_ProfileFormTable`, each section preceded by an `h2.iCIMS_SubHeader`.
+  //
+  // ⚠ THIS RUNS INSIDE THE FORM IFRAME, not the top document — see cdpUseFormFrame. `document`
+  // here IS the frame's document, which is why nothing below reaches through a frame boundary.
+  if (ats === "icims") {
+    // Required is marked three independent ways and they do not always agree; detect all of them.
+    // Over-flagging is the safe direction (CLAUDE.md: a required field reading FALSE is the
+    // dangerous one — it hides an unfilled field that will block advancement).
+    const req = (el) => {
+      if (/iCIMS_Forms_RequiredField/.test(String(el.className || ""))) return true;
+      if (el.getAttribute("aria-required") === "true" || el.required === true) return true;
+      if (el.getAttribute("i_required") === "true") return true; // iCIMS' own marker, on its dropdowns
+      const row = el.closest(".iCIMS_TableRow") || el.parentElement;
+      if (row && row.querySelector(".Field_Required, .Field_RequiredStar")) return true;
+      return /[*✱]\s*$/.test(labelFor(el) || "");
+    };
+    // The nearest preceding section heading ("Create a login", "Enter your information") — carried
+    // for logs and review grouping. ⚠ A required repeating block titles itself with a <legend>, not
+    // a heading, so a heading is a HINT about where a field sits, never an identity.
+    const sectionOf = (el) => {
+      const table = el.closest(".iCIMS_ProfileFormTable");
+      let p = table ? table.previousElementSibling : null;
+      for (let i = 0; i < 4 && p; i++) { if (/^H[1-4]$/.test(p.tagName)) return txt(p); p = p.previousElementSibling; }
+      const lg = el.closest("fieldset") ? el.closest("fieldset").querySelector("legend") : null;
+      return lg ? stripReq(txt(lg)) : null;
+    };
+    // GROUPED CONTROLS FIRST (radio + checkbox, by shared name), so the general loop below can skip
+    // their members. Same shape as the Greenhouse and Lever branches, and for the same reason: a box
+    // classified by the general loop becomes a phantom REQUIRED text field over the same control,
+    // and a text write to a checkbox sets the string that option would SUBMIT.
+    const optLabel = (r) => (r.id && txt(document.querySelector('label[for="' + esc(r.id) + '"]'))) || txt(r.closest("label")) || r.value;
+    const groups = {};
+    for (const r of document.querySelectorAll('input[type="radio"], input[type="checkbox"]')) {
+      if (!vis(r.closest("label") || r.closest(".iCIMS_TableRow") || r)) continue;
+      const nm = r.name || r.id || ""; if (!nm) continue;
+      (groups[nm] = groups[nm] || []).push(r);
+    }
+    for (const [nm, list] of Object.entries(groups)) {
+      seen.add(nm);
+      const kind = list[0].type === "radio" ? "radio" : (list.length > 1 ? "checkbox_group" : "checkbox");
+      const rec = { fieldName: nm, inputSel: 'input[name="' + esc(nm) + '"]', widgetType: kind,
+        label: stripReq(labelFor(list[0]) || nm), isRequired: list.some(req), section: sectionOf(list[0]) };
+      if (kind === "checkbox") { push(Object.assign(rec, { value: list[0].checked ? "true" : null })); continue; }
+      push(Object.assign(rec, {
+        value: (list.filter((r) => r.checked).map(optLabel).join(", ")) || null,
+        options: list.map(optLabel).filter(Boolean), group: list[0].type }));
+    }
+    // ── ONE QUESTION, SEVERAL CONTROLS — detected, not enumerated ────────────────────────
+    // "What are your salary requirements? (Currency / Amount / Time Frame)" is ONE question that
+    // iCIMS renders as three controls, and so is "End Date (Month / Day / Year)". Traced 2026-08-17:
+    //
+    //   DIV.iCIMS_FieldRow                    ← the QUESTION; its label is the question text
+    //    └ DIV.iCIMS_TableCell
+    //       └ DIV.iCIMS_Table
+    //          └ DIV.iCIMS_TableRow           ← the PARTS
+    //             ├ …Salary_Currency   label "Currency"
+    //             ├ …Salary            label "Amount (Numbers only)"
+    //             └ …Salary_Timeframe  label "Time Frame"
+    //
+    // ⚠ `iCIMS_FieldRow` IS THE DISCRIMINATOR, and using it is what keeps this free of hardcoding
+    // (operator's standing ask): no list of composite field names, no suffix vocabulary
+    // (_Currency/_Month/_Year), no per-tenant table. The page says "these controls answer one
+    // question" and we read that. Any composite iCIMS invents is covered for free, and the inner
+    // `.iCIMS_TableRow` alone is NOT enough — it also matches the outer field row, which is exactly
+    // why the question and its parts have to be told apart by the FieldRow class.
+    // ⚠ MATCH THE FieldRow FAMILY, not one class. A date question wraps its parts in
+    // `iCIMS_FieldRow_Inline` — a DIFFERENT class token, which `.iCIMS_FieldRow` does not match, so
+    // "End Date (Month / Day / Year)" stayed three separate rows while Salary grouped correctly
+    // (traced 2026-08-17: `DIV.rcf3211-1 iCIMS_TableRow iCIMS_FieldRow_Inline`, label "End Date").
+    // A prefix match covers the whole family, including variants no tenant has shown us yet, which is
+    // the point — enumerating `_Inline` would just be the same mistake one class later.
+    const questionRowOf = (el) => el.closest('[class*="iCIMS_FieldRow"]') || null;
+    const questionTextOf = (el) => {
+      const qr = questionRowOf(el);
+      if (!qr) return null;
+      // The FIRST label in the question row is the question; the parts' own labels come after it,
+      // inside the nested table.
+      const l = qr.querySelector("label, .iCIMS_FormLabel, legend");
+      const t = l ? stripReq(txt(l)) : null;
+      return t || null;
+    };
+    // ⚠ GROUP BY THE INNERMOST PARTS ROW, take only the question TEXT from the FieldRow. A composite's
+    // controls always share ONE `.iCIMS_TableRow`; a FieldRow may legitimately hold several distinct
+    // questions, and keying the group on it would merge them into one row on the review page. Using
+    // the nearest row is both tighter and immune to that — and `closest` picks the inner row even
+    // though the FieldRow also carries `iCIMS_TableRow`, because it walks outward and stops first.
+    const partsRowOf = (el) => el.closest(".iCIMS_TableRow") || null;
+    const qrKeys = new Map();
+    const questionKeyOf = (el) => {
+      const pr = partsRowOf(el);
+      if (!pr) return null;
+      if (!qrKeys.has(pr)) qrKeys.set(pr, "q" + qrKeys.size);
+      return qrKeys.get(pr);
+    };
+    // ⚠ COUNT ONLY WHAT THE LOOP BELOW WILL ACTUALLY EMIT. Counting every control in the row marked
+    // single-question rows as composites whenever the row also held a radio or checkbox — which this
+    // loop skips (they are handled by the grouping pass) — so "Time Zone" and the SMS-consent
+    // dropdown arrived flagged as composites with one part each.
+    const emittable = 'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=reset]):not([type=radio]):not([type=checkbox]), select, textarea';
+    // ⚠ AND ONLY THE VISIBLE ONES. An `icims_dropdown` keeps its own `input.dropdown-search` inside
+    // the same field row, hidden until the widget is opened — so a plain one-question row counted TWO
+    // controls and was mis-marked a composite ("Time Zone", the SMS-consent question). The loop below
+    // already skips invisible controls; the count has to agree with it or the two disagree about what
+    // a question contains.
+    const controlsInQuestion = (el) => {
+      const pr = partsRowOf(el);
+      if (!pr) return 1;
+      return [...pr.querySelectorAll(emittable)].filter(vis).length;
+    };
+    // The container that holds THIS control and no other — its own cell within the question. Found by
+    // walking outward while the ancestor still contains exactly one emittable control, which needs no
+    // class names at all and so survives any markup iCIMS uses. That cell's label is the part's name
+    // ("Currency", "Month"): those labels are SIBLINGS of the control, not `label[for=…]` and not
+    // ancestors, which is why labelFor found nothing and every part inherited the question text.
+    const partLabelOf = (el) => {
+      let cell = el;
+      for (let i = 0; i < 5; i++) {
+        const up = cell.parentElement;
+        if (!up || up.querySelectorAll(emittable).length !== 1) break;
+        cell = up;
+      }
+      const l = cell.querySelector("label, .iCIMS_FormLabel, legend");
+      if (l) { const t = stripReq(txt(l)); if (t) return t; }
+      // No label element — take the cell's own text, minus anything the control itself renders (a
+      // <select>'s option list would otherwise come back as the "label").
+      const own = [...cell.childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join(" ");
+      const t = stripReq(String(own || "").replace(/\s+/g, " ").trim());
+      return t || null;
+    };
+
+    for (const el of document.querySelectorAll("input, textarea, select")) {
+      if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox") continue;
+      // ⚠ A BUTTON IS NOT A FIELD. `<input type="submit" id="cp_form_submit_i">` was being scanned as
+      // a text field, so "cp_form_submit_i" appeared in review as a question with a raw id for a label
+      // (operator, 2026-08-17) — and, worse, it was a writable target: atsInjSetText on a submit input
+      // rewrites its caption. Detected by the element's own type, so it needs no per-tenant id.
+      if (/^(submit|button|reset|image)$/.test(String(el.type || ""))) continue;
+      const id = el.id || el.name || ""; if (!id || seen.has(id)) continue;
+      // file inputs are styled invisible on this theme (the visible control is a sibling button row)
+      if (el.type !== "file" && !vis(el)) continue;
+      seen.add(id);
+      const sel = el.id ? "#" + esc(el.id) : el.tagName.toLowerCase() + '[name="' + esc(el.name) + '"]';
+      // ⚠ NEVER FALL BACK TO THE RAW ID FOR A LABEL. `labelFor` only knows `label[for=…]` and an
+      // ancestor <label>, and an iCIMS composite part has neither — so review showed
+      // "CandProfileFields.Salary_Currency" AS THE QUESTION (operator, 2026-08-17). Three sources
+      // now, in order of how well they describe the field to a human:
+      //   own label  → the part's name inside the question ("Currency", "Month")
+      //   question   → the FieldRow's label ("What are your salary requirements?")
+      //   the id     → last resort, and now visibly a last resort rather than the norm
+      const question = questionTextOf(el);
+      const parts = controlsInQuestion(el);
+      // For a composite the part's name comes from its own cell (partLabelOf); for a lone control the
+      // ordinary label association is right, and cheaper.
+      const own = parts > 1 ? (partLabelOf(el) || stripReq(labelFor(el) || "") || null)
+        : (stripReq(labelFor(el) || "") || null);
+      // A question rendered as SEVERAL controls needs both halves to read properly; a lone control
+      // just takes whichever it has, because "Currency — Currency" is noise.
+      const label = (parts > 1 && question && own && own !== question) ? question + " — " + own
+        : (question || own || id);
+      const base = { fieldName: id, inputSel: sel, label, isRequired: req(el), section: sectionOf(el),
+        // Carried so review can GROUP the parts of one question instead of listing them as peers.
+        questionKey: parts > 1 ? questionKeyOf(el) : null,
+        questionLabel: parts > 1 ? question : null,
+        partLabel: parts > 1 ? own : null };
+      if (el.type === "file") { push(Object.assign(base, { widgetType: "file_upload", isRequired: req(el), value: (el.files && el.files[0] && el.files[0].name) || null })); continue; }
+      if (el.tagName === "SELECT" && el.multiple) {
+        // A native <select multiple> is a MULTI-answer control: committing it by selectedIndex (what
+        // dropdown_native does) would answer one option and silently discard the rest.
+        // ⚠ JOINED WITH "; " — the shared group separator (`GROUP_JOIN`, lib.js), NOT ", ".
+        // A multi-select's selection reaches review the same way a checkbox GROUP's does: the joined
+        // string is `current_value` and the array is `selected_options`, and the review editor ticks
+        // its boxes by splitting the joined string on GROUP_JOIN. Joining with ", " here meant
+        // `splitGroupValue` could not split it, so `"Internship, Part-time"` arrived as ONE unmatched
+        // option and the editor rendered the question BLANK while the form plainly held both answers
+        // (operator, live 2026-08-17). Hardcoded because an injected function cannot import — pinned
+        // against GROUP_JOIN by test.
+        push(Object.assign(base, { widgetType: "multiselect_native",
+          values: [...el.selectedOptions].map((o) => txt(o)).filter(Boolean),
+          value: [...el.selectedOptions].map((o) => txt(o)).join("; ") || null,
+          options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^(select|—s*make a selection)/i.test(t)) }));
+        continue;
+      }
+      if (el.tagName === "SELECT") {
+        // ⚠ NOT EVERY <select> HERE IS A SELECT. iCIMS replaces many of them with its own AJAX
+        // combobox ("IdDropDown"), and when it does, the <select> element is left PERMANENTLY EMPTY —
+        // one blank <option> — while the real choices live in a sibling `<ul id="<id>_dropdown-results">`
+        // of `<li role="option">`. Reading `el.options` there yields NOTHING, which is exactly how the
+        // required Country and State/Province fields reached review as "no live options to choose
+        // from" (live 2026-08-16) while the page was showing a perfectly good list.
+        // The tell is the element's own attribute, not a guess: `icimsdropdown-enabled="1"`.
+        // ⚠ The backing <select> stays empty even AFTER a successful commit — it holds an opaque id
+        // (`12781`), never the text — so both the option read and the read-back must use the widget.
+        if (el.getAttribute("icimsdropdown-enabled") === "1") {
+          const ul = document.getElementById(el.id + "_dropdown-results");
+          // ⚠ DROP THE AWAITING-PARENT ROW TOO, not just the placeholder. A child whose parent is
+          // unset renders exactly one row — "Please select a country" — and that is not an option:
+          // left in, it is a one-item list, which reads as a COMPLETE vocabulary and would reach the
+          // review editor as the single thing the operator may pick. The unset parent is explained
+          // by the record's own detail (see awaitingParent); the option list must simply be empty.
+          const items = ul ? [...ul.children].map((li) => txt(li))
+            .filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^please select a /i.test(t)) : [];
+          const shown = document.getElementById(el.id + "_fakeSelected_icimsDropdown");
+          const cur = shown ? txt(shown) : "";
+          push(Object.assign(base, {
+            widgetType: "icims_dropdown",
+            value: cur && !/^—\s*make a selection/i.test(cur) && !/^please select/i.test(cur) ? cur : null,
+            options: items,
+            // ⚠ PROVENANCE, NOT A GUESS: this widget renders ONE PAGE and offers a search box —
+            // measured at 26 countries and 25 states (Alabama…Michigan, so Minnesota→Wyoming are
+            // absent). Marking it partial is what stops review presenting a 25-row list as the
+            // complete set of US states, and what tells the actuator to search before giving up.
+            optionsPartial: !!(ul && ul.getAttribute("data-ap-complete") !== "1"),
+            // The parent→child dependency, DECLARED by the page: picking this field's value is what
+            // populates the named child (Country → State/Province). Carried so the driver can order
+            // them and explain an empty child honestly instead of guessing.
+            childLink: el.getAttribute("data-ddd-child-link") || null,
+          }));
+          continue;
+        }
+        push(Object.assign(base, { widgetType: "dropdown_native",
+          // Same "index 0 is not unselected" rule as atsInjReadValue — a select whose first row is a
+          // REAL option (iCIMS' salary currency starts at "USD $") would otherwise scan as blank, so a
+          // value already on the form is invisible to the fill and to the post-fill audit.
+          value: selectedTextOf(el),
+          // iCIMS' placeholder row is "— Make a Selection —"; drop it and any bare "Select…"
+          options: [...el.options].map((o) => txt(o)).filter((t) => t && !/^(select|—\s*make a selection)/i.test(t)) }));
+        continue;
+      }
+      if (el.tagName === "TEXTAREA") { push(Object.assign(base, { widgetType: "textarea", value: el.value || null })); continue; }
+      // ⚠ `inputType` is carried for ONE reason: a password box must be recognizable as a secret
+      // even on a tenant whose field ids the static map does not know. See atsCredentialKind.
+      push(Object.assign(base, { widgetType: "text", inputType: el.type || "text",
+        autocomplete: el.getAttribute("autocomplete") || null,
+        value: el.type === "password" ? null : (el.value || null) }));
+    }
+    return out;
+  }
+
+  // ⚠ THE ASHBY BLOCK BELOW IS THE FALL-THROUGH, NOT A GUARDED BRANCH. Without this line a fifth
+  // tenant added above would silently run Ashby's selectors and return a plausible-looking 0-field
+  // scan instead of failing. An empty scan is refused by atsLooksLikeApplicationForm — an honest stop.
+  if (ats !== "ashby") return out;
 
   // ashby — field units: the semantic .ashby-application-form-field-entry PLUS the
   // hashed `_fieldEntry_*` css-module class. The EEOC survey's entries and the consent
@@ -593,6 +1563,229 @@ function atsInjSetText(inputSel, value) {
   return { ok: true, after: el.value };
 }
 
+// ── CREDENTIAL WRITE / VERIFY ────────────────────────────────────────────────────────────
+// Deliberately separate from atsInjSetText for two reasons, each earned:
+//
+// 1. ⚠ IT NEVER RETURNS THE VALUE. atsInjSetText answers `{after: el.value}`, which for a password
+//    box hands the secret back across the CDP boundary into a record, a log line and ultimately the
+//    review bundle POSTed to the website. These return a LENGTH and a MATCH BOOLEAN — everything
+//    needed to verify the write, nothing that carries it.
+// 2. ⚠ IT CLEARS FIRST. The setter SETS a value, it does not replace a selection, so rewriting a
+//    prepopulated login produced "someone.else@old-account.comkevin@example.com". iCIMS renders the
+//    session's own login into that box, so a rewrite is the NORMAL case here, not an edge one.
+//    Same "clear before typing" rule the typeahead path already follows.
+function atsInjSetCredential(inputSel, value) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const proto = el.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+  const had = (el.value || "").length;
+  el.focus();
+  setter.call(el, "");
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  setter.call(el, value);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  el.blur();
+  el.dispatchEvent(new Event("focusout", { bubbles: true }));
+  return { ok: true, hadLength: had, len: (el.value || "").length, matches: el.value === value };
+}
+
+// Press an auth form's own submit control. Page-side on purpose: iCIMS is server-rendered jQuery,
+// so `el.click()` on a real `<input type="submit">` runs the browser's native submit algorithm
+// (onsubmit handlers included, which is what invisible hCaptcha hooks into). That is NOT the
+// Workday case where a synthetic auth submit went inert — there the failure was React never seeing
+// a native-setter value, and iCIMS has no controlled-component layer to miss it. The caller still
+// proves the page moved afterwards rather than trusting the click.
+function atsInjClickAuthSubmit(sel) {
+  const btn = (sel ? document.querySelector(sel) : null)
+    || document.querySelector('input[type="submit"], button[type="submit"]');
+  if (!btn) return { ok: false, error: "no-submit-control" };
+  if (btn.disabled || btn.getAttribute("aria-disabled") === "true") return { ok: false, error: "submit-disabled" };
+  btn.click();
+  return { ok: true, caption: String(btn.value || btn.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40) };
+}
+
+// Independent re-read of a credential box. Same no-value contract as the write.
+// `matches` is the whole point: it answers "does the page still hold what we put there?" without
+// anyone outside the page ever seeing either string.
+function atsInjVerifyCredential(inputSel, value) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const v = el.value || "";
+  return { ok: true, len: v.length, empty: v === "", matches: v === value };
+}
+
+// ── iCIMS "IdDropDown" — an AJAX combobox wearing a <select> ─────────────────────────────
+// Anatomy, traced live 2026-08-16 (astrion), all ids derived from the <select>'s own id:
+//   <select id="X" icimsdropdown-enabled="1" data-ddd-child-link="…">  ← ALWAYS EMPTY; value is an
+//                                                                        opaque id ("12781"), never text
+//   <a  id="X_icimsDropdown" class="dropdown-select">                  ← the OPENER
+//   <span id="X_fakeSelected_icimsDropdown">                           ← what the user SEES = read-back
+//   <div id="X_icimsDropdown_ctnr" class="dropdown-container[ dropdown-invisible]">
+//        <input class="dropdown-search" placeholder="— Type to Search —">
+//   <ul id="X_dropdown-results"> <li role="option" class="dropdown-result result-selectable">
+//
+// ⚠ `aria-expanded` STAYS "false" even while open — gate on the container's `dropdown-invisible`
+// class, never on aria (the same lesson Workday's dropdown close taught).
+// ⚠ ONE PAGE ONLY: 26 countries / 25 states. Anything past it needs the search box.
+
+// Open the widget. Returns the option texts it is showing.
+function atsInjIcimsOpen(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const opener = document.getElementById(el.id + "_icimsDropdown");
+  const ctnr = document.getElementById(el.id + "_icimsDropdown_ctnr");
+  if (!opener || !ctnr) return { ok: false, error: "no-widget" };
+  if (/dropdown-invisible/.test(String(ctnr.className))) {
+    for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) {
+      opener.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+    }
+  }
+  const ul = document.getElementById(el.id + "_dropdown-results");
+  const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+  const opts = ul ? [...ul.children].map(txt).filter((t) => t && !/^—\s*make a selection/i.test(t)) : [];
+  return { ok: true, open: !/dropdown-invisible/.test(String(ctnr.className)), options: opts };
+}
+
+// Type into the widget's own search box. iCIMS filters/fetches on input; the caller re-reads after.
+function atsInjIcimsSearch(inputSel, query) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const ctnr = document.getElementById(el.id + "_icimsDropdown_ctnr");
+  const box = ctnr ? ctnr.querySelector("input.dropdown-search") : null;
+  if (!box) return { ok: false, error: "no-search-box" };
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  box.focus();
+  setter.call(box, "");
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+  setter.call(box, String(query));
+  box.dispatchEvent(new Event("input", { bubbles: true }));
+  box.dispatchEvent(new Event("keyup", { bubbles: true }));
+  return { ok: true };
+}
+
+// Read whatever the widget is currently showing (after a search, or to settle-poll it).
+function atsInjIcimsReadOptions(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const ul = document.getElementById(el.id + "_dropdown-results");
+  if (!ul) return { ok: false, error: "no-results-list" };
+  const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+  const all = [...ul.children].map(txt);
+  return { ok: true,
+    options: all.filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^no results/i.test(t)),
+    // a child whose parent is unset says so in its own list — report it rather than calling it empty
+    awaitingParent: all.some((t) => /^please select a /i.test(t)),
+    noChildren: all.some((t) => /^no .* available$/i.test(t)),
+    // the widget's own "nothing matched" row. A TERMINAL state for a search: it means keep waiting
+    // is pointless, and (for the school pair) that the form's "Other" branch is the right answer.
+    noResults: all.some((t) => /^no results/i.test(t)) };
+}
+
+// Commit by clicking the row whose text matches EXACTLY (the caller has already run the match ladder).
+function atsInjIcimsCommit(inputSel, optionText) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const ul = document.getElementById(el.id + "_dropdown-results");
+  if (!ul) return { ok: false, error: "no-results-list" };
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const row = [...ul.children].find((li) => norm(li.textContent) === norm(optionText));
+  if (!row) return { ok: false, error: "option-not-found" };
+  for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) {
+    row.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  }
+  return { ok: true };
+}
+
+// Read-back: the widget's OWN displayed text. Never `select.value` — that is an opaque numeric id.
+function atsInjIcimsRead(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const shown = document.getElementById(el.id + "_fakeSelected_icimsDropdown");
+  const t = shown && shown.textContent ? shown.textContent.replace(/\s+/g, " ").trim() : "";
+  const placeholder = !t || /^—\s*make a selection/i.test(t) || /^please select/i.test(t);
+  return { ok: true, value: placeholder ? null : t, rawId: el.value || null };
+}
+
+// Close, and CONFIRM it closed. Same rule as the Workday dropdown close: a list left mounted over
+// the next field's opener is how a stray click commits the wrong value.
+function atsInjIcimsClose(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el || !el.id) return { ok: false, error: "not-found:" + inputSel };
+  const ctnr = document.getElementById(el.id + "_icimsDropdown_ctnr");
+  if (!ctnr) return { ok: true, closed: true };
+  if (!/dropdown-invisible/.test(String(ctnr.className))) {
+    document.body.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+    const opener = document.getElementById(el.id + "_icimsDropdown");
+    if (opener && !/dropdown-invisible/.test(String(ctnr.className))) {
+      for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) {
+        opener.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+      }
+    }
+  }
+  return { ok: true, closed: /dropdown-invisible/.test(String(ctnr.className)) };
+}
+
+// Click a repeating section's "Add More" anchor. Anchored by the anchor's OWN TEXT rather than its
+// id (`rcf3211Button_-1` is per-customer) — every one of them reads "Add More (<section name>)".
+// Returns the control count before/after so the caller can tell a real mount from a no-op.
+// Where does this field sit inside the FRAME's document? (absolute, not viewport-relative)
+function atsInjFrameFieldY(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false };
+  const r = el.getBoundingClientRect();
+  return { ok: true, y: Math.round(r.top + (window.scrollY || 0)), h: Math.round(r.height) };
+}
+
+// WHICH URL IS THE iCIMS CONTENT FRAME? Read from the TOP document, where the <iframe> element lives,
+// so the answer is the tenant's own markup rather than a guess about the frame tree. This is what lets
+// a frame be pinned BEFORE it holds any form control (an `<tenant>.icims.com` posting page: job
+// description + one Apply anchor, zero inputs) without risking a pin on an unrelated iframe — see
+// cdpUseFormFrame's identity rule.
+function atsInjIcimsFrameSrc() {
+  const fr = document.getElementById("icims_content_iframe") ||
+    document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
+  if (!fr) return { ok: false };
+  // `.src` is the attribute as written; the frame's LIVE url can differ once it navigates (a postback,
+  // an Apply click), so both are reported and the caller matches on whichever it can.
+  return { ok: true, src: fr.src || null, id: fr.id || fr.name || null };
+}
+
+// ⚠ SCROLLING INSIDE THE FRAME MOVES NOTHING WHEN THE FRAME IS FULL-HEIGHT. iCIMS sizes its iframe
+// to its content, so the frame's document has no scrollbar of its own — the TOP window is the
+// scroller. `atsInjScrollIntoView` therefore ran per field and the operator still saw a motionless
+// page. This runs in the TOP frame and scrolls it to the field's position PLUS the iframe's own
+// offset, which is the only place that arithmetic is available.
+function atsInjScrollTopToFrameY(y, h) {
+  const fr = document.getElementById("icims_content_iframe") ||
+    document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
+  if (!fr) return { ok: false };
+  const fy = fr.getBoundingClientRect().top + (window.scrollY || 0);
+  const target = fy + y - Math.max(120, (window.innerHeight || 800) / 2 - (h || 0) / 2);
+    // ⚠ INSTANT, NEVER SMOOTH. A smooth scroll is still ANIMATING when the next widget is opened and
+  // clicked, and these comboboxes portal their menu at a fixed screen position — so the page slid
+  // under the menu and three fields that had filled cleanly came back "no option matched". Watching
+  // the fill must never move the page while the fill is touching it.
+  window.scrollTo({ top: Math.max(0, Math.round(target)), behavior: "auto" });
+  return { ok: true };
+}
+
+function atsInjIcimsAddEntry(labelPattern) {
+  const re = new RegExp(labelPattern, "i");
+  const anchors = [...document.querySelectorAll("a, button")].filter((a) => {
+    const t = (a.textContent || "").replace(/\s+/g, " ").trim();
+    return /^add more/i.test(t) && re.test(t);
+  });
+  if (!anchors.length) return { ok: false, error: "no-add-button" };
+  const before = document.querySelectorAll("input, select, textarea").length;
+  const a = anchors[anchors.length - 1]; // the LAST one is the live section's, after any prior adds
+  for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) {
+    a.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+  }
+  return { ok: true, before, label: (a.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60) };
+}
+
 // Read one field's CURRENT live value (verify/audit) — same read rules as the scan.
 function atsInjReadValue(ats, inputSel, widgetType) {
   const el = document.querySelector(inputSel);
@@ -614,7 +1807,35 @@ function atsInjReadValue(ats, inputSel, widgetType) {
     }
     return { ok: true, value: el.value || null };
   }
-  if (widgetType === "dropdown_native") return { ok: true, value: el.selectedIndex > 0 ? txt(el.options[el.selectedIndex]) : null };
+  // `values` is the AUTHORITATIVE array; `value` is the joined display string, and it joins on the
+  // shared group separator "; " (GROUP_JOIN, lib.js) so the review editor can split it back into
+  // ticked options. See the scan's multiselect branch for what joining on ", " cost.
+  if (widgetType === "multiselect_native") {
+    const picked = [...el.selectedOptions].map(txt).filter(Boolean);
+    return { ok: true, values: picked, value: picked.join("; ") || null };
+  }
+  // ⚠ INDEX 0 IS NOT "UNSELECTED" — a select need not have a placeholder. This read used
+  // `selectedIndex > 0`, so on iCIMS' salary selects (raw options start at "USD $" and "Hr." with NO
+  // blank first row) choosing the FIRST option read back as null, and a rehearsal reported `native
+  // select commit failed` on two fields whose values were sitting on the form the whole time
+  // (measured 2026-08-17: selectedIndex 0, value "USD $"). A FALSE NEGATIVE on a verify gate blocks a
+  // submit that should pass, which is why it is worth the extra care.
+  // "Unselected" is: nothing selected at all, or the selected row is a PLACEHOLDER — the same
+  // vocabulary the scan uses to filter placeholders out of its option list.
+  if (widgetType === "dropdown_native") {
+    if (el.selectedIndex < 0) return { ok: true, value: null };
+    const t = txt(el.options[el.selectedIndex]);
+    return { ok: true, value: (!t || /^(select|choose|—\s*make a selection)/i.test(t)) ? null : t };
+  }
+  // ⚠ iCIMS' AJAX combobox: its <select> is empty and holds an opaque numeric id, so BOTH the usual
+  // reads (`selectedIndex`/`el.value`) lie about it — one says "nothing selected", the other returns
+  // "12781". The truth is the text the widget displays. Without this the post-fill audit would flag
+  // every one of these as audit-mismatch on a correct fill.
+  if (widgetType === "icims_dropdown") {
+    const shown = el.id ? document.getElementById(el.id + "_fakeSelected_icimsDropdown") : null;
+    const t = shown ? txt(shown) : "";
+    return { ok: true, value: (!t || /^—\s*make a selection/i.test(t) || /^please select/i.test(t)) ? null : t };
+  }
   if (widgetType === "radio" || widgetType === "checkbox_group") {
     const list = [...document.querySelectorAll(inputSel)];
     const on = list.filter((r) => r.checked);
@@ -920,12 +2141,50 @@ function atsInjAttachFile(inputSel, base64, filename, mime) {
   } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 }
 
+// Tick an ACCEPT checkbox the operator has authorised (atsConsentKind → "accept"), and prove it took.
+// The LABEL is clicked in preference to the input: iCIMS is server-rendered jQuery whose handlers hang
+// off the row, and native label activation flips `checked` AND fires the change event those handlers
+// listen for — the same reason the Workday radio path clicks labels. Falls back to the input itself,
+// then to a property write + change, so a tenant that hides its box behind CSS still commits.
+// Returns only whether it ended CHECKED: a tick that did not take must never be reported as consent
+// given, because the caller is about to say so in the log on the operator's behalf.
+function atsInjTickConsent(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return { ok: false, error: "not-found:" + sel };
+  if (el.checked) return { ok: true, checked: true, already: true };
+  // Read the escaper OFF window, matching the guard. The sibling readers here write `window.CSS &&
+  // CSS.escape`, which works in a page (bare `CSS` resolves on the global) but throws the moment the
+  // global is anything other than a real window — including under a unit test, which is how a tick
+  // primitive doing something legally meaningful would otherwise go unpinned.
+  const esc = (s) => (window.CSS && window.CSS.escape ? window.CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+  const label = el.id ? document.querySelector('label[for="' + esc(el.id) + '"]') : (el.closest("label") || null);
+  try { if (label) label.click(); } catch (e) { /* fall through */ }
+  if (!el.checked) { try { el.click(); } catch (e) { /* fall through */ } }
+  if (!el.checked) {
+    try {
+      el.checked = true;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+  }
+  return { ok: !!el.checked, checked: !!el.checked };
+}
+
 // The submit control + captcha/confirmation state — READ-ONLY (the click itself is the
 // caller's, trusted, and gated). One reader for everything the gate needs to see.
 function atsInjSubmitState(ats) {
   const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   let btn = null;
   if (ats === "lever") btn = document.querySelector("#btn-submit");
+  // ⚠ iCIMS NEEDS ITS OWN BRANCH, and without it the form is REFUSED rather than filled. Its control
+  // is `<input type="submit" id="cp_form_submit_i" value="Submit Profile">`, which the generic finder
+  // below cannot see twice over: it queries only `button`s, and it matches on `textContent`, which an
+  // <input> does not have (its caption is `.value`). `hasSubmit:false` makes
+  // atsLooksLikeApplicationForm reject a perfectly good page as "not an application form".
+  // Scoped to iCIMS so the other three tenants' detection stays byte-identical.
+  // Detection only — nothing here clicks anything; the fill run never submits, and the submit run
+  // clicks only behind the arm gate.
+  if (ats === "icims") btn = [...document.querySelectorAll('#cp_form_submit_i, input[type="submit"], button[type="submit"]')].find((b) => vis(b)) || null;
   if (!btn) btn = [...document.querySelectorAll('button[type="submit"], button')].find((b) => /submit application|submit$/i.test((b.textContent || "").trim()) && vis(b));
   const r = btn ? btn.getBoundingClientRect() : null;
   // a VISIBLE captcha challenge. ⚠ Lever's DORMANT invisible-mode hCaptcha container is a
@@ -1063,6 +2322,11 @@ function atsPostingGone(jd, requestedUrl, landedUrl) {
   const title = String((jd && jd.title) || "").trim();
   if (/^(not found|404|page not found|job not found)$/i.test(title)) return 'the posting page reports "' + title + '"';
   if (/^current openings at/i.test(title)) return 'it redirected to the board index ("' + title + '")';
+  // iCIMS says so in the URL, and it is the clearest signal any of these tenants gives: a dead job id
+  // redirects to the tenant's OWN job-search page carrying `notFound=1` (measured 2026-08-18 — three of
+  // four postings taken from a search index were already closed, every one answering this way). Checked
+  // ahead of the id rule below because it names the cause instead of describing the symptom.
+  if (/[?&]notfound=1(&|$)/i.test(String(landedUrl || ""))) return "the tenant's own search page answered notFound=1 for it";
   const idOf = (u) => {
     const t = String(u || "");
     const m = /\/jobs?\/(\d{4,})/.exec(t) ||
@@ -1147,11 +2411,69 @@ function atsAttachOptions(rec, texts, partial) {
   rec.captured_options = null;
 }
 
+// ── IS AN iCIMS DROPDOWN'S LIST COMPLETE, OR JUST THE FIRST PAGE? ────────────────────────
+// The widget serves ONE page and offers a search box, so its rows may be a prefix of a longer
+// list. Until now EVERY icims_dropdown was marked partial UNCONDITIONALLY: the flag read a
+// `data-ap-complete` attribute that nothing in this codebase has ever written. And a partial list
+// is attached as `captured_options` with widgetType "typeahead" — review renders a type-it-yourself
+// box with an honest caveat instead of a picker. So a two-option "May We Contact" question reached
+// the operator as FREE TEXT. Measured on the Astrion form: 14 of 25 dropdowns were provably
+// complete and mislabelled, including all ten Yes/No screening questions and a 6-row Availability.
+//
+// The form reveals its own page size when you look at every dropdown at once: unrelated
+// vocabularies do not stop at the same exact length by chance. Measured there — Time Zone, Country,
+// State/Province and Degree all stop at exactly 25 while nothing else comes near it. That is a
+// pager, not a coincidence. Derived rather than hardcoded because the cap is a tenant setting: a
+// constant 25 would silently mislabel a tenant that pages at 50.
+var ATS_ICIMS_CAP_MIN = 10; // below this a repeated length is a vocabulary, not a page size
+
+function atsIcimsPageCap(lengths) {
+  const counts = new Map();
+  for (const n of lengths || []) {
+    if (!Number.isFinite(n) || n < ATS_ICIMS_CAP_MIN) continue;
+    counts.set(n, (counts.get(n) || 0) + 1);
+  }
+  let cap = null;
+  for (const [n, c] of counts) if (c >= 2 && (cap == null || n > cap)) cap = n;
+  return cap;
+}
+
+// A pager that returned FEWER rows than a full page has reached its end — the same inference any
+// paged API invites. With no cap proven the only safe claim is "nothing on this form is even
+// page-sized, so truncation is not in play at all"; everything else stays UNPROVEN, which is
+// exactly today's behaviour.
+// ⚠ THE ASYMMETRY IS DELIBERATE. Calling a truncated list complete shows the operator a picker
+// that is MISSING their answer — they conclude the form does not offer it. Calling a complete list
+// partial merely costs them a typed value. So this errs toward under-claiming, every time.
+function atsIcimsListComplete(n, cap, maxLen) {
+  if (!Number.isFinite(n) || n <= 0) return false;
+  if (cap != null) return n < cap;
+  return Number.isFinite(maxLen) && maxLen > 0 && maxLen < ATS_ICIMS_CAP_MIN;
+}
+
+// THE choice-widget list, in ONE place. It was inlined identically at three call sites, which is
+// exactly the trap CLAUDE.md already warns about for this vocabulary ("a new choice widget must be
+// registered in FOUR places, and missing one fails silently and differently each time") — a
+// copy-paste list makes the fourth miss inevitable.
+var ATS_CHOICE_WIDGETS = ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native",
+  "location", "icims_dropdown", "multiselect_native"];
+
 const ATS_REVIEW_WIDGET = { // scan widgetType → the review schema's widget_type vocabulary
   text: "text", textarea: "textarea", select: "dropdown", dial: "dropdown", location: "typeahead",
   dropdown_native: "dropdown", radio: "radio", checkbox: "checkbox", checkbox_group: "checkbox_group",
   yesno: "radio", file_upload: "file_upload", date: "date", unknown: "unknown",
+  icims_dropdown: "dropdown", multiselect_native: "checkbox_group",
 };
+
+// The same set of widgets under their REVIEW-side names. A record's `widgetType` is rewritten to
+// this vocabulary the moment it is built (`ATS_REVIEW_WIDGET[f.widgetType]`), so anything looking at
+// a RESULT must match on these, not on the scan's names — checking the scan vocabulary against a
+// built record silently matches almost nothing. DERIVED from the two tables above rather than
+// written out a third time, so a new choice widget cannot be missed here. `typeahead` is added
+// explicitly because `atsAttachOptions` rewrites a partial-list record to it.
+var ATS_CHOICE_REVIEW_WIDGETS = [...new Set(
+  ATS_CHOICE_WIDGETS.map((w) => ATS_REVIEW_WIDGET[w] || w).concat(["typeahead"])
+)];
 
 // Options for a dial-code select carry a trailing "+<digits>" ("United States +1") that no
 // profile value will ever contain — strip it for matching, commit by the FULL text.
@@ -1377,6 +2699,44 @@ function atsDurableFieldName(name) {
   return n;
 }
 
+// ⚠ AN ENTRY'S SUBMIT KEY IS ITS POSITION, NOT THE ID THE FORM MINTED (live 2026-08-18).
+// `atsDurableFieldName` alone was enough while iCIMS numbered repeating entries POSITIONALLY (`-1_`,
+// `-2_`, `-3_` — an ordinal is a position, and the same form renders the same ordinals every visit).
+// The résumé parse breaks that: it SAVES the entries it extracts, so they come back as server rows
+// carrying opaque ids, and a fresh visit mints fresh ones. Measured on Astrion: a fill wrote its bundle
+// under `-8455804/5/6_` and the rehearsal's form served `-8459967/8/9_`, so all 45 Experience fields
+// reported `approved value has NO matching field on the live form` and the gate refused a submit whose
+// values were all present. An id that changes per visit cannot be a key.
+//
+// The position CAN be, and both sides already carry it: `atsAssignEntryIndexes` stamps `entryIndex`
+// (+`entrySection`) by FIRST DOM APPEARANCE, and the bundle carries them as `entry_section` /
+// `entry_index`. So a section entry keys as `@experience[0]/<bare id>` — stable however the tenant
+// numbers its rows.
+//
+// This is not a NEW trust assumption: matching by ordinal was already positional, so a tenant that
+// reordered its rows between visits could always have mis-aligned them. What changed is only that the
+// position is now read from the stamp instead of from the id. Anything without a section stamp — every
+// page-level field, and the candidate's own address/phone block, which the parse leaves at `-1_` (all 45
+// failures were Experience; not one was `PersonProfileFields.Address*`/`Phone*`) — keeps the old key
+// exactly, so Greenhouse / Lever / Ashby are byte-identical.
+// Accepts BOTH shapes on purpose: live scan fields (camelCase, from atsInjScan) and bundle entries /
+// result records (snake_case). One key function, or the two sides key differently and nothing matches.
+function atsSubmitKey(ats, f) {
+  // A bare string is accepted so a caller that only holds a name still gets the OLD key rather than a
+  // silently empty one — an empty key would match every other keyless field, which is worse than
+  // missing the position.
+  if (typeof f === "string") return atsDurableFieldName(f);
+  const name = String((f && (f.fieldName != null ? f.fieldName : f.name)) || "");
+  if (ats !== "icims" || !f) return atsDurableFieldName(name);
+  const section = f.entrySection != null ? f.entrySection : f.entry_section;
+  const idx = typeof f.entryIndex === "number" ? f.entryIndex
+    : (typeof f.entry_index === "number" ? f.entry_index : null);
+  if (section != null && String(section) !== "" && typeof idx === "number") {
+    return "@" + section + "[" + idx + "]/" + atsMapKey(ats, name);
+  }
+  return atsDurableFieldName(name);
+}
+
 // The form's OWN "no answer" option, if it offers one. A required choice question the profile
 // cannot answer must not be left blank — it blocks the submit and reaches the operator as a
 // dead end. Declining is a real, truthful, submittable answer that asserts nothing false, and a
@@ -1434,6 +2794,351 @@ function atsPickApplyLink(links, isAts) {
   const labelled = list.filter((l) => l.kind === "text");
   if (uniq(labelled).length === 1) return labelled[0].href;
   return null;
+}
+
+// ── EMPLOYER-FRONTED PORTALS: the URL names no ATS at all ────────────────────────────────
+// `careers.astrion.us/jobs/24615` is an iCIMS career portal served under the EMPLOYER's own
+// domain, so `detectAts` — which is host-based and must stay that way, because that is what makes
+// `icims.com.evil.com` return null — sees nothing. There is no hostname pattern to widen to:
+// "careers.<anything>" is every ATS and none of them.
+//
+// So the portal is identified the way every other unknown in this codebase is: READ THE PAGE, and
+// decide SW-side. The evidence is the set of hosts the page itself references — iframe srcs, script
+// srcs, stylesheet hrefs, and the hosts its own Apply affordances point at. That is the employer
+// telling us who runs their careers site, not us guessing from a name.
+function atsInjPortalEvidence() {
+  const attr = (sel, name) => [...document.querySelectorAll(sel)].map((e) => e.getAttribute(name) || "").filter(Boolean).slice(0, 60);
+  const hostsOf = (list) => {
+    const out = [];
+    for (const u of list) { try { out.push(new URL(u, location.href).hostname.toLowerCase()); } catch (e) { /* skip */ } }
+    return out;
+  };
+  const applyHrefs = [...document.querySelectorAll("a[href]")]
+    .filter((a) => /\bapply\b/i.test(a.textContent || "") || /\/(apply|login)\b|apply\?/i.test(a.getAttribute("href") || ""))
+    .map((a) => a.href).slice(0, 20);
+  return {
+    ok: true, url: location.href,
+    frameHosts: hostsOf(attr("iframe", "src")),
+    scriptHosts: hostsOf(attr("script[src]", "src")),
+    linkHosts: hostsOf(attr("link[href]", "href")),
+    applyHosts: hostsOf(applyHrefs),
+    frameIds: [...document.querySelectorAll("iframe")].map((f) => f.id || "").filter(Boolean).slice(0, 10),
+  };
+}
+
+// Which ATS does the page's own evidence name? `isAts` is injected (detectAts) so host knowledge
+// stays in ONE place. Refuses ambiguity exactly like atsPickApplyLink / atsPickEmbeddedForm: a page
+// referencing two different ATSs is not a situation to guess through.
+function atsPortalAts(ev, isAts) {
+  if (!ev || !ev.ok) return null;
+  const kinds = new Set();
+  for (const hosts of [ev.frameHosts, ev.scriptHosts, ev.applyHosts, ev.linkHosts]) {
+    for (const h of hosts || []) {
+      const k = isAts("https://" + h + "/");
+      if (k && k !== "workday") kinds.add(k);
+    }
+  }
+  if (kinds.size === 1) return [...kinds][0];
+  if (kinds.size > 1) return null;
+  // iCIMS' own frame id, which only exists on a page iCIMS rendered. Kept as a LAST tier rather
+  // than a first one: a host reference is harder evidence than an element id.
+  if ((ev.frameIds || []).some((id) => /^icims_content_iframe$/i.test(id))) return "icims";
+  return null;
+}
+
+// ── PAGE SIGNATURE — "did that click actually do anything?" ──────────────────────────────
+// The iCIMS Apply control is FLAKY: a click can be swallowed and the page simply stays put
+// (operator, observed). A fixed click COUNT is the wrong remedy — it either under-clicks a slow
+// page or over-clicks a page that already moved. So the retry polls the page's own IDENTITY, the
+// same rule the Workday walk's transition wait uses: url || the rendered control set || the
+// heading. Any one of them differing means we advanced.
+function atsInjPageSignature() {
+  const q = "input:not([type=hidden]), select, textarea";
+  const ids = [...document.querySelectorAll(q + ", button")].map((e) => e.id || e.name || "").filter(Boolean).sort().join("|");
+  const fr = document.getElementById("icims_content_iframe") || document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
+  const h = document.querySelector("h1, h2");
+  return {
+    url: String(location.href).split("#")[0],
+    frameSrc: fr ? String(fr.getAttribute("src") || fr.src || "").split("#")[0] : null,
+    controls: document.querySelectorAll(q).length,
+    heading: String((h && h.textContent) || "").replace(/\s+/g, " ").trim().slice(0, 80),
+    ids: ids.slice(0, 600),
+  };
+}
+
+// PURE. Deliberately conservative in ONE direction: an unreadable side is "no change", so a read
+// that failed can never be mistaken for progress — the caller keeps waiting or gives up saying so.
+function atsSignatureChanged(a, b) {
+  if (!a || !b) return false;
+  if (String(a.url) !== String(b.url)) return true;
+  if (String(a.frameSrc || "") !== String(b.frameSrc || "")) return true;
+  if (String(a.heading || "") !== String(b.heading || "")) return true;
+  if (Number(a.controls || 0) !== Number(b.controls || 0)) return true;
+  return String(a.ids || "") !== String(b.ids || "");
+}
+
+// Click an Apply control the existing `atsInjClickApplyButton` cannot see. That one queries
+// `button, [role=button], a[href="#"]` and matches on `textContent` — so an `<input type="submit"
+// value="Apply">` (no textContent) and an ordinary `<a href="…">Apply</a>` (a real href) both miss.
+// Kept SEPARATE rather than widening the original, so Greenhouse / Lever / Ashby keep the exact
+// affordance-finding they were live-verified with. Same refusals: invisible-preferred, ambiguity
+// declines rather than guesses.
+function atsInjClickApplyAnchor() {
+  const vis = (el) => {
+    if (typeof el.checkVisibility === "function") return el.checkVisibility({ checkVisibilityCSS: true });
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const cap = (el) => String(el.value || el.textContent || "").replace(/\s+/g, " ").trim();
+  const APPLY_RE = /^apply\b|\bapply (now|here|online|for this)\b/i;
+  const all = [...document.querySelectorAll('a[href], input[type="submit"], input[type="button"]')]
+    .filter((el) => { const t = cap(el); return APPLY_RE.test(t) && t.length <= 40; });
+  const shown = all.filter(vis);
+  const els = shown.length ? shown : all;
+  if (!els.length) return { ok: false, reason: "no-apply-control" };
+  const uniq = [...new Set(els.map(cap))];
+  if (uniq.length > 1) return { ok: false, reason: "ambiguous", offered: uniq.slice(0, 4) };
+  els[0].click();
+  return { ok: true, clicked: uniq[0], href: els[0].tagName === "A" ? String(els[0].href || "").split("?")[0] : null };
+}
+
+// ── iCIMS SIGN-IN GATE ───────────────────────────────────────────────────────────────────
+// Reaching an iCIMS application form means getting past an email gate first (traced live
+// 2026-08-16 on astrioncareers-astrion.icims.com/jobs/<id>/login): step one is an "Enter Your
+// Information" card holding ONE visible control — `<input type="email" id="email"
+// name="css_loginName">` — plus `<input type="submit" id="enterEmailSubmitButton" value="Next">`,
+// inside the same `#icims_content_iframe` the form itself lives in, with hCaptcha in INVISIBLE
+// mode (a corner badge, no checkbox).
+//
+// ⚠ THE LOGIN PAGE PASSES `atsLooksLikeApplicationForm`. It has a submit control and an email
+// field, which is exactly that function's positive test — so without an auth check running FIRST,
+// a run that reaches the gate would classify it as the application form and start filling profile
+// data into a login box. Recognising the gate is therefore a SAFETY property, not a convenience:
+// the same reasoning that makes an UNrecognised password field the dangerous outcome for the
+// credential tier.
+//
+// READ-ONLY. Runs inside the form frame when one is armed and works unchanged on a top-level
+// document, so a tenant that stops framing its login needs no new code.
+function atsInjAuthScan() {
+  const vis = (el) => {
+    if (!el) return false;
+    if (typeof el.checkVisibility === "function") return el.checkVisibility({ checkVisibilityCSS: true });
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+  const labelOf = (e) => {
+    let l = e.id ? document.querySelector('label[for="' + esc(e.id) + '"]') : null;
+    if (!l) l = e.closest("label");
+    if (!l) { const row = e.closest("tr, .iCIMS_TableRow, fieldset, div"); l = row ? row.querySelector("label") : null; }
+    return clean(l && l.textContent).slice(0, 80);
+  };
+  const words = (e) => clean((e.id || "") + " " + (e.name || "") + " " + (e.getAttribute("autocomplete") || "") + " " + labelOf(e));
+  const selOf = (e) => (e.id ? "#" + esc(e.id) : (e.name ? '[name="' + esc(e.name) + '"]' : null));
+  const describe = (e) => (e ? { sel: selOf(e), id: e.id || null, name: e.name || null, label: labelOf(e),
+    type: String(e.type || "").toLowerCase(), prefilled: !!(e.value && String(e.value).length) } : null);
+
+  const shown = [...document.querySelectorAll("input:not([type=hidden]), select, textarea")].filter(vis);
+  const find = (test) => describe(shown.find(test) || null);
+  const password = find((e) => String(e.type || "").toLowerCase() === "password");
+  const email = find((e) => String(e.type || "").toLowerCase() === "email" || /\b(e-?mail|loginname|login_?name|username|user_?id)\b/i.test(words(e)));
+  // A one-time code box. iCIMS can mail a code instead of showing a password step; recognising it
+  // is what lets the run say so instead of halting on "an unknown page".
+  const code = find((e) => /one-time-code/i.test(e.getAttribute("autocomplete") || "")
+    || /\b(otp|one[ _-]?time|verification[ _-]?code|access[ _-]?code|security[ _-]?code|passcode)\b/i.test(words(e)));
+
+  const clickables = [...document.querySelectorAll('input[type="submit"], input[type="button"], button, a.iCIMS_Anchor, [role="button"]')].filter(vis);
+  const cap = (b) => clean(b.value || b.textContent).slice(0, 60);
+  const submitEl = clickables.find((b) => /^input$/i.test(b.tagName) && /^submit$/i.test(String(b.type || "")))
+    || clickables.find((b) => /^(next|continue|sign in|log ?in|submit|go|send)\b/i.test(cap(b)));
+  const submit = submitEl ? { sel: submitEl.id ? "#" + esc(submitEl.id) : null, id: submitEl.id || null, caption: cap(submitEl) } : null;
+
+  // FEDERATED buttons are REPORTED and never clicked — the Workday `sso` rule, carried over.
+  const federated = clickables.map(cap).filter((t) => /\b(with|using)\s+(google|linkedin|apple|microsoft|facebook)\b|\b(sso|single sign[ -]?on)\b/i.test(t)).slice(0, 5);
+  // An account-CREATION control is likewise reported, never pressed: on iCIMS the account is made
+  // by the SUBMISSION (the form's own "Create a login" block, behind the review gate), so a
+  // standalone register button here is a flow we have not traced and must not press blind.
+  const createAccount = clickables.map(cap).filter((t) => /\b(create (an? )?account|register|sign ?up)\b/i.test(t)).slice(0, 5);
+
+  // Same VISIBLE-challenge rule as atsInjSubmitState (a dormant invisible-mode container is a
+  // full-viewport hidden iframe and must not read as a challenge).
+  const captchaChallenge = [...document.querySelectorAll('iframe[src*="hcaptcha"], iframe[src*="recaptcha"]')].some((f) => {
+    const cs = getComputedStyle(f);
+    if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) < 0.1) return false;
+    const r = f.getBoundingClientRect();
+    return r.width > 60 && r.height > 60 && r.width < 700;
+  });
+
+  const errors = [...document.querySelectorAll('.iCIMS_Error, .iCIMS_Validation_Error, .error, [role="alert"], .alert-danger')]
+    .filter(vis).map((e) => clean(e.textContent)).filter(Boolean).slice(0, 4);
+
+  // ── A LEGAL CONSENT IS A PRECONDITION WE MUST NOT SATISFY OURSELVES (live 2026-08-18) ──────
+  // iCIMS gates postings outside the US behind a data-privacy consent ON THE SIGN-IN CARD: an
+  // UNCHECKED `#accept_gdpr` carrying `aria-required="true"`, a hidden `#consentCaptureTitle` naming
+  // it ("General Data Protection Regulation (GDPR)"), and a row that states the rule itself — "You
+  // must indicate that you have read the privacy notice and consent to the processing of your
+  // personal data before you can continue." (ITT, a Bogotá posting.)
+  // This function REPORTS them and classifies NOTHING. Which boxes are an acceptance of a notice,
+  // which are an unrelated opt-in, and what may be done about either is a JUDGEMENT — it lives in
+  // `atsConsentKind` + the caller, so there is exactly one copy of it instead of an injected dup that
+  // could drift from the one the operator authorised.
+  // `blocking` is two-sourced on purpose: the required MARKER, or the row SAYING it is mandatory,
+  // because a tenant can word the requirement without marking the input.
+  const consentTitle = clean((document.querySelector("#consentCaptureTitle") || {}).value || "").slice(0, 80);
+  const rowTextOf = (e) => clean((e.closest("tr, .iCIMS_TableRow, fieldset, div") || {}).innerText || "").slice(0, 240);
+  const consents = [...document.querySelectorAll('input[type="checkbox"]')].filter(vis)
+    .map((e) => {
+      const row = rowTextOf(e);
+      return {
+        sel: selOf(e), id: e.id || null, checked: !!e.checked,
+        label: labelOf(e) || null, rowText: row, title: consentTitle || null,
+        required: e.required === true || e.getAttribute("aria-required") === "true",
+        blocking: e.required === true || e.getAttribute("aria-required") === "true"
+          || /must|before you can continue|required/i.test(row),
+      };
+    }).slice(0, 8);
+
+  // ── the two signals that say WHY a submit went nowhere ──────────────────────────────
+  // The gate's submit is preventDefault-ed and gated on INVISIBLE hCaptcha (traced 2026-08-16):
+  //   form.onsubmit → e.preventDefault() → hcaptcha.execute(widgetId)
+  //   hCaptcha callback → append <input name="h-captcha-response" value=token> → form.submit()
+  // So "the page did not change" has two completely different causes, and without these two reads
+  // they are indistinguishable — which is a whole debugging round each time.
+  //   submitLocked : iCIMS' own onsubmit calls icimsDisableSaveAndSubmitButtons, so a DISABLED
+  //                  button proves the submit event FIRED and we are waiting on the captcha.
+  //   captchaToken : a token present proves hCaptcha RESOLVED and the form was really submitted.
+  // The token's VALUE is never returned — a boolean and a length, the credential discipline.
+  const tokenEl = document.querySelector('[name="h-captcha-response"]');
+  const submitLocked = submitEl ? !!(submitEl.disabled || submitEl.getAttribute("aria-disabled") === "true") : null;
+
+  return { ok: true, url: location.href, title: document.title, readyState: document.readyState,
+    controlCount: shown.length, email, password, code, submit, federated, createAccount,
+    consents, consentTitle: consentTitle || null,
+    captchaChallenge, submitLocked,
+    captchaPresent: !!tokenEl, captchaToken: !!(tokenEl && tokenEl.value && String(tokenEl.value).length),
+    captchaFrames: document.querySelectorAll('iframe[src*="hcaptcha"]').length,
+    errors, bodyText: clean(document.body ? document.body.innerText : "").slice(0, 1200) };
+}
+
+// How many visible controls before a page stops being a sign-in card and starts being a form. The
+// gate renders ONE (measured); the application form renders ~118. Nothing real sits between, and
+// the caller ALSO requires the positive form identity (atsLooksLikeApplicationForm) before it
+// treats a page as the form — this bound only stops the auth classifier claiming a page it should
+// keep its hands off.
+var ICIMS_AUTH_MAX_CONTROLS = 5;
+
+// PURE. What auth view is this? Ordered so a BLOCKING state outranks page shape, and so the
+// classifier never claims a page that is too big to be a sign-in card.
+//   captcha    — a visible challenge; the bot never solves one
+//   code       — iCIMS mailed a one-time code
+//   password   — the credential step
+//   email      — the "Enter Your Information" gate
+//   blocked    — an auth-shaped page whose only way on is a control we refuse to press
+//   none       — not an auth view (the caller decides whether it is the form)
+function icimsAuthView(s) {
+  if (!s || !s.ok) return "unreadable";
+  if (s.captchaChallenge) return "captcha";
+  if (Number(s.controlCount || 0) > ICIMS_AUTH_MAX_CONTROLS) return "none";
+  if (s.code) return "code";
+  if (s.password) return "password";
+  if (s.email) return "email";
+  // No field we can fill, but the page is offering federated sign-in or account creation — that is
+  // an auth wall, and saying so beats "unknown page".
+  if ((s.federated || []).length || (s.createAccount || []).length) return "blocked";
+  return "none";
+}
+
+// ── WHAT KIND OF CHECKBOX IS THIS? (operator, 2026-08-18) ────────────────────────────────
+// The operator read ITT's and Peraton's privacy notices themselves and instructed that **accept
+// checkboxes be ticked, now and in the future**. They are the data subject, the notices govern the
+// processing of THEIR data for THEIR application, and refusing them means the application cannot be
+// made at all — so this is theirs to delegate. It replaces the earlier `consent-required` halt.
+//
+// The authorisation is precise, so the recognizer is too. Ticking a box is a legal act, and "all accept
+// checkboxes" is not the same set as "all checkboxes":
+//
+//   "accept"  — I accept / I agree / I acknowledge / I have read <a notice, policy, terms, GDPR>.
+//               This is what was authorised: assent to a document governing the application.
+//   "optin"   — send me jobs, add me to a talent community, contact me about future roles. NOT an
+//               acceptance of anything; ticking it signs the operator up for mail they never asked
+//               for, and leaving it unticked costs them nothing. Never ticked.
+//   null      — anything else (a "still enrolled?" box, "upload résumé later", a screening question).
+//               Untouched, as before.
+//
+// ⚠ Deliberately NOT classed "accept": a TRUTHFULNESS attestation ("I certify the information given is
+// accurate", "I understand falsification is grounds for dismissal"). Those are a factual claim by the
+// applicant rather than assent to a notice, they carry a different consequence when wrong, and the
+// instruction that authorised this was about privacy notices. They stay out until asked for by name.
+// Cookie/consent BANNERS are also out of scope — unrelated to applying, and the standing rule to
+// prefer the privacy-preserving option there is untouched.
+var ATS_CONSENT_ACCEPT_RE = /\b(i\s+(accept|agree|consent|acknowledge|have\s+read)|accept(ing)?\s+the|agree\s+to\s+the|consent\s+to\s+the)\b|\bgdpr\b|privacy\s+(notice|policy|statement)|data\s+protection|terms\s+(of\s+(use|service)|and\s+conditions)/i;
+var ATS_CONSENT_OPTIN_RE = /\b(talent\s+(community|network)|job\s+alerts?|email\s+me|notify\s+me|keep\s+me\s+(informed|posted)|marketing|newsletter|similar\s+(jobs|roles|openings)|future\s+(jobs|roles|opportunities|openings))\b/i;
+// A truthfulness attestation — recognized ONLY so it can be excluded on purpose rather than by
+// accident, and so a future decision about it has a name to refer to.
+var ATS_CONSENT_ATTEST_RE = /\b(i\s+certify|i\s+declare|i\s+affirm|under\s+penalty|falsif(y|ication)|to\s+the\s+best\s+of\s+my\s+knowledge)\b/i;
+// text = whatever describes the box (label, its row, the consent's own title). Most specific wins:
+// an opt-in that merely mentions "privacy" must not read as an acceptance.
+function atsConsentKind(text) {
+  const t = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  if (ATS_CONSENT_OPTIN_RE.test(t)) return "optin";
+  if (ATS_CONSENT_ATTEST_RE.test(t)) return "attestation";
+  if (ATS_CONSENT_ACCEPT_RE.test(t)) return "accept";
+  return null;
+}
+// The gate's boxes, decided. Returns what to TICK and what was deliberately left alone, so the caller
+// can log both — an acceptance made on the operator's behalf must be visible in the run, by name.
+function atsConsentPlan(consents) {
+  const list = Array.isArray(consents) ? consents : [];
+  const out = { tick: [], left: [] };
+  for (const c of list) {
+    if (!c) continue;
+    const kind = atsConsentKind([c.label, c.rowText, c.title].filter(Boolean).join(" · "));
+    const rec = { ...c, kind };
+    if (kind === "accept" && !c.checked) out.tick.push(rec);
+    else out.left.push(rec);
+  }
+  return out;
+}
+
+// SSO refusal is URL-EVIDENCED ONLY (the Workday invariant, verbatim): a real federated login
+// LEAVES the portal host. Field-absence proves nothing — a still-rendering auth widget looks
+// identical to a provider redirect, and that mistake produced a flat-wrong `sso` halt on Workday.
+var ICIMS_SSO_HOST_RE = /(^|\.)(okta(preview)?\.com|onelogin\.com|pingidentity\.com|auth0\.com|accounts\.google\.com|login\.microsoftonline\.com|login\.live\.com|appleid\.apple\.com|www\.linkedin\.com)$/i;
+var ICIMS_SSO_PATH_RE = /\/(saml2?|sso|openid|oauth2?|idp)(\/|$)/i;
+function icimsLooksLikeSso(url, portalHost) {
+  let u = null;
+  try { u = new URL(String(url == null ? "" : url)); } catch (e) { return false; }
+  const host = u.hostname.toLowerCase();
+  // Still on the portal ⇒ never SSO, whatever the path says. iCIMS' own routes include `/login`,
+  // and a tenant vanity path must not be read as a federation hop.
+  if (portalHost && host === String(portalHost).toLowerCase()) return false;
+  if (ICIMS_SSO_HOST_RE.test(host)) return true;
+  return ICIMS_SSO_PATH_RE.test(u.pathname);
+}
+
+// ⚠ NOT EVERY icims.com LOGIN IS THE CANDIDATE'S. `login.icims.com` is iCIMS' Auth0 universal
+// login for RECRUITERS — traced 2026-08-16, `/u/login/identifier` with the customer's own org name
+// on it, reached by wandering one path off the candidate portal (`/jobs/intro` redirects there).
+// It renders an email box, so the auth scan would classify it `email` and type the candidate's
+// account address into a STAFF login. The host is the whole tell, and it is a host we can never
+// have business on: the candidate portal always lives on a TENANT subdomain.
+// Checked ahead of the SSO test, because the SSO test deliberately exempts icims.com hosts.
+function icimsIsAdminLogin(url) {
+  try { return new URL(String(url == null ? "" : url)).hostname.toLowerCase() === "login.icims.com"; }
+  catch (e) { return false; }
+}
+
+// iCIMS can answer the email gate by MAILING you a one-time link instead of showing a password
+// box — that is where the `?eem=…&code=…` magic-link session this tenant was first driven with
+// came from. Such a page has no field to fill and no button worth pressing, so it must be
+// recognised: without this it lands in the generic "unknown page" halt, which tells the operator
+// nothing about the fact that the next step is sitting in their inbox.
+// Anchored on the SENDING claim, not the word "email" (the gate itself says "Email" as a label).
+var ICIMS_MAILED_LINK_RE = /\b(we('ve| have)? (just )?(sent|emailed|e-mailed)|(an? )?(email|link|code) (has been|was) sent|check your (e-?mail|inbox)|sent you (an? )?(e-?mail|link|code))\b/i;
+function icimsMailedCredential(bodyText) {
+  return ICIMS_MAILED_LINK_RE.test(String(bodyText == null ? "" : bodyText));
 }
 
 // A STATED demographic and the form's option can be the same answer in different words: the profile
@@ -1562,8 +3267,74 @@ async function atsAiWriteText(act, f, profile, jobContext) {
 // Order: static map → bucket (exact wording) → label recognizers → employment recognizer →
 // null (the driver then tries AI for REQUIRED fields, else leaves blank). Same tiering as
 // the Workday driver: deterministic tiers run for optional fields too, AI is required-only.
-function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
-  const map = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
+// ⚠ DISPLAY LABEL vs MATCH LABEL. `f.label` is what the REVIEW PAGE shows, and for a composite part
+// the scan composes it as "<question> — <part>" ("Start Date — Month") so the row reads properly. The
+// MATCHING layer must keep seeing the control's own raw name, which is what it saw before that display
+// change — otherwise a date part stops matching its date-group spec and falls through to the AI, which
+// then invents a work-experience date the profile already answers (observed live 2026-08-17: "Jun 1
+// 2026", reasoned from "typical summer internship start date"). One helper, used at every label-keyed
+// rung, so a future display tweak cannot reach the matcher again.
+function atsMatchLabel(f) {
+  return String((f && (f.partLabel || f.label)) || "");
+}
+
+function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, credentials) {
+  // ── CREDENTIALS — the TOP rung, above the static map, buckets, labels and AI ────────────
+  // This is the only way a credential is ever filled, and being FIRST is a safety property, not
+  // an ordering preference: every rung below it could otherwise reach a login box (a taught bucket
+  // wording, a label recognizer, or the AI rescue on a required field), and each of those would put
+  // a value into an account credential that the operator never chose.
+  //
+  // The properties this tier guarantees:
+  //   • the value comes ONLY from `store.credentials` — the same slot the website's Credentials page
+  //     writes and the Workday onboarding signs in with. Never a profile value, never a bucket, never
+  //     an LLM. There is no path from any of those to a field recognized here.
+  //   • it never enters a log line, a record or the review bundle. The record carries `credential:true`
+  //     + `credentialKind` so review can name WHICH credential was used without carrying it.
+  //   • `overwrite:true` — a prepopulated box is REPLACED. iCIMS renders the session's own login into
+  //     it, and the account this application creates must use the stored credentials.
+  //   • absent or incomplete credentials ⇒ needs_review, never a blank guess and never half an account.
+  const ck = atsCredentialKind(ats, f);
+  if (ck) {
+    const value = atsCredentialValue(ck, credentials);
+    const pretty = ck.replace(/_/g, " ");
+    if (!value) {
+      return { kind: "credential-missing", credentialKind: ck, review: true, flag: "credentials-not-stored",
+        detail: "this form asks for a " + pretty + ", but no complete sign-in credentials are stored — set them on the website's Credentials page, or type it here" };
+    }
+    return { kind: "credential", credentialKind: ck, value, source: "credentials", credential: true, overwrite: true };
+  }
+  // ── REPEATING-ENTRY FIELDS ARE SEALED TO THEIR OWN ENTRY ───────────────────────────────
+  // Above the static map, buckets and labels, and it RETURNS EVEN WHEN IT HAS NO ANSWER — that
+  // early return is the point. Falling through would let the label ladder answer an Education
+  // "State/Province" from the home address, which is a different fact, not a near-miss. An entry
+  // field the entry cannot answer goes to the AI, which sees only that entry (atsScopeForField).
+  // ⚠ `es` ALONE SEALS IT — deliberately not `es && es.spec`. A field inside a repeating section
+  // that we have NO mapping for must still be sealed: with the `.spec` condition, an unmapped
+  // `EducationCity` fell straight through to the label ladder and was answered "Tallahassee" from
+  // the home address. No mapping means "no deterministic answer", never "answer it from anywhere".
+  const es = atsEntrySpec(ats, f);
+  if (es) {
+    const arr = (profile || {})[es.source];
+    const entry = Array.isArray(arr) ? arr[es.entryIndex] : null;
+    // `defaults` threaded through for the day-of-month fallback (see atsDefaultDay) — the entry seal is
+    // unaffected: a default is the OPERATOR's own setting, not another entry's data.
+    const r = atsResolveEntryField(es, entry, f, undefined, defaults);
+    if (r) return r;
+    return { kind: "entry-unanswered", source: "entry", section: es.section, entryIndex: es.entryIndex };
+  }
+  // A REPEAT of a field the profile answers with a single value — the second address row, the second
+  // phone row. Claimed BEFORE the static map below, because that map is keyed on the ordinal-stripped
+  // id and would otherwise answer every entry identically.
+  // ⚠ Only ever reached when the FORM ACTUALLY RENDERED more than one (see atsAssignEntryIndexes) —
+  // nothing here declares which blocks repeat, so a tenant whose phone is a single row never sees it.
+  if (ats === "icims" && typeof f.repeatIndex === "number" && f.repeatIndex > 0) {
+    const what = String(f.label || "").replace(/[*✱:]\s*$/, "").trim();
+    return { kind: "skip", source: "repeat-entry",
+      detail: "this form renders more than one " + (what ? '"' + what + '"' : "of this field") +
+        " and your profile holds a single value for it — the extra entry is left for you to fill on the form" };
+  }
+  const map = (ATS_STATIC_MAPS[ats] || {})[atsMapKey(ats, f.fieldName)];
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
     if (map.kind === "skip") return { kind: "skip", source: "map", detail: map.detail };
@@ -1586,8 +3357,11 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
   }
   // Buckets — the operator's own taught wordings, exact-normalized (no fuzzy; misses fall
   // through). Mode A (profile_path) + Mode B (value list) both become candidates/value.
-  if (bucketIndex && f.label) {
-    const b = bucketIndex.get ? bucketIndex.get(atsLib.normalizeLabel(f.label)) : bucketIndex[atsLib.normalizeLabel(f.label)];
+  // A taught wording is matched against the control's own name too (atsMatchLabel), so the display
+  // composition cannot silently orphan every bucket on a composite question.
+  if (bucketIndex && atsMatchLabel(f)) {
+    const bk = atsLib.normalizeLabel(atsMatchLabel(f));
+    const b = bucketIndex.get ? bucketIndex.get(bk) : bucketIndex[bk];
     if (b) {
       if (b.profile_path) {
         const raw = String(b.profile_path).split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
@@ -1603,26 +3377,285 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex) {
       if (vals.length) return { candidates: vals, source: "bucket", kind: ATS_LOCATION_LABEL_RE.test(String(f.label || "")) ? "location" : undefined };
     }
   }
-  const routed = atsRouteLabel(f.label, f, profile, defaults);
+  const routed = atsRouteLabel(atsMatchLabel(f), f, profile, defaults);
   if (routed) return routed;
   // Employment-status recognizer (the "have you worked for «company» before?" class) —
   // the same deterministic tier the Workday driver runs, sentence-scoped + bail-guarded.
   // Contract (fill-driver): recognize → {tense, company} | null; decide → {fill, review,
   // detail} where fill:null = unevaluable → blank + review, NEVER a guess.
   const company = (jobContext && jobContext.company) || null;
-  const er = atsFd.recognizeEmploymentQuestion(f.label, company);
+  const er = atsFd.recognizeEmploymentQuestion(atsMatchLabel(f), company);
   if (er) {
-    const dec = atsFd.decideEmploymentStatus(er.tense, company, profile, f.label);
+    const dec = atsFd.decideEmploymentStatus(er.tense, company, profile, atsMatchLabel(f));
     if (dec && dec.fill) return { candidates: [dec.fill], source: "employment", review: !!dec.review, flag: dec.review ? "employer-match" : null, detail: dec.detail || "employment-status recognizer" };
     return { kind: "employment-blank", review: true, flag: "employer-match", detail: (dec && dec.detail) || "employment question unevaluable — left blank" };
   }
   return null;
 }
 
+// ── THE RÉSUMÉ ON iCIMS: ATTACHED FIRST, AND THE PARSE IS WAITED OUT (operator, 2026-08-17) ─────────
+// iCIMS parses an uploaded résumé SERVER-SIDE and posts the result back into the panel, re-rendering
+// entries under new ids and blanking what was already written — the form says so in its own words
+// ("Existing data in the form will be replaced"). Attaching it as an ordinary field is therefore
+// self-defeating, which is why it was skipped entirely from 2026-08-16.
+//
+// The fix is ORDER: attach BEFORE anything is filled, wait for the parse to land AND the panel to stop
+// churning, and only then fill. The parse then overwrites nothing of ours, and the fill (or the approved
+// replay) writes on top of whatever it produced. Everything after this point in the run is unchanged.
+//
+// ⚠ THE WAIT IS NOT A TIMER (CLAUDE.md: nothing proceeds on a fixed delay — every wait polls the
+// condition it gates). Two independent conditions, both polled on SW wall-clock:
+//   • the form's own IDENTITY changed — the postback re-renders fields under new ids and repopulates
+//     values, so a scan signature is the evidence that the parse actually LANDED. A field-COUNT settle
+//     cannot see this: the count is often identical on both sides of a re-render.
+//   • …and then the panel goes QUIET — the mutation-stamp watch is the only probe here that can say
+//     "the DOM is mid-reaction", which no count settle can (the cdpInstallQuietWatch lesson).
+// A parse that changes NOTHING is indistinguishable from one that has not started yet, so the no-change
+// branch does NOT proceed early — it still requires quiet + a stable signature, spends its whole
+// change budget first, and says which branch it took. Being slow there costs latency; being early
+// costs the whole fill.
+const ATS_ICIMS_PARSE = {
+  pollMs: 900,        // one read-only scan per tick (waitAtsFormReady already polls this at 450ms)
+  quietMs: 1500,      // no mutation for this long ⇒ the postback has finished rendering
+  stableReads: 3,     // …and the signature agreed that many times (the waitAtsFormReady bar)
+  // How long the postback gets to START before we accept "it changed nothing". ⚠ THIS IS THE ONE
+  // NUMBER THAT CAN LET A PARSE LAND MID-FILL: past it, a quiet form is taken at face value, so a
+  // postback arriving later would overwrite fields we had already written. Six live runs on Astrion
+  // (2026-08-18) landed the parse at 8.4 · 9.0 · 9.4 · 10.5 · 12.9 · 17.6s — the worst case was only
+  // 2.4s inside the 20000 this shipped with, which is not headroom, it is luck. 45s is ~2.5× the
+  // slowest observed. It costs NOTHING in the normal case: every one of those runs saw the change and
+  // exited on quiet+stable (~14s), so only a form whose parse genuinely produces nothing waits it out.
+  // ⚠ CONFIRMED THE SAME DAY, NOT THEORETICAL: a later Astrion run landed its parse at **25.6s**
+  // (settled 29.7s). Under the 20s budget that run would have called the form quiet, started filling,
+  // and had the postback overwrite it mid-fill — the exact failure this stage exists to prevent, on the
+  // tenant that had already passed six clean runs. Slow parses are a fact about the SERVER's load, not
+  // about the page, so they cannot be designed away — only waited for.
+  changeMs: 45000,
+  ceilingMs: 120000,  // total budget: attach → parse → quiet. Generous by design (see above).
+};
+// The quiet watch observes the PARENT of what it is given, so this hands it the profile panel and gets
+// the whole form. Absent ⇒ cdpInstallQuietWatch falls back to document.body, which inside the iCIMS
+// form frame IS the form — the right answer either way.
+const ATS_ICIMS_QUIET_ROOT = ".iCIMS_ProfileFormTable";
+
+// The form's identity as one comparable string: how many fields, WHICH fields, and which of them hold
+// a value. Deliberately NOT the values themselves and not the option lists — a signature that carries
+// text no postback settles on (a search-filtered list, a re-quoted filename) would never stabilise, and
+// the question here is only "did the form change and has it stopped changing". Pure + unit-pinned.
+function atsFormSignature(scan) {
+  const fields = (scan && scan.fields) || [];
+  return fields.length + "|" + fields
+    .map((f) => String((f && f.fieldName) || "") + ":" + (f && f.value != null && String(f.value).trim() !== "" ? "1" : "0"))
+    .join(",");
+}
+
+// Wait for iCIMS' résumé parse to land and the panel to go quiet. Returns what it OBSERVED — never
+// throws, because a wait that cannot read the page must not abort a run that can still fill it.
+async function atsIcimsAwaitParse(act, ats, opts) {
+  const o = opts || {};
+  const cfg = Object.assign({}, ATS_ICIMS_PARSE, o.parse || {});
+  const log = o.log || (() => {});
+  const t0 = Date.now();
+  const deadline = t0 + cfg.ceilingMs;
+  const readSig = async () => {
+    try { return atsFormSignature(await act.eval(atsInjScan, ats)); } catch (e) { return null; }
+  };
+  const base = o.baseSignature != null ? o.baseSignature : await readSig();
+  let prev = base, stable = 0, changed = false, changedAt = null, idle = 0;
+  while (Date.now() < deadline) {
+    if (act.wakePage) { try { await act.wakePage(); } catch (e) { /* a hidden tab still reads */ } }
+    await act.delayFull(cfg.pollMs);
+    const sig = await readSig();
+    if (sig == null) { stable = 0; continue; } // a read we could not make is not a stable read
+    if (base != null && sig !== base && !changed) { changed = true; changedAt = Date.now() - t0; }
+    stable = sig === prev ? stable + 1 : 0;
+    prev = sig;
+    // QUIET: a missing watch means the postback replaced the world it lived in — i.e. something just
+    // happened — so re-arm and treat this tick as busy rather than as evidence of calm.
+    idle = 0;
+    if (act.quietRead) {
+      let q = null;
+      try { q = await act.quietRead(ATS_ICIMS_QUIET_ROOT); } catch (e) { q = null; }
+      if (q && q.ok) idle = q.idleMs || 0;
+      else if (act.quietInstall) { try { await act.quietInstall(ATS_ICIMS_QUIET_ROOT); } catch (e) { /* best effort */ } }
+    } else {
+      idle = cfg.quietMs; // no quiescence probe (a test act, a substrate without it) ⇒ signature only
+    }
+    const settled = stable >= cfg.stableReads && idle >= cfg.quietMs;
+    if (settled && (changed || Date.now() - t0 >= cfg.changeMs)) {
+      const waitedMs = Date.now() - t0;
+      log(changed
+        ? `the résumé parse landed after ${(changedAt / 1000).toFixed(1)}s and the form settled at ${waitedMs > 0 ? (waitedMs / 1000).toFixed(1) : "0.0"}s — filling now, on top of whatever it wrote`
+        : `no postback changed this form within ${(waitedMs / 1000).toFixed(1)}s — the parse either produced nothing or had already landed before we looked; the form is quiet, filling now`);
+      return { parsed: true, changed, changedAt, waitedMs, quietMs: idle, signature: prev, baseSignature: base };
+    }
+  }
+  const waitedMs = Date.now() - t0;
+  // ⚠ SAY WHAT WE SAW. A parse still churning at the ceiling is the one case where filling can be
+  // overwritten, so the caller flags the résumé for review rather than reporting a clean attach.
+  log(`⚠ the form was STILL changing ${(waitedMs / 1000).toFixed(1)}s after the résumé attach (changed=${changed}, quiet ${idle}ms, ${stable} stable read(s)) — filling anyway, but the parse may overwrite fields; check the résumé section in review`);
+  return { parsed: false, changed, changedAt, waitedMs, quietMs: idle, signature: prev, baseSignature: base, reason: "still-changing" };
+}
+
+// Attach the résumé BEFORE the fill and wait its parse out. Returns an `attachResume`-shaped outcome
+// ({ok, name, verified, detail} | {ok:false, error}) plus what the wait observed, so the fill loop can
+// record it as the résumé field's own result without attaching anything itself.
+async function atsIcimsResumeStage(act, ats, opts) {
+  const o = opts || {};
+  const log = o.log || (() => {});
+  let scan = o.scan || null;
+  if (!scan) { try { scan = await act.eval(atsInjScan, ats); } catch (e) { scan = null; } }
+  const fields = (scan && scan.fields) || [];
+  // ⚠ WHICH FILE FIELD IS THE RÉSUMÉ IS THE ROUTER'S ANSWER, NOT A LABEL GUESS — the same rule the
+  // replay learned on a Greenhouse cover-letter dropzone (attaching to every file field files the
+  // wrong document to the employer, and no gate downstream catches it).
+  const f = fields.find((x) => {
+    if (!x || x.widgetType !== "file_upload") return false;
+    const r = atsRouteField(ats, x, {}, {}, {}, null, null);
+    return !!(r && r.kind === "resume");
+  });
+  if (!f) {
+    log("no résumé field on this form — nothing to attach before the fill");
+    return { ran: false, ok: false, error: "no résumé field on this form", reason: "no-field" };
+  }
+  // ALREADY CARRIES A FILE ⇒ DO NOT ATTACH A SECOND ONE. A second upload is a second parse, and that
+  // one lands DURING the fill — exactly the failure this whole stage exists to avoid.
+  if (f.value) {
+    log(`the form already carries ${JSON.stringify(String(f.value))} — not attaching again (a second upload is a second parse)`);
+    return { ran: false, ok: true, already: true, name: String(f.value), verified: true,
+      detail: "the form already carried this file when the run arrived — not re-attached (a second upload would re-parse and blank the fill)" };
+  }
+  const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
+  // Arm the quiescence watch BEFORE the upload, so the stamp exists while the parse is rendering.
+  if (act.quietInstall) { try { await act.quietInstall(ATS_ICIMS_QUIET_ROOT); } catch (e) { /* signature-only then */ } }
+  log(`attaching the résumé FIRST (${f.fieldName}${f.isRequired ? ", required" : ""}) — its parse rewrites this form, so nothing is filled until the parse is done`);
+  const att = await act.attachResume(ref);
+  if (!att || !att.ok) {
+    // A required résumé we could not attach is a review item, not a silent gap — the fill loop turns
+    // this into needs_review + `resume-attach-failed` from the same shape the other ATSs use.
+    log(`⚠ the résumé did NOT attach: ${(att && att.error) || "unknown"} — the form is untouched, so the fill proceeds without it`);
+    return Object.assign({ ran: true, ok: false, error: "unknown" }, att || {}, { fieldName: f.fieldName, isRequired: !!f.isRequired });
+  }
+  // BASELINE AFTER THE CONFIRMATION, not before the attach: our own upload changes the résumé row, and
+  // a baseline taken before it would count that as "the parse landed". If the postback beat the
+  // confirmation, the no-change branch of the wait covers it (quiet + stable, then proceed).
+  const baseSignature = atsFormSignature(await act.eval(atsInjScan, ats).catch(() => null));
+  const parse = await atsIcimsAwaitParse(act, ats, { log, baseSignature, parse: o.parse });
+  // WHAT EVIDENCE DO WE ACTUALLY HAVE THAT THE FILE LANDED? Setting `input.files` proves nothing on
+  // its own — it is a page-side write, and iCIMS uploads on the change event. Two independent kinds of
+  // positive evidence, and the record is flagged for review when there is NEITHER:
+  //   • the widget CONFIRMED it (attachResume read the filename back), or
+  //   • the server REACTED — a postback re-rendered this form, which only an accepted upload does.
+  // A required résumé reported `filled` on no evidence is the false-verify class CLAUDE.md exists to
+  // prevent, and on this form it would be reported at the one moment it cannot be undone.
+  const flag = !parse.parsed ? "resume-parse-unsettled"
+    : (att.verified || parse.changed) ? null
+      : "resume-unconfirmed";
+  const bits = [att.detail || null,
+    parse.parsed
+      ? (parse.changed ? `the form's own parse re-rendered it ${(parse.changedAt / 1000).toFixed(1)}s later and settled before the fill started` : "no parse postback changed the form")
+      : "the form was still changing when the fill started — the parse may have overwritten fields",
+    flag === "resume-unconfirmed" ? "nothing confirmed the upload — no filename read back and no postback — so check the résumé section on the form" : null].filter(Boolean);
+  return { ran: true, ok: true, name: att.name || null, verified: !!att.verified && parse.parsed,
+    detail: "attached before the fill — " + bits.join("; "), parse,
+    flag, fieldName: f.fieldName, isRequired: !!f.isRequired };
+}
+
+// Add entries to each repeating section until it can hold every profile row it maps to.
+// Bounded twice over: never more than the profile has, and never more than ATS_ENTRY_MAX clicks —
+// a section whose Add button does not actually mount anything must cost a few seconds, not a loop.
+const ATS_ENTRY_MAX = 8;
+// ⚠ `wantBySection` OVERRIDES the profile count, and the SUBMIT run cannot work without it. A submit
+// run replays an APPROVED BUNDLE and deliberately passes `profile: {}` — every value comes from the
+// bundle, never the profile — so counting profile rows here yields 0 and the form keeps the ONE entry
+// it renders by default. Live 2026-08-17 that produced 28 of a rehearsal's 32 verify failures: every
+// field of work-history entries 2 and 3 reported "approved value has NO matching field on the live
+// form", because those entries had never been added. A multi-entry history could not be replayed at
+// all. The bundle knows how many entries it holds, so the caller counts them and says so.
+async function atsGrowIcimsEntries(act, ats, scan, profile, wantBySection) {
+  let current = scan;
+  for (const [section, def] of Object.entries(ATS_ICIMS_ENTRY_MAPS)) {
+    if (!def.addButton) continue;
+    const asked = wantBySection && typeof wantBySection[section] === "number" ? wantBySection[section] : null;
+    const want = asked != null ? asked
+      : (Array.isArray((profile || {})[def.source]) ? profile[def.source].length : 0);
+    if (want < 2) continue;                       // one entry is what the form already renders
+    const countEntries = (s) => {
+      const seen = new Set();
+      for (const f of (s && s.fields) || []) if (f.entrySection === section && typeof f.entryIndex === "number") seen.add(f.entryIndex);
+      return seen.size;
+    };
+    let have = countEntries(current);
+    let guard = 0;
+    while (have < Math.min(want, ATS_ENTRY_MAX) && guard++ < ATS_ENTRY_MAX) {
+      const r = await act.eval(atsInjIcimsAddEntry, def.addButton.source).catch(() => null);
+      if (!r || !r.ok) break;
+      await act.delayFull(900);                   // the new entry is server-rendered into the panel
+      const rescan = await act.eval(atsInjScan, ats).catch(() => null);
+      if (!rescan || !rescan.fields) break;
+      atsAssignEntryIndexes(ats, rescan.fields);
+      const now = countEntries(rescan);
+      current = rescan;
+      if (now <= have) break;                     // the click mounted nothing — stop rather than spin
+      have = now;
+    }
+    try { console.log(`[ApplyPilot][ATS-FILL] ${section}: ${asked != null ? "the approved bundle holds" : "profile has"} ${want} entr(ies), form now shows ${have}`); } catch (e) { /* log only */ }
+  }
+  return current;
+}
+
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
-  const scan = await act.eval(atsInjScan, ats);
+  let scan = await act.eval(atsInjScan, ats);
+  // Stamp which ENTRY of a repeating section each field belongs to, before anything routes it.
+  if (scan && scan.fields) atsAssignEntryIndexes(ats, scan.fields);
+  // ⚠ GROW REPEATING SECTIONS TO FIT THE PROFILE, BEFORE FILLING. The form renders ONE entry and
+  // mints the rest on demand, so without this a three-role history silently becomes a one-role
+  // history — the worst kind of miss, because the page looks completely filled. Reconcile UP only:
+  // never delete an entry the operator may have typed themselves.
+  // Grown on BOTH paths now: a fill sizes the sections from the profile, a submit run from the counts
+  // the caller derived from the approved bundle (see atsGrowIcimsEntries — it used to be skipped
+  // whenever `valueFor` was present, which is exactly the submit run).
+  if (ats === "icims") scan = await atsGrowIcimsEntries(act, ats, scan, profile, o.entryCounts);
+  // RECON THE LISTS BEFORE FILLING — including the OPTIONAL ones (operator, 2026-08-16). On these
+  // one-page forms a field we never fill still has to be ANSWERABLE in review, and that means a
+  // real picker, not a picker-shaped text box. The scan already carries every list, so the work is
+  // not fetching them: it is deciding which ones are COMPLETE, because a list flagged partial is
+  // rendered as free text. See atsIcimsPageCap — the form's own dropdowns reveal its page size, and
+  // a list shorter than a page has reached its end. Zero extra page contact, so this costs nothing.
+  if (ats === "icims") {
+    const idd = ((scan && scan.fields) || []).filter((f) => f.widgetType === "icims_dropdown");
+    const lens = idd.map((f) => (f.options || []).length);
+    const cap = atsIcimsPageCap(lens);
+    const maxLen = lens.length ? Math.max.apply(null, lens) : 0;
+    let proven = 0;
+    for (const f of idd) {
+      if (f.optionsPartial === true && atsIcimsListComplete((f.options || []).length, cap, maxLen)) {
+        f.optionsPartial = false;
+        proven++;
+      }
+    }
+    if (idd.length) console.log(`[ApplyPilot][ATS-OPTIONS] iCIMS page cap ${cap == null ? "NOT proven" : cap} — ${proven}/${idd.length} dropdown list(s) proven COMPLETE (these reach review as real pickers), ${idd.length - proven} stay partial`);
+  }
+  // WHAT DID THE SCAN ALREADY SEE? Printed BEFORE anything actuates, because that is the only
+  // moment the answer is uncontaminated: once a dropdown has been opened its result list stays
+  // populated, so a probe of a finished run reports full coverage no matter what the fresh page
+  // served. This line is what tells "the scan carries the list, attaching it is free" apart from
+  // "the list is only there after we open it" — and those want opposite implementations.
+  try {
+    const per = {};
+    for (const f of (scan && scan.fields) || []) {
+      if (!ATS_CHOICE_WIDGETS.includes(f.widgetType)) continue;
+      const k = f.widgetType;
+      per[k] = per[k] || { total: 0, withOpts: 0, partial: 0 };
+      per[k].total++;
+      if ((f.options || []).length) per[k].withOpts++;
+      if (f.optionsPartial === true) per[k].partial++;
+    }
+    const parts = Object.entries(per).map(([k, v]) => `${k} ${v.withOpts}/${v.total}${v.partial ? ` (${v.partial} partial)` : ""}`);
+    if (parts.length) console.log(`[ApplyPilot][ATS-OPTIONS] scan-time coverage — ${parts.join(" · ")}`);
+  } catch (e) { /* diagnostic only */ }
   const results = [];
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
@@ -1643,6 +3676,7 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     let rescan = null;
     try { rescan = await act.eval(atsInjScan, ats); } catch (e) { break; }
     if (!rescan || !rescan.fields) break;
+    atsAssignEntryIndexes(ats, rescan.fields);
     const seen = new Set(results.map((r) => r.fieldName));
     const fresh = rescan.fields.filter((f) => !seen.has(f.fieldName));
     if (!fresh.length) break;
@@ -1668,7 +3702,22 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     }
   }
 
-  return await atsFinishFill(act, ats, scan, results);
+  // DID EVERY CHOICE FIELD ACTUALLY REACH REVIEW AS A PICKER? The scan-time line above says what we
+  // KNEW; this says what the operator will SEE, which is the thing that was asked for and the only
+  // one worth measuring. A record with `options` renders a picker; one holding `captured_options`
+  // was flagged partial and renders a type-it-yourself box instead. They diverge for a real reason —
+  // a field filled through a SEARCH records only the filtered rows it matched against — so keeping
+  // both numbers visible is what stops "16 proven complete" being mistaken for "16 pickers".
+  try {
+    // ⚠ REVIEW-side names. A result's widgetType is already rewritten by ATS_REVIEW_WIDGET, so
+    // matching the scan vocabulary here counted almost nothing (measured: 19 of 46 choice fields).
+    const ch = results.filter((r) => r && (ATS_CHOICE_REVIEW_WIDGETS.includes(r.widgetType) || (r.captured_options || []).length));
+    const picker = ch.filter((r) => Array.isArray(r.options) && r.options.length).length;
+    const freeText = ch.filter((r) => !(Array.isArray(r.options) && r.options.length) && (r.captured_options || []).length).length;
+    const bare = ch.length - picker - freeText;
+    if (ch.length) console.log(`[ApplyPilot][ATS-OPTIONS] review editors — ${picker} picker · ${freeText} filter-or-type (list unproven) · ${bare} with no options at all, of ${ch.length} choice record(s)`);
+  } catch (e) { /* diagnostic only */ }
+  return await atsFinishFill(act, ats, scan, results, o.credentials);
 }
 
 // ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
@@ -1715,7 +3764,7 @@ function atsAiBatchKind(f) {
   // it in the "essay" group and bill it to the operator's essay model. Workday's `aiFillDate` routes a
   // date to "fill" for the same reason; this keeps the two paths saying the same thing.
   if (wt === "date") return "date";
-  if (["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location"].includes(wt)) return "choice";
+  if (ATS_CHOICE_WIDGETS.includes(wt)) return "choice";
   return null;
 }
 
@@ -1870,7 +3919,29 @@ const ATS_BATCH_ACTION = { choice: "fill", text: "essay" };
 // Fire the batched call(s) for everything the deterministic pass deferred, and fold the answers into
 // the page-level cache (key = normalized QUESTION). Never throws: every failure mode simply leaves the
 // cache without that question, and the commit pass then makes its own per-field call.
+// ⚠ ONE BATCH PER SCOPE (operator, 2026-08-16). A repeating-entry field may only be answered from
+// its OWN entry, and that rule binds the LLM exactly as it binds the deterministic tiers — so an
+// entry field cannot share a prompt with page-level questions (it would be shown the whole profile)
+// nor with a DIFFERENT entry of the same section. Group first, batch within a group. Batching is
+// preserved where it matters: all of one entry's questions still go in one call.
 async function atsRunAiBatch(act, deferred, profile, jc, cache) {
+  const groups = new Map();
+  for (const d of deferred) {
+    const k = d.scopeKey || "";
+    if (!groups.has(k)) groups.set(k, { items: [], profile: d.scopeProfile || profile });
+    groups.get(k).items.push(d);
+  }
+  let fired = false, items = 0, answers = 0;
+  for (const g of groups.values()) {
+    const r = await atsRunAiBatchGroup(act, g.items, g.profile, jc, cache);
+    fired = fired || !!(r && r.fired);
+    items += (r && r.items) || 0;
+    answers += (r && r.answers) || 0;
+  }
+  return { fired, items, answers };
+}
+
+async function atsRunAiBatchGroup(act, deferred, profile, jc, cache) {
   const byKind = { choice: [], text: [] };
   const idToKey = new Map();
   const seen = new Set();
@@ -1960,10 +4031,45 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       fieldName: f.fieldName, label: f.label, widgetType: ATS_REVIEW_WIDGET[f.widgetType] || f.widgetType,
       isRequired: !!f.isRequired, mappedPath: null, rawValue: null, resolved: null,
       status: null, matchTier: null, confidence: null, flag: null, verified: null, after: null, detail: null,
+      // ⚠ CARRY THE SECTION THROUGH. The scan reads it (`sectionOf` — the nearest preceding heading)
+      // and the bundle has a slot for it, but nothing joined the two, so every iCIMS field arrived
+      // with `section_heading: null` and the review page filed all 108 of them under "Other fields".
+      // That is why "Supervisor's Name" and "Employer Phone Number" read as context-free questions:
+      // they are Experience fields that lost the only thing saying so (operator, 2026-08-17).
+      section_heading: f.section != null ? f.section : null,
+      section_known: f.section != null ? true : null,
+      // One question rendered as several controls — see the scan's questionRowOf. Carried so the
+      // review page can show ONE row per question with its parts inside, instead of three peers
+      // whose labels ("Month", "Year") say nothing about which date they belong to.
+      question_key: f.questionKey != null ? f.questionKey : null,
+      question_label_full: f.questionLabel != null ? f.questionLabel : null,
+      part_label: f.partLabel != null ? f.partLabel : null,
+      // ⚠ WHICH REPEATING ENTRY THIS FIELD BELONGS TO. atsAssignEntryIndexes already works this out
+      // from the id's ordinal, but nothing carried it, so a per-customer Experience field (Start Date,
+      // Supervisor's Name, Employer Phone Number — all `rcf<NNNN>`, so no profile path either) had
+      // nothing placing it in a job. Review therefore listed all 27 of them AFTER the three entry
+      // blocks instead of inside them, which is what the operator saw (2026-08-17).
+      // ⚠ EMITTED AS THE SECTION KEY, because that is what `canonical_field` is built from
+      // ("experience[0].company", not "work_experience[0].company"). A first cut sent the profile
+      // ARRAY name instead and the two disagreed, so Experience split into `experience[i]` (the mapped
+      // fields) and `work_experience[i]` (these) — two groups per job. Education hid the bug, because
+      // its section key and its profile array happen to share a name.
+      entry_section: f.entrySection != null ? f.entrySection : null,
+      entry_index: typeof f.entryIndex === "number" ? f.entryIndex : null,
     };
     const ref = { inputSel: f.inputSel, widgetType: f.widgetType };
     // show the operator what we are filling (see atsInjScrollIntoView) — best effort, never fatal
     try { await act.eval(atsInjScrollIntoView, f.inputSel); } catch (e) { /* a field we cannot scroll to still fills */ }
+    // ⚠ AND SCROLL THE TOP PAGE TOO (operator, 2026-08-16). iCIMS sizes its iframe to its content,
+    // so the frame has no scroller of its own and the line above moves nothing — the run looked
+    // motionless while it filled. Best-effort and never fatal: a fill that cannot be watched is
+    // still a fill. Only when a frame is pinned, so the other tenants are untouched.
+    if (ats === "icims" && act.evalTop) {
+      try {
+        const at = await act.eval(atsInjFrameFieldY, f.inputSel);
+        if (at && at.ok) await act.evalTop(atsInjScrollTopToFrameY, at.y, at.h);
+      } catch (e) { /* watching is a nicety, never a requirement */ }
+    }
     // Per-field wall clock, so [ATS-TIME] can name what a slow fill actually spent its time on
     // (the Workday [CDP-TIME] habit). A record is finalized at several `continue`s below, so the
     // stamp is applied by `fin()` rather than at one exit.
@@ -1982,7 +4088,12 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // Replay mode: the value comes from the APPROVED bundle, not the profile (the submit
       // run re-fills a blank form). Everything else — actuation + verify — is identical.
       let route = null;
-      if (o.valueFor) {
+      // ⚠ A CREDENTIAL IS NEVER REPLAYED FROM THE BUNDLE — note the `&& !atsCredentialKind(...)`.
+      // The bundle deliberately carries a PLACEHOLDER for these ("(stored login)"), never the value,
+      // so a replay that treated them like any other approved field would type that placeholder
+      // string into the account's login box and submit it. They re-route through the credential
+      // tier instead, which reads the stored credentials directly — the same source the fill used.
+      if (o.valueFor && !atsCredentialKind(ats, f)) {
         const v = o.valueFor(f);
         if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(fin()); continue; }
         if (f.widgetType === "file_upload") {
@@ -1993,7 +4104,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           // only re-checks approved VALUES, and a bundle never carries a file for a field we
           // deliberately skipped. Route it through the same router the fill uses — which maps
           // exactly one field to the résumé — and leave any other file field alone.
-          const fr = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
+          const fr = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, o.credentials);
           route = fr && fr.kind === "resume"
             ? { kind: "resume", source: "replay" }
             : { kind: "skip", detail: (fr && fr.detail) || "a file field that is not the résumé — left to the operator" };
@@ -2009,22 +4120,130 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           // Read the KIND straight from the static map: it describes the widget's SHAPE, which is
           // true regardless of whether the profile happens to hold a value for it (atsRouteField
           // returns nothing when the mapped value is empty, and the shape would be lost with it).
-          const shape = (ATS_STATIC_MAPS[ats] || {})[f.fieldName];
+          const shape = (ATS_STATIC_MAPS[ats] || {})[atsMapKey(ats, f.fieldName)];
           if (shape && shape.kind === "dial") route.kind = "dial";
         }
       } else {
-        route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex);
+        route = atsRouteField(ats, f, profile, defaults, jc, bucketIndex, o.credentials);
+      }
+      const es0 = atsEntrySpec(ats, f);
+      // An entry field its own entry cannot answer falls through to the AI/blank path exactly like an
+      // unrouted field — the difference is that the AI is handed ONLY that entry (see the deferral).
+      // It must NOT fall back to the profile root, which is what the early return in atsRouteField
+      // prevents and what this preserves.
+      if (route && route.kind === "entry-unanswered") route = null;
+
+      // ── CREDENTIALS ────────────────────────────────────────────────────────────────────
+      // Handled before every other kind, and it `continue`s out before `rec.rawValue` /
+      // `rec.resolved` are assigned further down — which is exactly how the value stays out of the
+      // record, and therefore out of the review bundle and the report POSTed to the website.
+      if (route && route.kind === "credential-missing") {
+        rec.status = "needs_review";
+        rec.credential = true; rec.credentialKind = route.credentialKind;
+        rec.flag = route.flag || "credentials-not-stored";
+        rec.detail = route.detail;
+        results.push(fin()); continue;
+      }
+      if (route && route.kind === "credential") {
+        const w = await act.eval(atsInjSetCredential, ref.inputSel, route.value);
+        await act.delay(120);
+        rec.credential = true; rec.credentialKind = route.credentialKind;
+        rec.mappedPath = "(credentials." + (route.credentialKind === "login" ? "email" : "password") + ")";
+        // ⚠ A PLACEHOLDER, NEVER THE VALUE — `fin()` logs `rec.after`, and the bundle carries it.
+        rec.after = "(stored " + route.credentialKind.replace(/_/g, " ") + ")";
+        if (!w || !w.ok) {
+          rec.status = "needs_review"; rec.after = null;
+          rec.detail = "could not write the " + route.credentialKind.replace(/_/g, " ") + ": " + ((w && w.error) || "unknown");
+          results.push(fin()); continue;
+        }
+        rec.verified = !!w.matches;
+        rec.status = w.matches ? "filled" : "needs_review";
+        if (!w.matches) { rec.after = null; rec.detail = "the box did not take the value (" + w.len + " characters present afterwards)"; }
+        else if (w.hadLength) rec.detail = "replaced a value the page had prefilled";
+        results.push(fin()); continue;
+      }
+
+      // ── SCHOOL / OTHER SCHOOL — one decision spanning two REQUIRED fields (operator) ────
+      // The form pairs a school typeahead with a free-text "Other School", and both are required.
+      // The rule: if the school IS in the list, pick it and put "N/A" in Other School; if it is NOT,
+      // pick the list's own "Other" and put the school's name in Other School. DOM order puts School
+      // first, so the pair's outcome is recorded there and read by the text field below.
+      const pairKey = es0 ? es0.section + ":" + es0.entryIndex : null;
+      if (route && route.kind === "school") {
+        const store = (o._icimsSchool = o._icimsSchool || {});
+        const name = (route.candidates || [])[0] || null;
+        await atsActuateField(act, ats, f, ref, rec, route.candidates || [], null, jc, profile, { containment: false });
+        if (rec.status === "filled" || rec.status === "filled_review") {
+          store[pairKey] = { matched: true, schoolName: name };
+        } else if (!rec.listNoResults) {
+          // ⚠ WE COULD NOT CONFIRM THE SCHOOL IS ABSENT, so we must not claim it is (operator,
+          // 2026-08-16). "Other" is only truthful once the widget has SAID "No Results" for the
+          // school we typed. Any other miss — a search still in flight, a menu disturbed by the
+          // page moving under it (which the smooth-scroll bug did), a list that never answered —
+          // is an UNKNOWN, and answering an unknown with "Other" writes a false statement onto the
+          // application: it says this university is not in their system when it is. Observed live:
+          // School "Other" + Other School "Carnegie Mellon University" on a form that lists CMU.
+          store[pairKey] = { matched: false, confirmedAbsent: false, schoolName: name };
+          rec.flag = rec.flag || "school-unconfirmed";
+          rec.detail = "could not confirm whether this form lists " + JSON.stringify(String(name || "")) +
+            " — the search did not report \"No Results\", so it was NOT answered \"Other\"; pick it here";
+        } else {
+          // Confirmed absent: the widget itself reported No Results for this school, so the form's
+          // own escape hatch is the truthful answer rather than leaving a REQUIRED field empty.
+          // The record is REBUILT rather than patched: the failed attempt's detail/tier/after describe
+          // a different commit, and leaving them would report the "Other" pick as if it were the miss.
+          rec.status = null; rec.after = null; rec.detail = null; rec.matchTier = null; rec.verified = null; rec.flag = null;
+          await atsActuateField(act, ats, f, ref, rec, ["Other"], null, jc, profile, { containment: false });
+          store[pairKey] = { matched: false, schoolName: name };
+          if (rec.status === "filled" || rec.status === "filled_review") {
+            rec.status = "filled_review";
+            rec.flag = "school-not-listed";
+            rec.detail = "this form's school list does not offer " + JSON.stringify(String(name || "")) +
+              " — chose its own \"Other\" and put the name in Other School";
+          }
+        }
+        rec.mappedPath = route.path || null;
+        results.push(fin()); continue;
+      }
+      if (route && route.kind === "other_school") {
+        const st = (o._icimsSchool || {})[pairKey] || null;
+        // ⚠ UNKNOWN ≠ MATCHED. If School never produced an outcome (an error, or a form that renders
+        // Other School first), writing "N/A" would silently drop the school entirely — the one
+        // outcome that loses information. Write the NAME and flag it instead.
+        const useName = !st || st.matched === false;
+        const value = useName ? (st && st.schoolName) || route.schoolName || null : "N/A";
+        if (value == null) { rec.status = "needs_review"; rec.detail = "no school in this education entry"; results.push(fin()); continue; }
+        rec.mappedPath = route.path || null;
+        await atsActuateField(act, ats, f, ref, rec, null, String(value), jc, profile, {});
+        if (!st) { rec.flag = rec.flag || "school-pair-unresolved"; rec.detail = "the School field produced no outcome, so the name was written here rather than \"N/A\""; }
+        results.push(fin()); continue;
       }
 
       if (route && route.kind === "resume") {
-        const att = await act.attachResume(ref);
+        // ⚠ ON iCIMS THE ATTACH ALREADY HAPPENED, BEFORE THIS LOOP EVER RAN (atsIcimsResumeStage).
+        // Its parse REPLACES the form's contents, so attaching here would blank every field written
+        // above this one — and on a submit run it would blank approved values on their way to a real
+        // submission. So the outcome is RECORDED and the file input is never touched: the pre-attach
+        // is the only attach, and its absence is reported rather than quietly repaired here.
+        const pre = o.resumePreattached || null;
+        const att = pre || (ats === "icims" ? null : await act.attachResume(ref));
+        if (!att) {
+          rec.status = f.isRequired ? "needs_review" : "skipped";
+          rec.flag = "resume-not-attached";
+          rec.detail = "no résumé stage ran for this page — on iCIMS the résumé is attached BEFORE the fill (its parse rewrites the form), never during it";
+          results.push(fin()); continue;
+        }
         Object.assign(rec, att.ok
-          ? { status: "filled", after: att.name || "resume attached", detail: att.detail || null, verified: !!att.verified }
+          ? { status: att.flag ? "filled_review" : "filled", after: att.name || "resume attached", detail: att.detail || null, verified: !!att.verified, flag: att.flag || null }
           : { status: f.isRequired ? "needs_review" : "skipped", detail: "resume attach failed: " + (att.error || "unknown"), flag: "resume-attach-failed" });
         results.push(fin()); continue;
       }
       if (route && (route.kind === "skip" || route.skip)) { rec.status = "skipped"; rec.detail = route.detail || "deliberately left to the operator"; results.push(fin()); continue; }
       if (route && route.kind === "employment-blank") { rec.status = "needs_review"; rec.flag = route.flag || "employer-match"; rec.detail = route.detail; results.push(fin()); continue; }
+      // A clearance question we cannot answer from a STATED clearance stops here, blank and flagged —
+      // it must not fall through to the AI, which would answer it by reasoning from absence. Claiming
+      // the question is what keeps that from happening; see the clearance rung in atsRouteLabel.
+      if (route && route.kind === "clearance-unstated") { rec.status = "needs_review"; rec.flag = route.flag || "clearance-unstated"; rec.detail = route.detail; results.push(fin()); continue; }
       if (route && route.eeoUnstated) {
         // OPTIONAL: leave it blank — the operator's own choice, nothing blocks.
         // REQUIRED: blank blocks the submit, so take the form's OWN decline option when it
@@ -2038,7 +4257,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
           const c = f.widgetType === "radio" || f.widgetType === "checkbox_group"
             ? await act.eval(atsInjCheckOption, ref.inputSel, dec, true)
             : f.widgetType === "dropdown_native"
-              ? await act.eval(atsInjSelectNative, ref.inputSel, dec)
+              ? await act.eval(atsInjSelectNative, atsInjSelectNativeMulti, ref.inputSel, dec)
               : await act.eval(atsInjCommitOption, ref.inputSel, dec);
           const b = await atsReadBackSettled(act, ats, ref.inputSel, f.widgetType);
           rec.after = b && b.ok ? b.value : null;
@@ -2067,12 +4286,28 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       if (route) {
         if (route.candidates) candidates = route.candidates.slice();
         else if (route.raw !== undefined) {
-          const isChoice = ["select", "dial", "radio", "yesno", "checkbox_group", "dropdown_native", "location"].includes(f.widgetType);
+          // ⚠ A NEW CHOICE WIDGET MUST BE LISTED HERE. resolve() coerces per KIND, and a widget
+          // missing from this list is treated as free text — which silently drops a TIERED profile
+          // array (the country ladder) instead of passing it through as candidates, so the fallback
+          // tier that actually matches the form's wording never gets tried.
+          const isChoice = ATS_CHOICE_WIDGETS.includes(f.widgetType);
           const rr = atsFd.resolve(route.raw, isChoice ? "dropdown" : "text");
           if (rr.skip) { /* falls through to AI/blank */ }
           else if (rr.candidates) candidates = rr.candidates;
           else if (rr.value !== undefined) { textValue = String(rr.value); candidates = [String(rr.value)]; }
-        } else if (route.value != null) { textValue = String(route.value); candidates = [String(route.value)]; }
+        } else if (route.value != null) {
+          textValue = String(route.value);
+          // ⚠ A MULTI-ANSWER WIDGET'S APPROVED VALUE IS A SET, AND ARRIVES JOINED. `current_value` for a
+          // checkbox group / native multi-select is the display string ("Internship; Part-time"), so a
+          // replay that passes it through as ONE candidate asks the form for an option by that whole
+          // name — live 2026-08-17 the rehearsal reported `your profile answer ("Internship; Part-time")
+          // isn't one of this form's options`. Split it back into the set it represents, using the same
+          // shared vocabulary the fill joined it with (GROUP_JOIN), so the multi-select handler matches
+          // each answer against the live options exactly as it does on a fill.
+          candidates = (f.widgetType === "multiselect_native" || f.widgetType === "checkbox_group")
+            ? atsLib.splitGroupValue(route.value)
+            : [String(route.value)];
+        }
         if (route.path && candidates) candidates = atsFd.appendFieldVariants(profile, route.path, candidates);
       }
 
@@ -2117,6 +4352,13 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
               } catch (e) { d.options = []; }   // the commit pass re-reads and reports it honestly
             }
           }
+          // The ONLY profile this question may be answered from. For a repeating-entry field that is
+          // its own entry and nothing else — same seal the deterministic tier obeys.
+          const scope = atsEntrySpec(ats, f);
+          if (scope) {
+            d.scopeKey = scope.section + ":" + scope.entryIndex;
+            d.scopeProfile = atsScopeForField(ats, f, profile);
+          }
           deferred.push(d);
           // PROVISIONAL — phase 3 overwrites both, so neither ever reaches a review bundle. The
           // record is pushed HERE, in the loop, so REVIEW ORDER stays FORM ORDER.
@@ -2144,6 +4386,32 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
             rec.detail = rec.detail || "no profile mapping for this question";
           }
         }
+      }
+      // ⚠ EVERY CHOICE FIELD REACHES REVIEW WITH ITS OPTIONS, filled or not (operator, 2026-08-16).
+      // A field we did not fill still has to be ANSWERABLE on the review page, and a picker with no
+      // options is just a text box — the operator ends up retyping a value the form was showing us
+      // all along. The scan already read these (native selects, radios, checkbox groups, and the
+      // first page of an iCIMS dropdown), so attaching them costs NOTHING: no reopening, no page
+      // contact, no added latency. Only the widget families whose list has no end — the big
+      // server-backed typeaheads — are left alone, and they are left alone by construction here,
+      // because the scan does not carry options for them either.
+      // Attached only when the record has none: a field that DID actuate already recorded the live
+      // list it matched against, which is the better of the two.
+      if (!rec.options && !rec.captured_options && Array.isArray(f.options) && f.options.length) {
+        atsAttachOptions(rec, f.options, f.optionsPartial === true);
+      } else if (rec.captured_options && !rec.options && Array.isArray(f.options)
+                 && f.optionsPartial !== true && f.options.length >= (rec.captured_options || []).length) {
+        // …AND A COMPLETE LIST BEATS A FILTERED ONE. The rule above — "a field that actuated already
+        // recorded the live list it matched against, which is the better of the two" — holds only
+        // while the actuation list is FULLER. It is not: a field filled through the widget's SEARCH
+        // records just the rows that search returned, so the record lands partial (a filter-or-type
+        // box) even when the scan's own list for that field is proven COMPLETE. Measured on the
+        // Astrion form: 18 of 46 choice records were filter-or-type, and most were dropdowns the
+        // fill had answered by searching.
+        // Both guards are load-bearing: the scan list must be PROVEN complete (never a first page
+        // standing in for a longer list), and it must not be SHORTER than what the actuation saw —
+        // otherwise a stale scan could narrow a list the widget had already shown us in full.
+        atsAttachOptions(rec, f.options);
       }
       // Route-level review force (employment "Yes" etc.).
       if (route && route.review && rec.status === "filled") rec.status = "filled_review";
@@ -2177,7 +4445,9 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
     const t0 = Date.now();
     try { await act.eval(atsInjScrollIntoView, d.ref.inputSel); } catch (e) { /* a field we cannot scroll to still fills */ }
     try {
-      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, profile, answer);
+      // scoped profile when this field belongs to a repeating entry — a solo call must obey the
+      // same seal the batch does, or the scoping is only as good as whether a batch happened to fire
+      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, d.scopeProfile || profile, answer);
     } catch (e) {
       d.rec.status = "needs_review";
       d.rec.detail = "AI commit pass exception: " + String((e && e.message) || e);
@@ -2195,8 +4465,65 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
   } catch (e) { /* log only */ }
 }
 
+// ── CREDENTIALS ARE RE-CHECKED LAST ──────────────────────────────────────────────────────
+// The credential tier verifies its write with an immediate read-back, and that read-back is NOT
+// enough. Observed live on iCIMS: `PersonProfileFields.Login` ended up holding an address that was
+// neither the profile's nor the stored one, with an empty password, on a run whose log said both
+// were filled and verified. The box carries `autocomplete="username"`, and the address was the
+// operator's real one — the browser's own password manager writes into it AFTER the page settles.
+// Written, verified, reverted, still reported `filled`: the exact false-verify class the safety
+// contract exists to prevent.
+//
+// ⚠ THE POST-FILL AUDIT STRUCTURALLY CANNOT COVER THIS, which is why this exists rather than a
+// tweak to it. `atsFinishFill` compares the live page against `rec.after`, and `rec.after` is
+// deliberately the placeholder "(stored login)" rather than a value — so the audit can only ever
+// mismatch on a credential, which is why credential records are skipped there. This check compares
+// against the EXPECTED value instead, which has to stay out of records and the bundle, so it lives
+// where the credentials already are: inside the fill.
+//
+// It runs LAST, after the cascade rounds and the audit, so anything that was going to re-render or
+// autofill already has. A field that has been replaced is rewritten once; one the page keeps taking
+// back ends `needs_review` + `credential-overwritten` with its placeholder cleared — a login we
+// could not keep on the page must never be reported as filled.
+async function atsCredentialRecheck(act, ats, scan, results, credentials) {
+  if (!credentials || !credentials.email || !credentials.password) return null;
+  const creds = results.filter((r) => r && r.credential && r.credentialKind && r.status === "filled");
+  if (!creds.length) return null;
+  let repaired = 0, lost = 0;
+  for (const rec of creds) {
+    const f = scan.fields.find((x) => x.fieldName === rec.fieldName);
+    if (!f) continue;
+    const want = atsCredentialValue(rec.credentialKind, credentials);
+    if (!want) continue;
+    let v = null;
+    try { v = await act.eval(atsInjVerifyCredential, f.inputSel, want); } catch (e) { v = null; }
+    if (v && v.ok && v.matches) continue;
+    let w = null;
+    try { w = await act.eval(atsInjSetCredential, f.inputSel, want); } catch (e) { w = null; }
+    await act.delay(150);
+    let after = null;
+    try { after = await act.eval(atsInjVerifyCredential, f.inputSel, want); } catch (e) { after = null; }
+    if (after && after.ok && after.matches) {
+      repaired++;
+      rec.detail = (rec.detail ? rec.detail + "; " : "") + "the page replaced this after the fill — rewritten";
+      continue;
+    }
+    lost++;
+    rec.status = "needs_review";
+    rec.flag = "credential-overwritten";
+    rec.verified = false;
+    rec.after = null;
+    rec.detail = "the page kept replacing this " + rec.credentialKind.replace(/_/g, " ") +
+      " after we wrote it (the browser's own password manager is the usual cause) — set it yourself before submitting";
+  }
+  if (repaired || lost) {
+    try { console.log(`[ApplyPilot][ATS-FILL] credential re-check: ${repaired} rewritten, ${lost} could not be kept on the page`); } catch (e) { /* log only */ }
+  }
+  return { repaired, lost };
+}
+
 // The audit + envelope — extracted with the loop (see atsFillFields).
-async function atsFinishFill(act, ats, scan, results) {
+async function atsFinishFill(act, ats, scan, results, credentials) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
   await act.delayFull(600);
@@ -2204,6 +4531,12 @@ async function atsFinishFill(act, ats, scan, results) {
     if (rec.status !== "filled" && rec.status !== "filled_review") continue;
     const f = scan.fields.find((x) => x.fieldName === rec.fieldName);
     if (!f || f.widgetType === "file_upload") continue;
+    // ⚠ CREDENTIALS ARE NOT AUDITABLE HERE, AND SKIPPING THEM IS NOT A HOLE — atsCredentialRecheck
+    // below is the second look they get, and it is a STRONGER one. This loop compares the page
+    // against `rec.after`, which for a credential is the placeholder "(stored login)" rather than a
+    // value, so it could only ever produce a false audit-mismatch. Auditing them here would also
+    // read a password out of the page and into `rec.after` — the one thing this path must not do.
+    if (rec.credential) continue;
     try {
       const live = await act.eval(atsInjReadValue, ats, f.inputSel, f.widgetType);
       if (!live || !live.ok) { rec.flag = rec.flag || "audit-unverifiable"; continue; }
@@ -2228,6 +4561,10 @@ async function atsFinishFill(act, ats, scan, results) {
       }
     } catch (e) { rec.flag = rec.flag || "audit-unverifiable"; }
   }
+
+  // Genuinely last, and BEFORE counts — a credential the page took back becomes `needs_review`
+  // here, and the envelope must report that, not the status it held a moment earlier.
+  await atsCredentialRecheck(act, ats, scan, results, credentials);
 
   const counts = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
   // DID THIS PAGE'S ASYNC WIDGETS EVER ANSWER? Greenhouse forms sometimes load in a state where their
@@ -2278,6 +4615,146 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     rec.matchTier = tier; rec.verified = okv;
     if (!okv) rec.detail = "location commit did not persist (selectedLocation empty)";
     else if (tier === "containment") { rec.flag = rec.flag || "non-exact-match"; rec.detail = "picked the first city match — verify the state"; }
+    return true;
+  }
+
+  // iCIMS' AJAX combobox. Its own widget, because none of the react-select helpers fit: the opener,
+  // the results list, the search box and the read-back are all iCIMS-specific, and its <select> is
+  // decorative. Shape: open → (search if the page we can see doesn't hold it) → match through the
+  // SAME ladder → click the row → read back the DISPLAYED text → close CONFIRMED.
+  if (wt === "icims_dropdown") {
+    if (!candidates || !candidates.length) return false;
+    rec.resolved = candidates;
+    const open = await act.eval(atsInjIcimsOpen, ref.inputSel);
+    await act.delay(180);
+    if (!open || !open.ok) { rec.status = "needs_review"; rec.detail = "could not open the dropdown: " + ((open && open.error) || "unknown"); return true; }
+
+    let opts = open.options || [];
+    let searched = false;
+    // ⚠ ASK ABOUT THE PARENT FIRST, BEFORE ANY SEARCH. A child whose parent is unset shows only the
+    // widget's own "Please select a country" row; searching REPLACES that row, so by the time the
+    // no-match branch re-read the list the evidence was gone and the field reported the generic
+    // "no option matched \"Pennsylvania\"" — naming the wrong cause. Searching a list that cannot
+    // contain the answer is also pure latency.
+    {
+      const pre = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
+      if (pre && pre.ok && pre.awaitingParent) {
+        await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+        rec.status = "needs_review";
+        rec.detail = "this list only fills in once its parent field is chosen, and that hadn't happened yet";
+        return true;
+      }
+    }
+    let m = atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
+    // ⚠ ONE PAGE AT A TIME (26 countries / 25 states measured live). A miss here is NOT proof the
+    // option doesn't exist, so the search box is tried before anything is reported — otherwise a
+    // candidate in Texas fails on a list that stops at Michigan.
+    if (!m || m.targetIndex < 0) {
+      const beforeKey = opts.join("");
+      const s = await act.eval(atsInjIcimsSearch, ref.inputSel, String(candidates[0]));
+      if (s && s.ok) {
+        searched = true;
+        // POLL FOR SUCCESS, NOT FOR STILLNESS. Two settles failed live for the SAME underlying
+        // reason: every "has the search finished?" proxy is already satisfied by the PRE-SEARCH
+        // list. Stability alone accepts it (it is non-zero and perfectly stable). "Changed since we
+        // opened" accepts it too, because the list is frequently still loading at open time, so the
+        // baseline is empty and the ordinary unfiltered page reads as the change — which is what
+        // made School report `no option matched "Carnegie Mellon University" (after searching)` and
+        // fall to "Other" in 675ms, while typing the same text by hand returns it as the first hit.
+        //
+        // A MATCH is unambiguous, so match on EVERY read and stop at the first hit; "No Results" is
+        // the widget's own terminal no. Otherwise keep looking for the whole budget rather than
+        // deciding that a still list is a finished one. Only the timeout path can be wrong now, and
+        // it errs toward looking longer.
+        let read = null, hit = null;
+        for (let i = 0; i < 40; i++) {
+          await act.delay(200);
+          read = await act.eval(atsInjIcimsReadOptions, ref.inputSel);
+          if (!read || !read.ok) continue;
+          if (read.noResults) { opts = []; rec.listNoResults = true; break; }
+          const list = read.options || [];
+          if (list.length) opts = list;
+          const tryM = atsLib.matchCandidates(candidates, list, { containment: allowContainment });
+          if (tryM && tryM.targetIndex >= 0) { opts = list; hit = tryM; break; }
+        }
+        m = hit || atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
+      }
+    }
+    // ALWAYS partial: this widget renders one page and offers a search box, so even an unsearched
+    // read is a VIEW of the list, never the whole of it. Review then gets a type-to-filter editor
+    // and an honest note instead of a 25-row list presented as every US state.
+    atsAttachOptions(rec, opts, true);
+
+    if (!m || m.targetIndex < 0) {
+      const st = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
+      await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+      rec.status = "needs_review";
+      // A CHILD WHOSE PARENT IS UNSET SAYS SO, and that is a different fact from "your answer isn't
+      // offered" — reporting them the same way is what produced "no live options to choose from" on
+      // a State field whose Country simply hadn't been chosen yet.
+      rec.detail = st && st.awaitingParent
+        ? "this list only fills in once its parent field is chosen, and that hadn't happened yet"
+        : st && st.noChildren
+          ? "the form offers no options here for the parent value chosen"
+          : "no option matched " + JSON.stringify(String(candidates[0])) + (searched ? " (after searching)" : "") +
+            (opts.length ? " — offered: " + opts.slice(0, 4).join(" | ") : " — the list was empty");
+      return true;
+    }
+
+    const chosen = opts[m.targetIndex];
+    const c = await act.eval(atsInjIcimsCommit, ref.inputSel, chosen);
+    await act.delay(250);
+    const back = await act.eval(atsInjIcimsRead, ref.inputSel);
+    rec.after = back && back.ok ? back.value : null;
+    // ⚠ close BEFORE reporting: a results list left mounted sits over the next field's opener, and
+    // this page stacks these widgets directly above one another (Country → State/Province).
+    await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+    const okv = !!(c && c.ok) && String(rec.after || "").trim() !== "" &&
+      atsLib.normalize(String(rec.after || "")) === atsLib.normalize(String(chosen));
+    rec.matchTier = m.matchTier;
+    rec.verified = okv;
+    rec.status = okv ? (m.matchTier === "exact-normalized" ? "filled" : "filled_review") : "needs_review";
+    if (!okv) rec.detail = "the pick did not persist (the widget shows " + JSON.stringify(String(rec.after || "")) + ")";
+    else if (m.matchTier !== "exact-normalized") { rec.flag = rec.flag || "non-exact-match"; rec.detail = rec.detail || ("matched at the " + m.matchTier + " tier"); }
+    return true;
+  }
+
+  // Native multi-select: EVERY stored answer that the form offers, in one commit.
+  if (wt === "multiselect_native") {
+    if (!candidates || !candidates.length) return false;
+    rec.resolved = candidates;
+    const texts = f.options || [];
+    // Each stored answer goes through the ORDINARY ladder against the live options — a multi-answer
+    // question is still N single matches, so nothing is committed that the form did not offer.
+    const picks = [];
+    for (const c of candidates) {
+      const m = atsLib.matchCandidates([c], texts, { containment: allowContainment });
+      if (m && m.targetIndex >= 0 && picks.indexOf(texts[m.targetIndex]) === -1) picks.push(texts[m.targetIndex]);
+    }
+    atsAttachOptions(rec, texts);
+    if (!picks.length) { rec.detail = "none of " + candidates.length + " stored answer(s) matched " + texts.length + " option(s)"; return false; }
+    const r = await act.eval(atsInjSelectNativeMulti, ref.inputSel, picks);
+    await act.delay(140);
+    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    // ⚠ CARRY THE ARRAY, don't re-split a string. A multi-select reaches review as a checkbox GROUP,
+    // whose contract is `selected_options` = the authoritative array + `current_value` = the joined
+    // display. Setting only the joined string left the editor splitting on the wrong separator and
+    // rendering the question BLANK on a form that held both answers (live 2026-08-17).
+    const chosen = (back && back.ok && Array.isArray(back.values)) ? back.values
+      : (r && Array.isArray(r.selected) ? r.selected : []);
+    rec.selected_options = chosen;
+    rec.after = chosen.length ? atsLib.joinGroupValue(chosen) : null;
+    const got = chosen.map((x) => atsLib.normalize(x));
+    const okv = !!(r && r.ok) && picks.every((p) => got.indexOf(atsLib.normalize(p)) !== -1);
+    rec.verified = okv;
+    // ⚠ A STORED ANSWER THIS FORM DOES NOT OFFER IS REPORTED, never dropped in silence: the operator
+    // said they would consider it, and a shorter list than they chose is a different answer.
+    const unoffered = candidates.filter((c) => !picks.some((p) => atsLib.normalize(p) === atsLib.normalize(c)));
+    if (!okv) { rec.status = "needs_review"; rec.detail = "the selection did not persist (form shows " + JSON.stringify(String(rec.after || "")) + ")"; }
+    else if (unoffered.length) {
+      rec.status = "filled_review"; rec.flag = rec.flag || "partial-multiselect";
+      rec.detail = "selected " + picks.length + " of your " + candidates.length + " answers — this form does not offer " + unoffered.join(", ");
+    } else { rec.status = "filled"; rec.matchTier = "exact-normalized"; }
     return true;
   }
 
@@ -2860,8 +5337,13 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     }
     if (!m || m.targetIndex < 0) { rec.detail = "no candidate matched " + texts.length + " option(s)"; atsAttachOptions(rec, texts); return false; }
     const r = await act.eval(atsInjSelectNative, ref.inputSel, texts[m.targetIndex]);
-    await act.delay(120);
-    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    // ⚠ POLL THE READ-BACK, don't sample it once after a fixed beat. `act.delay` is ADAPTIVE and
+    // collapses to ~20ms when page timers measure fast, so "delay(120) then read once" could sample
+    // before the widget had settled — the exact trap atsReadBackSettled exists for and which the other
+    // commit paths already use. Live 2026-08-17 two iCIMS salary selects reported `native select commit
+    // failed` on a rehearsal; polling is the honest read, and a genuinely blank field still reports
+    // blank — it just costs the window to say so.
+    const back = await atsReadBackSettled(act, ats, ref.inputSel, wt, 2000);
     rec.after = back && back.ok ? back.value : null;
     atsAttachOptions(rec, texts);
     const okv = atsLib.normalize(String(rec.after || "")) === atsLib.normalize(texts[m.targetIndex]);
@@ -2981,6 +5463,23 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   return false; // unknown widget — AI/blank fallback decides
 }
 
+// Native <select multiple> — select EVERY requested option in one pass.
+// ⚠ Not a loop over the single-select committer: each `selectedIndex =` write REPLACES the whole
+// selection, so committing four options one at a time leaves exactly the last one. The selection is
+// built first and `change` fired ONCE at the end, which is also what a real multi-select does.
+function atsInjSelectNativeMulti(inputSel, optionTexts) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim().toLowerCase();
+  const want = (Array.isArray(optionTexts) ? optionTexts : []).map(norm);
+  const missed = [];
+  for (const w of want) if (![...el.options].some((o) => norm(o.textContent) === w)) missed.push(w);
+  for (const o of el.options) o.selected = want.indexOf(norm(o.textContent)) !== -1;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return { ok: true, missed, selected: [...el.selectedOptions].map((o) => (o.textContent || "").replace(/\s+/g, " ").trim()) };
+}
+
 // Native <select> (Lever custom dropdowns).
 function atsInjSelectNative(inputSel, optionText) {
   const el = document.querySelector(inputSel);
@@ -3042,6 +5541,24 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       // anyway, and the answer must be matched against what the form is showing NOW.
       if (wt !== "dropdown_native") texts = await atsOpenAndPollOptions(act, ref);
     }
+    // ⚠ THIS IS WHAT PRODUCED "AI fallback: no live options to choose from" ON A PAGE THAT WAS
+    // PLAINLY SHOWING A LIST (live 2026-08-16, the required Country field). The AI path read options
+    // through the react-select helpers, which find nothing on an iCIMS widget — so the field was
+    // reported as offering no choices at all, and the message sent debugging to the option read
+    // rather than to the widget. It has its own opener; use it.
+    if (wt === "icims_dropdown") {
+      const o = await act.eval(atsInjIcimsOpen, ref.inputSel).catch(() => null);
+      texts = (o && o.ok && o.options) || [];
+      if (!texts.length) {
+        const st = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
+        if (st && st.ok && st.awaitingParent) {
+          await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+          rec.status = "needs_review";
+          rec.detail = "this list only fills in once its parent field is chosen, and that hadn't happened yet";
+          return;
+        }
+      }
+    }
     if (!texts.length) { rec.status = "needs_review"; rec.detail = "AI fallback: no live options to choose from"; return; }
     // ATTACH THE LIVE OPTIONS NOW, before any early return. A choice field that reaches review
     // must carry the form's real list so the editor renders a PICKER — whatever the AI did with
@@ -3058,6 +5575,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       if (wt === "radio" || wt === "checkbox_group") c = await act.eval(atsInjCheckOption, ref.inputSel, dec, true);
       else if (wt === "yesno") c = await act.eval(atsInjClickYesNo, ref.inputSel, dec);
       else if (wt === "dropdown_native") c = await act.eval(atsInjSelectNative, ref.inputSel, dec);
+      else if (wt === "icims_dropdown") c = await act.eval(atsInjIcimsCommit, ref.inputSel, dec);
       else c = await act.eval(atsInjCommitOption, ref.inputSel, dec);
       const b = await atsReadBackSettled(act, ats, ref.inputSel, wt);
       rec.after = b && b.ok ? b.value : null;
@@ -3093,6 +5611,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     if (wt === "radio" || wt === "checkbox_group") committed = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
     else if (wt === "yesno") committed = await act.eval(atsInjClickYesNo, ref.inputSel, pick);
     else if (wt === "dropdown_native") committed = await act.eval(atsInjSelectNative, ref.inputSel, pick);
+    else if (wt === "icims_dropdown") committed = await act.eval(atsInjIcimsCommit, ref.inputSel, pick);
     else committed = await act.eval(atsInjCommitOption, ref.inputSel, pick);
     const back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
     rec.after = back && back.ok ? back.value : null;
@@ -3120,19 +5639,28 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
 // ── UMD-lite export (Node tests) ─────────────────────────────────────────────────────────
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    detectAts, atsFormUrl, atsCompanyFromUrl, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
-    atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_POLL, driveAtsPageFill, atsActuateField,
+    detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
+    atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
+    atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
+    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
+    atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
-    atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsDeclineOption,
+    atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
+    atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
+    atsConsentKind, atsConsentPlan, atsInjTickConsent,
+    ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
+    atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
+    atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
-    atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
+    atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
   };

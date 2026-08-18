@@ -274,6 +274,9 @@ function cdpAttach(tabId) {
       _timerLatCache = { fast: null, at: 0 };  // fresh timer-latency sampling per run
       _workerTimersActive = false;             // re-detected by cdpInstallPageOverrides after attach (default slow/safe until then)
       _pageClockOn = false;                    // page-clock pacing is per-run opt-in (FILL/REPLAY only) — onboarding/auth/recon stay SW-timed
+      _fastWhenHidden = false;                 // fast-while-hidden is per-run opt-in (a page whose reactions are not page-timer driven)
+      _frameCtxId = null;                      // frame-scoped eval is per-run opt-in (iCIMS only) — everything else evaluates in the top frame
+      _frameCtxUrl = null;
       _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
       try {
         await cdpSend("Runtime.enable", {});
@@ -683,9 +686,24 @@ function buildOverrideSrc(opts) {
 // SPA doc, then read back whether worker-timers took. Best-effort: an install failure
 // logs and is swallowed — it must NEVER abort a run (the fill already works hidden;
 // this helps page-to-page advancement AND, via worker-timers, hidden-run SPEED).
-async function cdpInstallPageOverrides() {
+// `opts.noWorkerTimers` lets a CALLER opt its run out of the blob-worker timer polyfill while
+// leaving everything else in place. Added for iCIMS (2026-08-16): its sign-in gate is guarded by
+// INVISIBLE hCaptcha, and under the polyfill hCaptcha never initialises at all — measured, not
+// theorised (`captchaFrames 0` under a run vs a rendered challenge iframe on the same page by
+// hand), so the gate's submit fired, iCIMS disabled its own button, and nothing ever came back.
+// We are not evading the captcha by turning this off — we are removing OUR OWN tampering so the
+// page's own anti-abuse check can run and judge the session on its merits. If it then refuses us,
+// the pre-form stage halts for the operator; nothing here forges or solves anything.
+// The storage kill-switch still wins, so `forceWorkerTimersOff` behaves exactly as before.
+async function cdpInstallPageOverrides(opts) {
+  // Two separate switches, deliberately NOT merged: the storage kill-switch exists to SIMULATE a
+  // CSP-blocked tenant, so it turns the bypass off too; the caller opt-out only declines the
+  // worker. Keeping them apart is what let the iCIMS cause be narrowed to the worker alone rather
+  // than "something in the override block".
+  const callerNoWorker = !!(opts && opts.noWorkerTimers);
   let forceNoWorker = false;
   try { const { forceWorkerTimersOff } = await new Promise((r) => chrome.storage.local.get("forceWorkerTimersOff", r)); forceNoWorker = !!forceWorkerTimersOff; } catch (e) { /* default OFF */ }
+  const noWorker = forceNoWorker || callerNoWorker;
   // CSP BYPASS (2026-07-25 — the wd3.myworkdaysite.com slow-run diagnosis): a tenant whose CSP blocks
   // blob: workers silently killed the WHOLE fast hidden path — the worker-timers install threw, the
   // readback stayed false, and every page-side debounce/render quantized to the ~1Hz throttle (the
@@ -699,7 +717,7 @@ async function cdpInstallPageOverrides() {
     try { await cdpSend("Page.setBypassCSP", { enabled: true }); cspBypassed = true; } catch (e) { /* stay CSP-bound */ }
   }
   try {
-    const src = buildOverrideSrc({ forceNoWorker });
+    const src = buildOverrideSrc({ forceNoWorker: noWorker });
     await cdpSend("Page.addScriptToEvaluateOnNewDocument", { source: src }); // future loads / re-auth
     await cdpSend("Runtime.evaluate", { expression: src });                  // the current already-loaded SPA doc
     // Read back whether the worker-timers polyfill actually installed on the CURRENT
@@ -708,19 +726,22 @@ async function cdpInstallPageOverrides() {
     // RETRY once (worker-only): the doc may carry __apOverridesInstalled from an EARLIER attach that
     // ran without the bypass (SPA — no reload between runs), so the full override no-ops and the
     // worker stays dead. buildWorkerRetrySrc re-runs JUST the worker block when the worker isn't live.
-    if (!_workerTimersActive && !forceNoWorker && cspBypassed) {
+    if (!_workerTimersActive && !noWorker && cspBypassed) {
       try {
         await cdpSend("Runtime.evaluate", { expression: buildWorkerRetrySrc() });
         _workerTimersActive = !!(await cdpEval(() => !!window.__apWorkerTimers));
       } catch (e) { /* stays slow/safe */ }
     }
-    const wt = _workerTimersActive ? "ON" : (forceNoWorker ? "OFF (forced)" : (cspBypassed ? "OFF (blocked even with CSP bypass)" : "OFF (CSP?)"));
+    const wt = _workerTimersActive ? "ON"
+      : callerNoWorker && !forceNoWorker ? "OFF (declined by this run — it meets a page whose own anti-abuse check the polyfill breaks)"
+      : forceNoWorker ? "OFF (forced)" : (cspBypassed ? "OFF (blocked even with CSP bypass)" : "OFF (CSP?)");
     console.log(`[ApplyPilot][CDP] page overrides installed (rAF→setTimeout + hasFocus; CSP bypass ${cspBypassed ? "ON" : "unavailable"}; worker-timers ${wt}) — hidden-tab unblock + fast timers.`);
-    if (!_workerTimersActive && !forceNoWorker) warnNoWorkerTimers(cspBypassed ? "blocked even with CSP bypass" : "install threw (CSP?)");
+    // A DECLINED worker is a decision, not a fault — the banner would be a false alarm.
+    if (!_workerTimersActive && !noWorker) warnNoWorkerTimers(cspBypassed ? "blocked even with CSP bypass" : "install threw (CSP?)");
   } catch (e) {
     _workerTimersActive = false;
     console.log("[ApplyPilot][CDP] page-override install failed (best-effort, continuing):", String((e && e.message) || e));
-    if (!forceNoWorker) warnNoWorkerTimers("the whole override install failed: " + String((e && e.message) || e));
+    if (!noWorker) warnNoWorkerTimers("the whole override install failed: " + String((e && e.message) || e));
   }
 }
 
@@ -782,14 +803,140 @@ function cdpAuthButtonReady(selector) {
 // discipline as chrome.scripting injections). CDP-injected evaluation executes
 // promptly even hidden (it is not timer-driven) — this is the DOM-READ channel;
 // all WAITING between reads stays SW-side (cdpDelay).
+// ── FRAME-SCOPED EVAL (iCIMS and any other iframe-hosted form) ──────────────────────────
+// iCIMS serves its whole application inside a same-origin iframe (`#icims_content_iframe`):
+// the top document holds ZERO form controls and the frame holds ~118 (traced 2026-08-16 on
+// astrioncareers-astrion.icims.com). Every other ATS this file drives is a top-frame form, so
+// without this a scan reads an empty page and the run reports "not a form".
+//
+// Re-opening that frame's src as a top-level page is NOT a substitute: when the session was
+// established by a one-time magic link the first navigation consumes the `eem`/`code` token, so
+// the second lands on a login page with 0 fields. The form has to be driven WHERE IT IS.
+//
+// Discovery is request/response — `Page.getFrameTree` then `Page.createIsolatedWorld` — because
+// cdp.js deliberately registers NO event listener, which rules out `Runtime.executionContextCreated`.
+//
+// ⚠ An ISOLATED world is the right world here, and it is not a compromise: it shares the DOM with
+// the page, so the native-setter + dispatchEvent pattern every injected function uses works
+// identically (that is exactly how a content script fills a controlled input). It only lacks the
+// page's own JS globals, which no injected function here touches.
+//
+// ⚠ DEFAULTS TO NULL, AND ONLY AN OPT-IN CALLER SETS IT. With `_frameCtxId === null` this is
+// byte-identical to the previous `Runtime.evaluate` call, so Workday / Greenhouse / Lever / Ashby
+// are untouched. Reset on every attach.
+let _frameCtxId = null;
+let _frameCtxUrl = null;
+// How the current pin was obtained ({floor, identifyUrl}), so cdpEval's re-arm reproduces it rather
+// than falling back to a hardcoded floor that may not accept the very frame we are pinned to.
+let _frameArmSpec = null;
+
+// Point subsequent cdpEval calls at the richest same-origin CHILD frame. Returns
+// {ok, url, controls} or {ok:false, reason}. Re-resolving is cheap, and a navigation invalidates
+// the world, so callers re-arm after any navigation.
+// ⚠ A FRAME CAN BE THE ONE WE WANT BEFORE IT HOLDS A FORM (live 2026-08-18).
+// The control-count floor below is the right test for "which frame has the application form", and the
+// wrong one for "which frame is this tenant's content". On an `<tenant>.icims.com` POSTING page the
+// content frame holds the job description and a single `<a>Apply for this job online</a>` — ZERO form
+// controls — so a floored call refuses it, nothing is pinned, and every subsequent eval lands in the
+// TOP document, which on iCIMS is 13 characters of branding. Measured: the pre-form stage reported
+// `controls 0 frame none apply no-apply-button` and halted `apply-not-followable` on a page whose Apply
+// link was plainly there by hand. Astrion hid this for two days because its run ARRIVES from an
+// employer portal, where the Apply link really is in the top document.
+//
+// So `minControls: 0` is now reachable — but "any child frame will do" is not safe: pinning an
+// analytics iframe would make the caller blind in a NEW way, and silently. A 0-floor call must
+// therefore say HOW the frame identifies itself (`opts.identifyUrl`, tested against the frame's own
+// URL), an identified frame outranks a fuller one, and a 0-floor call with no identity is refused
+// outright rather than guessing.
+async function cdpUseFormFrame(minControls, opts) {
+  const floor = minControls == null ? 4 : minControls;
+  const idRe = (opts && opts.identifyUrl) || null;
+  if (floor <= 0 && !idRe) return { ok: false, reason: "0-floor-needs-an-identity" };
+  _frameCtxId = null; _frameCtxUrl = null; _frameArmSpec = null;
+  let tree = null;
+  try { tree = await cdpSend("Page.getFrameTree", {}); } catch (e) { return { ok: false, reason: "no-frame-tree" }; }
+  const kids = (tree && tree.frameTree && tree.frameTree.childFrames) || [];
+  if (!kids.length) return { ok: false, reason: "no-child-frames" };
+  let best = null;
+  for (const k of kids) {
+    const frameId = k.frame && k.frame.id;
+    if (!frameId) continue;
+    let ctx = null;
+    try { ctx = await cdpSend("Page.createIsolatedWorld", { frameId, worldName: "apFormFrame", grantUniversalAccess: false }); } catch (e) { continue; }
+    const contextId = ctx && ctx.executionContextId;
+    if (!contextId) continue;
+    let n = 0;
+    try {
+      const r = await cdpSend("Runtime.evaluate", {
+        expression: "document.querySelectorAll('input:not([type=hidden]),textarea,select,[role=combobox]').length",
+        returnByValue: true, contextId,
+      });
+      n = (r && r.result && r.result.value) || 0;
+    } catch (e) { n = 0; }
+    const furl = (k.frame && k.frame.url) || "";
+    const identified = idRe ? idRe.test(furl) : false;
+    // An IDENTIFIED frame outranks a fuller one — that ordering is what lets a 0-floor call pin the
+    // tenant's own content frame rather than whichever child frame happened to come first.
+    const better = !best || (identified && !best.identified)
+      || (identified === best.identified && n > best.controls);
+    if (better) best = { contextId, controls: n, url: furl, identified };
+  }
+  if (!best) return { ok: false, reason: "no-frame-with-a-form", controls: 0 };
+  if (best.controls < floor) return { ok: false, reason: "no-frame-with-a-form", controls: best.controls };
+  if (floor <= 0 && !best.identified) return { ok: false, reason: "no-identified-frame", controls: best.controls };
+  _frameCtxId = best.contextId; _frameCtxUrl = best.url;
+  // REMEMBER HOW THIS PIN WAS OBTAINED, so the re-arm in cdpEval can reproduce it. Without this a
+  // postback on a 0-control page (an iCIMS JD frame) re-armed at the hardcoded floor of 1, failed, and
+  // dropped the pin back to the top document — the same blindness this function just fixed, arriving
+  // later and looking like a different bug.
+  _frameArmSpec = { floor, identifyUrl: idRe };
+  return { ok: true, url: best.url, controls: best.controls, identified: best.identified };
+}
+function cdpClearFormFrame() { _frameCtxId = null; _frameCtxUrl = null; _frameArmSpec = null; }
+function cdpFormFrameUrl() { return _frameCtxUrl; }
+function cdpFormFrameArmed() { return _frameCtxId != null; }
+
 async function cdpEval(fn, ...args) {
   const expression = "(" + String(fn) + ")(" + args.map((a) => JSON.stringify(a)).join(",") + ")";
-  const res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+  const params = { expression, returnByValue: true, awaitPromise: true };
+  if (_frameCtxId != null) params.contextId = _frameCtxId;
+  let res;
+  try {
+    res = await cdpSend("Runtime.evaluate", params);
+  } catch (e) {
+    // ⚠ AN ISOLATED WORLD DIES WITH ITS DOCUMENT. iCIMS does partial postbacks, and mid-fill the
+    // frame can re-create its context: `Cannot find context with specified id` (-32000), which
+    // surfaces as `error` records on otherwise-good fields. Re-arm ONCE and retry — a stale world is
+    // a recoverable condition, not a failed field.
+    // Only ever taken when a frame context is armed, so the top-frame path is untouched.
+    const msg = String((e && e.message) || e);
+    if (_frameCtxId == null || !/Cannot find context with specified id/i.test(msg)) throw e;
+    const spec = _frameArmSpec || { floor: 1, identifyUrl: null };
+    const again = await cdpUseFormFrame(spec.floor, { identifyUrl: spec.identifyUrl }).catch(() => ({ ok: false }));
+    if (!again.ok) { _frameCtxId = null; throw e; }
+    console.log("[ApplyPilot][CDP] the frame's isolated world was replaced (a postback) — re-armed and retrying");
+    res = await cdpSend("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true, contextId: _frameCtxId });
+  }
   if (res && res.exceptionDetails) {
     const d = res.exceptionDetails;
     throw new Error("cdpEval: " + ((d.exception && d.exception.description) || d.text || "page exception"));
   }
   return res && res.result ? res.result.value : undefined;
+}
+
+// Evaluate in the TOP frame even while a form frame is pinned. Needed whenever the answer belongs
+// to the top document rather than the frame — notably the frame's own on-screen box, because
+// `Input.*` dispatches into the TOP-LEVEL viewport while an element inside a frame reports a
+// frame-relative rect, so a trusted coordinate click has to add the two.
+// Deliberately does NOT disturb `_frameCtxId`: the pin is restored for the caller's next cdpEval.
+async function cdpEvalTop(fn, ...args) {
+  const saved = _frameCtxId;
+  _frameCtxId = null;
+  try {
+    return await cdpEval(fn, ...args);
+  } finally {
+    _frameCtxId = saved;
+  }
 }
 
 // ── Foreground-adaptive pacing ───────────────────────────────────────────────
@@ -881,8 +1028,36 @@ async function cdpTimersFast() {
 // installed → slow (today's behavior; skip the probe). Hidden + worker installed →
 // fast ONLY if timers MEASURE fast (the honest gate against a fast wait on a still-
 // throttled page — the false-verify class the whole design guards against).
+// ── FAST PACING ON A HIDDEN TAB WHOSE PAGE DOES NOT NEED PAGE TIMERS ─────────────────────
+// SCOPED OPT-IN, a sibling of cdpSetSyntheticInput / cdpSetPageClock, and a DIFFERENT AXIS from the
+// page clock: that one chooses WHERE a pace sleeps, this one chooses HOW LONG.
+//
+// The `!_workerTimersActive ⇒ slow` rule below exists because a hidden page's OWN setTimeout rides
+// Chrome's ~1Hz throttle, so the debounced REACT re-renders a Workday fill waits on genuinely take
+// ~1s. iCIMS is not that page: server-rendered jQuery, no React (docs/dom-patterns.md 2026-08-16), so
+// what we wait for is an AJAX reply (network events are not timer-throttled) or a synchronous DOM write
+// after a native setter. Neither needs the page's clock to tick fast.
+//
+// And it declines the worker polyfill on purpose — its captcha will not initialise under it — so
+// without this an iCIMS hidden run pays FULL pacing on every field: measured 37.2s hidden vs 16.6s
+// visible, with the entire gap in per-field time (26.5s vs 6.5s). See round 11 of
+// docs/fill-speed-log.md.
+//
+// ⚠ WHY THIS IS NOT A NEW TIMING REGIME: it applies the SAME FAST_FACTOR every VISIBLE run already
+// uses, to a hidden tab. And it is latency-safe rather than coverage-safe by luck — every adaptive-pace
+// site is gated by a read-back or a poll, so a too-short wait costs a RETRY, never a silent wrong fill
+// (CLAUDE.md's pacing rule, and standing conclusion 3 of the speed log: a monotone or stability
+// predicate can be noticed late, never missed).
+// Reset at every cdpAttach, so it can never leak into a tenant that has not claimed it.
+let _fastWhenHidden = false;
+function cdpSetFastWhenHidden(on) {
+  _fastWhenHidden = !!on;
+  if (on) console.log("[ApplyPilot][CDP] fast pacing allowed while HIDDEN for this run — this page's reactions are AJAX/DOM, not page-timer driven, and every pace site is read-back gated (a short wait costs a retry).");
+}
+
 async function cdpFast() {
   if (await cdpVisible()) return true;
+  if (_fastWhenHidden) return true;
   if (!_workerTimersActive) return false;
   return await cdpTimersFast();
 }
@@ -906,6 +1081,9 @@ async function cdpVisibilityLabel() { return (await cdpVisible()) ? "visible" : 
 // the whole-run bottleneck class, not something the adaptive budgets can fix. Cheap (TTL-cached reads).
 async function cdpPacingLabel() {
   if (await cdpVisible()) return "visible-fast";
+  // Named distinctly from the worker-timer path so a timing line still says WHY it is fast: this one is
+  // fast because the page does not need its own clock, not because the polyfill is holding it up.
+  if (_fastWhenHidden) return "hidden-fast (page-clock-independent)";
   if (!_workerTimersActive) return "hidden-SLOW (no worker timers)";
   return (await cdpTimersFast()) ? "hidden-fast (worker timers)" : "hidden-SLOW (worker throttled)";
 }

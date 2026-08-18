@@ -40,8 +40,31 @@ export type SectionInfo = { key: string; label: string; index: number | null };
 /** Group info for an entry, from its canonical_field. Repeating: base[idx]; flat: prefix.rest. */
 export function sectionOf(e: ReviewEntry): SectionInfo {
   const cf = e.canonical_field || "";
+  // A repeating ENTRY keeps its profile-shaped key: the INDEX is what separates education[0] from
+  // education[1], and a form heading cannot express that (both sit under one "Education").
   let m = cf.match(/^([A-Za-z_]+)\s*\[(\d+)\]/);
   if (m) return { key: m[1], label: humanize(m[1]), index: +m[2] };
+  // ⚠ A FIELD WITH NO PROFILE PATH CAN STILL BELONG TO A REPEATING ENTRY. Every per-customer question
+  // inside a work-history entry (Start Date, Supervisor's Name, Employer Phone Number — all
+  // `rcf<NNNN>`) has no canonical_field, so the branch above cannot place it, and it used to be listed
+  // AFTER the three entry blocks instead of inside them. The fill now carries the entry the scan
+  // worked out from the id's ordinal; using it puts the field in its job — and dissolves the duplicate
+  // "EXPERIENCE" heading, because these fields join experience[i] instead of forming a section of
+  // their own. Keyed on the SAME profile base the mapped fields use, so an entry stays one group and
+  // `sectionKey` keeps building valid canonical_fields for a newly added entry.
+  // `entry_section` arrives as the SAME base canonical_field uses, so it needs no translation.
+  if (e.entry_section && typeof e.entry_index === "number") {
+    return { key: e.entry_section, label: humanize(e.entry_section), index: e.entry_index };
+  }
+  // ⚠ THE FORM'S OWN HEADING WINS for a flat field, because the review page is read next to the form
+  // (operator, 2026-08-17: "display the same order as the form"). Grouping by PROFILE SHAPE instead
+  // reordered the page relative to the form and — worse — collapsed every question with no profile
+  // path into one "Other Fields" bucket, which is how "Supervisor's Name", "Employer Phone Number"
+  // and a bare "Day" ended up as context-free rows. Section ORDER is first-appearance (see the
+  // grouping in ReviewEditor), so honouring the heading also puts the sections in form order.
+  // Keyed on the heading text with a prefix, so it can never collide with a profile-path key.
+  const heading = String(e.section_heading || "").trim();
+  if (heading) return { key: "h:" + heading.toLowerCase(), label: heading, index: null };
   m = cf.match(/^([A-Za-z_]+)\./);
   if (m) return { key: m[1], label: humanize(m[1]), index: null };
   if (e.widget_type === "file_upload") return { key: "_documents", label: "Documents", index: null };

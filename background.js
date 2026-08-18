@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "jd-headings-3";
+const AP_BUILD_MARKER = "premerge-regress-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -449,7 +449,9 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         // per-run "which job is this" object and is already threaded to every reportApplication call
         // site. Nothing on the Workday path READS `description` (only ats.js prompts do, and they
         // re-slice it themselves), so this is inert here apart from being reported.
-        if (jd && jd.text) jobContext.description = String(jd.text);
+        // Redacted here for the same reason the ATS path does it (see runAtsApplicationRun): this
+        // string reaches Supabase, the AI prompts and the logs, so a token in it leaks three ways.
+        if (jd && jd.text) jobContext.description = redactSecrets(String(jd.text));
 
         // BEFORE the Workday path: does this page EMBED a non-Workday application? An employer
         // careers page matches no ATS host pattern, so it lands here — but it may be serving a
@@ -461,6 +463,15 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           try {
             const att = await cdpAttach(tabId);
             if (att.ok) {
+              // ⚠ SETTLE OVER CDP FIRST. waitJobPageSettled above reads through chrome.scripting,
+              // which is HOST-GATED — and an employer careers domain (careers.astrion.us) is
+              // deliberately not in host_permissions, so it fails on its first read and returns
+              // instantly. That left this probe racing the render on exactly the pages it exists
+              // for: careers.astrion.us renders its one Apply anchor from Angular, and a probe that
+              // arrives first sees no apply affordance and falls through to the Workday path. We
+              // are attached here, so ask the way the ATS run already asks.
+              const st = await waitAtsPostingSettled().catch(() => null);
+              if (st) console.log(`[ApplyPilot][RUN] employer page ${st.settled ? "settled" : "did NOT settle (" + st.reason + ")"} after ${st.waitedMs}ms — ${st.chars} chars`);
               const emb = await cdpEval(atsInjFindEmbeddedForms).catch(() => null);
               let embUrl = emb && atsPickEmbeddedForm(emb.srcs, detectAts);
               let embAts = embUrl && detectAts(embUrl);
@@ -479,11 +490,30 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
                 const linkAts = linkUrl && detectAts(linkUrl);
                 if (linkAts && linkAts !== "workday") { embUrl = linkUrl; embAts = linkAts; }
               }
+              // …and if it neither embeds NOR links to one, WHO RUNS THIS CAREERS SITE? An iCIMS
+              // career portal can be served entirely under the employer's own domain, in which case
+              // the URL names no ATS and the two tiers above can still come up empty — the Apply
+              // affordance may be a scripted button, or render after the settle. The page's own
+              // referenced hosts answer it (atsPortalAts), which is the employer telling us, not a
+              // hostname guess. No URL to hop to here, so the run stays on this page and the ATS
+              // pipeline's own pre-form stage follows the Apply control from where it is.
+              if (!embAts || embAts === "workday") {
+                const ev = await cdpEval(atsInjPortalEvidence).catch(() => null);
+                const portal = atsPortalAts(ev, detectAts);
+                if (portal && portal !== "workday") {
+                  console.log(`[ApplyPilot][RUN] this careers page is a ${portal} portal on the employer's own domain — driving it with that pipeline from here`);
+                  embUrl = startUrl; embAts = portal;
+                }
+              }
               await cdpDetach();
               if (embAts && embAts !== "workday") {
-                console.log(`[ApplyPilot][RUN] this page ${emb && emb.srcs && emb.srcs.length ? "embeds" : "links to"} a ${embAts} application — driving it with that pipeline: ${embUrl}`);
+                if (embUrl !== startUrl) console.log(`[ApplyPilot][RUN] this page ${emb && emb.srcs && emb.srcs.length ? "embeds" : "links to"} a ${embAts} application — driving it with that pipeline: ${embUrl}`);
                 const res = await runAtsApplicationRun(tabId, embAts, store, embUrl, { applyHops: 1, originUrl: startUrl });
-                sendResponse({ ...res, jd, tabId, startUrl });
+                // ⚠ `jd` here is the chrome.scripting scrape, which is NULL on any host outside
+                // host_permissions — every employer careers domain. Overwriting the run's own
+                // CDP-scraped JD with it threw away the description on exactly the pages that
+                // needed the CDP path, so the tracker's Job description came back empty.
+                sendResponse({ ...res, jd: (res && res.jd) || jd, tabId, startUrl });
                 return;
               }
             }
@@ -776,9 +806,71 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       try {
         const attached = await cdpAttach(tabId);
         if (!attached.ok) { sendResponse({ ok: false, error: "attach-failed:" + attached.error }); return; }
+        // ⚠ iCIMS serves its form inside a same-origin iframe, and cdpAttach RESETS the frame pin —
+        // so without this the "go look at the tab" probe reads the (empty) top document and reports
+        // 0 fields, which reads exactly like a broken fill on the one tenant where you most need a
+        // second opinion. Same arming as waitAtsFormReady.
+        if (ats === "icims") await cdpUseFormFrame(4).catch(() => null);
         const scan = await cdpEval(atsInjScan, ats);
         const state = await cdpEval(atsInjSubmitState, ats).catch(() => null);
-        sendResponse({ ok: true, scan, submitState: state });
+        // `rowsFor: [fieldName, …]` — READ-ONLY structural trace of the row a control sits in, so a
+        // label/grouping question can be answered from the real markup instead of guessed at. Added
+        // for the iCIMS composites (Salary = Currency/Amount/Time Frame in one row), which carry no
+        // <label for> at all and so reached review labelled with their raw field id.
+        let rows = null;
+        if (Array.isArray(message.rowsFor) && message.rowsFor.length) {
+          rows = await cdpEval(function (names) {
+            const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+            const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
+            return names.map((n) => {
+              const el = document.getElementById(n) || document.querySelector('[name="' + esc(n) + '"]');
+              if (!el) return { name: n, found: false };
+              const row = el.closest(".iCIMS_TableRow") || el.closest("tr") || el.parentElement;
+              const controls = row ? [...row.querySelectorAll("input:not([type=hidden]), select, textarea")]
+                .map((c) => ({ id: c.id || c.name || "", tag: c.tagName, type: c.type || "" })) : [];
+              // RAW option list WITH INDEXES for the named element itself — the scan filters
+              // placeholders out, so its list cannot answer "is the wanted option at index 0?", which
+              // is what a `selectedIndex > 0` read-back turns on.
+              const rawOptions = el.tagName === "SELECT"
+                ? [...el.options].slice(0, 6).map((o, i) => i + ":" + clean(o.textContent).slice(0, 24))
+                : null;
+              // Where does the QUESTION text live, if not inside the row? Walk outward and back so the
+              // answer comes from the markup rather than a guess.
+              const prevs = [];
+              let p = row ? row.previousElementSibling : null;
+              for (let i = 0; i < 3 && p; i++, p = p.previousElementSibling) {
+                prevs.push({ tag: p.tagName, cls: clean(p.className).slice(0, 60), text: clean(p.innerText).slice(0, 120) });
+              }
+              const up = [];
+              let a = row ? row.parentElement : null;
+              for (let i = 0; i < 3 && a; i++, a = a.parentElement) {
+                up.push({ tag: a.tagName, cls: clean(a.className).slice(0, 60),
+                  ownText: clean([...a.childNodes].filter((c) => c.nodeType === 3).map((c) => c.textContent).join(" ")).slice(0, 120),
+                  firstLabel: clean((a.querySelector("label, .iCIMS_FormLabel, th, legend") || {}).textContent).slice(0, 120) });
+              }
+              return { name: n, found: true,
+                rowClass: row ? clean(row.className).slice(0, 90) : null,
+                rowText: row ? clean(row.innerText).slice(0, 200) : null,
+                prevSiblings: prevs, ancestors: up, rawOptions,
+                selectedIndex: el.tagName === "SELECT" ? el.selectedIndex : null,
+                controlsInRow: controls };
+            });
+          }, message.rowsFor).catch((e) => ({ error: String((e && e.message) || e) }));
+        }
+        // Is there an hCaptcha on THIS document at all? The sign-in gate has one (invisible), which is
+        // why iCIMS runs decline the worker-timer polyfill and pay a ~2.2x hidden penalty. Whether the
+        // FORM also has one decides whether that concession has to cover the whole run or only the gate.
+        let captcha = null;
+        try {
+          captcha = await cdpEval(function () {
+            const q = (s) => document.querySelectorAll(s).length;
+            return { hcaptchaFrames: q('iframe[src*="hcaptcha"]'), recaptchaFrames: q('iframe[src*="recaptcha"]'),
+              widgets: q('.h-captcha,[data-sitekey],#h-captcha'), responseInputs: q('[name="h-captcha-response"],[name="g-recaptcha-response"]'),
+              apiScripts: [...document.querySelectorAll("script[src]")].filter((s) => /hcaptcha|recaptcha/i.test(s.src)).length,
+              hcaptchaGlobal: typeof window.hcaptcha };
+          });
+        } catch (e) { captcha = { error: String((e && e.message) || e) }; }
+        sendResponse({ ok: true, scan, submitState: state, rows, captcha });
       } catch (e) {
         sendResponse({ ok: false, error: String((e && e.message) || e) });
       } finally {
@@ -3879,7 +3971,15 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
         (named.length ? ` | error named: ${named.join(", ")}` : "") + ` (${decision.reason || ""})`);
       if (decision.action === "refill") {
         const f = scan.fields.find((x) => x.fieldName === decision.field);
-        if (f) {
+        // ⚠ AI-4 MAY NOT REFILL A SECURITY CLEARANCE (2026-08-18). This is the fourth and last path that
+        // could put a guessed clearance on a form, and the most tempting one: the page has just REFUSED to
+        // save, the error names the empty clearance field, and refilling it is exactly what would clear the
+        // block. That is precisely the trade the clearance rule refuses — the walk halting is the intended
+        // outcome, and the fix is one profile edit. Remediation's own prompt already forbids accepting
+        // consents; a clearance belongs in the same category of thing it must not decide.
+        if (f && apMatch.recognizeClearanceQuestion(f.label)) {
+          LOG(`  ⛔ REFUSING the AI-4 refill of ${f.fieldName} — it is a security-clearance question, and a guessed clearance is a false statement on an application. Set work_authorization.security_clearance ("None" is a valid answer) and re-run.`);
+        } else if (f) {
           let r, refillNote;
           if (f.widgetType === "hierarchical") {
             // Source is a click-TREE — NEVER flat-type the AI's guess ("job boards" is what that produced).
@@ -4173,7 +4273,12 @@ async function reportApplication(bundle, jobContext, extra) {
       // ABSENT means "I have nothing to say", never "blank it": a submit run reports with the per-USER
       // jobContext slot (which carries no description), and the route omits an absent column rather
       // than nulling it — so submitting can never erase the JD the fill run recorded.
-      job_description: (jobContext && jobContext.description) || null,
+      // ⚠ REDACTED AGAIN HERE, on purpose. The assignment sites already scrub it, so this is the belt
+      // for any path that sets a description without going through them — including an OLD value
+      // already sitting in `jobContext` from a previous build. This is the ONE choke point through
+      // which everything reaches the tracker, so it is the right place to be certain rather than
+      // hopeful. Idempotent: redacting redacted text is a no-op.
+      job_description: (jobContext && jobContext.description) ? redactSecrets(jobContext.description) : null,
       review_bundle: bundle
     };
     const res = await fetch(apSession.ingestUrl, {
@@ -4346,6 +4451,16 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
   let prev = -1, stable = 0;
   while (Date.now() < deadline) {
     await cdpWakePage();
+    // ⚠ iCIMS SERVES ITS WHOLE FORM INSIDE A SAME-ORIGIN IFRAME — the top document holds ZERO
+    // controls, so without this every poll below reads 0 fields, the settle times out, and the run
+    // reports "not an application form" on a perfectly good page. Armed HERE rather than at the
+    // call sites because both the fill and the submit run come through this function.
+    // Re-tried while unarmed (the frame can mount after the first poll); once armed, cdpEval
+    // re-arms itself if a postback replaces the world.
+    if (ats === "icims" && !cdpFormFrameArmed()) {
+      const fr = await cdpUseFormFrame(4).catch(() => ({ ok: false }));
+      if (fr && fr.ok) LOG(`the application is inside an iframe — driving it there (${fr.controls} controls)`);
+    }
     let n = 0;
     try { const s = await cdpEval(atsInjScan, ats); n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; }
     // THREE consecutive equal non-zero reads AND ≥2.5s elapsed — two reads 450ms apart
@@ -4389,6 +4504,10 @@ function makeAtsActuation(llmConfig) {
     delay: cdpAdaptiveDelay,
     delayFull: cdpDelay,
     eval: (fn, ...args) => cdpEval(fn, ...args),
+    // Evaluate in the TOP document even while a form frame is pinned. Only the top frame knows
+    // where the iframe sits on screen, which is what makes "scroll to the field being filled"
+    // possible on iCIMS — inside a content-sized frame there is nothing to scroll.
+    evalTop: (fn, ...args) => cdpEvalTop(fn, ...args),
     wakePage: () => cdpWakePage(), // hidden-tab unfreeze between polls (the discover rule)
     // ⚠ FORWARD THE SHARED PROBES. This object is hand-built, so anything added to makeCdpActuation
     // is invisible here — which silently disabled two fixes: the quiescence watch (the ATS poll fell
@@ -4474,6 +4593,345 @@ async function waitAtsPostingSettled(ceilingMs = 8000, intervalMs = 300) {
   return { settled: false, reason: "ceiling", chars: last ? last.len : 0, waitedMs: Date.now() - t0 };
 }
 
+// ── iCIMS PRE-FORM STAGE (portal → Apply → the email gate → the form) ────────────────────
+//
+// The stage BEFORE the fill, for the one ATS in this file that has one. Greenhouse / Lever /
+// Ashby serve a login-free form at the posting URL; iCIMS serves a career PORTAL whose
+// application form sits behind an email gate, so a run started from an employer careers link
+// reaches a sign-in card, not a form.
+//
+// Modelled on runCdpOnboard and carrying its invariants VERBATIM:
+//   • credentials come ONLY from chrome.storage.local — never a profile value, never a taught
+//     bucket, never an LLM. The password is written through atsInjSetCredential, which returns a
+//     LENGTH and a match boolean, so it cannot reach a log line even by accident.
+//   • SSO is refused on URL EVIDENCE ONLY (a federated login LEAVES the portal host). A federated
+//     button is REPORTED, never clicked — field-absence is not evidence of anything.
+//   • an account-CREATION control is never pressed: on iCIMS the account is made BY THE
+//     SUBMISSION, from the form's own "Create a login" block, behind the review gate.
+//   • every human-needed stop returns needs_operator + a self-explaining stopped/detail.
+//   • it STOPS at the form. Nothing here submits an application.
+// Contract: `{reached_form:true}` to carry on, or `{halt:{…}}` for the caller to return.
+async function runIcimsPreForm(tabId, credentials, LOG) {
+  const MAX_ROUNDS = 8;
+  const halt = (stopped, detail, extra) => {
+    LOG(`⛔ ${stopped} — ${detail}`);
+    return { halt: { ok: true, needs_operator: true, stopped, detail, ...(extra || {}) } };
+  };
+  let portalHost = null;
+  try { portalHost = new URL(await cdpEval(function () { return location.href; })).hostname; } catch (e) { /* below */ }
+
+  // ⚠ ARM THE CONTENT FRAME EVEN ON A PAGE THAT HAS NO FORM YET (live 2026-08-18).
+  // Two shapes reach this stage. From an EMPLOYER PORTAL (careers.<company>.com — how Astrion was
+  // built and tested) the Apply control is in the TOP document, so nothing needed pinning. But a run
+  // started from `<tenant>.icims.com/jobs/<id>/…/job` — which is what most iCIMS links are — has its
+  // ENTIRE page inside `#icims_content_iframe`, including the `<a>Apply for this job online</a>`, and
+  // that frame holds ZERO form controls. The old `cdpUseFormFrame(1)` refused it, so this stage read
+  // the top document (13 characters of branding), found nothing to act on and halted
+  // `apply-not-followable` on a perfectly good posting.
+  // Ladder: the ordinary floored call first, so a gate/form page behaves EXACTLY as before; only if
+  // that refuses do we fall back to a 0-floor call, which is safe because it must match the frame's
+  // own url as read from the top document's <iframe> element (never a hostname guess).
+  const armIcimsFrame = async () => {
+    if (cdpFormFrameArmed()) return true;
+    const floored = await cdpUseFormFrame(1).catch(() => ({ ok: false }));
+    if (floored && floored.ok) return true;
+    const el = await cdpEvalTop(atsInjIcimsFrameSrc).catch(() => null);
+    if (!el || !el.ok || !el.src) return false;
+    // The frame may have navigated since the attribute was written, so identity is the STABLE part of
+    // its url — origin + path, without the query (an iCIMS session query is one-time and changes).
+    let idRe = null;
+    try {
+      const u = new URL(el.src);
+      idRe = new RegExp("^" + (u.origin + u.pathname).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    } catch (e) { return false; }
+    const id = await cdpUseFormFrame(0, { identifyUrl: idRe }).catch(() => ({ ok: false }));
+    if (id && id.ok) LOG(`the posting itself is inside the iCIMS frame — driving it there (${id.controls} control(s), identified by the page's own iframe src)`);
+    return !!(id && id.ok);
+  };
+
+  // The composite page identity: iCIMS frames everything, so a change can land in the TOP document
+  // (a navigation) or inside the frame (a postback). Reading only one of them makes the other look
+  // like a swallowed click.
+  const signature = async () => {
+    const top = await cdpEvalTop(atsInjPageSignature).catch(() => null);
+    const frame = cdpFormFrameArmed() ? await cdpEval(atsInjPageSignature).catch(() => null) : null;
+    if (!top && !frame) return null;
+    return {
+      url: (top && top.url) || (frame && frame.url) || "",
+      frameSrc: (top && top.frameSrc) || null,
+      heading: (frame && frame.heading) || (top && top.heading) || "",
+      controls: ((top && top.controls) || 0) + ((frame && frame.controls) || 0),
+      ids: [(top && top.ids) || "", (frame && frame.ids) || ""].join("#"),
+    };
+  };
+  // Wait for the page to actually MOVE. Poll-based against the page's own identity — never a fixed
+  // delay, and never a click count (see atsInjPageSignature).
+  const waitForChange = async (before, budgetMs) => {
+    const t0 = Date.now();
+    const deadline = t0 + (budgetMs || 8000);
+    while (Date.now() < deadline) {
+      await cdpDelay(400);
+      await cdpWakePage();
+      // A navigation kills the frame's isolated world; re-arm so the frame half of the signature
+      // is read from the NEW document rather than reported missing.
+      await armIcimsFrame();
+      const now = await signature();
+      if (atsSignatureChanged(before, now)) return { changed: true, waitedMs: Date.now() - t0 };
+    }
+    return { changed: false, waitedMs: Date.now() - t0 };
+  };
+  // THE APPLY CONTROL IS FLAKY (operator, observed): a click can be swallowed and the page simply
+  // stays put. The remedy is NOT a fixed number of clicks — that either under-clicks a slow page or
+  // over-clicks one that already moved. Click, then watch the page's identity; retry only when it
+  // provably did not move.
+  const clickApplyRetrying = async (attempts) => {
+    for (let i = 1; i <= (attempts || 3); i++) {
+      const before = await signature();
+      // The existing finder first (proven on Greenhouse/Lever/Ashby landings), then the widened one
+      // for affordances it structurally cannot see: an <input type=submit value="Apply"> has no
+      // textContent, and a plain <a href>Apply</a> is not `a[href="#"]`.
+      let r = await cdpEval(atsInjClickApplyButton).catch(() => null);
+      if (!r || !r.ok) {
+        const r2 = await cdpEval(atsInjClickApplyAnchor).catch(() => null);
+        if (r2 && r2.ok) r = r2; else if (!r) r = r2;
+      }
+      if (!r || !r.ok) return { ok: false, reason: (r && r.reason) || "no-apply-control", offered: r && r.offered };
+      LOG(`clicked Apply ("${r.clicked}") — attempt ${i}/${attempts || 3}; watching whether the page moves`);
+      if ((await waitForChange(before, 7000)).changed) return { ok: true, clicked: r.clicked, attempts: i };
+      LOG(`that Apply click changed nothing — the control is known to swallow clicks; retrying`);
+    }
+    return { ok: false, reason: "click-had-no-effect" };
+  };
+
+  // ⚠ SETTLE BEFORE SCANNING — the standing rule, and this stage broke it (live 2026-08-16).
+  // iCIMS mounts #icims_content_iframe a beat AFTER its document loads, so a scan that arrives
+  // first reads the EMPTY top document and concludes "no auth fields and no Apply control here".
+  // What makes it worth a comment: it is invisible on a HIDDEN run, which is slow enough to lose
+  // the race, and reproducible on a VISIBLE one — the opposite of the usual direction, so "it
+  // worked in the background" is not evidence. Polls the page's own readiness; never a fixed delay.
+  const settleAuthPage = async (budgetMs) => {
+    const deadline = Date.now() + (budgetMs || 12000);
+    let prev = null, stable = 0;
+    while (Date.now() < deadline) {
+      await cdpWakePage();
+      // Re-arm every poll: the gate's card holds ONE visible control, so the floor is 1 here rather
+      // than waitAtsFormReady's 4 (which is tuned to refuse a page with no form on it at all) — and a
+      // POSTING page holds none at all, which is what armIcimsFrame's second rung is for.
+      await armIcimsFrame();
+      const sig = await signature();
+      // "Rendered" = something to act on: a control to fill, or a heading (the careers page has a
+      // job title and no controls at all, and must not burn the whole budget waiting for one).
+      const rendered = !!(sig && (sig.controls > 0 || String(sig.heading || "").length > 0));
+      stable = rendered && prev && !atsSignatureChanged(prev, sig) ? stable + 1 : 0;
+      if (stable >= 1) return { settled: true, controls: sig.controls, waitedMs: Date.now() - (deadline - (budgetMs || 12000)) };
+      prev = sig;
+      await cdpDelay(400);
+    }
+    return { settled: false, controls: (prev && prev.controls) || 0 };
+  };
+
+  // What we accepted on the operator's behalf, carried out with the result so the run record — not just
+  // the log ring — says which notices were agreed to.
+  let consentsAccepted = [];
+  let lastView = null, sameViewRounds = 0, captchaStalls = 0;
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    const settled = await settleAuthPage(12000);
+    if (!settled.settled) LOG(`the page never settled (${settled.controls} control(s)) — reading it anyway`);
+
+    const url = await cdpEval(function () { return location.href; }).catch(() => null);
+    // The RECRUITER login is an icims.com host with an email box on it, so it has to be refused
+    // BEFORE the SSO test (which exempts icims.com hosts) and before the auth scan ever sees it.
+    if (url && icimsIsAdminLogin(url)) {
+      return halt("wrong-login", "This landed on iCIMS' STAFF login (login.icims.com), not the candidate portal — " +
+        "nothing was typed. Open the job's own Apply link and check where it leads.");
+    }
+    // TWO hosts are legitimately ours during this stage — the employer's careers domain we started
+    // on, and the iCIMS tenant host the Apply control hands us to. `portalHost` covers the first;
+    // detectAts covers the second, and without it a tenant whose vanity path happens to contain an
+    // SSO-ish segment would be refused on its own portal.
+    if (url && detectAts(url) !== "icims" && icimsLooksLikeSso(url, portalHost)) {
+      return halt("sso", "This portal handed the sign-in to a federated identity provider (" + url.split("?")[0] +
+        "). Sign in yourself in the tab, then re-run — the pipeline never drives an SSO login.");
+    }
+
+    const auth = await cdpEval(atsInjAuthScan).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    const view = icimsAuthView(auth);
+
+    // NOT an auth view — so is it the form? Asked with the SAME positive identifier the rest of the
+    // pipeline uses, never by absence.
+    if (view === "none") {
+      const scan = await cdpEval(atsInjScan, "icims").catch(() => null);
+      const sub = await cdpEval(atsInjSubmitState, "icims").catch(() => null);
+      const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
+      if (id.ok) {
+        LOG(`signed in and on the application form — ${(scan.fields || []).length} field(s). Handing over to the fill.`);
+        return { reached_form: true, fields: (scan.fields || []).length, consentsAccepted };
+      }
+      // A mailed link/code is the one "no field to fill" page worth naming: the next step is in the
+      // operator's inbox, and the generic unknown-page halt would hide that completely.
+      if (icimsMailedCredential(auth && auth.bodyText)) {
+        return halt("verification-emailed", "iCIMS emailed a sign-in link or code to the stored account instead of asking for a password. " +
+          "Open it in this tab to finish signing in, then re-run — auto-fetching an iCIMS verification mail is not built yet.");
+      }
+      // Still on a portal/JD page: the way on is the Apply control.
+      const applied = await clickApplyRetrying(3);
+      if (applied.ok) { LOG(`Apply took after ${applied.attempts} attempt(s)`); continue; }
+      LOG(`nothing to act on here — url=${(url || "?").split("?")[0]} controls=${settled.controls} frame=${cdpFormFrameArmed() ? "armed" : "none"} apply=${applied.reason}`);
+      return halt("apply-not-followable",
+        applied.reason === "ambiguous"
+          ? "Several different Apply controls are on this page (" + (applied.offered || []).join(" | ") + ") — the run refuses to guess which one is the application."
+          : applied.reason === "click-had-no-effect"
+            ? "The Apply control was clicked 3 times and the page never changed. Open the tab and press it yourself, then re-run."
+            : "This page is neither an iCIMS sign-in nor an application form, and it offers no Apply control to follow (" + (url || "?") + ").",
+        { redirectUrl: url || null });
+    }
+
+    // Same view twice with nothing moving means the step is not working — say so rather than
+    // burning the round budget re-typing into a box that is not listening.
+    sameViewRounds = view === lastView ? sameViewRounds + 1 : 0;
+    lastView = view;
+    if (sameViewRounds >= 2) {
+      return halt("auth-stalled", "The iCIMS sign-in stayed on the same '" + view + "' step across three attempts" +
+        ((auth.errors || []).length ? " — the page says: " + auth.errors.join(" / ") : " and showed no error") +
+        ". Sign in yourself in the tab, then re-run.");
+    }
+
+    if (view === "unreadable") {
+      LOG(`could not read the page (${(auth && auth.error) || "no reason given"}) — retrying`);
+      await cdpDelay(1200);
+      continue;
+    }
+    if (view === "captcha") {
+      return halt("captcha-challenge", "A captcha challenge is showing on the iCIMS sign-in. Solve it yourself in the tab, then re-run — the bot never solves or bypasses one.");
+    }
+    if (view === "code") {
+      return halt("verification-code-required", "iCIMS is asking for a one-time code it mailed to the stored account. " +
+        "Enter it yourself in the tab, then re-run — auto-fetching an iCIMS verification mail is not built yet.");
+    }
+    if (view === "blocked") {
+      const offered = [...(auth.federated || []), ...(auth.createAccount || [])].join(" | ");
+      return halt("auth-blocked", "The iCIMS sign-in offers only controls this pipeline refuses to press (" + offered + "). " +
+        "A federated login is never driven, and an account is never created outside the application's own review-gated submit. Sign in yourself, then re-run.");
+    }
+
+    // ── ACCEPT CHECKBOXES ARE TICKED, BY STANDING OPERATOR INSTRUCTION (2026-08-18) ──────
+    // The operator read ITT's and Peraton's privacy notices themselves and instructed that accept
+    // checkboxes be ticked, now and in the future. They are the data subject, the notice governs the
+    // processing of THEIR data for THEIR application, and declining it means the application cannot be
+    // made — so the decision is theirs to delegate, and this replaces the `consent-required` halt.
+    //
+    // Three things make it auditable rather than silent, and all three are the point:
+    //   • only `atsConsentKind === "accept"` is ticked — assent to a notice/policy/terms. An OPT-IN
+    //     (talent community, job alerts) is never ticked: it is not an acceptance, and it would sign
+    //     the operator up for mail they never asked for. A truthfulness ATTESTATION is also left alone
+    //     (a factual claim, not assent to a notice) until asked for by name.
+    //   • every acceptance is LOGGED BY NAME, with the notice's own title, so the run record says what
+    //     was agreed to on their behalf and when.
+    //   • the tick is VERIFIED. A box that did not end checked is never reported as consent given, and
+    //     the run halts instead — iCIMS `preventDefault`s its submit and disables its own button, so an
+    //     unticked consent would otherwise resurface as "the Next control could not be pressed".
+    // Kill-switch: `chrome.storage.local.declineConsents = true` restores the halt.
+    {
+      const plan = atsConsentPlan(auth.consents || []);
+      const declineFlag = await new Promise((r) => chrome.storage.local.get(["declineConsents"], (v) => r(!!(v && v.declineConsents))));
+      const optins = plan.left.filter((c) => c.kind === "optin" && !c.checked);
+      if (optins.length) LOG(`leaving ${optins.length} opt-in box(es) UNTICKED (not an acceptance): ${optins.map((c) => JSON.stringify(String(c.label || c.id).slice(0, 40))).join(", ")}`);
+      const attest = plan.left.filter((c) => c.kind === "attestation" && !c.checked);
+      if (attest.length) LOG(`leaving ${attest.length} truthfulness attestation(s) untouched — not a privacy consent: ${attest.map((c) => JSON.stringify(String(c.label || c.id).slice(0, 40))).join(", ")}`);
+      if (plan.tick.length && declineFlag) {
+        const named = plan.tick.map((c) => JSON.stringify(String(c.label || c.id || "a consent").slice(0, 70))).join(", ");
+        return halt("consent-required",
+          "This iCIMS sign-in requires accepting " + (auth.consentTitle ? JSON.stringify(auth.consentTitle) : "a data-privacy consent") +
+          " (" + named + "), and `declineConsents` is set, so the pipeline will not tick it. Accept it yourself in the tab, then re-run.",
+          { consents: plan.tick.map((c) => ({ id: c.id, label: c.label, required: c.required })) });
+      }
+      const accepted = [];
+      for (const c of plan.tick) {
+        if (!c.sel) { return halt("consent-unaddressable", "This sign-in's consent box (" + JSON.stringify(String(c.label || "unnamed")) + ") has neither an id nor a name, so it cannot be ticked safely."); }
+        const t = await cdpEval(atsInjTickConsent, c.sel).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        if (!t || !t.ok || !t.checked) {
+          return halt("consent-not-accepted",
+            "Could not tick this sign-in's " + JSON.stringify(String(auth.consentTitle || c.label || "consent")) + " box (" +
+            ((t && t.error) || "it did not stay checked") + "). Nothing was signed in or filled — accept it yourself in the tab, then re-run.");
+        }
+        accepted.push({ id: c.id, label: c.label, title: auth.consentTitle || null, required: !!c.required });
+        LOG(`✔ ACCEPTED on your instruction: ${JSON.stringify(String(auth.consentTitle || c.label || "a privacy consent"))}` +
+          (c.label && auth.consentTitle ? ` — the box reads ${JSON.stringify(String(c.label).slice(0, 60))}` : "") +
+          (c.required ? " (required by the form)" : ""));
+      }
+      if (accepted.length) {
+        consentsAccepted = consentsAccepted.concat(accepted);
+        // ⚠ `#consentCaptureTitle` is PAGE-level, not per-box: Peraton renders two acceptances and both
+        // carry the same title, so titling the progress line read "GDPR · GDPR" and named neither of the
+        // two things just agreed to. When the titles do not distinguish them, the box LABELS do.
+        const titles = [...new Set(accepted.map((a) => a.title).filter(Boolean))];
+        const detail = accepted.length > 1 && titles.length < accepted.length
+          ? accepted.map((a) => a.label || a.title).filter(Boolean).join(" · ")
+          : titles.concat(accepted.map((a) => a.label).filter(Boolean)).slice(0, accepted.length).join(" · ");
+        emitRunProgress(accepted.length > 1 ? "Accepted the privacy notices" : "Accepted the privacy notice", detail);
+      }
+    }
+
+    // ── the two fillable steps ──────────────────────────────────────────────────────────
+    const wantPassword = view === "password";
+    const target = wantPassword ? auth.password : auth.email;
+    const value = wantPassword ? (credentials && credentials.password) : (credentials && credentials.email);
+    const what = wantPassword ? "password" : "account email";
+    if (!value) {
+      return halt("no-credentials", "This iCIMS portal asks for the " + what + " of your candidate account, and none is stored. " +
+        "Set it on the website's Credentials page (or the popup), then re-run. The pipeline never invents a login.");
+    }
+    if (!target || !target.sel) {
+      return halt("auth-field-unaddressable", "The iCIMS sign-in shows a " + what + " box with neither an id nor a name, so it cannot be targeted safely.");
+    }
+    // The write returns a LENGTH and a match boolean — never the string (atsInjSetCredential).
+    const w = await cdpEval(atsInjSetCredential, target.sel, value).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    if (!w || !w.ok || !w.matches) {
+      return halt("auth-field-not-written", "Could not put the " + what + " into the iCIMS sign-in box (" + ((w && w.error) || "the field did not keep the value") + ").");
+    }
+    LOG(`wrote the ${what} into ${target.sel} (${w.len} chars) — submitting "${(auth.submit && auth.submit.caption) || "the form"}"`);
+    emitRunProgress("Signing in to " + (portalHost || "the careers portal"), wantPassword ? "password step" : "email step");
+
+    const before = await signature();
+    const clicked = await cdpEval(atsInjClickAuthSubmit, (auth.submit && auth.submit.sel) || null).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    if (!clicked || !clicked.ok) {
+      return halt("auth-submit-unavailable", "The iCIMS sign-in's " + ((auth.submit && auth.submit.caption) || "submit") +
+        " control could not be pressed (" + ((clicked && clicked.error) || "not found") + ").");
+    }
+    const moved = await waitForChange(before, 15000);
+    if (!moved.changed) {
+      // NOT automatically a halt: the next round re-reads the page, and the same-view guard above
+      // ends it if the step really is inert. A submit whose response is merely slow must not be
+      // called a failure. But SAY WHAT WE SAW — "nothing happened" has two causes here with
+      // opposite fixes, and telling them apart is a whole debugging round each time.
+      const d = await cdpEval(atsInjAuthScan).catch(() => null);
+      LOG(`the ${what} submit has not changed the page after ${moved.waitedMs}ms — submitLocked=${d && d.submitLocked}` +
+        ` captchaToken=${d && d.captchaToken} captchaFrames=${d && d.captchaFrames} challengeVisible=${d && d.captchaChallenge}` +
+        `${(d && d.errors || []).length ? " errors=" + d.errors.join(" / ") : ""}` +
+        ` — ${d && d.submitLocked && !d.captchaToken ? "the form fired and is waiting on the invisible captcha" : d && d.captchaToken ? "the captcha resolved; the POST is in flight" : "the submit handler may not have run at all"}`);
+      // ⚠ THE GATE LOCKS ITS OWN BUTTON and only the captcha callback ever unlocks it
+      // (`icimsDisableSaveAndSubmitButtons` runs in its onsubmit). So a captcha that never answers
+      // leaves a page that CANNOT be retried in place: the next round re-presses and gets
+      // `submit-disabled`, which reads like a different fault entirely. A reload is the only thing
+      // that restores the control — bounded at one, because a second stall is a real refusal.
+      if (d && d.submitLocked && !d.captchaToken) {
+        if (captchaStalls >= 1) {
+          return halt("captcha-unanswered", "The iCIMS sign-in's invisible hCaptcha never answered, twice — the form submitted and its own button locked, " +
+            "but no captcha token ever arrived, so the page cannot move. Sign in yourself in the tab and re-run; the bot never solves or works around a captcha.");
+        }
+        captchaStalls++;
+        LOG("the gate locked its own button and the captcha never answered — reloading the sign-in once to restore it");
+        await cdpReload();
+        await waitTabComplete(tabId, 20000).catch(() => null);
+        cdpClearFormFrame();
+        lastView = null; sameViewRounds = 0; // a reloaded gate is a fresh attempt, not a repeat
+      }
+    }
+  }
+  return { halt: { ok: true, needs_operator: true, stopped: "auth-rounds-exhausted",
+    detail: "The iCIMS sign-in did not reach the application form within " + MAX_ROUNDS + " steps. Sign in yourself in the tab, then re-run." } };
+}
+
 async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // THE JOB IDENTITY IS THE LINK WE WERE GIVEN, not wherever the form turned out to live. A
   // landing hop (employer redirect, embedded frame, apply link) changes the URL, and keying the
@@ -4482,6 +4940,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // 2026-08-02, after a bad fill had been corrected). Every hop carries the origin forward.
   const originUrl = opts0.originUrl || startUrl;
   const LOG = (...a) => console.log("[ApplyPilot][ATS-RUN]", ...a);
+  // Notices accepted by the iCIMS pre-form on the operator's standing instruction (2026-08-18), so the
+  // run's own result says what was agreed to rather than requiring a log dig.
+  let icimsConsentsAccepted = [];
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
@@ -4498,7 +4959,21 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // fetched and every document the run touches starts with it. That costs NOTHING — it is the same
     // single navigation the run always made, just moved to after the install. A reload here would have
     // worked too and was rejected for being a second page load.
-    await cdpInstallPageOverrides();  // hidden tab: worker timers + rAF unblock
+    // ⚠ iCIMS DECLINES THE WORKER-TIMER POLYFILL, and the reason is its SIGN-IN GATE, not its form.
+    // That gate's submit is preventDefault-ed and gated on INVISIBLE hCaptcha; under the polyfill
+    // hCaptcha never initialises at all — measured 2026-08-16 on the same page in the same session:
+    // `captchaFrames 0` under a run against a rendered hcaptcha iframe by hand, so the submit event
+    // fired, iCIMS disabled its own button, and no callback ever came. Declining restores the page's
+    // native timers so its own anti-abuse check can run and judge us; it does not solve, forge or
+    // hide anything, and a refusal still halts for the operator. Costs a hidden run its fast timers
+    // on this tenant — the right trade against a gate that cannot be passed at all.
+    await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined);
+    // …and COMPENSATE for that decline. Declining the polyfill costs a hidden run FULL pacing on every
+    // field (measured 37.2s hidden vs 16.6s visible, the whole gap in per-field time). iCIMS does not
+    // need the page's clock to tick fast — it is server-rendered jQuery, so a pace waits on an AJAX
+    // reply or a synchronous DOM write — so the fast pace is allowed while hidden. See cdpSetFastWhenHidden
+    // for why that is latency-safe rather than lucky: every pace site is read-back or poll gated.
+    if (ats === "icims") cdpSetFastWhenHidden(true);
     await cdpSetFocusEmulation(true).catch(() => {});
     // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
     // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
@@ -4567,6 +5042,39 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       LOG(`navigating to the application form: ${formUrl}`);
       await cdpNavigate(formUrl);
       await cdpDelay(1200);
+      cdpClearFormFrame(); // the pinned world died with the old document
+    }
+    // ⚠ iCIMS PUTS AN EMAIL GATE IN FRONT OF THE FORM, and its login page PASSES the form
+    // identifier (a submit control + an email field is exactly atsLooksLikeApplicationForm's
+    // positive test). So the pre-form stage runs BEFORE the form wait, not as a fallback after it:
+    // reaching the gate and calling it "the application form" would start typing profile data into
+    // a login box. Never submits; stops at the form.
+    if (ats === "icims") {
+      emitRunProgress("Signing in to the careers portal", "iCIMS");
+      const pre = await runIcimsPreForm(tabId, store.credentials || null, LOG);
+      // WHICH NOTICES WERE ACCEPTED on the operator's standing instruction — carried out of the stage so
+      // it reaches the run record, not just the log ring (see the accept-checkbox block in the pre-form).
+      icimsConsentsAccepted = (pre && pre.consentsAccepted) || [];
+      // ⚠ A CLOSED POSTING IS NOT A BROKEN APPLY FINDER. iCIMS answers a dead job id by REDIRECTING to
+      // its own job-search page with `notFound=1`, which is a page with no auth fields and no Apply
+      // control — so the pre-form correctly finds nothing to act on and says `apply-not-followable`,
+      // which reads exactly like our finder failed on a live posting. Measured 2026-08-18: three of four
+      // postings taken from a search index were already closed, so this is the COMMON case when testing,
+      // not an edge one. atsPostingGone already knew the general rule (the requested id is absent from
+      // the url we landed on) and was simply never consulted here — the iCIMS stage returns before the
+      // form wait, which is where the other tenants check it.
+      if (pre.halt) {
+        if (pre.halt.stopped === "apply-not-followable") {
+          const at = await cdpEval(function () { return location.href; }).catch(() => null);
+          const gone = atsPostingGone(jd, originUrl || startUrl, at);
+          if (gone) {
+            LOG(`this posting is GONE — ${gone}`);
+            return { ok: true, needs_operator: true, stopped: "posting-gone", jd, ats,
+              detail: "This job is no longer posted — " + gone + ". Nothing is wrong with the fill; pick another posting." };
+          }
+        }
+        return { ...pre.halt, jd, ats };
+      }
     }
     emitRunProgress("Waiting for the form", ats);
     let ready = await waitAtsFormReady(ats, LOG);
@@ -4663,8 +5171,27 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     LOG(`form settled — ${ready.fields} field(s).`);
 
     const jobContext = { ...(store.jobContext || {}) };
-    if (jd && jd.company) jobContext.company = jd.company;
-    if (!jobContext.company) jobContext.company = atsCompanyFromUrl(startUrl);
+    // WHICH COMPANY IS THIS? The string anchors the safety-critical "have you worked for us
+    // before?" recognizer, so it is worth two reads and a sanity test rather than the first
+    // non-empty answer. Two independent sources:
+    //   • the JD scrape — right on a real ATS posting, but on an EMPLOYER-hosted careers page it
+    //     has no ATS markup to key on and can hand back the document TITLE (live 2026-08-16:
+    //     "Engineering Directorate Support Intern in Mountain View, California | Astrion").
+    //   • the URL — atsCompanyFromUrl needs a recognized ATS host, so the START url gives nothing
+    //     on an employer domain. The page we LANDED on does: an iCIMS portal carries its tenant in
+    //     the subdomain ("astrioncareers-astrion" → "Astrion"). That is evidence, not a heuristic.
+    // A scrape that fails the plausibility test is dropped in favour of the URL; if neither is
+    // usable the scrape is still better than nothing, so it is kept as the last resort.
+    const urlCompany = atsCompanyFromUrl(startUrl)
+      || atsCompanyFromUrl(await cdpEval(function () { return location.href; }).catch(() => null));
+    const scrapedCompany = (jd && jd.company) || null;
+    if (scrapedCompany && !atsPlausibleCompany(scrapedCompany) && urlCompany) {
+      LOG(`the posting scrape read the company as "${String(scrapedCompany).slice(0, 60)}" — that is a page title, not a name; using "${urlCompany}" from the portal host instead`);
+      jobContext.company = urlCompany;
+    } else if (scrapedCompany) {
+      jobContext.company = scrapedCompany;
+    }
+    if (!jobContext.company) jobContext.company = urlCompany;
     if (jd && jd.title) jobContext.title = jd.title;
     // The JD text grounds the AI answers (an essay written blind to the posting invents a
     // company theme — live: "Kraken's work in the robotics space" for an ENERGY company).
@@ -4673,13 +5200,44 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // 4000 chars ends mid-sentence for a reader. The three prompt sites in ats.js each slice to 4000
     // themselves, so the bytes any model sees are UNCHANGED by this.
     const jdText = jd && (jd.description || jd.text);
-    if (jdText) jobContext.description = String(jdText);
+    // ⚠ REDACTED AT THE POINT OF ASSIGNMENT, not just before reporting. `jobContext.description` has
+    // THREE consumers and each is a separate exposure: the tracker row (Supabase, at rest), every AI
+    // prompt the JD grounds (sent verbatim to the model provider), and the run's log lines. Scrubbing
+    // only at the report boundary would leave the other two leaking. See redactSecrets — live, an
+    // iCIMS page's bootstrap script became the JD and carried the one-time magic-link session token.
+    // (bare global call, not `apMatch.` — importScripts shares one scope, and adding a name to that
+    // hand-written literal is the lockstep trap CLAUDE.md documents: it passes every Node test and
+    // throws in the browser.)
+    if (jdText) jobContext.description = redactSecrets(String(jdText));
 
     emitRunProgress("Filling the application", "single-page " + ats + " form (never submits)");
     const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
     const prepared = prepareProfile(store.profile);
-    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [] });
+    // ⚠ `credentials` reaches the ATS driver ONLY here, and only the credential tier can consume it
+    // (atsRouteField claims a recognized credential field before any other rung sees it). It is the
+    // same {email, password} the website's Credentials page writes and the Workday onboarding signs
+    // in with — iCIMS asks for it as part of the application itself, because the account is created
+    // by the submission rather than beforehand.
+    // ⚠ THE RÉSUMÉ GOES ON FIRST ON iCIMS, AND ITS PARSE IS WAITED OUT (operator, 2026-08-17).
+    // iCIMS parses the upload SERVER-SIDE and re-renders the whole panel with the result, so attaching
+    // it as an ordinary field mid-fill blanks the fill (that is why it was skipped from 2026-08-16).
+    // Attaching HERE — after the form has settled, before a single value is written — makes the parse
+    // harmless: it can only overwrite an empty form, and everything the fill writes lands on top of it.
+    // ⚠ AND THE FILL RUN DOES IT TOO, NOT JUST THE SUBMIT RUN. The parse re-renders repeating entries
+    // under new ids, so a bundle captured from an UNPARSED form would be replayed against a PARSED one
+    // and every entry field would report "approved value has NO matching field on the live form" — the
+    // shape that produced 28 of a rehearsal's 32 verify failures when the entry counts disagreed. Both
+    // visits must see the same form, so both attach.
+    let resumePre = null, resumeStageMs = null;
+    if (ats === "icims") {
+      emitRunProgress("Attaching your résumé", "iCIMS parses it server-side — the fill waits for that to finish");
+      const rsT0 = Date.now();
+      resumePre = await atsIcimsResumeStage(act, ats, { log: (m) => LOG("résumé: " + m) });
+      resumeStageMs = Date.now() - rsT0;
+      LOG(`[ATS-TIME] résumé stage ${(resumeStageMs / 1000).toFixed(1)}s — ${resumePre.ok ? (resumePre.already ? "already on the form" : "attached" + (resumePre.parse ? `, parse ${resumePre.parse.parsed ? "settled" : "STILL CHANGING"}` : "")) : "NOT attached (" + (resumePre.error || "unknown") + ")"}`);
+    }
+    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], credentials: store.credentials || null, resumePreattached: resumePre });
 
     // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
     // here, added when Greenhouse forms would land in a state where every server-backed combobox returned
@@ -4720,8 +5278,12 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // sitting in two widgets waiting out a ceiling — which is the only thing worth retuning.
     // The résumé is ALWAYS named, whatever it cost: it is the field whose time varies most between a
     // visible and a hidden run, so "it wasn't in the slowest list" is not the same as knowing.
+    // ⚠ ON iCIMS THE RÉSUMÉ'S COST IS NOT IN ITS RECORD. The attach + parse wait happen BEFORE the
+    // fill loop (see the résumé stage above), so its record's own elapsedMs is ~0 and printing that
+    // would report the most expensive stage of the run as free. Prefer the stage's measured time.
     const res = out.results.find((r) => /resume|\bcv\b/i.test(r.fieldName || "") || r.widgetType === "file_upload");
-    const resPart = res ? ` | resume ${((res.elapsedMs || 0) / 1000).toFixed(1)}s` : "";
+    const resPart = resumeStageMs != null ? ` | resume ${(resumeStageMs / 1000).toFixed(1)}s (attach + parse, before the fill)`
+      : res ? ` | resume ${((res.elapsedMs || 0) / 1000).toFixed(1)}s` : "";
     const slow = out.results
       .filter((r) => (r.elapsedMs || 0) >= 1500)
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
@@ -4735,7 +5297,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. ${landed}`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
-    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok), walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
+    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok), consents_accepted: icimsConsentsAccepted, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };
   } finally {
@@ -4754,8 +5316,15 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
-    await cdpInstallPageOverrides();
+    await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined); // see the fill run: its sign-in gate's invisible hCaptcha will not initialise under the polyfill
+    if (ats === "icims") cdpSetFastWhenHidden(true); // …and the same compensation the fill run makes
     await cdpSetFocusEmulation(true).catch(() => {});
+    // SAY WHICH PACING REGIME THIS RUN GOT — the fill run has logged this since the CDP path existed
+    // and the submit run never did, which leaves a rehearsal unable to state whether it ran visible or
+    // hidden. `background:false` at the call site is an INTENTION, not an observation (the operator can
+    // hide or alt-tab a tab mid-run, and an occluded tab still reports active), so a hidden-vs-visible
+    // claim about a REHEARSAL had no ground truth to cite. Noticed while live-verifying both arms.
+    try { LOG(`[ATS-PACING] ${await cdpPacingLabel()}`); } catch (e) { /* label only */ }
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real
     // form from an embedded frame, and the fill followed it there. Starting from the caller's
@@ -4765,7 +5334,28 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // The caller's URL stays the fallback for bundles written before this was recorded.
     const formUrl = atsFormUrl(ats, bundle.url || (opts && opts.startUrl));
     const here = await cdpEval(function () { return location.href; }).catch(() => null);
-    if (here && formUrl && here.split("#")[0] !== formUrl) { await cdpNavigate(formUrl); await cdpDelay(1200); }
+    if (here && formUrl && here.split("#")[0] !== formUrl) { await cdpNavigate(formUrl); await cdpDelay(1200); cdpClearFormFrame(); }
+    // The submit run opens a FRESH tab, so it meets the same iCIMS email gate the fill did — and
+    // the gate would otherwise be replayed into as if it were the form. Signing in is all this
+    // does; the submit itself stays behind its own gates below.
+    if (ats === "icims") {
+      const preCreds = await new Promise((r) => chrome.storage.local.get(["credentials"], r));
+      const pre = await runIcimsPreForm(tabId, (preCreds && preCreds.credentials) || null, LOG);
+      // Same closed-posting rule as the fill run: a job can be pulled between the fill and the submit,
+      // and "we could not find the Apply control" would send the operator to debug a dead requisition.
+      if (pre.halt) {
+        if (pre.halt.stopped === "apply-not-followable") {
+          const at = await cdpEval(function () { return location.href; }).catch(() => null);
+          const gone = atsPostingGone(null, bundle.url || (opts && opts.startUrl), at);
+          if (gone) {
+            LOG(`this posting is GONE — ${gone}`);
+            return { ok: true, needs_operator: true, submitted: false, replayed: false, stopped: "posting-gone", ats,
+              detail: "This job is no longer posted — " + gone + ". Nothing was replayed or submitted." };
+          }
+        }
+        return { ...pre.halt, submitted: false, replayed: false, ats };
+      }
+    }
     let ready = await waitAtsFormReady(ats, LOG);
     // Same landing recovery the FILL run has: the form may be EMBEDDED on this page.
     if (!ready.ready) {
@@ -4799,16 +5389,20 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // prefix ("c4787042-…__systemfield_eeoc_gender" one load, "aa058f67-…" the next), so a
     // full-name match can never survive the fresh form a submit run opens. The
     // __systemfield_* suffix is the stable identity — strip the uuid prefix on BOTH sides.
-    const durable = atsDurableFieldName; // shared + unit-pinned in ats.js (per-session uuid prefixes)
+    // ⚠ KEYED BY POSITION FOR A REPEATING ENTRY, not by the id the form minted — see atsSubmitKey.
+    // iCIMS' résumé parse SAVES the entries it extracts, so their ids are per-visit and a bundle keyed
+    // on them can never match a fresh form (measured: 45/45 Experience fields "NO matching field").
+    // Byte-identical for every other tenant and for every non-entry field.
+    const durable = (x) => atsSubmitKey(ats, x); // shared + unit-pinned in ats.js
     const approved = new Map();
     for (const e of bundle.entries || []) {
       if (!e || e.is_deleted) continue;
       const m = /::formField-(.+)$/.exec(String(e.field_id || ""));
       const name = m ? m[1] : String(e.field_id || "");
-      approved.set(durable(name), e);
+      approved.set(durable({ fieldName: name, entry_section: e.entry_section, entry_index: e.entry_index }), e);
     }
     const valueFor = (f) => {
-      const e = approved.get(durable(f.fieldName));
+      const e = approved.get(durable(f));
       if (!e) return undefined;                       // never in the bundle → leave alone
       if (f.widgetType === "file_upload") return "resume"; // presence = re-attach
       const v = e.current_value;
@@ -4821,7 +5415,60 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // AI stays out of a submit run entirely: valueFor covers every field the human approved;
     // anything else is deliberately blank. aiEnabled=false regardless of the popup toggle.
     act.aiEnabled = false;
-    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor });
+    // ⚠ CREDENTIALS ARE READ FRESH HERE, NOT TAKEN FROM THE BUNDLE. On a form whose account is
+    // created by the submission, the login block has to be filled on this visit too — and the bundle
+    // holds only a placeholder for it, by design. Without this the replay would type "(stored login)"
+    // into the login box. Same slot, same {email, password} the fill used.
+    const subStore = await new Promise((r) => chrome.storage.local.get(["credentials"], r));
+    // HOW MANY REPEATING ENTRIES THE APPROVED BUNDLE HOLDS. The replay passes `profile: {}` by design
+    // (every value comes from the bundle), so the entry-growing pass had nothing to size itself from
+    // and left the form with the single entry it renders — 28 of a rehearsal's 32 verify failures were
+    // work-history entries 2 and 3 "having no matching field on the live form" because they were never
+    // added. Counted from BOTH shapes an entry field can carry: a profile-mapped one names its section
+    // in `canonical_field` ("experience[2].company"), and a per-customer one carries `entry_section` +
+    // `entry_index` instead. Same section key either way (see the entry_section note in ats.js).
+    const entryCounts = (() => {
+      const seen = {};
+      for (const e of bundle.entries || []) {
+        if (!e || e.is_deleted) continue;
+        let section = null, index = null;
+        const m = /^([A-Za-z_]+)\s*\[(\d+)\]/.exec(String(e.canonical_field || ""));
+        if (m) { section = m[1]; index = Number(m[2]); }
+        else if (e.entry_section && typeof e.entry_index === "number") { section = e.entry_section; index = e.entry_index; }
+        if (section == null || !Number.isFinite(index)) continue;
+        (seen[section] = seen[section] || new Set()).add(index);
+      }
+      const out = {};
+      for (const k of Object.keys(seen)) out[k] = seen[k].size;
+      return out;
+    })();
+    if (Object.keys(entryCounts).length) LOG(`the approved bundle holds repeating entries: ${Object.entries(entryCounts).map(([k, v]) => k + "×" + v).join(", ")} — the form will be grown to fit`);
+    // ⚠ THE RÉSUMÉ IS ATTACHED BEFORE THE REPLAY, AND ITS PARSE IS WAITED OUT — on the REHEARSAL as
+    // well as the armed run, because a rehearsal that skipped it would be rehearsing a different form
+    // than the one that gets submitted. Two reasons it cannot be an ordinary replay field here:
+    //   • the parse REPLACES the form's contents, so attaching it partway through the replay would
+    //     blank approved values on their way to a real submission — the one place that is unrecoverable;
+    //   • a résumé is a FILE, and the bundle never carries file bytes. It comes from IndexedDB on every
+    //     visit, exactly like the credentials come from storage rather than from the bundle.
+    // The attach is idempotent by inspection (a form already carrying a file is left alone), so the
+    // cascade re-replay below reuses this outcome instead of uploading a second time.
+    let resumePre = null;
+    if (ats === "icims") {
+      emitRunProgress(arm ? "Attaching your résumé (ARMED)" : "Attaching your résumé", "iCIMS parses it server-side — the replay waits for that to finish");
+      const rsT0 = Date.now();
+      resumePre = await atsIcimsResumeStage(act, ats, { log: (m) => LOG("résumé: " + m) });
+      LOG(`[ATS-TIME] résumé stage ${((Date.now() - rsT0) / 1000).toFixed(1)}s — ${resumePre.ok ? (resumePre.already ? "already on the form" : "attached" + (resumePre.parse ? `, parse ${resumePre.parse.parsed ? "settled" : "STILL CHANGING"}` : "")) : "NOT attached (" + (resumePre.error || "unknown") + ")"}`);
+      // ⚠ A REQUIRED RÉSUMÉ THAT DID NOT ATTACH BLOCKS THE GATE RATHER THAN RIDING ALONG. The strict
+      // verify below only re-checks approved VALUES, and a file field's approved "value" is the
+      // filename — so nothing downstream would notice a missing attachment on a form that requires
+      // one, and the submit would go out incomplete.
+      if (!resumePre.ok && resumePre.isRequired) {
+        LOG(`⚠ REFUSING to ${arm ? "submit" : "rehearse"} — this form REQUIRES a résumé and it did not attach: ${resumePre.error || "unknown"}`);
+        return { ok: true, needs_operator: true, submitted: false, replayed: false, stopped: "resume-not-attached", ats,
+          detail: "The form's required résumé upload did not attach (" + (resumePre.error || "unknown") + ") — nothing was replayed or submitted. Upload a résumé in the extension/website, then re-run." };
+      }
+    }
+    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre });
 
     // CASCADE RE-REPLAY (2026-08-01). A value committed during the replay can REVEAL more
     // questions — live on an Ashby form, two work-authorization questions mount only after an
@@ -4832,16 +5479,16 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // approved value is actually missing. Re-filling is idempotent (same approved values, and
     // a field already holding its value is left alone), so the second pass can only add.
     const missingAfter = (res) => {
-      const live = new Set(res.map((r) => durable(r.fieldName)));
+      const live = new Set(res.map((r) => durable(r)));
       return [...approved].filter(([n, e]) => !live.has(n) && e.current_value != null && String(e.current_value).trim() !== "");
     };
     if (missingAfter(out.results).length) {
       const before = out.results.length;
       LOG(`${missingAfter(out.results).length} approved value(s) had no field yet — re-scanning for questions the replay revealed`);
-      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor });
+      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre });
       // Keep the LATER record for any field seen twice: it reflects the form as it stands now.
-      const merged = new Map(out.results.map((r) => [durable(r.fieldName), r]));
-      for (const r of again.results) merged.set(durable(r.fieldName), r);
+      const merged = new Map(out.results.map((r) => [durable(r), r]));
+      for (const r of again.results) merged.set(durable(r), r);
       out = { ...again, results: [...merged.values()] };
       LOG(`re-scan: ${before} → ${out.results.length} field(s); ${missingAfter(out.results).length} still absent`);
     }
@@ -4849,7 +5496,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // STRICT verify: every approved non-blank value must be ON the form now.
     const failures = [];
     for (const r of out.results) {
-      const e = approved.get(durable(r.fieldName));
+      const e = approved.get(durable(r));
       if (!e) continue;
       const want = e.current_value;
       if (want == null || String(want).trim() === "") continue;
@@ -4857,7 +5504,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       failures.push(`${r.fieldName} ("${(e.question_label || "").slice(0, 60)}"): ${r.status} — ${r.detail || "no detail"}`);
     }
     // Approved entries the live form no longer shows (form changed since the fill).
-    const liveNames = new Set(out.results.map((r) => durable(r.fieldName)));
+    const liveNames = new Set(out.results.map((r) => durable(r)));
     for (const [name, e] of approved) {
       if (liveNames.has(name)) continue;
       if (e.current_value == null || String(e.current_value).trim() === "") continue;

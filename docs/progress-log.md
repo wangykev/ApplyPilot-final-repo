@@ -20,7 +20,11 @@ For current state and open work, see **`docs/status.md`**.
 |---|---|
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — MULTI-ATS: Greenhouse / Lever / Ashby end-to-end` (the landing milestone), then `2026-07-31 (b)`…`(f)`, `2026-08-04 — the async combobox`, `2026-08-05 — multi-ATS end to end`, `2026-08-07 — the dead first fill` |
 | **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
-| **Onboarding / auth / already-applied** | `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
+| **iCIMS pre-form (employer portal → gate → form)** | `2026-08-16 (c) — iCIMS PRE-FORM` |
+| **Résumé attach (iCIMS: attach-then-wait)** | `2026-08-17 (b) — the résumé goes on FIRST, which makes iCIMS' parse harmless` |
+| **Option lists reaching review (pickers vs free text)** | `2026-08-16 (d) — an OPTIONAL dropdown reaches review as a real picker` |
+| **Secrets / redaction / scraped-text hygiene** | `2026-08-16 (e) — a session token reached Supabase and the AI providers` |
+| **Onboarding / auth / already-applied** | `2026-08-16 (c) — iCIMS PRE-FORM` (the non-Workday one), `2026-08-07 — fresh-account regression`, `2026-07-28 — Workday's already-applied LIE`, `2026-07-29 - a job-description page is not an auth screen`, `2026-07-27 — The false "SSO" halt`, `2026-07-24 — "Already applied" detector` |
 | **Autofill with résumé** | `2026-08-08 — Autofill-with-Resume end to end`, `2026-08-07 (e) — the flow a first application should take` |
 | **SKILLS field** | `2026-08-07 (d) — SKILLS: the multi-value typeahead` |
 | **Replay walk / submit gate** | `2026-07-28 — The replay walk never settled the page`, `2026-07-28 — Submit gate relaxed`, `2026-07-28 — Background submit runs`, `2026-07-27 — Page-5 replay`, `2026-07-26 — Per-application LOGIN on the backend` |
@@ -33,6 +37,7 @@ For current state and open work, see **`docs/status.md`**.
 | **AI batching / stray clicks** | `2026-08-06 — one AI call per page, and the stray click that was blamed on Workday` |
 | **Résumé attach** | `2026-07-29 (later) - ` (the `role="alert"` status-channel fix) |
 | **Service-worker breakage (the two Node-invisible classes)** | `2026-07-28 — Dead service worker: two files declaring one name`, `2026-07-28 — The replay walk never settled the page` |
+| **iCIMS / credentials tier** | `2026-08-16 — iCIMS routed, the form frame, and the Create-a-login block` |
 | **Latest live sweeps** | `2026-08-09 — live sweep: marvell + moog verified`, `2026-08-09 (b) — the non-Workday merge did NOT regress Workday` |
 
 ## Progress log
@@ -4931,3 +4936,559 @@ and nothing re-evaluated it.
 
 Reverted immediately (`git checkout -- fill-driver.js background.js`), suite re-run, and the extension
 reloaded so the running build matches the committed one — the experiment flag was never committed.
+
+## 2026-08-16 — iCIMS routed, the form frame, and the Create-a-login block
+
+First step of expanding the non-Workday pipeline to iCIMS, against Astrion
+(`astrioncareers-astrion.icims.com/jobs/24615`). Operator's ask: the "Create a login" section — Login,
+Password, Password (Re-enter) — fills DETERMINISTICALLY from the website's stored sign-in credentials.
+Résumé deliberately left alone this round (its server-side parse re-renders the panel and blanks the fill).
+
+**Recon first, read-only, before a line of code** — the standing rule, and it paid twice. Two findings
+would each have made the first live run fail in a way that looks like a broken detector:
+
+1. **The whole form is inside a same-origin `<iframe id="icims_content_iframe">`.** Top document: 0
+   controls. Frame: 118 (70 scannable). A top-frame scan reads an empty page.
+2. **The submit control is `<input type="submit" value="Submit Profile">`.** `atsInjSubmitState`'s generic
+   finder queries only `button`s and matches on `textContent`, which an `<input>` does not have. Measured
+   on the live page: old finder `hasSubmit:false` → `atsLooksLikeApplicationForm` REFUSES the form. Now
+   `hasSubmit:true`, `looksLikeForm_ok:true`, both verified against the real DOM.
+
+**What landed.** `detectAts` gains an anchored `icims.com` SUFFIX test (the first non-exact-host tenant —
+iCIMS gives every customer a subdomain); `atsCompanyFromUrl` reads that subdomain, because path segment 0
+is the literal `jobs` and that string anchors the employment recognizer; `atsFormUrl` keeps the query,
+since `?eem=…&code=…` is a one-time magic-link session, not tracking cruft. `cdpUseFormFrame` /
+`cdpEvalTop` (lifted from the abandoned `worktree-generic-filler-design` branch, which had already earned
+them live) pin `Runtime.evaluate` to the frame's isolated world, armed in `waitAtsFormReady` so both the
+fill and the submit run get it; `_frameCtxId` defaults null, so Workday / GH / Lever / Ashby are
+byte-identical. A new `atsInjScan` iCIMS branch reads the tenant's conventions (label[for], three
+independent required markers, `h2.iCIMS_SubHeader` sections, native selects) — its predicates were run
+verbatim against all 118 live controls and resolve 70 fields, 22 required, with the login trio correctly
+labelled and sectioned.
+
+**The credential tier, and why it is the TOP rung.** Above the static map, buckets, labels and AI — being
+first is the safety property, since every rung below could otherwise reach a login box. The value comes
+only from `store.credentials`; it never enters a log line, a record or the review bundle (`rec.after` is
+the placeholder `"(stored login)"` + `credential:true` + `credentialKind`); `atsInjSetCredential` /
+`atsInjVerifyCredential` return a length and a boolean, never a value; the box is cleared before typing;
+incomplete credentials yield `needs_review`, never half an account.
+
+**Four failure modes were imported rather than re-earned**, from the abandoned branch's live rounds:
+the value reaching Supabase via `buildReviewBundle`; a rewrite merging into `old@x.comnew@y.com`; the
+post-fill audit flagging every credential once `after` became a placeholder; and — the important one —
+Chrome's own password manager writing the `autocomplete="username"` box back AFTER the fill, on a run
+that still reported `filled`. The audit structurally cannot catch that, so `atsCredentialRecheck` runs
+last and compares against the EXPECTED value inside the fill: a replaced field is rewritten once, one the
+page keeps taking back ends `needs_review` + `credential-overwritten`.
+
+Also fixed while it was cheap: the submit run would have replayed the placeholder string into the login
+box, because the bundle carries `"(stored login)"` by design. Credentials are now re-read from storage on
+the replay path instead of being taken from the bundle.
+
+**Tests:** 20 new in `test/ats-icims.test.js`. The load-bearing one greps the entire result set for the
+password and the login. Per the project's own "a test that passes both ways proves nothing" rule, it was
+verified to FAIL when `rec.after` is changed back to the real value ("THE PASSWORD LEAKED INTO A RECORD").
+Full suite 1406 pass / 1 fail — `db.test.js`, a missing `fake-indexeddb` devDependency in this worktree,
+pre-existing and unrelated.
+
+**NOT yet live-verified** — this is a fill built from recon and unit pins; no run has been driven through
+the extension yet. The credential re-check in particular has never fired against a real page.
+
+## 2026-08-16 (b) — iCIMS LIVE: the login block verified, and the `<select>` that is not a select
+
+Two live runs on `astrioncareers-astrion.icims.com/jobs/24615`.
+
+**Run 1 (build `icims-login-1`) verified step 1.** `the application is inside an iframe — driving it
+there (112 controls)`, then Login / Password / Password (Re-enter) each `filled` with
+`after="(stored login)"` etc. — the placeholder, never a value. Page: `filled 12 · filled_review 9 ·
+needs_review 9 · skipped 42`.
+
+⚠ **Getting there cost two environment findings worth writing down.** The extension was running build
+`skip-resume-34` — the ABANDONED generic-filler branch's marker — because that worktree FOLDER had its
+branch switched underneath a running service worker. The marker check is what caught it; `AP_PING`
+answering `{ok:true}` proves nothing. And re-adding the unpacked extension **wipes
+`chrome.storage.local`**: profile, résumé and credentials all had to be re-pushed (Connect → Sync
+everything, then Credentials → Save) before a fill could mean anything. Note `AP_PING` on this branch
+does NOT report credential state — that field existed only on the abandoned branch, so its absence is
+not evidence of missing credentials.
+
+**Run 1 also exposed the real bug the operator asked about next:** the REQUIRED Country reached review as
+`AI fallback: no live options to choose from` and State as `needs_review`, on a page plainly showing both
+lists. Recon (`docs/dom-patterns.md` 2026-08-16 (b)) found the cause: **iCIMS replaces many `<select>`s
+with its own AJAX combobox, leaving the `<select>` permanently empty and its `value` an opaque numeric
+id.** Reading `select.options` there returns nothing. The tell is `icimsdropdown-enabled="1"`; the real
+rows are `<li role="option">` in `<ul id="<id>_dropdown-results">`, the read-back is the widget's
+`_fakeSelected` span, and `aria-expanded` stays `"false"` even while open.
+
+Two properties of that widget shaped the handler more than the plumbing did:
+- **it pages** — 26 countries, 25 states (Alabama…**Michigan**), with a `— Type to Search —` box. A
+  first-page miss is not proof of absence, so the handler searches before reporting. Florida was in
+  range, which is exactly the luck that would have hidden this until someone in Texas applied. Its
+  option list is recorded **always partial**.
+- **the parent→child link is DECLARED** (`data-ddd-child-link`), and the child reads "Please select a
+  country" until the parent commits. So a child whose parent is unset now says that, rather than
+  reporting "no options" — the generic message is what sent debugging to the option read instead of to
+  the unset parent.
+
+**A new choice widget must be registered in FOUR places, and each omission fails differently.** Missing
+`ATS_REVIEW_WIDGET` leaks the raw name into the bundle; missing the `isChoice` list feeding `resolve()`
+coerces a TIERED profile array as free text — caught by a unit test, and it is what would have stopped
+`["United States of America", "United States"]` from ever trying the second tier the form actually
+offers; missing `atsAiBatchKind` mis-routes the AI call; missing `atsAiFallback`'s option-read and
+commit switches reproduces the original "no live options" for AI-answered fields. `atsInjReadValue`
+needs a branch too, or the post-fill audit flags every correct fill as `audit-mismatch`.
+
+The address block itself is a REPEATING section, so `atsMapKey` strips the entry ordinal
+(`-1_PersonProfileFields.AddressCity` → `PersonProfileFields.AddressCity`) for iCIMS only. Keying by id
+is safe because `PersonProfileFields.Address*` is iCIMS' own vocabulary for the CANDIDATE's address — a
+work-history employer address is a per-customer `rcf<NNNN>` group and cannot collide. It does not yet
+tell entry 1 from entry 2; with one profile address and one form entry there is nothing to
+disambiguate, and that limit is recorded rather than hidden.
+
+**Run 2 (build `icims-addr-1`) verified it live:** Street1 `"715 Middlebrooks Circle"`, City
+`"Tallahassee"`, Zip `"32312"` (deterministic now — it had been an `ai-text` guess), **Country `filled ·
+exact-normalized · "United States"`**, **State `filled · exact-normalized · "Florida"`**. Page totals
+`filled 21 · filled_review 8 · needs_review 1 · skipped 43` — `needs_review` 9 → 1. The one left is
+`CandProfileFields.School`, which searched the AJAX list for "Carnegie Mellon University", found no
+match, and said so: the new widget working, and the next step's problem.
+
+Suite 1413/1414 (`db.test.js` needs `fake-indexeddb`, absent in this worktree — pre-existing).
+
+⚠ **The independent page re-read did not complete.** `AP_DEV_ATS_SCAN` was taught to arm the frame (a
+fresh `cdpAttach` resets the pin, so it had been reading the empty top document and reporting 0 fields),
+but a client-side timeout left its debugger attached and the retry wedged. The verification therefore
+rests on the two reads inside the run — `atsInjIcimsRead` after the commit, and the M40-lite audit's
+independent re-read after the page settled, which flagged nothing — not on a third outside opinion.
+
+## 2026-08-16 (c) — iCIMS PRE-FORM: an employer careers link now reaches the form signed in
+
+**What:** the stage before everything in the two entries above. A run started from an employer-hosted
+careers link (`careers.astrion.us/jobs/24615?mode=apply&iis=LinkedIn`, the LinkedIn-provided link) now
+scrapes the JD, follows Apply, gets past iCIMS' email gate with the stored credentials, and hands the
+application form to the existing fill. **Live-verified end to end, hidden AND visible** —
+`signed in and on the application form — 70 field(s)` → `fill complete — 108 field(s), 6 need review.
+Reported to the website.` Hidden: **28.7s, 265ms/field**.
+
+**Why it did not work before:** `detectAts` is host-based and must stay that way, so `careers.astrion.us`
+returned null and nothing iCIMS-aware ever saw the URL. And once a run *did* reach the tenant host it met
+a sign-in card no stage knew how to pass.
+
+**The dangerous half was not the missing feature.** iCIMS' login page PASSES
+`atsLooksLikeApplicationForm` — a submit control plus an email field is exactly that function's positive
+test — so a run reaching the gate would classify it as the application form and start writing profile data
+into a login box. The auth check therefore runs BEFORE the form wait, not as a fallback after it, and
+`icimsAuthView` is what stands between the two. Its control bound is unit-pinned in both directions,
+including the case that matters most: the application form carries its OWN Login/Password/Password_Confirm
+block (the account is created by the submission), so a password box is NOT evidence of a sign-in page.
+
+**`runIcimsPreForm`** (background.js) carries `runCdpOnboard`'s invariants verbatim: credentials only from
+`chrome.storage.local`, written through `atsInjSetCredential` (returns a LENGTH and a match boolean, so the
+password cannot reach a log line); SSO refused on URL evidence only; a federated button reported, never
+clicked; an account-creation control never pressed; every human-needed stop `needs_operator` with a
+self-explaining reason. It stops at the form and submits nothing. It also runs on the SUBMIT path, which
+opens a fresh tab and meets the same gate.
+
+**The Apply retry watches the page's IDENTITY, not a click count** (`atsInjPageSignature` /
+`atsSignatureChanged`): url, the iCIMS frame src, the heading, and the rendered control set, read across
+BOTH the top document and the frame, since a postback changes only the second. An unreadable read scores as
+NO change, so a failed probe can never look like progress.
+
+**Three faults found by running it** — each measured, not reasoned about; full DOM detail in
+`docs/dom-patterns.md` `2026-08-16 (c)`:
+
+1. **The gate's submit is gated on INVISIBLE hCAPTCHA, and OUR blob-worker timer polyfill stopped hCaptcha
+   initialising.** Measured `captchaFrames 0` under a run against a rendered hcaptcha iframe by hand.
+   Isolated to the worker polyfill *alone*, not the CSP bypass, by splitting the two switches —
+   `cdpInstallPageOverrides` now takes `{noWorkerTimers}` for a caller, while the storage kill-switch keeps
+   its old meaning (it simulates a CSP-blocked tenant, so it still disables the bypass too). ⚠ This is NOT
+   captcha handling and must never become it: it removes our own tampering so the page's own check can run
+   and judge the session; a refusal still halts for the operator. Two new read-backs (`submitLocked`,
+   `captchaToken`) are what tell "the form fired and the captcha never came back" from "the POST is in
+   flight" — without them the two are indistinguishable. The gate also DISABLES ITS OWN BUTTON on submit,
+   so a stall cannot be retried in place; one bounded reload restores it, a second stall halts
+   `captcha-unanswered`.
+2. **The scan outran iCIMS' iframe mount — and only when VISIBLE.** A hidden run is slow enough to lose the
+   race, so "it worked in the background" was not evidence. Settle before scanning, polled against the
+   page's own readiness (the standing rule this stage had broken).
+3. **The company was a page title.** With no ATS markup to key on, the JD scrape returned *"Engineering
+   Directorate Support Intern in Mountain View, California | Astrion"* as the COMPANY — the string that
+   anchors the safety-critical "have you worked for us before?" recognizer. `atsPlausibleCompany` is a
+   NEGATIVE test with loud tells rather than a cleverer parser; what it rejects falls back to the iCIMS
+   tenant subdomain (evidence, not a heuristic), and what it cannot judge is KEPT, so Greenhouse / Lever /
+   Ashby are unchanged.
+
+**Also fixed on the way:** the employer-domain probe in `AP_RUN_APPLICATION` settles over CDP instead of
+racing the render (`waitJobPageSettled` reads through host-gated `chrome.scripting`, which fails instantly
+on an employer domain); it learned a third tier, `atsPortalAts`, which asks who runs a careers site from
+the hosts the page itself references and refuses when two ATSs are named; and it no longer overwrites the
+run's CDP-scraped `jd` with its own null one, which had emptied the tracker's job description for every
+employer-hosted posting. `login.icims.com` — iCIMS' Auth0 login for RECRUITERS, one path off the candidate
+portal — gets its own refusal, because it is an `icims.com` host and the SSO test deliberately exempts
+those.
+
+**Tests:** 29 new in `test/ats-icims-onboard.test.js`; suite 1468/1469 (`db.test.js` needs `fake-indexeddb`,
+absent from this worktree's `node_modules` — pre-existing, unrelated).
+
+**Verified alongside:** the review editor renders real pickers, carrying their live options, for choice
+fields left blank (phone Type, currency, rate unit, month/day) — eyeballed on the tracker. And
+certifications did NOT report `skipped · no profile mapping` on this requisition; that string appears
+nowhere in the bundle, so the earlier report is either fixed or belongs to a different req. Not chased
+further.
+
+**Open:** `runIcimsPreForm` has met only the EMAIL step live — this tenant's account already existed, and
+the gate let it through without a password. The `password`, `code`, `blocked` and `verification-emailed`
+branches are unit-pinned but not live-exercised. The submit/rehearse path through the gate is likewise
+unexercised.
+
+## 2026-08-16 (d) — an OPTIONAL dropdown reaches review as a real picker
+
+**Operator:** on these one-page forms, dropdowns should be reconned even when optional.
+
+They already were being READ. The gap was that the result was discarded as unusable: every
+`icims_dropdown` was flagged partial **unconditionally**, because the flag read a
+`data-ap-complete` attribute nothing in this codebase has ever written. A partial list is attached
+as `captured_options` + widgetType `typeahead`, which the review editor renders as a
+type-it-yourself box plus a caveat — so a two-option "May We Contact" question reached the operator
+as FREE TEXT and they retyped a value the form had been showing us all along.
+
+**The form reveals its own page size if you look at every dropdown at once.** Measured scan-time on
+a fresh Astrion form: `2×1, 10×2, 1×6, 1×17, 11×25`. Time Zone, Country, State/Province and Degree
+all stopping at exactly 25 is a pager — unrelated vocabularies do not share an exact length. So a
+list SHORTER than a page has reached its end (`atsIcimsPageCap` / `atsIcimsListComplete`, both pure
+and unit-pinned). Derived rather than hardcoded because the cap is a tenant setting, and a repeated
+length must clear `ATS_ICIMS_CAP_MIN` — otherwise ten Yes/No dropdowns "prove" a page size of 2 and
+nothing can ever be complete again.
+
+⚠ **The asymmetry is deliberate and is the safety story:** a picker MISSING the operator's answer
+makes them conclude the form does not offer it; a complete list called partial only costs them a
+typed value. Every uncertain case stays partial.
+
+**A complete list also beats a FILTERED one.** The existing rule ("a field that actuated already
+recorded the live list it matched against, which is the better of the two") holds only while that
+list is fuller — and it is not, because a field filled through the widget's own search records just
+the rows the search returned. Both guards on the new branch are load-bearing: the scan list must be
+PROVEN complete, and must not be shorter than what the actuation saw.
+
+**Measured, one form, end to end:** 16/25 dropdown lists proven complete; the review bundle went
+**22 pickers / 18 filter-or-type → 28 pickers / 12 filter-or-type** of 46 choice records. The 12 are
+the genuinely paged 25-row lists, honestly labelled. Zero extra page contact ⇒ zero added cost
+(28.7s before, 25.9s after — noise).
+
+**Two measurement faults found on the way, both producing wrong numbers:**
+1. **The scan kept the AWAITING-PARENT row.** A child whose parent is unset renders exactly one row,
+   `"Please select a country"`; left in, that reads as a one-option COMPLETE vocabulary and would
+   have reached review as the single value the operator may pick. The unset parent is already
+   explained by the record's own detail — the option list must simply be empty.
+2. **A result's `widgetType` is rewritten to the REVIEW vocabulary** as the record is built, so the
+   first outcome diagnostic matched the scan names and counted 19 of 46 choice records.
+   `ATS_CHOICE_REVIEW_WIDGETS` is DERIVED from the two existing tables rather than written a third
+   time.
+
+**Also:** `ATS_CHOICE_WIDGETS` replaces three identical inlined copies of that list — exactly the
+trap CLAUDE.md warns about for this vocabulary (four registration sites, a miss fails silently),
+where a copy-paste list makes the fourth miss inevitable.
+
+**Two always-on diagnostics**, because this question could not be answered from outside the run:
+`[ATS-OPTIONS] scan-time coverage` (what we KNEW, printed before anything actuates — the only
+uncontaminated moment, since an opened dropdown keeps its list) and `[ATS-OPTIONS] review editors`
+(what the operator will SEE). Keeping both visible is what stops "16 proven complete" being read as
+"16 pickers".
+
+**Tests:** 9 new (38 in `test/ats-icims-onboard.test.js`, 200 across the three ATS files); suite
+1477/1478 (`db.test.js` needs `fake-indexeddb`, absent here).
+
+**Open / not chased:** the tracker page still renders the partial caption more often than the bundle
+has partial records, and its inline `<select>` count did not move with the bundle — the editor only
+renders an editor for some rows, so a DOM count is a poor proxy. `options_partial` IS threaded
+correctly (`fill-driver.js` → `options_partial`, read by `ReviewEditor.tsx`), and the note has two
+other trigger clauses (a radio/checkbox_group with no options, a typeahead with captured options),
+so the extra captions are most likely those. A web-side check, not an extension one.
+
+## 2026-08-16 (e) — a session token reached Supabase and the AI providers inside a job description
+
+Found while checking the JD-summary bug above. An iCIMS candidate page's **bootstrap script** had
+been stored as a job description — 3009 chars of `icims_handlePostMessage` — and that script embeds
+the one-time magic-link session URL, so the `eem`/`code` pair was sitting in
+`applications.job_description` at rest.
+
+**Three exposures from one string, and only the first is obvious:** the tracker row in Supabase
+(indefinitely); every AI prompt the JD grounds (the description is sent to the model provider
+verbatim, to stop essays inventing a company theme); and the run's own log lines. Fixing only the
+report boundary would have fixed one third of it.
+
+**How it got in.** `scrapeJobPosting`'s reader is `innerText || textContent`, and `textContent`
+INCLUDES `<script>` source. Its last-resort "largest text block on the page" loop is a CONTEST, so on
+a page that is mostly bootstrap JS the winner is the JS: `innerText` of a script-wrapping div is
+empty, so every candidate fell through to `textContent`. Measured on the live iCIMS shell, old reader
+vs new, same page:
+
+```
+OLD -> DIV.parent_width_fix, 2597 chars, isScript TRUE
+NEW -> DIV.site-wrapper,      145 chars, isScript false
+```
+
+That loop now reads **rendered text only**. The hidden-tab case the fallback existed for is paid
+ONCE, on the body, with `script`/`style`/`template` source subtracted — rather than per-candidate,
+where it both cost 4000 sanitizations and let a script win the contest.
+
+**The belt.** `redactSecrets` (lib.js, pure) rewrites credential-shaped URL parameters to
+`key=<redacted>`, **keeping the key** so a reader diagnosing a leak still sees that a magic link was
+there while carrying nothing usable. Applied where `jobContext.description` is ASSIGNED — both the
+ATS and Workday paths — and again at `reportApplication`, the one choke point everything reaches the
+tracker through, so a stale value already in `jobContext` cannot slip past. Anchored on a URL
+separator so ordinary prose is left exactly as written; `#` is in the set because an OAuth
+implicit-flow token lives in the FRAGMENT — a gap caught by the new test file, not by review. A
+6-char floor keeps a short value like a country code readable. Called as a **bare global** from
+background.js, deliberately not via the `apMatch` literal (the lockstep trap: passes every Node test,
+throws in the browser).
+
+**Remediation of what was already written:** `web/scripts/scrub-job-description-secrets.mjs` imports
+the same `redactSecrets` rather than reimplementing it, DRY-RUNS by default, is idempotent, and never
+prints a token (findings are key NAMES and counts — printing the leak would just move it). Scanned 9
+rows with a description; exactly **1** contained secrets, no other tenant affected. Applied and
+re-verified: **0 rows still leaking**.
+
+**Live regression check:** a fresh careers-page run still scrapes 2622 chars of real posting text, no
+script, no redaction needed, filling 108 fields / 6 to review.
+
+**Tests:** 8 new in `test/redact-secrets.test.js`, written in BOTH directions — a real token never
+survives, and ordinary prose is never mangled. Suite 1485/1486 (`db.test.js` needs `fake-indexeddb`).
+
+**Open:** the polluted row's description is still that bootstrap script, now merely token-free — a
+duplicate row whose JD is worthless, so nulling it is cleanup rather than security. Also: that run
+produced a SECOND tracker row for this posting, because it started from the iCIMS magic link rather
+than the careers page, so its `job_key` differed.
+
+## 2026-08-17 — the candidate's phone, and a repeat that is DETECTED rather than declared
+
+**The bug the operator caught on the tracker:** `-1_PersonProfileFields.PhoneNumber` held **`24615`** —
+the job's requisition id — flagged `ai-text`. Both phone fields (`PhoneNumber`, `PhoneType`) are
+REQUIRED and were UNMAPPED, and their labels are only *"Number"* and *"Type"*, which match nothing in
+the label ladder. So both fell through to the AI, and it answered "Number" with the most
+number-shaped thing in the JD. The review gate held — it was flagged, not silently filed — but a phone
+field holding a requisition id is the confident-wrong-value class, and it recurred on every run.
+*The generalisable shape: a REQUIRED platform field whose label is a bare noun silently reaches the AI.*
+
+Mapped `PhoneNumber` / `PhoneType` / `PhoneExtension` / `PhoneCountry` (the last as `kind:"dial"`).
+Safe to key by bare id for exactly the reason the address block is: `PersonProfileFields.Phone*` is
+iCIMS' own vocabulary for the CANDIDATE, while an employer's phone in a work-history entry is a
+per-customer `rcf<NNNN>` (`rcf3271` here) and cannot collide.
+
+**Live: needs-review 6 → 4.** `PhoneType` = "Mobile" (`filled`, `exact-normalized`, unflagged),
+`PhoneNumber` = the profile's real number, unflagged. The remaining four are the résumé skip and three
+empty Experience dates, all pre-existing.
+
+**A REPEAT IS DETECTED, NOT DECLARED.** The static map is keyed on the ordinal-STRIPPED id, so a second
+rendered address/phone row would be handed a DUPLICATE of the first — the hazard CLAUDE.md had already
+flagged for addresses. ⚠ **A first cut hardcoded the families (`Address*`, `Phone*`) and the operator
+rejected it, correctly:** iCIMS is configured per customer, so a block that repeats on this tenant may
+be a single row on the next, and naming families makes the next portal a code change. The rule now asks
+what the PAGE can answer — *has this exact BARE id already appeared under a different ordinal?* —
+and `repeatIndex` is the position of the field's own ordinal in that id's first-seen ordinal list.
+Consequences worth stating: index 0 is the entry the map fills; a form with one row produces 0 for
+everything so the rule **never fires**; and a tenant repeating something never seen before is covered
+without a code change. Ordinals are POSITIONS, never values (`-1` is the default entry, a saved one
+carries an opaque server id, so `-2` is not "the second").
+
+Section entries are excluded, and that exclusion is load-bearing: `rcf3271` at -1/-2/-3 is three real
+jobs filled from `work_experience[i]`, so treating them as one value repeated would blank two of them.
+
+A repeat is left **BLANK with a note** rather than copied or AI-guessed — the profile holds one phone,
+so a copy is a fabricated second number and the AI's would be a guessed one; the extra entry is
+optional, so blank blocks nothing.
+
+**Tests:** 11 new (46 in the file). Both directions are pinned: a single row still maps, a second row
+skips, position-not-value, a section entry is untouched, and `atsAssignEntryIndexes` is asserted to
+contain **no** id-family names so the hardcode cannot creep back. Suite 1493/1494 (`db.test.js` needs
+`fake-indexeddb`).
+
+⚠ **The repeat rule is unit-pinned but NOT live-exercised** — this form renders one address row and one
+phone row, so `repeatIndex` was 0 everywhere and the branch never ran. That is the designed behaviour,
+but it means a real two-entry form has yet to confirm it.
+
+## 2026-08-17 (b) — the résumé goes on FIRST, which makes iCIMS' parse harmless
+
+Operator's ask: attach the résumé on the iCIMS rehearsal and the real submission, but make sure the
+parse has FINISHED before the form fill starts, because it re-parses the whole form. That is exactly the
+right framing — the problem was never the upload, it was the order.
+
+**Background.** iCIMS parses an uploaded résumé server-side and posts the result back into the panel
+seconds later, re-rendering repeating entries under new ids and blanking what was already written (the
+form announces it: *"Existing data in the form will be replaced"*). Attaching it as an ordinary field
+mid-fill therefore destroyed the fill, so on 2026-08-16 it was mapped `kind:"skip"` — the résumé, on a
+form that requires one, was left to the operator.
+
+**Now** (`atsIcimsResumeStage`, ats.js): after the form settles and **before a single value is written**,
+the stage finds the résumé field, attaches, and waits the parse out. The parse can then only overwrite an
+empty form, and everything the fill (or the approved replay) writes lands on top of whatever it produced.
+Nothing else in the run changed.
+
+**The wait is polled, never timed** — two independent conditions, both required:
+
+| signal | what it proves | why the other cannot |
+|---|---|---|
+| `atsFormSignature` changed | the postback LANDED | the field COUNT is often identical on both sides of a re-render (entries return under new ids), so a count settle sees nothing happen |
+| the mutation stamp idle ≥1.5s | the panel stopped rendering | a signature can hold still between two bursts of a server-rendered re-render — the `cdpInstallQuietWatch` lesson |
+
+The signature is the field SET plus which fields hold a value — deliberately not the values' text or the
+option lists, which churn (a re-quoted filename, a filtered list) and would never stabilise.
+
+**Three judgement calls worth keeping:**
+- **A parse that changed NOTHING is indistinguishable from one that has not started yet.** So that branch
+  does not exit early: it spends its whole 20s change budget and still requires quiet + a stable
+  signature. Being slow there costs latency; being early costs the entire fill.
+- **`filled` requires EVIDENCE the file landed.** Writing `input.files` is a page-side write and iCIMS
+  uploads on the change event, so the record needs either the widget's own confirmation (filename read
+  back) or a server reaction (a postback only happens to an accepted upload). Neither ⇒ `filled_review` +
+  `resume-unconfirmed`. Still churning at the ceiling ⇒ `resume-parse-unsettled`. A required résumé that
+  did not attach at all HALTS a submit run (`resume-not-attached`) — the strict verify only re-checks
+  approved VALUES, so a missing file is invisible to it.
+- **The FILL run attaches too, not just the rehearsal/submit.** Asked for the submit path only, but a
+  bundle captured from an UNPARSED form and replayed against a PARSED one reports every entry field as
+  *"approved value has NO matching field on the live form"* — the same shape that produced 28 of a
+  rehearsal's 32 verify failures when entry counts disagreed. Both visits must see the same form.
+
+**The fill loop never attaches on iCIMS** — it records the stage's outcome (`opts.resumePreattached`) and
+never touches the file input. A second upload is a second parse, and that one lands *during* the fill; on
+a submit run it would blank approved values between the verify and the click. The stage is also
+idempotent by inspection (a form already carrying a file is left alone), which is what makes the submit
+run's cascade re-replay safe.
+
+**Pinned:** 13 tests in `test/ats-icims.test.js` (never-attach-mid-fill, the record for each outcome,
+attach-once + ordering, no-second-upload, router-decides-which-file-field, no-early-exit on no-change,
+watch re-arm, the signature's identity). Observed DOM + the rejected alternatives:
+`docs/dom-patterns.md` `2026-08-17 (c)`.
+
+## 2026-08-18 (c) — PRE-MERGE regression: all four pipelines live, six runs, nothing submitted
+
+Before merging the day's work (résumé-first, the submit key, the posting-page frame, consent accept, the
+clearance field) to main. The risk was never iCIMS — it was that `lib.js`, `fill-driver.js` and `cdp.js`
+are loaded by EVERY pipeline, so the clearance rung and the frame-arming change could regress Workday and
+the other three ATSs. Build marker `premerge-regress-1`, every run hidden, every run a FILL or a dry
+rehearsal.
+
+| pipeline | fixture | result |
+|---|---|---|
+| **Workday fill** | cat.wd5 `R0000388155` (fresh req) | ✅ `✓✓ reached the REVIEW page after 5 page(s)`, `audit_flagged 0` on all 5, no nav-timeout |
+| **Workday rehearsal** | same req, approved 2/2 | ✅ 5 pages replayed `0 FAILED` each · `AGREE 49 · DISAGREE 0` · **`SUBMIT GATE PASSED`** |
+| **Greenhouse** | Discord `8625545002` | ✅ 26 fields, 7 review, reported |
+| **Lever** | Shield AI | ✅ 38 fields, 7 review, reported |
+| **Ashby** | Linear | ✅ 14 fields, 7 review, reported |
+| **iCIMS** | Astrion (106-field form) | ✅ 106 fields, 3 review — identical to pre-refactor |
+
+**What each one was actually testing:**
+- The Workday pair is the only thing that exercises `fill-driver.js`'s flat loop with the new clearance
+  rung in place, the `deterministicTierFor` tier (which the AI-batch planner consults), the two rescue
+  exclusions and the backstop exclusion — plus `cdpEval`'s changed re-arm path. The REHEARSAL additionally
+  covers the replay walk and the review-page reconcile, both of which read the `apMatch` literal the
+  clearance helpers were added to.
+- `resume 0.6s` on Greenhouse and `0.1s` on Lever is the signal that the iCIMS résumé STAGE did not leak
+  into the other tenants: those still attach inside the fill loop, as before.
+- iCIMS re-run because the `lib.js` refactor moved the clearance recognizer AFTER the last iCIMS run of
+  the day — the fill had to be re-proven against the shared helper, and came back with the same numbers.
+
+**Pre-existing, not a regression:** Greenhouse's `school--0` async widget never answered (31.4s) — the
+documented Discord/GH combobox limitation, reported honestly rather than retried.
+
+**A second sighting of the slow parse:** Astrion landed its parse at **21.5s** (settled 26.2s), the second
+run today past the 20s budget the code shipped with this morning. Two of ~9 observed parses would have
+been mis-called "no postback" under the old number.
+
+## 2026-08-18 (b) — LIVE: four more iCIMS tenants, and the pipeline was Astrion-shaped
+
+Asked whether iCIMS works for ANY tenant. It did not, and the reasons were structural rather than
+per-tenant quirks. Tenants sampled: **ITT** (`careersen-itt-inc`), **Peraton** (`careers-peraton`),
+**Cretex** (`rms-cretex`), **Wieland/Chase Brass** (`careers-chasebrass`), against **Astrion** as the
+control. Every run a FILL; nothing submitted.
+
+| tenant | outcome |
+|---|---|
+| Cretex | **fill works end to end** — signed in, 81 fields, résumé attached + parse settled, reported 200 |
+| ITT | **externally blocked** — `consent-required` (a GDPR box only the operator may tick) |
+| Peraton | **externally blocked** — `consent-required` ×2 ("I accept the Privacy Policy", "…Job Application Privacy Notice") |
+| Wieland | gate is consent-free (email + hCaptcha), not run further |
+| Astrion | control — unchanged, still passes |
+
+**FAULT 1 — the content frame was unreachable on a POSTING page.** `cdpUseFormFrame` accepts a frame
+only if it holds ≥N *form controls*. That is the right test for "which frame has the application form"
+and the wrong one for "which frame is this tenant's content": an `<tenant>.icims.com/jobs/<id>/…/job`
+page keeps the job description **and its lone `<a>Apply for this job online</a>`** inside
+`#icims_content_iframe`, with zero form controls, so nothing was pinned and every eval read the top
+document — 13 characters of branding. The run reported `controls 0 frame none apply no-apply-button`
+and halted `apply-not-followable` on a page whose Apply link works by hand.
+
+*Why it survived two days of testing:* Astrion is reached from an **employer portal**, where the Apply
+link really is in the top document. The shape we built against is the exception; most iCIMS links are
+the posting page. `minControls:0` is now reachable but must be identity-anchored (the frame's own url,
+read from the page's own `<iframe src>`), an identified frame outranks a fuller one, and an unanchored
+0-floor call is refused — pinning an analytics iframe would blind the caller in a new way, silently.
+`cdpEval`'s re-arm reproduces how the pin was obtained rather than a hardcoded floor.
+
+**FAULT 2 — a legal consent was reported as a broken button.** With the frame reachable, ITT clicked
+Apply, reached the gate, wrote the email, and halted `auth-submit-unavailable … (submit-disabled)`. The
+real cause was an UNCHECKED `aria-required` `#accept_gdpr` whose own row says *"You must indicate that
+you have read the privacy notice … before you can continue"*. iCIMS `preventDefault`s the submit and
+disables its own button, so an unticked consent is indistinguishable from a dead control — and the
+message sent us to debug a click that was fine. Now `consent-required`, named and quoted, halting
+before anything is written. **2 of 5 tenants gate this way**, so it is a normal iCIMS configuration,
+not an oddity — and the bot never ticks a legal agreement to get a run further.
+
+**A THIRD, cheaper finding: three of four postings taken from a search index were already CLOSED**, and
+iCIMS answers a dead job id by redirecting to its own job-search page with `notFound=1`. The pre-form
+stage therefore found nothing to click and said `apply-not-followable` — "we could not find the Apply
+control" — for a job that no longer exists. `atsPostingGone` already knew the general rule and was
+simply never consulted on this path; it now is, on both run paths, and reads iCIMS' explicit signal.
+
+**The regression check paid for the morning's budget change.** Astrion (the control) still fills 106
+fields / 3 review — and landed its parse at **25.6s**, settling at 29.7s. That is PAST the 20s change
+budget this pipeline shipped with at breakfast: under it, that run would have declared the form quiet,
+begun filling, and had the postback overwrite it — on the tenant that had already passed six clean runs.
+A slow parse is a fact about the server's load, not about the page, so it cannot be designed away.
+
+**Open, not fixed:** Cretex's required `-1_CandProfileFields.Degree` reported `no option matched
+"Bachelor of Science" (after searching) — the list was empty`. It reached review honestly, so nothing
+was guessed, but whether the tenant's list is genuinely empty or we read the wrong container is
+UNSETTLED — the session did not outlive the run, so the widget could not be inspected afterwards.
+Worth one signed-in look before assuming either. Cretex's fill also left 42 of 81 fields needing
+review, which is what an unmapped tenant full of per-customer `rcf` questions looks like.
+
+## 2026-08-18 — LIVE: the résumé round, both arms, and the bug only a rehearsal could find
+
+Six runs on Astrion (`careers.astrion.us/jobs/24615`), extension loaded from this worktree and proven so
+by a build marker bumped and re-read each time (`icims-resume-1/2/3`). Every run a FILL or a DRY
+rehearsal; `arm` never set; nothing submitted.
+
+**The résumé stage does what it was built to do, and the postback is real.** Every run saw it:
+
+| run | pacing (measured) | parse landed | form settled | stage | outcome |
+|---|---|---|---|---|---|
+| fill | `visible-fast` · `tab VISIBLE, painting (visible)` | 9.0s | 13.8s | 14.1s | 106 fields, 3 review, reported 200 |
+| fill | `hidden-fast (page-clock-independent)` · `tab HIDDEN, painting (hidden)` | 8.4s | 13.6s | 13.7s | 106 fields, 3 review, reported 200 |
+| rehearsal | `visible-fast` | 17.6s | 21.0s | 21.3s | 106 replayed, **0 failures** → WOULD CLICK SUBMIT |
+| rehearsal | `hidden-fast` | 9.4s | 14.2s | 14.3s | 106 replayed, **0 failures** → WOULD CLICK SUBMIT |
+
+Plus one earlier unlabelled rehearsal per arm, also 0 failures — so each arm passed TWICE (the
+rehearse-twice rule). The 3 review items are the pre-existing `default-value` day-of-month flags, and
+the résumé itself reaches review as `filled · Kevin's Resume.pdf`.
+
+**THE BUG: entry ids are per-visit once the parse SAVES entries.** The first rehearsal failed —
+`verify-failed`, **45 of 45** Experience fields reporting `approved value has NO matching field on the
+live form` — on a form whose approved values were all present. The fill's bundle was keyed on the ids
+iCIMS minted for it (`-8455804/5/6_`) and the rehearsal's own parse served fresh ones
+(`-8459967/8/9_`). Before the résumé this could not happen: entries were positional (`-1_`, `-2_`,
+`-3_`), identical every visit. `atsSubmitKey` keys a section entry by POSITION
+(`@experience[0]/<bare id>`) from the stamp both sides already carry. Same bundle, next run:
+`106 field(s) replayed, 0 failure(s)`. Not one of the 45 was an `Address*`/`Phone*` field — the parse
+only re-mints what it saves — so everything unstamped keeps its old key.
+
+*This is the whole argument for live-verifying a change that unit tests already cover.* 13 tests passed
+against the fill path while the submit path could not replay a single work-history field.
+
+**Two things the round changed on evidence, not reasoning:**
+- **The change budget was luck, not headroom.** Parse landings measured 8.4 · 9.0 · 9.4 · 10.5 · 12.9 ·
+  17.6s against a 20s budget — and past that budget a quiet form is taken at face value, which is
+  exactly when a late postback would overwrite a fill in progress. Now 45s (~2.5× the slowest observed),
+  free in the normal case because every run exited early on the change it saw.
+- **A rehearsal now states its own pacing.** The submit run never logged `[ATS-PACING]` while the fill
+  run always has, so two clean rehearsals had no ground truth for "was that hidden?" — `background:false`
+  at the call site is an intention, not an observation.

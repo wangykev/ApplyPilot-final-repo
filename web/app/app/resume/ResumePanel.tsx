@@ -36,7 +36,11 @@ type Pending = {
   fingerprint: string;
   decisions?: unknown[];
   corrections?: string[];
-  aiPlan?: { section: string; action: "update" | "add"; label: string; replaces: string | null; reason: string }[];
+  aiPlan?: {
+    section: string; action: "update" | "add"; label: string; replaces: string | null; reason: string;
+    // per-row field changes — what the merge actually edits inside a matched entry
+    fields?: { key: string; kind: "added" | "changed"; before: string; after: string }[];
+  }[];
 } | null;
 
 // Draft persistence: the editor survives navigating away and coming back, even
@@ -838,9 +842,14 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                   <span className="font-mono text-[10px] text-ink-faint">{changeCount(pending.diff)} change(s)</span>
                 </div>
 
-                {pending.aiPlan && pending.aiPlan.length > 0 && (
+                {/* ⚠ ONLY ROWS THAT ACTUALLY CHANGE SOMETHING (operator, 2026-08-16). The matcher
+                    emits a decision for EVERY entry it recognised, so an untouched entry still
+                    produced a row reading «X — replaces "X" · same role and company» — and a preview
+                    that is mostly no-ops buries the handful of real edits it exists to show. An `add`
+                    is always a change; an `update` only counts once it has field changes. */}
+                {pending.aiPlan && pending.aiPlan.filter((p) => p.action === "add" || (p.fields?.length ?? 0) > 0).length > 0 && (
                   <ul className="mt-3 space-y-2 border-b border-hairline pb-3">
-                    {pending.aiPlan.map((p, i) => (
+                    {pending.aiPlan.filter((p) => p.action === "add" || (p.fields?.length ?? 0) > 0).map((p, i) => (
                       <li key={i} className="text-sm">
                         <span
                           className={clsx(
@@ -851,8 +860,27 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                           {p.action}
                         </span>
                         <span className="text-ink">{p.label}</span>
-                        {p.replaces && <span className="text-ink-faint"> — replaces “{p.replaces}”</span>}
-                        {p.reason && <div className="ml-12 text-xs text-ink-faint">{p.reason}</div>}
+                        {p.replaces && p.replaces !== p.label && (
+                          <span className="text-ink-faint"> — replaces “{p.replaces}”</span>
+                        )}
+                        {/* WHAT ACTUALLY CHANGES. Without this the row states only the matching
+                            decision, so adding three role descriptions looked like a no-op. */}
+                        {p.fields && p.fields.length > 0 && (
+                          <ul className="ml-12 mt-1 space-y-0.5">
+                            {p.fields.map((f, k) => (
+                              <li key={k} className="text-xs">
+                                <span className={clsx("mr-1.5 font-mono", f.kind === "added" ? "text-verified" : "text-amber")}>
+                                  {f.kind === "added" ? "+" : "~"} {f.key}
+                                </span>
+                                {f.kind === "changed" && f.before && (
+                                  <span className="text-ink-faint line-through">{f.before}</span>
+                                )}
+                                {f.kind === "changed" && f.before && <span className="text-ink-faint"> → </span>}
+                                <span className="text-ink-faint">{f.after}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
                       </li>
                     ))}
                   </ul>
@@ -865,8 +893,15 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                   </p>
                 )}
 
+                {/* ⚠ ONE RENDERING PER CHANGE. This block used to repeat every entry the rows above
+                    already show — the same edit twice, once with values and once as a bare field
+                    name ("entry 1 … role_description"), which is what made a 10-change preview read
+                    as an unreadable wall. The ROWS own entry-level changes, because they show the
+                    actual before/after. What only lives here is what has no row: scalar sections
+                    like personal info, and flat value lists like skills. `s.entries` is therefore
+                    deliberately not rendered, and a section with nothing else in it is dropped. */}
                 <div className="mt-3 space-y-4">
-                  {pending.diff.sections.map((s) => (
+                  {pending.diff.sections.filter((s) => s.fields || s.values).map((s) => (
                     <div key={s.section}>
                       <div className="font-mono text-[11px] uppercase tracking-label text-amber">
                         {s.section.replace(/_/g, " ")}
@@ -878,39 +913,6 @@ export function ResumePanel({ initialStored, initialSource }: { initialStored: S
                               <span className="font-mono text-[11px] text-ink-faint">{f.field}</span>{" "}
                               <span className="text-ink-faint line-through">{f.before}</span>{" "}
                               <span className="text-ink-faint">→</span> <span className="text-ink">{f.after}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                      {s.entries && (
-                        <ul className="mt-1.5 space-y-1 text-sm">
-                          {s.entries.map((e, i) => (
-                            <li key={i}>
-                              {e.kind === "add" && (
-                                <>
-                                  <span className="mr-2 font-mono text-[10px] uppercase text-verified">add</span>
-                                  <span className="text-ink">{e.label}</span>
-                                </>
-                              )}
-                              {e.kind === "remove" && (
-                                <>
-                                  <span className="mr-2 font-mono text-[10px] uppercase text-signal">remove</span>
-                                  <span className="text-ink-faint line-through">{e.label}</span>
-                                </>
-                              )}
-                              {e.kind === "change" && (
-                                <>
-                                  <span className="mr-2 font-mono text-[10px] uppercase text-amber">
-                                    entry {e.index + 1}
-                                  </span>
-                                  <span className="text-ink-faint line-through">{e.before}</span>{" "}
-                                  <span className="text-ink-faint">→</span>{" "}
-                                  <span className="text-ink">{e.after}</span>
-                                  <div className="ml-12 font-mono text-[11px] text-ink-faint">
-                                    {e.fields.join(", ")}
-                                  </div>
-                                </>
-                              )}
                             </li>
                           ))}
                         </ul>

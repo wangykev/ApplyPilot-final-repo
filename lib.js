@@ -776,6 +776,58 @@ function isSignatureDateQuestion(label) {
   if (SIG_DATE_OTHER_EVENT_RE.test(t)) return false;   // names a different event — never today
   return SIG_DATE_RE.test(t) || SIG_DATE_EXPLICIT_RE.test(t);
 }
+// ── SECURITY CLEARANCE: STATED OR NOT ANSWERED (operator, 2026-08-18) ───────────────────────────────
+// Lives here, not in ats.js, because BOTH engines need the identical judgement: the ATS driver reaches
+// it through `atsLib.*` and the Workday driver through `apMatch.*`. A clearance is a FACTUAL claim about
+// the applicant and claiming one you do not hold is serious, so there is one definition of what counts
+// as a clearance question and what may be offered for it.
+//
+// Aliases are strictly SIDEWAYS — the same clearance as other forms word it. Never a promotion: a
+// Secret must never be offered Top Secret, and an interim grade must never be offered the full one.
+const CLEARANCE_ALIASES = {
+  "top secret/sci": ["TS/SCI", "Top Secret / SCI", "Top Secret with SCI", "TS SCI"],
+  "top secret/sci with ci polygraph": ["TS/SCI with CI Poly", "TS/SCI CI Poly", "Top Secret/SCI CI Polygraph"],
+  "top secret/sci with full scope polygraph": ["TS/SCI with FSP", "TS/SCI Full Scope Polygraph", "TS/SCI FSP", "TS/SCI with Poly"],
+  "top secret": ["TS", "Top-Secret"],
+  secret: ["S"],
+  confidential: ["C"],
+  "public trust": ["Public Trust (Tier 2)", "MBI", "NACI", "Public Trust/Suitability"],
+  "interim secret": ["Interim Secret Clearance"],
+  "interim top secret": ["Interim Top Secret Clearance", "Interim TS"],
+  "doe l": ["DOE L Clearance", "L Clearance"],
+  "doe q": ["DOE Q Clearance", "Q Clearance"],
+  "yankee white": ["Yankee White Clearance"],
+};
+function clearanceAliases(level) {
+  const k = String(level == null ? "" : level).replace(/\s+/g, " ").trim().toLowerCase();
+  return CLEARANCE_ALIASES[k] || [];
+}
+// Does this label ask what clearance the applicant HOLDS? Returns null for anything else — including,
+// deliberately, a WILLINGNESS or ELIGIBILITY question ("are you willing to obtain", "eligible to
+// obtain", "can you be sponsored for a clearance"). Those ask about the FUTURE, and a currently-held
+// level answers them wrongly in BOTH directions: a cleared applicant is not necessarily willing, and an
+// uncleared one is not necessarily unwilling. Same discipline as the export-control bail.
+const CLEARANCE_ASK_RE = /\bclearance\b|\bcleared\b|\bsci\b|\bpolygraph\b/i;
+const CLEARANCE_FUTURE_RE = /willing|able to obtain|eligible|obtainable|can you (obtain|get)|sponsor/i;
+function recognizeClearanceQuestion(label) {
+  const t = String(label == null ? "" : label).replace(/\s+/g, " ").trim();
+  if (!t || !CLEARANCE_ASK_RE.test(t)) return null;
+  if (CLEARANCE_FUTURE_RE.test(t)) return null;
+  return { kind: "held" };
+}
+// What may be offered for a clearance question, given what the profile STATES.
+// ⚠ EMPTY ≠ "None": empty means the operator has not told us — `{unstated:true}`, answer nothing — while
+// "None" is a stated fact that answers a yes/no with No. ONE tiered list serves both shapes the question
+// takes (a level list and a yes/no), because the match ladder only ever commits an exact or
+// leading-polarity hit: on a level list the level matches and the polarity tokens are ignored; on a
+// yes/no widget the level matches nothing and the polarity answers it.
+function clearanceCandidates(stored) {
+  const sc = String(stored == null ? "" : stored).replace(/\s+/g, " ").trim();
+  if (!sc) return { unstated: true };
+  if (/^none$/i.test(sc)) return { candidates: ["None", "No clearance", "No", "False"], level: "None", none: true };
+  return { candidates: [sc, ...clearanceAliases(sc), "Yes", "True"], level: sc, none: false };
+}
+
 // Do two strings name the SAME calendar date? Workday re-formats what we typed — it displays
 // "05/01/2028" for an approved "5/1/2028" — and a plain string compare calls that a contradiction,
 // which BLOCKS submit over pure zero-padding (live, Home Depot 2026-08-04).
@@ -1172,6 +1224,35 @@ function websiteDeletionPlan(entries) {
 // Stable per-JOB identity for tracker dedup. A Workday application URL VARIES across runs AND hosts:
 // the POSTING the user pastes is <tenant>.wdN.myworkdayjobs.com (tenant in the SUBDOMAIN), but after
 // login the form is on wdN.myworkdaysite.com (tenant in the PATH, /recruiting/<tenant>/ — NOT the
+// ── SECRET REDACTION — nothing we PERSIST or SEND may carry a session token ───────────────
+// A job description is scraped text, and scraped text can contain a URL that is itself a
+// credential. Live 2026-08-16: an iCIMS candidate page's bootstrap script was stored as the job
+// description, and it embedded the one-time magic-link session token — `?from=login&eem=…&code=…`.
+// That single string then travelled to THREE places, and each is a real exposure:
+//   • the tracker row in Supabase (at rest, indefinitely),
+//   • every AI prompt the JD grounds (the JD is sent to the model provider verbatim),
+//   • the run's own log lines.
+// The scrape no longer picks up script text (see scrapeJobPosting), which removes the way it got in.
+// This is the BELT: the JD is prose from an untrusted page, so any future path that puts a token in
+// it is caught here rather than discovered later. Cheap, pure and unit-pinned.
+//
+// Deliberately REDACTS THE VALUE AND KEEPS THE KEY: "eem=<redacted>" still shows a reader that a
+// magic link was present, which is exactly what you want to see when diagnosing a leak, while
+// carrying nothing usable. Names cover the iCIMS pair plus the usual credential-ish query keys; the
+// match is on the KEY, so a token whose value merely looks random is never guessed at.
+var SECRET_QUERY_KEYS = /\b(eem|code|token|access[_-]?token|id[_-]?token|refresh[_-]?token|auth|apikey|api[_-]?key|key|sig|signature|password|passwd|pwd|secret|session|sessionid|jsessionid|validitytoken)\b/i;
+function redactSecrets(text) {
+  const s = String(text == null ? "" : text);
+  if (!s) return s;
+  // Query/fragment pairs: `key=value` where the value runs to the next separator. Anchored on a URL
+  // separator — `?` or `&`, `;` (which iCIMS uses), and `#` — so a bare `code=` inside prose ("use
+  // code=X in your build") is left alone; only something already shaped like a URL parameter is
+  // rewritten. `#` is in the set because an OAuth implicit-flow token lives in the FRAGMENT, which a
+  // query-only pattern misses entirely (caught by this file's own test, not by review).
+  return s.replace(/([?&;#])([A-Za-z0-9_-]{2,24})=([^\s&;#"'<>)\]]+)/g, (m, sep, key, val) =>
+    (SECRET_QUERY_KEYS.test(key) && val.length >= 6 ? sep + key + "=<redacted>" : m));
+}
+
 // subdomain), with a per-application-instance tail. The one token common to BOTH hosts is the
 // data-center (wd3, wd5, …); combined with the requisition id (…_R00244793, present in both paths) it
 // gives a key — "<dc>:r<reqid>" — that collapses the posting + every form/instance/query variant to
@@ -2373,10 +2454,11 @@ function reportOutcome(status) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-  groupSelection, joinGroupValue, splitGroupValue, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
+  groupSelection, joinGroupValue, splitGroupValue, GROUP_JOIN, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
+  recognizeClearanceQuestion, clearanceCandidates, clearanceAliases, CLEARANCE_ALIASES,
   skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
   skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
   rejectedValueEntries,
   isPlaceholderOption, withoutPlaceholderOptions,
-  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthRefusal, BLANK_PAGE_BOILERPLATE_MAX, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
+  isPlaceholderOption, withoutPlaceholderOptions, parseYearMonth, parseYearMonthDay, parseRepeatingFkit, parseNestedFkit, meaningfulEntries, meaningfulWorkExperience, sortWorkExperienceByRecency, workExperienceRecency, parseYear, joinBullets, ensureHttps, isFluent, normalize, fuzzyRatio, matchCandidates, isPolarityToken, polarityLeadIndex, sessionLooksDead, isWorkdayMaintenance, cdpPageKey, AI_NEEDS_ANSWER_MARK, isAiPlaceholder, unreplacedPlaceholders, parseErrorFieldName, errorSetUnchanged, normalizeLabel, errorLabelKey, mappedFieldsFromErrors, expandErrorSamples, externalGateHalt, isSelfIdPage, isDuplicateLanguageError, languageEntriesFromResults, languageDeletionPlan, isDuplicateWebsiteError, websiteEntriesFromResults, websiteDeletionPlan, duplicateErrorSection, sectionEntriesFromResults, sectionDeletionPlan, findLiveSection, liveDupEntries, newlyRequiredGaps, requiredBlankOnPage, requiredBlankByLabel, requiredEntriesAbsentFromScan, cascadeEntryFor, dateOrderOf, canonicalJobUrl, redactSecrets, SECRET_QUERY_KEYS, reconcileReviewPage, APPLY_BUTTON_CHAIN, APPLY_REJECT, pickApplyTarget, classifyAuthOutcome, ONBOARD_VERIFY_RX, ONBOARD_WRONG_RX, isWorkdaySoftError, looksLikeSso, isWorkdayHost, isBlankAuthPage, blankAuthRefusal, BLANK_PAGE_BOILERPLATE_MAX, blankAuthPersists, BLANK_AUTH_MIN_READS, jobPageSettleStep, isAlreadyApplied, tenantCompanyFromUrl, classifyWorkdayPage, applyChainStuckMixed, isMyApplicationsPage, applicationStatusOf, reqIdFromUrl, pickApplicationRow, phantomRequiredTargets, devLogFormat, devLogAppend, devLogSelect, REGION_ABBREV };
 }

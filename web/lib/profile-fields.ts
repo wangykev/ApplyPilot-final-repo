@@ -40,6 +40,35 @@ export const DISABILITY_STATUS_OPTIONS = [
   "Yes, I have a disability (or previously had one)",
   "I do not wish to answer",
 ];
+/**
+ * US security clearances, lowest to highest, with the DOE and niche ones after the ladder.
+ *
+ * ⚠ A CLEARANCE IS A FACTUAL CLAIM, and claiming one you do not hold is a serious matter — so the
+ * blank (unset) entry and "None" mean DIFFERENT things and both are needed. Blank = "I have not told
+ * ApplyPilot", which leaves a clearance question for the human (the extension refuses to guess and
+ * never lets the AI answer it). "None" = "I hold no clearance", a real, statable answer that fills
+ * "Do you have an active clearance?" with No deterministically.
+ *
+ * "Public Trust" is not strictly a clearance but is offered by most federal-contractor forms in the
+ * same dropdown, so it belongs in the same list. Interim grades are listed because forms ask for them
+ * specifically and an interim Secret is not a Secret.
+ */
+export const SECURITY_CLEARANCE_OPTIONS = [
+  "",
+  "None",
+  "Public Trust",
+  "Confidential",
+  "Interim Secret",
+  "Secret",
+  "Interim Top Secret",
+  "Top Secret",
+  "Top Secret/SCI",
+  "Top Secret/SCI with CI Polygraph",
+  "Top Secret/SCI with Full Scope Polygraph",
+  "DOE L",
+  "DOE Q",
+  "Yankee White",
+];
 
 // ── field metadata ──
 /** How the answer editor renders a given profile field. */
@@ -81,6 +110,7 @@ const META: Record<string, ProfileFieldMeta> = {
   "work_authorization.requires_sponsorship_future": { widget: "tribool", bucketWidget: "radio" },
   "work_authorization.permanent_resident": { widget: "tribool", bucketWidget: "radio" },
   "work_authorization.citizenship_country": { widget: "candidate", dropdownMode: "country", bucketWidget: "dropdown" },
+  "work_authorization.security_clearance": { widget: "dropdown", options: SECURITY_CLEARANCE_OPTIONS, bucketWidget: "dropdown" },
 
   // how_did_you_hear
   "how_did_you_hear.preferred": { widget: "tiered", bucketWidget: "typeahead" },

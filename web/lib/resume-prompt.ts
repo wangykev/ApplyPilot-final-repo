@@ -14,7 +14,12 @@ export function buildResumePrompt(resumeText: string): { system: string; user: s
     "NEVER invent facts (emails, phone numbers, dates, employers). If it isn't in the resume, leave it blank.",
     "Dates: work_experience.from/to and certifications dates as \"YYYY-MM\" or \"YYYY-MM-DD\"; education from_year/to_year as \"YYYY\".",
     "Tiered fields (degree, field_of_study, country, country_phone_code, certification) are arrays, most-specific first.",
-    "work_experience[].role_description is ONE paragraph (a few sentences) describing the role — how it would fill a single Workday text box, NOT a bulleted list.",
+    // ⚠ EVERY BULLET, VERBATIM — this asked for "one paragraph (a few sentences)" until 2026-08-16,
+    // and a summarising instruction is a LOSSY one: the operator's third bullet was simply dropped on
+    // every role. The field fills a single text box, which is why it must stay plain text — but plain
+    // text and complete are not in tension: newline-separated bullets fill a textarea perfectly well.
+    // Same rule projects[] already had; work experience was the odd one out.
+    "work_experience[].role_description is the role's bullet points VERBATIM — EVERY bullet, none omitted, none summarised or merged, in resume order, one per LINE separated by \\n, each line prefixed with \"- \". It fills a single plain text box, so plain text only — but it must be COMPLETE.",
     "work_experience[].currently_work_here is a boolean: true when the role has no end date or says Present/Current, else false.",
     "education[].graduation_date is \"YYYY-MM\" when the resume shows an (expected) graduation month/year; education[].coursework is the 'Relevant Coursework' course list, one string per course.",
     "projects[] mirror the resume's Projects section: bullets VERBATIM (one string per bullet), tech_stack from the project's tech line.",
@@ -105,6 +110,27 @@ export function deriveCurrentlyWorkHere(profile: Profile): Profile {
     if (w.currently_work_here != null) continue;
     const to = (w.to ?? "").trim().toLowerCase();
     w.currently_work_here = to === "" || to === "present" || to === "current";
+  }
+  return profile;
+}
+/**
+ * Prefix every role-description line with "- ".
+ *
+ * ⚠ DONE HERE, NOT LEFT TO THE PROMPT. The prompt asks for it too, but a model that forgets on one
+ * role out of four produces a description that is inconsistent with its neighbours — and that is
+ * exactly the kind of near-miss nobody notices until it is on an employer's form. Deterministic
+ * post-processing makes the shape a property of the output rather than a request.
+ *
+ * IDEMPOTENT by construction: an existing "-", "–", "—" or "•" marker is normalised rather than
+ * stacked, so re-parsing never yields "- - Developed…". Blank lines are dropped, not bulleted.
+ */
+export function bulletizeRoleDescriptions<T>(profile: T): T {
+  const p = profile as unknown as { work_experience?: { role_description?: unknown }[] };
+  for (const role of Array.isArray(p?.work_experience) ? p.work_experience : []) {
+    if (!role || typeof role.role_description !== "string") continue;
+    const lines = role.role_description.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    if (!lines.length) continue;
+    role.role_description = lines.map((l) => "- " + l.replace(/^\s*[-–—•*]+\s*/, "")).join("\n");
   }
   return profile;
 }

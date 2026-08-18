@@ -1531,3 +1531,102 @@ pages arrived pre-filled (`dropdown-prefilled-kept`). Reported for completeness,
 reached REVIEW after 5 pages, fills 7.1 · 7.3 · 4.1 · 8.8 · 5.8s (33.1s), all five M40 audits "all matched
 the report". **Use a genuinely unused requisition for any timing comparison** — this one is only evidence
 that the change is safe on the resume path.
+
+---
+
+## Round 11 (2026-08-17) — iCIMS: hidden is 2.24× visible, and the cause is NOT drift
+
+First tenant measured in the **`hidden-SLOW (no worker timers)`** regime. Round 6's table calls that
+regime "a documented code path with a label that has never once been OBSERVED" — it is observed now, on
+every iCIMS run, because iCIMS DECLINES the worker-timer polyfill (its sign-in gate is guarded by
+invisible hCaptcha, which does not initialise under the polyfill — see `docs/dom-patterns.md`
+`2026-08-16 (c)`). So the standing conclusions below were re-tested here rather than assumed.
+
+**A/B, same build, same form, both labels MEASURED (never the `background:` flag), Chrome untouched
+during each run so polling could not activate a tab:**
+
+| | HIDDEN | VISIBLE |
+|---|---|---|
+| pacing label | `hidden-SLOW (no worker timers)` | `visible-fast` |
+| fill total | **37.2s** | **16.6s** |
+| per field | 348ms | 155ms |
+| **sum of per-field times** | **26.5s** | **6.5s** |
+| slowest field | 2.38s | 0.98s |
+| fields ≥1s | 7 | 0 |
+| `[PACE]` overrun total | ~1.1s (1 warning) | ~2.5s (3 warnings) |
+| `[LLM]` calls | **0** | **0** |
+
+### What that says
+
+1. **The gap is per-field PAGE CONTACT, not our timers.** Field time is 26.5s vs 6.5s — a 4× ratio that
+   accounts for the whole 20.6s difference; non-field overhead is flat (10.7s vs 10.1s). It is
+   `cdpAdaptiveDelay` behaving as designed: FULL pacing when hidden and worker timers are unavailable,
+   ~10× faster when visible.
+2. **⚠ Standing conclusion 1 does NOT transfer to this tenant.** Drift is ~1.1s of 37.2s here, and the
+   VISIBLE run had the WORSE overrun (2.5s). On Workday a single `delay(250)` was measured at 17.3s; the
+   worst here is 250ms → 1322ms. Do not arrive at an iCIMS slowness with "it's the SW timers".
+3. **The LLM is absent entirely.** 0 calls on a 107-field form, because the iCIMS mapping is now
+   deterministic. So "a slow page is the LLM until proven otherwise" has nothing to subtract here — this
+   is the rare fill where page contact really is the whole cost.
+4. Round 4's shape holds anyway: median field is FAST (47 of 107 under 50ms), and a tail of 7 fields at
+   1.6–2.4s carries ~11s of the 26.5s.
+
+### ⛔ DO NOT "fix" this by re-enabling the worker-timer polyfill
+
+The obvious optimisation is to give the FORM the polyfill and keep it off only for the gate. **Measured
+2026-08-17: the application form carries its own captcha** — `hcaptchaFrames: 2`, `recaptchaFrames: 1`,
+one `[data-sitekey]` widget and one `h-captcha-response` input. So the final **Submit Profile is
+captcha-gated exactly like the sign-in**, and the failure mode is already known and silent: under the
+polyfill hCaptcha never initialises, the submit event fires, iCIMS disables its own button, and nothing
+comes back. Trading a 20s hidden fill for a submit that cannot complete is the wrong direction.
+
+### The remaining lever — TESTED in round 12 below, and it worked
+
+Allow the FAST pace on iCIMS even when hidden. The full pace exists to wait out Workday's debounced
+REACT re-renders; iCIMS is server-rendered jQuery with no React (`docs/dom-patterns.md` 2026-08-16), and
+every pace site here is gated by a read-back or a poll — so by standing conclusion 3 a too-short wait
+costs a RETRY, not a miss. Plausible, and it would close most of the 20.6s. Not attempted yet: it is a
+pacing change on a tenant whose correctness was only just established (rehearsal 109 replayed / 0
+failures), so it wants its own round with the verify count as the acceptance test.
+
+---
+
+## Round 12 (2026-08-17) — fast pacing while HIDDEN closes the iCIMS gap entirely
+
+Round 11's untested lever, tried. `cdpSetFastWhenHidden(true)` — a scoped per-run opt-in, sibling of
+`cdpSetSyntheticInput` / `cdpSetPageClock`, reset at every `cdpAttach` — makes `cdpFast()` return true on
+a hidden tab for a page whose reactions are not page-timer driven. Enabled for iCIMS on both the fill and
+the submit path, right where the worker-timer decline happens, because it exists to compensate for it.
+
+**A DIFFERENT AXIS from the page clock**, and worth keeping straight: `cdpSetPageClock` chooses WHERE a
+pace sleeps (the page's worker-backed timer vs the starved SW one) and needs the polyfill iCIMS declines.
+This chooses HOW LONG the pace is.
+
+| | HIDDEN before | VISIBLE | **HIDDEN + fast** |
+|---|---|---|---|
+| pacing label | `hidden-SLOW (no worker timers)` | `visible-fast` | `hidden-fast (page-clock-independent)` |
+| fill total | 37.2s | 16.6s | **15.1s** |
+| per field | 348ms | 155ms | **141ms** |
+| sum of per-field times | 26.5s | 6.5s | **7.8s** |
+| slowest field | 2.38s | 0.98s | **1.18s** |
+| `needs_review` | 4 | 4 | **4** |
+| `[ATS-FILL]` needs_review/error | 0 | 0 | **0** |
+
+**Hidden is now at parity with visible — marginally faster, which is noise, not a win.** The 2.24x gap is
+gone, and the whole of it was the per-field pace.
+
+**Acceptance test was the REHEARSAL, not the clock.** A faster fill that quietly commits less is the
+failure this could have caused, so the pass condition was the strict verify: `107 field(s) replayed,
+0 failure(s)` then `WOULD CLICK SUBMIT`. Plus the fill's own `needs_review` count unchanged at 4 and zero
+field-level errors. Timing alone would not have been evidence.
+
+**Why it is safe rather than lucky**, restated because it is the load-bearing part: it applies the SAME
+`FAST_FACTOR` (0.1) every VISIBLE run already uses — no new timing regime — and every adaptive-pace site
+is gated by a read-back or a poll, so a too-short wait costs a RETRY, never a silent wrong fill
+(standing conclusion 3: a monotone or stability predicate is noticed late, never missed). iCIMS earns the
+claim specifically: server-rendered jQuery, no React, so a pace waits on an AJAX reply (network events
+are not timer-throttled) or a synchronous DOM write after a native setter.
+
+⚠ **Do not generalise this to Workday.** There the full hidden pace exists to wait out debounced REACT
+re-renders, which genuinely ride the ~1Hz throttle — the regime standing conclusion 1 measured. The
+opt-in is per-run and resets at attach precisely so it cannot leak there.

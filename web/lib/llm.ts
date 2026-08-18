@@ -8,7 +8,7 @@
 
 import {
   llmKeysFor, resolveLlmRoute, orderLlmKeys, classifyLlmFailure, applyLlmKeyOutcome, newLlmKeyState,
-  type LlmKey, type LlmKeyState, type LlmActionInput, type LlmThinking,
+  type LlmKey, type LlmKeyState, type LlmActionInput, type LlmThinking, type LlmRouteAttempt,
 } from "@/lib/llm-keys";
 
 export type LlmProvider = "anthropic" | "gemini" | "openai";
@@ -371,7 +371,7 @@ export async function callLLMForAction(
   fetchImpl: typeof fetch = fetch
 ): Promise<LlmResult> {
   const cfg = (config ?? {}) as { preferFreeFirst?: boolean };
-  const attempts = resolveLlmRoute(config, action, LLM_DEFAULT_MODELS);
+  const attempts = llmExpandAutoAttempts(resolveLlmRoute(config, action, LLM_DEFAULT_MODELS));
   if (!attempts.length) return { ok: false, error: "No AI model configured — set one on the AI page." };
 
   let state = newLlmKeyState();
@@ -547,6 +547,43 @@ export const LLM_AUTO_MODEL = "auto";
 export const LLM_AUTO_CANDIDATES: Partial<Record<LlmProvider, string[]>> = {
   gemini: ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite"],
 };
+
+/**
+ * Expand any `auto` slot into ONE ATTEMPT PER CANDIDATE — the server-side twin of the extension's
+ * `llmExpandAutoAttempts` (llm.js).
+ *
+ * ⚠ WITHOUT THIS THE DEFAULT CONFIG IS BROKEN, not merely unoptimised. "auto" is stored as a literal
+ * model id, and the doc above says the EXTENSION resolves it — which left every SERVER-side caller
+ * (résumé parse, cover letter, teach) POSTing `models/auto` to the provider. Google answers
+ * `404 models/auto is not found for API version v1beta`, so a user on the shipped default hit it on
+ * their first parse. Reported live 2026-08-16.
+ *
+ * The extension picks by MEASURED latency; the server has no such measurements, so it takes the
+ * documented candidate ORDER, which is already best-observed-first (see the 20× note above) — and,
+ * because these become successive attempts, a candidate that is down simply falls through to its
+ * sibling instead of ending the call. That is the same in-call failover the extension gets.
+ * Dedupe key matches the extension's, keyId included, so pinning composes with auto.
+ */
+export function llmExpandAutoAttempts(slots: LlmRouteAttempt[]): LlmRouteAttempt[] {
+  const out: LlmRouteAttempt[] = [];
+  const seen = new Set<string>();
+  for (const slot of Array.isArray(slots) ? slots : []) {
+    if (!slot || typeof slot !== "object") continue;
+    const models = slot.model === LLM_AUTO_MODEL
+      ? (LLM_AUTO_CANDIDATES[slot.provider] || [])
+      : [slot.model];
+    // An `auto` slot for a provider with no candidate list would otherwise vanish silently and take
+    // the user's only configured model with it — keep it, and let the provider report the truth.
+    const list = models.length ? models : [slot.model];
+    for (const model of list) {
+      const k = [slot.provider, model, slot.thinking || "off", slot.effort || "", slot.keyId || ""].join("|");
+      if (seen.has(k)) continue;
+      seen.add(k);
+      out.push(slot.model === LLM_AUTO_MODEL ? { ...slot, model } : slot);
+    }
+  }
+  return out;
+}
 
 export const LLM_PROVIDER_LABELS: Record<LlmProvider, string> = {
   gemini: "Google Gemini",

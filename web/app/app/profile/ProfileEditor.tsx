@@ -35,6 +35,7 @@ import {
   RACE_ETHNICITY_OPTIONS,
   VETERAN_STATUS_OPTIONS,
   DISABILITY_STATUS_OPTIONS,
+  SECURITY_CLEARANCE_OPTIONS,
 } from "@/lib/profile-fields";
 import { saveProfile, saveBuckets } from "./actions";
 import { liveSync } from "@/lib/extension-sync";
@@ -83,6 +84,11 @@ function withDefaultWebsites(list: { type: string; url: string }[] | undefined) 
 // to a non-empty list keeps theirs. "Other" ships as the last default entry (the catch-all), so
 // there's no separate "last resort" field anymore.
 const DEFAULT_SOURCE_LADDER = ["LinkedIn", "Handshake", "GitHub", "Other"];
+/** The canonical employment-option words, in the order the fill should try them. Kept here so the
+ *  editor and the profile agree on spelling — a form's own wording is matched through the ordinary
+ *  ladder, so these do not have to equal any one tenant's labels. */
+const EMPLOYMENT_TYPES = ["Full-time", "Part-time", "Internship", "Temporary"] as const;
+
 function withDefaultSources(h: Profile["how_did_you_hear"] | undefined) {
   const preferred =
     Array.isArray(h?.preferred) && h!.preferred.length > 0 ? h!.preferred : [...DEFAULT_SOURCE_LADDER];
@@ -98,6 +104,7 @@ const YES_NO_DECLINE = opt(YES_NO_DECLINE_OPTIONS);
 const RACE_ETHNICITY = opt(RACE_ETHNICITY_OPTIONS);
 const VETERAN_STATUS = opt(VETERAN_STATUS_OPTIONS);
 const DISABILITY_STATUS = opt(DISABILITY_STATUS_OPTIONS);
+const SECURITY_CLEARANCE = opt(SECURITY_CLEARANCE_OPTIONS);
 
 export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; initialBuckets: Bucket[] }) {
   // The seeded baseline (initial + default website/source rows). Used for BOTH the live
@@ -291,7 +298,39 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
               </div>
               <div className="mt-4 space-y-4">
                 <TextAreaField label="Role description" bulletOnEnter bucketPath={i === 0 ? "work_experience.0.role_description" : undefined} value={w.role_description} rows={5} placeholder={"- Led the redesign of…\n- Shipped…"} onChange={(v) => update((p) => { p.work_experience[i].role_description = v; })} />
-                <TagListField label="Tech stack" value={w.tech_stack} onChange={(v) => update((p) => { p.work_experience[i].tech_stack = v; })} />
+                {/* Tech stack has no editor any more (operator, 2026-08-16). The FIELD is kept on the
+                    schema on purpose: the resume parse still populates it and smart merge folds it
+                    into the skills list, so deleting it would quietly drop data the merge depends on.
+                    It simply is not something to maintain by hand. */}
+              </div>
+              {/* ── Employer detail some ATSs ask for (iCIMS asks for all of it) ────────────── */}
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <TextField label="Employer address" bucketPath={i === 0 ? "work_experience.0.employer_address" : undefined} value={w.employer_address} onChange={(v) => update((p) => { p.work_experience[i].employer_address = v; })} />
+                <TextField label="Employer ZIP / postal code" bucketPath={i === 0 ? "work_experience.0.employer_postal_code" : undefined} value={w.employer_postal_code} onChange={(v) => update((p) => { p.work_experience[i].employer_postal_code = v; })} />
+                <TextField label="Supervisor's name" bucketPath={i === 0 ? "work_experience.0.supervisor_name" : undefined} value={w.supervisor_name} onChange={(v) => update((p) => { p.work_experience[i].supervisor_name = v; })} />
+                <TextField label="Supervisor's title" bucketPath={i === 0 ? "work_experience.0.supervisor_title" : undefined} value={w.supervisor_title} onChange={(v) => update((p) => { p.work_experience[i].supervisor_title = v; })} />
+              </div>
+              <div className="mt-4 space-y-4">
+                <TextAreaField label="Reason for leaving" bucketPath={i === 0 ? "work_experience.0.reason_for_leaving" : undefined} value={w.reason_for_leaving} rows={2} onChange={(v) => update((p) => { p.work_experience[i].reason_for_leaving = v; })} />
+                {/* ⚠ TRI-STATE, and the two contact boxes appear ONLY on an explicit Yes. Answering
+                    this is what authorises a recruiter to ring a past employer, so an unanswered
+                    question must not look the same as "no" — and the details must not sit there
+                    inviting entry when nothing has been agreed to. The filler applies the same gate,
+                    so clearing this back to unanswered withholds them again. */}
+                <TriBoolField
+                  label="May we contact this employer?"
+                  bucketPath={i === 0 ? "work_experience.0.may_contact" : undefined}
+                  value={w.may_contact}
+                  onChange={(v) => update((p) => { p.work_experience[i].may_contact = v; })}
+                  ladder={profile.answer_ladders?.["work_experience.0.may_contact"]}
+                  onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_experience.0.may_contact"] = n; })}
+                />
+                {w.may_contact === true && (
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                    <TextField label="Employer email" bucketPath={i === 0 ? "work_experience.0.employer_email" : undefined} value={w.employer_email} onChange={(v) => update((p) => { p.work_experience[i].employer_email = v; })} />
+                    <TextField label="Employer phone number" bucketPath={i === 0 ? "work_experience.0.employer_phone" : undefined} value={w.employer_phone} onChange={(v) => update((p) => { p.work_experience[i].employer_phone = v; })} />
+                  </div>
+                )}
               </div>
             </EntryCard>
           ))}
@@ -464,8 +503,12 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <TriBoolField label="Permanent resident" bucketPath="work_authorization.permanent_resident" value={profile.work_authorization.permanent_resident} onChange={(v) => update((p) => { p.work_authorization.permanent_resident = v; })} ladder={profile.answer_ladders?.["work_authorization.permanent_resident"]} onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_authorization.permanent_resident"] = n; })} />
           <TextField label="Current visa status" bucketPath="work_authorization.current_visa_status" value={profile.work_authorization.current_visa_status} onChange={(v) => update((p) => { p.work_authorization.current_visa_status = v; })} />
         </div>
-        <div className="mt-4">
+        <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <CandidateField label="Citizenship country" mode="dropdown" bucketPath="work_authorization.citizenship_country" value={profile.work_authorization.citizenship_country} countries={COUNTRIES} expand={countryCandidates} onChange={(v) => update((p) => { p.work_authorization.citizenship_country = v; })} />
+          {/* ⚠ Blank and "None" are DIFFERENT answers: blank leaves a clearance question to you (the
+              extension refuses to guess one and keeps the AI away from it), while "None" is a stated
+              fact that answers "do you hold an active clearance?" with No. */}
+          <SelectField label="Security clearance" bucketPath="work_authorization.security_clearance" value={profile.work_authorization.security_clearance} options={SECURITY_CLEARANCE} onChange={(v) => update((p) => { p.work_authorization.security_clearance = v; })} />
         </div>
         <SectionRemembered items={rememberedFor("Work authorization")} {...fieldRowProps} />
       </SectionCard>
@@ -539,6 +582,27 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
           <DateField label="Earliest start date" granularity="month-day-year" bucketPath="screening.earliest_start_date" value={profile.screening.earliest_start_date} onChange={(v) => update((p) => { p.screening.earliest_start_date = v; })} />
           <TextField label="Total years of experience" bucketPath="screening.years_of_experience_total" value={profile.screening.years_of_experience_total} onChange={(v) => update((p) => { p.screening.years_of_experience_total = v; })} />
           <TextField label="Salary expectation" bucketPath="screening.salary_expectation" value={profile.screening.salary_expectation} onChange={(v) => update((p) => { p.screening.salary_expectation = v; })} />
+        </div>
+        {/* Employment types considered — a MULTI-answer preference, so it lives with the other
+            screening preferences rather than in a card of its own. */}
+        <div className="mt-4">
+          <FieldLabel>Employment types you'd consider</FieldLabel>
+          <div className="flex flex-wrap gap-x-8 gap-y-2">
+          {EMPLOYMENT_TYPES.map((t) => (
+            <CheckboxField
+              key={t}
+              label={t}
+              bucketPath={t === EMPLOYMENT_TYPES[0] ? "employment_types_considered" : undefined}
+              checked={profile.employment_types_considered.includes(t)}
+              onChange={(on) => update((p) => {
+                // Kept in the canonical order above rather than click order, so the fill tries them
+                // in a stable sequence and two profiles with the same ticks are the same answer.
+                const next = EMPLOYMENT_TYPES.filter((x) => (x === t ? on : p.employment_types_considered.includes(x)));
+                p.employment_types_considered = next;
+              })}
+            />
+          ))}
+        </div>
         </div>
         <SectionRemembered items={rememberedFor("Screening")} {...fieldRowProps} />
       </SectionCard>

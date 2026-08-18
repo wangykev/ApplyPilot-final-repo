@@ -17,6 +17,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import Link from "next/link";
+import { Eye, EyeOff } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 import type { ReviewBundle, ReviewEntry, FieldShape, WalkStatus } from "@/lib/review-summary";
 import {
@@ -84,10 +85,14 @@ export function ReviewEditor({
   appId,
   initialBundle,
   canPersist,
+  credentials,
 }: {
   appId: string;
   initialBundle: ReviewBundle;
   canPersist: boolean;
+  // The account's OWN stored login, read from `credentials_json` server-side — NOT from the bundle,
+  // which carries only a placeholder for these fields by design. Absent when none is stored.
+  credentials?: { email: string; password: string } | null;
 }) {
   const [bundle, setBundle] = useState<ReviewBundle>(initialBundle);
   const [filter, setFilter] = useState<Filter>("all");
@@ -488,8 +493,8 @@ export function ReviewEditor({
   // shared props threaded into the field renderer — STABLE (memoized over stable callbacks) so a
   // field row's ref-registration effect doesn't re-run on every keystroke elsewhere on the page.
   const ctx = useMemo<RowCtx>(
-    () => ({ commit, setApproved, setTiers, registerRow, jumpTo, addBack: addBackEntry, leaveRemoved }),
-    [commit, setApproved, setTiers, registerRow, jumpTo, addBackEntry, leaveRemoved]
+    () => ({ commit, setApproved, setTiers, registerRow, jumpTo, addBack: addBackEntry, leaveRemoved, credentials }),
+    [commit, setApproved, setTiers, registerRow, jumpTo, addBackEntry, leaveRemoved, credentials]
   );
 
   return (
@@ -629,6 +634,7 @@ type RowCtx = {
   jumpTo: (e: ReviewEntry) => void;
   addBack: (removed: ReviewEntry) => void; // Phase 2: reconstruct a removed_entry PREFILLED
   leaveRemoved: (removed: ReviewEntry) => void; // Phase 2: accept the removal (approve the card)
+  credentials?: { email: string; password: string } | null; // for credential fields — see FieldEditor
 };
 
 // ── the FIELD LIST (grouped by page → section, collapsible, repeating entries + nested) ──
@@ -829,7 +835,8 @@ function SectionGroup({
         />
       );
       const own = vis.filter((e) => !nestedInfoOf(e));
-      for (const e of own) body.push(<FieldRow key={e.field_id} e={e} ctx={ctx} />);
+      for (const g of groupByQuestion(own))
+        body.push(<QuestionRow key={Array.isArray(g) ? g[0].field_id : g.field_id} g={g} ctx={ctx} />);
       // nested sub-sections (cert ▸ specialties)
       const nestedByChild: Record<string, { e: ReviewEntry; ni: NestedInfo }[]> = {};
       const childOrder: string[] = [];
@@ -859,8 +866,8 @@ function SectionGroup({
         );
     }
   } else {
-    for (const e of items.filter((e) => !e.is_deleted && filterPass(e) && e.widget_type !== "removed_entry"))
-      body.push(<FieldRow key={e.field_id} e={e} ctx={ctx} />);
+    for (const g of groupByQuestion(items.filter((e) => !e.is_deleted && filterPass(e) && e.widget_type !== "removed_entry")))
+      body.push(<QuestionRow key={Array.isArray(g) ? g[0].field_id : g.field_id} g={g} ctx={ctx} />);
   }
 
   // Phase 2 delete-with-memory: an add-back card per removed_entry (prefilled reconstruct, or leave removed).
@@ -986,8 +993,8 @@ function NestedSub({
                 </button>
               )}
             </div>
-            {byCi[ci].map((e) => (
-              <FieldRow key={e.field_id} e={e} ctx={ctx} />
+            {groupByQuestion(byCi[ci]).map((g) => (
+              <QuestionRow key={Array.isArray(g) ? g[0].field_id : g.field_id} g={g} ctx={ctx} />
             ))}
           </div>
         );
@@ -1002,6 +1009,102 @@ function NestedSub({
 }
 
 // ── ONE field row (used in both the review list and the section list) ──
+// ── ONE FORM QUESTION = ONE ROW ────────────────────────────────────────────────────────
+// "What are your salary requirements? (Currency / Amount / Time Frame)" is one question the form
+// renders as three controls, and so is "End Date (Month / Day / Year)". The fill detects that from
+// the page and stamps `question_key` on each part (see the scan's partsRowOf), so here it is purely a
+// question of rendering: emit ONE row carrying the question, with the parts inside it.
+//
+// Grouping is by ADJACENCY as well as key — the parts are contiguous in form order, and requiring
+// that keeps a row from silently swallowing something that merely shares a key from elsewhere.
+function groupByQuestion(list: ReviewEntry[]): (ReviewEntry | ReviewEntry[])[] {
+  const out: (ReviewEntry | ReviewEntry[])[] = [];
+  for (const e of list) {
+    const k = e.question_key;
+    const prev = out.length ? out[out.length - 1] : null;
+    if (k && Array.isArray(prev) && prev[0].question_key === k) { prev.push(e); continue; }
+    if (k && prev && !Array.isArray(prev) && (prev as ReviewEntry).question_key === k) {
+      out[out.length - 1] = [prev as ReviewEntry, e];
+      continue;
+    }
+    out.push(e);
+  }
+  // A "group" of one is just a field — a composite whose siblings were filtered out of this view.
+  return out.map((g) => (Array.isArray(g) && g.length === 1 ? g[0] : g));
+}
+
+// Render a grouped question, or fall through to the ordinary row.
+function QuestionRow({ g, ctx }: { g: ReviewEntry | ReviewEntry[]; ctx: RowCtx }) {
+  if (!Array.isArray(g)) return <FieldRow e={g} ctx={ctx} />;
+  return <CompositeRow parts={g} ctx={ctx} />;
+}
+
+function CompositeRow({ parts, ctx }: { parts: ReviewEntry[]; ctx: RowCtx }) {
+  const rowRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // Registered under EVERY part's id, so "go to field" from the review list still lands on the row
+    // that now contains it.
+    for (const p of parts) ctx.registerRow(p.field_id, rowRef.current);
+    return () => { for (const p of parts) ctx.registerRow(p.field_id, null); };
+  }, [parts, ctx]);
+
+  const question = parts[0].question_label_full || parts[0].question_label || "";
+  const needing = parts.filter((p) => requiresApproval(p));
+  const pending = needing.filter((p) => !p.is_approved);
+  const required = parts.some((p) => p.is_required);
+  // The row states the WORST outcome among its parts: an approved row must not hide a part still
+  // holding up the gate. Approving here approves each pending part individually, so it is exactly
+  // equivalent to approving them one by one — the submit gate counts the same fields either way.
+  const rowTint = pending.length
+    ? (pending.some(mustReplace) ? "bg-signal/[0.05]" : "bg-amber/[0.04]")
+    : needing.length
+      ? "border-l-2 border-verified/60 bg-verified/[0.06]"
+      : "";
+
+  return (
+    <div ref={rowRef} className={clsx("px-4 py-3", rowTint)}>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+        <div className="min-w-0 sm:w-1/2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-sm text-ink">{question}</span>
+            {required && <span className="text-signal" title="required on the form">✱</span>}
+            {!pending.length && needing.length > 0 && (
+              <span className="font-mono text-[10px] tracking-label text-verified">APPROVED</span>
+            )}
+          </div>
+          {/* Anything a part wants to say (an AI note, a mismatch) still gets said — attributed to the
+              part it belongs to, so a three-control question does not lose the detail. */}
+          {parts.filter((p) => p.detail).map((p) => (
+            <p key={p.field_id} className="mt-1 text-xs leading-relaxed text-ink-dim">
+              <span className="text-ink-faint">{p.part_label ? p.part_label + ": " : ""}</span>
+              {p.detail}
+            </p>
+          ))}
+        </div>
+        {/* The parts, side by side, each under its own name — the shape the form itself uses. */}
+        <div className="flex flex-wrap items-start gap-3 sm:w-1/2 sm:justify-end">
+          {parts.map((p) => (
+            <div key={p.field_id} className="min-w-[7rem] flex-1">
+              <div className="mb-1 font-mono text-[10px] tracking-label text-ink-faint">
+                {p.part_label || ""}
+              </div>
+              <FieldEditor e={p} ctx={ctx} />
+            </div>
+          ))}
+          {pending.length > 0 && (
+            <button
+              className="btn-ghost mt-5 shrink-0 px-3 py-1.5 font-mono text-[10px] tracking-label"
+              onClick={() => { for (const p of pending) ctx.setApproved(p, true); }}
+            >
+              APPROVE
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function FieldRow({ e, review, ctx }: { e: ReviewEntry; review?: boolean; ctx: RowCtx }) {
   const rowRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -1167,6 +1270,39 @@ function FieldNotes({ e, review, kind }: { e: ReviewEntry; review?: boolean; kin
   return <>{notes}</>;
 }
 
+// A credential, shown the way a login form shows it: the login as plain text, the password as dots
+// with a reveal toggle (the same control the Credentials page uses, so the two pages behave alike).
+// Read-only — see the FieldEditor branch for why editing here would defeat the placeholder.
+function CredentialDisplay({ kind, value }: { kind: string; value: string }) {
+  const [shown, setShown] = useState(false);
+  const isPassword = kind !== "login";
+  return (
+    <div className="flex items-center gap-2">
+      <input
+        readOnly
+        type={!isPassword || shown ? "text" : "password"}
+        value={value}
+        // autoComplete off + no name: this box exists to SHOW a stored value, and must not invite the
+        // browser's password manager to treat it as a login field and overwrite it (the same hazard
+        // the fill's credential re-check exists for).
+        autoComplete="off"
+        aria-label={isPassword ? "Stored password" : "Stored login"}
+        className="w-full rounded-lg border border-hairline bg-cockpit px-3 py-2 text-sm text-ink outline-none"
+      />
+      {isPassword && (
+        <button
+          type="button"
+          onClick={() => setShown((s) => !s)}
+          className="btn-ghost shrink-0 px-3 py-2"
+          aria-label={shown ? "Hide password" : "Show password"}
+        >
+          {shown ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ── the per-widget EDITOR (buildEditor equivalent) ──
 function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   const wt = e.widget_type;
@@ -1174,6 +1310,37 @@ function FieldEditor({ e, ctx }: { e: ReviewEntry; ctx: RowCtx }) {
   const onCommit = (v: string | null, patch?: Partial<ReviewEntry>) => ctx.commit(e, v, patch ? { patch } : undefined);
   // "Today" writes one self-evident value, so it also approves — see commit()'s approve option.
   const onCommitApproved = (v: string | null) => ctx.commit(e, v, { approve: true });
+
+  // ── CREDENTIAL: show it the way a login form does ─────────────────────────────────────
+  // On a form whose account is created by the submission (iCIMS), the login and password are
+  // ordinary fields — so review should look like a login box: the login as text, the password as
+  // dots you can reveal.
+  //
+  // ⚠ THE VALUE COMES FROM THE ACCOUNT'S CREDENTIALS RECORD, NEVER FROM THE BUNDLE. `current_value`
+  // here is the placeholder "(stored login)" precisely because the bundle is stored on the
+  // application row in Supabase, and a password must not live there. So this reads `ctx.credentials`
+  // (loaded server-side from `credentials_json`, the same row the Credentials page edits).
+  //
+  // READ-ONLY on purpose, and it is the safe direction rather than a shortcut: an editable box here
+  // would write whatever was typed into `current_value`, which is exactly how the secret would end
+  // up in the bundle. Changing it belongs on the Credentials page, which is the one place that
+  // stores it — and the submit run re-reads it from there rather than replaying this row.
+  if (e.credential) {
+    const kind = e.credential_kind ?? "login";
+    const isLogin = kind === "login";
+    const value = isLogin ? (ctx.credentials?.email ?? "") : (ctx.credentials?.password ?? "");
+    if (!value) {
+      return (
+        <div className="text-sm">
+          <span className="text-flagged">no {kind.replace(/_/g, " ")} stored</span>
+          <Link href="/app/credentials" className="ml-2 text-xs text-amber underline-offset-2 hover:underline">
+            Set it on the Credentials page
+          </Link>
+        </div>
+      );
+    }
+    return <CredentialDisplay kind={kind} value={value} />;
+  }
 
   // file_upload: the résumé + top-level Documents are uploaded elsewhere (the profile /
   // attachments manager); per-entry attachments attach on the form. Display-only here.

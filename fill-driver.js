@@ -37,6 +37,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       // replayField re-derives a SIGNATURE date to TODAY and uses this to skip the rewrite when the
       // approved value already IS today (so a same-day replay stays a zero-actuation no-op).
       isSignatureDateQuestion: isSignatureDateQuestion, signatureDateDemanded: signatureDateDemanded, signatureDateAskInText: signatureDateAskInText, isJobPostingGone: isJobPostingGone, sameCalendarDate: sameCalendarDate,
+      recognizeClearanceQuestion: recognizeClearanceQuestion, clearanceCandidates: clearanceCandidates, clearanceAliases: clearanceAliases,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
@@ -1352,6 +1353,11 @@ function deterministicTierFor(f, profile, bucketIndex, empCompany) {
   // The employer-match question is decided by decidePreviousWorker, never by the AI — it is answered (or
   // deliberately left blank + flagged) on its own path.
   if (f.fieldName === "candidateIsPreviousWorker") return "employer-match";
+  // A SECURITY CLEARANCE question is owned by its own tier whether or not the profile states one — and
+  // that is the point. Returning a tier here keeps it out of the AI BATCH planner as well as the
+  // per-field call, so the model is never even ASKED to guess a clearance. (The AI prompt tells it to
+  // infer from the ABSENCE of information and never refuse, which is exactly the wrong instinct here.)
+  try { if (apMatch.recognizeClearanceQuestion(f.label)) return "clearance"; } catch (e) { /* recognizer threw → the rung below still claims it */ }
   // Buckets — same gate as the loop: UNMAPPED fields only.
   if (!mappedPath && bucketIndex && bucketIndex.size) {
     const b = bucketIndex.get(apMatch.normalizeLabel(f.label));
@@ -4589,6 +4595,49 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       }
     }
 
+    // ── SECURITY CLEARANCE — STATED OR NOT ANSWERED (operator, 2026-08-18) ─────────────────────────
+    // The ATS engine got this first; Workday is the other half, and until now a clearance question here
+    // fell through to the AI, whose prompt tells it to infer from ABSENCE and never refuse. An invented
+    // "No" for a TS/SCI holder — or an invented "Yes" for someone with none — is a false statement on a
+    // federal application, so the question is CLAIMED here whether or not we can answer it. Claiming is
+    // what keeps the AI away from it (`producedNothing` is false for a flagged needs_review, so the AI
+    // branch below is skipped), and `deterministicTierFor` keeps it out of the batch for the same reason.
+    // Answers ONLY from work_authorization.security_clearance; the candidate ladder is shared with the
+    // ATS driver (apMatch.clearanceCandidates) so both engines offer exactly the same thing.
+    if (record.resolved == null && record.status !== "filled" && record.status !== "filled_review"
+        && (f.widgetType === "radio" || f.widgetType === "dropdown" || f.widgetType === "text"
+            || f.widgetType === "textarea" || f.widgetType === "checkbox_group")
+        && apMatch.recognizeClearanceQuestion(f.label)) {
+      try {
+        const stored = ((profile && profile.work_authorization) || {}).security_clearance;
+        const cl = apMatch.clearanceCandidates(stored);
+        record.mappedPath = "work_authorization.security_clearance";
+        if (cl.unstated) {
+          // Blank + flagged, deliberately. A required one will block Save & Continue and halt the walk —
+          // and that is the honest outcome: the fix is one profile edit ("None" is a valid answer), not a
+          // guess. See the final-backstop exclusion below, which is what stops that blank from being
+          // filled with an arbitrary clearance to keep the walk moving.
+          record.status = "needs_review";
+          record.flag = "clearance-unstated";
+          record.detail = "this form asks about a security clearance and your profile does not state one — set it on the Profile page (\"None\" is a valid answer) rather than having it guessed";
+        } else {
+          record.rawValue = cl.level;
+          const arg = (f.widgetType === "text" || f.widgetType === "textarea") ? cl.level : cl.candidates;
+          record.resolved = arg;
+          if (f.widgetType === "text") Object.assign(record, await fillTextCdp(act, loc, arg, budgets));
+          else if (f.widgetType === "textarea") Object.assign(record, await fillTextCdp(act, loc, arg, budgets, "textarea"));
+          else if (f.widgetType === "dropdown") Object.assign(record, await fillDropdownCdp(act, loc, arg, budgets));
+          else if (f.widgetType === "radio") Object.assign(record, await fillRadioCdp(act, loc, arg, budgets));
+          else if (f.widgetType === "checkbox_group") Object.assign(record, await fillCheckboxGroupCdp(act, loc, arg, budgets));
+          if (record.detail == null) record.detail = "work_authorization.security_clearance = " + JSON.stringify(cl.level);
+        }
+      } catch (e) {
+        record.status = "needs_review";
+        record.flag = "clearance-unstated";
+        record.detail = "security-clearance rung errored: " + String((e && e.message) || e);
+      }
+    }
+
     if ((f.widgetType === "radio" || f.widgetType === "dropdown" || f.widgetType === "text"
          || f.widgetType === "textarea" || f.widgetType === "checkbox") && record.resolved == null
         && record.status !== "filled" && record.status !== "filled_review") {
@@ -4813,7 +4862,17 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     // HARD. GATE on `record.resolved == null` so a decision the deterministic pass ALREADY made but failed to
     // commit (e.g. a matched "Yes" employer decision) is NEVER overridden by a contradictory guess — it stays
     // review-flagged. AI OFF / OPTIONAL → never fires (a blank optional radio doesn't block; unit-pinned).
+    // ⚠ AND A CLEARANCE RADIO IS EXEMPT, for the same reason the dropdown backstop below is (2026-08-18):
+    // this path exists to GUESS-to-reach-review, and a guessed clearance is a false statement on a
+    // federal application whichever way it lands. `record.resolved == null` does not cover it — that gate
+    // catches a decision we made and failed to commit, whereas here the clearance rung deliberately made
+    // NO decision, which looks identical to "unmapped" from here. Caught live by a unit test whose
+    // fixture handed the model a willing answer: the radio came back filled_review "No".
+    const clearanceAsk = (() => {
+      try { return !!apMatch.recognizeClearanceQuestion(f.label); } catch (e) { return false; }
+    })();
     if (act.aiEnabled && f.isRequired && f.widgetType === "radio" && record.resolved == null
+        && !clearanceAsk
         && record.status !== "filled" && record.status !== "filled_review") {
       try {
         const aiRes = await aiFillRadio(act, loc, f, profile, jobContext, budgets);
@@ -4840,7 +4899,24 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     // we deliberately kept, or a value that strayed and was surfaced for review — is not blocking
     // anything, and overwriting it would destroy a real answer to solve a problem that does not exist.
     // `hasLiveValue` treats the "Select One" placeholder as empty, which is exactly the blocking case.
-    if (record.widgetType === "dropdown" && f.isRequired
+    // ⚠ ONE EXCLUSION: A SECURITY CLEARANCE IS NEVER PICKED TO KEEP THE WALK MOVING (2026-08-18).
+    // This backstop exists because "getting to the review page is 1st priority" — a flagged placeholder
+    // beats a halted walk, and for a phone-device-type or a how-did-you-hear that trade is obviously
+    // right. A clearance is different in kind: whatever it picked would be a FALSE STATEMENT on a
+    // federal application in one direction or the other (an arbitrary "Top Secret" claims a clearance
+    // the applicant may not hold; an arbitrary "None" denies one they do), and unlike a wrong dial code
+    // it is a claim someone acts on. There is also a one-edit fix that makes the question answerable
+    // forever, which is what the review item says. So this field ends BLANK and the walk may halt —
+    // deliberately, and the halt names the reason.
+    // Scoped to a RECOGNIZED clearance question only; every other required dropdown is unchanged.
+    const clearanceHeld = (() => {
+      try { return !!apMatch.recognizeClearanceQuestion(f.label); } catch (e) { return false; }
+    })();
+    if (clearanceHeld && record.widgetType === "dropdown" && f.isRequired
+        && record.status !== "filled" && record.status !== "filled_review") {
+      record.detail = `${record.detail || "no clearance stated"} · last-resort pick DELIBERATELY SKIPPED: a security clearance is never guessed to keep the walk moving`;
+    }
+    if (!clearanceHeld && record.widgetType === "dropdown" && f.isRequired
         && record.status !== "filled" && record.status !== "filled_review"
         && !hasLiveValue(record.after)) {
       try {
@@ -4859,7 +4935,10 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     // pick-one SET shape. A required one nothing can answer blocks Save & Continue forever (live:
     // PSECU's required ethnicity group). A bare `checkbox` is deliberately NOT here — ticking one is
     // an assertion, not a choice.
+    // …and a clearance rendered as a pick-one SET is exempt too — third of the three guess-to-reach-review
+    // paths (radio above, dropdown below). Same reason: a guessed clearance is a false statement either way.
     if (act.aiEnabled && f.isRequired && f.widgetType === "checkbox_group" && record.resolved == null
+        && !clearanceAsk
         && record.status !== "filled" && record.status !== "filled_review") {
       try {
         const aiRes = await aiFillCheckboxGroup(act, loc, f, profile, jobContext, budgets);
@@ -8256,6 +8335,24 @@ function buildReviewBundle(results, meta) {
       // A checkbox GROUP holds a SET; current_value is the joined display string and this is the
       // authoritative array. Absent for every other widget.
       selected_options: Array.isArray(rec.selected_options) ? rec.selected_options : null,
+      // ⚠ FLAGS ONLY — THE VALUE NEVER TRAVELS. A form whose account is created by the submission
+      // (iCIMS) asks for the login and password as ordinary fields, and `current_value` for those is
+      // deliberately the PLACEHOLDER "(stored login)". These two say WHICH credential the field wants
+      // so the review page can render it like a login box — reading the actual value from the site's
+      // own credentials record, not from here. Carrying the secret in the bundle would put it in
+      // Supabase on the application row, which is the leak the placeholder exists to prevent.
+      credential: rec.credential === true ? true : null,
+      credential_kind: rec.credentialKind != null ? String(rec.credentialKind) : null,
+      // One form question rendered as SEVERAL controls (salary = currency/amount/timeframe, a date =
+      // month/day/year). Detected from the page, never enumerated — see the scan's questionRowOf.
+      question_key: rec.question_key != null ? String(rec.question_key) : null,
+      question_label_full: rec.question_label_full != null ? String(rec.question_label_full) : null,
+      part_label: rec.part_label != null ? String(rec.part_label) : null,
+      // Which repeating ENTRY a field belongs to, for a field the profile does not map (a per-customer
+      // `rcf<NNNN>` question inside a work-history entry). Without it review has nothing placing the
+      // field in a job, and lists them all after the entry blocks.
+      entry_section: rec.entry_section != null ? String(rec.entry_section) : null,
+      entry_index: typeof rec.entry_index === "number" ? rec.entry_index : null,
       tree_structure: (rec.tree_structure && typeof rec.tree_structure === "object") ? rec.tree_structure : null, // tree-AI recon (categories + chosen category's leaves) for the summary
       section_field_shape: Array.isArray(rec.section_field_shape) ? rec.section_field_shape : null, // 2b: section_stub → the viewer builds a new entry from this shape
       remembered_fields: Array.isArray(rec.remembered_fields) ? rec.remembered_fields : null, // Phase 2: removed_entry → what filled (per field + how) so add-back PREFILLS them

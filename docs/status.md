@@ -12,6 +12,98 @@ discover branch).
 
 ## Active
 
+### NEXT (0) — iCIMS: LIVE-VERIFIED through the address block; next is Education (operator 2026-08-16)
+
+**Steps 1 and 2 are LIVE-VERIFIED** on `astrioncareers-astrion.icims.com/jobs/24615`, build `icims-addr-1`:
+
+- the frame arms — `the application is inside an iframe — driving it there (112 controls)`;
+- the "Create a login" trio reports `filled` with `after="(stored login)"` / `"(stored password)"` —
+  never a real value;
+- the address block fills deterministically: Street1 `"715 Middlebrooks Circle"`, City `"Tallahassee"`,
+  Zip `"32312"`, **Country `filled · exact-normalized · "United States"`**, **State `filled ·
+  exact-normalized · "Florida"`** — all unflagged, no AI.
+- page totals went `filled 12 / filled_review 9 / needs_review 9` → **`filled 21 / filled_review 8 /
+  needs_review 1`**.
+
+⚠ **The credential re-check has still never fired live** — no run has yet had the password manager
+repopulate the login box after the fill. The run to watch for ends `needs_review` +
+`credential-overwritten`, not a silent `filled`.
+
+**Step 3 (Education + entry scoping) is LIVE-VERIFIED** on build `icims-edu-3`. The whole education
+section fills deterministically and `needs_review` on the page is **0**:
+
+| field | result |
+|---|---|
+| School | `filled` · exact · "Carnegie Mellon University" |
+| Other School | `filled` · "N/A" |
+| Degree / Major | `filled` · exact · "Bachelor of Science" / "Electrical and computer engineering" |
+| Minor | `skipped` (empty in profile) |
+| Did You Graduate | `filled` · exact · **"No"** |
+| Graduation Month / Year · Start Year | `filled` · "May" / "2028" · "2024" |
+| Country / State | `filled` · exact · "United States" / **"Pennsylvania"** |
+
+Page totals across the three steps: `filled 12 → 21 → 29`, `needs_review 9 → 1 → 0`.
+
+**The seal is demonstrated, not just asserted:** the only "Florida" anywhere in that run is
+`PersonProfileFields.AddressState` (the home address, where it belongs), while `EducationState` is
+Pennsylvania — derived from the education entry's OWN location.
+
+Three faults were fixed in this round, each of which had produced a confidently wrong or missing
+answer, and each worth remembering:
+- the search settle polled for STILLNESS; the pre-search list satisfies every such proxy. Measured:
+  the school search takes **~4s**, and a 675ms give-up said "no option matched". Now it matches on
+  every read and stops at the first hit.
+- `currently_enrolled` is **not exposed by the website's education editor**, so a synced profile
+  carries the default `false` and a 2028 graduand was answered "Yes, graduated". A future graduation
+  date now decides first.
+- Country is State's declared PARENT and had no deterministic source, so it was deferred to the AI —
+  and the deterministic "Pennsylvania" ran against an empty child list. A US state in the entry's
+  location now implies the country, filling the parent in the same pass ahead of the child.
+
+**Multi-tenant state (live 2026-08-18):** iCIMS is no longer Astrion-shaped — a run can start from an
+`<tenant>.icims.com` posting page, which is what most iCIMS links are (the content frame is armed by
+identity now, not by control count). Verified: **Astrion** full loop (fill + rehearsal, both arms) and
+**Cretex** fill end to end on a previously untouched tenant. **ITT** and **Peraton** halt
+`consent-required` — a privacy consent on the sign-in card that only the operator may tick (2 of 5
+tenants sampled do this; **an operator decision is pending on whether to keep halting or to let the
+extension accept a privacy notice on your behalf**). Closed postings now report `posting-gone` instead
+of "no Apply control". Open: Cretex's required Degree dropdown read an empty option list — unclassified,
+needs one signed-in look.
+
+Remaining, in rough order:
+1. **Education** — the one `needs_review` left: `CandProfileFields.School` found no match for
+   `"Carnegie Mellon University"` *after searching* the AJAX list. That is the new widget behaving
+   correctly (it searched, then reported honestly) — the question is what the field actually offers.
+   `-1_CandProfileFields.EducationCountry` / `EducationState` are the same declared parent→child pair
+   as the address, so they should come along with it.
+2. ~~**The résumé parse postback.**~~ **BUILT 2026-08-17 — order, not avoidance.** `atsIcimsResumeStage`
+   attaches the résumé after the form settles and BEFORE any value is written, then waits the postback
+   out (signature changed → panel quiet, both polled) — so the parse can only overwrite an empty form.
+   The fill loop never attaches on iCIMS; it records the stage's outcome. Runs on the FILL and the
+   rehearsal/submit runs, because a bundle captured from an unparsed form cannot be replayed against a
+   parsed one. `kind:"resume"` now. **LIVE-VERIFIED 2026-08-18, both arms** — fill + dry rehearsal,
+   visible and hidden, each rehearsal arm passing twice: `106 field(s) replayed, 0 failure(s)` →
+   `▶▶ WOULD CLICK SUBMIT ◀◀`, with the postback observed landing at 8.4–17.6s every run. That round
+   also found and fixed the entry-id bug below (`atsSubmitKey`) and widened the parse change budget to
+   45s on the measured landings. Details: `docs/progress-log.md` 2026-08-18.
+3. **Multi-entry repeating sections.** `atsMapKey` strips the entry ordinal, which is correct for ONE
+   address against one form entry — but a SECOND entry would map to the same profile address. Phones /
+   Certifications / Experience all have the same shape (`a.iCIMS_Anchor` "Add More (…)").
+4. **The `rcf<NNNN>` custom questions** — per-customer, routed by label today; check what falls to AI and
+   what wants a bucket.
+5. **Multi-step.** The Astrion form is step 1 of 4 (the progress rail reads 1·2·3·4). `runAtsSubmitRun`
+   assumes one page, one click, one confirmation — that assumption does not hold here.
+
+**Tooling note:** `AP_DEV_ATS_SCAN` is frame-aware for iCIMS now, but it attaches its own debugger — a
+call that times out client-side leaves the attach held and the next one fails `attach-failed: Another
+debugger is already attached`. Fire it without awaiting in-page (the CDP ceiling is ~45s) and give a
+wedged attach time to clear.
+
+⚠ There is ~6000 lines of earlier iCIMS work on the unmerged branch `worktree-generic-filler-design`
+(education tier, work-experience tier, address tier, the parse-postback round, a login gate the author
+would not call reliable). It was NOT ported — this branch restarted from main deliberately — but it is
+worth mining before building any of the four above, the way the credential tier was mined for this step.
+
 ### NEXT (1) — BATCH the questions page into ONE AI call (operator 2026-08-05)
 
 A screening page can hold many AI-answered questions and today each one is its OWN `act.llm` round trip,

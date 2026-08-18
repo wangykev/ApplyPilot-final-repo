@@ -31,12 +31,15 @@ during 2026-08, so a later date can appear above an earlier one.
 | **Multi-page walk + error banners** | `2026-06-15 — Magna wd3: VPS ≠ validation error`, `2026-06-21 — M38 Part 3: the N-page walk loop`, `2026-07-01 — Workday error banner CONCATENATES`, `2026-07-25 — Solar Turbines: a phone-triggered SMS-consent checkbox REFLOWS the footer` |
 | **Session death / maintenance page** | `2026-06-14 — Magna wd3: rect/focus retry`, `2026-06-14 — Magna wd3: session-expiry is NOT statically detectable`, `2026-06-27 — Workday PLANNED-MAINTENANCE page` |
 | **Auth / onboarding / consent** | `2026-07-25 — Caterpillar: create-account consent`, `2026-07-25 — Caterpillar: the auth widget can OPEN on the Create Account view`, `2026-08-02 (d) — the prompt row, the contaminated sign-in box`, `2026-08-07 (d) — AUTOFILL WITH RESUME` |
-| **Résumé attach** | `2026-06-03 — LiveRamp wd5 resume upload`, `2026-06-21 — Resume attach on the CDP path` |
+| **Résumé attach** | `2026-06-03 — LiveRamp wd5 resume upload`, `2026-06-21 — Resume attach on the CDP path`, `2026-08-17 (c) — Astrion iCIMS: the résumé goes on FIRST, and the parse is waited out` |
 | **Review page / reconcile** | `2026-07-07 — Magna wd3 REVIEW page` |
 | **What Workday does NOT persist** | `2026-08-04 — waystar.wd1: what Workday does NOT persist`, `2026-08-04 (c) — HIDDEN runs: Workday rejects synthetic text/date` |
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
+| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out` |
+| **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
+| **Option lists: paging, completeness, what review can offer** | `2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE` |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
 | **Host / URL shapes** | `2026-07-22 — logged-in host is` |
 
@@ -4070,3 +4073,363 @@ remediation, so error-name→field matching on this label is worth re-checking i
 DOMContentLoaded 793ms · load event 1484ms · posting content on screen **~13s**. cat.wd5 renders nothing
 until it renders everything, so a poll that samples early sees a completely empty page (`formFields 0 ·
 markers [none]`), not a partial one — do not read that as "the control is missing".
+
+## 2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it
+
+Read-only recon of `astrioncareers-astrion.icims.com/jobs/24615/…/candidate`, reached with a magic-link
+apply URL (`?from=login&eem=…&code=…`). First iCIMS tenant observed. Everything below was traced against
+the live DOM, not inferred.
+
+**THE WHOLE APPLICATION IS INSIDE `<iframe id="icims_content_iframe">`, SAME-ORIGIN.** The top document
+holds **0** form controls; the frame holds **118** (70 visible/scannable). Every other ATS this codebase
+drives is a top-frame form, so a top-frame scan reads an empty page and the run refuses it as "not an
+application form" — the failure looks like a broken detector, not a missing frame. `cdpUseFormFrame`
+(cdp.js) pins `Runtime.evaluate` to the frame's isolated world; `_frameCtxId` defaults null so every
+other tenant stays byte-identical.
+
+⚠ **Re-opening the frame's `src` as a top-level page is NOT a substitute.** The magic link is one-time:
+the first navigation consumes `eem`/`code`, so a second lands on a sign-in page with 0 fields. The form
+has to be driven where it is. For the same reason `atsFormUrl` must KEEP the query for iCIMS — unlike
+greenhouse's `gh_jid`, it is the session.
+
+**NOT React.** No `__reactProps$`/fiber keys on any input; jQuery is present; markup is server-rendered.
+A plain native-setter write + `input`/`change` is sufficient — there is no controlled-component state to
+re-sync, and none of the React value-setter care Workday requires.
+
+**Field identity is two vocabularies.** `PersonProfileFields.*` / `CandProfileFields.*` /
+`PortalProfileFields.*` are iCIMS PLATFORM ids and should be stable across tenants — worth mapping.
+`rcf<NNNN>` (e.g. `rcf3077`, `rcf2010`) are per-customer configured questions — never map these, route
+them by label. A leading `-1_` is a REPEATING-ENTRY ORDINAL (`-1_PersonProfileFields.AddressCity`), and
+the same ids recur inside work-history entries, where an "address" is the EMPLOYER's, not the
+applicant's — so a bare-id map entry for those would file the candidate's home address under a past job.
+
+**Conventions:**
+- labels — `label[for="<id>"]`, itself carrying `id="label_<id>"`. Clean; no heuristics needed.
+- required — THREE independent markers, which do not always agree: `iCIMS_Forms_RequiredField` on the
+  input, `aria-required="true"`, and a `span.Field_Required` / `span.Field_RequiredStar` (`*`) in the row.
+  Detect all three. 22 of 70 fields are required here.
+- rows/sections — `.iCIMS_TableRow` inside `.iCIMS_ProfileFormTable`, each table preceded by an
+  `h2.iCIMS_SubHeader`. Observed sections: Resume · Attachments · **Create a login** · Preferences ·
+  Enter your information · Education · Skills · Experience.
+- choice widgets are native `<select>` (32 of the 70); placeholder row is `— Make a Selection —`.
+- repeating sections expose `a.iCIMS_Anchor` "Add More (Addresses|Phones|Education|…)" with ids like
+  `PersonProfileFields.AddressesButton_-1`.
+
+**"Create a login" is INSIDE the application form** — `PersonProfileFields.Login` (text,
+`autocomplete="username"`), `PersonProfileFields.Password` and `PersonProfileFields.Password_Confirm`
+(both `type=password`, `autocomplete="new-password"`, labels "Password" / "Password (Re-enter)").
+On this class of application **the account is created BY the submission** — there is no separate
+onboarding — so this block is simply another section of the form. Note all three render **OPTIONAL** (no
+required marker) while `FirstName`/`Email` render required; that is convenient rather than a problem,
+because the AI rescue is required-only and therefore structurally cannot reach a password.
+
+⚠ **`autocomplete="username"` INVITES CHROME'S OWN PASSWORD MANAGER INTO THAT BOX.** Observed on an
+earlier round: the login held an address that was neither the profile's nor the stored one, with an empty
+password, on a run whose log said both were filled and read-back verified — written, verified, reverted,
+still reported `filled`. An immediate read-back cannot catch this; only a re-check after the page has
+settled can. See `atsCredentialRecheck`.
+
+⚠ **THE SUBMIT CONTROL IS `<input type="submit" id="cp_form_submit_i" value="Submit Profile">`.** The
+generic finder in `atsInjSubmitState` could not see it twice over — it queries only `button`s, and it
+matches on `textContent`, which an `<input>` does not have (its caption is `.value`). Measured on this
+page: the old finder returns `hasSubmit:false`, which makes `atsLooksLikeApplicationForm` reject a
+perfectly good form. Its rect is FRAME-RELATIVE (`cy≈4356`) while `Input.*` dispatches into the
+top-level viewport, so any future trusted click here must add the frame's own box (`cdpEvalTop`).
+
+**The résumé is a trap, and the trap is TIMING.** The page says so itself — "Provide your
+resume below to pre-fill your profile. Existing data in the form will be replaced." iCIMS parses the
+upload SERVER-SIDE and posts results back into the panel seconds after the attach reports success,
+re-rendering entries under new ids and blanking what was written. The form offers its own
+`#resume_skip_checkbox` ("Upload Resume at a later time"), left UNTICKED — an operator's choice about
+their own application.
+⚠ **Superseded 2026-08-17** — see `2026-08-17 (c)` below. The observation above stands unchanged; what
+changed is the ORDER: the résumé is attached BEFORE anything is filled and the postback is waited out,
+so the parse can only overwrite an empty form. It was `kind:"skip"` for one day.
+
+## 2026-08-16 (b) — Astrion iCIMS: the `<select>` that is not a select, and its declared parent→child
+
+Traced after a live run reported the REQUIRED Country as `needs_review · AI fallback: no live options
+to choose from` and State as `needs_review`, on a page that was plainly showing both lists.
+
+**The cause: iCIMS replaces many `<select>`s with its own AJAX combobox ("IdDropDown").** When it does:
+
+- the `<select>` is **permanently empty** — exactly one blank `<option>` — and stays empty even AFTER a
+  successful commit;
+- its `value` becomes an **opaque numeric id** (`"12781"` for United States), never the text;
+- so BOTH usual reads lie: `selectedIndex` says "nothing selected", `el.value` says `"12781"`.
+
+The tell is the element's own attribute, not a heuristic: `icimsdropdown-enabled="1"` (plus
+`icimsdropdown-ajax="1"`, `icimsdropdown-search="1"`). On this form 12+ of the 34 selects are these,
+including Address + Education country/state and several `rcf<NNNN>` questions; the rest are ordinary
+native selects with real options, so the branch must be per-element, never per-page.
+
+**Anatomy** — every id derived from the `<select>`'s own id:
+
+```
+<select id="X" icimsdropdown-enabled="1" data-ddd-child-link="…" i_required="true">  ← empty, opaque id
+<a     id="X_icimsDropdown" class="dropdown-select">                                 ← THE OPENER
+<span  id="X_fakeSelected_icimsDropdown" class="dropdown-text">                      ← THE READ-BACK
+<div   id="X_icimsDropdown_ctnr" class="dropdown-container[ dropdown-invisible]">    ← open/closed gate
+   <input class="dropdown-search" placeholder="— Type to Search —">
+<ul    id="X_dropdown-results"> <li role="option" class="dropdown-result result-selectable">
+```
+
+⚠ **`aria-expanded` STAYS `"false"` even while open** — gate on the container's `dropdown-invisible`
+class. (Same shape of trap as Workday's dropdown close, which is gated on options-GONE rather than aria.)
+
+⚠ **ONE PAGE AT A TIME.** Measured: 26 countries, 25 states — Alabama…**Michigan**, so Minnesota→Wyoming
+are simply absent from the initial list. A first-page miss is NOT evidence the option doesn't exist;
+the search box is the rest of the list. Florida happened to be in range, which is exactly the kind of
+luck that hides this until someone in Texas applies. The option list is therefore recorded **always
+partial**, so review renders a type-to-filter editor rather than presenting 25 rows as every US state.
+
+**The parent→child dependency is DECLARED, so it never has to be inferred.** Country carries
+`data-ddd-child-link="PersonProfileFields.AddressState"`, `data-ddd-message="Please select a country"`,
+`data-ddd-no-children="No states available"`, and an `onchange` calling `icimsChangeParent(...)`.
+Verified live: clicking the "United States" row set `select.value="12781"`, put "United States" in the
+fakeSelected span, and **populated the State list with 25 rows (Alabama, Alaska, …)** — while the State
+`<select>` itself stayed at 1 option. DOM order already places parent before child, so a plain in-order
+fill works; the value of the declaration is that a child whose parent is unset can be REPORTED as such
+("this list only fills in once its parent field is chosen") instead of being called empty. That
+distinction is not cosmetic — the generic "no live options" message sent a debugging round at the option
+read rather than at the unset parent.
+
+**Also observed:** `i_required="true"` is a fourth required marker on these widgets, and `data-label`
+carries the field's own label ("Country", "State/Province").
+
+**Result on the next live run:** Country `filled · exact-normalized · "United States"`, State
+`filled · exact-normalized · "Florida"`, both deterministic and unflagged; the page's `needs_review`
+count went 9 → 1. The tiered profile country (`["United States of America", "United States"]`) is what
+lands it — the form offers the short form only, so the second tier is the one that matches.
+
+## 2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage — the employer portal, the email gate, and its invisible hCaptcha
+
+Traced live from the LinkedIn-provided link `careers.astrion.us/jobs/24615?mode=apply&iis=LinkedIn`,
+then driven end to end by the pipeline (hidden and visible). This is the stage BEFORE everything in the
+two entries above: how a run gets from an employer careers link to the form those entries describe.
+
+**The employer portal is a separate host with no ATS in its name.** `careers.astrion.us` is an iCIMS
+career portal served under the employer's own domain — AngularJS (`html#ng-app`), **zero iframes**, and
+exactly ONE Apply affordance: a plain `<a href="https://astrioncareers-astrion.icims.com/jobs/24615/login?iis=LinkedIn">Apply</a>`.
+`?mode=apply` is INERT — the page is byte-identical with and without it (measured at 0ms and 3s), so
+there is no auto-hop to detect and no query to preserve on the employer side.
+
+⚠ `chrome.scripting` CANNOT READ THIS HOST — it is not in `host_permissions` and deliberately never will
+be (the whole point of driving these through the debugger). So `waitJobPageSettled` and
+`scrapeJobDescription` both fail on their first read with *"Cannot access contents of url … Extension
+manifest must request permission to access this host"*, and the settle returns **instantly with 0 chars**.
+Anything downstream that assumed the page had settled was racing the Angular render. Over CDP the same
+page settles in ~1.3–1.9s at **4598 chars**.
+
+**The apply link lands on a LOGIN page, and that login page passes the form identifier.** The gate is at
+`<tenant>.icims.com/jobs/<id>/login`, and it is inside the SAME `#icims_content_iframe` the application
+form uses (top document: 159 chars, zero controls). Its content:
+
+```html
+<h2>Enter Your Information</h2>
+<input type="email" id="email" name="css_loginName" autocomplete="email">
+<input type="submit" id="enterEmailSubmitButton" value="Next">
+<textarea id="h-captcha-response-<rand>" name="h-captcha-response">   <!-- hidden -->
+```
+
+⚠ **A submit control + an email field is exactly `atsLooksLikeApplicationForm`'s positive test**, so
+without an auth check running FIRST this page classifies as the application form. Note also that the frame
+holds only **3** controls, so `cdpUseFormFrame(4)` — the floor `waitAtsFormReady` uses — REFUSES to arm on
+it; the pre-form stage arms with a floor of 1.
+
+**The gate's submit is preventDefault-ed and gated on INVISIBLE hCaptcha.** Verbatim from the frame's own
+inline script (sitekey `94fee806-…`, `data-size="invisible"`):
+
+```js
+form.addEventListener("submit", (e) => {
+  e.preventDefault();   // Stops the form from submitting until we can call hcaptcha
+  if (typeof icimsInvisibleRecaptchaBeforeSubmit === 'undefined' || icimsInvisibleRecaptchaBeforeSubmit())
+    hcaptcha.execute(widgetId);
+});
+// hcaptcha callback: append <input name="h-captcha-response" value=token>, then form.submit()
+```
+
+and the form's own `onsubmit` attribute is
+`icimsDisableSaveAndSubmitButtons('enterEmailSubmitButton','','enterEmailForm')`.
+
+**Two consequences, both load-bearing.** (1) The button DISABLES ITSELF on submit and only the captcha
+callback ever unlocks it — so a captcha that never answers leaves a page that cannot be retried in place;
+a second press reports `submit-disabled`, which reads like an unrelated fault. Only a reload restores it.
+(2) The pair (`submitLocked`, `captchaToken`) is what tells the two failure modes apart, and nothing else
+does: **submitLocked true + captchaToken false = the form fired and the captcha never came back**;
+captchaToken true = the POST is in flight.
+
+**✅ MEASURED CAUSE — OUR blob-worker timer polyfill stops hCaptcha initialising.** Under a run:
+`submitLocked true · captchaToken false · captchaFrames 0 · challengeVisible false`. By hand on the same
+page in the same session, an `newassets.hcaptcha.com/captcha/v1/…` iframe is present. So hCaptcha was not
+*refusing* us — it never loaded. Isolated to the **worker polyfill alone, not the CSP bypass**, by
+splitting the two switches: with `Page.setBypassCSP` still ON and only the worker declined, the gate
+passes on the FIRST submit. iCIMS runs therefore pass `{noWorkerTimers:true}` to
+`cdpInstallPageOverrides`. ⚠ This is not captcha handling and must never become it — it removes our own
+tampering so the page's check can run and judge the session; a refusal still halts for the operator.
+Cost: a hidden iCIMS run reports `hidden-SLOW (no worker timers)`. Measured price on this form: **28.7s
+for 108 fields (265ms/field)** — iCIMS is server-rendered jQuery, so it leans on page timers far less
+than Workday does.
+
+**⚠ THE IFRAME MOUNTS AFTER THE DOCUMENT, and the race is VISIBLE-ONLY.** A scan arriving before
+`#icims_content_iframe` exists reads the empty top document and concludes there is neither a gate nor an
+Apply control. A HIDDEN run is slow enough to lose the race and never sees it — so "it worked in the
+background" is NOT evidence here; the visible run is the one that reproduces it.
+
+**⚠ `login.icims.com` IS THE RECRUITER LOGIN, NOT THE CANDIDATE'S.** `/jobs/intro` on this tenant
+redirects to `login.icims.com/u/login/identifier?state=…` — an Auth0 universal login carrying the
+customer's org name. It renders an email box, so an auth classifier will happily offer the candidate's
+address to a STAFF login. It is an `icims.com` host, so a `detectAts`-based SSO exemption cannot catch
+it: it needs its own host check, ahead of everything.
+
+**The JD scrape's company is a PAGE TITLE on this host.** With no ATS markup to key on,
+`scrapeJobPosting` returned `"Engineering Directorate Support Intern in Mountain View, California |
+Astrion"` as the *company*. That string anchors the safety-critical employment recognizer. The iCIMS
+subdomain is the reliable source (`astrioncareers-astrion` → `"Astrion"`).
+
+**Result:** `careers.astrion.us` → Apply → the email gate → the form, then **108 fields, 67 filled ·
+40 skipped · 6 needing review**, reported to the tracker. Verified hidden AND visible.
+
+## 2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE, measured, and what it proves
+
+Measured **scan-time on a freshly loaded form**, before any actuation. That qualifier is the whole
+entry: an iCIMS dropdown's `<ul id="X_dropdown-results">` STAYS populated once the widget has been
+opened, so probing a finished run reports full coverage no matter what the fresh page served. Every
+number below is from `[ATS-OPTIONS] scan-time coverage`, printed before the first field is touched.
+
+**Coverage on a fresh form:** `icims_dropdown 25/25 · dropdown_native 20/20 · multiselect_native 1/1`
+— i.e. the scan DOES carry a list for every choice widget; none arrive empty. A native `<select>`
+carries its whole vocabulary. An `icims_dropdown` carries only its first page.
+
+**The option-count distribution across the 25 `icims_dropdown`s:**
+
+| rows | count | which |
+|---|---|---|
+| 1 | 2 | State/Province, awaiting its parent — the single row is `"Please select a country"`, NOT an option |
+| 2 | 10 | the Yes/No screening questions (May We Contact, "Have you ever been employed by…", consent, travel, covenant) |
+| 6 | 1 | Availability |
+| 17 | 1 | School (first page) |
+| **25** | **11** | Time Zone, Country, State/Province, Degree, … |
+
+**⇒ THE PAGE SIZE IS 25.** Eleven dropdowns stopping at exactly 25 while nothing else comes near it
+is a pager, not a coincidence — four of those (Time Zone, Country, State/Province, Degree) are
+unrelated vocabularies, and unrelated vocabularies do not share an exact length. It also matches the
+independent observation in the `2026-08-16 (b)` entry that State/Province served Alabama…Michigan
+only. **A list shorter than a page has therefore reached its end** — which is what makes a 2-row
+"May We Contact" or a 6-row Availability a COMPLETE, pickable vocabulary.
+
+⚠ **Do not hardcode 25.** The cap is a tenant setting; derive it from the form's own dropdowns
+(`atsIcimsPageCap`: the largest length two or more of them independently stop at). And note the
+degenerate case that rule has to refuse: ten Yes/No dropdowns all holding 2 options must not "prove"
+a page size of 2, or every list on the form is at-or-above the cap and nothing is ever complete.
+
+**⚠ `data-ap-complete` is READ AND NEVER WRITTEN.** `optionsPartial` was
+`ul.getAttribute("data-ap-complete") !== "1"`, and nothing in the codebase sets that attribute — so
+the answer was unconditionally "partial" for every iCIMS dropdown ever scanned. It is a placeholder
+someone intended to fill in, not a signal.
+
+**⚠ The awaiting-parent row is not an option.** `"Please select a country"` has to be filtered out of
+the scan's list alongside `"— Make a Selection —"`. Left in, the child reads as a ONE-OPTION complete
+vocabulary and reaches the review editor as the single value the operator is allowed to pick.
+
+**Outcome on the review bundle** (`[ATS-OPTIONS] review editors`, of 46 choice records): 22 picker /
+18 filter-or-type before, **28 picker / 12 filter-or-type** after. The remaining 12 are the genuinely
+paged 25-row lists. 6 records carry no options at all. No page contact was added, and the fill's wall
+clock did not move (28.7s → 25.9s across runs, noise).
+
+## 2026-08-17 (b) — Astrion iCIMS: the REHEARSAL, and what a `<select>` with no placeholder submits
+
+Five consecutive dry rehearsals (`arm` absent throughout; nothing ever submitted). Three clean passes
+either side of two deliberately adversarial rounds.
+
+**The form loads FRESH on every rehearsal.** Nothing is persisted server-side, because the application
+is never submitted — so each run re-writes every approved value from scratch, and a field the replay
+does not write shows the form's OWN default rather than the previous run's value. Worth knowing before
+reading any "did my change stick?" result: the evidence is the CURRENT run's writes, not leftovers.
+
+**⚠ A `<select>` WITH NO PLACEHOLDER SUBMITS ITS FIRST OPTION WHETHER OR NOT ANYONE CHOSE IT.** The
+salary selects have no blank first row — raw options begin at `0:USD $` and `0:Hr.`. HTML selects
+option 0 by default, so an untouched Currency reads (and would SUBMIT) `"USD $"`. Two consequences:
+
+- a `selectedIndex > 0` read is wrong twice over — it calls a legitimately-chosen first option blank
+  (the false negative that failed two rehearsal verifies) AND it describes an untouched select as
+  empty when the form would in fact submit its first option;
+- so reporting `"USD $"` for an untouched Currency is the TRUTHFUL reading, not a bug. These salary
+  fields will go out as USD / Hr. unless the operator changes them, and review now shows that.
+
+**Measured, round by round:**
+
+| round | change | outcome |
+|---|---|---|
+| 1 | 4 blank fields given values | all reached the form |
+| 2 | every value CHANGED | replay REPLACES: Home to Work, USD $ to CAD $ (off index 0), 30 to 45, Hr. to Yr., and a DISJOINT multi-select set {Internship,Part-time} to {Full-time,Temporary} — verified by an independent scan, not the replay's own read-back |
+| 3 | `"ZZZ Dollars"` (not an option) | `stated-value-unmatched` then `verify-failed`, `submitted:false`. It never picked a near match. |
+| 3 | `""` (cleared) | `skipped · no approved entry for this field` — the replay writes NOTHING, so the field keeps whatever the fresh form has. A cleared value is "leave alone", NOT "erase". |
+
+**A verify failure is per-FIELD and blocks the whole gate**, which is the point: one unmatched approved
+value out of 109 stopped the run at `verify-failed`.
+
+**Entry growing is what makes 109 fields possible** — the submit run grows repeating sections from the
+approved bundle (`the approved bundle holds 3 entr(ies), form now shows 3`). Without it the form
+carries one work-history entry and 28 approved values have nowhere to go.
+
+## 2026-08-17 (c) — Astrion iCIMS: the résumé goes on FIRST, and the parse is waited out
+
+Supersedes the `kind:"skip"` decision in `2026-08-16` (one day old). **Nothing about the observed
+behaviour changed** — iCIMS still parses the upload server-side and re-renders the panel with the
+result. What changed is WHEN we attach: before a single field is written, instead of partway through
+the fill. A parse that lands on an empty form has nothing of ours to destroy.
+
+**Why "just attach it later / re-fill afterwards" was rejected.** Both were considered:
+- *attach last* — the parse would then blank the finished fill, and on a submit run it would blank
+  APPROVED values between the strict verify and the click. That is the one window where a wrong state
+  cannot be caught by anything downstream.
+- *attach, then re-fill from scratch* — a second full fill (and a second AI pass) to repair damage that
+  ordering avoids entirely.
+
+**The wait, and why each half is load-bearing.** `atsIcimsAwaitParse` requires BOTH, polled on SW
+wall-clock (no page timer, no fixed delay):
+
+| signal | what it answers | why the other one cannot |
+|---|---|---|
+| `atsFormSignature` changed | the postback LANDED | the field COUNT is often identical either side of a re-render — entries come back under new ids, so a count settle sees nothing happen |
+| the mutation stamp is idle ≥1.5s | the panel has stopped rendering | a signature can hold still between two bursts of a server-rendered re-render (the same lesson `cdpInstallQuietWatch` was built for) |
+
+Signature = field SET + which fields hold a value. Deliberately **not** the values' text and not the
+option lists: a re-quoted filename or a search-filtered list never stabilises, and the question here is
+only *did it change, and has it stopped*.
+
+**A parse that changes NOTHING is indistinguishable from one that has not started**, so that branch does
+not exit early — it spends its whole 20s change budget first and still requires quiet + a stable
+signature. The mutation watch also lives in the isolated world the postback can REPLACE, so an
+unreadable stamp is treated as "something just happened" (re-arm, keep waiting), never as calm.
+
+**Evidence, not optimism, before reporting `filled`.** Writing `input.files` is a page-side write; iCIMS
+uploads on the change event. So the record needs either the widget's own confirmation (filename read
+back) or a server reaction (a postback happens only to an accepted upload). Neither ⇒ `filled_review` +
+`resume-unconfirmed`. Still churning at the ceiling ⇒ `resume-parse-unsettled`.
+
+**⚠ THE PARSE ALSO CHANGES WHAT AN ENTRY IS CALLED — measured on the first rehearsal after this
+landed.** Before the résumé, this form numbered repeating entries positionally: `-1_`, `-2_`, `-3_`,
+the same on every visit. The parse SAVES the entries it extracts, so they come back as server rows
+with opaque ids — and each visit mints its own:
+
+| visit | Experience entry ids |
+|---|---|
+| the fill (bundle written under these) | `-8455804_` `-8455805_` `-8455806_` |
+| the rehearsal, ~4 min later | `-8459967_` `-8459968_` `-8459969_` |
+
+Result: **45 of 45** Experience fields reported `approved value has NO matching field on the live form`
+and the gate refused a submit whose approved values were, in fact, all on the page. Not one failure was
+a `PersonProfileFields.Address*`/`Phone*` field — the candidate's own address and phone block stays at
+`-1_`, so the parse only re-mints what it SAVES.
+
+The position is the stable name, and both sides already carry it (`entryIndex`/`entrySection`, stamped
+by first DOM appearance; `entry_section`/`entry_index` in the bundle). `atsSubmitKey` keys a section
+entry `@experience[0]/<bare id>`. Verified: the same bundle then replayed `106 field(s), 0 failure(s)`.
+
+**Both visits attach.** Bundle field ids are captured from whatever form the fill saw, so a bundle taken
+from an UNPARSED form and replayed against a PARSED one reproduces the `approved value has NO matching
+field on the live form` failure mode documented in `(b)` above — for every entry field. A required
+résumé that fails to attach halts the submit run at `resume-not-attached`, because the strict verify
+only re-checks approved VALUES and a missing file is not one.

@@ -74,6 +74,25 @@ export type ReviewEntry = {
   // on PSECU's ethnicityMulti — two options checked, both saved). current_value stays the joined
   // display string so the blank tests / submit gate / review reconcile keep reading one value.
   selected_options?: string[] | null;
+  // ⚠ A CREDENTIAL FIELD CARRIES NO VALUE. On a form whose account is created by the submission
+  // (iCIMS), the login/password are ordinary fields, but `current_value` is the placeholder
+  // "(stored login)" — the secret is never put in the bundle, because the bundle lives on the
+  // application row in Supabase. These two say WHICH credential the field wants, so the editor can
+  // render it as a login box and read the real value from the account's own credentials record.
+  credential?: boolean | null;
+  credential_kind?: string | null; // "login" | "password" | "password_confirm"
+  // ONE form question rendered as SEVERAL controls — salary = currency/amount/timeframe, a date =
+  // month/day/year. Detected from the page's own markup by the fill (never a hardcoded list), so the
+  // review page can show one row per question instead of three peers whose labels ("Month", "Year")
+  // say nothing about which date they belong to.
+  question_key?: string | null;        // shared by the parts of one question
+  question_label_full?: string | null; // "What are your salary requirements?"
+  part_label?: string | null;          // "Currency" / "Month"
+  // Which repeating ENTRY a field belongs to, for a field the profile does not map (a per-customer
+  // question inside a work-history entry). Carried as the SAME base `canonical_field` uses
+  // ("experience"), so sectionOf lands it in the group its mapped siblings already form.
+  entry_section?: string | null;
+  entry_index?: number | null;
   tree_structure?: TreeStructure; // cert/source tree-AI (chosen category + leaves)
   date_order?: string[] | null; // segment order for the segmented date editor
   tiers?: string[] | null; // ordered candidate list for a hierarchical/tree field

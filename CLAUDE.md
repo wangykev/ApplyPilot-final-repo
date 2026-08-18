@@ -11,7 +11,7 @@ This file holds **standing rules, invariants and safety contracts only** — eve
 | `workday-walk` skill | the N-page walk, `clickPageNext`, nav-timeout halts, AI-4 remediation, phantom duplicates, repeating sections + the `*_MAP` maps, résumé attach |
 | `review-and-submit` skill | the `reviewSummary` schema, accumulation, the viewer/editor, the approval envelope, replay re-verify, review-page reconcile, `submitPrecondition` |
 | `answers-and-ai` skill | the full match ladder, answer buckets + answer ladders, `llm.js` / AI-0…AI-4, employer-match + employment-status recognizers |
-| `ats-tenants` skill | Greenhouse / Lever / Ashby (`ats.js`) — routing, the option poll, per-ATS traps, the dev loop |
+| `ats-tenants` skill | Greenhouse / Lever / Ashby (`ats.js`) — routing, the option poll, per-ATS traps, the dev loop. ⚠ Assumes a top-frame, login-free form: for **iCIMS** read the iCIMS section below first (iframe-hosted, and it creates an account), then use this skill's dev loop |
 | `workday-onboarding` skill | pre-form: JD → Apply → sign-in → Gmail verify → the form |
 | `job-discovery` skill | the LinkedIn / Handshake / Simplify sweep (`discover.js`) |
 | `live-testing` skill | driving a real end-to-end run through Chrome |
@@ -465,6 +465,378 @@ The full schema, accumulation, the viewer/editor, replay re-verify and the revie
   blocks the gate (positive evidence the page CONTRADICTS what was approved); **MISSING is absence of evidence
   and is INFORMATIONAL** — Workday legitimately doesn't render every field. A scrape FAILURE still blocks.
 
+## iCIMS — an IFRAME-hosted form whose ACCOUNT IS CREATED BY THE SUBMISSION (2026-08-16)
+
+Observed DOM (ids, required markers, section shape, the résumé postback): `docs/dom-patterns.md`
+`2026-08-16 — Astrion iCIMS`. The standing rules:
+
+- **The whole application is inside a same-origin `<iframe id="icims_content_iframe">`** — the top
+  document has ZERO controls. `cdpUseFormFrame` pins `Runtime.evaluate` to the frame's isolated world
+  (`Page.getFrameTree` → `Page.createIsolatedWorld`), armed in `waitAtsFormReady` so BOTH the fill and
+  the submit run get it. **`_frameCtxId` defaults null, so Workday / GH / Lever / Ashby are byte-identical.**
+  An isolated world is not a compromise: it shares the DOM, and iCIMS is server-rendered jQuery, not React.
+  ⚠ A postback can replace the world (`Cannot find context with specified id`) — `cdpEval` re-arms ONCE
+  and retries; a stale world is recoverable, not a failed field. **`atsFormUrl` KEEPS the query for
+  iCIMS** — `?eem=…&code=…` is a one-time magic-link session, not tracking cruft, and a second top-level
+  navigation to the frame's src consumes it and lands on a 0-field sign-in page.
+- **`atsCompanyFromUrl` reads the SUBDOMAIN for iCIMS**, not path segment 0 (which is the literal
+  `jobs`) — that string anchors the safety-critical employment recognizer.
+- **CREDENTIALS ARE A TIER, AND IT IS THE TOP ONE** (`atsRouteField`, above the static map, buckets,
+  labels and AI). iCIMS embeds "Create a login" INSIDE the form because **the account is created as part
+  of submitting** — so it is simply another section, and a prepopulated value (iCIMS renders the
+  session's own login) is REPLACED. Being first is the safety property: every rung below could otherwise
+  reach a login box. Invariants, all unit-pinned:
+  - the value comes ONLY from `store.credentials` — the website's Credentials page, the same slot Workday
+    onboarding signs in with. **Never a profile value, never a taught bucket, never an LLM.** The contact
+    email (`personal_info.email`) is deliberately NOT the login: the two may differ.
+  - **it never enters a log line, a record or the review bundle.** `rec.after` is a PLACEHOLDER
+    (`"(stored login)"`) + `credential:true` + `credentialKind`, so review names WHICH credential without
+    carrying it. `atsInjSetCredential` / `atsInjVerifyCredential` return a LENGTH and a MATCH BOOLEAN,
+    never a value — `atsInjSetText`'s `{after: el.value}` would hand the secret to Supabase, because
+    `buildReviewBundle` copies `rec.after` into `current_value` and nothing on that path redacts.
+  - **clear before typing** — the setter SETS rather than replaces, so a rewrite merged into
+    `"old@x.comnew@y.com"`. Write order is pinned `["", value]`.
+  - absent/incomplete credentials ⇒ `needs_review` + `credentials-not-stored`, never a half-made account.
+  - **REVIEW SHOWS IT LIKE A LOGIN FORM, and reads the value from the ACCOUNT, not the bundle
+    (operator, 2026-08-17).** The bundle carries `credential: true` + `credential_kind` — FLAGS ONLY —
+    so the review editor renders the login as text and the password as dots with a reveal toggle,
+    sourcing the actual value server-side from `credentials_json` (the same row the Credentials page
+    edits). ⚠ **Read-only, and that is the safe direction, not a shortcut:** an editable box would
+    write what was typed into `current_value`, which is precisely how the secret would reach the
+    application row. Changing it belongs on the Credentials page — the submit run re-reads it there
+    anyway. Regression-checked live: the stored bundle contains neither the password nor the login
+    email, only the placeholders.
+  - **an unmapped `type=password` box is claimed anyway** — recognition is what keeps the AI rescue away
+    from it, so an UNrecognized password field is the dangerous outcome. Claiming a LOGIN needs two
+    agreeing signals (`autocomplete="username"` AND login/username wording).
+- **THE IMMEDIATE READ-BACK IS NOT ENOUGH — `atsCredentialRecheck` runs LAST.** `autocomplete="username"`
+  invites Chrome's own password manager into the box after the page settles: observed live as written,
+  verified, reverted, still reported `filled`. The post-fill audit **structurally cannot** cover this (it
+  compares against `rec.after`, which is a placeholder — so credential records are SKIPPED there), which
+  is why a dedicated check compares against the EXPECTED value, inside the fill where the credentials
+  already are. A replaced field is rewritten once; one the page keeps taking back ends `needs_review` +
+  `credential-overwritten` with its placeholder cleared. **A login we could not keep on the page must
+  never be reported as filled.**
+- **A CREDENTIAL IS NEVER REPLAYED FROM THE BUNDLE.** The bundle holds the placeholder by design, so the
+  submit run re-reads `chrome.storage.local.credentials` and routes these fields through the credential
+  tier — otherwise it would type `"(stored login)"` into the account's login box and submit it.
+- **NOT EVERY `<select>` ON THIS FORM IS A SELECT — the `icims_dropdown` widget (2026-08-16).** iCIMS
+  replaces many of them with its own AJAX combobox ("IdDropDown"), and when it does the `<select>` is
+  left **permanently empty** (one blank `<option>`) while its `value` holds an **opaque numeric id**
+  (`12781`), never text. The real choices are `<li role="option">` rows in a sibling
+  `<ul id="<id>_dropdown-results">`. The tell is the element's own attribute,
+  `icimsdropdown-enabled="1"` — not a guess. Anatomy: `<a id="<id>_icimsDropdown">` opens it,
+  `<span id="<id>_fakeSelected_icimsDropdown">` is the READ-BACK, `input.dropdown-search` is the search
+  box, and the container's `dropdown-invisible` class is the open/closed gate — **`aria-expanded` stays
+  `"false"` even while open.** Reading `select.options` there returns NOTHING, which is exactly how the
+  required Country and State/Province reached review as *"no live options to choose from"* while the
+  page was plainly showing a list.
+  - **ONE PAGE AT A TIME** — measured 26 countries / 25 states (Alabama…Michigan, so Minnesota→Wyoming
+    are absent). A first-page miss is NOT proof the option is absent: **search before reporting**, or
+    everyone past Michigan fails. Its option list is therefore recorded **always partial**.
+  - **A NEW CHOICE WIDGET MUST BE REGISTERED IN FOUR PLACES**, and missing one fails silently and
+    differently each time: `ATS_REVIEW_WIDGET`, the `isChoice` list feeding `resolve()` (miss it and a
+    TIERED profile array is coerced as free text, so the fallback tier that matches the form's wording
+    is never tried), `atsAiBatchKind`, and `atsAiFallback`'s option-read + commit switches.
+  - **`atsInjReadValue` needs a branch too** — otherwise the post-fill audit flags every one of these
+    as `audit-mismatch` on a correct fill, because `selectedIndex` says "nothing selected".
+- **A PARENT→CHILD DEPENDENCY IS DECLARED IN THE DOM, so report it rather than guessing.** Country
+  carries `data-ddd-child-link="PersonProfileFields.AddressState"` and an `onchange` calling
+  `icimsChangeParent`; the child's list reads `"Please select a country"` until the parent commits.
+  DOM order already puts parent before child, so the natural fill order works — but a child whose
+  parent is unset must say **that**, not "no options": the generic message sent a debugging round to
+  the option read instead of to the unset parent.
+- **A REPEATING-SECTION FIELD IS SEALED TO ITS OWN ENTRY (operator, 2026-08-16).** A "State/Province"
+  inside an Education entry is the COLLEGE's state, so answering it from the applicant's home address
+  is a DIFFERENT FACT, not a near-miss. `atsEntrySpec` / `atsResolveEntryField` read
+  `profile.<source>[entryIndex]` and the rung **returns even when it has no answer**
+  (`entry-unanswered`) — that early return is the seal; falling through would let the label ladder
+  reach the profile root. **The LLM obeys the same seal:** `atsScopeForField` hands an entry field
+  ONLY its own entry, and `atsRunAiBatch` groups deferred questions **by scope**, so an entry question
+  never shares a prompt with page-level ones (which carry the whole profile) or with a different
+  entry. A solo call uses the scoped profile too — otherwise the seal would hold only when a batch
+  happened to fire. Entry indexes are stamped by **first DOM appearance** of the ordinal, never its
+  numeric value (`-1` is the default entry; saved ones carry opaque server ids).
+- **SCHOOL / OTHER SCHOOL is ONE decision across TWO required fields.** In the list ⇒ pick it and put
+  `"N/A"` in Other School; not in the list ⇒ pick the list's own `"Other"` and put the name in Other
+  School. Two non-obvious parts: on the fallback the record is **rebuilt, not patched** (the failed
+  attempt's tier/detail describe a different commit), and an **UNKNOWN** School outcome writes the
+  NAME, not `"N/A"` — treating unknown as matched is the one branch that silently loses the school.
+- **A FORM CAN REQUIRE A DAY THE PROFILE DOES NOT STORE (operator, 2026-08-17).** Profile dates are
+  month-precision (`"2025-05"`), so every required Day reached review BLANK. Two sources, and the
+  distinction is the point: the profile's OWN day when it stores one (`"2025-05-12"` → a stated FACT,
+  `filled`, unflagged), else `defaults.date_day` (`data/application_defaults.json`, built-in **1**) —
+  an APPROXIMATION, so it is **`filled_review` + `default-value`** and faces the human gate like any
+  value the operator did not state (operator, 2026-08-17). It still FILLS, which is the point: the
+  field went from blank-and-flagged (type a value) to filled-and-flagged (approve it). ⚠ Deliberately ONE
+  default, not first-of-month/last-of-month cleverness: that invents precision the operator never gave,
+  and a date on an application is a factual claim. `atsDefaultDay` accepts only **1–31** so a typo
+  cannot reach a form, an explicit `null` OPTS OUT (nothing filled), and a **year-only** value gets no
+  day at all — a day off `"2024"` is two guesses stacked. ⚠ **REQUIRED ONLY:** an optional blank blocks
+  nothing (not Save, not the submit gate, and it is not a review item), so an approximation there buys
+  nothing and adds an unasked-for claim — the same rule the AI tier obeys. A **stated** day ignores
+  required-ness, because a fact has no downside.
+- **`currently_enrolled` IS NOT TRUSTWORTHY ALONE — a FUTURE graduation date wins.** The website's
+  education editor does not expose that checkbox, so a synced profile carries the schema default
+  (`false`) and a student graduating in 2028 was answered **"Yes, graduated"** deterministically and
+  unflagged on 2026-08-16. Reading an absent field as a positive assertion was the fault, not the
+  matching. `atsIsFutureYearMonth` decides first; the flag is consulted only when the dates say
+  nothing. A US state in the entry's `location` also implies the country — which is what fills the
+  declared PARENT (Country) in the same pass, ahead of its child (State).
+- **THE SEARCH SETTLE POLLS FOR A MATCH, NOT FOR STILLNESS — three attempts, one cause.** Every
+  "has the search finished?" proxy is already satisfied by the PRE-SEARCH list: stability accepts it
+  (non-zero and stable), and "changed since we opened" accepts it too, because the list is often
+  still loading at open time so the baseline is empty. Measured: the school search takes **~4s** to
+  return, and a 675ms give-up reported `no option matched "Carnegie Mellon University" (after
+  searching)` while typing the same text by hand returns it first. Now: match on EVERY read, stop at
+  the first hit, `"No Results"` is the widget's own terminal no, ~8s budget. **Check "awaiting
+  parent" BEFORE searching** — searching replaces the widget's "Please select a country" row, which
+  destroys the evidence and misreports the cause.
+- **The address block is a REPEATING section** (`a.iCIMS_Anchor` "Add More (Addresses)"), and every
+  field carries an entry ordinal: `-1_PersonProfileFields.AddressCity`. `atsMapKey` strips a leading
+  `<digits>_` **for iCIMS only** before the static-map lookup, so the map is keyed on the bare platform
+  id. Keying by id is safe here precisely because `PersonProfileFields.Address*` is iCIMS' own
+  vocabulary for the CANDIDATE's address — a work-history employer address is a per-customer
+  `rcf<NNNN>` group and cannot collide. **The candidate's PHONE is the same shape and the same rule**
+  (`PersonProfileFields.PhoneNumber` / `.PhoneType` / `.PhoneExtension` / `.PhoneCountry`) — ⚠ both were
+  UNMAPPED until 2026-08-17, and because their labels are only "Number" and "Type" they fell through the
+  label ladder to the AI, which answered the required "Number" with **`24615` — the job's requisition
+  id** (flagged `ai-text`, so the gate held, but it recurred every run). *A required platform field
+  whose label is a bare noun is the shape that silently reaches the AI.*
+- **A REPEATED entry of a single-value field is DETECTED, NOT DECLARED (operator, 2026-08-17).** The
+  static map is keyed on the ordinal-STRIPPED id, so a second rendered address/phone row would be handed
+  a DUPLICATE of the first. Nothing names which blocks repeat — iCIMS is configured per customer, so a
+  family list (`Address*`, `Phone*`) would make the next portal a code change. Instead
+  `atsAssignEntryIndexes` asks what the page can answer: **has this exact BARE id already appeared under
+  a different ordinal?** `repeatIndex` is the position of the field's own ordinal in that id's first-seen
+  ordinal list — so index 0 is the entry the map fills, a form with one row produces 0 for everything and
+  the rule never fires, and a tenant that repeats something we have never seen is covered for free.
+  Ordinals are POSITIONS, never values (`-1` is the default entry; a saved one carries an opaque server
+  id). Fields already claimed by a SECTION are excluded — those repeat legitimately from a profile ARRAY
+  (`rcf3271` "Employer Phone Number" at -1/-2/-3 is three real jobs, not one value three times).
+  A repeat is left **BLANK with a note**: the profile holds one phone, so a copy is a fabricated second
+  number and the AI's would be a guessed one, and the extra entry is optional so blank blocks nothing.
+- **⚠ THE SUBMIT RUN MUST GROW REPEATING ENTRIES FROM THE *BUNDLE*, NOT THE PROFILE (2026-08-17).** A
+  replay passes `profile: {}` by design (every value comes from the approved bundle), so the
+  entry-growing pass counted 0 rows and the form kept the ONE entry it renders. Live that was **28 of a
+  rehearsal's 32 verify failures** — every field of work-history entries 2 and 3 reported *"approved
+  value has NO matching field on the live form"*, and a multi-entry history could not be replayed at
+  all. `runAtsSubmitRun` counts entries from the bundle (BOTH shapes: `canonical_field`'s
+  `experience[2]…` and the `entry_section`/`entry_index` a per-customer field carries) and passes
+  `opts.entryCounts`.
+- **⚠ INDEX 0 IS NOT "UNSELECTED" — a `<select>` need not have a placeholder (2026-08-17).** Both select
+  readers used `selectedIndex > 0`, so iCIMS' salary Currency and Time Frame (raw options start at
+  `"USD $"` / `"Hr."`, no blank first row) read a legitimately-chosen FIRST option as blank — a
+  rehearsal reported `native select commit failed` on two fields whose values were on the form the whole
+  time. **A false negative on a verify gate blocks a submit that should pass.** "Unselected" is: nothing
+  selected, or the selected row is a PLACEHOLDER. LOCKSTEP in `atsInjScan` + `atsInjReadValue` (two
+  injected fns cannot share code) — pinned by a test that strips comments first, because both functions
+  now *document* the old shape in prose and a naive grep matches the explanation.
+- **A MULTI-ANSWER value arrives JOINED, and the replay must split it.** `current_value` for a
+  checkbox group / native multi-select is the display string (`"Internship; Part-time"`), so passing it
+  through as one candidate asks the form for an option by that whole name. Split with
+  `atsLib.splitGroupValue` — the same vocabulary the fill joined it with.
+- **`atsInjSubmitState` needs its iCIMS branch**: the control is `<input type="submit"
+  id="cp_form_submit_i" value="Submit Profile">`, and the generic finder queries only `button`s and
+  matches `textContent`, which an `<input>` lacks. Measured: without it `hasSubmit:false` and
+  `atsLooksLikeApplicationForm` REFUSES a perfectly good form.
+- **A RUN STARTS FROM AN EMPLOYER-HOSTED PORTAL, AND ITS LOGIN PAGE LOOKS LIKE A FORM (2026-08-16).**
+  `careers.astrion.us` is an iCIMS portal on the EMPLOYER's domain, so `detectAts` (host-based, and it
+  must stay that way) returns null. Detection is by PAGE EVIDENCE — `atsPortalAts` reads the hosts the
+  page itself references and refuses when two ATSs are named. ⚠ Then the Apply link lands on
+  `/jobs/<id>/login`, whose email box + submit control **PASS `atsLooksLikeApplicationForm`** — so
+  `runIcimsPreForm` runs BEFORE the form wait, never as a fallback after it. Reaching the gate and calling
+  it "the form" would type profile data into a login box. `icimsAuthView`'s control bound is what separates
+  them, and it is unit-pinned in the direction that bites: **the application form carries its OWN
+  Login/Password block, so a password box is NOT evidence of a sign-in page.** The stage carries
+  `runCdpOnboard`'s invariants verbatim (credentials only from storage and written through
+  `atsInjSetCredential`, so the password cannot reach a log line; SSO refused on URL evidence ONLY;
+  federated and account-creation controls REPORTED, never pressed; every stop `needs_operator`; it stops at
+  the form and submits nothing) and runs on the SUBMIT path too, which meets the same gate on a fresh tab.
+  `login.icims.com` is the **RECRUITER** login and needs its own refusal — it is an `icims.com` host, so
+  the SSO test exempts it. Settle before scanning: the frame mounts after the document, and that race is
+  **VISIBLE-ONLY** (a hidden run is slow enough to miss it, so "it worked in the background" is not
+  evidence). The flaky Apply control is retried against the page's own IDENTITY (`atsSignatureChanged`
+  over top **and** frame — a postback changes only the frame), never a click count.
+- **⚠ THE SIGN-IN GATE IS INVISIBLE hCAPTCHA, AND OUR OWN TIMER POLYFILL BREAKS IT (2026-08-16).** The
+  gate's submit is `preventDefault`-ed and only proceeds on `hcaptcha.execute`'s callback; measured,
+  hCaptcha **never initialises** under the blob-worker timer polyfill (`captchaFrames 0` under a run vs a
+  rendered iframe by hand). Isolated to the WORKER alone, not the CSP bypass, so iCIMS runs pass
+  `{noWorkerTimers:true}` to `cdpInstallPageOverrides` and accept `hidden-SLOW` pacing. **Measured A/B
+  2026-08-17: hidden 37.2s vs visible 16.6s (2.24×), and the whole gap is per-field PAGE CONTACT (26.5s
+  vs 6.5s), NOT SW drift** (~1.1s — and the VISIBLE run's overrun was worse, so Workday's
+  drift-dominates conclusion does not transfer here). ⛔ **DO NOT close that gap by giving the FORM the
+  polyfill: the form carries its OWN captcha** (2 hcaptcha frames + an `h-captcha-response` input), so
+  Submit Profile is captcha-gated exactly like the gate and the failure mode is silent. **The gap is
+  closed the OTHER way instead: `cdpSetFastWhenHidden(true)`** — a scoped per-run opt-in (reset at every
+  attach, so it cannot leak to Workday) that lets `cdpFast()` say yes on a hidden tab because iCIMS'
+  reactions are AJAX/DOM, not page-timer driven. Hidden went **37.2s → 15.1s, parity with visible's
+  16.6s**, with `needs_review` unchanged and the rehearsal still `0 failure(s)`. ⚠ A DIFFERENT AXIS from
+  `cdpSetPageClock`: that chooses WHERE a pace sleeps, this chooses HOW LONG. Safe because it applies the
+  SAME `FAST_FACTOR` every visible run uses and every pace site is read-back gated — a short wait costs a
+  retry, never a silent wrong fill. Rounds 11–12 of `docs/fill-speed-log.md`.
+  **This is NOT captcha handling and must never become it:** it removes OUR tampering so the page's own
+  check can run and judge the session — nothing is solved, forged or hidden, and a refusal still halts for
+  the operator. The gate also **disables its own button** on submit (`icimsDisableSaveAndSubmitButtons`) and
+  only the captcha callback unlocks it, so a stall cannot be retried in place — one bounded reload, then
+  `captcha-unanswered`. Diagnose with the pair `submitLocked` (the submit FIRED) + `captchaToken` (the
+  captcha RESOLVED); nothing else tells the two apart.
+- **AN OPTIONAL DROPDOWN MUST REACH REVIEW AS A REAL PICKER (operator, 2026-08-16).** On these
+  one-page forms a field we never filled still has to be ANSWERABLE, and a picker with no usable
+  options is just a text box. The lists were already being READ — the gap was that
+  `icims_dropdown` was flagged partial **unconditionally** (the flag read a `data-ap-complete`
+  attribute nothing ever wrote), and a partial list is attached as `captured_options` +
+  widgetType `typeahead`, which review renders as type-it-yourself. A two-option "May We Contact"
+  question arrived as FREE TEXT. **The form reveals its own page size when you look at every
+  dropdown at once** (`atsIcimsPageCap`): unrelated vocabularies do not stop at the same exact
+  length by chance, so N dropdowns all ending at 25 is a pager — and a list SHORTER than a page has
+  reached its end. Derived, never hardcoded (the cap is a tenant setting), and a repeated length must
+  clear `ATS_ICIMS_CAP_MIN` or ten Yes/No dropdowns "prove" a page size of 2 and nothing is ever
+  complete again. ⚠ **The asymmetry is the safety property:** a picker MISSING the operator's answer
+  makes them conclude the form doesn't offer it, while a complete list called partial only costs a
+  typed value — so every uncertain case stays partial. A **proven-complete scan list also beats a
+  search-FILTERED actuation list** (the "the actuation list is better" rule holds only while it is
+  fuller). Costs nothing: no page contact, measured same wall clock. Diagnose with the two always-on
+  `[ATS-OPTIONS]` lines — *scan-time coverage* (what we knew, printed BEFORE anything actuates, the
+  only uncontaminated moment) and *review editors* (what the operator will see); reading one as the
+  other is how "16 proven complete" gets mistaken for "16 pickers".
+  ⚠ A result's `widgetType` is rewritten to the **REVIEW** vocabulary as the record is built, so
+  anything inspecting a RESULT must match `ATS_CHOICE_REVIEW_WIDGETS`, not `ATS_CHOICE_WIDGETS`.
+- **⚠ A RUN USUALLY STARTS FROM THE POSTING ITSELF, AND THEN *EVERYTHING* IS IN THE FRAME (live
+  2026-08-18).** The Astrion flow — employer portal → Apply → gate → form — is the EXCEPTION. Most
+  iCIMS links are `<tenant>.icims.com/jobs/<id>/…/job`, where the job description **and its lone
+  `<a>Apply for this job online</a>`** live inside `#icims_content_iframe` and the top document is ~13
+  characters of branding. `cdpUseFormFrame` refused to pin that frame because it counts **form
+  controls** and a posting page has none, so the pre-form stage read the top document and halted
+  `apply-not-followable` on a page whose Apply link works by hand. A control count answers "which frame
+  has the form"; it cannot answer "which frame is this tenant's content".
+  - `minControls:0` is now reachable but must be **IDENTITY-ANCHORED** (`opts.identifyUrl`, matched
+    against the frame's own url, taken from the page's own `<iframe src>` via `atsInjIcimsFrameSrc`) —
+    an unanchored 0-floor call would happily pin an analytics iframe and blind the caller in a NEW
+    way, silently. An identified frame outranks a fuller one; a 0-floor call with no identity is
+    refused. `runIcimsPreForm` tries the ordinary floored call FIRST, so a gate/form page is unchanged.
+  - **`cdpEval`'s re-arm reproduces how the pin was obtained** (`_frameArmSpec`) instead of a hardcoded
+    floor of 1 — otherwise a postback on a 0-control frame re-armed, failed, dropped the pin back to
+    the top document, and the same blindness returned later looking like a different bug.
+- **⚠ AN ACCEPT CHECKBOX IS TICKED — STANDING OPERATOR INSTRUCTION (2026-08-18).** Many tenants gate the
+  gate: an UNCHECKED `aria-required` privacy box (`#accept_gdpr`), a hidden `#consentCaptureTitle` naming
+  it, and a row stating the rule ("You must indicate that you have read the privacy notice … before you
+  can continue"). Measured 2 of 5 sampled tenants — ITT (one box) and Peraton (**two**: "I accept the
+  Privacy Policy", "I accept the Peraton Job Application Privacy Notice"); Astrion, Cretex and Wieland
+  have none. **The operator read those notices themselves and instructed that accept checkboxes be
+  ticked, now and in the future** — they are the data subject, the notice governs the processing of
+  THEIR data for THEIR application, and declining it means the application cannot be made at all. This
+  REPLACED a `consent-required` halt.
+  - **Only `atsConsentKind === "accept"`** — assent to a notice/policy/terms/GDPR. An **OPT-IN** (talent
+    community, job alerts, "email me about similar jobs") is NEVER ticked: it is not an acceptance, and
+    it would sign the operator up for mail they never asked for. An opt-in that merely *mentions*
+    privacy still classifies as an opt-in — pinned by test.
+  - **A truthfulness ATTESTATION is deliberately excluded** ("I certify the information is accurate",
+    "under penalty of perjury"). That is a factual claim by the applicant, not assent to a notice; the
+    consequence of a wrong one differs, and the instruction that authorised this was about privacy
+    notices. Recognized (`ATS_CONSENT_ATTEST_RE`) only so it is skipped ON PURPOSE. **Do not fold these
+    in without asking.**
+  - **Cookie/consent BANNERS are out of scope** — unrelated to applying; the onboarding rule below
+    (never press an affirmative consent-popup control) is untouched, as is preferring the
+    privacy-preserving option on a cookie banner.
+  - **Auditable, not silent:** every acceptance is logged BY NAME with the notice's own title
+    (`✔ ACCEPTED on your instruction: …`) and carried out on the run result as `consents_accepted`. The
+    tick is **verified** — a box that did not end checked halts `consent-not-accepted` rather than being
+    reported as consent given, which also keeps iCIMS' `preventDefault`ed submit from resurfacing as
+    "the Next control could not be pressed". Kill-switch: `chrome.storage.local.declineConsents = true`
+    restores the halt.
+  - The scan REPORTS boxes and classifies nothing (`atsInjAuthScan` returns label + row text + markers);
+    the judgement lives SW-side in `atsConsentKind`/`atsConsentPlan`, so there is one copy of it rather
+    than an injected dup that could drift from what was authorised.
+- **SECURITY CLEARANCE — STATED OR NOT ANSWERED (operator, 2026-08-18).**
+  `work_authorization.security_clearance` (a dropdown of the US clearances +
+  `None` — `SECURITY_CLEARANCE_OPTIONS`, web/lib/profile-fields.ts). A clearance is a FACTUAL claim and
+  claiming one you do not hold is serious, so the rung in `atsRouteLabel` answers ONLY from that field.
+  - **EMPTY ≠ "None".** Empty = the operator has not told us ⇒ `clearance-unstated`, blank + review.
+    "None" = a stated fact ⇒ answers "do you hold an active clearance?" with **No**.
+  - **It CLAIMS the question even when it cannot answer it.** That is the point: an unanswered REQUIRED
+    clearance question would otherwise reach the AI rescue, whose prompt tells it to infer from ABSENCE
+    and never refuse — and an invented "No" for a TS/SCI holder, or an invented "Yes" for someone with
+    nothing, is the confident-wrong-value class. Recognition is what keeps the AI away from it.
+  - **ONE tiered candidate list serves both shapes** (a level dropdown and a yes/no), because the ladder
+    only ever commits an exact or leading-polarity hit. Aliases are strictly SIDEWAYS
+    (`atsClearanceAliases`): a Secret must never offer Top Secret, an interim grade never the full one.
+  - **BAILS on willingness/eligibility** ("willing to obtain", "eligible to obtain", "sponsor a
+    clearance") — those ask about the FUTURE and a held level answers them wrongly in both directions.
+  - **BOTH ENGINES, ONE DEFINITION.** The recognizer, the future-tense bail and the candidate ladder live
+    in **lib.js** (`recognizeClearanceQuestion` / `clearanceCandidates` / `clearanceAliases`), reached as
+    `atsLib.*` from ats.js and `apMatch.*` from fill-driver.js — a second copy could drift from the one
+    the operator authorised. ⚠ Both hand-written SW literals need the names (the `atsLib` literal in
+    ats.js **and** the `apMatch` literal in fill-driver.js); `test/sw-globals.test.js` caught exactly that
+    omission before a live run did.
+  - **⚠ ON WORKDAY, FOUR PATHS WOULD OTHERWISE GUESS IT — all four are now closed**, and three of them are
+    invisible from the deterministic rung:
+    1. the **AI batch** — `deterministicTierFor` returns `"clearance"`, so the question never enters the
+       batch (the planner skips any field a tier owns);
+    2. the **AI infer** pass — a flagged `needs_review` is not `producedNothing`, so it is skipped;
+    3. the **required-radio / checkbox-group rescues** — these exist to *guess to reach review*, and
+       `record.resolved == null` does NOT exclude a clearance (that gate catches a decision we made and
+       failed to commit; here the rung deliberately made none, which looks identical to "unmapped").
+       Caught by a test whose fixture handed the model a willing "No";
+    4. the **final required-dropdown backstop** (`forceRequiredDropdownPick`) — the one deliberate
+       exception to "a required dropdown never ends a page blank". For a phone type that trade is right;
+       for a clearance, whatever it picked is a false statement in one direction or the other, so the
+       field ends BLANK, the walk may halt, and the detail says `last-resort pick DELIBERATELY SKIPPED`.
+    Plus **AI-4 remediation may not refill it** — the most tempting path of all, since the page has just
+    refused to save and the error names the empty field. The halt is the intended outcome; the fix is one
+    profile edit.
+- **A JD-scraped COMPANY can be a PAGE TITLE, and that string is safety-critical.** On an employer page
+  there is no ATS markup to key on, so the scrape returned the document title as the company — the anchor
+  for "have you worked for us before?". `atsPlausibleCompany` is a NEGATIVE test; what it rejects falls back
+  to the iCIMS tenant subdomain (evidence), what it cannot judge is KEPT (so GH/Lever/Ashby are unchanged).
+- **THE RÉSUMÉ GOES ON FIRST, AND ITS PARSE IS WAITED OUT — ORDER IS THE WHOLE FIX (operator,
+  2026-08-17).** iCIMS parses the upload SERVER-SIDE and posts the result back into the panel seconds
+  later, re-rendering entries under new ids and blanking what was written ("Existing data in the form
+  will be replaced" — the form's own words). As an ordinary field mid-fill it therefore destroys the fill
+  it is meant to help, which is why it was `kind:"skip"` from 2026-08-16. `atsIcimsResumeStage` attaches
+  it after the form settles and **before a single value is written**, then waits; the parse can only
+  overwrite an empty form, and everything filled afterwards lands on top of whatever it produced.
+  - **The wait is NOT a timer** (the standing pacing rule) — two polled conditions, both required: the
+    form's own IDENTITY changed (`atsFormSignature` = field SET + which fields hold a value; a
+    field-COUNT settle cannot see a re-render that keeps the count), **and then** the panel goes QUIET
+    (the mutation-stamp watch — the only probe here that can say "the DOM is mid-reaction"). A parse
+    that changed NOTHING is indistinguishable from one that has not started, so that branch still spends
+    its whole change budget and requires quiet+stable before filling. Being slow costs latency; being
+    early costs the entire fill.
+  - **The fill loop NEVER attaches on iCIMS** — it records the stage's outcome. A second upload is a
+    second parse, and that one lands *during* the fill (on a submit run, over approved values).
+    A form already carrying a file is left alone, which is what makes the cascade re-replay safe.
+  - **BOTH VISITS ATTACH — fill and rehearsal/submit.** The parse re-renders repeating entries under new
+    ids, so a bundle captured from an UNPARSED form replayed against a PARSED one reports every entry
+    field as *"approved value has NO matching field on the live form"* (the shape that produced 28 of a
+    rehearsal's 32 verify failures when entry counts disagreed). A résumé is also a FILE: the bundle
+    never carries bytes, so it comes from IndexedDB on each visit — like credentials, never from the
+    bundle. A **required** résumé that did not attach **blocks the submit gate** (`resume-not-attached`):
+    the strict verify only re-checks approved VALUES, so nothing else downstream would notice.
+  - **`filled` needs EVIDENCE the file landed, not just that we wrote `input.files`** (a page-side write;
+    iCIMS uploads on the change event). Either the widget confirmed it (filename read back) **or** the
+    server reacted (a postback — only an accepted upload causes one). Neither ⇒ `filled_review` +
+    `resume-unconfirmed`; a parse still churning at the ceiling ⇒ `resume-parse-unsettled`.
+  - The form's own "Upload Resume at a later time" box is still left UNTICKED — the operator's choice.
+  - **⚠ AND THE PARSE MAKES ENTRY IDS PER-VISIT, SO A SUBMIT KEY MUST BE A POSITION (live 2026-08-18).**
+    `atsDurableFieldName` sufficed while iCIMS numbered repeating entries POSITIONALLY (`-1_`, `-2_`,
+    `-3_` — an ordinal *is* a position, and the same form serves the same ordinals every visit). The
+    parse SAVES the entries it extracts, so they return as server rows with opaque ids and each visit
+    mints its own: measured, a fill wrote its bundle under `-8455804/5/6_` and the rehearsal's form
+    served `-8459967/8/9_`, so **all 45 Experience fields** reported *"approved value has NO matching
+    field on the live form"* and the gate refused a submit whose values were all present.
+    `atsSubmitKey` keys a section entry as `@experience[0]/<bare id>` from the `entryIndex` /
+    `entrySection` stamp (bundle: `entry_section` / `entry_index`) — the pair `entryCounts` already
+    reads. **Not a new trust assumption:** ordinal matching was already positional, so only the SOURCE
+    of the position changed. Anything without a section stamp keeps the old key byte-for-byte (every
+    page-level field, and the candidate's own address/phone block, which the parse leaves at `-1_` —
+    live, not one of the 45 failures was `PersonProfileFields.Address*`/`Phone*`), so GH/Lever/Ashby
+    are untouched. It accepts BOTH shapes (live camelCase, bundle/record snake_case) because the two
+    sides keying differently IS the bug.
+- **Map only PLATFORM ids** (`PersonProfileFields.*` etc.). `rcf<NNNN>` are per-customer questions → the
+  label ladder. A leading `-1_` is a repeating-entry ordinal whose ids recur inside work history, where
+  an "address" is the EMPLOYER's — mapping those by bare id files your home address under a past job.
+
 ## Multi-ATS — Greenhouse / Lever / Ashby (`ats.js`; fill + gated submit, live-verified 2026-07-31)
 
 Routing, the option poll, per-ATS traps, the dev loop and every measured refutation: **`ats-tenants` skill.**
@@ -542,6 +914,32 @@ walk still refills the page as if blank.
 
 Mechanism (the auth loop + which-view discrimination, Gmail auto-verify, hidden-tab render budgets, the
 wait-predicate rules, the cover-check re-measure, per-tenant traps): **load the `workday-onboarding` skill.**
+
+## A SCRAPED JOB DESCRIPTION IS UNTRUSTED TEXT, AND IT LEAKS THREE WAYS (2026-08-16)
+
+`jobContext.description` is not just display data. One string reaches **Supabase** (the tracker row,
+at rest), **every AI prompt it grounds** (sent to the model provider verbatim), and **the run's log
+lines** — so anything secret inside it leaks three times over, and fixing only the report boundary
+fixes one third of the problem.
+
+- **⚠ `textContent` INCLUDES `<script>` SOURCE.** `scrapeJobPosting`'s reader is
+  `innerText || textContent`, and its last-resort "largest text block on the page" loop is a
+  CONTEST — so on a server-rendered portal whose page is mostly bootstrap JS, the winner is the JS
+  (`innerText` of a script-wrapping div is empty, so every candidate fell through). Live on iCIMS
+  that stored 3009 chars of `icims_handlePostMessage` as the description, carrying the **one-time
+  magic-link session token** (`?from=login&eem=…&code=…`). That loop reads **rendered text only**;
+  the hidden-tab case the fallback existed for is paid ONCE, on the body, with script/style
+  subtracted. A `<script>` is never a job description.
+- **`redactSecrets` (lib.js, pure) is the belt**, applied where `description` is ASSIGNED (both the
+  ATS and Workday paths) **and** at `reportApplication`, the single choke point to the tracker. It
+  rewrites credential-shaped URL params to `key=<redacted>` — **keeping the KEY**, so a leak stays
+  diagnosable while carrying nothing usable. Anchored on a URL separator (`? & ; #` — `#` because an
+  OAuth token lives in the FRAGMENT) so prose like "use code=ALPHA" is untouched: a JD is prose, and
+  over-redacting corrupts what the operator reads and the model is grounded on. 6-char floor keeps
+  `?code=US`. ⚠ Called as a **bare global** from background.js — never through the `apMatch` literal.
+- **Remediation for data already written:** `web/scripts/scrub-job-description-secrets.mjs` — imports
+  the same helper, dry-runs by default, idempotent, and never prints a token (key names + counts
+  only). Re-run it after any new leak class is found.
 
 ## Job discovery (find work → the website queue; reads only, NEVER applies)
 

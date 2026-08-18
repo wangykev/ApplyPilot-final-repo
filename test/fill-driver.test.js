@@ -788,6 +788,77 @@ test("employment anchor via URL tenant: a custom 'former «co» employee?' with 
   assert.ok(!act.log.some(([m]) => m === "llm"), "LLM NOT called — the URL tenant anchor made it deterministic");
 });
 
+// ── SECURITY CLEARANCE on the WORKDAY engine (operator, 2026-08-18) ──────────────────
+//
+// The ATS engine got this first. Until it was wired here, a Workday clearance question fell through to
+// the AI — whose prompt tells it to infer from the ABSENCE of information and never refuse. An invented
+// "No" for a TS/SCI holder, or an invented "Yes" for someone with none, is a false statement on a
+// federal application, so the question is claimed here whether or not it can be answered.
+
+const clearField = (label, opts) => ({
+  wrapperSel: "[w-clr]", fieldName: "customScreeningQuestion", widgetType: "radio", isRequired: true, label,
+  options: opts || [{ id: "y", labelText: "Yes", checked: false }, { id: "n", labelText: "No", checked: false }],
+});
+const clearProfile = (v) => (v === undefined ? { work_authorization: {} } : { work_authorization: { security_clearance: v } });
+
+test("clearance (Workday): a STATED level answers a yes/no clearance question deterministically", async () => {
+  const act = makeFakeAct([clearField("Do you currently hold an active security clearance?")], { aiEnabled: true, ai: '{"choice":"No","confidence":"High"}' });
+  const rec = (await drivePageFill(act, clearProfile("Top Secret/SCI"), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "Yes");
+  assert.strictEqual(rec.status, "filled", "a stated clearance is a fact — no review flag");
+  assert.strictEqual(rec.mappedPath, "work_authorization.security_clearance");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "the LLM must never be asked about a clearance");
+});
+
+test('clearance (Workday): "None" answers No, and a level list gets the level', async () => {
+  const act = makeFakeAct([clearField("Active Security Clearance")], {});
+  const rec = (await drivePageFill(act, clearProfile("None"), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.after, "No");
+  assert.strictEqual(rec.status, "filled");
+  const lvl = makeFakeAct([clearField("What is your current clearance level?", [
+    { id: "a", labelText: "None", checked: false }, { id: "b", labelText: "Secret", checked: false },
+    { id: "c", labelText: "Top Secret", checked: false }])], {});
+  const r2 = (await drivePageFill(lvl, clearProfile("Secret"), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(r2.after, "Secret");
+  assert.strictEqual(r2.status, "filled");
+});
+
+test("clearance (Workday): UNSTATED is left blank + flagged, and the AI is never asked", async () => {
+  // The willing model is the point of the fixture: it WOULD answer, and must not be consulted.
+  const act = makeFakeAct([clearField("Do you have an active US security clearance?")],
+    { aiEnabled: true, ai: '{"choice":"No","justification":"no clearance in profile","confidence":"High"}' });
+  const rec = (await drivePageFill(act, clearProfile(""), {}, {}, T_BUDGETS)).results[0];
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "clearance-unstated");
+  assert.strictEqual(rec.after, null, "nothing may be committed — a clearance is never invented");
+  assert.ok(!act.log.some(([m]) => m === "llm"), "the LLM must never be asked about a clearance");
+  assert.match(rec.detail, /does not state one/);
+});
+
+test("clearance (Workday): a required clearance DROPDOWN is exempt from the last-resort pick", async () => {
+  // The backstop exists so a required dropdown never ends a page blank ("getting to the review page is
+  // 1st priority"). A clearance is the one exception: whatever it picked would be a false statement in
+  // one direction or the other, and there is a one-edit fix. So it ends blank and says so.
+  const field = { wrapperSel: "[w-clr]", fieldName: "customScreeningQuestion", widgetType: "dropdown",
+    isRequired: true, label: "Security Clearance Level", options: ["Select One", "None", "Secret", "Top Secret"] };
+  const act = makeFakeAct([field], { aiEnabled: false });
+  const rec = (await drivePageFill(act, clearProfile(""), {}, {}, T_BUDGETS)).results[0];
+  assert.notStrictEqual(rec.status, "filled");
+  assert.notStrictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.flag, "clearance-unstated");
+  assert.match(rec.detail, /DELIBERATELY SKIPPED/);
+});
+
+test("clearance (Workday): a WILLINGNESS question is not answered from a held level", async () => {
+  // Asks about the FUTURE. A held level answers it wrongly in both directions, so it must fall through
+  // to the ordinary AI/blank path rather than being claimed.
+  const act = makeFakeAct([clearField("Are you willing to obtain a security clearance?")],
+    { aiEnabled: true, ai: '{"choice":"Yes","confidence":"High"}' });
+  const rec = (await drivePageFill(act, clearProfile("Secret"), {}, {}, T_BUDGETS)).results[0];
+  assert.notStrictEqual(rec.flag, "clearance-unstated");
+  assert.notStrictEqual(rec.mappedPath, "work_authorization.security_clearance");
+});
+
 // ── ADVERSARIAL WORDINGS (2026-07-24) — each of these WOULD have produced a silent WRONG deterministic
 // answer if recognized; all must bail (→ the AI+review fallback: a flagged guess, never a silent wrong).
 test("employment recognizer BAILS: wrong SUBJECT (relatives / referral / spouse / know-anyone)", () => {
