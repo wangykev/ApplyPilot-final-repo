@@ -763,9 +763,28 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
     (`atsClearanceAliases`): a Secret must never offer Top Secret, an interim grade never the full one.
   - **BAILS on willingness/eligibility** ("willing to obtain", "eligible to obtain", "sponsor a
     clearance") — those ask about the FUTURE and a held level answers them wrongly in both directions.
-  - ⚠ **WORKDAY IS NOT WIRED YET.** `fill-driver.js` has no label ladder for this, so a Workday clearance
-    question still reaches the AI. Closing that means claiming the question ahead of the AI gate there
-    too — the ATS engine (iCIMS/GH/Lever/Ashby) is done.
+  - **BOTH ENGINES, ONE DEFINITION.** The recognizer, the future-tense bail and the candidate ladder live
+    in **lib.js** (`recognizeClearanceQuestion` / `clearanceCandidates` / `clearanceAliases`), reached as
+    `atsLib.*` from ats.js and `apMatch.*` from fill-driver.js — a second copy could drift from the one
+    the operator authorised. ⚠ Both hand-written SW literals need the names (the `atsLib` literal in
+    ats.js **and** the `apMatch` literal in fill-driver.js); `test/sw-globals.test.js` caught exactly that
+    omission before a live run did.
+  - **⚠ ON WORKDAY, FOUR PATHS WOULD OTHERWISE GUESS IT — all four are now closed**, and three of them are
+    invisible from the deterministic rung:
+    1. the **AI batch** — `deterministicTierFor` returns `"clearance"`, so the question never enters the
+       batch (the planner skips any field a tier owns);
+    2. the **AI infer** pass — a flagged `needs_review` is not `producedNothing`, so it is skipped;
+    3. the **required-radio / checkbox-group rescues** — these exist to *guess to reach review*, and
+       `record.resolved == null` does NOT exclude a clearance (that gate catches a decision we made and
+       failed to commit; here the rung deliberately made none, which looks identical to "unmapped").
+       Caught by a test whose fixture handed the model a willing "No";
+    4. the **final required-dropdown backstop** (`forceRequiredDropdownPick`) — the one deliberate
+       exception to "a required dropdown never ends a page blank". For a phone type that trade is right;
+       for a clearance, whatever it picked is a false statement in one direction or the other, so the
+       field ends BLANK, the walk may halt, and the detail says `last-resort pick DELIBERATELY SKIPPED`.
+    Plus **AI-4 remediation may not refill it** — the most tempting path of all, since the page has just
+    refused to save and the error names the empty field. The halt is the intended outcome; the fix is one
+    profile edit.
 - **A JD-scraped COMPANY can be a PAGE TITLE, and that string is safety-critical.** On an employer page
   there is no ATS markup to key on, so the scrape returned the document title as the company — the anchor
   for "have you worked for us before?". `atsPlausibleCompany` is a NEGATIVE test; what it rejects falls back

@@ -29,6 +29,9 @@ const atsLib = (typeof module !== "undefined" && module.exports)
       ensureHttps: ensureHttps, canonicalJobUrl: canonicalJobUrl, isAiPlaceholder: isAiPlaceholder,
       AI_NEEDS_ANSWER_MARK: AI_NEEDS_ANSWER_MARK, REGION_ABBREV: REGION_ABBREV,
       isSignatureDateQuestion: isSignatureDateQuestion,
+      // Security clearance: recognizer + candidate ladder, shared with the Workday driver's own rung so
+      // the two engines answer a clearance question identically.
+      recognizeClearanceQuestion: recognizeClearanceQuestion, clearanceCandidates: clearanceCandidates,
       // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
       // join/split exactly the way groups do — see the multiselect commit path.
       joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN };
@@ -925,23 +928,17 @@ function atsRouteLabel(label, f, profile, defaults) {
   // "can you be sponsored for a clearance"). Those ask about the FUTURE, and answering them from a
   // currently-held level is wrong in both directions — a cleared applicant is not necessarily willing,
   // and an uncleared one is not necessarily unwilling. Same discipline as the export-control bail above.
-  if (/\bclearance\b|\bcleared\b|\bsci\b|\bpolygraph\b/i.test(L)) {
-    if (/willing|able to obtain|eligible|obtainable|can you (obtain|get)|sponsor/i.test(L)) return null;
-    const sc = String(wa.security_clearance == null ? "" : wa.security_clearance).trim();
-    if (!sc) {
+  // ⚠ THE JUDGEMENT LIVES IN lib.js, NOT HERE. The WORKDAY driver needs the identical one, and a second
+  // copy in this file could drift from the one the operator authorised — so the wording recognizer, the
+  // future-tense bail and the candidate ladder are all `atsLib.*`, shared with fill-driver's rung.
+  if (atsLib.recognizeClearanceQuestion(L)) {
+    const cl = atsLib.clearanceCandidates(wa.security_clearance);
+    if (cl.unstated) {
       return { kind: "clearance-unstated", review: true, flag: "clearance-unstated",
         detail: "this form asks about a security clearance and your profile does not state one — set it on the Profile page (\"None\" is a valid answer) rather than having it guessed" };
     }
-    const none = /^none$/i.test(sc);
-    // ONE tiered candidate list serves both shapes the question takes, because the match ladder only
-    // ever commits an exact (or leading-polarity) hit: on a LEVEL list the level matches and the
-    // polarity tokens are ignored; on a YES/NO widget the level matches nothing and the polarity
-    // answers it. A "No clearance"-style option is reached by POLARITY LEAD, not by guessing.
-    const cands = none
-      ? ["None", "No clearance", "No", "False"]
-      : [sc, ...atsClearanceAliases(sc), "Yes", "True"];
-    return { candidates: cands, source: "clearance", path: "work_authorization.security_clearance",
-      detail: "work_authorization.security_clearance = " + JSON.stringify(sc) };
+    return { candidates: cl.candidates, source: "clearance", path: "work_authorization.security_clearance",
+      detail: "work_authorization.security_clearance = " + JSON.stringify(cl.level) };
   }
 
   // Profile links.
@@ -3050,28 +3047,6 @@ function icimsAuthView(s) {
   // an auth wall, and saying so beats "unknown page".
   if ((s.federated || []).length || (s.createAccount || []).length) return "blocked";
   return "none";
-}
-
-// The SAME clearance, worded the way other forms word it. Aliases only — never a promotion: "Secret"
-// must never offer "Top Secret", and an interim grade must never offer the full one, so each entry maps
-// strictly sideways. Tried after the stored wording, so a form offering the exact stored text wins.
-var ATS_CLEARANCE_ALIASES = {
-  "top secret/sci": ["TS/SCI", "Top Secret / SCI", "Top Secret with SCI", "TS SCI"],
-  "top secret/sci with ci polygraph": ["TS/SCI with CI Poly", "TS/SCI CI Poly", "Top Secret/SCI CI Polygraph"],
-  "top secret/sci with full scope polygraph": ["TS/SCI with FSP", "TS/SCI Full Scope Polygraph", "TS/SCI FSP", "TS/SCI with Poly"],
-  "top secret": ["TS", "Top-Secret"],
-  secret: ["S"],
-  confidential: ["C"],
-  "public trust": ["Public Trust (Tier 2)", "MBI", "NACI", "Public Trust/Suitability"],
-  "interim secret": ["Interim Secret Clearance"],
-  "interim top secret": ["Interim Top Secret Clearance", "Interim TS"],
-  "doe l": ["DOE L Clearance", "L Clearance"],
-  "doe q": ["DOE Q Clearance", "Q Clearance"],
-  "yankee white": ["Yankee White Clearance"],
-};
-function atsClearanceAliases(level) {
-  const k = String(level == null ? "" : level).replace(/\s+/g, " ").trim().toLowerCase();
-  return ATS_CLEARANCE_ALIASES[k] || [];
 }
 
 // ── WHAT KIND OF CHECKBOX IS THIS? (operator, 2026-08-18) ────────────────────────────────
@@ -5677,7 +5652,6 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent,
-    atsClearanceAliases, ATS_CLEARANCE_ALIASES,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,

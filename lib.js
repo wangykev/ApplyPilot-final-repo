@@ -776,6 +776,58 @@ function isSignatureDateQuestion(label) {
   if (SIG_DATE_OTHER_EVENT_RE.test(t)) return false;   // names a different event — never today
   return SIG_DATE_RE.test(t) || SIG_DATE_EXPLICIT_RE.test(t);
 }
+// ── SECURITY CLEARANCE: STATED OR NOT ANSWERED (operator, 2026-08-18) ───────────────────────────────
+// Lives here, not in ats.js, because BOTH engines need the identical judgement: the ATS driver reaches
+// it through `atsLib.*` and the Workday driver through `apMatch.*`. A clearance is a FACTUAL claim about
+// the applicant and claiming one you do not hold is serious, so there is one definition of what counts
+// as a clearance question and what may be offered for it.
+//
+// Aliases are strictly SIDEWAYS — the same clearance as other forms word it. Never a promotion: a
+// Secret must never be offered Top Secret, and an interim grade must never be offered the full one.
+const CLEARANCE_ALIASES = {
+  "top secret/sci": ["TS/SCI", "Top Secret / SCI", "Top Secret with SCI", "TS SCI"],
+  "top secret/sci with ci polygraph": ["TS/SCI with CI Poly", "TS/SCI CI Poly", "Top Secret/SCI CI Polygraph"],
+  "top secret/sci with full scope polygraph": ["TS/SCI with FSP", "TS/SCI Full Scope Polygraph", "TS/SCI FSP", "TS/SCI with Poly"],
+  "top secret": ["TS", "Top-Secret"],
+  secret: ["S"],
+  confidential: ["C"],
+  "public trust": ["Public Trust (Tier 2)", "MBI", "NACI", "Public Trust/Suitability"],
+  "interim secret": ["Interim Secret Clearance"],
+  "interim top secret": ["Interim Top Secret Clearance", "Interim TS"],
+  "doe l": ["DOE L Clearance", "L Clearance"],
+  "doe q": ["DOE Q Clearance", "Q Clearance"],
+  "yankee white": ["Yankee White Clearance"],
+};
+function clearanceAliases(level) {
+  const k = String(level == null ? "" : level).replace(/\s+/g, " ").trim().toLowerCase();
+  return CLEARANCE_ALIASES[k] || [];
+}
+// Does this label ask what clearance the applicant HOLDS? Returns null for anything else — including,
+// deliberately, a WILLINGNESS or ELIGIBILITY question ("are you willing to obtain", "eligible to
+// obtain", "can you be sponsored for a clearance"). Those ask about the FUTURE, and a currently-held
+// level answers them wrongly in BOTH directions: a cleared applicant is not necessarily willing, and an
+// uncleared one is not necessarily unwilling. Same discipline as the export-control bail.
+const CLEARANCE_ASK_RE = /\bclearance\b|\bcleared\b|\bsci\b|\bpolygraph\b/i;
+const CLEARANCE_FUTURE_RE = /willing|able to obtain|eligible|obtainable|can you (obtain|get)|sponsor/i;
+function recognizeClearanceQuestion(label) {
+  const t = String(label == null ? "" : label).replace(/\s+/g, " ").trim();
+  if (!t || !CLEARANCE_ASK_RE.test(t)) return null;
+  if (CLEARANCE_FUTURE_RE.test(t)) return null;
+  return { kind: "held" };
+}
+// What may be offered for a clearance question, given what the profile STATES.
+// ⚠ EMPTY ≠ "None": empty means the operator has not told us — `{unstated:true}`, answer nothing — while
+// "None" is a stated fact that answers a yes/no with No. ONE tiered list serves both shapes the question
+// takes (a level list and a yes/no), because the match ladder only ever commits an exact or
+// leading-polarity hit: on a level list the level matches and the polarity tokens are ignored; on a
+// yes/no widget the level matches nothing and the polarity answers it.
+function clearanceCandidates(stored) {
+  const sc = String(stored == null ? "" : stored).replace(/\s+/g, " ").trim();
+  if (!sc) return { unstated: true };
+  if (/^none$/i.test(sc)) return { candidates: ["None", "No clearance", "No", "False"], level: "None", none: true };
+  return { candidates: [sc, ...clearanceAliases(sc), "Yes", "True"], level: sc, none: false };
+}
+
 // Do two strings name the SAME calendar date? Workday re-formats what we typed — it displays
 // "05/01/2028" for an approved "5/1/2028" — and a plain string compare calls that a contradiction,
 // which BLOCKS submit over pure zero-padding (live, Home Depot 2026-08-04).
@@ -2403,6 +2455,7 @@ function reportOutcome(status) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
   groupSelection, joinGroupValue, splitGroupValue, GROUP_JOIN, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
+  recognizeClearanceQuestion, clearanceCandidates, clearanceAliases, CLEARANCE_ALIASES,
   skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
   skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
   rejectedValueEntries,

@@ -3971,7 +3971,15 @@ async function remediatePageErrors(act, profile, defaults, jobContext, out, page
         (named.length ? ` | error named: ${named.join(", ")}` : "") + ` (${decision.reason || ""})`);
       if (decision.action === "refill") {
         const f = scan.fields.find((x) => x.fieldName === decision.field);
-        if (f) {
+        // ⚠ AI-4 MAY NOT REFILL A SECURITY CLEARANCE (2026-08-18). This is the fourth and last path that
+        // could put a guessed clearance on a form, and the most tempting one: the page has just REFUSED to
+        // save, the error names the empty clearance field, and refilling it is exactly what would clear the
+        // block. That is precisely the trade the clearance rule refuses — the walk halting is the intended
+        // outcome, and the fix is one profile edit. Remediation's own prompt already forbids accepting
+        // consents; a clearance belongs in the same category of thing it must not decide.
+        if (f && apMatch.recognizeClearanceQuestion(f.label)) {
+          LOG(`  ⛔ REFUSING the AI-4 refill of ${f.fieldName} — it is a security-clearance question, and a guessed clearance is a false statement on an application. Set work_authorization.security_clearance ("None" is a valid answer) and re-run.`);
+        } else if (f) {
           let r, refillNote;
           if (f.widgetType === "hierarchical") {
             // Source is a click-TREE — NEVER flat-type the AI's guess ("job boards" is what that produced).
