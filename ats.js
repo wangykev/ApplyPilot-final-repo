@@ -3312,6 +3312,11 @@ const ATS_ICIMS_PARSE = {
   // 2.4s inside the 20000 this shipped with, which is not headroom, it is luck. 45s is ~2.5× the
   // slowest observed. It costs NOTHING in the normal case: every one of those runs saw the change and
   // exited on quiet+stable (~14s), so only a form whose parse genuinely produces nothing waits it out.
+  // ⚠ CONFIRMED THE SAME DAY, NOT THEORETICAL: a later Astrion run landed its parse at **25.6s**
+  // (settled 29.7s). Under the 20s budget that run would have called the form quiet, started filling,
+  // and had the postback overwrite it mid-fill — the exact failure this stage exists to prevent, on the
+  // tenant that had already passed six clean runs. Slow parses are a fact about the SERVER's load, not
+  // about the page, so they cannot be designed away — only waited for.
   changeMs: 45000,
   ceilingMs: 120000,  // total budget: attach → parse → quiet. Generous by design (see above).
 };

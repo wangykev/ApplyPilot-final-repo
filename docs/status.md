@@ -60,6 +60,16 @@ answer, and each worth remembering:
   and the deterministic "Pennsylvania" ran against an empty child list. A US state in the entry's
   location now implies the country, filling the parent in the same pass ahead of the child.
 
+**Multi-tenant state (live 2026-08-18):** iCIMS is no longer Astrion-shaped — a run can start from an
+`<tenant>.icims.com` posting page, which is what most iCIMS links are (the content frame is armed by
+identity now, not by control count). Verified: **Astrion** full loop (fill + rehearsal, both arms) and
+**Cretex** fill end to end on a previously untouched tenant. **ITT** and **Peraton** halt
+`consent-required` — a privacy consent on the sign-in card that only the operator may tick (2 of 5
+tenants sampled do this; **an operator decision is pending on whether to keep halting or to let the
+extension accept a privacy notice on your behalf**). Closed postings now report `posting-gone` instead
+of "no Apply control". Open: Cretex's required Degree dropdown read an empty option list — unclassified,
+needs one signed-in look.
+
 Remaining, in rough order:
 1. **Education** — the one `needs_review` left: `CandProfileFields.School` found no match for
    `"Carnegie Mellon University"` *after searching* the AJAX list. That is the new widget behaving

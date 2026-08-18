@@ -5404,6 +5404,12 @@ stage therefore found nothing to click and said `apply-not-followable` — "we c
 control" — for a job that no longer exists. `atsPostingGone` already knew the general rule and was
 simply never consulted on this path; it now is, on both run paths, and reads iCIMS' explicit signal.
 
+**The regression check paid for the morning's budget change.** Astrion (the control) still fills 106
+fields / 3 review — and landed its parse at **25.6s**, settling at 29.7s. That is PAST the 20s change
+budget this pipeline shipped with at breakfast: under it, that run would have declared the form quiet,
+begun filling, and had the postback overwrite it — on the tenant that had already passed six clean runs.
+A slow parse is a fact about the server's load, not about the page, so it cannot be designed away.
+
 **Open, not fixed:** Cretex's required `-1_CandProfileFields.Degree` reported `no option matched
 "Bachelor of Science" (after searching) — the list was empty`. It reached review honestly, so nothing
 was guessed, but whether the tenant's list is genuinely empty or we read the wrong container is
