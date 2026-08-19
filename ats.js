@@ -393,10 +393,26 @@ const ATS_ICIMS_ENTRY_MAPS = {
       "CandProfileFields.Minor": { path: "minor" },
       "CandProfileFields.GPA": { path: "gpa" },
       "CandProfileFields.IsGraduated": { kind: "is_graduated" },
+      // ⚠ DAY PARTS, AND WHY THE `from` KEYS DIFFER (operator, 2026-08-18). A form can require a DAY
+      // for education dates. `from_year`/`to_year` are year-only — a year says nothing about a month,
+      // let alone a day — so the profile grew `start_date`/`end_date` ("YYYY-MM-DD", or "YYYY-MM" when
+      // only the month is known) for exactly this. `fromAlt` is the year-only fallback, so a profile
+      // that has not filled the new fields behaves exactly as before.
+      // The `_Date` suffix is iCIMS' own name for the day part (observed on the experience block's
+      // rcf3214_Date); `_Day` is accepted too because the platform ids are not guaranteed to agree
+      // across tenants and a wrong guess here costs nothing — an id that does not exist never matches.
       "CandProfileFields.GraduationDate_Month": { kind: "date_month", from: "graduation_date" },
       "CandProfileFields.GraduationDate_Year": { kind: "date_year", from: "graduation_date" },
-      "CandProfileFields.EducationStartDate_Month": { kind: "date_month", from: "from_year" },
-      "CandProfileFields.EducationStartDate_Year": { kind: "date_year", from: "from_year" },
+      "CandProfileFields.GraduationDate_Date": { kind: "date_day", from: "graduation_date" },
+      "CandProfileFields.GraduationDate_Day": { kind: "date_day", from: "graduation_date" },
+      "CandProfileFields.EducationStartDate_Month": { kind: "date_month", from: "start_date", fromAlt: "from_year" },
+      "CandProfileFields.EducationStartDate_Year": { kind: "date_year", from: "start_date", fromAlt: "from_year" },
+      "CandProfileFields.EducationStartDate_Date": { kind: "date_day", from: "start_date" },
+      "CandProfileFields.EducationStartDate_Day": { kind: "date_day", from: "start_date" },
+      "CandProfileFields.EducationEndDate_Month": { kind: "date_month", from: "end_date", fromAlt: "to_year" },
+      "CandProfileFields.EducationEndDate_Year": { kind: "date_year", from: "end_date", fromAlt: "to_year" },
+      "CandProfileFields.EducationEndDate_Date": { kind: "date_day", from: "end_date" },
+      "CandProfileFields.EducationEndDate_Day": { kind: "date_day", from: "end_date" },
       // derived from the ENTRY's own location ("Pittsburgh, PA"), never the home address
       "CandProfileFields.EducationCountry": { kind: "entry_country" },
       "CandProfileFields.EducationState": { kind: "entry_state" },
@@ -603,13 +619,13 @@ function atsAssignEntryIndexes(ats, fields) {
       if (!mm || f.entrySection) continue;
       const bare = atsMapKey(ats, f.fieldName);
       const h = String(f.section || "(no heading)").trim() || "(no heading)";
-      const k = h + " " + bare;
+      const k = h + "\u0000" + bare;
       (byId[k] = byId[k] || new Set()).add(mm[1]);
     }
     const perHeading = {};
     for (const [k, ords] of Object.entries(byId)) {
       if (ords.size < 2) continue;                       // rendered once — not a repeating block
-      const [h, bare] = k.split(" ");
+      const [h, bare] = k.split("\u0000");
       (perHeading[h] = perHeading[h] || { ids: [], rows: 0 });
       perHeading[h].ids.push(bare);
       perHeading[h].rows = Math.max(perHeading[h].rows, ords.size);
@@ -770,6 +786,8 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
   // job application a date is a factual claim. One number they can see and change is honest; guessing
   // differently at each end is not.
   if (spec.kind === "date_day") {
+    // `fromAlt` is a YEAR-ONLY fallback and can never carry a day, so the day spec does not consult it:
+    // a day off "2024" would be two guesses stacked (see the year-only refusal below).
     const raw = val(spec.from);
     if (raw == null) return null;
     const ymd = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(raw));
@@ -798,10 +816,16 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
       detail: 'day-of-month is not in your profile (it stores "' + String(raw) + '") — used your default of ' + d + '; approve it or set the real day' };
   }
   if (spec.kind === "date_month" || spec.kind === "date_year") {
-    const raw = val(spec.from);
+    // Prefer the day-capable field; fall back to the year-only one when the operator has not filled it,
+    // so adding these fields cannot change what an existing profile fills.
+    const raw = val(spec.from) != null ? val(spec.from) : (spec.fromAlt ? val(spec.fromAlt) : null);
     if (raw == null) return null;
     const s = String(raw);
-    const ym = /^(\d{4})-(\d{1,2})$/.exec(s);          // "2028-05"
+    // ⚠ ACCEPT DAY PRECISION TOO. These specs matched "YYYY-MM" EXACTLY, so the moment a date carried a
+    // day ("2024-08-26" — the whole point of the new start_date/end_date fields) the month part returned
+    // null and the form's Month dropdown went unfilled while its Day filled perfectly. A more precise
+    // value must never answer LESS than a vaguer one.
+    const ym = /^(\d{4})-(\d{1,2})(?:-\d{1,2})?$/.exec(s);   // "2028-05" or "2028-05-11"
     const yOnly = /^(\d{4})$/.exec(s);                  // "2024"
     if (spec.kind === "date_year") {
       const y = ym ? ym[1] : (yOnly ? yOnly[1] : null);

@@ -108,9 +108,25 @@ export const educationSchema = z.object({
   minor: str,
   gpa: str,
   gpa_scale: str,
-  from_year: str, // "YYYY"
-  to_year: str, // "YYYY"
-  graduation_date: str, // "YYYY-MM"
+  from_year: str, // "YYYY" — résumé rendering ("2023 – 2027"); the ATS fill prefers start_date below
+  to_year: str, // "YYYY" — ditto
+  /**
+   * ⚠ DAY-CAPABLE DATES FOR THE ATS FILL (operator, 2026-08-18). Some application forms require a
+   * DAY for education start/end, and `from_year`/`to_year` are year-only — a year says nothing about a
+   * month, let alone a day, so those forms fell back to `defaults.date_day` (an approximation, flagged
+   * `default-value` in review) or were left to the résumé parse's guess.
+   *
+   * These are the day-capable equivalents: "YYYY-MM-DD" when the operator knows the day, "YYYY-MM"
+   * when they only know the month. A day STATED here is a fact, so it fills unflagged and stops
+   * reaching review; an absent one leaves the existing default/blank behaviour exactly as it was.
+   *
+   * Deliberately SEPARATE from from_year/to_year rather than a change of their format: the résumé
+   * renders those as a year range, and widening a field the résumé prints is a different blast radius
+   * than adding one the fill reads. The fill prefers these and falls back to the year fields.
+   */
+  start_date: str, // "YYYY-MM-DD" | "YYYY-MM" | ""
+  end_date: str, // "YYYY-MM-DD" | "YYYY-MM" | ""
+  graduation_date: str, // "YYYY-MM" or "YYYY-MM-DD" — a stated day fills unflagged
   currently_enrolled: bool, // checkbox
   // Resume-only: the "Relevant Coursework: …" line under this school. coerceProfile
   // bridges the extension profile's application_questions.role_specific.coursework_relevant
@@ -138,8 +154,11 @@ export const workExperienceSchema = z.object({
   company: str,
   location: str,
   currently_work_here: bool, // checkbox
-  from: str, // "YYYY-MM"
-  to: str, // "YYYY-MM"
+  // "YYYY-MM", or "YYYY-MM-DD" when the operator knows the day. A form that REQUIRES a day gets the
+  // stated one unflagged; with month precision it falls back to `defaults.date_day` and flags it
+  // `default-value` for review (which is what 6 of one Cretex fill's 11 review items were).
+  from: str, // "YYYY-MM" | "YYYY-MM-DD"
+  to: str, // "YYYY-MM" | "YYYY-MM-DD"
   role_description: str, // one textarea — how Workday renders the role description
   tech_stack: z.array(z.string()).default([]),
   // ── Employer detail some ATSs ask for and a resume never states (operator, 2026-08-16) ──

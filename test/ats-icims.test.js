@@ -552,6 +552,75 @@ test("atsPostingGone: iCIMS answers a dead job id with notFound=1 on its own sea
 // consent surfaced as `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be
 // pressed" — which sends the operator to debug a click that was fine.
 
+// ── A DAY THE PROFILE STATES IS A FACT; A DEFAULT IS AN APPROXIMATION (operator, 2026-08-18) ──
+//
+// Ids confirmed by recon on Cretex: `CandProfileFields.EducationStartDate_Month` / `_Date` / `_Year`,
+// where `_Date` is iCIMS' name for the DAY part (same as the experience block's rcf3214_Date). Education
+// previously had no day spec at all and its start/end came from year-only `from_year`/`to_year`, so a form
+// requiring a day got the parse's guess or the operator's default. `start_date`/`end_date` are the
+// day-capable fields; the year fields remain for résumé rendering and as the month/year fallback.
+
+const eduDate = (fieldName, entry, defaults) => {
+  const f = { fieldName: "-1_" + fieldName, label: fieldName, isRequired: true, section: "Education" };
+  const es = ats.atsEntrySpec("icims", f);
+  return es ? ats.atsResolveEntryField(es, entry, f, new Date("2026-08-18T12:00:00Z"), defaults || {}) : null;
+};
+
+test("education: a STATED day fills the day part unflagged", () => {
+  const entry = { start_date: "2024-08-26", end_date: "2028-05-11", from_year: "2024", to_year: "2028" };
+  const day = eduDate("CandProfileFields.EducationStartDate_Date", entry);
+  assert.strictEqual(day.value !== undefined ? day.value : day.raw, "26");
+  assert.strictEqual(day.source, "entry", "a stated day is a fact, not a default");
+  assert.ok(!day.review, "and it must not reach review");
+  assert.ok(!day.flag);
+  // the month and year come off the SAME field, so one entry answers all three parts
+  // the month arrives TIERED (a month dropdown's vocabulary is the tenant's choice, not a fact)
+  const mon = eduDate("CandProfileFields.EducationStartDate_Month", entry);
+  assert.deepStrictEqual(mon.candidates, ["August", "Aug"], "full name first, then the abbreviation");
+  assert.strictEqual(mon.source, "entry");
+  const yr = eduDate("CandProfileFields.EducationStartDate_Year", entry);
+  assert.strictEqual(String(yr.value || yr.raw), "2024");
+  // …and the END date answers its own parts
+  assert.strictEqual(eduDate("CandProfileFields.EducationEndDate_Date", entry).value, "11");
+});
+
+test("education: with only the year fields set, nothing changes from before", () => {
+  // The new fields are additive: an existing profile that has not filled them must fill exactly what it
+  // filled yesterday — the year from the year field, and no invented month or day.
+  const entry = { from_year: "2024", to_year: "2028" };
+  const yr = eduDate("CandProfileFields.EducationStartDate_Year", entry);
+  assert.strictEqual(String(yr.value || yr.raw), "2024", "the year still comes from from_year");
+  assert.strictEqual(eduDate("CandProfileFields.EducationStartDate_Month", entry), null, "a year states no month");
+  assert.strictEqual(eduDate("CandProfileFields.EducationStartDate_Date", entry), null, "…and certainly no day");
+});
+
+test("education: a MONTH-precision date still refuses to invent a day, and says so", () => {
+  const entry = { start_date: "2024-08" };
+  const day = eduDate("CandProfileFields.EducationStartDate_Date", entry, { date_day: 1 });
+  assert.strictEqual(day.value, "1");
+  assert.strictEqual(day.flag, "default-value", "an approximation faces the human gate");
+  assert.strictEqual(day.review, true);
+  // and with the default explicitly opted OUT, the field goes back to reaching review empty
+  assert.strictEqual(eduDate("CandProfileFields.EducationStartDate_Date", entry, { date_day: null }), null);
+});
+
+test("experience: a stated day removes the default-value flag those 6 review items had", () => {
+  // Work experience already had day specs — which is why its days were FILLED but flagged. With a day in
+  // the profile they become facts. (6 of one Cretex fill's 11 review items were exactly this.)
+  // the day part is identified by `partLabel` + its date GROUP (see atsEntrySpec) — the raw control name,
+  // deliberately not the display label, so a review-side wording change cannot reach the matching layer
+  const f = { fieldName: "-1_PersonProfileFields.rcf3214_Date", label: "Start Date", partLabel: "Day",
+    dateGroup: 0, isRequired: true, section: "Work Experience" };
+  const es = ats.atsEntrySpec("icims", f);
+  assert.ok(es, "the experience section must claim this field");
+  const stated = ats.atsResolveEntryField(es, { from: "2025-05-12" }, f, new Date(), {});
+  assert.strictEqual(stated.value, "12");
+  assert.strictEqual(stated.source, "entry");
+  assert.ok(!stated.flag, "no default-value flag when the day is stated");
+  const approx = ats.atsResolveEntryField(es, { from: "2025-05" }, f, new Date(), { date_day: 1 });
+  assert.strictEqual(approx.flag, "default-value");
+});
+
 // ── THE WORK-HISTORY HEADING IS THE SECTION'S ONLY IDENTITY (live 2026-08-18) ────────────
 //
 // Astrion titles it "Experience"; Cretex titles it "Work Experience". The pattern was anchored at the
