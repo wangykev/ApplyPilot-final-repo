@@ -833,6 +833,60 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
     live, not one of the 45 failures was `PersonProfileFields.Address*`/`Phone*`), so GH/Lever/Ashby
     are untouched. It accepts BOTH shapes (live camelCase, bundle/record snake_case) because the two
     sides keying differently IS the bug.
+- **A CONTACT OPT-IN ASKED AS A QUESTION IS STILL AN OPT-IN (operator, 2026-08-18).** Ticking ACCEPT
+  boxes is authorised and opt-ins are NOT — but that rule lived only on the checkbox path, so the same
+  question asked as a required Yes/No **dropdown** went to the AI, which answered "Yes" and subscribed
+  the operator to texts (live on SCS Engineers **and** Sargent & Lundy: *"Do you consent to receive text
+  message communication…?"*). One policy, two widgets: answered **"No" deterministically**, flagged so
+  someone who does want texts can flip it. ⚠ **The bail list is the load-bearing half** — a "No" to a
+  background check, a drug screening, a reference check or the privacy notice **SINKS the application**,
+  and none of those is a marketing opt-in, so the rung fires only on contact/marketing wordings and
+  refuses anything naming a check or the data-processing notice. Pinned in BOTH directions.
+- **WILLINGNESS TO RELOCATE IS IN THE PROFILE, AND NEITHER ENGINE READ IT (live 2026-08-18).** Sargent &
+  Lundy's required relocation dropdown was answered by the AI *while its reasoning cited the field*
+  (`screening.willing_to_relocate is explicitly set to true in profile`) — so an operator who stated
+  their preference got it back as a flagged guess to re-approve. Now `recognizeRelocationQuestion` /
+  `relocationCandidates` in lib.js, wired into **both** engines like clearance. Two facts stay APART
+  (`willing_to_relocate` = would you move at all; `willing_to_relocate_at_own_cost` = would you move
+  unpaid) because answering either from the other is a wrong answer, not an approximation. Two wordings
+  are REFUSED: the past ("have you relocated before?") and what the EMPLOYER must provide ("do you
+  require relocation assistance?") — the latter looks answerable by negating own-cost, but it is a
+  question about a NEGOTIATION. ⚠ **Unlike clearance this rung does NOT claim what it cannot answer** —
+  a clearance is a legal status where an invented answer is a false statement; a relocation preference
+  is an ordinary flagged guess, and blocking Save over an unstated preference costs a walk to save
+  nothing.
+- **"MAY WE CONTACT THIS EMPLOYER?" — THREE ANSWERS, AND UNANSWERED IS CLAIMED (operator, 2026-08-18).**
+  `may_contact` is per work-experience entry and is now **yes / no / yes_if_required** (a profile
+  dropdown; the schema MIGRATES the tri-bool it replaced, `true` → `"yes"`, because a failed parse here
+  silently empties the WHOLE profile). Each answer is a **tiered ladder**, so the form's vocabulary
+  decides: the conditional one ends with a bare "Yes", so a form offering *"Yes, if required"* takes that
+  and a plain Yes/No form takes "Yes" — the truthful projection onto the options that exist. Unflagged,
+  like every tiered profile ladder. A conditional yes also **RELEASES** the employer email/phone (it
+  permits contact, and those fields are the mechanism); "no" and unanswered still withhold.
+  ⚠ **An UNANSWERED one is CLAIMED, not passed on.** The resolver already refused to default it
+  ("not a default anyone should own") and then returned null — which makes it an ordinary
+  `entry-unanswered` field, and those go to the AI **by design**, whose prompt infers from ABSENCE and
+  never refuses. Measured on Cretex, all three work-history rows: `ai-choice · "Yes" ·
+  reasoning-from-absence`. **The refusal was being overridden one rung later.** Same remedy as the
+  clearance rung and the credential tier: claiming is what keeps the AI away, so it is claimed even
+  though we cannot answer it. A "Yes" nobody gave could tip off an employer the operator has not told
+  they are looking, and that is not recoverable from a review page afterwards.
+- **⚠ THE PARSE-SETTLE HEARTBEAT MUST BE A CHEAP READ, OR IT BECOMES THE WAIT (live 2026-08-18).** Asked
+  why the fill starts so long after the résumé upload: on Cretex the parse landed at **6.0s** and the
+  stage finished at **15.4s** — the 8.6s between was **OURS**, proving the form had gone quiet.
+  `atsIcimsAwaitParse` called `atsInjScan` once per tick, and that is a 479-line full read (labels,
+  every option list, every `icims_dropdown`'s results `<ul>`, the section walk, the ordinals, then 68
+  field objects back over CDP) — so a "900ms poll" really cost **~2.9s** and the three stable reads took
+  ~8.6s instead of ~2.8s. `atsInjLeanSignature` reads only each control's NAME + whether it HOLDS a
+  value and returns the finished STRING (10 reads, **704ms total**; stage 15.4s → 12.7s).
+  Plumbing is skipped — a rotating anti-forgery token in a hidden input would mean the form NEVER looks
+  stable — and a `<select>` is judged by its **value**, never `selectedIndex > 0`.
+  ⚠ **BOTH SIDES OF THE COMPARISON MUST BE COMPUTED THE SAME WAY**, so the caller no longer passes a
+  full-scan baseline: mixed vocabularies differ on tick ONE, the loop reads that as "the parse changed
+  the form", and a **false `changed` lets it finish on the first brief quiet — possibly before the parse
+  has started**, which is the one failure this stage exists to prevent. `quietMs` 1500 → **2500**,
+  deliberately spending ~1s of what the probe saved: **polling faster makes a STABILITY predicate
+  weaker, not stronger**, so the binding evidence must be the quiet watch's wall-clock idle time.
 - **Map only PLATFORM ids** (`PersonProfileFields.*` etc.). `rcf<NNNN>` are per-customer questions → the
   label ladder. A leading `-1_` is a repeating-entry ordinal whose ids recur inside work history, where
   an "address" is the EMPLOYER's — mapping those by bare id files your home address under a past job.
