@@ -5049,6 +5049,23 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // Notices accepted by the iCIMS pre-form on the operator's standing instruction (2026-08-18), so the
   // run's own result says what was agreed to rather than requiring a log dig.
   let icimsConsentsAccepted = [];
+  // ⚠ ORACLE IS DETECTED BUT NOT YET DRIVEABLE — REFUSE LOUDLY RATHER THAN FALL THROUGH (2026-08-19).
+  // `detectAts` learned Oracle Recruiting Cloud one increment ahead of its scan branch, and the two
+  // must not be allowed to disagree quietly. `atsInjScan` has no `oracle` branch, so an ORC page would
+  // reach the GENERIC tail — and ORC's controls are plain `<input>`s, so that tail would happily
+  // classify them. That is strictly worse than finding nothing:
+  //   • it would pick up the BOT-DETECTION HONEYPOT (`#honey-pot-1` — see atsDecoyKind: it passes every
+  //     visibility test this pipeline owns), putting a poison field into the review bundle as an
+  //     ordinary fillable box, where a typed value gets replayed on submit;
+  //   • the apply route is not even reachable yet (ORC needs an Apply-click stage — atsFormUrl
+  //     deliberately returns the posting url), so anything scanned would be the POSTING, not the form.
+  // A wrong-but-plausible bundle is the failure class this pipeline exists to prevent, so this refuses
+  // before touching the tab at all. Delete this guard in the same commit that adds the oracle scan.
+  if (ats === "oracle") {
+    LOG("⚠ Oracle Recruiting Cloud detected but its fill stage is not built yet — refusing before any page contact");
+    return { ok: true, needs_operator: true, stopped: "oracle-not-implemented",
+      detail: "This is an Oracle Recruiting Cloud posting. ApplyPilot recognizes the platform but its fill stage is still being built (recon landed 2026-08-19), so it will not touch the page — an ORC form needs an Apply-click stage and a scan that excludes the site's bot-detection honeypot. Apply here yourself for now." };
+  }
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
@@ -5421,6 +5438,15 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
 async function runAtsSubmitRun(tabId, ats, bundle, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][ATS-SUBMIT]", ...a);
   const arm = !!(opts && opts.arm);
+  // ⚠ THE SAME ORACLE GUARD THE FILL RUN CARRIES, AND IT MATTERS MORE HERE. This is the path that can
+  // press Submit, and there is no ORC bundle it could legitimately be replaying: the fill run refuses,
+  // so any bundle reaching this point for `oracle` was not produced by an ORC fill. Refuse before the
+  // attach. Delete in the same commit that adds the oracle scan.
+  if (ats === "oracle") {
+    LOG("⚠ Oracle Recruiting Cloud detected but its submit stage is not built yet — refusing before any page contact");
+    return { ok: true, needs_operator: true, stopped: "oracle-not-implemented",
+      detail: "Oracle Recruiting Cloud submit is not built yet — no approved bundle can have come from an ORC fill, so this run will not touch the page." };
+  }
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };

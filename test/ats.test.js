@@ -2358,3 +2358,143 @@ test("canonicalJobUrl: a short path number is NOT mistaken for a requisition", (
   // ≥4 digits required, so an ordinary segment number keys by path as before.
   assert.notStrictEqual(lib.canonicalJobUrl("https://x.wd1.myworkdayjobs.com/en-US/b/job/L/Role_12"), "wd1:12");
 });
+
+// ── Oracle Recruiting Cloud (ORC / Candidate Experience) ────────────────────────────────
+// Recon 2026-08-19 (Nokia, read-only). Oracle is the one family whose HOST cannot identify it,
+// so detection is host + PATH — still URL-only, no page evidence. See detectAts.
+
+test("detectAts oracle: all three observed host shapes, including the one with NO region", () => {
+  // <tenant>.fa.<region>.oraclecloud.com — the common shape, six regions seen live
+  for (const h of ["eeho.fa.us2", "ejov.fa.ca2", "hdpc.fa.us2", "efds.fa.em5", "hcmn.fa.ap1", "hdow.fa.us6"]) {
+    assert.strictEqual(
+      ats.detectAts("https://" + h + ".oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/35578"),
+      "oracle", h);
+  }
+  // fa-<code>-saasfaprod1.fa.ocs.oraclecloud.com — the hyphenated pod + `.fa.ocs.` shape
+  assert.strictEqual(
+    ats.detectAts("https://fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/35578"),
+    "oracle");
+  // <tenant>.fa.oraclecloud.com — BARE: the optional region group is absent (jpmc, live)
+  assert.strictEqual(
+    ats.detectAts("https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210682657"),
+    "oracle");
+});
+
+test("detectAts oracle: siteCode is a TENANT SETTING — nothing may key on the literal CX_1", () => {
+  // Observed live across tenants. A detector keyed on "CX_1" would work on one and miss the rest.
+  for (const site of ["CX_1", "CX", "CX_1001", "CX_1003", "nfcu", "LateralHiring"]) {
+    assert.strictEqual(
+      ats.detectAts("https://eeho.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/" + site + "/jobs"),
+      "oracle", site);
+  }
+});
+
+test("detectAts oracle: an Oracle FUSION host that is NOT a careers page is refused", () => {
+  // The whole reason detection is host+path. `*.fa.*.oraclecloud.com` also serves ERP/HCM
+  // back-office UIs, and driving one of those would be actively wrong — not merely useless.
+  const host = "https://eeho.fa.us2.oraclecloud.com";
+  assert.strictEqual(ats.detectAts(host + "/fscmUI/faces/FuseWelcome"), null);
+  assert.strictEqual(ats.detectAts(host + "/hcmUI/faces/FuseWelcome"), null);       // HCM, but not CandidateExperience
+  assert.strictEqual(ats.detectAts(host + "/"), null);
+  assert.strictEqual(ats.detectAts(host + "/soa-infra/services"), null);
+});
+
+test("detectAts oracle: the host test is ANCHORED — lookalikes return null", () => {
+  const p = "/hcmUI/CandidateExperience/en/sites/CX_1/job/1";
+  // the same discipline pinned for lever/greenhouse above: a suffix, not a substring
+  assert.strictEqual(ats.detectAts("https://eeho.fa.us2.oraclecloud.com.evil.com" + p), null);
+  assert.strictEqual(ats.detectAts("https://fakeoraclecloud.com" + p), null);
+  assert.strictEqual(ats.detectAts("https://oraclecloud.com.evil.com" + p), null);
+  // `.fa.` must be a real label, and a host with no `fa` label at all is not a Fusion pod
+  assert.strictEqual(ats.detectAts("https://cloud.oraclecloud.com" + p), null);
+  assert.strictEqual(ats.detectAts("https://notfa.oraclecloud.com" + p), null);
+  // a vanity domain CNAME'd to ORC is DELIBERATELY not matched — that is the page-evidence case
+  assert.strictEqual(ats.detectAts("https://careers.nokia.com" + p), null);
+});
+
+test("atsFormUrl oracle: returns the POSTING url unchanged — never a synthesized /apply", () => {
+  // Measured: guessing the Lever/Ashby shape redirects to `…/sites/CX_1/404`. The apply route is
+  // reached only by pressing button.apply-now-button. A synthesized url is a broken run.
+  const u = "https://fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/35578";
+  assert.strictEqual(ats.atsFormUrl("oracle", u), u);
+  assert.ok(!/\/apply/.test(ats.atsFormUrl("oracle", u)));
+  // idempotent, and a query is preserved rather than invented
+  assert.strictEqual(ats.atsFormUrl("oracle", u + "?utm=x"), u + "?utm=x");
+});
+
+test("atsCompanyFromUrl oracle: null — a Fusion POD ID is not a company name", () => {
+  // The subdomain is an opaque pod (`eeho`, `fa-evmr-saasfaprod1`) and path segment 0 is `hcmUI`.
+  // Either would hand the safety-critical employment recognizer a word no employer is called —
+  // the exact failure iCIMS' literal `jobs` segment produced. Null makes the recognizer
+  // UNEVALUABLE (blank + review) instead of confidently comparing against a pod id.
+  for (const u of [
+    "https://eeho.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/1",
+    "https://fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/35578",
+    "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/2",
+  ]) {
+    assert.strictEqual(ats.atsCompanyFromUrl(u), null, u);
+  }
+  // …and the other families are UNTOUCHED by that change
+  assert.strictEqual(ats.atsCompanyFromUrl("https://job-boards.greenhouse.io/figma/jobs/61191"), "Figma");
+  assert.strictEqual(ats.atsCompanyFromUrl("https://astrioncareers-astrion.icims.com/jobs/24615/x/job"), "Astrion");
+});
+
+// ── the decoy / honeypot recognizer ─────────────────────────────────────────────────────
+// ORC ships a bot-detection honeypot that EVERY visibility test in this pipeline passes
+// (measured: rect 179×38, offsetParent non-null, display inline-block, visibility visible,
+// opacity 1). Writing to it marks the application as a bot, and no read-back catches that
+// because the write SUCCEEDS. Both directions are pinned: what it claims and what it must not.
+
+test("atsDecoyKind: the live ORC honeypot is recognized", () => {
+  // exactly as observed on the Nokia gate
+  assert.strictEqual(ats.atsDecoyKind({
+    fieldName: "honey-pot", ariaLabel: "honeypot", ariaHidden: "true", tabIndex: "-1",
+    cssClassAttr: "input-row--invisible", widgetType: "text", isRequired: false,
+  }), "honeypot");
+});
+
+test("atsDecoyKind: the GENERIC pair works with no Oracle-specific naming", () => {
+  // The primary signal must not depend on a vendor's word choice — a control the page hides from
+  // assistive tech AND removes from tab order is not one a human is asked to fill, anywhere.
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "xyz_trap_9", ariaHidden: "true", tabIndex: "-1" }),
+    "aria-hidden+untabbable");
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "q7", ariaHidden: true, tabIndex: "-1" }),
+    "aria-hidden+untabbable");
+});
+
+test("atsDecoyKind: NEITHER marker alone is enough", () => {
+  // aria-hidden alone: a decorative wrapper around a real input legitimately carries it.
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "first-name", ariaHidden: "true" }), null);
+  // tabindex=-1 alone: custom widgets routinely park a programmatically-focused input out of
+  // tab order — Workday's own CSS-clipped radios are reached by label, not by tabbing.
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "first-name", tabIndex: "-1" }), null);
+  // an "invisible" wrapper class alone is the tenant's vocabulary, not evidence
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "first-name", cssClassAttr: "input-row--invisible" }), null);
+});
+
+test("atsDecoyKind: a REAL field is never claimed", () => {
+  // the real email box that sits directly beside the honeypot, same classes, same container
+  assert.strictEqual(ats.atsDecoyKind({
+    fieldName: "primary-email", ariaLabel: "Email Address", ariaHidden: null, tabIndex: null,
+    cssClassAttr: "", widgetType: "text", isRequired: true,
+  }), null);
+  // the CSS-clipped terms checkbox — 0×0 and opacity 0, but it MUST be ticked, so claiming it
+  // as a decoy would be the inverse failure: consent silently never given.
+  assert.strictEqual(ats.atsDecoyKind({
+    fieldName: "legal-disclaimer-checkbox", ariaLabel: null, ariaHidden: null, tabIndex: null,
+    widgetType: "checkbox", isRequired: true,
+  }), null);
+  assert.strictEqual(ats.atsDecoyKind({}), null);
+  assert.strictEqual(ats.atsDecoyKind(null), null);
+});
+
+test("atsDecoyKind: the name match is word-anchored, so a substring cannot claim a real field", () => {
+  // the guard-rail the skills containment tier had to learn: raw `includes` puts `CAN` inside
+  // "Canadian". A field merely CONTAINING the letters must not be dropped.
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "honeymoon-leave-request" }), null);
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "pot-luck-preference" }), null);
+  // …while the real separators used in the wild all match
+  for (const n of ["honey-pot", "honey_pot", "honeypot", "honey pot", "HONEY-POT-1"]) {
+    assert.strictEqual(ats.atsDecoyKind({ fieldName: n }), "honeypot", n);
+  }
+});

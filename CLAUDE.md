@@ -642,8 +642,8 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   matches `textContent`, which an `<input>` lacks. Measured: without it `hasSubmit:false` and
   `atsLooksLikeApplicationForm` REFUSES a perfectly good form.
 - **A RUN STARTS FROM AN EMPLOYER-HOSTED PORTAL, AND ITS LOGIN PAGE LOOKS LIKE A FORM (2026-08-16).**
-  `careers.astrion.us` is an iCIMS portal on the EMPLOYER's domain, so `detectAts` (host-based, and it
-  must stay that way) returns null. Detection is by PAGE EVIDENCE — `atsPortalAts` reads the hosts the
+  `careers.astrion.us` is an iCIMS portal on the EMPLOYER's domain, so `detectAts` (**URL-only** — see
+  the Oracle note below for why that is the real rule, not "host-only") returns null. Detection is by PAGE EVIDENCE — `atsPortalAts` reads the hosts the
   page itself references and refuses when two ATSs are named. ⚠ Then the Apply link lands on
   `/jobs/<id>/login`, whose email box + submit control **PASS `atsLooksLikeApplicationForm`** — so
   `runIcimsPreForm` runs BEFORE the form wait, never as a fallback after it. Reaching the gate and calling
@@ -892,6 +892,84 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   label ladder. A leading `-1_` is a repeating-entry ordinal whose ids recur inside work history, where
   an "address" is the EMPLOYER's — mapping those by bare id files your home address under a past job.
 
+## Oracle Recruiting Cloud (ORC) — RECON DONE, FILL NOT BUILT (2026-08-19)
+
+Observed DOM, URL shapes and every measurement: `docs/dom-patterns.md` `2026-08-19 — Oracle Recruiting
+Cloud (ORC) / Candidate Experience: FIRST RECON`. **Read `docs/adding-a-filler.md` before building the
+rest.** What is settled, and what must not be re-litigated:
+
+- **DETECTED, AND DELIBERATELY REFUSED UNTIL THE SCAN EXISTS.** `detectAts` returns `"oracle"` (host +
+  path — see the URL-only amendment above), and BOTH `runAtsApplicationRun` and `runAtsSubmitRun` halt
+  `oracle-not-implemented` **before the attach**. That guard is not caution for its own sake:
+  `atsInjScan` has no `oracle` branch, so an ORC page would reach the GENERIC tail, and because ORC's
+  controls are plain `<input>`s that tail would classify them — including the honeypot below. A
+  plausible-but-wrong bundle is worse than no bundle. **Delete both guards in the commit that adds the
+  scan**, not before.
+- **⚠⚠ THERE IS A BOT-DETECTION HONEYPOT AND EVERY VISIBILITY TEST WE OWN PASSES IT.** `#honey-pot-1`
+  sits beside the real email box with rect **179×38**, closest-`div` **179×19**, `offsetParent` non-null,
+  `display:inline-block`, `visibility:visible`, `opacity:1`. The Greenhouse/Lever predicate
+  (`rect.width > 0 && rect.height > 0`) admits it. It is OPTIONAL, so the AI tier never fills it and the
+  fill *looks* clean — but it still reaches the **review editor as a fillable box**, and a value typed
+  there is replayed on submit and marks the application as a bot. **No read-back catches this: the write
+  SUCCEEDS.** Invisible from inside the pipeline, and it lands on the employer's side.
+  - `atsDecoyKind` (ats.js, pure, unit-pinned both directions) is the recognizer. The primary signal is
+    **generic, not an Oracle name match**: `aria-hidden="true"` **AND** `tabindex="-1"` — a control the
+    page hides from assistive tech *and* removes from tab order is not one a human is asked to fill, on
+    any platform. **Neither marker alone is enough** (a decorative wrapper legitimately carries
+    `aria-hidden`; custom widgets routinely park a focused input out of tab order). The `honey[-_ ]?pot`
+    name match is a word-anchored belt.
+  - ⛔ **DO NOT "fix" this by tightening the visibility test** — the Workday dropdown-chip dead end
+    (tried twice, confirmed): the element is genuinely visible by every computed-style measure.
+    Exclusion must key on **declared intent**, never on geometry.
+  - **The scan REPORTS the markers; the judgement stays SW-side**, like `atsInjAuthScan` /
+    `atsConsentKind` — one copy of a rule this consequential, not an injected dup that can drift.
+  - **Polarity trap, same page:** the terms checkbox is **0×0**, `opacity:0`, clipped — and it MUST be
+    ticked (click its `<label>`, the Workday radio rule verbatim). Non-zero rect ⇒ never touch;
+    zero rect ⇒ click the label. **Geometry answers neither question.**
+- **PAGE-SIDE SYNTHETIC, and that is MEASURED not assumed.** The form path is not JET components but
+  native `<input>`s carrying a Knockout `data-bind`. A native-setter write with **no events** left
+  `aria-invalid` at `false` (Knockout did not notice); adding `input` + `change` flipped it to `true`.
+  Same lesson as React for a different reason — `el.value = x` alone is still not enough. ⚠ `valueUpdate`
+  is **per-element and dynamic** (`element.valueUpdateType()`), so always dispatch BOTH events rather
+  than detecting which one is bound. ⚠ JET components DO exist (`oj-text-area`, `oj-dialog`) — so far
+  only in dialogs and the AI assistant. An `oj-select-single` binds its value as an element **property**,
+  not through an inner input, so if the form uses them that is a separate widget class with its own
+  commit path and read-back.
+- **THE APPLY URL IS NOT DERIVABLE — the button is a required STAGE.** `…/job/<id>/apply` **redirects to
+  `…/sites/<site>/404`**; only pressing `button.apply-now-button` pushes `…/job/<id>/apply/email`. So
+  `atsFormUrl` returns the POSTING url unchanged for `oracle`, and that is the correct answer, not an
+  oversight — **do not append a path**. ORC therefore needs an Apply-click pre-form stage like iCIMS'.
+- **AUTH: the Workday pattern, per operator instruction (2026-08-19)** — sign in with the **stored
+  credentials** and let **Gmail auto-verify** approve the emailed code. Two shapes exist: the quick
+  `<quick-email-verification-form>` gate (email + terms → code; *"You don't need to have an account"*, so
+  **no password and no account creation**) and a full account sign-in. Either way the value comes ONLY
+  from `store.credentials` via `atsInjSetCredential` (returns a LENGTH, never a value) — never a profile
+  value, never a bucket, never an LLM — and it never enters a log line, a record or the bundle. The
+  terms box is an **ACCEPT** checkbox under the 2026-08-18 instruction ⇒ ticked, logged by name, verified.
+- **THE COMPANY ANCHOR IS EVIDENCE, NOT A URL HEURISTIC.** `atsCompanyFromUrl` returns **null** for
+  oracle on purpose: the subdomain is an opaque Fusion **pod id** (`eeho`, `fa-evmr-saasfaprod1`) and
+  path segment 0 is the literal `hcmUI` — either would hand the safety-critical employment recognizer a
+  word no employer is called, the exact failure iCIMS' `jobs` segment produced. Null is safe here *only*
+  because ORC supplies the real name structurally: JSON-LD **`hiringOrganization.name`**, plus its own CX
+  REST requisition endpoint (`recruitingCEJobRequisitionDetails`, **200 unauthenticated**). With no
+  plausible fallback, an absent company correctly makes the recognizer UNEVALUABLE (blank + review).
+- **`siteCode` IS A TENANT SETTING** — `CX_1`, `CX`, `CX_1001`, `CX_1003`, `nfcu`, `LateralHiring`.
+  Nothing may key on the literal `CX_1`. Three host shapes, and `jpmc.fa.oraclecloud.com` has **no region
+  segment**. A vanity domain CNAME'd to ORC is deliberately unmatched — that is the page-evidence case.
+- **SCOPE THE SCAN TO THE APPLY-FLOW CONTAINER.** `oj-text-area#oda-work-summary-text-area` (the Oracle
+  Digital Assistant's box) carries `required="true"` and is **not an application field** — a
+  document-wide sweep for required controls picks it up, and a required unmapped textarea is exactly the
+  shape that buys an LLM call. Same discipline as scoping a Workday dropdown scrape to its own listbox.
+- **No iframe** (JET SPA in the top document), so no `cdpUseFormFrame`. But `<session-expire>` means ORC
+  has an idle timeout, so the Workday rule holds: **session death is behavioural, not statically
+  detectable**. And the JD scrape's largest-text-block fallback is a **contest** on an SPA that is mostly
+  bundled JS — the shape that made a session token a job description on iCIMS. Prefer JSON-LD → REST →
+  rendered text, and keep `redactSecrets` on the assignment.
+
+**Open (all need the gate passed):** does a verification CODE follow the email; is the form one page or a
+wizard (`<apply-flow-header>` hints at a progress rail); JET vs Knockout-bound `<select>` for choices;
+whether field ids are stable platform ids or per-tenant; repeating-section shape; captcha on submit.
+
 ## Multi-ATS — Greenhouse / Lever / Ashby (`ats.js`; fill + gated submit, live-verified 2026-07-31)
 
 Routing, the option poll, per-ATS traps, the dev loop and every measured refutation: **`ats-tenants` skill.**
@@ -904,6 +982,14 @@ The standing rules:
 - **`detectAts(url)` routes `AP_RUN_APPLICATION` / `AP_SUBMIT_APPLICATION`.** Workday and anything
   unrecognized keep the existing onboard→walk path **byte-identical**. All through CDP — **NO new host
   permissions.**
+  ⚠ **THE RULE IS URL-ONLY, NOT HOST-ONLY (amended 2026-08-19, operator-approved).** Every family except
+  Oracle is identified by host alone, and the property that actually matters is that detection needs **no
+  PAGE EVIDENCE** — that is `atsPortalAts`' job, a separate and more expensive decision. Oracle keeps that
+  property while breaking the letter: `*.fa.*.oraclecloud.com` is the generic Oracle **Fusion
+  Applications** host, which also serves ERP / HCM back-office UIs this pipeline must never drive, and the
+  recruiting product's identity lives in the **PATH** (`/hcmUI/CandidateExperience/`). So Oracle tests
+  host **and** path — still one URL parse, no fetch, no injection. A host test widened until it matched
+  what it cannot verify would be the unsafe direction.
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.

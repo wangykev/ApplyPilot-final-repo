@@ -60,6 +60,31 @@ function detectAts(url) {
   // an exact-host allowlist cannot work. ANCHORED at a dot or start so `icims.com.evil.com` and
   // `fakeicims.com` still return null — the same discipline test/ats.test.js pins for the others.
   if (/(^|\.)icims\.com$/.test(host)) return "icims";
+  // ⚠ ORACLE RECRUITING CLOUD IS THE ONE FAMILY THE HOST ALONE CANNOT IDENTIFY (2026-08-19).
+  // Every test above is host-only, and CLAUDE.md said that must stay so — the reason being that
+  // detection must never need PAGE EVIDENCE (that is atsPortalAts' job, and it is a separate,
+  // more expensive decision). Oracle keeps that property while breaking the letter of the rule:
+  // `*.fa.*.oraclecloud.com` is the generic Oracle FUSION APPLICATIONS host, which also serves
+  // ERP and HCM back-office UIs — pages this pipeline must never drive. The recruiting product's
+  // identity is in the PATH (`/hcmUI/CandidateExperience/`), so that is what we test. Still
+  // URL-only: no fetch, no injection, no page contact. Operator-approved 2026-08-19.
+  //
+  // Three host shapes observed live, and the third has NO region segment:
+  //   eeho.fa.us2.oraclecloud.com · ejov.fa.ca2 · hdpc.fa.us2 · efds.fa.em5 · hcmn.fa.ap1 · hdow.fa.us6
+  //   fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com   (the `fa-<code>-saasfaprod1` + `.fa.ocs.` shape)
+  //   jpmc.fa.oraclecloud.com                      (bare — the optional region group is absent)
+  // ANCHORED at `$` and on a label boundary, so `oraclecloud.com.evil.com` and
+  // `fakeoraclecloud.com` return null — the same discipline test/ats.test.js pins for the others.
+  //
+  // ⚠ An employer VANITY domain CNAME'd to ORC (careers.<company>.com) does not match, by design:
+  // that is the employer-hosted-portal case iCIMS already established, and it is answered by page
+  // evidence, not by widening a host test until it matches things it cannot verify.
+  if (/(^|\.)fa(\.[a-z0-9-]+)?\.oraclecloud\.com$/.test(host)) {
+    let path = "";
+    try { path = new URL(String(url)).pathname; } catch (e) { return null; }
+    if (/\/hcmUI\/CandidateExperience\//i.test(path)) return "oracle";
+    return null;
+  }
   return null;
 }
 
@@ -80,6 +105,14 @@ function atsFormUrl(ats, url) {
       u.pathname = /\/application$/i.test(path) ? path : path + "/application";
       return u.origin + u.pathname;
     }
+    // ⚠ ORACLE MUST NOT BE GIVEN A SYNTHESIZED FORM URL (measured 2026-08-19). It falls to the
+    // default below — which returns the POSTING url unchanged — and that is the correct answer, not
+    // an oversight. Guessing the Lever/Ashby shape `…/job/<id>/apply` **redirects to
+    // `…/sites/<site>/404`**: the apply route is reached only by pressing `button.apply-now-button`,
+    // which pushes `…/job/<id>/apply/email`. Landing on that route directly is also not a shortcut —
+    // it is a step of a stateful SPA flow. So the Apply click is a required STAGE for ORC, the way
+    // it is for an iCIMS portal. Do not "fix" this by appending a path.
+    if (ats === "oracle") return u.origin + u.pathname + u.search;
     // ⚠ iCIMS falls to the default below, and KEEPING THE QUERY IS LOAD-BEARING — not incidental
     // like greenhouse's gh_jid. An iCIMS apply link carries the one-time magic-link session in
     // `?eem=…&code=…`; strip it and the run lands on a sign-in page with no form at all.
@@ -108,6 +141,19 @@ function atsCompanyFromUrl(url) {
       if (!seg) return null;
       return seg[0].toUpperCase() + seg.slice(1);
     }
+    // ⚠ ORACLE'S SUBDOMAIN IS OPAQUE, SO THIS RETURNS NOTHING RATHER THAN A GUESS (2026-08-19).
+    // The tenant label is a Fusion POD id — `eeho`, `hdpc`, `ejov`, `fa-evmr-saasfaprod1` — which
+    // names no employer, and path segment 0 is the literal `hcmUI`. Both would hand the
+    // safety-critical employment recognizer ("have you worked for us before?") a word no company is
+    // called, which is the exact failure iCIMS' `jobs` segment produced.
+    //
+    // Returning null is SAFE here in a way it would not be elsewhere, and only because ORC supplies
+    // the real name in STRUCTURED form: the posting carries JSON-LD `hiringOrganization.name`
+    // ("Nokia Corporation"), and its own CX REST requisition endpoint answers 200 unauthenticated.
+    // So the anchor is evidence rather than a URL heuristic — and with no plausible fallback, an
+    // absent company correctly makes the recognizer UNEVALUABLE (blank + review) instead of
+    // confidently comparing against a pod id.
+    if (kind === "oracle") return null;
     const seg = (u.pathname.split("/").filter(Boolean)[0] || "").replace(/[-_]+/g, " ").trim();
     if (!seg || seg === "embed") return null;
     return seg.split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
@@ -3349,6 +3395,58 @@ function atsConsentPlan(consents) {
   return out;
 }
 
+// ── A DECOY FIELD: VISIBLE BY EVERY MEASURE, AND WRITING TO IT SABOTAGES THE APPLICATION ─────────
+// Oracle Recruiting Cloud's apply gate ships a bot-detection HONEYPOT next to the real email box
+// (observed live 2026-08-19, Nokia):
+//
+//   <input class="input-row__control" id="honey-pot-1" name="honey-pot"
+//          cssclass="input-row--invisible" aria-label="honeypot" aria-hidden="true" tabindex="-1">
+//
+// ⚠ EVERY VISIBILITY TEST THIS PIPELINE OWNS PASSES IT. Measured on the live page: rect 179×38, the
+// closest `div` 179×19, `offsetParent` NOT null, `display:inline-block`, `visibility:visible`,
+// `opacity:1`. The Greenhouse/Lever scan predicate (`rect.width > 0 && rect.height > 0`, optionally
+// on `el.closest("div")`) therefore admits it as an ordinary required-less text field.
+//
+// Why that is worse than it looks. Being OPTIONAL, the AI tier never touches it (AI is REQUIRED-only)
+// and it would end blank — so the fill looks clean. But it still reaches the REVIEW EDITOR as a
+// fillable box, and anything typed there is replayed on submit. **No read-back catches this: the
+// write succeeds.** The failure is invisible from inside the pipeline and lands on the employer's
+// side as "this application was filed by a bot" — the one failure class that cannot be recovered from
+// a review page afterwards, and the reason this is a recognizer rather than a filter.
+//
+// ⛔ DO NOT "FIX" THIS BY TIGHTENING THE VISIBILITY TEST. That is the Workday dropdown-chip dead end
+// (tried twice, confirmed): the element is genuinely visible by every computed-style measure. The only
+// honest signal is the intent the PAGE DECLARES about the control.
+//
+// Judgement lives here, SW-side, and the scan only REPORTS markers — the same split `atsInjAuthScan` /
+// `atsConsentKind` uses, so there is ONE copy of a rule this consequential rather than an injected dup
+// that can drift.
+//
+// The primary signal is deliberately GENERIC, not an Oracle name match: a control the page hides from
+// assistive technology AND removes from tab order is not a control a human is being asked to fill, on
+// any platform. `aria-hidden` alone is NOT enough — a decorative wrapper around a real input can carry
+// it — and `tabindex="-1"` alone is NOT enough either, since custom widgets routinely park a
+// programmatically-focused input out of tab order. Requiring BOTH is what makes it precise. The name /
+// label match is a belt for a tenant that ships only one of them.
+function atsDecoyKind(f) {
+  if (!f) return null;
+  const name = String(f.fieldName == null ? "" : f.fieldName);
+  const label = String(f.ariaLabel == null ? "" : f.ariaLabel);
+  const cssClassAttr = String(f.cssClassAttr == null ? "" : f.cssClassAttr);
+  // A NAMED honeypot is a honeypot whatever else it does — anchored on a word boundary so a genuine
+  // field is never claimed by a substring ("phone-number" must not match "honey").
+  if (/\bhoney[\s_-]?pot\b/i.test(name) || /\bhoney[\s_-]?pot\b/i.test(label)) return "honeypot";
+  // The page's own "do not show this to anyone" pair.
+  const hiddenFromAt = f.ariaHidden === true || String(f.ariaHidden) === "true";
+  const outOfTabOrder = String(f.tabIndex) === "-1";
+  if (hiddenFromAt && outOfTabOrder) return "aria-hidden+untabbable";
+  // A wrapper the tenant itself marks invisible, via ORC's Knockout `cssclass` binding attribute.
+  // Only trusted alongside one of the two signals above, because a class NAME is the tenant's
+  // vocabulary and could plausibly mean something else on its own.
+  if (/(^|[\s_-])(invisible|hidden|offscreen)([\s_-]|$)/i.test(cssClassAttr) && (hiddenFromAt || outOfTabOrder)) return "invisible-wrapper";
+  return null;
+}
+
 // SSO refusal is URL-EVIDENCED ONLY (the Workday invariant, verbatim): a real federated login
 // LEAVES the portal host. Field-absence proves nothing — a still-rendering auth widget looks
 // identical to a provider redirect, and that mistake produced a flat-wrong `sso` halt on Workday.
@@ -6138,7 +6236,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
-    atsConsentKind, atsConsentPlan, atsInjTickConsent,
+    atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
