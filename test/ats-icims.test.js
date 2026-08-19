@@ -552,6 +552,74 @@ test("atsPostingGone: iCIMS answers a dead job id with notFound=1 on its own sea
 // consent surfaced as `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be
 // pressed" — which sends the operator to debug a click that was fine.
 
+// ── THE WORK-HISTORY HEADING IS THE SECTION'S ONLY IDENTITY (live 2026-08-18) ────────────
+//
+// Astrion titles it "Experience"; Cretex titles it "Work Experience". The pattern was anchored at the
+// start, so Cretex matched nothing — and because this section has NO id family (`match: /^$/`), an
+// unmatched heading unmaps the whole block silently: every row is then answered from work_experience.0
+// and the later rows are left as "repeats", with the résumé parse's guesses still on them.
+
+test("experience heading: the wordings tenants actually use all match", () => {
+  const re = ats.ATS_ICIMS_ENTRY_MAPS.experience.sectionTitle;
+  for (const h of ["Experience", "Work Experience", "Professional Experience", "Employment History",
+                   "Work History", "Employment", "Prior Experience", "Relevant Experience",
+                   "work experience (1)"]) {
+    assert.ok(re.test(h), "should match: " + h);
+  }
+});
+
+test("experience heading: a DIFFERENT kind of experience is refused, not near-missed", () => {
+  // Filing volunteer or military history as employment is a factual error about the applicant, so these
+  // must fail the test rather than be treated as a close-enough heading.
+  const re = ats.ATS_ICIMS_ENTRY_MAPS.experience.sectionTitle;
+  for (const h of ["Volunteer Experience", "Military Experience", "Education", "Education Experience",
+                   "Skills", "Certifications", "References"]) {
+    assert.ok(!re.test(h), "must NOT match: " + h);
+  }
+});
+
+test("the unmapped-block warning fires on a REPEATING block only — never on address/phone", () => {
+  // A warning that cries wolf on every form trains you to skip the line that matters. The candidate's own
+  // address and phone carry ordinals and match no section either, and for them that is CORRECT (they are
+  // single-value fields answered from the profile root). The discriminator is repetition: a missed section
+  // renders the same bare id under two or more ordinals.
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => { logs.push(a.join(" ")); };
+  try {
+    ats.atsAssignEntryIndexes("icims", [
+      { fieldName: "-1_PersonProfileFields.AddressCity", section: "Enter your information" },
+      { fieldName: "-1_PersonProfileFields.PhoneNumber", section: "Enter your information" },
+    ]);
+    assert.strictEqual(logs.filter((l) => /matched NO section map/.test(l)).length, 0,
+      "an address block must not warn: " + logs.join(" / "));
+    logs.length = 0;
+    ats.atsAssignEntryIndexes("icims", ["-1", "-2", "-3"].flatMap((o) =>
+      ["rcf9001", "rcf9002"].map((id) => ({ fieldName: o + "_PersonProfileFields." + id, section: "Career History" }))));
+    const warn = logs.find((l) => /matched NO section map/.test(l));
+    assert.ok(warn, "a genuinely unmapped repeating block must warn");
+    assert.match(warn, /Career History/);
+    assert.match(warn, /3 rows/);
+  } finally { console.log = orig; }
+});
+
+test("atsAssignEntryIndexes: a 'Work Experience' block is stamped per ENTRY, not collapsed to entry 0", () => {
+  // The exact Cretex shape: three rows of the same ids under "Work Experience", ordinals -2/-3/-1 in DOM
+  // order. Each row must become its own entry, indexed by FIRST APPEARANCE, or rows 2 and 3 are answered
+  // from experience[0] / left as repeats — which is what happened live.
+  const mk = (ord, id) => ({ fieldName: ord + "_PersonProfileFields." + id, section: "Work Experience", label: id });
+  const fields = [mk("-2", "rcf3212"), mk("-2", "rcf3213"), mk("-3", "rcf3212"), mk("-3", "rcf3213"),
+                  mk("-1", "rcf3212"), mk("-1", "rcf3213")];
+  ats.atsAssignEntryIndexes("icims", fields);
+  const idxOf = (ord) => fields.find((f) => f.fieldName.startsWith(ord + "_")).entryIndex;
+  assert.strictEqual(fields[0].entrySection, "experience", "the heading is what identifies it");
+  assert.strictEqual(idxOf("-2"), 0, "first APPEARANCE is entry 0 — never the numeric value of the ordinal");
+  assert.strictEqual(idxOf("-3"), 1);
+  assert.strictEqual(idxOf("-1"), 2);
+  // …and every field of a row shares its row's index
+  assert.deepStrictEqual(fields.filter((f) => f.entryIndex === 0).map((f) => f.label), ["rcf3212", "rcf3213"]);
+});
+
 // ── WHAT THE PARSE LEFT BEHIND MUST REACH REVIEW (operator, 2026-08-18) ─────────────────
 //
 // "The auto parse is really bad… pretend the form is blank and refill everything." A field we CAN answer

@@ -411,7 +411,18 @@ const ATS_ICIMS_ENTRY_MAPS = {
   // label is the home address, which is exactly the bug the seal exists to stop.
   experience: {
     source: "work_experience",
-    sectionTitle: /^(professional\s+)?experience/i,
+    // ⚠ THE HEADING IS THIS SECTION'S ONLY IDENTITY, SO ITS WORDING IS LOAD-BEARING (live 2026-08-18).
+    // `match` below is empty on purpose — there is no id family to key on — which means one unmatched
+    // heading unmaps the whole section silently. That happened: Astrion titles it "Experience" and this
+    // pattern was anchored at the start, so Cretex's "Work Experience" missed. The consequence was not a
+    // missing field or two — the ENTIRE work-history block went unstamped, the label ladder then answered
+    // each row from `work_experience.0` (always entry 0), the repeat-detector left rows 2 and 3 blank as
+    // "repeats of a single value", and iCIMS' résumé-parse guesses stayed on the form in all of them.
+    // Education survived the same tenant only because it HAS an id family as a second signal.
+    // Widened to the wordings tenants actually use, and deliberately NOT to every heading containing the
+    // word: "Volunteer Experience" and "Military Experience" are different sections, and filing volunteer
+    // or service history as employment would be a factual error about the applicant, not a near-miss.
+    sectionTitle: /^(?!.*\b(volunteer|military|education)\b)(work\s+|professional\s+|employment\s+|prior\s+|relevant\s+)?(experience|employment|work\s+history|employment\s+history)\b/i,
     match: /^$/,                       // no id family — membership is what identifies these
     addButton: /professional experience|employment/i,
     byLabel: {
@@ -572,6 +583,42 @@ function atsAssignEntryIndexes(ats, fields) {
       f.entrySection = section;
     }
   }
+  // ⚠ SAY WHEN A REPEATING BLOCK MATCHED NO SECTION AT ALL. This is the signal whose absence cost a whole
+  // round: on Cretex every work-history field carried an ordinal, sat under a heading, and matched no
+  // section map — and NOTHING said so. The fill then looked healthy (rows filled from entry 0, later rows
+  // "left for you"), the review pile looked like ordinary unmapped questions, and the parse's values sat
+  // on the form. A heading is a per-customer string, so this WILL happen again on the next tenant; the
+  // log is what makes it a five-second diagnosis instead of an archaeology session.
+  try {
+    // ⚠ WARN ONLY ABOUT A GENUINE MULTI-ROW BLOCK. The first version of this fired on every iCIMS form,
+    // because the candidate's own address and phone fields also carry ordinals and match no section — and
+    // for THEM that is correct (they are single-value fields answered from the profile root, see the
+    // repeat rule below). A warning that cries wolf on every run is worse than none: it trains you to
+    // skip the line that matters. The discriminator is REPETITION — a missed section renders the SAME
+    // bare id under two or more ordinals (Cretex's rcf3212 under -1/-2/-3), while an address block
+    // renders each id exactly once.
+    const byId = {};
+    for (const f of fields) {
+      const mm = /^(-?\d+)_/.exec(String(f.fieldName || ""));
+      if (!mm || f.entrySection) continue;
+      const bare = atsMapKey(ats, f.fieldName);
+      const h = String(f.section || "(no heading)").trim() || "(no heading)";
+      const k = h + " " + bare;
+      (byId[k] = byId[k] || new Set()).add(mm[1]);
+    }
+    const perHeading = {};
+    for (const [k, ords] of Object.entries(byId)) {
+      if (ords.size < 2) continue;                       // rendered once — not a repeating block
+      const [h, bare] = k.split(" ");
+      (perHeading[h] = perHeading[h] || { ids: [], rows: 0 });
+      perHeading[h].ids.push(bare);
+      perHeading[h].rows = Math.max(perHeading[h].rows, ords.size);
+    }
+    for (const [heading, info] of Object.entries(perHeading)) {
+      console.log(`[ApplyPilot][ATS-FILL] ⚠ ${info.ids.length} field(s) under ${JSON.stringify(heading)} repeat across ${info.rows} rows but matched NO section map — every row will be answered from entry 0 (or left as a repeat), so a multi-entry block here fills only its first row. Add the heading to a section map. Ids: ${[...new Set(info.ids)].slice(0, 6).join(", ")}`);
+    }
+  } catch (e) { /* diagnostic only */ }
+
   // …and stamp REPEATS of a field that is answered from the profile ROOT — the candidate's own
   // address and phone blocks, and anything else a tenant chooses to make repeatable. DETECTED, not
   // declared: group by the BARE id and record where this field's ordinal falls in that id's
