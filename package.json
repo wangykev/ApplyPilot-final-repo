@@ -6,6 +6,7 @@
   "scripts": {
     "test": "node --test test/*.test.js",
     "build:icons": "node scripts/build-icons.mjs",
+    "check:justifications": "node scripts/check-justifications.mjs",
     "build:store": "node scripts/build-store-zip.mjs",
     "build:store:dry": "node scripts/build-store-zip.mjs --dry"
   },
