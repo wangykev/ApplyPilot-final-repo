@@ -831,11 +831,23 @@ function monthLabel(m: string): string {
 export type DateGranularity = "year" | "month-year" | "month-day-year";
 type DateParts = { year: string; month: string; day: string };
 
+/** "1" → "01". Empty or out-of-range → "" (the segment clears rather than keeping a non-date). */
+function padSeg(v: string, max: number): string {
+  const n = Number(String(v).trim());
+  if (!String(v).trim() || !Number.isFinite(n) || n < 1 || n > max) return "";
+  return String(n).padStart(2, "0");
+}
+
 function parseDateValue(value: string, g: DateGranularity): DateParts {
   if (g === "year") return { year: /^\d{4}$/.test(value) ? value : "", month: "", day: "" };
-  const m = value.match(/^(\d{4})-(\d{2})(?:-(\d{2}))?$/);
+  // ⚠ ACCEPT AN UNPADDED STORED VALUE. This required exactly two digits, so a date written "2024-8-26"
+  // — which every parser downstream accepts, and which an imported profile or an older write can hold —
+  // failed to match and the editor rendered EMPTY SEGMENTS over a value that was really there. Silently
+  // showing nothing for stored data is worse than showing it oddly: the operator retypes it, or worse
+  // assumes it is gone. Parsed tolerantly, displayed padded, and re-stored canonically.
+  const m = value.match(/^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?$/);
   if (!m) return { year: "", month: "", day: "" };
-  return { year: m[1], month: String(Number(m[2])), day: m[3] ? String(Number(m[3])) : "" };
+  return { year: m[1], month: padSeg(m[2], 12), day: m[3] ? padSeg(m[3], 31) : "" };
 }
 
 /** Reassemble the canonical string; empty until the required segments exist so
@@ -897,8 +909,10 @@ export function DateField({
             onChange={(e) => set({ month: e.target.value.replace(/\D/g, "").slice(0, 2) })}
             onBlur={() => {
               setMonthFocused(false);
-              const n = Number(parts.month);
-              if (!(n >= 1 && n <= 12)) set({ month: "" }); // invalid → clear
+              // pad on BLUR, never while typing: padding "1" to "01" mid-entry would fight anyone on
+              // their way to "12". padSeg also clears a month that cannot be one, which is what the
+              // previous invalid→clear check did.
+              set({ month: padSeg(parts.month, 12) });
             }}
             className={clsx(seg, "min-w-0 flex-1")}
           />
@@ -910,6 +924,12 @@ export function DateField({
             value={parts.day}
             placeholder="DD"
             onChange={(e) => set({ day: e.target.value.replace(/\D/g, "").slice(0, 2) })}
+            onBlur={() => {
+              // The day had no blur handler at all: a typed "1" stayed "1", and "0" or "45" was kept and
+              // assembled into the stored date. Same rule as the month now — pad, or clear what cannot
+              // be a day.
+              set({ day: padSeg(parts.day, 31) });
+            }}
             className={clsx(seg, "w-16 text-center")}
           />
         )}

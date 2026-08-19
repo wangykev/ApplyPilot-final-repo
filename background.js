@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "premerge-regress-1";
+const AP_BUILD_MARKER = "icims-leansig-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -703,7 +703,11 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace"];
+    // `skipIcimsResume` exists for ONE experiment that cannot be run any other way: the iCIMS résumé
+    // parse re-renders the form, so "is this widget's option list empty because the tenant has none, or
+    // because the PARSE left it that way?" is only answerable by filling the same form with the attach
+    // OFF. Diagnostic only — a real run always attaches (the operator's résumé belongs on the form).
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -883,6 +887,91 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // DEV: close the tabs a test sweep opened. Each run opens a job tab and deliberately LEAVES
   // it (so the operator can look at what happened), which piles up over a testing session.
   // Matches on a url substring and never touches the tab that asked (the dev site).
+  // ── AP_DEV_ICIMS_DROPDOWN — look inside an icims_dropdown, READ-ONLY (2026-08-18) ──────────────
+  // Built to answer one question that no log line could: when a required iCIMS combobox reports "no
+  // option matched … the list was empty", is the TENANT'S list empty, or did our SEARCH come back empty?
+  // Those need opposite responses — the first is an honest review item, the second is our bug — and the
+  // widget's post-run state cannot tell them apart, because a search leaves the list holding its own
+  // "No Results" row.
+  // Opens the widget, optionally types ONE query, reads the rows, closes it. Commits NOTHING and clicks
+  // no option, so it can be pointed at a live form safely. `query` omitted ⇒ the UNFILTERED list, which
+  // is the reading that actually settles the question.
+  if (type === "AP_DEV_ICIMS_DROPDOWN") {
+    (async () => {
+      if (runInFlight || discoverInFlight) { sendResponse({ ok: false, error: "busy" }); return; }
+      let tabId = Number(message.tabId) || 0;
+      if (!tabId && message.urlContains) {
+        const tabs = await new Promise((r) => chrome.tabs.query({}, r));
+        const hit = (tabs || []).find((t) => t.url && t.url.includes(String(message.urlContains)));
+        if (hit) tabId = hit.id;
+      }
+      // An ATTRIBUTE selector, not `#id`: these ids start with the entry ordinal ("-1_CandProfile…"),
+      // and a CSS id selector cannot begin with a hyphen followed by a digit — `#-1_x` is a SyntaxError
+      // inside querySelector, which is how the first probe run failed.
+      const sel = String(message.sel || (message.fieldName ? '[id="' + String(message.fieldName).replace(/"/g, '\\"') + '"]' : ""));
+      if (!tabId || !sel) { sendResponse({ ok: false, error: "need tabId (or urlContains) + sel/fieldName" }); return; }
+      try {
+        const attached = await cdpAttach(tabId);
+        if (!attached.ok) { sendResponse({ ok: false, error: "attach-failed:" + attached.error }); return; }
+        await cdpUseFormFrame(4).catch(() => null);
+        const out = { ok: true, sel, tabId };
+        out.opened = await cdpEval(atsInjIcimsOpen, sel).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        // ⚠ CLEAR THE SEARCH BOX BEFORE READING, or "unfiltered" is a lie. This probe was built to ask
+        // whether a list was empty, and its first run answered YES about a nine-option list — because the
+        // box still held the FILL's own query, so the rows it read were filtered by it. A tool written to
+        // check our work reproduced our bug and confirmed the wrong conclusion; clearing is what makes
+        // the word "unfiltered" mean anything. `atsInjIcimsSearch(sel, "")` sets the box empty.
+        out.cleared = await cdpEval(atsInjIcimsSearch, sel, "").catch(() => null);
+        // Poll the unfiltered list: iCIMS fetches the first page on OPEN, so an immediate read is a race.
+        for (let i = 0; i < 12; i++) {
+          await cdpDelay(400);
+          out.unfiltered = await cdpEval(atsInjIcimsReadOptions, sel).catch(() => null);
+          if (out.unfiltered && (out.unfiltered.options || []).length) break;
+        }
+        if (message.query) {
+          out.searched = await cdpEval(atsInjIcimsSearch, sel, String(message.query)).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+          for (let i = 0; i < 20; i++) {
+            await cdpDelay(400);
+            out.afterSearch = await cdpEval(atsInjIcimsReadOptions, sel).catch(() => null);
+            const rows = (out.afterSearch && out.afterSearch.options) || [];
+            if (rows.length && !(rows.length === 1 && /^no results$/i.test(String(rows[0]).trim()))) break;
+          }
+        }
+        // ⚠ RAW DUMP — added because two rounds of theorising about WHY a list was empty were both wrong
+        // (the résumé parse: ruled out by an A/B; the tenant: contradicted by the operator's own screen).
+        // What settles it is what the page actually contains: the widget's own attributes (is it really
+        // the AJAX flavour?), the NATIVE select's options (which we ignore for an icims_dropdown — if
+        // they are populated, we are reading the wrong place), the results <ul>'s rows, whether a search
+        // box exists at all, and the iframe's src params (iCIMS varies its rendering by width/mobile).
+        out.dump = await cdpEval(function (s2) {
+          const el = document.querySelector(s2);
+          if (!el) return { ok: false, error: "not-found" };
+          const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+          const ul = el.id ? document.getElementById(el.id + "_dropdown-results") : null;
+          const ctnr = el.id ? document.getElementById(el.id + "_icimsDropdown_ctnr") : null;
+          return { ok: true,
+            attrs: [...el.attributes].map((a) => a.name + "=" + String(a.value).slice(0, 40)),
+            nativeOptionCount: el.options ? el.options.length : null,
+            nativeOptions: el.options ? [...el.options].slice(0, 30).map((o) => txt(o) || "(blank)") : null,
+            nativeValue: el.value, selectedIndex: el.selectedIndex,
+            ulRows: ul ? [...ul.children].map(txt).slice(0, 30) : null,
+            ctnrClass: ctnr ? String(ctnr.className) : null,
+            hasSearchBox: !!(ctnr && ctnr.querySelector("input.dropdown-search")),
+            searchBoxValue: ctnr && ctnr.querySelector("input.dropdown-search") ? ctnr.querySelector("input.dropdown-search").value : null,
+            frameUrl: String(location.href).slice(0, 160) };
+        }, sel).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        out.shown = await cdpEval(atsInjIcimsRead, sel).catch(() => null);
+        await cdpEval(atsInjIcimsClose, sel).catch(() => null);
+        sendResponse(out);
+      } catch (e) {
+        sendResponse({ ok: false, error: "exception:" + String((e && e.message) || e) });
+      } finally {
+        await cdpDetach();
+      }
+    })();
+    return true;
+  }
+
   if (type === "AP_DEV_CLOSE_TABS") {
     (async () => {
       const needle = String(message.urlContains || "");
@@ -4721,7 +4810,24 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
       const sig = await signature();
       // "Rendered" = something to act on: a control to fill, or a heading (the careers page has a
       // job title and no controls at all, and must not burn the whole budget waiting for one).
-      const rendered = !!(sig && (sig.controls > 0 || String(sig.heading || "").length > 0));
+      let rendered = !!(sig && (sig.controls > 0 || String(sig.heading || "").length > 0));
+      // ⚠ AN EMPLOYER-BRANDED WRAPPER SATISFIES BOTH OF THOSE ON ITS OWN (live 2026-08-18, Cretex).
+      // That tenant serves the iCIMS frame inside its OWN marketing page: the top document carries the
+      // company header (so `heading` is non-empty), a site-SEARCH input and an accessibility-widget
+      // iframe (so `controls > 0`) — none of which is the application. The settle therefore accepted the
+      // page ~1s in, before `#icims_content_iframe` had navigated (a not-yet-navigated frame's live url
+      // is `about:blank`, so the identity rung cannot match it either), and the run read the wrapper,
+      // found a search box instead of an email box, and halted `apply-not-followable` on a tenant that
+      // fills perfectly. Astrion/ITT/Peraton hid it: their top document is ~13 characters with no
+      // heading, so "rendered" was never true until the frame arrived.
+      // So: when the page ADVERTISES an iCIMS frame that is not armed yet, nothing in the top document
+      // counts as rendered. Evidence-based — the `<iframe>` element is server-rendered and present
+      // immediately, so this waits only when there is something to wait FOR, and the 12s ceiling still
+      // bounds it.
+      if (rendered && !cdpFormFrameArmed()) {
+        const el = await cdpEvalTop(atsInjIcimsFrameSrc).catch(() => null);
+        if (el && el.ok) rendered = false;
+      }
       stable = rendered && prev && !atsSignatureChanged(prev, sig) ? stable + 1 : 0;
       if (stable >= 1) return { settled: true, controls: sig.controls, waitedMs: Date.now() - (deadline - (budgetMs || 12000)) };
       prev = sig;
@@ -5230,7 +5336,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // shape that produced 28 of a rehearsal's 32 verify failures when the entry counts disagreed. Both
     // visits must see the same form, so both attach.
     let resumePre = null, resumeStageMs = null;
-    if (ats === "icims") {
+    const skipIcimsResume = await new Promise((r) => chrome.storage.local.get(["skipIcimsResume"], (v) => r(!!(v && v.skipIcimsResume))));
+    if (skipIcimsResume && ats === "icims") LOG("⚠ skipIcimsResume is SET — attaching NO résumé this run (diagnostic only; a real run always attaches)");
+    if (ats === "icims" && !skipIcimsResume) {
       emitRunProgress("Attaching your résumé", "iCIMS parses it server-side — the fill waits for that to finish");
       const rsT0 = Date.now();
       resumePre = await atsIcimsResumeStage(act, ats, { log: (m) => LOG("résumé: " + m) });

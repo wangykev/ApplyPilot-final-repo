@@ -18,6 +18,29 @@ const str = z.string().default("");
  *  TOLERANT of legacy string values ("yes"/"no"/"true"/"false"; anything else → null) — before
  *  this, ONE string tri-bool anywhere failed the whole parse and coerceProfile silently returned
  *  an EMPTY profile (hit live: the extension's data/profile.json carries string values here). */
+/** "may we contact this employer?" — yes / no / yes-if-required / null (unanswered).
+ *  MIGRATES the tri-bool this replaced (true → "yes", false → "no"), because profiles already stored
+ *  that shape and a failed parse here silently empties the WHOLE profile (see triBool's note). Every
+ *  wording the option has been written as maps in, so a hand-edited profile.json still loads. */
+const mayContact = z
+  .preprocess((v) => {
+    if (v === true) return "yes";
+    if (v === false) return "no";
+    if (typeof v === "string") {
+      // punctuation stripped too: the STORED label spelling is "Yes, if required", and a profile
+      // hand-edited to the label rather than the code must still load as an answer, not as unanswered.
+      const t = v.trim().toLowerCase().replace(/[.,]/g, "").replace(/[\s_-]+/g, " ");
+      if (!t) return null;
+      if (/^(yes|y|true)$/.test(t)) return "yes";
+      if (/^(no|n|false)$/.test(t)) return "no";
+      // "yes if required" / "yes if necessary" / "only if required" / "if required"
+      if (/^(yes )?(if|only if) (required|requested|necessary|needed)$/.test(t)) return "yes_if_required";
+      return null;
+    }
+    return null;
+  }, z.enum(["yes", "no", "yes_if_required"]).nullable())
+  .default(null);
+
 const triBool = z
   .preprocess((v) => {
     if (v === true || v === false || v === null) return v;
@@ -108,9 +131,29 @@ export const educationSchema = z.object({
   minor: str,
   gpa: str,
   gpa_scale: str,
-  from_year: str, // "YYYY"
-  to_year: str, // "YYYY"
-  graduation_date: str, // "YYYY-MM"
+  from_year: str, // "YYYY" — résumé rendering ("2023 – 2027"); the ATS fill prefers start_date below
+  to_year: str, // "YYYY" — ditto
+  /**
+   * ⚠ DAY-CAPABLE DATES FOR THE ATS FILL (operator, 2026-08-18). Some application forms require a
+   * DAY for education start/end, and `from_year`/`to_year` are year-only — a year says nothing about a
+   * month, let alone a day, so those forms fell back to `defaults.date_day` (an approximation, flagged
+   * `default-value` in review) or were left to the résumé parse's guess.
+   *
+   * These are the day-capable equivalents: "YYYY-MM-DD" when the operator knows the day, "YYYY-MM"
+   * when they only know the month. A day STATED here is a fact, so it fills unflagged and stops
+   * reaching review; an absent one leaves the existing default/blank behaviour exactly as it was.
+   *
+   * Deliberately SEPARATE from from_year/to_year rather than a change of their format: the résumé
+   * renders those as a year range, and widening a field the résumé prints is a different blast radius
+   * than adding one the fill reads. The fill prefers these and falls back to the year fields.
+   *
+   * ⚠ THERE IS NO `end_date` HERE, ON PURPOSE (operator, 2026-08-18): for education the end date IS the
+   * GRADUATION date, so a second field would be a second place to state one fact — which invites the two
+   * to disagree and leaves the fill guessing which is current. A form's "End Date" parts therefore read
+   * `graduation_date`, and only the START needed a new field (from_year is year-only).
+   */
+  start_date: str, // "YYYY-MM-DD" | "YYYY-MM" | ""
+  graduation_date: str, // "YYYY-MM" | "YYYY-MM-DD" — ALSO the education end date; a stated day fills unflagged
   currently_enrolled: bool, // checkbox
   // Resume-only: the "Relevant Coursework: …" line under this school. coerceProfile
   // bridges the extension profile's application_questions.role_specific.coursework_relevant
@@ -138,8 +181,11 @@ export const workExperienceSchema = z.object({
   company: str,
   location: str,
   currently_work_here: bool, // checkbox
-  from: str, // "YYYY-MM"
-  to: str, // "YYYY-MM"
+  // "YYYY-MM", or "YYYY-MM-DD" when the operator knows the day. A form that REQUIRES a day gets the
+  // stated one unflagged; with month precision it falls back to `defaults.date_day` and flags it
+  // `default-value` for review (which is what 6 of one Cretex fill's 11 review items were).
+  from: str, // "YYYY-MM" | "YYYY-MM-DD"
+  to: str, // "YYYY-MM" | "YYYY-MM-DD"
   role_description: str, // one textarea — how Workday renders the role description
   tech_stack: z.array(z.string()).default([]),
   // ── Employer detail some ATSs ask for and a resume never states (operator, 2026-08-16) ──
@@ -151,11 +197,17 @@ export const workExperienceSchema = z.object({
   supervisor_name: str,
   supervisor_title: str,
   reason_for_leaving: str,
-  // ⚠ TRI-STATE, not a checkbox. "may we contact this employer?" is a QUESTION with a real
-  // consequence — a false yes hands a recruiter a reference you did not agree to — so an unanswered
-  // one must stay unanswered rather than defaulting to either polarity. `triBool` is the same type
-  // the work-authorization questions use for exactly this reason.
-  may_contact: triBool,
+  // ⚠ A THREE-WAY ANSWER, not a checkbox and no longer a plain tri-bool (operator, 2026-08-18).
+  // "may we contact this employer?" is a QUESTION with a real consequence — a false yes hands a
+  // recruiter a reference you did not agree to — so an unanswered one stays unanswered rather than
+  // defaulting to either polarity, exactly like the work-authorization questions.
+  //
+  // The third option exists because it is the answer many people actually hold and no boolean can
+  // express: "yes_if_required" — they may, but only if the process demands it. Forms that offer a
+  // conditional option get it; a plain Yes/No form gets "Yes", which is the truthful projection onto
+  // the options that exist (the conditionality has nowhere to live there), and the filler's tiered
+  // candidate ladder is what picks whichever the form actually offers.
+  may_contact: mayContact,
   // Only meaningful when may_contact is true; the filler enforces that, and gates on the ANSWER
   // rather than on whether these happen to be filled in.
   employer_email: str,

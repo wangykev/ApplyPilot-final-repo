@@ -38,6 +38,8 @@ For current state and open work, see **`docs/status.md`**.
 | **Résumé attach** | `2026-07-29 (later) - ` (the `role="alert"` status-channel fix) |
 | **Service-worker breakage (the two Node-invisible classes)** | `2026-07-28 — Dead service worker: two files declaring one name`, `2026-07-28 — The replay walk never settled the page` |
 | **iCIMS / credentials tier** | `2026-08-16 — iCIMS routed, the form frame, and the Create-a-login block` |
+| **iCIMS multi-tenant triage (5 tenants, item by item)** | `2026-08-18 — five iCIMS tenants triaged item by item` |
+| **Questions the profile answers but nothing read** | `2026-08-18 — five iCIMS tenants triaged item by item` (relocation, address Type, contact opt-ins, may_contact) |
 | **Latest live sweeps** | `2026-08-09 — live sweep: marvell + moog verified`, `2026-08-09 (b) — the non-Workday merge did NOT regress Workday` |
 
 ## Progress log
@@ -5492,3 +5494,74 @@ against the fill path while the submit path could not replay a single work-histo
 - **A rehearsal now states its own pacing.** The submit run never logged `[ATS-PACING]` while the fill
   run always has, so two clean rehearsals had no ground truth for "was that hidden?" — `background:false`
   at the call site is an intention, not an observation.
+
+## 2026-08-18 — five iCIMS tenants triaged item by item; four questions stop being guesses
+
+The ask: *"go find some more icims forms and make sure they all fill correctly end to end. really make
+sure — last time I asked and you said it was fine, but we realized an entire section was not filled
+correctly. correct fills should have low number of review items."*
+
+So this round counted nothing and read every remaining review item, per tenant, back to its cause. Five
+tenants: **Wieland Chase**, **SCS Engineers**, **Sargent & Lundy**, **Cretex**, plus the earlier Astrion.
+Four of the causes were ours.
+
+### What the triage found
+
+| tenant | fields | review | what was left |
+|---|---|---|---|
+| SCS Engineers | 18 | 2 | how-did-you-hear pair |
+| Sargent & Lundy | 24 | **4 → 3** | SMS consent (now deterministic), how-did-you-hear pair |
+| Cretex | 68 | **42 → 3 → 2** | how-did-you-hear pair |
+| Wieland Chase | 21 | 4 | address Type (now mapped), how-did-you-hear |
+
+No unmapped repeating blocks and no parse residue on any of them. ⚠ Six earlier `⚠ N repeating field(s)
+… matched NO section map` warnings were all Cretex, all from BEFORE the Experience-heading fix landed —
+worth stating because they nearly sent this round chasing a bug that was already dead.
+
+### The four fixes
+
+1. **SCS Engineers never reached its form** — `apply-not-followable`. Its Apply control is iCIMS'
+   action-button widget, which renders its label TWICE for responsive layout, so the anchor's
+   `textContent` is `"ApplyApply"` — and `/^apply\b/` does not match that: there is no word boundary
+   between "y" and "A". Astrion hid it for a week because its own duplication left a space. Both finders
+   now read each LEAF's text alongside the concatenation — what is actually rendered, no iCIMS class to
+   key on, and it fixes any duplicated-label widget.
+2. **The address "Type" was answered by the AI, differently each time** — "Home" on Cretex, "Work" on
+   Wieland. Its label is a bare "Type" inside the candidate's own address block, so the label ladder has
+   nothing to key on. There is nothing to ASK here: the one address a profile holds is the applicant's
+   residence, so this is a fact about the FORM's vocabulary. Maps now take a literal candidate list.
+3. **A contact opt-in asked as a QUESTION is still an opt-in.** The operator's rule lived only on the
+   checkbox path, so the same question as a required Yes/No dropdown went to the AI, which answered
+   "Yes" and subscribed them to texts. Answered "No" deterministically and flagged. The bail list is the
+   load-bearing half — a "No" to a background check or the privacy notice sinks the application.
+4. **Willingness to relocate was guessed while the guess cited the profile field** nothing read
+   (`screening.willing_to_relocate is explicitly set to true in profile`). Now a shared recognizer wired
+   into both engines, keeping "would you move" and "who pays" apart, and refusing the past tense and
+   "do you require relocation assistance?" (a negotiation, not a stored fact).
+
+### "May we contact this employer?" — the refusal that was overridden one rung later
+
+`may_contact`'s resolver said, in as many words, that defaulting it "is not a default anyone should own"
+— and then returned null. Null makes it an ordinary `entry-unanswered` field, and those go to the AI **by
+design**. Measured on Cretex, all three work-history rows: `ai-choice · "Yes" · reasoning-from-absence:
+default affirmative`. A "Yes" nobody gave could tip off an employer the operator has not told they are
+looking, and no review page recovers that.
+
+Now CLAIMED — the remedy the clearance rung and credential tier already use, because claiming is what
+keeps the AI away from a question. And at the operator's request the answer became **three-way**: yes /
+no / **yes_if_required**, a dropdown on the profile's work-experience entries, schema-migrating the
+tri-bool it replaced. Each answer is a tiered ladder, so a form offering *"Yes, if required"* takes that
+and a plain Yes/No form takes "Yes". A conditional yes also releases the employer email/phone — it
+permits contact, and those fields are the mechanism.
+
+### And the résumé-upload pause, answered with numbers
+
+*"after the resume finishes uploading it seems to take a long time before actually filling out the form.
+why is this?"* — about two thirds of it was **ours**. Cretex: parse landed 6.0s, "settled" 14.6s. The
+settle gate read its signature with `atsInjScan`, a 479-line full form read, so a nominal 900ms poll cost
+~2.9s per tick. `atsInjLeanSignature` reads only name + has-value: 10 reads, **704ms total**, stage
+15.4s → 12.7s against a *stricter* quiet bar. Full round in `docs/fill-speed-log.md` round 13, including
+the trap that both sides of the comparison must be computed the same way — a mixed baseline reads as
+"the parse changed the form", and a false `changed` can finish the wait before the parse starts.
+
+**1574 unit tests** (112 iCIMS). The baseline-vocabulary test was confirmed to FAIL on a reverted probe.
