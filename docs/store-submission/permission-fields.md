@@ -1,9 +1,10 @@
-# Permission justification fields — 1000-char versions
+# Privacy-tab form fields — 1000-char versions
 
-The dashboard caps **every** justification field at 1000 characters. The prose in
-`privacy-tab.md` explains the reasoning at length for our own reference; these are the
-versions that actually fit the form. Each block below is verified ≤ 1000 chars by
-`node scripts/check-justifications.mjs`.
+The dashboard caps **every** free-text field on this tab at 1000 characters — the single
+purpose description and each permission justification alike. The prose in `privacy-tab.md`
+explains the reasoning at length for our own reference; these are the versions that fit the
+form. Every block below is verified by `npm run check:justifications`, which measures the
+**CRLF-adjusted** length (see the script — a field measuring 999 can arrive as 1015).
 
 What survived the cut, and what did not: every field keeps the *why a narrower permission
 will not do* argument, because that is the reviewer's real question. What was dropped is
@@ -11,6 +12,29 @@ restatement and context. In `debugger` the two mechanisms and the scope-and-visi
 paragraph are all load-bearing and all stayed.
 
 ---
+
+## Single purpose description
+
+The policy tests *scope coherence*, not feature count — so this names the one pipeline
+(fill → review → submit) and lets the résumé handling, the tracker and the optional AI read
+as steps within it rather than as separate bundled products. It also states the never-submit
+guarantee, because a reviewer's first worry about an application-filling tool is an extension
+that applies to jobs on its own.
+
+```
+ApplyPilot has one purpose: to fill in job application forms on the user's behalf from a
+profile they maintain, and to let them review every filled value before anything is
+submitted.
+
+Everything in the extension serves that one flow. The user stores their profile once —
+contact details, work history, education, and the answers employers commonly ask for. When
+they open a job application, ApplyPilot reads the form's fields, matches each against that
+profile, fills what it can answer confidently, and records every value it entered. Anything
+it cannot answer with certainty is flagged for the user to correct rather than guessed at.
+
+The extension never submits an application by itself. Submission happens only after the
+user has reviewed the record of what was filled and approved the flagged values.
+```
 
 ## activeTab
 
