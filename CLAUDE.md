@@ -968,17 +968,27 @@ rest.** What is settled, and what must not be re-litigated:
 
 ### Through the gate — the form's shape (recon 2, 2026-08-19; Baylor + Nokia)
 
-- **⚠ THE CODE STEP IS CONDITIONAL ON WHETHER THE EMAIL IS ALREADY KNOWN — and Gmail auto-verify IS on the
-  critical path (corrected 2026-08-19, recon 4).** Recon 2 concluded "no code is needed" from a single
-  observation: a **first-time** email at a tenant goes `Next` → straight to `…/apply/section/1`. Re-entering
-  the flow with **the same email** at the same tenant instead lands on **"Confirm Your Identity"** — a
-  six-digit code (`input#pin-code-1…6`, `type=number`, **no `name`**, Knockout-bound, `aria-label="Enter
-  verification code digit N of six."`), a `Verify` button, and `<resend-pin>` / "Send New Code".
-  **Both paths must be handled and neither may be assumed.** It matters most on the SUBMIT visit, which is by
-  construction a *second* visit with the same email — so a fill run may sail through while its submit run
-  demands a code. This is why the mechanism the operator specified (stored credentials + **Gmail
-  auto-verify**) is required, not optional. ⚠ A deep link to `…/apply/section/<n>` from a cold browser
-  **redirects to the posting** — the flow is not resumable without re-entering the gate.
+- **⚠ ONCE THE CANDIDATE EXISTS, THE CODE IS REQUIRED ON *EVERY* RE-ENTRY — so Gmail auto-verify is on the
+  critical path for every run, fill included (operator, 2026-08-19).** This took three passes to get right
+  and the wrong versions were each load-bearing, so the whole ladder is recorded:
+  - recon 2 saw a **brand-new** email go `Next` → straight to `…/apply/section/1` and concluded "no code is
+    ever needed". Wrong, from one observation of a conditional branch.
+  - recon 4 saw a **known** email hit **"Confirm Your Identity"** and concluded "conditional on whether the
+    email is known". Closer, but it framed the code as the exception.
+  - the operator's own experience settles it: *"you need to approve each time you reopen the application."*
+    So: **no candidate account yet ⇒ no code; the account exists ⇒ a code on every entry.** Both earlier
+    observations fit that, and the common case in production is the coded one.
+  The screen: six digit boxes (`input#pin-code-1…6`, `type=number`, **no `name`**, Knockout-bound,
+  `aria-label="Enter verification code digit N of six."`), a `Verify` button, `<resend-pin>` / "Send New
+  Code". Route `…/apply/pin` on some tenants, still `…/apply/email` on others — so **recognize the view by
+  its CONTENT, never by route or message text** (Baylor names the address, Oracle's own site says only "sent
+  to you").
+- **⚠⚠ THE APPLY-FLOW SESSION IS PER-TAB, NOT A COOKIE (measured 2026-08-19).** A fresh tab in the SAME
+  Chrome profile, with `ORA_CX_USERID` / `ORA_CX_SITE_NUMBER` cookies present, still bounces
+  `…/apply/section<n>` → `…/apply/pin`. The verified flow state lives in **`sessionStorage`**, which is
+  per-tab. Two consequences, both structural: **a run must clear the gate in the SAME TAB it then fills**
+  and can never borrow a session another tab established (including the operator's own signed-in tab); and
+  **the flow is not resumable cold** — a deep link from a new tab is not an entry point.
   ⚠ The terms checkbox is **per-tenant optional** (Nokia has one, Baylor none) — tick it when present, never
   require it. The honeypot's WIDTH also varies by tenant (179 vs 200), so no size constant may ever enter the
   test.

@@ -5123,3 +5123,48 @@ The group-question element for `input-row--radiogroup` is **still unanswered** �
 gate instead. Also still open: whether a combobox accepts a typed value; `region1` vs `region2`; where a
 combobox's options mount relative to `timeline-form-inline`; whether ids renumber across a section
 transition; captcha on submit; the Education entry's field set; a second tenant's form.
+
+---
+
+## 2026-08-19 (e) — ORC: the code is per RE-ENTRY, and the apply session is per TAB
+
+Two corrections, both from trying to reach an already-verified form and failing.
+
+### The code rule, third and final version
+
+Recon (b) said "no code is ever needed" (one observation of a brand-new email). Recon (d) said
+"conditional on whether the email is known". The operator settles it: **"you need to approve each time you
+reopen the application."**
+
+| candidate state | outcome |
+|---|---|
+| no account at this tenant yet | no code — straight to the form |
+| the account exists | **a code on EVERY re-entry** |
+
+Both earlier observations fit, and the coded path is the common one in production. Gmail auto-verify is
+therefore on the critical path for **every** run, not just the submit visit.
+
+⚠ Route names differ per tenant (`…/apply/pin` on Oracle's own site, still `…/apply/email` on Baylor) and
+so does the copy (Baylor names the address; Oracle says only "sent to you", because it takes the address
+from the EXISTING candidate cookie rather than anything typed). **Recognize the view by CONTENT** —
+the six `#pin-code-N` boxes — never by route or message text.
+
+### ⚠⚠ The apply-flow session is per TAB
+
+Measured: a fresh tab in the SAME Chrome profile, with `ORA_CX_USERID`, `ORA_CX_USERID_FUNCTIONAL`,
+`ORA_CX_SITE_NUMBER` and `ORA_FPC` cookies all present, still bounces `…/apply/section1` → `…/apply/pin`.
+The verified flow state is in **`sessionStorage`** (per-tab), not in a cookie.
+
+Two structural consequences:
+
+- **A run must clear the gate in the SAME TAB it then fills.** It can never inherit a session another tab
+  established — including the operator's own signed-in tab, which is why "just use my open form" is not
+  available to an automated run. This validates `runOrcPreForm` being an in-tab stage rather than a
+  precondition someone else can satisfy.
+- **The flow is not resumable cold.** A deep link to a section from a new tab is not an entry point.
+
+### Setup gotcha found on the way
+
+The popup loads credentials from **`data/credentials.json`**, not `data/.credentials.json` —
+`chrome.runtime.getURL` 404s on a dotfile. A repo carrying only the dotfile has a popup whose "Load
+credentials" silently cannot work.
