@@ -63,6 +63,15 @@ function icimsPage(over) {
     atsInjReadValue: (a, sel) => ({ ok: true, value: box[sel] != null ? box[sel] : null }),
     _box: box, _writes: writes,
   };
+  // The settle heartbeat reads a LEAN signature rather than a full scan (2026-08-18) — cheap on a real
+  // page, where a 479-line `atsInjScan` per tick cost ~2.9s and turned an 8.6s probe into the wait.
+  // The fake derives it from whatever scan this page is serving, via the SAME reducer the wait used
+  // before, so these tests still exercise the state machine (pre-parse → post-parse → quiet) and the
+  // per-tick scan COUNT the timing assertions read stays one-per-tick.
+  page.atsInjLeanSignature = () => {
+    const scan = page.atsInjScan();
+    return { ok: true, sig: ats.atsFormSignature(scan), n: ((scan && scan.fields) || []).length };
+  };
   return Object.assign(page, over || {});
 }
 
@@ -487,6 +496,88 @@ test("atsIcimsResumeStage: an attach that FAILED does not wait for a parse that 
   assert.strictEqual(page._st.scans, scansAtFailure, "nothing was polled after a failed upload");
 });
 
+// ── THE SETTLE HEARTBEAT IS A CHEAP READ, NOT A FULL SCAN (live 2026-08-18) ─────────────────────
+//
+// Cretex: the parse landed at 6.0s, the stage finished at 15.4s. The 8.6s between was ours — one
+// `atsInjScan` per tick (labels, every option list, the section walk, 68 field objects back over CDP)
+// made a "900ms poll" cost ~2.9s, so three stable reads took ~8.6s instead of ~2.8s.
+
+test("atsInjLeanSignature: reads only name + has-value, and notices both kinds of change", () => {
+  const el = (o) => Object.assign({ tagName: "INPUT", type: "text", name: "", id: "", value: "", checked: false }, o);
+  const run = (els) => {
+    global.document = { querySelectorAll: () => els };
+    try { return ats.atsInjLeanSignature("icims"); } finally { delete global.document; }
+  };
+  const before = run([el({ name: "a" }), el({ name: "b" })]);
+  assert.strictEqual(before.ok, true);
+  assert.strictEqual(before.n, 2);
+  // a field GAINING a value is a change (the parse filled something in)
+  const filled = run([el({ name: "a", value: "Kevin" }), el({ name: "b" })]);
+  assert.notStrictEqual(filled.sig, before.sig, "a value appearing must change the signature");
+  // …and so is a field APPEARING (the parse minted an entry)
+  const grown = run([el({ name: "a" }), el({ name: "b" }), el({ name: "c" })]);
+  assert.notStrictEqual(grown.sig, before.sig, "a new field must change the signature");
+  // whitespace is not a value — otherwise a re-render that pads a box reads as a parse landing
+  assert.strictEqual(run([el({ name: "a", value: "   " }), el({ name: "b" })]).sig, before.sig);
+});
+
+test("atsInjLeanSignature: plumbing is skipped, and index 0 is not read as unselected", () => {
+  const el = (o) => Object.assign({ tagName: "INPUT", type: "text", name: "", id: "", value: "", checked: false }, o);
+  const run = (els) => {
+    global.document = { querySelectorAll: () => els };
+    try { return ats.atsInjLeanSignature("icims"); } finally { delete global.document; }
+  };
+  // hidden/submit/button carry values that have nothing to do with the applicant's answers — an
+  // anti-forgery token that rotates on every postback would make the form NEVER look stable.
+  const r = run([
+    el({ name: "real" }),
+    el({ name: "__VIEWSTATE", type: "hidden", value: "churns-every-postback" }),
+    el({ name: "go", type: "submit", value: "Submit Profile" }),
+    el({ name: "btn", type: "button", value: "Add More" }),
+    el({ name: "rst", type: "reset", value: "Reset" }),
+  ]);
+  assert.strictEqual(r.n, 1, "only the real control counts: " + r.sig);
+  // an element with neither name nor id cannot be tracked across renders — skipped rather than guessed
+  assert.strictEqual(run([el({ name: "", id: "" })]).n, 0);
+  assert.strictEqual(run([el({ name: "", id: "byId" })]).n, 1, "…but an id is a usable key");
+  // ⚠ a <select> is judged by its VALUE, never selectedIndex > 0 — the first option may be a real
+  // choice (iCIMS' salary Currency starts at "USD $"), and an opaque iCIMS id IS a value.
+  const sel = (o) => Object.assign({ tagName: "SELECT", type: "select-one", name: "s", id: "", value: "", checked: false }, o);
+  assert.match(run([sel({ value: "12781" })]).sig, /s:1$/, "an opaque id counts as chosen");
+  assert.match(run([sel({ value: "" })]).sig, /s:0$/, "a placeholder row carries no value");
+  // a checkbox/radio is judged by CHECKED, not by its value attribute (which is always present)
+  const box = (o) => Object.assign({ tagName: "INPUT", type: "checkbox", name: "c", id: "", value: "on", checked: false }, o);
+  assert.match(run([box({ checked: false })]).sig, /c:0$/);
+  assert.match(run([box({ checked: true })]).sig, /c:1$/);
+});
+
+test("atsInjLeanSignature: a DOM read that throws reports it rather than looking like a stable form", () => {
+  global.document = { querySelectorAll: () => { throw new Error("world replaced"); } };
+  try {
+    const r = ats.atsInjLeanSignature("icims");
+    assert.strictEqual(r.ok, false, "ok:false is what makes the caller treat the tick as unreadable");
+    assert.match(r.error, /world replaced/);
+  } finally { delete global.document; }
+});
+
+test("atsIcimsAwaitParse: the BASELINE is read the same way the ticks are", async () => {
+  // ⚠ The failure this pins: a base computed from a full scan and ticks read leanly differ on tick
+  // ONE, which the loop reads as "the parse changed the form" — and a false `changed` lets it finish
+  // on the first brief quiet, possibly before the parse has even started. Mixed vocabularies are the
+  // one thing that can defeat this whole stage, so the wait reads its own baseline.
+  const page = parsingPage();
+  const seen = [];
+  const act = fakeAct(page);
+  const inner = act.eval;
+  act.eval = async (fn, ...args) => { seen.push(fn.name); return inner(fn, ...args); };
+  act.quietRead = async () => ({ ok: true, idleMs: 9000 });
+  const r = await ats.atsIcimsAwaitParse(act, "icims", { parse: FAST_PARSE });
+  assert.ok(r, "the wait must return an observation, never throw");
+  assert.ok(seen.length > 0, "it must actually read the page");
+  assert.ok(seen.every((n) => n === "atsInjLeanSignature"),
+    "every read — baseline included — goes through the lean probe: " + [...new Set(seen)].join(", "));
+});
+
 test("atsIcimsAwaitParse: NO change is not permission to proceed early", async () => {
   // A parse that changed nothing is indistinguishable from one that has not started, so the
   // no-change branch spends its whole change budget before it accepts a quiet, stable form.
@@ -551,6 +642,350 @@ test("atsPostingGone: iCIMS answers a dead job id with notFound=1 on its own sea
 // `#accept_gdpr`. Because iCIMS preventDefaults the submit and disables its own button, an unticked
 // consent surfaced as `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be
 // pressed" — which sends the operator to debug a click that was fine.
+
+// ── A DAY THE PROFILE STATES IS A FACT; A DEFAULT IS AN APPROXIMATION (operator, 2026-08-18) ──
+//
+// Ids confirmed by recon on Cretex: `CandProfileFields.EducationStartDate_Month` / `_Date` / `_Year`,
+// where `_Date` is iCIMS' name for the DAY part (same as the experience block's rcf3214_Date). Education
+// previously had no day spec at all and its start/end came from year-only `from_year`/`to_year`, so a form
+// requiring a day got the parse's guess or the operator's default. `start_date`/`end_date` are the
+// day-capable fields; the year fields remain for résumé rendering and as the month/year fallback.
+
+const eduDate = (fieldName, entry, defaults) => {
+  const f = { fieldName: "-1_" + fieldName, label: fieldName, isRequired: true, section: "Education" };
+  const es = ats.atsEntrySpec("icims", f);
+  return es ? ats.atsResolveEntryField(es, entry, f, new Date("2026-08-18T12:00:00Z"), defaults || {}) : null;
+};
+
+test("education: a STATED day fills the day part unflagged", () => {
+  // ⚠ NO education `end_date`: the end date IS the graduation date (operator), so a form's End Date parts
+  // read `graduation_date` — one fact, one place to state it.
+  const entry = { start_date: "2024-08-26", graduation_date: "2028-05-11", from_year: "2024", to_year: "2028" };
+  const day = eduDate("CandProfileFields.EducationStartDate_Date", entry);
+  assert.strictEqual(day.value !== undefined ? day.value : day.raw, "26");
+  assert.strictEqual(day.source, "entry", "a stated day is a fact, not a default");
+  assert.ok(!day.review, "and it must not reach review");
+  assert.ok(!day.flag);
+  // the month and year come off the SAME field, so one entry answers all three parts
+  // the month arrives TIERED (a month dropdown's vocabulary is the tenant's choice, not a fact)
+  const mon = eduDate("CandProfileFields.EducationStartDate_Month", entry);
+  assert.deepStrictEqual(mon.candidates, ["August", "Aug"], "full name first, then the abbreviation");
+  assert.strictEqual(mon.source, "entry");
+  const yr = eduDate("CandProfileFields.EducationStartDate_Year", entry);
+  assert.strictEqual(String(yr.value || yr.raw), "2024");
+  // …and the END date answers its own parts
+  // End Date and Graduation are the SAME fact, so both answer from graduation_date
+  assert.strictEqual(eduDate("CandProfileFields.EducationEndDate_Date", entry).value, "11");
+  assert.strictEqual(eduDate("CandProfileFields.GraduationDate_Date", entry).value, "11");
+  assert.strictEqual(String(eduDate("CandProfileFields.EducationEndDate_Year", entry).value), "2028");
+});
+
+test("education: with only the year fields set, nothing changes from before", () => {
+  // The new fields are additive: an existing profile that has not filled them must fill exactly what it
+  // filled yesterday — the year from the year field, and no invented month or day.
+  const entry = { from_year: "2024", to_year: "2028" };
+  const yr = eduDate("CandProfileFields.EducationStartDate_Year", entry);
+  assert.strictEqual(String(yr.value || yr.raw), "2024", "the year still comes from from_year");
+  assert.strictEqual(eduDate("CandProfileFields.EducationStartDate_Month", entry), null, "a year states no month");
+  assert.strictEqual(eduDate("CandProfileFields.EducationStartDate_Date", entry), null, "…and certainly no day");
+});
+
+test("education: a MONTH-precision date still refuses to invent a day, and says so", () => {
+  const entry = { start_date: "2024-08" };
+  const day = eduDate("CandProfileFields.EducationStartDate_Date", entry, { date_day: 1 });
+  assert.strictEqual(day.value, "1");
+  assert.strictEqual(day.flag, "default-value", "an approximation faces the human gate");
+  assert.strictEqual(day.review, true);
+  // and with the default explicitly opted OUT, the field goes back to reaching review empty
+  assert.strictEqual(eduDate("CandProfileFields.EducationStartDate_Date", entry, { date_day: null }), null);
+});
+
+test("experience: a stated day removes the default-value flag those 6 review items had", () => {
+  // Work experience already had day specs — which is why its days were FILLED but flagged. With a day in
+  // the profile they become facts. (6 of one Cretex fill's 11 review items were exactly this.)
+  // the day part is identified by `partLabel` + its date GROUP (see atsEntrySpec) — the raw control name,
+  // deliberately not the display label, so a review-side wording change cannot reach the matching layer
+  const f = { fieldName: "-1_PersonProfileFields.rcf3214_Date", label: "Start Date", partLabel: "Day",
+    dateGroup: 0, isRequired: true, section: "Work Experience" };
+  const es = ats.atsEntrySpec("icims", f);
+  assert.ok(es, "the experience section must claim this field");
+  const stated = ats.atsResolveEntryField(es, { from: "2025-05-12" }, f, new Date(), {});
+  assert.strictEqual(stated.value, "12");
+  assert.strictEqual(stated.source, "entry");
+  assert.ok(!stated.flag, "no default-value flag when the day is stated");
+  const approx = ats.atsResolveEntryField(es, { from: "2025-05" }, f, new Date(), { date_day: 1 });
+  assert.strictEqual(approx.flag, "default-value");
+});
+
+// ── THE WORK-HISTORY HEADING IS THE SECTION'S ONLY IDENTITY (live 2026-08-18) ────────────
+//
+// Astrion titles it "Experience"; Cretex titles it "Work Experience". The pattern was anchored at the
+// start, so Cretex matched nothing — and because this section has NO id family (`match: /^$/`), an
+// unmatched heading unmaps the whole block silently: every row is then answered from work_experience.0
+// and the later rows are left as "repeats", with the résumé parse's guesses still on them.
+
+test("experience heading: the wordings tenants actually use all match", () => {
+  const re = ats.ATS_ICIMS_ENTRY_MAPS.experience.sectionTitle;
+  for (const h of ["Experience", "Work Experience", "Professional Experience", "Employment History",
+                   "Work History", "Employment", "Prior Experience", "Relevant Experience",
+                   "work experience (1)"]) {
+    assert.ok(re.test(h), "should match: " + h);
+  }
+});
+
+test("experience heading: a DIFFERENT kind of experience is refused, not near-missed", () => {
+  // Filing volunteer or military history as employment is a factual error about the applicant, so these
+  // must fail the test rather than be treated as a close-enough heading.
+  const re = ats.ATS_ICIMS_ENTRY_MAPS.experience.sectionTitle;
+  for (const h of ["Volunteer Experience", "Military Experience", "Education", "Education Experience",
+                   "Skills", "Certifications", "References"]) {
+    assert.ok(!re.test(h), "must NOT match: " + h);
+  }
+});
+
+test("the unmapped-block warning fires on a REPEATING block only — never on address/phone", () => {
+  // A warning that cries wolf on every form trains you to skip the line that matters. The candidate's own
+  // address and phone carry ordinals and match no section either, and for them that is CORRECT (they are
+  // single-value fields answered from the profile root). The discriminator is repetition: a missed section
+  // renders the same bare id under two or more ordinals.
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => { logs.push(a.join(" ")); };
+  try {
+    ats.atsAssignEntryIndexes("icims", [
+      { fieldName: "-1_PersonProfileFields.AddressCity", section: "Enter your information" },
+      { fieldName: "-1_PersonProfileFields.PhoneNumber", section: "Enter your information" },
+    ]);
+    assert.strictEqual(logs.filter((l) => /matched NO section map/.test(l)).length, 0,
+      "an address block must not warn: " + logs.join(" / "));
+    logs.length = 0;
+    ats.atsAssignEntryIndexes("icims", ["-1", "-2", "-3"].flatMap((o) =>
+      ["rcf9001", "rcf9002"].map((id) => ({ fieldName: o + "_PersonProfileFields." + id, section: "Career History" }))));
+    const warn = logs.find((l) => /matched NO section map/.test(l));
+    assert.ok(warn, "a genuinely unmapped repeating block must warn");
+    assert.match(warn, /Career History/);
+    assert.match(warn, /3 rows/);
+  } finally { console.log = orig; }
+});
+
+test("atsAssignEntryIndexes: a 'Work Experience' block is stamped per ENTRY, not collapsed to entry 0", () => {
+  // The exact Cretex shape: three rows of the same ids under "Work Experience", ordinals -2/-3/-1 in DOM
+  // order. Each row must become its own entry, indexed by FIRST APPEARANCE, or rows 2 and 3 are answered
+  // from experience[0] / left as repeats — which is what happened live.
+  const mk = (ord, id) => ({ fieldName: ord + "_PersonProfileFields." + id, section: "Work Experience", label: id });
+  const fields = [mk("-2", "rcf3212"), mk("-2", "rcf3213"), mk("-3", "rcf3212"), mk("-3", "rcf3213"),
+                  mk("-1", "rcf3212"), mk("-1", "rcf3213")];
+  ats.atsAssignEntryIndexes("icims", fields);
+  const idxOf = (ord) => fields.find((f) => f.fieldName.startsWith(ord + "_")).entryIndex;
+  assert.strictEqual(fields[0].entrySection, "experience", "the heading is what identifies it");
+  assert.strictEqual(idxOf("-2"), 0, "first APPEARANCE is entry 0 — never the numeric value of the ordinal");
+  assert.strictEqual(idxOf("-3"), 1);
+  assert.strictEqual(idxOf("-1"), 2);
+  // …and every field of a row shares its row's index
+  assert.deepStrictEqual(fields.filter((f) => f.entryIndex === 0).map((f) => f.label), ["rcf3212", "rcf3213"]);
+});
+
+// ── WHAT THE PARSE LEFT BEHIND MUST REACH REVIEW (operator, 2026-08-18) ─────────────────
+//
+// "The auto parse is really bad… pretend the form is blank and refill everything." A field we CAN answer
+// was already overwritten; a field we CANNOT answer kept the parse's guess and was recorded BLANK, so the
+// review editor showed nothing while the form carried it — invisible, and submitted.
+
+test("a field the FORM populated and we did not fill reaches review WITH the value", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    // no profile mapping and no bucket — the fill has nothing to write here
+    { fieldName: "rcf9100", inputSel: "#rcf9100", widgetType: "text", inputType: "text",
+      label: "Anything else we should know", isRequired: false, value: null, domIndex: 0 },
+  ] });
+  // the PAGE holds a parse-derived value even though our fill wrote nothing
+  page.atsInjReadValue = () => ({ ok: true, value: "Robotics intern, summers 2024-2025" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", PROFILE, {}, {}, { credentials: CREDS });
+  const rec = out.results[0];
+  assert.strictEqual(rec.after, "Robotics intern, summers 2024-2025", "the live value rides the record");
+  assert.strictEqual(rec.status, "filled_review", "and it faces the human gate");
+  assert.strictEqual(rec.flag, "already-filled");
+  assert.match(rec.detail, /ALREADY on the form/);
+  assert.match(rec.detail, /parse is not trustworthy/, "on iCIMS it names the résumé parse");
+});
+
+test("surfacing NEVER touches a field we filled, nor invents a value for a blank one", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "PersonProfileFields.FirstName", inputSel: "#fn", widgetType: "text", inputType: "text",
+      label: "Legal First Name", isRequired: true, value: null, domIndex: 0 },
+    { fieldName: "rcf9101", inputSel: "#rcf9101", widgetType: "text", inputType: "text",
+      label: "Nothing here", isRequired: false, value: null, domIndex: 1 },
+  ] });
+  // the page answers with whatever was WRITTEN for the mapped field, and empty for the unmapped one
+  page.atsInjReadValue = (a, sel) => ({ ok: true, value: sel === "#fn" ? "Kevin" : "" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", PROFILE, {}, {}, { credentials: CREDS });
+  const filled = out.results.find((r) => /FirstName/.test(r.fieldName));
+  const empty = out.results.find((r) => r.fieldName === "rcf9101");
+  assert.strictEqual(filled.after, "Kevin");
+  assert.notStrictEqual(filled.flag, "already-filled", "a field WE filled is ours, not the page's");
+  assert.strictEqual(empty.status, "skipped", "a genuinely blank field stays a quiet skip");
+  assert.strictEqual(empty.after, null);
+});
+
+test("surfacing leaves CREDENTIALS alone — reading one back into a record is the thing we never do", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "PersonProfileFields.Password", inputSel: "#pw", widgetType: "text", inputType: "password",
+      autocomplete: "new-password", label: "Password", isRequired: false, value: null, domIndex: 0 },
+  ] });
+  page.atsInjReadValue = () => ({ ok: true, value: "a-real-secret-on-the-page" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", PROFILE, {}, {}, { credentials: CREDS });
+  for (const r of out.results) {
+    assert.ok(!/a-real-secret-on-the-page/.test(JSON.stringify(r)), "no credential value may enter a record");
+  }
+});
+
+// ── AN EMPTY TENANT LIST IS THE TENANT'S, AND "No Results" IS NOT AN OPTION (live 2026-08-18) ──
+//
+// Cretex renders a REQUIRED Degree dropdown whose vocabulary is genuinely unpopulated. Probed read-only
+// with AP_DEV_ICIMS_DROPDOWN: "No Results" unfiltered, no parent pending, and still "No Results" after a
+// deliberately broad "Bachelor" search. Two defects came out of establishing that.
+
+test("scan: the widget's own \"No Results\" row is NOT a pickable option", () => {
+  // The ACTUATION reader filtered this sentinel all along; the SCAN did not — so a field whose list had
+  // been searched reached review offering exactly one thing to pick, and that thing was "No Results".
+  // The one-row case is the dangerous one: a single-item list reads as a COMPLETE vocabulary.
+  const rows = ["No Results"];
+  const scanFilter = (all) => all.filter((t) => t && !/^—\s*make a selection/i.test(t)
+    && !/^please select a /i.test(t) && !/^no results/i.test(t));
+  assert.deepStrictEqual(scanFilter(rows), [], "a sentinel must never reach the review editor as an option");
+  // …and the three sentinels stay filtered while real options survive
+  assert.deepStrictEqual(scanFilter(["— Make a Selection —", "Please select a country", "No Results", "Secret"]), ["Secret"]);
+  // LOCKSTEP: the actuation reader's own filter must agree
+  const src = String(ats.atsInjIcimsReadOptions);
+  assert.match(src, /no results/i, "atsInjIcimsReadOptions must filter the same sentinel");
+});
+
+test("a SEARCH-LESS icims_dropdown is never typed into — that is what emptied its list", async () => {
+  // Cretex's Degree: `icimsdropdown-search="0"`, nine real options, reported EMPTY twice. The search box
+  // exists in the markup either way, so its presence proves nothing; typing into a search-less widget
+  // FILTERS the rendered rows to nothing, which reads exactly like an empty list. The operator's screen
+  // is what refuted the "empty tenant list" conclusion.
+  const DEGREES = ["High School Diploma/GED", "AS", "BS", "MS", "PhD", "MBA", "MCS", "BCS", "BA"];
+  const page = icimsPage();
+  let searched = 0;
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
+      label: "Degree", isRequired: true, value: null, options: DEGREES, optionsPartial: false,
+      searchable: false, domIndex: 0 },
+  ] });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: DEGREES });
+  page.atsInjIcimsReadOptions = () => ({ ok: true, options: DEGREES, awaitingParent: false, noResults: false });
+  page.atsInjIcimsSearch = () => { searched++; return { ok: true }; };
+  page.atsInjIcimsClose = () => ({ ok: true });
+  page.atsInjIcimsRead = () => ({ ok: true, value: "BS" });
+  page.atsInjIcimsCommit = () => ({ ok: true });
+  // the POST-FILL AUDIT re-reads every committed field independently — without this the fake page's
+  // generic reader answers null and the audit (correctly) downgrades a good commit to needs_review
+  page.atsInjReadValue = () => ({ ok: true, value: "BS" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { education: [{ degree: "Bachelor of Science", school: "Carnegie Mellon University" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results.find((r) => /Degree/.test(r.fieldName));
+  assert.strictEqual(searched, 0, "a search-less widget must never be typed into");
+  // …and the DEGREE BRIDGE makes the abbreviation reachable: "Bachelor of Science" → "BS".
+  // Graded EXACT and left UNFLAGGED deliberately — an acronym is a fact about the words, not a
+  // similarity score, and uniqueness is enforced, so asking the operator to re-check it is noise.
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "BS");
+  assert.strictEqual(rec.matchTier, "exact-normalized");
+  assert.strictEqual(rec.flag, null);
+});
+
+test("an AJAX list that arrives LATE is waited for, not called empty", async () => {
+  // The list is fetched on open (`icimsdropdown-ajax="1"`), so the first read is a race — and hidden runs
+  // pace fast, which is how "sometimes it shows no results" happens. Ask the page, never a clock.
+  const DEG = ["AS", "BS", "MS"];
+  let reads = 0;
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
+      label: "Degree", isRequired: true, value: null, options: [], searchable: false, domIndex: 0 },
+  ] });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: [] });          // empty at open
+  page.atsInjIcimsReadOptions = () => (++reads >= 3                               // …arrives on the 3rd read
+    ? { ok: true, options: DEG, awaitingParent: false, noResults: false }
+    : { ok: true, options: [], awaitingParent: false, noResults: false });
+  page.atsInjIcimsClose = () => ({ ok: true });
+  page.atsInjIcimsRead = () => ({ ok: true, value: "BS" });
+  page.atsInjIcimsCommit = () => ({ ok: true });
+  page.atsInjReadValue = () => ({ ok: true, value: "BS" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { education: [{ degree: "Bachelor of Science" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results.find((r) => /Degree/.test(r.fieldName));
+  assert.ok(reads >= 3, "it must keep asking until the rows arrive");
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "BS");
+});
+
+test("a list that NEVER loads is reported as OUR failed read, not as the employer's vocabulary", async () => {
+  // The mistake this round started with was claiming an empty read proved the form offers nothing. An
+  // absent list is evidence about our read and nothing else.
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
+      label: "Degree", isRequired: true, value: null, options: [], searchable: false, domIndex: 0 },
+  ] });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: [] });
+  page.atsInjIcimsReadOptions = () => ({ ok: true, options: [], awaitingParent: false, noResults: true });
+  page.atsInjIcimsClose = () => ({ ok: true });
+  page.atsInjIcimsRead = () => ({ ok: true, value: null });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { education: [{ degree: "Bachelor of Science" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results.find((r) => /Degree/.test(r.fieldName));
+  assert.strictEqual(rec.status, "needs_review");
+  assert.strictEqual(rec.flag, "list-never-loaded");
+  assert.match(rec.detail, /our read, not the employer/);
+  assert.ok(!/all it offers/.test(rec.detail), "it must not claim to know the vocabulary: " + rec.detail);
+});
+
+test("atsDegreeMatch: the ACRONYM tier answers an abbreviation list the level tier cannot", () => {
+  // Cretex's list, measured. BS / BCS / BA are all "bachelor", so the level tier's exactly-one guard
+  // refuses it — correctly — and the option the applicant holds stays unreachable without initials.
+  const L = ["High School Diploma/GED", "AS", "BS", "MS", "PhD", "MBA", "MCS", "BCS", "BA"];
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelor of Science"], L), "BS");
+  assert.strictEqual(ats.atsDegreeMatch(["Master of Science"], L), "MS");
+  assert.strictEqual(ats.atsDegreeMatch(["Master of Business Administration"], L), "MBA");
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelor of Arts"], L), "BA");
+  // ⚠ AMBIGUITY STILL REFUSES: a bare level has no acronym, and three options share it
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelors"], L), null);
+  // …and a degree this list does not carry is an honest miss, never the nearest doctorate
+  assert.strictEqual(ats.atsDegreeMatch(["Doctor of Optometry"], L), null);
+  // the level tier still works where it always did (one bachelor spelled in full)
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelors"], ["High School", "Bachelor of Science", "Master of Science"]), "Bachelor of Science");
+  // acronym building: filler words dropped, single words refused
+  assert.strictEqual(ats.atsDegreeAcronym("Bachelor of Science"), "BS");
+  assert.strictEqual(ats.atsDegreeAcronym("Master of Business Administration"), "MBA");
+  assert.strictEqual(ats.atsDegreeAcronym("Bachelors"), null);
+});
+
+test("a search-less list reaches review as a REAL picker, not a type-it-yourself box", async () => {
+  // `optionsPartial` is provenance: a searchable widget renders one page of many, but a search-less one
+  // has no second page — so what it shows IS the vocabulary. Called partial, review offers a text box.
+  const DEGREES = ["AS", "BS", "MS"];
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
+      label: "Degree", isRequired: true, value: null, options: DEGREES, optionsPartial: false,
+      searchable: false, domIndex: 0 },
+  ] });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: DEGREES });
+  page.atsInjIcimsReadOptions = () => ({ ok: true, options: DEGREES, awaitingParent: false, noResults: false });
+  page.atsInjIcimsClose = () => ({ ok: true });
+  page.atsInjIcimsRead = () => ({ ok: true, value: null });
+  page.atsInjIcimsSearch = () => ({ ok: true });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { education: [{ degree: "Doctor of Optometry" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results.find((r) => /Degree/.test(r.fieldName));
+  assert.deepStrictEqual(rec.options, DEGREES, "the full list rides the record as a picker");
+  assert.ok(!rec.captured_options, "not the partial/typeahead shape");
+  assert.match(rec.detail, /cannot be searched/, "and it says why the miss is final: " + rec.detail);
+});
 
 // ── security clearance: STATED OR NOT ANSWERED (operator, 2026-08-18) ───────────────────
 //
@@ -801,6 +1236,162 @@ function runAuthScan(spec) {
   global.location = { href: "https://careersen-itt-inc.icims.com/jobs/17169/x/login" };
   try { return ats.atsInjAuthScan(); } finally { delete global.document; delete global.window; delete global.location; delete global.getComputedStyle; }
 }
+
+// ── iCIMS' ACTION-BUTTON WIDGET DUPLICATES ITS LABEL (live 2026-08-18) ──────────────────
+//
+// SCS Engineers renders Apply as an <a> wrapping TWO label spans for responsive layout, so the anchor's
+// textContent is "ApplyApply" — and /^apply\b/ does not match that: there is no word boundary between
+// "y" and "A". The control a human plainly sees was invisible to both finders and the run halted
+// `apply-not-followable` on a live posting. Astrion hid it because its duplication left a space.
+
+test("apply finder: a duplicated long/short label ('ApplyApply') is still found", () => {
+  const leaf = (t) => ({ tagName: "SPAN", textContent: t, children: [], querySelectorAll: () => [] });
+  const longL = leaf("Apply"), shortL = leaf("Apply");
+  const inner = { tagName: "DIV", textContent: "ApplyApply", children: [longL, shortL],
+    querySelectorAll: () => [longL, shortL] };
+  let clicked = 0;
+  const a = { tagName: "A", textContent: "ApplyApply", value: "", children: [inner],
+    querySelectorAll: () => [inner, longL, shortL],
+    getAttribute: () => "https://x.icims.com/jobs/1/login",
+    checkVisibility: () => true, getBoundingClientRect: () => ({ width: 80, height: 30 }),
+    click() { clicked++; }, href: "https://x.icims.com/jobs/1/login" };
+  global.document = { querySelectorAll: (sel) => (/a\[href\]/.test(sel) ? [a] : []) };
+  try {
+    const r = ats.atsInjClickApplyAnchor();
+    assert.strictEqual(r.ok, true, "the widget must be found: " + JSON.stringify(r));
+    assert.strictEqual(clicked, 1);
+    assert.strictEqual(r.clicked, "Apply", "and reported by its RENDERED label, not the concatenation");
+  } finally { delete global.document; }
+});
+
+test("apply finder: an unrelated link is still refused", () => {
+  const mk = (t) => ({ tagName: "A", textContent: t, value: "", children: [],
+    querySelectorAll: () => [], getAttribute: () => "/x", checkVisibility: () => true,
+    getBoundingClientRect: () => ({ width: 80, height: 30 }), click() {}, href: "/x" });
+  global.document = { querySelectorAll: (sel) => (/a\[href\]/.test(sel) ? [mk("Applicant privacy notice"), mk("Save job")] : []) };
+  try {
+    const r = ats.atsInjClickApplyAnchor();
+    assert.strictEqual(r.ok, false, "neither is an Apply control: " + JSON.stringify(r));
+  } finally { delete global.document; }
+});
+
+// ── "MAY WE CONTACT THIS EMPLOYER?" — THREE ANSWERS, AND UNANSWERED IS NEVER GUESSED ───────────
+//
+// The resolver already refused to default this ("not a default anyone should own") and then returned
+// null — which made it an ordinary entry-unanswered field, and those go to the AI by design. Measured
+// on Cretex, all three work-history rows: ai-choice · "Yes" · "reasoning-from-absence: default
+// affirmative". The one question the code explicitly declines to default was answered by a model.
+//
+// The operator then added a third stored answer no boolean could express (2026-08-18): "yes, if
+// required". It ends with a bare "Yes" so a plain Yes/No form still fills deterministically.
+
+test("may_contact: the stored answer becomes a TIERED ladder, and the tri-bool still migrates", () => {
+  const C = ats.atsMayContactCandidates;
+  assert.deepStrictEqual(C("yes").candidates, ["Yes", "True"]);
+  assert.deepStrictEqual(C("no").candidates, ["No", "False"]);
+  // ⚠ a profile synced before the option existed carries booleans — dropping these would make every
+  // pre-existing entry unanswered, i.e. a blocked submit on a question already answered.
+  assert.deepStrictEqual(C(true).candidates, ["Yes", "True"]);
+  assert.deepStrictEqual(C(false).candidates, ["No", "False"]);
+  const cond = C("yes_if_required");
+  assert.strictEqual(cond.conditional, true);
+  assert.strictEqual(cond.candidates[0], "Yes, if required", "most specific first");
+  assert.strictEqual(cond.candidates[cond.candidates.length - 1], "Yes",
+    "…and a bare Yes LAST, so a plain Yes/No form fills deterministically rather than reaching review");
+  // the label spellings a hand-edited profile.json may carry
+  for (const v of ["Yes, if required", "yes if necessary", "only if required", "If required"]) {
+    assert.strictEqual(C(v).answer, "yes_if_required", v);
+  }
+});
+
+test("may_contact: unanswered CLAIMS the field so the AI can never answer it", () => {
+  const es = { section: "work_experience", entryIndex: 2, spec: { kind: "may_contact" } };
+  const f = { label: "May We Contact", fieldName: "-1_PersonProfileFields.rcf3269", widgetType: "icims_dropdown" };
+  for (const entry of [{ may_contact: null }, { may_contact: "" }, {}, { may_contact: "maybe someday" }]) {
+    const r = ats.atsResolveEntryField(es, entry, f, undefined, {});
+    assert.ok(r, "must RETURN something — a null here is what let the AI have it: " + JSON.stringify(entry));
+    assert.strictEqual(r.kind, "entry-permission-unstated", JSON.stringify(entry));
+    assert.strictEqual(r.flag, "may-contact-unstated");
+    assert.strictEqual(r.review, true);
+    assert.ok(!r.candidates && r.value == null, "and it must carry NO answer of its own");
+    assert.match(r.path, /work_experience\[2\]\.may_contact/, "review must name where to set it");
+  }
+});
+
+test("may_contact: a stated answer fills deterministically and unflagged, all three of them", () => {
+  const es = { section: "work_experience", entryIndex: 1, spec: { kind: "may_contact" } };
+  const f = { label: "May We Contact", fieldName: "-1_PersonProfileFields.rcf3269", widgetType: "icims_dropdown" };
+  for (const [stored, first] of [["yes", "Yes"], ["no", "No"], ["yes_if_required", "Yes, if required"], [true, "Yes"]]) {
+    const r = ats.atsResolveEntryField(es, { may_contact: stored }, f, undefined, {});
+    assert.strictEqual(r.candidates[0], first, String(stored));
+    assert.strictEqual(r.source, "entry");
+    assert.ok(!r.flag && !r.review, "a value the operator STATED is not a review item: " + String(stored));
+    assert.match(r.path, /work_experience\[1\]\.may_contact/);
+  }
+});
+
+test("employer email/phone: a CONDITIONAL yes allows contact; no and unanswered withhold", () => {
+  const es = { section: "work_experience", entryIndex: 0, spec: { kind: "contact_if_allowed", path: "employer_email" } };
+  const f = { label: "Employer Email", fieldName: "-1_PersonProfileFields.rcf3270", widgetType: "text" };
+  const call = (mc) => ats.atsResolveEntryField(es, { may_contact: mc, employer_email: "hr@example.com" }, f, undefined, {});
+  // an answer that PERMITS contact releases the mechanism by which contact happens
+  assert.strictEqual(call("yes").raw, "hr@example.com");
+  assert.strictEqual(call("yes_if_required").raw, "hr@example.com",
+    'a conditional yes permits contact — withholding the details would answer "yes" and make it impossible');
+  assert.strictEqual(call(true).raw, "hr@example.com", "and the legacy tri-bool still releases");
+  // …and everything else withholds
+  assert.strictEqual(call("no").kind, "skip");
+  assert.match(call("no").detail, /you answered No/);
+  assert.strictEqual(call(null).kind, "skip");
+  assert.match(call(null).detail, /unanswered/);
+  assert.strictEqual(call(undefined).kind, "skip");
+});
+
+// ── A CONTACT OPT-IN ASKED AS A QUESTION IS STILL AN OPT-IN (operator's rule, live 2026-08-18) ───
+//
+// The operator authorised ticking ACCEPT boxes and explicitly NOT opt-ins. That rule lived only on the
+// checkbox path, so SCS Engineers asking the same thing as a required Yes/No DROPDOWN sent it to the AI,
+// which answered "Yes" and subscribed them to texts. One policy, two widgets.
+//
+// The bail list is the load-bearing half: a "No" to a background check, a drug screening, a reference
+// check or the privacy notice SINKS the application, and none of those is a marketing opt-in.
+
+test("opt-in question: a contact/marketing consent asked as a dropdown is DECLINED deterministically", () => {
+  const prof = { personal_info: {} };
+  for (const q of [
+    "Do you consent to receive text message communication during your application process?",
+    "Would you like to receive job alerts?",
+    "Opt in to receive marketing emails",
+    "Do you agree to receive SMS updates?",
+    "Join our talent community for future opportunities?",
+    "Subscribe to our newsletter?",
+  ]) {
+    const r = ats.atsRouteLabel(q, { label: q, widgetType: "dropdown_native" }, prof, {});
+    assert.ok(r, "must be routed rather than left to the AI: " + q);
+    assert.deepStrictEqual(r.candidates, ["No", "False"], q);
+    assert.strictEqual(r.flag, "optin-declined", q);
+    assert.strictEqual(r.review, true, "and flagged, so a human who DOES want texts can flip it: " + q);
+  }
+});
+
+test("opt-in question: a consent the APPLICATION needs is never touched", () => {
+  const prof = { personal_info: {} };
+  for (const q of [
+    "Do you consent to a background check?",
+    "Do you consent to a drug screening?",
+    "Do you consent to the processing of your personal data?",
+    "Do you agree to our privacy policy?",
+    "May we contact your references?",
+    "Do you consent to a credit check?",
+    "Do you agree that the information provided is true and complete?",
+    "Do you consent to a criminal history check?",
+  ]) {
+    const r = ats.atsRouteLabel(q, { label: q, widgetType: "dropdown_native" }, prof, {});
+    const flag = r && r.flag;
+    assert.notStrictEqual(flag, "optin-declined",
+      'answering "No" here would sink the application: ' + q);
+  }
+});
 
 // ── the content frame is identifiable BEFORE it holds a form ────────────────────────────
 //
@@ -1347,10 +1938,19 @@ test("employer contact details are withheld unless may_contact is an explicit YE
   assert.strictEqual(ask(null, "contact_if_allowed", "employer_phone").kind, "skip");
   assert.match(ask(null, "contact_if_allowed", "employer_phone").detail, /unanswered/);
 
-  // the question itself is deterministic when answered, and unanswered when not
-  assert.deepStrictEqual(ask(true, "may_contact").candidates, ["Yes"]);
-  assert.deepStrictEqual(ask(false, "may_contact").candidates, ["No"]);
-  assert.strictEqual(ask(null, "may_contact"), null, "an unanswered tri-state must not pick a side");
+  // the question itself is deterministic when answered…
+  // (a second "True" tier since 2026-08-18 — the same boolean ladder every other yes/no answer uses,
+  //  so a form whose dropdown reads True/False fills too)
+  assert.deepStrictEqual(ask(true, "may_contact").candidates, ["Yes", "True"]);
+  assert.deepStrictEqual(ask(false, "may_contact").candidates, ["No", "False"]);
+  // …and an unanswered one STILL PICKS NO SIDE — but it now CLAIMS the field rather than returning
+  // null (2026-08-18). Returning null made it an ordinary entry-unanswered field, and those go to the
+  // AI by design, which answered "Yes" from absence on all three of Cretex's work-history rows. The
+  // refusal here was being overridden one rung later; claiming is what enforces it.
+  const un = ask(null, "may_contact");
+  assert.strictEqual(un.kind, "entry-permission-unstated");
+  assert.ok(!un.candidates && un.value == null, "an unanswered tri-state must not pick a side");
+  assert.strictEqual(un.review, true, "and it must reach the human, not the model");
 });
 
 test("experience: the new employer fields route from the entry", () => {
@@ -1368,7 +1968,7 @@ test("experience: the new employer fields route from the entry", () => {
   assert.strictEqual(r("Supervisor's Name").raw, "Dana Lee");
   assert.strictEqual(r("Supervisor's Title").raw, "Staff Engineer");
   assert.strictEqual(r("Reason for Leaving").raw, "Internship ended");
-  assert.deepStrictEqual(r("May We Contact").candidates, ["Yes"]);
+  assert.deepStrictEqual(r("May We Contact").candidates, ["Yes", "True"]);
 });
 
 test("experience: a field with no mapping is still SEALED — unanswered, never borrowed", () => {
@@ -1497,6 +2097,22 @@ test("review: an UNFILLED choice field still carries the form's options", async 
   assert.strictEqual(by.rcf9003.options ?? null, null, "a text field gains nothing");
   // and this costs no page contact — the options came from the scan, not a re-open
   assert.strictEqual(by.rcf9001.status, "skipped");
+});
+
+test("atsIsFutureYearMonth: DAY precision answers too — adding a day must not cost an answer", () => {
+  // Live 2026-08-18: this accepted month precision only, so a graduation date of "2028-05-01" (the whole
+  // point of the day-capable fields) returned null, the is_graduated rule could not decide, and "have you
+  // graduated?" fell through to the AI and came back FLAGGED. A more precise value must never answer less.
+  const now = new Date("2026-08-18T12:00:00Z");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2028-05-01", now), true, "a future day is future");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true, "…and month precision still is");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2024-08-20", now), false, "a past day is past");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2020-01-15", now), false);
+  // within the CURRENT month, only a stated day can separate the two
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026-08-25", now), true, "later this month is future");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026-08-02", now), false, "earlier this month is past");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026-08", now), true, "no day → the month is not over yet (unchanged)");
+  assert.strictEqual(ats.atsIsFutureYearMonth("junk", now), null, "and a non-date is still null");
 });
 
 test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {

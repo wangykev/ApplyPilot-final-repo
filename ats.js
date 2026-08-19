@@ -32,6 +32,7 @@ const atsLib = (typeof module !== "undefined" && module.exports)
       // Security clearance: recognizer + candidate ladder, shared with the Workday driver's own rung so
       // the two engines answer a clearance question identically.
       recognizeClearanceQuestion: recognizeClearanceQuestion, clearanceCandidates: clearanceCandidates,
+      recognizeRelocationQuestion: recognizeRelocationQuestion, relocationCandidates: relocationCandidates,
       // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
       // join/split exactly the way groups do — see the multiselect commit path.
       joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN };
@@ -252,6 +253,15 @@ const ATS_STATIC_MAPS = {
     // answers it deterministically, and the AI's "Mobile" guess (flagged `ai-choice`) was only ever a
     // guess that happened to look right.
     "PersonProfileFields.PhoneType": { path: "personal_info.phone_device_type" },
+    // ⚠ THE ADDRESS TYPE IS KNOWABLE, AND THE AI WAS ANSWERING IT TWO DIFFERENT WAYS (live 2026-08-18).
+    // Its label is a bare "Type" inside the candidate's own address block, so the label ladder has nothing
+    // to key on and it fell to the AI — which answered "Home" on one tenant and "Work" on the next. Same
+    // question, same profile, two answers, and "Work" is simply wrong: the one address a profile holds is
+    // `personal_info.address_*`, the applicant's residence. There is no profile field for this because
+    // there is nothing to ask: it is a fact about the FORM's vocabulary, so the answer is a literal.
+    // Tiered because tenants word it differently, and still matched against the live options.
+    "PersonProfileFields.AddressType": { candidates: ["Home", "Home Address", "Residence", "Personal"],
+      note: "(the profile's address is the candidate's home)" },
     // The dial-code half, when a tenant renders one. Tiered in the profile like country, so resolve()
     // passes a ready-made candidate ladder; `kind:"dial"` strips the trailing "+<digits>" for matching.
     "PersonProfileFields.PhoneCountry": { kind: "dial", path: "personal_info.country_phone_code", altPath: "personal_info.country" },
@@ -393,10 +403,31 @@ const ATS_ICIMS_ENTRY_MAPS = {
       "CandProfileFields.Minor": { path: "minor" },
       "CandProfileFields.GPA": { path: "gpa" },
       "CandProfileFields.IsGraduated": { kind: "is_graduated" },
+      // ⚠ DAY PARTS, AND WHY THE `from` KEYS DIFFER (operator, 2026-08-18). A form can require a DAY
+      // for education dates. `from_year`/`to_year` are year-only — a year says nothing about a month,
+      // let alone a day — so the profile grew `start_date` ("YYYY-MM-DD", or "YYYY-MM" when only the
+      // month is known) for exactly this, while the END parts read `graduation_date` (one fact, one place
+      // to state it). `fromAlt` is the year-only fallback, so a profile
+      // that has not filled the new fields behaves exactly as before.
+      // The `_Date` suffix is iCIMS' own name for the day part (observed on the experience block's
+      // rcf3214_Date); `_Day` is accepted too because the platform ids are not guaranteed to agree
+      // across tenants and a wrong guess here costs nothing — an id that does not exist never matches.
       "CandProfileFields.GraduationDate_Month": { kind: "date_month", from: "graduation_date" },
       "CandProfileFields.GraduationDate_Year": { kind: "date_year", from: "graduation_date" },
-      "CandProfileFields.EducationStartDate_Month": { kind: "date_month", from: "from_year" },
-      "CandProfileFields.EducationStartDate_Year": { kind: "date_year", from: "from_year" },
+      "CandProfileFields.GraduationDate_Date": { kind: "date_day", from: "graduation_date" },
+      "CandProfileFields.GraduationDate_Day": { kind: "date_day", from: "graduation_date" },
+      "CandProfileFields.EducationStartDate_Month": { kind: "date_month", from: "start_date", fromAlt: "from_year" },
+      "CandProfileFields.EducationStartDate_Year": { kind: "date_year", from: "start_date", fromAlt: "from_year" },
+      "CandProfileFields.EducationStartDate_Date": { kind: "date_day", from: "start_date" },
+      "CandProfileFields.EducationStartDate_Day": { kind: "date_day", from: "start_date" },
+      // ⚠ THE EDUCATION END DATE *IS* THE GRADUATION DATE (operator, 2026-08-18). These read
+      // `graduation_date` rather than a field of their own: one fact, one place to state it. Two fields
+      // could disagree, and then the fill would have to pick — which is exactly the kind of guess this
+      // codebase refuses. `to_year` stays as the year-only fallback for the Month/Year parts.
+      "CandProfileFields.EducationEndDate_Month": { kind: "date_month", from: "graduation_date", fromAlt: "to_year" },
+      "CandProfileFields.EducationEndDate_Year": { kind: "date_year", from: "graduation_date", fromAlt: "to_year" },
+      "CandProfileFields.EducationEndDate_Date": { kind: "date_day", from: "graduation_date" },
+      "CandProfileFields.EducationEndDate_Day": { kind: "date_day", from: "graduation_date" },
       // derived from the ENTRY's own location ("Pittsburgh, PA"), never the home address
       "CandProfileFields.EducationCountry": { kind: "entry_country" },
       "CandProfileFields.EducationState": { kind: "entry_state" },
@@ -411,7 +442,18 @@ const ATS_ICIMS_ENTRY_MAPS = {
   // label is the home address, which is exactly the bug the seal exists to stop.
   experience: {
     source: "work_experience",
-    sectionTitle: /^(professional\s+)?experience/i,
+    // ⚠ THE HEADING IS THIS SECTION'S ONLY IDENTITY, SO ITS WORDING IS LOAD-BEARING (live 2026-08-18).
+    // `match` below is empty on purpose — there is no id family to key on — which means one unmatched
+    // heading unmaps the whole section silently. That happened: Astrion titles it "Experience" and this
+    // pattern was anchored at the start, so Cretex's "Work Experience" missed. The consequence was not a
+    // missing field or two — the ENTIRE work-history block went unstamped, the label ladder then answered
+    // each row from `work_experience.0` (always entry 0), the repeat-detector left rows 2 and 3 blank as
+    // "repeats of a single value", and iCIMS' résumé-parse guesses stayed on the form in all of them.
+    // Education survived the same tenant only because it HAS an id family as a second signal.
+    // Widened to the wordings tenants actually use, and deliberately NOT to every heading containing the
+    // word: "Volunteer Experience" and "Military Experience" are different sections, and filing volunteer
+    // or service history as employment would be a factual error about the applicant, not a near-miss.
+    sectionTitle: /^(?!.*\b(volunteer|military|education)\b)(work\s+|professional\s+|employment\s+|prior\s+|relevant\s+)?(experience|employment|work\s+history|employment\s+history)\b/i,
     match: /^$/,                       // no id family — membership is what identifies these
     addButton: /professional experience|employment/i,
     byLabel: {
@@ -572,6 +614,42 @@ function atsAssignEntryIndexes(ats, fields) {
       f.entrySection = section;
     }
   }
+  // ⚠ SAY WHEN A REPEATING BLOCK MATCHED NO SECTION AT ALL. This is the signal whose absence cost a whole
+  // round: on Cretex every work-history field carried an ordinal, sat under a heading, and matched no
+  // section map — and NOTHING said so. The fill then looked healthy (rows filled from entry 0, later rows
+  // "left for you"), the review pile looked like ordinary unmapped questions, and the parse's values sat
+  // on the form. A heading is a per-customer string, so this WILL happen again on the next tenant; the
+  // log is what makes it a five-second diagnosis instead of an archaeology session.
+  try {
+    // ⚠ WARN ONLY ABOUT A GENUINE MULTI-ROW BLOCK. The first version of this fired on every iCIMS form,
+    // because the candidate's own address and phone fields also carry ordinals and match no section — and
+    // for THEM that is correct (they are single-value fields answered from the profile root, see the
+    // repeat rule below). A warning that cries wolf on every run is worse than none: it trains you to
+    // skip the line that matters. The discriminator is REPETITION — a missed section renders the SAME
+    // bare id under two or more ordinals (Cretex's rcf3212 under -1/-2/-3), while an address block
+    // renders each id exactly once.
+    const byId = {};
+    for (const f of fields) {
+      const mm = /^(-?\d+)_/.exec(String(f.fieldName || ""));
+      if (!mm || f.entrySection) continue;
+      const bare = atsMapKey(ats, f.fieldName);
+      const h = String(f.section || "(no heading)").trim() || "(no heading)";
+      const k = h + "\u0000" + bare;
+      (byId[k] = byId[k] || new Set()).add(mm[1]);
+    }
+    const perHeading = {};
+    for (const [k, ords] of Object.entries(byId)) {
+      if (ords.size < 2) continue;                       // rendered once — not a repeating block
+      const [h, bare] = k.split("\u0000");
+      (perHeading[h] = perHeading[h] || { ids: [], rows: 0 });
+      perHeading[h].ids.push(bare);
+      perHeading[h].rows = Math.max(perHeading[h].rows, ords.size);
+    }
+    for (const [heading, info] of Object.entries(perHeading)) {
+      console.log(`[ApplyPilot][ATS-FILL] ⚠ ${info.ids.length} field(s) under ${JSON.stringify(heading)} repeat across ${info.rows} rows but matched NO section map — every row will be answered from entry 0 (or left as a repeat), so a multi-entry block here fills only its first row. Add the heading to a section map. Ids: ${[...new Set(info.ids)].slice(0, 6).join(", ")}`);
+    }
+  } catch (e) { /* diagnostic only */ }
+
   // …and stamp REPEATS of a field that is answered from the profile ROOT — the candidate's own
   // address and phone blocks, and anything else a tenant chooses to make repeatable. DETECTED, not
   // declared: group by the BARE id and record where this field's ordinal falls in that id's
@@ -633,17 +711,32 @@ function atsMonthCandidates(mi) {
   return out;
 }
 
-// Is a "YYYY" or "YYYY-MM" strictly in the future? null when it is neither shape.
+// Is a "YYYY", "YYYY-MM" or "YYYY-MM-DD" strictly in the future? null when it is none of those shapes.
 // `now` is a parameter so the rule is unit-testable without freezing the clock.
+// ⚠ THE DAY FORM WAS MISSING AND THAT REGRESSED A DETERMINISTIC ANSWER (live 2026-08-18). This accepted
+// month precision only, so the moment a graduation date carried a day — "2028-05-01", the whole point of
+// the day-capable fields — it returned null, the is_graduated rule could not decide, and "have you
+// graduated?" fell through to the AI and came back FLAGGED. Adding precision must never cost an answer:
+// same lesson as the Month/Year parts, found the same way (a run that should have had one fewer review
+// item had one more).
+// A stated DAY is compared as a day, so a graduation later this month reads as future rather than past;
+// month precision keeps its old meaning (the whole month counts as future until it is over), and a bare
+// year likewise.
 function atsIsFutureYearMonth(s, now) {
   const t = now == null ? new Date() : new Date(now);
-  const ym = /^(\d{4})-(\d{1,2})$/.exec(String(s).trim());
-  const y = /^(\d{4})$/.exec(String(s).trim());
-  if (!ym && !y) return null;
-  const yr = parseInt((ym ? ym[1] : y[1]), 10);
-  const mo = ym ? parseInt(ym[2], 10) : 12;          // a bare year is only past once the year is over
-  const nowYr = t.getFullYear(), nowMo = t.getMonth() + 1;
-  return yr > nowYr || (yr === nowYr && mo > nowMo);
+  const str = String(s).trim();
+  const ymd = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(str);
+  const ym = /^(\d{4})-(\d{1,2})$/.exec(str);
+  const y = /^(\d{4})$/.exec(str);
+  if (!ymd && !ym && !y) return null;
+  const yr = parseInt((ymd ? ymd[1] : ym ? ym[1] : y[1]), 10);
+  const mo = ymd ? parseInt(ymd[2], 10) : ym ? parseInt(ym[2], 10) : 12; // a bare year is past only once over
+  const nowYr = t.getFullYear(), nowMo = t.getMonth() + 1, nowDay = t.getDate();
+  if (yr !== nowYr) return yr > nowYr;
+  if (mo !== nowMo) return mo > nowMo;
+  // same year AND month: only a stated day can separate them. Without one, the month is not over, so it
+  // stays "future" exactly as before.
+  return ymd ? parseInt(ymd[3], 10) > nowDay : true;
 }
 
 // Resolve ONE repeating-entry field from ITS OWN entry. Returns a route, or null to fall through
@@ -666,6 +759,29 @@ function atsDefaultDay(defaults) {
   return Number.isFinite(n) && n >= 1 && n <= 31 ? n : null;
 }
 
+// The stored "may we contact this employer?" answer → a TIERED candidate ladder, most specific first.
+// Returns null for UNANSWERED, which is what makes the caller claim the field rather than guess.
+//
+// Accepts the tri-bool this replaced (true/false) as well as the three codes, because a profile synced
+// before 2026-08-18 still carries booleans and a migration that only worked on the website would leave
+// the extension answering nothing. Also accepts the label spellings, so a hand-edited profile.json
+// ("Yes, if required") is not silently read as unanswered.
+function atsMayContactCandidates(stored) {
+  if (stored === true) return { answer: "yes", candidates: ["Yes", "True"] };
+  if (stored === false) return { answer: "no", candidates: ["No", "False"] };
+  const t = String(stored == null ? "" : stored).trim().toLowerCase().replace(/[\s_-]+/g, " ").replace(/[.,]/g, "");
+  if (!t) return null;
+  if (/^(yes|y|true)$/.test(t)) return { answer: "yes", candidates: ["Yes", "True"] };
+  if (/^(no|n|false)$/.test(t)) return { answer: "no", candidates: ["No", "False"] };
+  if (/^(yes )?(if|only if) (required|requested|necessary|needed)$/.test(t)) {
+    return { answer: "yes_if_required", conditional: true, candidates: [
+      // every wording a form has been seen to offer, then the bare polarity as the last tier
+      "Yes, if required", "Yes if required", "Yes, if necessary", "Yes if necessary",
+      "Only if required", "Only if necessary", "If required", "Yes",
+    ] };
+  }
+  return null;                                     // prose we cannot read is UNANSWERED, never a guess
+}
 function atsResolveEntryField(es, entry, f, now, defaults) {
   const spec = es.spec;
   if (!spec || !entry) return null;
@@ -723,6 +839,8 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
   // job application a date is a factual claim. One number they can see and change is honest; guessing
   // differently at each end is not.
   if (spec.kind === "date_day") {
+    // `fromAlt` is a YEAR-ONLY fallback and can never carry a day, so the day spec does not consult it:
+    // a day off "2024" would be two guesses stacked (see the year-only refusal below).
     const raw = val(spec.from);
     if (raw == null) return null;
     const ymd = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(raw));
@@ -751,10 +869,16 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
       detail: 'day-of-month is not in your profile (it stores "' + String(raw) + '") — used your default of ' + d + '; approve it or set the real day' };
   }
   if (spec.kind === "date_month" || spec.kind === "date_year") {
-    const raw = val(spec.from);
+    // Prefer the day-capable field; fall back to the year-only one when the operator has not filled it,
+    // so adding these fields cannot change what an existing profile fills.
+    const raw = val(spec.from) != null ? val(spec.from) : (spec.fromAlt ? val(spec.fromAlt) : null);
     if (raw == null) return null;
     const s = String(raw);
-    const ym = /^(\d{4})-(\d{1,2})$/.exec(s);          // "2028-05"
+    // ⚠ ACCEPT DAY PRECISION TOO. These specs matched "YYYY-MM" EXACTLY, so the moment a date carried a
+    // day ("2024-08-26" — the whole point of the day-capable date fields) the month part returned
+    // null and the form's Month dropdown went unfilled while its Day filled perfectly. A more precise
+    // value must never answer LESS than a vaguer one.
+    const ym = /^(\d{4})-(\d{1,2})(?:-\d{1,2})?$/.exec(s);   // "2028-05" or "2028-05-11"
     const yOnly = /^(\d{4})$/.exec(s);                  // "2024"
     if (spec.kind === "date_year") {
       const y = ym ? ym[1] : (yOnly ? yOnly[1] : null);
@@ -785,17 +909,51 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
   if (spec.kind === "may_contact") {
     // A tri-state: unanswered stays UNANSWERED. Defaulting either way decides on the operator's
     // behalf whether a recruiter may ring a past employer, which is not a default anyone should own.
-    const v = entry.may_contact;
-    if (v === true) return { candidates: ["Yes"], source: "entry", path: es.section + "[" + es.entryIndex + "].may_contact" };
-    if (v === false) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].may_contact" };
-    return null;
+    // A THREE-WAY STORED ANSWER (operator, 2026-08-18) — yes / no / yes_if_required — and each one
+    // becomes a TIERED ladder, most specific first, so the form's own vocabulary decides which lands.
+    // `atsMayContactCandidates` also migrates the tri-bool this replaced, because a profile synced
+    // before today still carries true/false.
+    //
+    // The conditional answer is the reason a boolean was not enough: it ends with a bare "Yes", so a
+    // plain Yes/No form gets "Yes" — the truthful projection onto the options that exist, since the
+    // conditionality has nowhere to live there — while a form that DOES offer "Yes, if required" gets
+    // that instead, at a higher tier. Unflagged, like every other tiered profile ladder: the operator
+    // chose an answer that entails yes, and a value they stated is not a guess we made.
+    const mc = atsMayContactCandidates(entry.may_contact);
+    if (mc) return { candidates: mc.candidates, source: "entry",
+      path: es.section + "[" + es.entryIndex + "].may_contact",
+      detail: mc.conditional
+        ? "may_contact = \"yes, if required\" — a form offering only Yes/No gets Yes"
+        : "may_contact = " + JSON.stringify(mc.answer) };
+    // ⚠ AND AN UNANSWERED ONE IS CLAIMED, NOT PASSED ON (live 2026-08-18). The refusal two lines up
+    // was being overridden one rung later: returning null made this an ordinary "entry-unanswered"
+    // field, which by design falls through to the AI — whose prompt tells it to infer from ABSENCE and
+    // never refuse. Measured on Cretex, all three work-history rows: `ai-choice · after "Yes" ·
+    // reasoning-from-absence: default affirmative`. So the one question this file explicitly declines
+    // to default was answered "Yes" by a model, handing a recruiter permission to ring a past — or
+    // CURRENT — employer that the operator never gave. A current employer learning you are job
+    // hunting is a real cost, and it is not recoverable from a review page after the fact.
+    // Same remedy as the clearance rung and the credential tier: CLAIMING the field is what keeps the
+    // AI away from it, so it is claimed even though we cannot answer it. A required one then blocks the
+    // submit gate until a human answers it — which is the honest outcome, and the fix is one profile
+    // edit ("No" is a perfectly good answer) rather than a guess.
+    return { kind: "entry-permission-unstated", review: true, flag: "may-contact-unstated", source: "entry",
+      path: es.section + "[" + es.entryIndex + "].may_contact",
+      detail: "this asks whether they may contact this employer, and your profile does not say for this role — "
+        + "answer it here, or set it on the Profile page. It is deliberately never guessed: a \"Yes\" nobody "
+        + "gave could tip off an employer you have not told you are looking." };
   }
   if (spec.kind === "contact_if_allowed") {
     // ⚠ WITHHELD UNLESS THE ANSWER IS AN EXPLICIT YES. Releasing an employer's email or phone IS
     // the consequence the "may we contact?" question governs, so `no` and UNANSWERED both withhold.
-    if (entry.may_contact !== true) {
+    // ⚠ WITHHELD UNLESS THE ANSWER ALLOWS CONTACT. "yes_if_required" DOES allow it — it permits
+    // contact when the process demands it, and an employer email/phone is the mechanism BY WHICH that
+    // contact happens, so withholding the details would answer "yes" and then make it impossible.
+    // "no" and UNANSWERED both still withhold.
+    const mcA = atsMayContactCandidates(entry.may_contact);
+    if (!mcA || mcA.answer === "no") {
       return { kind: "skip", source: "entry",
-        detail: entry.may_contact === false
+        detail: mcA && mcA.answer === "no"
           ? "withheld — you answered No to contacting this employer"
           : "withheld — \"may we contact this employer?\" is unanswered for this role" };
     }
@@ -912,6 +1070,28 @@ function atsRouteLabel(label, f, profile, defaults) {
     return { candidates: bool(!!wa.authorized_to_work_in_us), source: "work_auth", path: "work_authorization.authorized_to_work_in_us", detail: "work_authorization.authorized_to_work_in_us" };
   }
 
+  // ── A CONTACT OPT-IN ASKED AS A QUESTION IS STILL AN OPT-IN (operator's rule, 2026-08-18) ──────
+  // The operator authorised ticking ACCEPT boxes (privacy notices) and explicitly NOT opt-ins — "it is not
+  // an acceptance, and it would sign the operator up for mail they never asked for". That rule lived only
+  // on the checkbox path, so the SAME question asked as a required Yes/No dropdown went to the AI, which
+  // answered "Yes" and subscribed them to texts: live on SCS Engineers, "Do you consent to receive text
+  // message communication during your application process?" → `ai-choice: Yes`. One policy, two widgets.
+  // Answered "No" DETERMINISTICALLY — declining is the privacy-preserving direction, it is truthful (they
+  // have not asked to be texted), and it costs the application nothing. Flagged, so a human who does want
+  // texts can flip it in review.
+  //
+  // ⚠ NARROW ON PURPOSE, and the bail list is the load-bearing half. A "No" to the wrong consent question
+  // SINKS the application: a background check, a drug test, a reference check and the privacy notice
+  // itself are all things an applicant must agree to for the process to continue, and none of them is a
+  // marketing opt-in. So this fires only on CONTACT/MARKETING wordings and refuses anything that names a
+  // check, a screening, or the data-processing notice.
+  if (/\b(text message|text messages|sms|marketing|promotional|newsletter|job alerts?|talent (community|network)|future (job|role|opportunit))/i.test(L)
+      && /\b(consent|opt[- ]?in|agree|receive|subscribe|join|sign me up|would you like)\b/i.test(L)
+      && !/(background|drug|reference|credit|criminal|e-?verify|screening|privacy (notice|policy|statement)|data protection|processing of your|terms)/i.test(L)) {
+    return { candidates: ["No", "False"], source: "optin-declined", review: true, flag: "optin-declined",
+      detail: "this asks whether you want to be CONTACTED (texts/marketing), which is an opt-in rather than something the application needs — answered \"No\" because you have not asked to be contacted that way; flip it here if you want it" };
+  }
+
   // ── SECURITY CLEARANCE — STATED OR NOT ANSWERED (operator, 2026-08-18) ─────────────────────
   // A clearance is a FACTUAL claim about the applicant, and claiming one you do not hold is a serious
   // matter — so this rung answers ONLY from `work_authorization.security_clearance` and refuses in
@@ -1016,6 +1196,19 @@ function atsRouteLabel(label, f, profile, defaults) {
     const v = ap.earliest_start_date || ap.available_for_full_employment_after;
     if (has(v)) return { value: v, source: "map", detail: "availability.earliest_start_date", review: true, flag: "start-date-format" };
     return null;
+  }
+
+  // RELOCATION — STATED only, and the two facts are kept apart (see recognizeRelocationQuestion).
+  // Live 2026-08-18: a required relocation dropdown on Sargent & Lundy was answered by the AI from
+  // the very profile field nothing read. An unstated preference still falls through — the operator
+  // not having answered is not a "No".
+  {
+    const rq = atsLib.recognizeRelocationQuestion(label);
+    if (rq) {
+      const rc = atsLib.relocationCandidates(profile && profile.screening, rq.kind);
+      if (rc.candidates) return { candidates: rc.candidates, source: "relocation", path: rc.path, detail: rc.path };
+      return null;
+    }
   }
 
   // How-did-you-hear — the same ladder the Workday source picker uses.
@@ -1417,8 +1610,21 @@ function atsInjScan(ats) {
           // left in, it is a one-item list, which reads as a COMPLETE vocabulary and would reach the
           // review editor as the single thing the operator may pick. The unset parent is explained
           // by the record's own detail (see awaitingParent); the option list must simply be empty.
+          // …AND DROP THE WIDGET'S OWN "No Results" ROW, for exactly the reason above. It was missed
+          // here while the ACTUATION reader (atsInjIcimsReadOptions) filtered it all along, so a field
+          // whose list had been searched reached review offering ONE pickable option — "No Results"
+          // (live 2026-08-18, Cretex's Degree). The operator would have selected a sentinel.
+          // ⚠ LOCKSTEP with atsInjIcimsReadOptions' filter: two injected fns cannot share code.
           const items = ul ? [...ul.children].map((li) => txt(li))
-            .filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^please select a /i.test(t)) : [];
+            .filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^please select a /i.test(t)
+              && !/^no results/i.test(t)) : [];
+          // ⚠ CAN THIS WIDGET BE SEARCHED AT ALL? It says so itself, and the answer changes what may be
+          // done to it: `icimsdropdown-search="0"` means the list is LOCAL and COMPLETE, and the search
+          // box present in the markup merely FILTERS the rendered rows. Typing into it therefore empties
+          // the list rather than fetching more — which is exactly how Cretex's 9-option Degree list
+          // ("High School Diploma/GED, AS, BS, MS, PhD, MBA, MCS, BCS, BA") was reported EMPTY, twice,
+          // by us and then by the probe sent to check us (live 2026-08-18, operator's screen refuted it).
+          const searchable = el.getAttribute("icimsdropdown-search") !== "0";
           const shown = document.getElementById(el.id + "_fakeSelected_icimsDropdown");
           const cur = shown ? txt(shown) : "";
           push(Object.assign(base, {
@@ -1429,7 +1635,14 @@ function atsInjScan(ats) {
             // measured at 26 countries and 25 states (Alabama…Michigan, so Minnesota→Wyoming are
             // absent). Marking it partial is what stops review presenting a 25-row list as the
             // complete set of US states, and what tells the actuator to search before giving up.
-            optionsPartial: !!(ul && ul.getAttribute("data-ap-complete") !== "1"),
+            // …EXCEPT when the widget itself says it cannot be searched. `icimsdropdown-search="0"` is a
+            // LOCAL list: there is no second page to fetch, so what is rendered IS the vocabulary, and
+            // calling it partial hands review a type-it-yourself box in place of a real picker.
+            optionsPartial: searchable ? !!(ul && ul.getAttribute("data-ap-complete") !== "1") : false,
+            // Whether the search box may be TYPED INTO. Carried because the box exists in the markup
+            // either way, so its presence proves nothing — and typing into a search-less widget FILTERS
+            // its rendered rows to nothing, which reads exactly like an empty list.
+            searchable,
             // The parent→child dependency, DECLARED by the page: picking this field's value is what
             // populates the named child (Country → State/Province). Carried so the driver can order
             // them and explain an empty child honestly instead of guessing.
@@ -2646,16 +2859,32 @@ function atsInjClickApplyButton() {
     return r.width > 0 && r.height > 0;
   };
   const APPLY_RE = /^apply\b|\bapply (now|here|for this)\b/i;
-  const all = [...document.querySelectorAll('button, [role="button"], a[href="#"]')].filter((b) => {
-    const t = (b.textContent || "").replace(/\s+/g, " ").trim();
-    return APPLY_RE.test(t) && t.length <= 40;
-  });
+  // ⚠ READ THE CAPTION FROM THE LEAVES TOO, NOT ONLY THE ELEMENT'S OWN TEXT (live 2026-08-18).
+  // iCIMS' action-button widget renders its label TWICE for responsive layout —
+  //   <a class="iCIMS_Anchor iCIMS_Action_Button iCIMS_ApplyOn" href="…">
+  //     <div class="iCIMS_Action_ButtonText">
+  //       <span class="iCIMS_LongLabel">Apply</span><span class="iCIMS_ShortLabel">Apply</span>
+  // — so the anchor's textContent is "ApplyApply", and `/^apply\b/` does NOT match it: there is no word
+  // boundary between "y" and "A". The control a human plainly sees was therefore invisible to both
+  // finders, and the run halted `apply-not-followable` on a perfectly good posting (SCS Engineers).
+  // Astrion hid this because its own duplication happened to leave a space ("Apply for this job
+  // onlineApply"), which the anchored alternative still matched.
+  // Each LEAF's text is what is actually rendered, so testing those alongside the concatenation is both
+  // more faithful and generic — no iCIMS class to key on, and it fixes any duplicated-label widget.
+  const caps = (el) => {
+    const own = String(el.textContent || "").replace(/\s+/g, " ").trim();
+    const leaves = [...el.querySelectorAll("*")].filter((n) => !n.children.length)
+      .map((n) => String(n.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    return [own, ...leaves];
+  };
+  const applyCap = (el) => caps(el).find((t) => t.length <= 40 && APPLY_RE.test(t)) || null;
+  const all = [...document.querySelectorAll('button, [role="button"], a[href="#"]')].filter((b) => !!applyCap(b));
   // Prefer a visibly-rendered one, but an all-invisible verdict falls back to the full set
   // rather than abandoning the run on a measurement a hidden tab is known to get wrong.
   const shown = all.filter(vis);
   const btns = shown.length ? shown : all;
   if (btns.length === 0) return { ok: false, reason: "no-apply-button" };
-  const uniq = [...new Set(btns.map((b) => (b.textContent || "").replace(/\s+/g, " ").trim()))];
+  const uniq = [...new Set(btns.map((b) => applyCap(b)))];
   if (uniq.length > 1) return { ok: false, reason: "ambiguous", offered: uniq.slice(0, 4) };
   btns[0].click();
   return { ok: true, clicked: uniq[0], hiddenLayout: shown.length === 0 };
@@ -2889,10 +3118,28 @@ function atsInjClickApplyAnchor() {
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   };
-  const cap = (el) => String(el.value || el.textContent || "").replace(/\s+/g, " ").trim();
   const APPLY_RE = /^apply\b|\bapply (now|here|online|for this)\b/i;
+  // ⚠ READ THE CAPTION FROM THE LEAVES TOO, NOT ONLY THE ELEMENT'S OWN TEXT (live 2026-08-18).
+  // iCIMS' action-button widget renders its label TWICE for responsive layout —
+  //   <a class="iCIMS_Anchor iCIMS_Action_Button iCIMS_ApplyOn" href="…">
+  //     <div class="iCIMS_Action_ButtonText">
+  //       <span class="iCIMS_LongLabel">Apply</span><span class="iCIMS_ShortLabel">Apply</span>
+  // — so the anchor's textContent is "ApplyApply", and `/^apply\b/` does NOT match it: there is no word
+  // boundary between "y" and "A". The control a human plainly sees was therefore invisible to both
+  // finders, and the run halted `apply-not-followable` on a perfectly good posting (SCS Engineers).
+  // Astrion hid this because its own duplication happened to leave a space ("Apply for this job
+  // onlineApply"), which the anchored alternative still matched.
+  // Each LEAF's text is what is actually rendered, so testing those alongside the concatenation is both
+  // more faithful and generic — no iCIMS class to key on, and it fixes any duplicated-label widget.
+  const caps = (el) => {
+    const own = String(el.value || el.textContent || "").replace(/\s+/g, " ").trim();
+    const leaves = [...el.querySelectorAll("*")].filter((n) => !n.children.length)
+      .map((n) => String(n.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    return [own, ...leaves];
+  };
+  const cap = (el) => caps(el).find((t) => t.length <= 40 && APPLY_RE.test(t)) || caps(el)[0] || "";
   const all = [...document.querySelectorAll('a[href], input[type="submit"], input[type="button"]')]
-    .filter((el) => { const t = cap(el); return APPLY_RE.test(t) && t.length <= 40; });
+    .filter((el) => caps(el).some((t) => t.length <= 40 && APPLY_RE.test(t)));
   const shown = all.filter(vis);
   const els = shown.length ? shown : all;
   if (!els.length) return { ok: false, reason: "no-apply-control" };
@@ -3194,7 +3441,30 @@ function atsDegreeLevel(text) {
   for (const [level, re] of ATS_DEGREE_LEVELS) if (re.test(t)) return level;
   return null;
 }
+// A degree spelled out reduces to its OWN initials, and that is not a guess: "Bachelor of Science" is
+// what "BS" abbreviates. `of/in/the/and` are dropped, so "Master of Business Administration" → "MBA".
+function atsDegreeAcronym(text) {
+  const words = String(text == null ? "" : text)
+    .replace(/[().,]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w && !/^(of|in|the|and|a)$/i.test(w));
+  if (words.length < 2) return null;             // "Bachelors" has no acronym to build
+  return words.map((w) => w[0].toUpperCase()).join("");
+}
 function atsDegreeMatch(candidates, options) {
+  const norm = (s) => String(s == null ? "" : s).replace(/[.\s]/g, "").toUpperCase();
+  // ⚠ THE ACRONYM TIER COMES FIRST, and it is what makes an abbreviation list usable (live 2026-08-18,
+  // Cretex: "AS · BS · MS · PhD · MBA · MCS · BCS · BA"). The level tier below cannot answer that list at
+  // all — BS, BCS and BA are ALL "bachelor", so its exactly-one guard correctly refuses, and the option
+  // the applicant plainly holds stays unreachable. Initials are exact, not fuzzy: "Bachelor of Science"
+  // abbreviates to BS and to nothing else, so a unique hit is a fact about the words rather than a
+  // similarity score. Still guarded by uniqueness, so a list carrying both "BS" and "B.S." asks a human.
+  for (const c of candidates || []) {
+    const ac = atsDegreeAcronym(c);
+    if (!ac) continue;
+    const hits = (options || []).filter((o) => norm(o) === norm(ac));
+    if (hits.length === 1) return hits[0];
+  }
   const wanted = (candidates || []).map(atsDegreeLevel).find(Boolean);
   if (!wanted) return null;
   const hits = (options || []).filter((o) => atsDegreeLevel(o) === wanted);
@@ -3338,6 +3608,15 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
     if (map.kind === "skip") return { kind: "skip", source: "map", detail: map.detail };
+    // ⚠ A LITERAL ANSWER, for a question whose answer is a fact about the FORM, not about the applicant.
+    // Used by the address Type below: the one address a profile holds is the candidate's own residence, so
+    // "Home" is not a guess and there is no profile field to read it from. Still a CANDIDATE list through
+    // the ordinary ladder — the tenant's wording ("Home", "Home Address", "Residence") is matched against
+    // its live options, never blind-committed.
+    if (Array.isArray(map.candidates) && map.candidates.length) {
+      return { candidates: map.candidates.slice(), source: "map", path: map.note || "(form-shape constant)",
+        detail: map.detail || null };
+    }
     if (map.kind === "location") {
       const v = atsComposeValue("city_state", profile);
       return v ? { kind: map.kind, value: v, source: "map", path: "(city+state)" } : { kind: "skip", source: "map", detail: "no city/state in profile" };
@@ -3416,7 +3695,12 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
 // costs the whole fill.
 const ATS_ICIMS_PARSE = {
   pollMs: 900,        // one read-only scan per tick (waitAtsFormReady already polls this at 450ms)
-  quietMs: 1500,      // no mutation for this long ⇒ the postback has finished rendering
+  // ⚠ RAISED from 1500 on 2026-08-18, deliberately spending ~1s of the ~6s the lean signature probe
+  // saved. Polling faster makes a STABILITY predicate weaker, not stronger — sparse reads are stronger
+  // evidence that nothing is moving — so with a cheap probe the binding evidence has to be the quiet
+  // watch's own wall-clock idle time rather than the read count. 2500ms also covers a parse that
+  // renders in two bursts with a gap between them, which 1500ms could have called finished.
+  quietMs: 2500,      // no mutation for this long ⇒ the postback has finished rendering
   stableReads: 3,     // …and the signature agreed that many times (the waitAtsFormReady bar)
   // How long the postback gets to START before we accept "it changed nothing". ⚠ THIS IS THE ONE
   // NUMBER THAT CAN LET A PARSE LAND MID-FILL: past it, a quiet form is taken at face value, so a
@@ -3449,6 +3733,47 @@ function atsFormSignature(scan) {
     .join(",");
 }
 
+// ── THE SETTLE HEARTBEAT MUST BE CHEAP, OR IT BECOMES THE WAIT (live 2026-08-18) ────────────────
+//
+// Measured on Cretex: the parse landed after 6.0s and the stage finished at 15.4s. The 8.6s in between
+// was not iCIMS — it was US proving the form had gone quiet. `atsIcimsAwaitParse` was calling
+// `atsInjScan` once per tick, and that is a 479-line full read: every label, every option list, every
+// icims_dropdown's `<ul>` of results, the section walk, the entry ordinals, then a large JSON payload
+// back over CDP for 68 fields. So a "900ms poll" actually cost ~2.9s per tick, and the three stable
+// reads the gate asks for took ~8.6s instead of ~2.8s.
+//
+// The signature only ever needed two things per field — its NAME and whether it HOLDS a value — which
+// is one flat pass over the controls, no labels, no options, no sections. It also returns the finished
+// STRING rather than 68 field objects, so the payload stops mattering too.
+//
+// ⚠ BOTH SIDES OF THE COMPARISON MUST BE COMPUTED THE SAME WAY. A base read with the full scan and
+// ticks read leanly would differ on tick one, which the loop would read as "the parse changed the
+// form" — and a false `changed` lets it exit as soon as the page is briefly quiet, i.e. possibly
+// BEFORE the real parse lands. That is the one failure this whole stage exists to prevent, so the
+// caller no longer passes a full-scan baseline and this function reads its own.
+//
+// ⚠ Deliberately NOT `selectedIndex > 0` for a <select> (see the "index 0 is not unselected" rule):
+// a non-empty `value` is the honest test, an opaque iCIMS id counts as a value, and a real
+// placeholder row carries "" — no placeholder guessing needed for a signature.
+function atsInjLeanSignature(ats) {
+  try {
+    const parts = [];
+    for (const el of document.querySelectorAll("input, textarea, select")) {
+      const type = String(el.type || "").toLowerCase();
+      if (type === "hidden" || type === "submit" || type === "button" || type === "image" || type === "reset") continue;
+      const nm = el.name || el.id || "";
+      if (!nm) continue;
+      let has = 0;
+      if (type === "checkbox" || type === "radio") has = el.checked ? 1 : 0;
+      else has = String(el.value == null ? "" : el.value).trim() ? 1 : 0;
+      parts.push(nm + ":" + has);
+    }
+    return { ok: true, sig: parts.length + "|" + parts.join(","), n: parts.length };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
 // Wait for iCIMS' résumé parse to land and the panel to go quiet. Returns what it OBSERVED — never
 // throws, because a wait that cannot read the page must not abort a run that can still fill it.
 async function atsIcimsAwaitParse(act, ats, opts) {
@@ -3457,9 +3782,17 @@ async function atsIcimsAwaitParse(act, ats, opts) {
   const log = o.log || (() => {});
   const t0 = Date.now();
   const deadline = t0 + cfg.ceilingMs;
+  let readMs = 0, reads = 0;
   const readSig = async () => {
-    try { return atsFormSignature(await act.eval(atsInjScan, ats)); } catch (e) { return null; }
+    const t = Date.now();
+    try {
+      const r = await act.eval(atsInjLeanSignature, ats);
+      return r && r.ok ? r.sig : null;
+    } catch (e) { return null; }
+    finally { readMs += Date.now() - t; reads++; }
   };
+  // ⚠ Reads its OWN baseline — see atsInjLeanSignature's note on why a mixed comparison is unsafe.
+  // `o.baseSignature` remains honoured so a test can pin a starting point.
   const base = o.baseSignature != null ? o.baseSignature : await readSig();
   let prev = base, stable = 0, changed = false, changedAt = null, idle = 0;
   while (Date.now() < deadline) {
@@ -3484,9 +3817,14 @@ async function atsIcimsAwaitParse(act, ats, opts) {
     const settled = stable >= cfg.stableReads && idle >= cfg.quietMs;
     if (settled && (changed || Date.now() - t0 >= cfg.changeMs)) {
       const waitedMs = Date.now() - t0;
-      log(changed
+      // The breakdown matters more than the total: "the parse landed at X, then WE spent Y proving it
+      // had stopped" is what separates the server's time from our own, and reading the total as the
+      // server's is how an 8.6s probe cost went unnoticed for a day.
+      const probing = changedAt != null ? waitedMs - changedAt : waitedMs;
+      const cost = ` [${reads} signature read(s) costing ${readMs}ms; ${(probing / 1000).toFixed(1)}s of this wait was OURS, proving quiet]`;
+      log((changed
         ? `the résumé parse landed after ${(changedAt / 1000).toFixed(1)}s and the form settled at ${waitedMs > 0 ? (waitedMs / 1000).toFixed(1) : "0.0"}s — filling now, on top of whatever it wrote`
-        : `no postback changed this form within ${(waitedMs / 1000).toFixed(1)}s — the parse either produced nothing or had already landed before we looked; the form is quiet, filling now`);
+        : `no postback changed this form within ${(waitedMs / 1000).toFixed(1)}s — the parse either produced nothing or had already landed before we looked; the form is quiet, filling now`) + cost);
       return { parsed: true, changed, changedAt, waitedMs, quietMs: idle, signature: prev, baseSignature: base };
     }
   }
@@ -3539,8 +3877,11 @@ async function atsIcimsResumeStage(act, ats, opts) {
   // BASELINE AFTER THE CONFIRMATION, not before the attach: our own upload changes the résumé row, and
   // a baseline taken before it would count that as "the parse landed". If the postback beat the
   // confirmation, the no-change branch of the wait covers it (quiet + stable, then proceed).
-  const baseSignature = atsFormSignature(await act.eval(atsInjScan, ats).catch(() => null));
-  const parse = await atsIcimsAwaitParse(act, ats, { log, baseSignature, parse: o.parse });
+  // ⚠ NO baseSignature FROM HERE. It used to pass one derived from a full atsInjScan, which the wait
+  // then compared against its own lean reads — two different vocabularies, so tick one always looked
+  // like a change. A false "changed" is the dangerous direction: it lets the wait finish on the first
+  // brief quiet, potentially before the parse has even started. The wait reads its own baseline now.
+  const parse = await atsIcimsAwaitParse(act, ats, { log, parse: o.parse });
   // WHAT EVIDENCE DO WE ACTUALLY HAVE THAT THE FILE LANDED? Setting `input.files` proves nothing on
   // its own — it is a page-side write, and iCIMS uploads on the change event. Two independent kinds of
   // positive evidence, and the record is flagged for review when there is NEITHER:
@@ -4137,6 +4478,16 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // Handled before every other kind, and it `continue`s out before `rec.rawValue` /
       // `rec.resolved` are assigned further down — which is exactly how the value stays out of the
       // record, and therefore out of the review bundle and the report POSTed to the website.
+      // A PERMISSION THE OPERATOR HAS NOT GIVEN — claimed by the entry resolver precisely so that the
+      // AI cannot reach it (see the may_contact branch). Blank + flagged, exactly like an unstated
+      // clearance: the answer belongs to a human, and a required one blocking the gate is the point.
+      if (route && route.kind === "entry-permission-unstated") {
+        rec.status = "needs_review";
+        rec.flag = route.flag || "may-contact-unstated";
+        rec.mappedPath = route.path || null;
+        rec.detail = route.detail;
+        results.push(fin()); continue;
+      }
       if (route && route.kind === "credential-missing") {
         rec.status = "needs_review";
         rec.credential = true; rec.credentialKind = route.credentialKind;
@@ -4523,6 +4874,71 @@ async function atsCredentialRecheck(act, ats, scan, results, credentials) {
 }
 
 // The audit + envelope — extracted with the loop (see atsFillFields).
+// ── WHAT THE FORM ALREADY HELD, AND WE DID NOT PUT THERE (operator, 2026-08-18) ─────────────────────
+// iCIMS parses the résumé and pre-populates whatever it thinks the answers are — and the operator's
+// verdict on that parse is blunt: "the auto parse is really bad… pretend the form is blank and refill
+// everything". Two halves to that, and only the first was true:
+//
+//   • A field we CAN answer is already overwritten. atsInjSetText assigns the whole value, and the choice
+//     paths commit regardless of what sits there, so nothing skips merely because the parse got there
+//     first. That half needed no change.
+//   • A field we CANNOT answer kept the parse's guess AND WENT UNRECORDED. Its record said `skipped` with
+//     `after: null`, so the review editor rendered it BLANK while the form carried the parse's value —
+//     invisible to the human, and submitted. On the Cretex form that was 45 of 81 fields' worth of blind
+//     spot. This is the gap the operator was describing.
+//
+// So: re-read every field we did not fill and, when the page holds something, put it ON the record and
+// flag it. Same convention the Workday walk has used for pre-filled fields (`already-filled` →
+// needs_review), and for the same reason — the review bundle is supposed to be the page's source of
+// truth, and a blank record about a populated field is simply false.
+//
+// ⚠ IT REPORTS, IT DOES NOT BLANK. Clearing a value we cannot vouch for is a different and riskier act:
+// on a REQUIRED field it trades a wrong answer for a blocked submit, and some of what the parse extracts
+// is correct. Surfacing puts the decision where it belongs — in review, next to the value, with an
+// editor. Blanking is a one-line change if the operator wants it.
+// ⚠ RUNS AFTER THE AUDIT, deliberately: the audit compares `rec.after` against the page for fields WE
+// filled, and these are not those. Promoting them beforehand would audit the parse's work as if it were
+// ours and report `audit-mismatch` on values nobody claimed.
+async function atsSurfacePrefilled(act, ats, scan, results) {
+  const fields = (scan && scan.fields) || [];
+  let surfaced = 0;
+  for (const rec of results) {
+    if (!rec || rec.credential) continue;
+    // Only records that claim NOTHING: a skip, or a review item we could not give a value to.
+    const claimsNothing = (rec.status === "skipped" || rec.status === "needs_review")
+      && (rec.after == null || String(rec.after).trim() === "");
+    if (!claimsNothing) continue;
+    // ⚠ ONLY FIELDS WE NEVER HAD A VALUE FOR. `resolved` is set before any actuation, so a record that
+    // carries one is a field we TRIED to fill — and if it ended without a value, that is a COMMIT FAILURE
+    // whose record must survive intact. Re-labelling it `already-filled` would both misattribute the
+    // value (we put it there, or tried to) and quietly convert a failed commit into a satisfied-looking
+    // review item — the false-verify class this codebase exists to refuse. Caught by the existing
+    // "a commit the widget does not display is NOT reported filled" test, which is precisely its job.
+    if (rec.resolved != null) continue;
+    const f = fields.find((x) => x.fieldName === rec.fieldName);
+    if (!f || f.widgetType === "file_upload") continue;
+    let live = null;
+    try { live = await act.eval(atsInjReadValue, ats, f.inputSel, f.widgetType); } catch (e) { live = null; }
+    // A read we could not make says nothing — leave the record exactly as the fill left it.
+    if (!live || !live.ok) continue;
+    const v = live.value == null ? "" : String(live.value).trim();
+    if (!v) continue;
+    rec.status = "filled_review";
+    rec.flag = "already-filled";
+    rec.after = v;
+    rec.verified = true;                 // it IS on the page — that is the whole point of the record
+    rec.detail = (rec.detail ? rec.detail + " · " : "")
+      + "this was ALREADY on the form and we did not put it there"
+      + (ats === "icims" ? " — iCIMS pre-fills fields from the résumé it parsed, and that parse is not trustworthy" : "")
+      + ". Your profile had no answer to overwrite it with, so check it or replace it here.";
+    surfaced++;
+  }
+  if (surfaced) {
+    try { console.log(`[ApplyPilot][ATS-FILL] ${surfaced} field(s) the form had ALREADY populated are now IN review with their live value — previously they were recorded blank and would have been submitted unseen`); } catch (e) { /* log only */ }
+  }
+  return surfaced;
+}
+
 async function atsFinishFill(act, ats, scan, results, credentials) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
@@ -4565,6 +4981,13 @@ async function atsFinishFill(act, ats, scan, results, credentials) {
   // Genuinely last, and BEFORE counts — a credential the page took back becomes `needs_review`
   // here, and the envelope must report that, not the status it held a moment earlier.
   await atsCredentialRecheck(act, ats, scan, results, credentials);
+
+  // …and the pre-filled sweep for the same reason: it promotes `skipped` records to `filled_review`, so
+  // running it after the tally left the envelope reporting 45 skips for a page that had 26 (measured on
+  // Cretex — the BUNDLE was right and the summary was not, which is the kind of disagreement that gets
+  // read as a bug in whichever half you look at second). Placed after the audit deliberately: see
+  // atsSurfacePrefilled.
+  try { await atsSurfacePrefilled(act, ats, scan, results); } catch (e) { /* completeness — never abort */ }
 
   const counts = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
   // DID THIS PAGE'S ASYNC WIDGETS EVER ANSWER? Greenhouse forms sometimes load in a state where their
@@ -4631,6 +5054,25 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
 
     let opts = open.options || [];
     let searched = false;
+    let listArrived = opts.length > 0;
+    // ⚠ THE LIST IS FETCHED ON OPEN (`icimsdropdown-ajax="1"`), SO THE FIRST READ IS A RACE — WAIT FOR IT
+    // (operator, 2026-08-18: "sometimes when you run it it shows no results… maybe it is the same reason"
+    // as the non-iCIMS form, i.e. what the run does to the page). Measured: this widget's list is present
+    // and complete under a run when read late, so an empty read is a not-yet-arrived list rather than a
+    // broken one — a RACE, not a hard break. Two things make us lose it more often than a human does:
+    // hidden runs pace fast (cdpSetFastWhenHidden), and we read immediately after a synthetic open.
+    // ASK THE PAGE, NEVER A CLOCK: poll on SW wall-clock (delayFull, so a hidden run does not shorten the
+    // one wait that matters) until rows appear, and remember whether they ever did — a list that never
+    // arrived must be reported as exactly that, and never as "your answer is not offered", which is a
+    // claim about the employer's vocabulary that an empty read cannot support.
+    if (!listArrived) {
+      for (let i = 0; i < 20; i++) {
+        await act.delayFull(300);
+        const r = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
+        if (r && r.ok && r.awaitingParent) break;          // a different, self-explaining state
+        if (r && r.ok && (r.options || []).length) { opts = r.options; listArrived = true; break; }
+      }
+    }
     // ⚠ ASK ABOUT THE PARENT FIRST, BEFORE ANY SEARCH. A child whose parent is unset shows only the
     // widget's own "Please select a country" row; searching REPLACES that row, so by the time the
     // no-match branch re-read the list the evidence was gone and the field reported the generic
@@ -4646,9 +5088,46 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       }
     }
     let m = atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
+    // ⚠ THE DEGREE BRIDGE BELONGS HERE TOO. A tenant's degree list is written in ABBREVIATIONS
+    // ("AS · BS · MS · PhD · MBA · BA" — Cretex, measured), and the profile stores "Bachelor of Science",
+    // which meets none of them on any string tier. The generic choice path has bridged this since the
+    // dial/degree work; this widget's path never did, so the option sitting in plain sight was
+    // unreachable and the field went to review — the miss that then triggered the destructive search
+    // below. Same helper, same label gate, so the two paths cannot disagree.
+    if ((!m || m.targetIndex < 0) && /degree|education level/i.test(String(f.label || ""))) {
+      const deg = atsDegreeMatch(candidates, opts);
+      // ⚠ `matchTier`, not `tier` — this path's grading reads matchTier (the other path converts it into
+      // its own `hit.tier`), and the mismatched key surfaced as `matched at the undefined tier`.
+      // Graded EXACT on purpose: an acronym is not a similarity score. "Bachelor of Science" abbreviates
+      // to "BS" and to nothing else, and uniqueness is already enforced — so this is the same kind of
+      // fact an exact-normalized hit is, and flagging it would ask the operator to re-check arithmetic.
+      if (deg) m = { targetIndex: opts.indexOf(deg), matchTier: "exact-normalized", degreeBridge: true };
+    }
     // ⚠ ONE PAGE AT A TIME (26 countries / 25 states measured live). A miss here is NOT proof the
     // option doesn't exist, so the search box is tried before anything is reported — otherwise a
     // candidate in Texas fails on a list that stops at Michigan.
+    // ⚠⚠ BUT ONLY IF THE WIDGET CAN ACTUALLY BE SEARCHED. `icimsdropdown-search="0"` means the list is
+    // LOCAL and complete; the search box in its markup only FILTERS the rendered rows, so typing into it
+    // DELETES the very options we are looking for and the field then reports an empty list. That is what
+    // happened to Cretex's Degree — 9 options, reported empty, twice, until the operator said the
+    // dropdown plainly works on their screen. A miss on a search-less widget is a REAL miss: report it
+    // with the options it actually offers.
+    if ((!m || m.targetIndex < 0) && f.searchable === false) {
+      await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+      atsAttachOptions(rec, opts, false);
+      rec.status = "needs_review";
+      // ⚠ TWO DIFFERENT FACTS, AND ONLY ONE OF THEM IS ABOUT THE EMPLOYER. A list that never arrived says
+      // nothing about what the form offers — claiming otherwise is the mistake this whole round started
+      // with — so it is reported as OUR failed read, with the flag naming it.
+      if (!listArrived) {
+        rec.flag = "list-never-loaded";
+        rec.detail = "this dropdown's list never loaded for us — it fetches on open and stayed empty for the whole wait, so we could not see what it offers (it is not searchable, so there was nothing else to try). It is populated when opened by hand, so this is our read, not the employer's form.";
+      } else {
+        rec.detail = "no option matched " + JSON.stringify(String(candidates[0])) +
+          " — this list cannot be searched, so what it shows is all it offers: " + opts.slice(0, 8).join(" | ");
+      }
+      return true;
+    }
     if (!m || m.targetIndex < 0) {
       const beforeKey = opts.join("");
       const s = await act.eval(atsInjIcimsSearch, ref.inputSel, String(candidates[0]));
@@ -4680,10 +5159,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         m = hit || atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
       }
     }
-    // ALWAYS partial: this widget renders one page and offers a search box, so even an unsearched
-    // read is a VIEW of the list, never the whole of it. Review then gets a type-to-filter editor
-    // and an honest note instead of a 25-row list presented as every US state.
-    atsAttachOptions(rec, opts, true);
+    // Partial ONLY when the widget can be searched: then one page is a VIEW of the list and review
+    // should get a type-to-filter editor rather than a 25-row list presented as every US state. A
+    // search-less widget (`icimsdropdown-search="0"`) has no second page, so what it renders IS the
+    // vocabulary and review gets a real picker.
+    atsAttachOptions(rec, opts, f.searchable !== false);
 
     if (!m || m.targetIndex < 0) {
       const st = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
@@ -4696,8 +5176,14 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         ? "this list only fills in once its parent field is chosen, and that hadn't happened yet"
         : st && st.noChildren
           ? "the form offers no options here for the parent value chosen"
+          // ⚠ DO NOT CLAIM THE TENANT'S LIST IS EMPTY. An earlier round of this shipped a message saying
+          // exactly that — "the employer's form offers no options" — on the strength of a probe that
+          // read the list while OUR OWN leftover search text was still filtering it. The operator's
+          // screen refuted it: nine options, no search box. A list that reads empty AFTER we searched is
+          // evidence about our search, not about the employer, so the wording stays on our side of the
+          // line and names the query we used.
           : "no option matched " + JSON.stringify(String(candidates[0])) + (searched ? " (after searching)" : "") +
-            (opts.length ? " — offered: " + opts.slice(0, 4).join(" | ") : " — the list was empty");
+              (opts.length ? " — offered: " + opts.slice(0, 4).join(" | ") : " — the list came back empty for this search");
       return true;
     }
 
@@ -5641,9 +6127,10 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
-    atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
-    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
+    atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
+    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
+    atsInjLeanSignature,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
@@ -5656,7 +6143,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,

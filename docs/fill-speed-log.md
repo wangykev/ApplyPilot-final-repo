@@ -74,6 +74,26 @@ page-side `MutationObserver` instead of sampling.
 floor — and "the poll didn't look often enough" is not an available explanation for a failed wait here.
 Full table + the sweep in round 6.
 
+### 3b. A poll's PREDICATE sets the loop's period — `pollMs` is only a floor (round 13)
+
+The corollary of conclusion 3, and it cost 8.6s per iCIMS run for a day. `atsIcimsAwaitParse` polled at a
+nominal **900ms** and asked for 3 stable reads, so the budget everyone reasons against is ~2.8s. Its
+predicate was a full `atsInjScan` — 479 lines of labels, option lists, section walk and ~68 field objects
+back over CDP — which cost **~2.9s per tick**, making the real period 3.2× the nominal and the gate ~8.6s.
+
+**Nothing in the numbers looks wrong.** `pollMs × reads` is the figure in the config and in your head; the
+predicate's cost appears nowhere, and the log printed only the TOTAL wait, which reads as the server being
+slow. Two habits come out of it:
+
+- **Price the predicate before tuning the interval.** A cheap probe (name + has-value, returning a string:
+  ~70ms) beat every possible retune of a 2.9s one.
+- **Log the split, not the total** — *"the parse landed at X; Y of this wait was OURS"*. Attribution is the
+  whole diagnostic, and a total silently credits the tenant for our own work.
+
+⚠ And when you make a stability poll cheaper you **weaken** it (conclusion 3: sparse reads are stronger
+evidence). Move the binding evidence onto wall clock — round 13 raised `quietMs` 1500 → 2500, spending ~1s
+of the ~6s saved.
+
 ### 4. The profile is "median fast, tail catastrophic"
 
 Which is exactly what "it lags sometimes" feels like from the outside. Page-thread median was healthy on
@@ -1630,3 +1650,73 @@ are not timer-throttled) or a synchronous DOM write after a native setter.
 ⚠ **Do not generalise this to Workday.** There the full hidden pace exists to wait out debounced REACT
 re-renders, which genuinely ride the ~1Hz throttle — the regime standing conclusion 1 measured. The
 opt-in is per-run and resets at attach precisely so it cannot leak there.
+
+## Round 13 (2026-08-18) — iCIMS: the résumé-parse SETTLE PROBE was most of the wait, not the parse
+
+**The question, from the operator:** *"after the resume finishes uploading it seems to take a long time
+before actually filling out the form. why is this?"*
+
+**The answer: about two thirds of it was ours.** The log already carried the split and nobody had read it
+that way — the message said *"the parse landed after 6.0s and the form settled at 14.6s"*, and the natural
+reading is "iCIMS took 14.6s". It didn't. iCIMS took 6.0s; **we** took the other 8.6s deciding the form
+had stopped moving.
+
+### Measured, Cretex (`careers-cretex.icims.com`, 68 fields)
+
+| | parse landed | form settled | **ours, proving quiet** | résumé stage |
+|---|---|---|---|---|
+| before | 6.0s | 14.6s | **8.6s** | 15.4s |
+| after | 8.8s (slower server that run) | 12.6s | **3.9s** | 12.7s |
+
+The "after" row is measured against a **stricter** quiet bar (below), so the probe's own cost fell further
+than the totals suggest: **10 signature reads costing 704ms TOTAL** (~70ms each) against roughly 1.5s each
+before.
+
+### Cause
+
+`atsIcimsAwaitParse`'s gate is *3 stable signature reads AND `quietMs` of no mutation*. It read that
+signature with **`atsInjScan`** — a 479-line full form read: every label, every option list, every
+`icims_dropdown`'s `<ul>` of results, the section walk, the entry ordinals, then ~68 field objects
+serialised back over CDP. So the loop's nominal **900ms** poll actually cost **~2.9s per tick**, and three
+stable reads took ~8.6s instead of ~2.8s.
+
+**Generalisable:** a poll whose PREDICATE is expensive silently sets the loop's period. The nominal
+`pollMs` is a floor, never the period — and the sum `pollMs × reads` is the number people budget
+against, so the overrun does not look like a bug anywhere.
+
+### Fix — `atsInjLeanSignature`
+
+The signature only ever needed, per control, its **NAME** and whether it **HOLDS a value**. One flat pass
+over `input, textarea, select`, returning the finished **string** rather than 68 objects (so the payload
+stops mattering too). Three details, each load-bearing:
+
+- **Plumbing is skipped** (`hidden`/`submit`/`button`/`reset`). A rotating anti-forgery token in a hidden
+  input would mean the form **never** looks stable — the loop would ride to its ceiling every run.
+- **A `<select>` is judged by its `value`, never `selectedIndex > 0`** — the "index 0 is not unselected"
+  rule (2026-08-17) applies here too: an opaque iCIMS id IS a value, and a real placeholder row carries
+  `""`, so no placeholder guessing is needed for a signature.
+- **⚠ Both sides of the comparison must be computed the same way.** The caller used to pass a baseline
+  derived from a full `atsInjScan`; comparing that against lean ticks differs on tick **ONE**, the loop
+  reads it as *"the parse changed the form"*, and **a false `changed` lets the wait finish on the first
+  brief quiet — possibly before the parse has even started.** That is the exact failure the whole stage
+  exists to prevent, so the wait now reads its own baseline. Unit-pinned, and the test was confirmed to
+  FAIL on a reverted probe.
+
+### …and ~1s of the saving was spent back, on purpose
+
+`quietMs` **1500 → 2500**. **Polling faster makes a STABILITY predicate weaker, not stronger** — sparse
+reads are stronger evidence that nothing is moving (the same reasoning as the 2026-08-10 poll audit) — so
+once the probe is cheap the binding evidence has to be the quiet watch's own **wall-clock** idle time
+rather than the read count. 2500ms also covers a parse that renders in **two bursts** with a gap, which
+1500ms could have called finished.
+
+### What this round does NOT claim
+
+The same pair of runs shows total fill **52.6s → 27.1s**, and that is mostly **not** this change: one
+required free-text question (`rcf3049_Text`) took **24.1s** in the first run and **746ms** in the second.
+Per Round 9, name the model before attributing anything — the résumé-stage number is the attributable
+one, the fill-loop number is provider variance.
+
+**Diagnose with the log line itself**, which now prints the split rather than only the total:
+`[N signature read(s) costing Xms; Y s of this wait was OURS, proving quiet]`. Reading a total as the
+server's time is how an 8.6s probe cost went unnoticed for a day.

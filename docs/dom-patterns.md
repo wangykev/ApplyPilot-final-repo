@@ -37,7 +37,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
-| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out` |
+| **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out`, `2026-08-18 — four more tenants: the Apply widget, the bare "Type", and the settle probe` |
 | **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
 | **Option lists: paging, completeness, what review can offer** | `2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE` |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
@@ -4433,3 +4433,71 @@ from an UNPARSED form and replayed against a PARSED one reproduces the `approved
 field on the live form` failure mode documented in `(b)` above — for every entry field. A required
 résumé that fails to attach halts the submit run at `resume-not-attached`, because the strict verify
 only re-checks approved VALUES and a missing file is not one.
+
+## 2026-08-18 — four more iCIMS tenants: the Apply widget, the bare "Type", and the settle probe
+
+Observed on **SCS Engineers** (`careers-scsengineers.icims.com`), **Sargent & Lundy**
+(`international-sargentlundy.icims.com`), **Wieland Chase** (`careers-chasebrass.icims.com`) and a
+re-trace of **Cretex** (`careers-cretex.icims.com`).
+
+### The action-button widget duplicates its label — `"ApplyApply"`
+
+SCS Engineers' Apply control:
+
+```html
+<a class="iCIMS_Anchor iCIMS_Action_Button iCIMS_ApplyOn" href="…/jobs/3903/…/login">
+  <div class="iCIMS_Action_ButtonText">
+    <span class="iCIMS_LongLabel">Apply</span><span class="iCIMS_ShortLabel">Apply</span>
+  </div>
+</a>
+```
+
+Two label spans for responsive layout, so `textContent` is **`"ApplyApply"`** with no separator — and
+`/^apply\b/` does **not** match it: there is no word boundary between "y" and "A". The control a human
+plainly sees was invisible to both finders and the run halted `apply-not-followable` on a live posting.
+
+**Astrion hid this**: its own duplication happens to leave a space (`"Apply for this job onlineApply"`),
+which the `\bapply (now|here|online|for this)\b` alternative still matched.
+
+**Rule:** read the caption from each **LEAF's** text as well as the element's own `textContent`. A leaf's
+text is what is actually rendered, so it is both more faithful and generic — no iCIMS class to key on.
+
+### `PersonProfileFields.AddressType` — a required field whose label is a bare "Type"
+
+Inside the candidate's own address block. The label ladder has nothing to key on, so it fell to the AI,
+which answered **"Home" on Cretex and "Work" on Wieland** — same question, same profile, two answers, and
+"Work" is simply wrong: the one address a profile holds is `personal_info.address_*`, the residence.
+
+There is no profile field for this because there is nothing to ask — it is a fact about the FORM's
+vocabulary. Mapped to a literal tiered list (`Home` / `Home Address` / `Residence` / `Personal`), still
+matched against the live options. *Same shape as `PersonProfileFields.PhoneType`/`.PhoneNumber`
+(2026-08-17): a required platform field whose label is a bare noun is what silently reaches the AI.*
+
+### Per-customer question ids seen this round
+
+| id | label | tenant(s) |
+|---|---|---|
+| `rcf3553` / `rcf2004` | "Do you consent to receive text message communication during your application process?" | S&L / SCS |
+| `rcf2019` | willingness to relocate | S&L |
+| `rcf3048` | "How did you hear about us?" — options are compound (**"Internet - LinkedIn"**, **"Job Board - LinkedIn"**) | S&L, Cretex |
+| `rcf3049` (+ `rcf3049_Text`) | "Please specify further" — a sub-source pair that depends on `rcf3048` | S&L, Cretex |
+| `rcf2023` | "Desired Salary" (free text) | SCS |
+| `rcf3214_*` / `rcf3215_*` | work-history start/end date, `_Month` + `_Date` + `_Year` | Cretex |
+| `rcf3219` | work-history description (textarea) | Cretex |
+| `rcf3269` | **"May We Contact"**, one per work-history entry | Cretex |
+| `rcf3267` / `rcf3268` | supervisor title / reason for leaving | Cretex |
+
+⚠ **`rcf3048`'s options are COMPOUND**, which is why it still reaches review: the profile says
+`"LinkedIn"` and the form offers `"Internet - LinkedIn"` / `"Job Board - LinkedIn"`. Dropdown containment
+is deliberately OFF (the `"PA"` → "Armed Forces **Pa**cific" rule), so this escalates rather than
+guessing — correctly. It wants a taught bucket or an operator decision, not a matcher change.
+
+### The parse-settle probe (timing, not DOM — full round in `fill-speed-log.md` round 13)
+
+Cretex, 68 fields: the parse landed at **6.0s** and the form was declared settled at **14.6s**. The 8.6s
+between was the settle gate itself, which read its signature with `atsInjScan` (a 479-line full read) once
+per nominal-900ms tick — ~2.9s per tick in practice. A lean read of name + has-value costs ~70ms.
+
+⚠ Both sides of that comparison must be computed the same way. A full-scan baseline against lean ticks
+differs on tick ONE, which the loop reads as "the parse changed the form" — and a false `changed` lets the
+wait finish on the first brief quiet, potentially **before the parse has started**.

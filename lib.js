@@ -828,6 +828,58 @@ function clearanceCandidates(stored) {
   return { candidates: [sc, ...clearanceAliases(sc), "Yes", "True"], level: sc, none: false };
 }
 
+// ── WILLINGNESS TO RELOCATE — a STATED preference, and "who pays" is a DIFFERENT FACT ──────────
+//
+// Live 2026-08-18 on Sargent & Lundy (iCIMS): a REQUIRED "willing to relocate" dropdown went to the
+// AI, which answered "Yes" and cited `screening.willing_to_relocate is explicitly set to true in
+// profile` — the profile held the answer, the website's editor exposes it, and NEITHER engine read
+// it. So an operator who had stated their preference got it back as a flagged AI guess to re-approve.
+// Same class as the how-did-you-hear leak: a deterministic answer the label match let slip.
+//
+// Returns the KIND of relocation question, because the profile stores two independent facts and
+// answering either from the other is a wrong answer, not an approximation:
+//   • "willing"  → screening.willing_to_relocate          — would you move at all
+//   • "own_cost" → screening.willing_to_relocate_at_own_cost — would you move UNPAID
+// A person willing to relocate is not thereby willing to fund it, and vice versa. This is the same
+// seal as an entry-scoped field: a near-miss on a different fact is still the wrong fact.
+//
+// ⚠ Two wordings are REFUSED rather than answered, both because the profile does not hold them:
+//   • the PAST ("have you relocated before?") — a history question, not a preference;
+//   • what the EMPLOYER must provide ("do you require relocation assistance?", "is a relocation
+//     package needed?"). That looks answerable by negating own-cost, but it is a question about a
+//     negotiation, and a wrong answer there costs the operator money. It falls through to the AI and
+//     arrives FLAGGED, which is the honest outcome for something never stated.
+const RELOCATE_ASK_RE = /\brelocat|\bwilling to move\b|\bopen to (a )?move\b/i;
+const RELOCATE_OWN_COST_RE = /\bown (cost|expense|dime|account)\b|\bself[- ]?fund|\bat your own\b|\bunpaid\b|\bwithout (relocation )?(assistance|support|reimbursement)\b/i;
+const RELOCATE_PAST_RE = /\bhave you (ever )?relocat|\bpreviously relocat|\bhave you moved\b/i;
+// ⚠ `reimburs` carries NO trailing  — the boundary fails INSIDE "reimbursed"/"reimbursement",
+// which let "Will relocation expenses be reimbursed?" through to a "Yes" about willingness.
+const RELOCATE_EMPLOYER_PROVISION_RE = /\b(assistance|package|allowance|stipend|benefit|paid for|cover the cost|who pays)\b|\breimburs|\bwill .*\bbe (provided|covered|offered)\b/i;
+function recognizeRelocationQuestion(label) {
+  const t = String(label == null ? "" : label).replace(/\s+/g, " ").trim();
+  if (!t || !RELOCATE_ASK_RE.test(t)) return null;
+  if (RELOCATE_PAST_RE.test(t)) return null;
+  if (RELOCATE_OWN_COST_RE.test(t)) return { kind: "own_cost" };
+  if (RELOCATE_EMPLOYER_PROVISION_RE.test(t)) return null;
+  return { kind: "willing" };
+}
+// What the profile STATES for that kind. A tri-bool: true / false / null, and `null` is "not told us"
+// rather than "no" — it returns `{unstated:true}` so the caller falls through to AI/blank instead of
+// answering a preference the operator never gave. The tiered candidate list is the ordinary boolean
+// ladder, so a Yes/No dropdown, a true/false select and a long-form option ("Yes, I am open to
+// relocating", reached by POLARITY LEAD) are all served by one answer.
+function relocationCandidates(screening, kind) {
+  const sc = screening || {};
+  const v = kind === "own_cost" ? sc.willing_to_relocate_at_own_cost : sc.willing_to_relocate;
+  if (v == null || v === "") return { unstated: true };
+  const yes = v === true || /^(true|yes|y|1)$/i.test(String(v));
+  return {
+    candidates: yes ? ["Yes", "True"] : ["No", "False"],
+    path: kind === "own_cost" ? "screening.willing_to_relocate_at_own_cost" : "screening.willing_to_relocate",
+    yes,
+  };
+}
+
 // Do two strings name the SAME calendar date? Workday re-formats what we typed — it displays
 // "05/01/2028" for an approved "5/1/2028" — and a plain string compare calls that a contradiction,
 // which BLOCKS submit over pure zero-padding (live, Home Depot 2026-08-04).
@@ -2456,6 +2508,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
   groupSelection, joinGroupValue, splitGroupValue, GROUP_JOIN, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
   recognizeClearanceQuestion, clearanceCandidates, clearanceAliases, CLEARANCE_ALIASES,
+  recognizeRelocationQuestion, relocationCandidates,
   skillBaseName, skillChipName, matchSkillOption, missingSkills, isSkillsFieldName, isSkillsEntry,
   skillTokens, skillContainmentEligible, skillWholeWordIn, reportOutcome,
   rejectedValueEntries,

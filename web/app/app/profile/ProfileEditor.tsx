@@ -35,6 +35,7 @@ import {
   RACE_ETHNICITY_OPTIONS,
   VETERAN_STATUS_OPTIONS,
   DISABILITY_STATUS_OPTIONS,
+  MAY_CONTACT_OPTIONS,
   SECURITY_CLEARANCE_OPTIONS,
 } from "@/lib/profile-fields";
 import { saveProfile, saveBuckets } from "./actions";
@@ -290,10 +291,10 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                     form checkbox has no "unanswered" state. Checking it clears the To date (no end
                     date), keeping main #14's behavior on the boolean widget. */}
                 <CheckboxField label="Currently work here" bucketPath={i === 0 ? "work_experience.0.currently_work_here" : undefined} checked={w.currently_work_here} onChange={(v) => update((p) => { p.work_experience[i].currently_work_here = v; if (v === true) p.work_experience[i].to = ""; })} />
-                <DateField label="From" granularity="month-year" bucketPath={i === 0 ? "work_experience.0.from" : undefined} value={w.from} onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
+                <DateField label="From" granularity="month-day-year" hint="day optional — fills forms that require one" bucketPath={i === 0 ? "work_experience.0.from" : undefined} value={w.from} onChange={(v) => update((p) => { p.work_experience[i].from = v; })} />
                 {/* "Currently work here" means no end date — hide the To field when Yes. */}
                 {w.currently_work_here !== true && (
-                  <DateField label="To" granularity="month-year" bucketPath={i === 0 ? "work_experience.0.to" : undefined} value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
+                  <DateField label="To" granularity="month-day-year" hint="day optional" bucketPath={i === 0 ? "work_experience.0.to" : undefined} value={w.to} onChange={(v) => update((p) => { p.work_experience[i].to = v; })} />
                 )}
               </div>
               <div className="mt-4 space-y-4">
@@ -312,20 +313,21 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
               </div>
               <div className="mt-4 space-y-4">
                 <TextAreaField label="Reason for leaving" bucketPath={i === 0 ? "work_experience.0.reason_for_leaving" : undefined} value={w.reason_for_leaving} rows={2} onChange={(v) => update((p) => { p.work_experience[i].reason_for_leaving = v; })} />
-                {/* ⚠ TRI-STATE, and the two contact boxes appear ONLY on an explicit Yes. Answering
+                {/* ⚠ THREE-WAY, and the two contact boxes appear only on an ALLOWING answer. Answering
                     this is what authorises a recruiter to ring a past employer, so an unanswered
                     question must not look the same as "no" — and the details must not sit there
                     inviting entry when nothing has been agreed to. The filler applies the same gate,
-                    so clearing this back to unanswered withholds them again. */}
-                <TriBoolField
+                    so clearing this back to unanswered withholds them again. "Yes, if required" is an
+                    allowing answer: it permits contact, so the details are how that contact happens. */}
+                <SelectField
                   label="May we contact this employer?"
+                  hint="Forms that offer a conditional option get it; a plain Yes/No form gets Yes."
                   bucketPath={i === 0 ? "work_experience.0.may_contact" : undefined}
-                  value={w.may_contact}
-                  onChange={(v) => update((p) => { p.work_experience[i].may_contact = v; })}
-                  ladder={profile.answer_ladders?.["work_experience.0.may_contact"]}
-                  onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_experience.0.may_contact"] = n; })}
+                  value={w.may_contact ?? ""}
+                  options={MAY_CONTACT_OPTIONS}
+                  onChange={(v) => update((p) => { p.work_experience[i].may_contact = (v || null) as typeof p.work_experience[number]["may_contact"]; })}
                 />
-                {w.may_contact === true && (
+                {w.may_contact != null && w.may_contact !== "no" && (
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <TextField label="Employer email" bucketPath={i === 0 ? "work_experience.0.employer_email" : undefined} value={w.employer_email} onChange={(v) => update((p) => { p.work_experience[i].employer_email = v; })} />
                     <TextField label="Employer phone number" bucketPath={i === 0 ? "work_experience.0.employer_phone" : undefined} value={w.employer_phone} onChange={(v) => update((p) => { p.work_experience[i].employer_phone = v; })} />
@@ -354,6 +356,14 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                 <TextField label="GPA scale" bucketPath={i === 0 ? "education.0.gpa_scale" : undefined} value={e.gpa_scale} placeholder="4.0" onChange={(v) => update((p) => { p.education[i].gpa_scale = v; })} />
                 <DateField label="From year" granularity="year" bucketPath={i === 0 ? "education.0.from_year" : undefined} value={e.from_year} onChange={(v) => update((p) => { p.education[i].from_year = v; })} />
                 <DateField label="To year" granularity="year" bucketPath={i === 0 ? "education.0.to_year" : undefined} value={e.to_year} onChange={(v) => update((p) => { p.education[i].to_year = v; })} />
+              </div>
+              {/* Day-capable dates for application forms that REQUIRE a day. The year fields above are
+                  what the résumé prints; these are what the fill reads, and a day stated here is a FACT,
+                  so it fills unflagged instead of falling back to your default day and asking you to
+                  approve it. Leave the day blank if you only know the month — that behaves as before. */}
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <DateField label="Start date" granularity="month-day-year" hint="for forms that ask a day" bucketPath={i === 0 ? "education.0.start_date" : undefined} value={e.start_date} onChange={(v) => update((p) => { p.education[i].start_date = v; })} />
+                <DateField label="Graduation date" granularity="month-day-year" hint="also used as the end date" bucketPath={i === 0 ? "education.0.graduation_date" : undefined} value={e.graduation_date} onChange={(v) => update((p) => { p.education[i].graduation_date = v; })} />
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <CandidateField label="Degree" bucketPath={i === 0 ? "education.0.degree" : undefined} value={e.degree} placeholder="e.g. Bachelor of Science" onChange={(v) => update((p) => { p.education[i].degree = v; })} />
