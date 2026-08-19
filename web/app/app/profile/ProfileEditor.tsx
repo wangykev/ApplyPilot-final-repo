@@ -359,10 +359,9 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
                   what the résumé prints; these are what the fill reads, and a day stated here is a FACT,
                   so it fills unflagged instead of falling back to your default day and asking you to
                   approve it. Leave the day blank if you only know the month — that behaves as before. */}
-              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <DateField label="Start date" granularity="month-day-year" hint="for forms that ask a day" bucketPath={i === 0 ? "education.0.start_date" : undefined} value={e.start_date} onChange={(v) => update((p) => { p.education[i].start_date = v; })} />
-                <DateField label="End date" granularity="month-day-year" hint="leave blank if enrolled" bucketPath={i === 0 ? "education.0.end_date" : undefined} value={e.end_date} onChange={(v) => update((p) => { p.education[i].end_date = v; })} />
-                <DateField label="Graduation date" granularity="month-day-year" bucketPath={i === 0 ? "education.0.graduation_date" : undefined} value={e.graduation_date} onChange={(v) => update((p) => { p.education[i].graduation_date = v; })} />
+                <DateField label="Graduation date" granularity="month-day-year" hint="also used as the end date" bucketPath={i === 0 ? "education.0.graduation_date" : undefined} value={e.graduation_date} onChange={(v) => update((p) => { p.education[i].graduation_date = v; })} />
               </div>
               <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <CandidateField label="Degree" bucketPath={i === 0 ? "education.0.degree" : undefined} value={e.degree} placeholder="e.g. Bachelor of Science" onChange={(v) => update((p) => { p.education[i].degree = v; })} />

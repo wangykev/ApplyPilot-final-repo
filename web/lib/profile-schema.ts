@@ -123,10 +123,14 @@ export const educationSchema = z.object({
    * Deliberately SEPARATE from from_year/to_year rather than a change of their format: the résumé
    * renders those as a year range, and widening a field the résumé prints is a different blast radius
    * than adding one the fill reads. The fill prefers these and falls back to the year fields.
+   *
+   * ⚠ THERE IS NO `end_date` HERE, ON PURPOSE (operator, 2026-08-18): for education the end date IS the
+   * GRADUATION date, so a second field would be a second place to state one fact — which invites the two
+   * to disagree and leaves the fill guessing which is current. A form's "End Date" parts therefore read
+   * `graduation_date`, and only the START needed a new field (from_year is year-only).
    */
   start_date: str, // "YYYY-MM-DD" | "YYYY-MM" | ""
-  end_date: str, // "YYYY-MM-DD" | "YYYY-MM" | ""
-  graduation_date: str, // "YYYY-MM" or "YYYY-MM-DD" — a stated day fills unflagged
+  graduation_date: str, // "YYYY-MM" | "YYYY-MM-DD" — ALSO the education end date; a stated day fills unflagged
   currently_enrolled: bool, // checkbox
   // Resume-only: the "Relevant Coursework: …" line under this school. coerceProfile
   // bridges the extension profile's application_questions.role_specific.coursework_relevant

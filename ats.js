@@ -395,8 +395,9 @@ const ATS_ICIMS_ENTRY_MAPS = {
       "CandProfileFields.IsGraduated": { kind: "is_graduated" },
       // ⚠ DAY PARTS, AND WHY THE `from` KEYS DIFFER (operator, 2026-08-18). A form can require a DAY
       // for education dates. `from_year`/`to_year` are year-only — a year says nothing about a month,
-      // let alone a day — so the profile grew `start_date`/`end_date` ("YYYY-MM-DD", or "YYYY-MM" when
-      // only the month is known) for exactly this. `fromAlt` is the year-only fallback, so a profile
+      // let alone a day — so the profile grew `start_date` ("YYYY-MM-DD", or "YYYY-MM" when only the
+      // month is known) for exactly this, while the END parts read `graduation_date` (one fact, one place
+      // to state it). `fromAlt` is the year-only fallback, so a profile
       // that has not filled the new fields behaves exactly as before.
       // The `_Date` suffix is iCIMS' own name for the day part (observed on the experience block's
       // rcf3214_Date); `_Day` is accepted too because the platform ids are not guaranteed to agree
@@ -409,10 +410,14 @@ const ATS_ICIMS_ENTRY_MAPS = {
       "CandProfileFields.EducationStartDate_Year": { kind: "date_year", from: "start_date", fromAlt: "from_year" },
       "CandProfileFields.EducationStartDate_Date": { kind: "date_day", from: "start_date" },
       "CandProfileFields.EducationStartDate_Day": { kind: "date_day", from: "start_date" },
-      "CandProfileFields.EducationEndDate_Month": { kind: "date_month", from: "end_date", fromAlt: "to_year" },
-      "CandProfileFields.EducationEndDate_Year": { kind: "date_year", from: "end_date", fromAlt: "to_year" },
-      "CandProfileFields.EducationEndDate_Date": { kind: "date_day", from: "end_date" },
-      "CandProfileFields.EducationEndDate_Day": { kind: "date_day", from: "end_date" },
+      // ⚠ THE EDUCATION END DATE *IS* THE GRADUATION DATE (operator, 2026-08-18). These read
+      // `graduation_date` rather than a field of their own: one fact, one place to state it. Two fields
+      // could disagree, and then the fill would have to pick — which is exactly the kind of guess this
+      // codebase refuses. `to_year` stays as the year-only fallback for the Month/Year parts.
+      "CandProfileFields.EducationEndDate_Month": { kind: "date_month", from: "graduation_date", fromAlt: "to_year" },
+      "CandProfileFields.EducationEndDate_Year": { kind: "date_year", from: "graduation_date", fromAlt: "to_year" },
+      "CandProfileFields.EducationEndDate_Date": { kind: "date_day", from: "graduation_date" },
+      "CandProfileFields.EducationEndDate_Day": { kind: "date_day", from: "graduation_date" },
       // derived from the ENTRY's own location ("Pittsburgh, PA"), never the home address
       "CandProfileFields.EducationCountry": { kind: "entry_country" },
       "CandProfileFields.EducationState": { kind: "entry_state" },
@@ -822,7 +827,7 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
     if (raw == null) return null;
     const s = String(raw);
     // ⚠ ACCEPT DAY PRECISION TOO. These specs matched "YYYY-MM" EXACTLY, so the moment a date carried a
-    // day ("2024-08-26" — the whole point of the new start_date/end_date fields) the month part returned
+    // day ("2024-08-26" — the whole point of the day-capable date fields) the month part returned
     // null and the form's Month dropdown went unfilled while its Day filled perfectly. A more precise
     // value must never answer LESS than a vaguer one.
     const ym = /^(\d{4})-(\d{1,2})(?:-\d{1,2})?$/.exec(s);   // "2028-05" or "2028-05-11"

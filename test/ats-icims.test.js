@@ -567,7 +567,9 @@ const eduDate = (fieldName, entry, defaults) => {
 };
 
 test("education: a STATED day fills the day part unflagged", () => {
-  const entry = { start_date: "2024-08-26", end_date: "2028-05-11", from_year: "2024", to_year: "2028" };
+  // ⚠ NO education `end_date`: the end date IS the graduation date (operator), so a form's End Date parts
+  // read `graduation_date` — one fact, one place to state it.
+  const entry = { start_date: "2024-08-26", graduation_date: "2028-05-11", from_year: "2024", to_year: "2028" };
   const day = eduDate("CandProfileFields.EducationStartDate_Date", entry);
   assert.strictEqual(day.value !== undefined ? day.value : day.raw, "26");
   assert.strictEqual(day.source, "entry", "a stated day is a fact, not a default");
@@ -581,7 +583,10 @@ test("education: a STATED day fills the day part unflagged", () => {
   const yr = eduDate("CandProfileFields.EducationStartDate_Year", entry);
   assert.strictEqual(String(yr.value || yr.raw), "2024");
   // …and the END date answers its own parts
+  // End Date and Graduation are the SAME fact, so both answer from graduation_date
   assert.strictEqual(eduDate("CandProfileFields.EducationEndDate_Date", entry).value, "11");
+  assert.strictEqual(eduDate("CandProfileFields.GraduationDate_Date", entry).value, "11");
+  assert.strictEqual(String(eduDate("CandProfileFields.EducationEndDate_Year", entry).value), "2028");
 });
 
 test("education: with only the year fields set, nothing changes from before", () => {
