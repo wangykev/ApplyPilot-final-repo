@@ -2813,3 +2813,53 @@ test("injected fns never reference another atsInj* function", () => {
     }
   }
 });
+
+
+// ── ORC option capture: which pickers may be enumerated for review ──────────────────────
+// The operator's asymmetry decides every uncertain case: a picker MISSING their answer makes them
+// conclude the form does not offer it, while a complete list wrongly called partial only costs a
+// typed value. So this errs toward not claiming a list.
+
+test("atsOrcCaptureEligible: a plain picker is captured, a GEO picker never is", () => {
+  // non-geo: an empty open returns the whole vocabulary on ORC (measured: country 251, dial 247,
+  // title 17 — there is no pager), so the captured list is genuinely complete.
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "select" }), true);
+  // geo: DEPENDENT (a child with an uncommitted parent answers "No results", so a scan-time capture
+  // would record an empty vocabulary as if it were the field's) and unbounded for city/postal.
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "select", searchDriven: true }), false);
+});
+
+test("atsOrcCaptureEligible: nothing already enumerated is re-opened", () => {
+  // radio / checkbox groups read their option labels inline during the scan — opening them would be
+  // page contact for a list we already hold.
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "radio", options: ["Yes", "No"] }), false);
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "checkbox_group", options: ["A", "B"] }), false);
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "select", options: ["A"] }), false);
+});
+
+test("atsOrcCaptureEligible: non-choice widgets are never opened", () => {
+  for (const w of ["text", "textarea", "date", "file_upload", "checkbox", "unknown"]) {
+    assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: w }), false, w);
+  }
+  assert.strictEqual(ats.atsOrcCaptureEligible(null), false);
+  assert.strictEqual(ats.atsOrcCaptureEligible({}), false);
+});
+
+test("atsAttachOptions: a captured COMPLETE ORC list renders as a real picker", () => {
+  // the whole point of the capture — `options` set means review draws a picker; `captured_options`
+  // means it draws type-it-yourself.
+  const rec = {};
+  ats.atsAttachOptions(rec, ["DR.", "Doctor", "Mr.", "Mrs.", "Ms."]);
+  assert.deepStrictEqual(rec.options, ["DR.", "Doctor", "Mr.", "Mrs.", "Ms."]);
+  assert.strictEqual(rec.captured_options, null);
+  assert.notStrictEqual(rec.widgetType, "typeahead");
+});
+
+test("atsAttachOptions: a list marked PARTIAL degrades to filter-or-type, never a false picker", () => {
+  const rec = {};
+  ats.atsAttachOptions(rec, ["Tallahassee, Leon, FL"], true);
+  assert.strictEqual(rec.options, null);
+  assert.deepStrictEqual(rec.captured_options, ["Tallahassee, Leon, FL"]);
+  assert.strictEqual(rec.widgetType, "typeahead");
+  assert.strictEqual(rec.optionsPartial, true);
+});

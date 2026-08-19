@@ -1660,7 +1660,7 @@ function atsInjScan(ats) {
         const rawLabel = txt(lblEl) || el.getAttribute("aria-label") || "";
         const row = el.closest("div.input-row");
         const rowCls = String((row && row.className) || "");
-        let widgetType, key = el.name || el.id;
+        let widgetType, key = el.name || el.id, searchDriven = false;
 
         if (isFile) {
           // ⚠ THREE FILE INPUTS SHARE `name="attachment-upload"`, told apart ONLY by their wrapper
@@ -1677,6 +1677,13 @@ function atsInjScan(ats) {
         } else if (el.tagName === "SELECT") {
           widgetType = "dropdown_native";
         } else if (el.getAttribute("role") === "combobox" || /input-row--has-picker/.test(rowCls)) {
+          // ⚠ IS THIS PICKER ENUMERABLE? Declared by the row, not inferred: a geo picker carries
+          // `geo-hierarchy-form-element` and is BOTH dependent on a parent and effectively unbounded
+          // (cities, postal codes), so an empty open cannot produce the operator's answer — the same
+          // reason Workday's option capture skips SKILLS. Everything else is a fixed vocabulary that
+          // an empty open returns WHOLE (measured: country = 251 rows, Afghanistan→Zimbabwe, so ORC
+          // does not paginate and needs no page-cap derivation the way iCIMS did).
+          searchDriven = /geo-hierarchy-form-element/.test(rowCls);
           // ORC's own picker. Options are NOT read here: the listbox is created on demand and holds
           // `div[role="row"]` rows inside a `div[role="grid"]` — a `[role=option]` scrape finds
           // NOTHING — so reading them at scan time would mean opening every dropdown on the page.
@@ -1699,6 +1706,7 @@ function atsInjScan(ats) {
           inputSel: el.id ? "#" + esc(el.id) : (el.name ? '[name="' + esc(el.name) + '"]' : ".phone-row__input"),
           widgetType, label: stripStar(rawLabel) || key, isRequired: reqOf(el, rawLabel),
           value: (el.type === "checkbox" ? (el.checked ? "true" : null) : (el.value || null)),
+          searchDriven: searchDriven || undefined,
           section: blockOf(el) });
       }
     }
@@ -3612,11 +3620,13 @@ function icimsAuthView(s) {
 //      fragment behind and the selection does not stick.
 //   5. READ AND COMMIT MUST HAPPEN IN ONE EVALUATION. Measured: the listbox closes between two
 //      separate CDP calls, so a read in one call and a click in the next finds zero rows.
-//   6. ⚠ NEVER PRESS ESCAPE TO CLOSE ONE. On ORC's geo pickers Escape REVERTS the field — and
-//      clearing the parent (`country`) UNMOUNTS its whole dependent block (addressLine1-3, city,
-//      region1/2, postalCode vanish from the DOM). Let focus movement close the list, which is the
-//      standing Workday rule ("sequential cleanup — don't over-engineer per-field close"); this
-//      function deliberately provides no Escape path.
+//   6. ⚠ ESCAPE IS THE CLOSE — and the hazard is UNCOMMITTED TEXT, not Escape (corrected by the
+//      operator, then measured). Blur, focus-move and a second toggle click ALL leave the rows
+//      mounted; Escape takes them to zero with the value untouched. What destroyed an address block
+//      during recon was DISMISSING A PICKER THAT HELD TEXT IT HAD NEVER COMMITTED (`country` was
+//      prefilled text wearing `cx-select-input--invalid`): the dismissal discarded it, and clearing
+//      a geo PARENT unmounts its whole dependent block. So: commit before closing, and if the value
+//      did not take, REPORT it — never dismiss it and hope.
 //
 // `wantTexts` is a LIST so a composite row can be matched whole ("Tallahassee, Leon, FL"), and the
 // caller supplies it — the ambiguity rules stay SW-side. Commits ONLY on exactly one match: two hits
@@ -3698,6 +3708,65 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs) {
     }
   }
   return { ok: false, error: "no-match", query, rows: lastRows };
+}
+
+// ── CAPTURE AN ORC PICKER'S OPTIONS SO REVIEW GETS A REAL PICKER (2026-08-19) ────────────
+// The operator's rule, carried over from iCIMS: on a form where a field we never filled still has to
+// be ANSWERABLE, a picker with no usable options is just a text box. ORC's scan cannot read options
+// inline — the listbox does not exist until the widget opens — so this is a separate, read-only pass.
+//
+// ⚠ AN EMPTY OPEN RETURNS THE WHOLE VOCABULARY ON ORC, which is what makes the captured list
+// genuinely COMPLETE rather than a first page. Measured: `country` returns **251** rows,
+// Afghanistan→Zimbabwe. So ORC needs none of the page-cap derivation iCIMS required — there is no
+// pager to detect. (If a future tenant does paginate, the caller must mark the list partial; that is
+// why completeness is the CALLER's call and this function only reports what it saw.)
+//
+// ⚠ IT OPENS WITH NO QUERY, on purpose. Typing would filter, and a filtered list is not the field's
+// vocabulary — the same reason a search-filtered actuation list must not be mistaken for a complete
+// scan list.
+//
+// ⚠ CLOSED BY BLUR ONLY. NEVER Escape (it REVERTS an ORC geo picker) and never a click elsewhere:
+// that combination unmounted an entire dependent address block during recon and did not recover.
+// Verifies the rows are GONE afterwards and says so, because a lingering list is the standing hazard.
+async function atsInjOrcCaptureOptions(inputSel, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
+  const readRows = () => {
+    const lb = lbId ? document.getElementById(lbId) : null;
+    return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
+  };
+  el.focus();
+  el.click();
+  const deadline = Date.now() + (budgetMs || 6000);
+  let texts = [];
+  let terminalNo = false;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    const rows = readRows();
+    if (rows.length) { texts = rows.map(t).filter(Boolean); break; }
+    const box = document.querySelector(".cx-select__listbox");
+    if (box && /no results/i.test(t(box))) { terminalNo = true; break; }
+  }
+  // ⚠ ESCAPE IS THE CLOSE, and it is the ONLY one that works (operator, then measured): blur,
+  // focus-move to another field, and a second toggle click ALL leave the rows mounted — captured
+  // lists were observed accumulating to 515 rows across three captures. Escape took `title` from 17
+  // rows to 0 with `aria-expanded` true→false and the value untouched.
+  //
+  // ⚠ THE REAL HAZARD IS NOT ESCAPE, IT IS CLOSING A PICKER THAT HOLDS UNCOMMITTED TEXT. A picker
+  // wearing `cx-select-input--invalid` is holding text it never accepted as a selection, and
+  // dismissing it DISCARDS that text — which for a geo PARENT (`country`) also unmounts its whole
+  // dependent block (addressLine1-3, city, region1/2, postalCode leave the DOM). This capture pass
+  // opens with NO query and writes nothing, so it has nothing to lose; a caller that has typed into
+  // a picker must commit it before closing, and report a failure rather than dismissing it.
+  el.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true }));
+  el.dispatchEvent(new KeyboardEvent("keyup", { key: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 300));
+  return { ok: true, options: texts, count: texts.length, terminalNo,
+    // the standing rule: a close is confirmed by the options being GONE, never by aria-expanded
+    closed: readRows().length === 0,
+    heldUncommittedText: /cx-select-input--invalid/.test(String(el.className || "")) };
 }
 
 // Read an ORC picker back. ⚠ THE VALUE ALONE IS NOT PROOF: the widget keeps typed text that it has
@@ -3887,6 +3956,36 @@ function atsInjOrcAuthScan() {
     errors: [...document.querySelectorAll('[role="alert"], .error, .cx-error, cx-notifications')].filter(vis)
       .map((e) => clean(e.textContent)).filter(Boolean).slice(0, 4),
   };
+}
+
+// ── SHOULD THIS ORC PICKER BE ENUMERATED FOR REVIEW? (2026-08-19) ────────────────────────
+// The judgement half of the option capture, SW-side so there is one copy of the policy.
+//
+// The operator's rule is an ASYMMETRY, and it decides every uncertain case here: a picker MISSING
+// their answer makes them conclude the form does not offer it, while a complete list wrongly called
+// partial only costs them a typed value. So this errs toward "do not claim a list".
+//
+//   • a NON-geo picker → capture, and the result is COMPLETE, because an empty open on ORC returns
+//     the whole vocabulary (measured: country = 251 rows) and there is no pager to defeat us.
+//   • a `searchDriven` (geo-hierarchy) picker → NEVER captured. Two independent reasons, either
+//     sufficient: its list is DEPENDENT (a child with an uncommitted parent answers "No results", so
+//     a capture at scan time would record an empty or wrong vocabulary as if it were the field's),
+//     and for city/postal it is effectively UNBOUNDED, so an empty open could never be the picker —
+//     exactly why Workday's capture skips SKILLS. It reaches review as type-it-yourself, which is
+//     the honest rendering. ⚠ Touching these has also already proven destructive during recon.
+//   • anything already carrying options from the scan (radio/checkbox groups read their own labels
+//     inline) needs no capture at all.
+//
+// ⚠ `country` is the one field this deliberately under-serves: it IS a fixed 251-item vocabulary and
+// it is the geo ROOT, so it could be enumerated. It is skipped anyway because it wears the same
+// declared geo class as its dependents, and keying on "which geo field is the root" would be a
+// guess about tenant configuration. The cost is one typed value on a 251-item list; noted rather
+// than silently accepted.
+function atsOrcCaptureEligible(f) {
+  if (!f) return false;
+  if (f.searchDriven) return false;
+  if (Array.isArray(f.options) && f.options.length) return false; // already enumerated inline
+  return f.widgetType === "select";
 }
 
 // ── WHICH ORACLE APPLY-FLOW VIEW ARE WE LOOKING AT? (2026-08-19) ─────────────────────────
@@ -6866,7 +6965,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
-    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker,
+    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,

@@ -5413,3 +5413,90 @@ safe on this platform specifically.
   number halves may need to be committed in a particular order, or the number wants a different format.
   Unresolved; worth a look before trusting the phone composite.
 - `title` (Mr./Ms./…) is optional here and the profile stores no salutation, so it is correctly left blank.
+
+---
+
+## 2026-08-19 (h) — ORC option capture: a real picker in review, and the Escape rule CORRECTED
+
+### ⚠⚠ CORRECTION to entry (g): Escape is the CLOSE. The hazard is UNCOMMITTED TEXT.
+
+Entry (g) concluded *"never press Escape — it reverts an ORC geo picker"* from a single destructive
+event. **Wrong**, and corrected by the operator, then measured. On `title` (non-geo, empty, optional):
+
+| close attempt | rows before | rows after | `aria-expanded` | value |
+|---|---|---|---|---|
+| `el.blur()` | 17 | **17** | true | untouched |
+| focus another field | 17 | **17** | true | untouched |
+| second toggle click | 17 | **17** | true | untouched |
+| **Escape (keydown+keyup)** | 17 | **0** | true → **false** | untouched |
+
+**Escape is the only thing that closes an ORC listbox.** Blur, focus-move and toggle all leave the rows
+mounted — captured lists were observed **accumulating to 515 rows** across three captures, and only
+Escape unmounted them.
+
+So what destroyed the address block in (g) was not Escape. It was **dismissing a picker that held text
+it had never committed.** `country` was PREFILLED text wearing `cx-select-input--invalid` from first
+load; dismissing it discarded that text, and clearing a geo PARENT unmounts its whole dependent block.
+
+The corrected rules:
+- **Escape to close**, always, and confirm by the rows being GONE (never by `aria-expanded`, which
+  stayed `"true"` in every failed attempt above).
+- **Commit before closing.** A picker wearing `--invalid` is holding uncommitted text; if a value was
+  typed and did not take, REPORT the failure — never dismiss and hope.
+- **A geo parent is load-bearing**: clearing `country` takes `addressLine1-3`, `city`, `region1/2` and
+  `postalCode` out of the DOM entirely.
+
+⚠ This is the THIRD single-observation over-generalisation on this platform (after "no verification
+code is ever needed" and "the URL indexes the section list"). The pattern is consistent enough to name:
+**ORC's behaviour is conditional far more often than it looks, so one observation of a branch reads
+exactly like an unconditional rule.**
+
+### An empty open returns the WHOLE vocabulary — so ORC needs no page-cap derivation
+
+Measured, opening with **no query**:
+
+| picker | rows | note |
+|---|---|---|
+| `country` | **251** | Afghanistan → Zimbabwe — the entire list, not a page |
+| dial code | **247** | `+93 (Afghanistan)` … — confirms the `+<code> (<Country>)` shape |
+| `title` | **17** | DR., De, Dipl. Ing., Doctor, Frau, Mag., Miss, Mr., … |
+
+This is the opposite of iCIMS, which paged at 25 and needed `atsIcimsPageCap` to *derive* the page size
+from several dropdowns agreeing on a length. ORC has no pager, so a captured list is genuinely
+**complete** and reaches review as a real picker rather than a filter-or-type box.
+
+⚠ The capture opens with **no query on purpose**: typing filters, and a filtered list is not the
+field's vocabulary — the same distinction as "a proven-complete scan list beats a search-FILTERED
+actuation list".
+
+### What is captured, and what deliberately is not
+
+`atsOrcCaptureEligible` (pure, SW-side, unit-pinned) — the operator's asymmetry decides the uncertain
+cases: a picker MISSING their answer makes them conclude the form does not offer it, while a complete
+list wrongly called partial only costs a typed value.
+
+| field kind | captured? | why |
+|---|---|---|
+| plain picker (`input-row--has-picker`) | **yes**, complete | an empty open returns the whole vocabulary |
+| **geo picker** (`geo-hierarchy-form-element`) | **never** | DEPENDENT — a child whose parent is uncommitted answers *"No results"*, so a scan-time capture would record an EMPTY vocabulary as if it were the field's — and city/postal are effectively unbounded, so an empty open could never be the picker. Exactly why Workday's capture skips SKILLS. |
+| radio / checkbox groups | no | already enumerated inline by the scan from their own `label[for]` texts |
+
+The declared tell is the row class, not a name guess: a geo picker's row reads
+`input-row input-row--has-picker geo-hierarchy-form-element`, a plain one just
+`input-row input-row--has-picker`. The scan stamps `searchDriven` from it.
+
+⚠ **`country` is deliberately under-served**: it IS a fixed 251-item vocabulary and it is the geo ROOT,
+so it *could* be enumerated. It is skipped because it wears the same declared geo class as its
+dependents, and keying on "which geo field is the root" would be a guess about tenant configuration.
+Cost: one typed value on a 251-item list. Recorded rather than silently accepted.
+
+### Verified live
+
+Running the finished primitive against the form: `title` → 17 options, `dial` → 247, both
+`closed: true` and `heldUncommittedText: false`, with DOM rows falling 498 → 251 (the remaining 251 is
+`country`'s list from an earlier un-Escaped capture — still mounted, which is the accumulation problem
+this fix removes).
+
+Before this, every ORC combobox reached review in the `bare` bucket — no options at all, i.e. a plain
+text box — because the scan deliberately does not open dropdowns inline. The `[ATS-OPTIONS]` review-editor
+line is the way to check this per run: it counts `picker` vs `filter-or-type` vs `no options at all`.
