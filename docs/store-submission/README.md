@@ -42,11 +42,11 @@ limited to test users until it clears, and everything else works.
 
 Four need a decision or an action from you. Nothing else is outstanding.
 
-### 1 · Set the privacy-policy contact email ⚠ blocking
+### 1 · Set the privacy-policy contact email ✔ done
 
-`web/app/privacy/page.tsx` has `CONTACT_EMAIL = "support@applypilot.app"`, a placeholder.
-Both reviews test that the contact is reachable, and a bounce restarts the queue. Set it to
-a mailbox you read, then deploy the site so `/privacy` is live before you submit.
+`CONTACT_EMAIL` in `web/app/privacy/page.tsx` is `wangykev@gmail.com`. Still to do: **deploy
+the site** so `/privacy` is live before you submit, and keep that mailbox monitored — both
+reviews test that the contact is reachable, and a bounce restarts the queue.
 
 ### 2 · Decide the "financial information" disclosure
 

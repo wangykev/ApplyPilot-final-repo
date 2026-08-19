@@ -245,6 +245,6 @@ Requirements this URL already satisfies (`web/app/privacy/page.tsx`):
   for by name.
 - **Same domain as the app**, also a Google OAuth requirement.
 
-⚠ Set `CONTACT_EMAIL` in `web/app/privacy/page.tsx` to a mailbox you actually read. It
-currently reads `support@applypilot.app`, a placeholder. Both reviews test the contact,
-and a bounce restarts the queue.
+The policy's contact is `wangykev@gmail.com` (`CONTACT_EMAIL` in
+`web/app/privacy/page.tsx`). Keep that mailbox monitored: both reviews test that the contact
+is reachable, and a bounce restarts the queue.

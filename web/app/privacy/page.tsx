@@ -17,10 +17,10 @@ import Link from "next/link";
  * it as a binding representation.
  */
 
-// ⚠ SET THIS to a mailbox you actually read before submitting. Both Chrome Web Store
-// review and Google OAuth verification check that the contact is reachable, and a
-// bounced verification email restarts the queue.
-const CONTACT_EMAIL = "support@applypilot.app";
+// The published contact for privacy and data requests. Both Chrome Web Store review and
+// Google OAuth verification test that this is reachable, and a bounce restarts the queue —
+// so it is a real monitored mailbox, not an alias that forwards somewhere unattended.
+const CONTACT_EMAIL = "wangykev@gmail.com";
 
 const EFFECTIVE = "August 19, 2026";
 
