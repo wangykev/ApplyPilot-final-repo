@@ -1034,6 +1034,31 @@ test("unwrapStoryLink: DROPS the shim's tracking token — it must never reach t
   assert.ok(!/l\.instagram\.com/.test(out), "the shim host survived");
 });
 
+test("unwrapStoryLink: strips Meta's fbclid from the DESTINATION, not just the shim (live 2026-08-19)", () => {
+  // Observed on the first real sweep: unwrapping the shim still left `?fbclid=<~90 chars>` on
+  // every url, which then reaches Supabase, the logs and the Run pipeline's navigation.
+  const real = "https://careers.truist.com/us/en/job/12345?fbclid=PAcGRvZgRleHRuA2FlbQIxMQBzcnRj";
+  const out = unwrapStoryLink("https://l.instagram.com/?u=" + encodeURIComponent(real));
+  assert.ok(!/fbclid/i.test(out), "fbclid survived: " + out);
+  assert.ok(out.startsWith("https://careers.truist.com/us/en/job/12345"));
+});
+
+test("unwrapStoryLink: strips igshid / igsh too, and leaves a clean url with no stray '?'", () => {
+  const real = "https://job-boards.greenhouse.io/acme/jobs/9?igshid=abc&igsh=def";
+  const out = unwrapStoryLink("https://l.instagram.com/?u=" + encodeURIComponent(real));
+  assert.equal(out, "https://job-boards.greenhouse.io/acme/jobs/9");
+});
+
+test("unwrapStoryLink: a DENYLIST, not 'drop the query' — real params survive alongside a tracker", () => {
+  // The whole reason this is a denylist: an ATS posting id lives in the query on some tenants,
+  // so blanket-stripping would break the link it is meant to clean.
+  const real = "https://x.example/job?jobId=129661&fbclid=PAcGRvZg&source=WEB";
+  const out = unwrapStoryLink("https://l.instagram.com/?u=" + encodeURIComponent(real));
+  assert.ok(out.includes("jobId=129661"), out);
+  assert.ok(out.includes("source=WEB"), out);
+  assert.ok(!/fbclid/i.test(out), out);
+});
+
 test("unwrapStoryLink: keeps the destination's OWN query — an ATS posting id can live there", () => {
   const real = "https://egug.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/job/26011698?mode=location";
   const shim = "https://l.instagram.com/?u=" + encodeURIComponent(real);

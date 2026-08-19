@@ -2301,8 +2301,18 @@ function unwrapStoryLink(raw) {
     try { u = new URL(decodeURIComponent(inner)); } catch (e) { return ""; }
   }
   if (!/^https?:$/i.test(u.protocol)) return "";
+  // ⚠ META APPENDS ITS OWN TRACKER TO THE DESTINATION TOO (live 2026-08-19). Stripping the
+  // `l.instagram.com` shim is not enough: the real url comes back carrying `?fbclid=<~90 chars>`,
+  // which then reaches Supabase, every log line and the Run pipeline's navigation.
+  // A DENYLIST, never "drop the query": the destination's own params are load-bearing (an Oracle
+  // posting id lives in one, and a test pins that `mode=location` survives). These three are
+  // click identifiers Meta injects at click time — no ATS reads them.
+  // NOT a dedup fix: discoveryJobKey already ignores the query (step 5 → _canonicalJobUrl).
+  for (const junk of STORY_LINK_TRACKERS) u.searchParams.delete(junk);
   return u.toString();
 }
+
+const STORY_LINK_TRACKERS = ["fbclid", "igshid", "igsh"];
 
 /**
  * INJECTED into an instagram.com tab. Self-contained — closes over NOTHING.
@@ -2381,11 +2391,28 @@ async function discoverFromZero2Sudo(opts) {
   } catch (e) {
     return { jobs: [], note: "Couldn't read @" + DISCOVER_Z2S_USERNAME + "'s stories: " + String((e && e.message) || e), scanned: 0 };
   }
-  if (!read) return { jobs: [], note: "@" + DISCOVER_Z2S_USERNAME + ": the story read returned nothing.", scanned: 0 };
-  if (read.signedIn === false) {
-    return { jobs: [], note: "@" + DISCOVER_Z2S_USERNAME + " skipped — " + (read.note || "not signed in to Instagram") + " Sign in to Instagram in this Chrome profile, then run Discover again.", scanned: 0 };
+  if (!read) {
+    dlog(`zero2sudo: the story read returned NOTHING (the injected reader gave no result)`);
+    return { jobs: [], note: "@" + DISCOVER_Z2S_USERNAME + ": the story read returned nothing.", scanned: 0 };
   }
-  if (read.note && !read.items.length) return { jobs: [], note: "@" + DISCOVER_Z2S_USERNAME + ": " + read.note, scanned: read.total || 0 };
+  // ⚠ SIGNED OUT MUST BE LOUD IN THE SW LOG, not only in the returned note (live 2026-08-19).
+  // The first live run on a fresh Chrome profile logged nothing but `scanned {"zero2sudo":0}`,
+  // which reads exactly like "he posted nothing today" — the note explaining why existed, but
+  // only on the RESULT, so the console (the primary debugging surface) showed a silent zero.
+  // `signedOut: true` mirrors what the boards return, so a caller can tell "fix your session"
+  // apart from "nothing found".
+  if (read.signedIn === false) {
+    dlog(`zero2sudo: NOT SIGNED IN — ${read.note || "no ds_user_id cookie on instagram.com"}`);
+    return {
+      jobs: [], scanned: 0, signedOut: true,
+      note: "@" + DISCOVER_Z2S_USERNAME + " skipped — you're not signed in to Instagram. "
+        + "Sign in to Instagram in this Chrome profile, then run Discover again.",
+    };
+  }
+  if (read.note && !read.items.length) {
+    dlog(`zero2sudo: read FAILED — ${read.note}`);
+    return { jobs: [], note: "@" + DISCOVER_Z2S_USERNAME + ": " + read.note, scanned: read.total || 0 };
+  }
 
   dlog(`zero2sudo: ${read.total} live stor${read.total === 1 ? "y" : "ies"}, ${read.linked} carrying a link sticker`);
 

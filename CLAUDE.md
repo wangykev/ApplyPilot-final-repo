@@ -1017,9 +1017,15 @@ LinkedIn/Handshake — **cookies, not keys**: the JSON instagram.com's own clien
 on that origin, carrying the operator's session. No API key, no burner, and the standing **never attempts a
 login** invariant holds (not signed in ⇒ note + skip).
 
-- **A LINK STICKER *IS* THE JOB FILTER — that is why this source is cheap.** Traced live: 32 stories, 16 with
-  a sticker, and **every one of the 16 was a real posting** while the other 16 carried no tappable link at
-  all. So there is **no OCR, no vision call and no classifier** — and `llm.js` needs no image support.
+- **A LINK STICKER IS A CHEAP PRE-FILTER — NOT a classifier (corrected by a live run, 2026-08-19).** The
+  first trace (32 stories, 16 stickered, all 16 real postings) suggested "the sticker IS the job filter", and
+  that claim was written here as fact. **A second live sweep refuted it**: of 13 stickered stories, ~7 were
+  real individual postings and the rest were an event RSVP (`rsvp.withgoogle.com`), a Zoom **webinar**
+  (`micron.zoom.us`), a "TikTok Interest Form", a careers **index** page (`verition.com` → "OPEN POSITIONS"),
+  and one **dead** posting (Intuit → "Job Not Found"). He links events and forms too. What survives: the
+  sticker still removes the ~half of stories with no link at all, and it is still **free** — so there is
+  **no OCR, no vision call and `llm.js` needs no image support**. What does NOT survive: the idea that no
+  further filtering is needed. ⚠ *One sample is not a property* — that is the whole lesson here.
 - **⚠ 24-HOUR WINDOW, AND HIGHLIGHTS DO NOT FIX IT — measured, not assumed.** The obvious hope (job stories
   get archived into a Highlight, which never expires) was **TESTED AND REFUTED**: "Insider Info 4" held 65
   items over the same dates, only 3 had a sticker, and cross-referencing by media id gave **ZERO overlap**
@@ -1031,9 +1037,23 @@ login** invariant holds (not signed in ⇒ note + skip).
   therefore scores ~0 on relevance and is dropped below the match threshold before anything ever opens it:
   **the source would look empty rather than filtered.** So it spends its own `maxStoryReads` budget inside
   the driver. Do not "simplify" this by deferring to the global reader pass.
-- **The shim's tracking token is DISCARDED.** A sticker url is `l.instagram.com/?u=<real>&e=<token>`;
-  `unwrapStoryLink` (pure, unit-pinned) keeps only the destination. A discovered url reaches Supabase and the
-  logs, so carrying `e=` there is the leak class `redactSecrets` exists for.
+- **META'S TRACKERS ARE DISCARDED — BOTH OF THEM.** A sticker url is `l.instagram.com/?u=<real>&e=<token>`,
+  **and the unwrapped destination comes back carrying `?fbclid=<~90 chars>`** (found live 2026-08-19: 13/13
+  urls). `unwrapStoryLink` (pure, unit-pinned) drops the shim and a **denylist** — `fbclid`, `igshid`,
+  `igsh`. A discovered url reaches Supabase, the logs and the Run pipeline's navigation, so this is the leak
+  class `redactSecrets` exists for. ⚠ **A denylist, never "drop the query"**: some tenants put the posting id
+  there (`?jobId=…`, `?gh_jid=…`) and he tags his own links `utm_source=zero2sudo` — both observed live.
+  Not a dedup fix: `discoveryJobKey` already ignores the query.
+- **SIGNED-OUT MUST BE LOUD IN THE SW LOG, not only in the returned note.** The first live run on a fresh
+  Chrome profile logged nothing but `scanned {"zero2sudo":0}` — indistinguishable from "he posted nothing
+  today". It now logs `zero2sudo: NOT SIGNED IN — …` and returns **`signedOut: true`**, mirroring what the
+  boards do so a caller can tell "fix your session" from "nothing found".
+- **⚠ THE MATCH THRESHOLD CAN ZERO THIS SOURCE OUT, and that is a real operational surprise.** Live: a sweep
+  with the operator's profile-derived keywords ("Characterization and Test Automation intern", …) found 13
+  links and queued **0** — every one scored 39–57% against a 60% default. Nothing is broken and nothing is
+  silent (the panel says *"13 scored lower — lower the threshold to take more"*), but a **human-curated**
+  feed being filtered by *your* keyword match is a genuine design tension: the point of the source is jobs
+  you would not have searched for. Left as the operator's call — the threshold is theirs to set.
 - **⚠ READING A STORY IS OBSERVABLE** — it marks them seen and the operator appears in his viewer list. Stated
   in the UI hint, not buried. It is the one discovery source that is not purely passive.
 - **THE TAB EXISTS ONLY TO SUPPLY THE ORIGIN, so it opens `robots.txt`, not instagram.com.** Nothing in the

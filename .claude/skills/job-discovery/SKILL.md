@@ -49,10 +49,25 @@ not a credential, and the calls 400 without it):
 Each item carries `taken_at`, `expiring_at`, and — the only field that matters —
 `story_link_stickers[].story_link.url`.
 
-- **A LINK STICKER *IS* THE JOB FILTER.** Measured: 32 live stories, 16 with a sticker, and every one of
-  those 16 was a real posting while the other 16 carried no tappable link at all. So there is **no OCR, no
-  vision call, no classifier**, and `llm.js` needs no image support. `story_cta` (the pre-2021 swipe-up) was
-  0/32, so only the sticker field is read.
+- **A LINK STICKER IS A PRE-FILTER, NOT A CLASSIFIER — corrected by a live sweep (2026-08-19).** The first
+  trace (32 stories, 16 stickered, all 16 real postings) was written up as "the sticker IS the job filter".
+  A second sweep refuted it: of 13 stickered stories, ~7 were real individual postings; the rest were an
+  event RSVP (`rsvp.withgoogle.com`), a Zoom **webinar** (`micron.zoom.us`), a "TikTok Interest Form", a
+  careers **index** (`verition.com` → "OPEN POSITIONS"), and a **dead** posting (Intuit → "Job Not Found").
+  Still true and still the point: the sticker removes the ~half of stories with no link at all, costs
+  nothing, and keeps **`llm.js` free of image support**. No longer true: that nothing further is needed.
+  `story_cta` (the pre-2021 swipe-up) remains 0 across every sample, so only the sticker field is read.
+  ⚠ **One sample is not a property.** This claim survived into CLAUDE.md as fact off a single trace.
+- **⚠ THE SCRAPED TITLE IS OFTEN A PAGE ARTIFACT.** Live, `scrapeJobPosting` returned literal
+  `"Job title"` (Truist), `"Single Position"` (Microsoft), `"CAREERS AT NVIDIA"` (a 134-char read) and
+  `"Job Not Found"` (Intuit) as *titles*. These are employer SPA shells, not postings — the same
+  non-ATS career sites that make up most of this source. Do not read a queued row's title as evidence
+  the posting parsed correctly.
+- **⚠ THE MATCH THRESHOLD CAN ZERO THIS SOURCE OUT.** Live: 13 links found, **0 queued** — all scored
+  39–57% against the 60% default, because the keywords were profile-derived and specific
+  ("Characterization and Test Automation intern"). Not a bug and not silent (the panel says *"13 scored
+  lower — lower the threshold to take more"*), but filtering a **human-curated** feed by your own keyword
+  match works against the reason the source exists. Operator's call; the threshold is theirs.
 - **⚠ HIGHLIGHTS DO NOT EXTEND THE 24h WINDOW — tested and refuted, do not re-theorise it.** "Insider Info 4"
   held 65 items over the same date range, only 3 had a sticker, and cross-referencing by media id gave
   **ZERO overlap** with the 16 live linked ones. He archives evergreen commentary, not the job drops. The

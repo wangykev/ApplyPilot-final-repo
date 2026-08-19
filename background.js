@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-leansig-1";
+const AP_BUILD_MARKER = "zero2sudo-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -614,6 +614,8 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           // everything, so the 60-job cap never applied on the website path).
           ...(message.maxTotal != null ? { maxTotal: message.maxTotal } : {}),
           ...(message.maxJdOpens != null ? { maxJdOpens: message.maxJdOpens } : {}),
+          // zero2sudo's own description budget — same `!= null` guard as its siblings.
+          ...(message.maxStoryReads != null ? { maxStoryReads: message.maxStoryReads } : {}),
           ...(message.maxRecords != null ? { maxRecords: message.maxRecords } : {}),
           // Scrape wide, queue narrow (2026-07-30): how many result pages to sweep,
           // and how many of the best-matching to actually return for queueing.
@@ -1512,6 +1514,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // Only when actually supplied — an `undefined` here would clobber the
           // default it is meant to override (see the AP_DISCOVER_JOBS note).
           ...(message.maxJdOpens != null ? { maxJdOpens: message.maxJdOpens } : {}),
+          // zero2sudo's own description budget — same `!= null` guard as its siblings.
+          ...(message.maxStoryReads != null ? { maxStoryReads: message.maxStoryReads } : {}),
           ...(message.maxRecords != null ? { maxRecords: message.maxRecords } : {}),
           ...(message.maxPages != null ? { maxPages: message.maxPages } : {}),
           ...(message.minMatchPercent != null ? { minMatchPercent: message.minMatchPercent } : {}),

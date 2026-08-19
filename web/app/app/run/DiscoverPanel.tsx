@@ -248,7 +248,7 @@ export function DiscoverPanel({
   return (
     <SectionCard
       title="Discover new jobs"
-      subtitle="Sweeps the Simplify 2026 internship board plus your signed-in LinkedIn and Handshake job searches for recent postings you haven't applied to, reads each job description, and adds them to your queue. It only reads — nothing is applied to."
+      subtitle="Sweeps the Simplify 2026 internship board, @zero2sudo's Instagram stories, and your signed-in LinkedIn and Handshake job searches for recent postings you haven't applied to, reads each job description, and adds them to your queue. It only reads — nothing is applied to."
     >
       {connected === false && (
         <div className="mb-5 flex items-start gap-3 rounded-lg border border-amber/30 bg-amber/[0.05] px-4 py-3 text-sm">

@@ -5650,8 +5650,43 @@ host permission to an already-installed extension makes Chrome **disable it unti
 Whether MV3's SW `credentials:"include"` attaches IG's cookies is also version-sensitive enough that it
 would need proving first. A sub-second tab is the cheaper trade.
 
-**1589 unit tests**, all green (11 new: shim unwrap incl. token-stripping, `foundOn` merge across both dedup
-passes, same-source repeats left alone). Website typecheck clean, `next build` clean, 315 web tests green
-including the `discover.js` ↔ `web/lib/discover.ts` lockstep cross-load. ⚠ **The full sweep is still not
-live-verified** — the endpoint reads and the origin trick both are, by hand; what remains unproven is the
-driver running under an actual Discover run in a loaded extension.
+### LIVE-VERIFIED the same day — and the live run corrected the headline claim
+
+Driven end to end in a second Chrome profile with the worktree loaded (`AP_PING` build marker
+`icims-leansig-1` → `zero2sudo-3` across reloads, which is what proved the loaded directory was this
+worktree and not another).
+
+**What passed.** Signed-out path: clean skip, actionable note, **no login attempted** — hit for real,
+because that profile was signed out. Happy path: `zero2sudo: 35 live stories, 13 carrying a link sticker`
+→ 13 jobs with correct keys (`greenhouse:gardacp:6146213004`, `wd5:jr2023495`), real companies and JDs
+(Nvidia, Gardacp, Honeywell, Humana). The `robots.txt` origin trick worked under a real sweep. All four
+source toggles render. And the queue tabs: **`ALL 40 · @ZERO2SUDO 13 · LINKEDIN 27`**, clicking
+@zero2sudo filtered to exactly 13 rows all badged `zero2sudo`, caption switching *"deduped union"* →
+*"everything this source found"*. With one source present the bar correctly stays hidden.
+
+**⚠ THE HEADLINE CLAIM WAS WRONG, and one sample is why.** "Every stickered story is a real posting" came
+off a single trace and was written into CLAUDE.md as fact. This sweep: of 13 stickered stories, ~7 were
+real individual postings; the rest were an event RSVP (`rsvp.withgoogle.com`), a Zoom **webinar**
+(`micron.zoom.us`), a "TikTok Interest Form", a careers **index** (`verition.com`), and a **dead** posting
+(Intuit → "Job Not Found"). The sticker is a cheap pre-filter, not a classifier. Corrected in CLAUDE.md and
+the skill. *A property claimed off one observation is a hypothesis.*
+
+**Three defects the live run found, all fixed:**
+- **`fbclid` on the DESTINATION.** Unwrapping the shim was not enough — 13/13 urls came back carrying
+  `?fbclid=<~90 chars>`, straight into Supabase and every log line. Now a denylist (`fbclid`/`igshid`/
+  `igsh`), deliberately not "drop the query": one of his links carries `utm_source=zero2sudo` and some
+  tenants put the posting id there (`?jobId=`, `?gh_jid=`). 3 tests.
+- **Signed-out was invisible in the SW log** — the note existed only on the RESULT, so the console showed a
+  bare `scanned {"zero2sudo":0}`, identical to "he posted nothing". Now `dlog`s `NOT SIGNED IN` and returns
+  `signedOut: true` like the boards. *This was the operator's own ask, and the live run is what showed the
+  note was reaching the wrong surface.*
+- **`maxStoryReads` was not forwardable** through either message handler, unlike every sibling budget.
+
+**One operational finding, left as the operator's call.** A sweep with profile-derived keywords found 13
+links and queued **0** — every one scored 39–57% against the 60% default. Nothing broken, nothing silent
+(*"13 scored lower — lower the threshold to take more"*), but filtering a **human-curated** feed by your own
+keyword match works against the reason the source exists. Also noted: `scrapeJobPosting` returns page
+artifacts as titles on these employer SPAs (`"Job title"`, `"Single Position"`, `"CAREERS AT NVIDIA"`).
+
+**1592 unit tests**, all green (14 new). Website typecheck clean, `next build` clean, 315 web tests green
+including the `discover.js` ↔ `web/lib/discover.ts` lockstep cross-load.

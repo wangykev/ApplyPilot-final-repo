@@ -12,29 +12,37 @@ discover branch).
 
 ## Active
 
-### NEXT (0a) — @zero2sudo source + queue tabs: BUILT AND GREEN, **not yet live-verified** (2026-08-19)
+### NEXT (0a) — @zero2sudo source + queue tabs: **LIVE-VERIFIED end to end** (2026-08-19)
 
-Branch `zero2sudo-source-queue-tabs`. 1589 unit tests green, website typecheck + `next build` clean, 315 web
-tests green. What is **not** yet proven, because it needs a loaded extension and a real sweep:
+Branch `zero2sudo-source-queue-tabs`. 1592 unit tests green, website typecheck + `next build` clean, 315 web
+tests green. Driven live in a second Chrome profile — build marker `zero2sudo-3` confirmed which directory
+was loaded, which is the check that makes the rest of it mean anything:
 
-- the driver's **tab orchestration** — `withDiscoverTab`, the CDP fallback (no host permission for that
-  origin), and the async injected reader resolving through `awaitPromise`. Verified by hand: the live
-  endpoints, and the `robots.txt` origin trick (`text/plain`, `document.cookie` readable, both endpoints
-  200). Unverified: all of it running under an actual Discover run.
-- **`fillMissingDescriptions` on story links** — 16 employer postings across 13 different ATS platforms is a
-  harsher input than the boards ever give it. Expect some to yield no description; they queue anyway.
-- the **per-source tabs** with real overlap in them (needs a sweep where two sources find the same job).
+- **signed-out skip** with a clear note and **no login attempt** (hit for real — that profile was signed out);
+- **`35 live stories → 13 stickered → 13 jobs`** with correct ATS keys (`greenhouse:gardacp:…`, `wd5:jr…`)
+  and real companies/JDs (Nvidia, Gardacp, Honeywell, Humana);
+- the **`robots.txt` origin trick** under a real sweep, and all four source toggles rendering;
+- the **queue tabs**: `ALL 40 · @ZERO2SUDO 13 · LINKEDIN 27`, filtering to exactly 13 badged rows, caption
+  switching *"deduped union"* → *"everything this source found"*. One source ⇒ bar correctly hidden.
 
-**Two operator decisions waiting**, both from the live trace:
+**Still unproven:** `foundOn` overlap *in the UI*. It is unit-pinned across both dedup passes, but no live
+sweep has yet had two sources find the SAME posting, so no row has rendered two badges.
 
-1. **Coverage.** Only 3 of the 16 links found are on an ATS ApplyPilot can fill (2 Greenhouse, 1 Workday).
-   **Oracle Recruiting Cloud** is the highest-value next adapter (3 of 16, and everywhere in the
-   defense/industrials postings he favours). A **Phenom** trace would settle 4 more — Phenom is a career-site
-   front end that often hands off to a real ATS at the apply step, so those may already be reachable.
-2. **The 24h window.** This source can only ever see what is live when the sweep runs; highlights were tested
-   and do not help. The operator's existing 8h GCP cron is the only thing that closes it — and with link
-   stickers present it no longer needs a Claude call at all, just the sticker urls. Reading that collector's
-   Sheet as a FIFTH source (~80 lines, mirroring `discoverFromSimplify`) is the cheap way to get coverage.
+**Three operator decisions waiting:**
+
+1. **A link sticker is NOT a job filter — refuted live** (details in the progress log). Of 13 stickered
+   stories ~7 were real postings; the rest were an event RSVP, a Zoom webinar, a "TikTok Interest Form", a
+   careers index page, and one dead posting ("Job Not Found"). Options: gate on `detectAts` (high precision,
+   ~3/16 recall), a URL/title heuristic (`rsvp.`, `zoom.us`, `/forms/`, "Job Not Found"), or leave it and
+   let the operator delete rows. **Not decided.**
+2. **Coverage.** Only ~3 of 16 links are on an ATS ApplyPilot can fill (2 Greenhouse, 1 Workday).
+   **Oracle Recruiting Cloud** is the highest-value next adapter; a **Phenom** trace could settle ~4 more,
+   since Phenom often hands off to a real ATS at the apply step.
+3. **The 24h window, and the match threshold.** Highlights do not help (tested). The 8h cron is the only
+   thing that closes the window — and with stickers present it needs no Claude call, just the urls; reading
+   its Sheet as a FIFTH source is ~80 lines mirroring `discoverFromSimplify`. Separately, a live sweep
+   queued **0 of 13** because they scored 39–57% against the 60% default: filtering a *curated* feed by your
+   own keywords works against the point of the source.
 
 ### NEXT (0) — iCIMS: LIVE-VERIFIED through the address block; next is Education (operator 2026-08-16)
 
