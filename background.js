@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-probe-1";
+const AP_BUILD_MARKER = "icims-listwait-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -703,7 +703,11 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
   // unreachable. WHITELISTED keys only: this must never become an arbitrary-storage write (the profile,
   // the review bundle and the session all live in the same store). Omit `value` to read them all.
   if (type === "AP_DEV_FLAG") {
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace"];
+    // `skipIcimsResume` exists for ONE experiment that cannot be run any other way: the iCIMS résumé
+    // parse re-renders the form, so "is this widget's option list empty because the tenant has none, or
+    // because the PARSE left it that way?" is only answerable by filling the same form with the attach
+    // OFF. Diagnostic only — a real run always attaches (the operator's résumé belongs on the form).
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -927,6 +931,29 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             if (rows.length && !(rows.length === 1 && /^no results$/i.test(String(rows[0]).trim()))) break;
           }
         }
+        // ⚠ RAW DUMP — added because two rounds of theorising about WHY a list was empty were both wrong
+        // (the résumé parse: ruled out by an A/B; the tenant: contradicted by the operator's own screen).
+        // What settles it is what the page actually contains: the widget's own attributes (is it really
+        // the AJAX flavour?), the NATIVE select's options (which we ignore for an icims_dropdown — if
+        // they are populated, we are reading the wrong place), the results <ul>'s rows, whether a search
+        // box exists at all, and the iframe's src params (iCIMS varies its rendering by width/mobile).
+        out.dump = await cdpEval(function (s2) {
+          const el = document.querySelector(s2);
+          if (!el) return { ok: false, error: "not-found" };
+          const txt = (n) => (n && n.textContent ? n.textContent.replace(/\s+/g, " ").trim() : "");
+          const ul = el.id ? document.getElementById(el.id + "_dropdown-results") : null;
+          const ctnr = el.id ? document.getElementById(el.id + "_icimsDropdown_ctnr") : null;
+          return { ok: true,
+            attrs: [...el.attributes].map((a) => a.name + "=" + String(a.value).slice(0, 40)),
+            nativeOptionCount: el.options ? el.options.length : null,
+            nativeOptions: el.options ? [...el.options].slice(0, 30).map((o) => txt(o) || "(blank)") : null,
+            nativeValue: el.value, selectedIndex: el.selectedIndex,
+            ulRows: ul ? [...ul.children].map(txt).slice(0, 30) : null,
+            ctnrClass: ctnr ? String(ctnr.className) : null,
+            hasSearchBox: !!(ctnr && ctnr.querySelector("input.dropdown-search")),
+            searchBoxValue: ctnr && ctnr.querySelector("input.dropdown-search") ? ctnr.querySelector("input.dropdown-search").value : null,
+            frameUrl: String(location.href).slice(0, 160) };
+        }, sel).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
         out.shown = await cdpEval(atsInjIcimsRead, sel).catch(() => null);
         await cdpEval(atsInjIcimsClose, sel).catch(() => null);
         sendResponse(out);
@@ -5303,7 +5330,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // shape that produced 28 of a rehearsal's 32 verify failures when the entry counts disagreed. Both
     // visits must see the same form, so both attach.
     let resumePre = null, resumeStageMs = null;
-    if (ats === "icims") {
+    const skipIcimsResume = await new Promise((r) => chrome.storage.local.get(["skipIcimsResume"], (v) => r(!!(v && v.skipIcimsResume))));
+    if (skipIcimsResume && ats === "icims") LOG("⚠ skipIcimsResume is SET — attaching NO résumé this run (diagnostic only; a real run always attaches)");
+    if (ats === "icims" && !skipIcimsResume) {
       emitRunProgress("Attaching your résumé", "iCIMS parses it server-side — the fill waits for that to finish");
       const rsT0 = Date.now();
       resumePre = await atsIcimsResumeStage(act, ats, { log: (m) => LOG("résumé: " + m) });

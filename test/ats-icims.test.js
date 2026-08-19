@@ -573,26 +573,129 @@ test("scan: the widget's own \"No Results\" row is NOT a pickable option", () =>
   assert.match(src, /no results/i, "atsInjIcimsReadOptions must filter the same sentinel");
 });
 
-test("an EMPTY tenant list is reported as the FORM's, not as a failed search", async () => {
-  // "the list was empty" read as OUR search having failed and cost a full investigation round. When the
-  // widget offers nothing at all, the record has to say so: no profile edit or rematch changes it.
+test("a SEARCH-LESS icims_dropdown is never typed into — that is what emptied its list", async () => {
+  // Cretex's Degree: `icimsdropdown-search="0"`, nine real options, reported EMPTY twice. The search box
+  // exists in the markup either way, so its presence proves nothing; typing into a search-less widget
+  // FILTERS the rendered rows to nothing, which reads exactly like an empty list. The operator's screen
+  // is what refuted the "empty tenant list" conclusion.
+  const DEGREES = ["High School Diploma/GED", "AS", "BS", "MS", "PhD", "MBA", "MCS", "BCS", "BA"];
+  const page = icimsPage();
+  let searched = 0;
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
+      label: "Degree", isRequired: true, value: null, options: DEGREES, optionsPartial: false,
+      searchable: false, domIndex: 0 },
+  ] });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: DEGREES });
+  page.atsInjIcimsReadOptions = () => ({ ok: true, options: DEGREES, awaitingParent: false, noResults: false });
+  page.atsInjIcimsSearch = () => { searched++; return { ok: true }; };
+  page.atsInjIcimsClose = () => ({ ok: true });
+  page.atsInjIcimsRead = () => ({ ok: true, value: "BS" });
+  page.atsInjIcimsCommit = () => ({ ok: true });
+  // the POST-FILL AUDIT re-reads every committed field independently — without this the fake page's
+  // generic reader answers null and the audit (correctly) downgrades a good commit to needs_review
+  page.atsInjReadValue = () => ({ ok: true, value: "BS" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { education: [{ degree: "Bachelor of Science", school: "Carnegie Mellon University" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results.find((r) => /Degree/.test(r.fieldName));
+  assert.strictEqual(searched, 0, "a search-less widget must never be typed into");
+  // …and the DEGREE BRIDGE makes the abbreviation reachable: "Bachelor of Science" → "BS".
+  // Graded EXACT and left UNFLAGGED deliberately — an acronym is a fact about the words, not a
+  // similarity score, and uniqueness is enforced, so asking the operator to re-check it is noise.
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "BS");
+  assert.strictEqual(rec.matchTier, "exact-normalized");
+  assert.strictEqual(rec.flag, null);
+});
+
+test("an AJAX list that arrives LATE is waited for, not called empty", async () => {
+  // The list is fetched on open (`icimsdropdown-ajax="1"`), so the first read is a race — and hidden runs
+  // pace fast, which is how "sometimes it shows no results" happens. Ask the page, never a clock.
+  const DEG = ["AS", "BS", "MS"];
+  let reads = 0;
   const page = icimsPage();
   page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
     { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
-      label: "Degree", isRequired: true, value: null, options: [], optionsPartial: true, domIndex: 0 },
+      label: "Degree", isRequired: true, value: null, options: [], searchable: false, domIndex: 0 },
   ] });
-  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: ["No Results"] });
-  page.atsInjIcimsReadOptions = () => ({ ok: true, options: [], awaitingParent: false, noChildren: false, noResults: true });
-  page.atsInjIcimsSearch = () => ({ ok: true });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: [] });          // empty at open
+  page.atsInjIcimsReadOptions = () => (++reads >= 3                               // …arrives on the 3rd read
+    ? { ok: true, options: DEG, awaitingParent: false, noResults: false }
+    : { ok: true, options: [], awaitingParent: false, noResults: false });
+  page.atsInjIcimsClose = () => ({ ok: true });
+  page.atsInjIcimsRead = () => ({ ok: true, value: "BS" });
+  page.atsInjIcimsCommit = () => ({ ok: true });
+  page.atsInjReadValue = () => ({ ok: true, value: "BS" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { education: [{ degree: "Bachelor of Science" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results.find((r) => /Degree/.test(r.fieldName));
+  assert.ok(reads >= 3, "it must keep asking until the rows arrive");
+  assert.strictEqual(rec.status, "filled");
+  assert.strictEqual(rec.after, "BS");
+});
+
+test("a list that NEVER loads is reported as OUR failed read, not as the employer's vocabulary", async () => {
+  // The mistake this round started with was claiming an empty read proved the form offers nothing. An
+  // absent list is evidence about our read and nothing else.
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
+      label: "Degree", isRequired: true, value: null, options: [], searchable: false, domIndex: 0 },
+  ] });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: [] });
+  page.atsInjIcimsReadOptions = () => ({ ok: true, options: [], awaitingParent: false, noResults: true });
   page.atsInjIcimsClose = () => ({ ok: true });
   page.atsInjIcimsRead = () => ({ ok: true, value: null });
   const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
-    { education: [{ degree: "Bachelor of Science", school: "Carnegie Mellon University" }] }, {}, {}, { credentials: CREDS });
-  const rec = out.results[0];
+    { education: [{ degree: "Bachelor of Science" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results.find((r) => /Degree/.test(r.fieldName));
   assert.strictEqual(rec.status, "needs_review");
-  assert.match(rec.detail, /EMPTY/, "it must name the form's empty list: " + rec.detail);
-  assert.match(rec.detail, /Nothing on our side/, "and say that our side cannot fix it");
-  assert.ok(!/after searching/.test(rec.detail), "it must not read as a failed search: " + rec.detail);
+  assert.strictEqual(rec.flag, "list-never-loaded");
+  assert.match(rec.detail, /our read, not the employer/);
+  assert.ok(!/all it offers/.test(rec.detail), "it must not claim to know the vocabulary: " + rec.detail);
+});
+
+test("atsDegreeMatch: the ACRONYM tier answers an abbreviation list the level tier cannot", () => {
+  // Cretex's list, measured. BS / BCS / BA are all "bachelor", so the level tier's exactly-one guard
+  // refuses it — correctly — and the option the applicant holds stays unreachable without initials.
+  const L = ["High School Diploma/GED", "AS", "BS", "MS", "PhD", "MBA", "MCS", "BCS", "BA"];
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelor of Science"], L), "BS");
+  assert.strictEqual(ats.atsDegreeMatch(["Master of Science"], L), "MS");
+  assert.strictEqual(ats.atsDegreeMatch(["Master of Business Administration"], L), "MBA");
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelor of Arts"], L), "BA");
+  // ⚠ AMBIGUITY STILL REFUSES: a bare level has no acronym, and three options share it
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelors"], L), null);
+  // …and a degree this list does not carry is an honest miss, never the nearest doctorate
+  assert.strictEqual(ats.atsDegreeMatch(["Doctor of Optometry"], L), null);
+  // the level tier still works where it always did (one bachelor spelled in full)
+  assert.strictEqual(ats.atsDegreeMatch(["Bachelors"], ["High School", "Bachelor of Science", "Master of Science"]), "Bachelor of Science");
+  // acronym building: filler words dropped, single words refused
+  assert.strictEqual(ats.atsDegreeAcronym("Bachelor of Science"), "BS");
+  assert.strictEqual(ats.atsDegreeAcronym("Master of Business Administration"), "MBA");
+  assert.strictEqual(ats.atsDegreeAcronym("Bachelors"), null);
+});
+
+test("a search-less list reaches review as a REAL picker, not a type-it-yourself box", async () => {
+  // `optionsPartial` is provenance: a searchable widget renders one page of many, but a search-less one
+  // has no second page — so what it shows IS the vocabulary. Called partial, review offers a text box.
+  const DEGREES = ["AS", "BS", "MS"];
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "-1_CandProfileFields.Degree", inputSel: "#degree", widgetType: "icims_dropdown",
+      label: "Degree", isRequired: true, value: null, options: DEGREES, optionsPartial: false,
+      searchable: false, domIndex: 0 },
+  ] });
+  page.atsInjIcimsOpen = () => ({ ok: true, open: true, options: DEGREES });
+  page.atsInjIcimsReadOptions = () => ({ ok: true, options: DEGREES, awaitingParent: false, noResults: false });
+  page.atsInjIcimsClose = () => ({ ok: true });
+  page.atsInjIcimsRead = () => ({ ok: true, value: null });
+  page.atsInjIcimsSearch = () => ({ ok: true });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims",
+    { education: [{ degree: "Doctor of Optometry" }] }, {}, {}, { credentials: CREDS });
+  const rec = out.results.find((r) => /Degree/.test(r.fieldName));
+  assert.deepStrictEqual(rec.options, DEGREES, "the full list rides the record as a picker");
+  assert.ok(!rec.captured_options, "not the partial/typeahead shape");
+  assert.match(rec.detail, /cannot be searched/, "and it says why the miss is final: " + rec.detail);
 });
 
 // ── security clearance: STATED OR NOT ANSWERED (operator, 2026-08-18) ───────────────────

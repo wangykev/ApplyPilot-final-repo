@@ -1425,6 +1425,13 @@ function atsInjScan(ats) {
           const items = ul ? [...ul.children].map((li) => txt(li))
             .filter((t) => t && !/^—\s*make a selection/i.test(t) && !/^please select a /i.test(t)
               && !/^no results/i.test(t)) : [];
+          // ⚠ CAN THIS WIDGET BE SEARCHED AT ALL? It says so itself, and the answer changes what may be
+          // done to it: `icimsdropdown-search="0"` means the list is LOCAL and COMPLETE, and the search
+          // box present in the markup merely FILTERS the rendered rows. Typing into it therefore empties
+          // the list rather than fetching more — which is exactly how Cretex's 9-option Degree list
+          // ("High School Diploma/GED, AS, BS, MS, PhD, MBA, MCS, BCS, BA") was reported EMPTY, twice,
+          // by us and then by the probe sent to check us (live 2026-08-18, operator's screen refuted it).
+          const searchable = el.getAttribute("icimsdropdown-search") !== "0";
           const shown = document.getElementById(el.id + "_fakeSelected_icimsDropdown");
           const cur = shown ? txt(shown) : "";
           push(Object.assign(base, {
@@ -1435,7 +1442,14 @@ function atsInjScan(ats) {
             // measured at 26 countries and 25 states (Alabama…Michigan, so Minnesota→Wyoming are
             // absent). Marking it partial is what stops review presenting a 25-row list as the
             // complete set of US states, and what tells the actuator to search before giving up.
-            optionsPartial: !!(ul && ul.getAttribute("data-ap-complete") !== "1"),
+            // …EXCEPT when the widget itself says it cannot be searched. `icimsdropdown-search="0"` is a
+            // LOCAL list: there is no second page to fetch, so what is rendered IS the vocabulary, and
+            // calling it partial hands review a type-it-yourself box in place of a real picker.
+            optionsPartial: searchable ? !!(ul && ul.getAttribute("data-ap-complete") !== "1") : false,
+            // Whether the search box may be TYPED INTO. Carried because the box exists in the markup
+            // either way, so its presence proves nothing — and typing into a search-less widget FILTERS
+            // its rendered rows to nothing, which reads exactly like an empty list.
+            searchable,
             // The parent→child dependency, DECLARED by the page: picking this field's value is what
             // populates the named child (Country → State/Province). Carried so the driver can order
             // them and explain an empty child honestly instead of guessing.
@@ -3200,7 +3214,30 @@ function atsDegreeLevel(text) {
   for (const [level, re] of ATS_DEGREE_LEVELS) if (re.test(t)) return level;
   return null;
 }
+// A degree spelled out reduces to its OWN initials, and that is not a guess: "Bachelor of Science" is
+// what "BS" abbreviates. `of/in/the/and` are dropped, so "Master of Business Administration" → "MBA".
+function atsDegreeAcronym(text) {
+  const words = String(text == null ? "" : text)
+    .replace(/[().,]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w && !/^(of|in|the|and|a)$/i.test(w));
+  if (words.length < 2) return null;             // "Bachelors" has no acronym to build
+  return words.map((w) => w[0].toUpperCase()).join("");
+}
 function atsDegreeMatch(candidates, options) {
+  const norm = (s) => String(s == null ? "" : s).replace(/[.\s]/g, "").toUpperCase();
+  // ⚠ THE ACRONYM TIER COMES FIRST, and it is what makes an abbreviation list usable (live 2026-08-18,
+  // Cretex: "AS · BS · MS · PhD · MBA · MCS · BCS · BA"). The level tier below cannot answer that list at
+  // all — BS, BCS and BA are ALL "bachelor", so its exactly-one guard correctly refuses, and the option
+  // the applicant plainly holds stays unreachable. Initials are exact, not fuzzy: "Bachelor of Science"
+  // abbreviates to BS and to nothing else, so a unique hit is a fact about the words rather than a
+  // similarity score. Still guarded by uniqueness, so a list carrying both "BS" and "B.S." asks a human.
+  for (const c of candidates || []) {
+    const ac = atsDegreeAcronym(c);
+    if (!ac) continue;
+    const hits = (options || []).filter((o) => norm(o) === norm(ac));
+    if (hits.length === 1) return hits[0];
+  }
   const wanted = (candidates || []).map(atsDegreeLevel).find(Boolean);
   if (!wanted) return null;
   const hits = (options || []).filter((o) => atsDegreeLevel(o) === wanted);
@@ -4637,6 +4674,25 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
 
     let opts = open.options || [];
     let searched = false;
+    let listArrived = opts.length > 0;
+    // ⚠ THE LIST IS FETCHED ON OPEN (`icimsdropdown-ajax="1"`), SO THE FIRST READ IS A RACE — WAIT FOR IT
+    // (operator, 2026-08-18: "sometimes when you run it it shows no results… maybe it is the same reason"
+    // as the non-iCIMS form, i.e. what the run does to the page). Measured: this widget's list is present
+    // and complete under a run when read late, so an empty read is a not-yet-arrived list rather than a
+    // broken one — a RACE, not a hard break. Two things make us lose it more often than a human does:
+    // hidden runs pace fast (cdpSetFastWhenHidden), and we read immediately after a synthetic open.
+    // ASK THE PAGE, NEVER A CLOCK: poll on SW wall-clock (delayFull, so a hidden run does not shorten the
+    // one wait that matters) until rows appear, and remember whether they ever did — a list that never
+    // arrived must be reported as exactly that, and never as "your answer is not offered", which is a
+    // claim about the employer's vocabulary that an empty read cannot support.
+    if (!listArrived) {
+      for (let i = 0; i < 20; i++) {
+        await act.delayFull(300);
+        const r = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
+        if (r && r.ok && r.awaitingParent) break;          // a different, self-explaining state
+        if (r && r.ok && (r.options || []).length) { opts = r.options; listArrived = true; break; }
+      }
+    }
     // ⚠ ASK ABOUT THE PARENT FIRST, BEFORE ANY SEARCH. A child whose parent is unset shows only the
     // widget's own "Please select a country" row; searching REPLACES that row, so by the time the
     // no-match branch re-read the list the evidence was gone and the field reported the generic
@@ -4652,9 +4708,46 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       }
     }
     let m = atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
+    // ⚠ THE DEGREE BRIDGE BELONGS HERE TOO. A tenant's degree list is written in ABBREVIATIONS
+    // ("AS · BS · MS · PhD · MBA · BA" — Cretex, measured), and the profile stores "Bachelor of Science",
+    // which meets none of them on any string tier. The generic choice path has bridged this since the
+    // dial/degree work; this widget's path never did, so the option sitting in plain sight was
+    // unreachable and the field went to review — the miss that then triggered the destructive search
+    // below. Same helper, same label gate, so the two paths cannot disagree.
+    if ((!m || m.targetIndex < 0) && /degree|education level/i.test(String(f.label || ""))) {
+      const deg = atsDegreeMatch(candidates, opts);
+      // ⚠ `matchTier`, not `tier` — this path's grading reads matchTier (the other path converts it into
+      // its own `hit.tier`), and the mismatched key surfaced as `matched at the undefined tier`.
+      // Graded EXACT on purpose: an acronym is not a similarity score. "Bachelor of Science" abbreviates
+      // to "BS" and to nothing else, and uniqueness is already enforced — so this is the same kind of
+      // fact an exact-normalized hit is, and flagging it would ask the operator to re-check arithmetic.
+      if (deg) m = { targetIndex: opts.indexOf(deg), matchTier: "exact-normalized", degreeBridge: true };
+    }
     // ⚠ ONE PAGE AT A TIME (26 countries / 25 states measured live). A miss here is NOT proof the
     // option doesn't exist, so the search box is tried before anything is reported — otherwise a
     // candidate in Texas fails on a list that stops at Michigan.
+    // ⚠⚠ BUT ONLY IF THE WIDGET CAN ACTUALLY BE SEARCHED. `icimsdropdown-search="0"` means the list is
+    // LOCAL and complete; the search box in its markup only FILTERS the rendered rows, so typing into it
+    // DELETES the very options we are looking for and the field then reports an empty list. That is what
+    // happened to Cretex's Degree — 9 options, reported empty, twice, until the operator said the
+    // dropdown plainly works on their screen. A miss on a search-less widget is a REAL miss: report it
+    // with the options it actually offers.
+    if ((!m || m.targetIndex < 0) && f.searchable === false) {
+      await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+      atsAttachOptions(rec, opts, false);
+      rec.status = "needs_review";
+      // ⚠ TWO DIFFERENT FACTS, AND ONLY ONE OF THEM IS ABOUT THE EMPLOYER. A list that never arrived says
+      // nothing about what the form offers — claiming otherwise is the mistake this whole round started
+      // with — so it is reported as OUR failed read, with the flag naming it.
+      if (!listArrived) {
+        rec.flag = "list-never-loaded";
+        rec.detail = "this dropdown's list never loaded for us — it fetches on open and stayed empty for the whole wait, so we could not see what it offers (it is not searchable, so there was nothing else to try). It is populated when opened by hand, so this is our read, not the employer's form.";
+      } else {
+        rec.detail = "no option matched " + JSON.stringify(String(candidates[0])) +
+          " — this list cannot be searched, so what it shows is all it offers: " + opts.slice(0, 8).join(" | ");
+      }
+      return true;
+    }
     if (!m || m.targetIndex < 0) {
       const beforeKey = opts.join("");
       const s = await act.eval(atsInjIcimsSearch, ref.inputSel, String(candidates[0]));
@@ -4686,10 +4779,11 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         m = hit || atsLib.matchCandidates(candidates, opts, { containment: allowContainment });
       }
     }
-    // ALWAYS partial: this widget renders one page and offers a search box, so even an unsearched
-    // read is a VIEW of the list, never the whole of it. Review then gets a type-to-filter editor
-    // and an honest note instead of a 25-row list presented as every US state.
-    atsAttachOptions(rec, opts, true);
+    // Partial ONLY when the widget can be searched: then one page is a VIEW of the list and review
+    // should get a type-to-filter editor rather than a 25-row list presented as every US state. A
+    // search-less widget (`icimsdropdown-search="0"`) has no second page, so what it renders IS the
+    // vocabulary and review gets a real picker.
+    atsAttachOptions(rec, opts, f.searchable !== false);
 
     if (!m || m.targetIndex < 0) {
       const st = await act.eval(atsInjIcimsReadOptions, ref.inputSel).catch(() => null);
@@ -4702,17 +4796,13 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         ? "this list only fills in once its parent field is chosen, and that hadn't happened yet"
         : st && st.noChildren
           ? "the form offers no options here for the parent value chosen"
-          // ⚠ "THE LIST WAS EMPTY" WAS BLAMING THE WRONG SIDE (live 2026-08-18). Cretex renders a
-          // REQUIRED Degree dropdown whose vocabulary is genuinely unpopulated: probed read-only, it
-          // answers "No Results" UNFILTERED, with no parent pending, and still answers "No Results" to
-          // a deliberately broad "Bachelor" search. The old wording ("no option matched X (after
-          // searching) — the list was empty") reads as OUR search having failed, and it cost a full
-          // investigation round to establish that it had not. When the widget offers nothing at all,
-          // say that — the employer's form cannot be completed as configured, and no profile edit or
-          // rematch on our side will change it.
-          : (!opts.length && st && st.noResults)
-            ? "this form's own list for this field is EMPTY — the widget answers \"No Results\" even with no search and no parent pending, so there is nothing here to select. Nothing on our side can fill it: the employer's form offers no options for a field it marks required."
-            : "no option matched " + JSON.stringify(String(candidates[0])) + (searched ? " (after searching)" : "") +
+          // ⚠ DO NOT CLAIM THE TENANT'S LIST IS EMPTY. An earlier round of this shipped a message saying
+          // exactly that — "the employer's form offers no options" — on the strength of a probe that
+          // read the list while OUR OWN leftover search text was still filtering it. The operator's
+          // screen refuted it: nine options, no search box. A list that reads empty AFTER we searched is
+          // evidence about our search, not about the employer, so the wording stays on our side of the
+          // line and names the query we used.
+          : "no option matched " + JSON.stringify(String(candidates[0])) + (searched ? " (after searching)" : "") +
               (opts.length ? " — offered: " + opts.slice(0, 4).join(" | ") : " — the list came back empty for this search");
       return true;
     }
@@ -5672,7 +5762,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
