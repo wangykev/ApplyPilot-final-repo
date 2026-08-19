@@ -1146,6 +1146,90 @@ function runAuthScan(spec) {
   try { return ats.atsInjAuthScan(); } finally { delete global.document; delete global.window; delete global.location; delete global.getComputedStyle; }
 }
 
+// ── iCIMS' ACTION-BUTTON WIDGET DUPLICATES ITS LABEL (live 2026-08-18) ──────────────────
+//
+// SCS Engineers renders Apply as an <a> wrapping TWO label spans for responsive layout, so the anchor's
+// textContent is "ApplyApply" — and /^apply\b/ does not match that: there is no word boundary between
+// "y" and "A". The control a human plainly sees was invisible to both finders and the run halted
+// `apply-not-followable` on a live posting. Astrion hid it because its duplication left a space.
+
+test("apply finder: a duplicated long/short label ('ApplyApply') is still found", () => {
+  const leaf = (t) => ({ tagName: "SPAN", textContent: t, children: [], querySelectorAll: () => [] });
+  const longL = leaf("Apply"), shortL = leaf("Apply");
+  const inner = { tagName: "DIV", textContent: "ApplyApply", children: [longL, shortL],
+    querySelectorAll: () => [longL, shortL] };
+  let clicked = 0;
+  const a = { tagName: "A", textContent: "ApplyApply", value: "", children: [inner],
+    querySelectorAll: () => [inner, longL, shortL],
+    getAttribute: () => "https://x.icims.com/jobs/1/login",
+    checkVisibility: () => true, getBoundingClientRect: () => ({ width: 80, height: 30 }),
+    click() { clicked++; }, href: "https://x.icims.com/jobs/1/login" };
+  global.document = { querySelectorAll: (sel) => (/a\[href\]/.test(sel) ? [a] : []) };
+  try {
+    const r = ats.atsInjClickApplyAnchor();
+    assert.strictEqual(r.ok, true, "the widget must be found: " + JSON.stringify(r));
+    assert.strictEqual(clicked, 1);
+    assert.strictEqual(r.clicked, "Apply", "and reported by its RENDERED label, not the concatenation");
+  } finally { delete global.document; }
+});
+
+test("apply finder: an unrelated link is still refused", () => {
+  const mk = (t) => ({ tagName: "A", textContent: t, value: "", children: [],
+    querySelectorAll: () => [], getAttribute: () => "/x", checkVisibility: () => true,
+    getBoundingClientRect: () => ({ width: 80, height: 30 }), click() {}, href: "/x" });
+  global.document = { querySelectorAll: (sel) => (/a\[href\]/.test(sel) ? [mk("Applicant privacy notice"), mk("Save job")] : []) };
+  try {
+    const r = ats.atsInjClickApplyAnchor();
+    assert.strictEqual(r.ok, false, "neither is an Apply control: " + JSON.stringify(r));
+  } finally { delete global.document; }
+});
+
+// ── A CONTACT OPT-IN ASKED AS A QUESTION IS STILL AN OPT-IN (operator's rule, live 2026-08-18) ───
+//
+// The operator authorised ticking ACCEPT boxes and explicitly NOT opt-ins. That rule lived only on the
+// checkbox path, so SCS Engineers asking the same thing as a required Yes/No DROPDOWN sent it to the AI,
+// which answered "Yes" and subscribed them to texts. One policy, two widgets.
+//
+// The bail list is the load-bearing half: a "No" to a background check, a drug screening, a reference
+// check or the privacy notice SINKS the application, and none of those is a marketing opt-in.
+
+test("opt-in question: a contact/marketing consent asked as a dropdown is DECLINED deterministically", () => {
+  const prof = { personal_info: {} };
+  for (const q of [
+    "Do you consent to receive text message communication during your application process?",
+    "Would you like to receive job alerts?",
+    "Opt in to receive marketing emails",
+    "Do you agree to receive SMS updates?",
+    "Join our talent community for future opportunities?",
+    "Subscribe to our newsletter?",
+  ]) {
+    const r = ats.atsRouteLabel(q, { label: q, widgetType: "dropdown_native" }, prof, {});
+    assert.ok(r, "must be routed rather than left to the AI: " + q);
+    assert.deepStrictEqual(r.candidates, ["No", "False"], q);
+    assert.strictEqual(r.flag, "optin-declined", q);
+    assert.strictEqual(r.review, true, "and flagged, so a human who DOES want texts can flip it: " + q);
+  }
+});
+
+test("opt-in question: a consent the APPLICATION needs is never touched", () => {
+  const prof = { personal_info: {} };
+  for (const q of [
+    "Do you consent to a background check?",
+    "Do you consent to a drug screening?",
+    "Do you consent to the processing of your personal data?",
+    "Do you agree to our privacy policy?",
+    "May we contact your references?",
+    "Do you consent to a credit check?",
+    "Do you agree that the information provided is true and complete?",
+    "Do you consent to a criminal history check?",
+  ]) {
+    const r = ats.atsRouteLabel(q, { label: q, widgetType: "dropdown_native" }, prof, {});
+    const flag = r && r.flag;
+    assert.notStrictEqual(flag, "optin-declined",
+      'answering "No" here would sink the application: ' + q);
+  }
+});
+
 // ── the content frame is identifiable BEFORE it holds a form ────────────────────────────
 //
 // Live 2026-08-18: a run started from `<tenant>.icims.com/jobs/<id>/…/job` (what most iCIMS links

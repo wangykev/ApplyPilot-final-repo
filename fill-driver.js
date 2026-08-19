@@ -38,6 +38,7 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       // approved value already IS today (so a same-day replay stays a zero-actuation no-op).
       isSignatureDateQuestion: isSignatureDateQuestion, signatureDateDemanded: signatureDateDemanded, signatureDateAskInText: signatureDateAskInText, isJobPostingGone: isJobPostingGone, sameCalendarDate: sameCalendarDate,
       recognizeClearanceQuestion: recognizeClearanceQuestion, clearanceCandidates: clearanceCandidates, clearanceAliases: clearanceAliases,
+      recognizeRelocationQuestion: recognizeRelocationQuestion, relocationCandidates: relocationCandidates,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
@@ -1358,6 +1359,13 @@ function deterministicTierFor(f, profile, bucketIndex, empCompany) {
   // per-field call, so the model is never even ASKED to guess a clearance. (The AI prompt tells it to
   // infer from the ABSENCE of information and never refuse, which is exactly the wrong instinct here.)
   try { if (apMatch.recognizeClearanceQuestion(f.label)) return "clearance"; } catch (e) { /* recognizer threw → the rung below still claims it */ }
+  // A relocation question the profile ANSWERS is deterministic, so it must not be planned into the AI
+  // batch — a batched question is paid for whether or not it is used. Gated on the answer EXISTING (not
+  // merely on the recognizer), because an unstated preference genuinely does belong to the AI here.
+  try {
+    const rq = apMatch.recognizeRelocationQuestion(f.label);
+    if (rq && apMatch.relocationCandidates(profile && profile.screening, rq.kind).candidates) return "relocation";
+  } catch (e) { /* recognizer threw → the ordinary ladder still runs */ }
   // Buckets — same gate as the loop: UNMAPPED fields only.
   if (!mappedPath && bucketIndex && bucketIndex.size) {
     const b = bucketIndex.get(apMatch.normalizeLabel(f.label));
@@ -4592,6 +4600,44 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
         }
       } catch (e) {
         record.detail = "self-ID display-language selector: " + String((e && e.message) || e);
+      }
+    }
+
+    // ── WILLINGNESS TO RELOCATE — STATED ONLY (live 2026-08-18) ────────────────────────────────────
+    // The ATS engine got this first (Sargent & Lundy asked it as a REQUIRED dropdown and the AI answered
+    // it while citing the very profile field nothing read). Workday is the other half, and it asks the
+    // same question — waystar's page 3 relocation dropdown is one of them.
+    //
+    // ⚠ UNLIKE CLEARANCE, this rung does NOT claim an unanswerable question. A clearance is a factual
+    // legal status where an invented answer is a false statement, so that rung claims the field even to
+    // refuse it. A relocation preference is neither legal nor unknowable-by-inference: an AI guess here
+    // is a normal flagged guess a human then approves, and blocking Save & Continue over an unstated
+    // preference would cost the operator a walk to save them nothing. So: stated → deterministic and
+    // silent; unstated → fall through exactly as before.
+    //
+    // The two facts stay apart (`recognizeRelocationQuestion` returns the kind), and the ladder is the
+    // shared boolean one, so Workday's long-form options are reached by POLARITY LEAD: a stored `true`
+    // fills "Yes, I am open to relocating" deterministically, while a tenant that splits one polarity
+    // into two meanings escalates to review instead of being guessed.
+    if (record.resolved == null && record.status !== "filled" && record.status !== "filled_review"
+        && (f.widgetType === "radio" || f.widgetType === "dropdown" || f.widgetType === "checkbox_group")) {
+      try {
+        const rq = apMatch.recognizeRelocationQuestion(f.label);
+        if (rq) {
+          const rc = apMatch.relocationCandidates(profile && profile.screening, rq.kind);
+          if (rc.candidates) {
+            record.mappedPath = rc.path;
+            record.rawValue = rc.yes;
+            record.resolved = rc.candidates;
+            if (f.widgetType === "dropdown") Object.assign(record, await fillDropdownCdp(act, loc, rc.candidates, budgets));
+            else if (f.widgetType === "radio") Object.assign(record, await fillRadioCdp(act, loc, rc.candidates, budgets));
+            else Object.assign(record, await fillCheckboxGroupCdp(act, loc, rc.candidates, budgets));
+            if (record.detail == null) record.detail = rc.path + " = " + JSON.stringify(rc.yes);
+          }
+        }
+      } catch (e) {
+        // A throw here must not consume the field: leaving it untouched lets the AI net answer it, which
+        // is the correct fallback for a preference (see the note above).
       }
     }
 

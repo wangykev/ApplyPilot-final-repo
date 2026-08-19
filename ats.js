@@ -32,6 +32,7 @@ const atsLib = (typeof module !== "undefined" && module.exports)
       // Security clearance: recognizer + candidate ladder, shared with the Workday driver's own rung so
       // the two engines answer a clearance question identically.
       recognizeClearanceQuestion: recognizeClearanceQuestion, clearanceCandidates: clearanceCandidates,
+      recognizeRelocationQuestion: recognizeRelocationQuestion, relocationCandidates: relocationCandidates,
       // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
       // join/split exactly the way groups do — see the multiselect commit path.
       joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN };
@@ -252,6 +253,15 @@ const ATS_STATIC_MAPS = {
     // answers it deterministically, and the AI's "Mobile" guess (flagged `ai-choice`) was only ever a
     // guess that happened to look right.
     "PersonProfileFields.PhoneType": { path: "personal_info.phone_device_type" },
+    // ⚠ THE ADDRESS TYPE IS KNOWABLE, AND THE AI WAS ANSWERING IT TWO DIFFERENT WAYS (live 2026-08-18).
+    // Its label is a bare "Type" inside the candidate's own address block, so the label ladder has nothing
+    // to key on and it fell to the AI — which answered "Home" on one tenant and "Work" on the next. Same
+    // question, same profile, two answers, and "Work" is simply wrong: the one address a profile holds is
+    // `personal_info.address_*`, the applicant's residence. There is no profile field for this because
+    // there is nothing to ask: it is a fact about the FORM's vocabulary, so the answer is a literal.
+    // Tiered because tenants word it differently, and still matched against the live options.
+    "PersonProfileFields.AddressType": { candidates: ["Home", "Home Address", "Residence", "Personal"],
+      note: "(the profile's address is the candidate's home)" },
     // The dial-code half, when a tenant renders one. Tiered in the profile like country, so resolve()
     // passes a ready-made candidate ladder; `kind:"dial"` strips the trailing "+<digits>" for matching.
     "PersonProfileFields.PhoneCountry": { kind: "dial", path: "personal_info.country_phone_code", altPath: "personal_info.country" },
@@ -1003,6 +1013,28 @@ function atsRouteLabel(label, f, profile, defaults) {
     return { candidates: bool(!!wa.authorized_to_work_in_us), source: "work_auth", path: "work_authorization.authorized_to_work_in_us", detail: "work_authorization.authorized_to_work_in_us" };
   }
 
+  // ── A CONTACT OPT-IN ASKED AS A QUESTION IS STILL AN OPT-IN (operator's rule, 2026-08-18) ──────
+  // The operator authorised ticking ACCEPT boxes (privacy notices) and explicitly NOT opt-ins — "it is not
+  // an acceptance, and it would sign the operator up for mail they never asked for". That rule lived only
+  // on the checkbox path, so the SAME question asked as a required Yes/No dropdown went to the AI, which
+  // answered "Yes" and subscribed them to texts: live on SCS Engineers, "Do you consent to receive text
+  // message communication during your application process?" → `ai-choice: Yes`. One policy, two widgets.
+  // Answered "No" DETERMINISTICALLY — declining is the privacy-preserving direction, it is truthful (they
+  // have not asked to be texted), and it costs the application nothing. Flagged, so a human who does want
+  // texts can flip it in review.
+  //
+  // ⚠ NARROW ON PURPOSE, and the bail list is the load-bearing half. A "No" to the wrong consent question
+  // SINKS the application: a background check, a drug test, a reference check and the privacy notice
+  // itself are all things an applicant must agree to for the process to continue, and none of them is a
+  // marketing opt-in. So this fires only on CONTACT/MARKETING wordings and refuses anything that names a
+  // check, a screening, or the data-processing notice.
+  if (/\b(text message|text messages|sms|marketing|promotional|newsletter|job alerts?|talent (community|network)|future (job|role|opportunit))/i.test(L)
+      && /\b(consent|opt[- ]?in|agree|receive|subscribe|join|sign me up|would you like)\b/i.test(L)
+      && !/(background|drug|reference|credit|criminal|e-?verify|screening|privacy (notice|policy|statement)|data protection|processing of your|terms)/i.test(L)) {
+    return { candidates: ["No", "False"], source: "optin-declined", review: true, flag: "optin-declined",
+      detail: "this asks whether you want to be CONTACTED (texts/marketing), which is an opt-in rather than something the application needs — answered \"No\" because you have not asked to be contacted that way; flip it here if you want it" };
+  }
+
   // ── SECURITY CLEARANCE — STATED OR NOT ANSWERED (operator, 2026-08-18) ─────────────────────
   // A clearance is a FACTUAL claim about the applicant, and claiming one you do not hold is a serious
   // matter — so this rung answers ONLY from `work_authorization.security_clearance` and refuses in
@@ -1107,6 +1139,19 @@ function atsRouteLabel(label, f, profile, defaults) {
     const v = ap.earliest_start_date || ap.available_for_full_employment_after;
     if (has(v)) return { value: v, source: "map", detail: "availability.earliest_start_date", review: true, flag: "start-date-format" };
     return null;
+  }
+
+  // RELOCATION — STATED only, and the two facts are kept apart (see recognizeRelocationQuestion).
+  // Live 2026-08-18: a required relocation dropdown on Sargent & Lundy was answered by the AI from
+  // the very profile field nothing read. An unstated preference still falls through — the operator
+  // not having answered is not a "No".
+  {
+    const rq = atsLib.recognizeRelocationQuestion(label);
+    if (rq) {
+      const rc = atsLib.relocationCandidates(profile && profile.screening, rq.kind);
+      if (rc.candidates) return { candidates: rc.candidates, source: "relocation", path: rc.path, detail: rc.path };
+      return null;
+    }
   }
 
   // How-did-you-hear — the same ladder the Workday source picker uses.
@@ -2757,16 +2802,32 @@ function atsInjClickApplyButton() {
     return r.width > 0 && r.height > 0;
   };
   const APPLY_RE = /^apply\b|\bapply (now|here|for this)\b/i;
-  const all = [...document.querySelectorAll('button, [role="button"], a[href="#"]')].filter((b) => {
-    const t = (b.textContent || "").replace(/\s+/g, " ").trim();
-    return APPLY_RE.test(t) && t.length <= 40;
-  });
+  // ⚠ READ THE CAPTION FROM THE LEAVES TOO, NOT ONLY THE ELEMENT'S OWN TEXT (live 2026-08-18).
+  // iCIMS' action-button widget renders its label TWICE for responsive layout —
+  //   <a class="iCIMS_Anchor iCIMS_Action_Button iCIMS_ApplyOn" href="…">
+  //     <div class="iCIMS_Action_ButtonText">
+  //       <span class="iCIMS_LongLabel">Apply</span><span class="iCIMS_ShortLabel">Apply</span>
+  // — so the anchor's textContent is "ApplyApply", and `/^apply\b/` does NOT match it: there is no word
+  // boundary between "y" and "A". The control a human plainly sees was therefore invisible to both
+  // finders, and the run halted `apply-not-followable` on a perfectly good posting (SCS Engineers).
+  // Astrion hid this because its own duplication happened to leave a space ("Apply for this job
+  // onlineApply"), which the anchored alternative still matched.
+  // Each LEAF's text is what is actually rendered, so testing those alongside the concatenation is both
+  // more faithful and generic — no iCIMS class to key on, and it fixes any duplicated-label widget.
+  const caps = (el) => {
+    const own = String(el.textContent || "").replace(/\s+/g, " ").trim();
+    const leaves = [...el.querySelectorAll("*")].filter((n) => !n.children.length)
+      .map((n) => String(n.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    return [own, ...leaves];
+  };
+  const applyCap = (el) => caps(el).find((t) => t.length <= 40 && APPLY_RE.test(t)) || null;
+  const all = [...document.querySelectorAll('button, [role="button"], a[href="#"]')].filter((b) => !!applyCap(b));
   // Prefer a visibly-rendered one, but an all-invisible verdict falls back to the full set
   // rather than abandoning the run on a measurement a hidden tab is known to get wrong.
   const shown = all.filter(vis);
   const btns = shown.length ? shown : all;
   if (btns.length === 0) return { ok: false, reason: "no-apply-button" };
-  const uniq = [...new Set(btns.map((b) => (b.textContent || "").replace(/\s+/g, " ").trim()))];
+  const uniq = [...new Set(btns.map((b) => applyCap(b)))];
   if (uniq.length > 1) return { ok: false, reason: "ambiguous", offered: uniq.slice(0, 4) };
   btns[0].click();
   return { ok: true, clicked: uniq[0], hiddenLayout: shown.length === 0 };
@@ -3000,10 +3061,28 @@ function atsInjClickApplyAnchor() {
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   };
-  const cap = (el) => String(el.value || el.textContent || "").replace(/\s+/g, " ").trim();
   const APPLY_RE = /^apply\b|\bapply (now|here|online|for this)\b/i;
+  // ⚠ READ THE CAPTION FROM THE LEAVES TOO, NOT ONLY THE ELEMENT'S OWN TEXT (live 2026-08-18).
+  // iCIMS' action-button widget renders its label TWICE for responsive layout —
+  //   <a class="iCIMS_Anchor iCIMS_Action_Button iCIMS_ApplyOn" href="…">
+  //     <div class="iCIMS_Action_ButtonText">
+  //       <span class="iCIMS_LongLabel">Apply</span><span class="iCIMS_ShortLabel">Apply</span>
+  // — so the anchor's textContent is "ApplyApply", and `/^apply\b/` does NOT match it: there is no word
+  // boundary between "y" and "A". The control a human plainly sees was therefore invisible to both
+  // finders, and the run halted `apply-not-followable` on a perfectly good posting (SCS Engineers).
+  // Astrion hid this because its own duplication happened to leave a space ("Apply for this job
+  // onlineApply"), which the anchored alternative still matched.
+  // Each LEAF's text is what is actually rendered, so testing those alongside the concatenation is both
+  // more faithful and generic — no iCIMS class to key on, and it fixes any duplicated-label widget.
+  const caps = (el) => {
+    const own = String(el.value || el.textContent || "").replace(/\s+/g, " ").trim();
+    const leaves = [...el.querySelectorAll("*")].filter((n) => !n.children.length)
+      .map((n) => String(n.textContent || "").replace(/\s+/g, " ").trim()).filter(Boolean);
+    return [own, ...leaves];
+  };
+  const cap = (el) => caps(el).find((t) => t.length <= 40 && APPLY_RE.test(t)) || caps(el)[0] || "";
   const all = [...document.querySelectorAll('a[href], input[type="submit"], input[type="button"]')]
-    .filter((el) => { const t = cap(el); return APPLY_RE.test(t) && t.length <= 40; });
+    .filter((el) => caps(el).some((t) => t.length <= 40 && APPLY_RE.test(t)));
   const shown = all.filter(vis);
   const els = shown.length ? shown : all;
   if (!els.length) return { ok: false, reason: "no-apply-control" };
@@ -3472,6 +3551,15 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
     if (map.kind === "skip") return { kind: "skip", source: "map", detail: map.detail };
+    // ⚠ A LITERAL ANSWER, for a question whose answer is a fact about the FORM, not about the applicant.
+    // Used by the address Type below: the one address a profile holds is the candidate's own residence, so
+    // "Home" is not a guess and there is no profile field to read it from. Still a CANDIDATE list through
+    // the ordinary ladder — the tenant's wording ("Home", "Home Address", "Residence") is matched against
+    // its live options, never blind-committed.
+    if (Array.isArray(map.candidates) && map.candidates.length) {
+      return { candidates: map.candidates.slice(), source: "map", path: map.note || "(form-shape constant)",
+        detail: map.detail || null };
+    }
     if (map.kind === "location") {
       const v = atsComposeValue("city_state", profile);
       return v ? { kind: map.kind, value: v, source: "map", path: "(city+state)" } : { kind: "skip", source: "map", detail: "no city/state in profile" };
