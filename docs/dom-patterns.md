@@ -5056,3 +5056,70 @@ Get this wrong in either direction and the submit visit misses the field.
 5. Captcha on submit; `<apply-flow-submission-checklist>` semantics.
 6. A SECOND tenant's form (the gate has two tenants, the form still has one).
 7. The Education entry's own field set (only Experience was opened).
+
+---
+
+## 2026-08-19 (d) — ORC: **REFUTATION** — the code step is conditional, and recon (b) called it wrong
+
+Same Baylor posting, same stored test login, read-only. This entry **corrects entry (b)**, which is why it
+exists as its own dated entry rather than an edit: the wrong conclusion was already load-bearing in CLAUDE.md.
+
+### What (b) claimed, and why it was wrong
+
+> (b): *"NO VERIFICATION CODE IS NEEDED TO REACH THE FORM … Gmail auto-verify is **not** on the critical
+> path."*
+
+That was inferred from **one** observation — a first-ever email at that tenant went `Next` → straight to
+`…/apply/section/1`. Re-entering the same flow with **the same email** instead produced:
+
+**"Confirm Your Identity"** — *"The verification code was sent to this email address: … it may take some time
+before you receive the code."*
+
+| control | identity |
+|---|---|
+| six digit boxes | `input#pin-code-1` … `#pin-code-6`, `type="number"`, **no `name`**, Knockout `data-bind`, `class="input-row__control pin-code-input__input"`, `aria-label="Enter verification code digit N of six."`, `autocomplete="off"` |
+| submit | `button.apply-flow-dialog__button` — "Verify" |
+| resend | `<resend-pin>` → `button.pin-code-form__action-button` — "Send New Code" |
+
+So the rule is **conditional on whether ORC already knows the email at that tenant**:
+
+| state | outcome |
+|---|---|
+| email unknown at this tenant | no code — straight to `section/1` |
+| email already known | **"Confirm Your Identity"**, six-digit code required |
+
+**Both paths must be handled; neither may be assumed.** And the asymmetry bites exactly where it hurts:
+**the fill visit and the submit visit are two visits with the same email**, so a fill can sail through while
+its own submit run is stopped by a code. That makes the mechanism the operator specified — stored credentials
+plus **Gmail auto-verify** — a requirement rather than a convenience, and `gmail.js` (built for Workday) the
+obvious reuse.
+
+The lesson is the ordinary one and worth restating because it was paid for twice in one day: **a single
+observation of a conditional branch looks exactly like an unconditional rule.** The gate's own copy
+("You don't need to have an account") describes *account creation*, not verification, and reading it as
+covering both is what made the wrong conclusion feel confirmed.
+
+### The flow is NOT resumable cold
+
+A deep link to `…/apply/section/2` from a fresh tab (session gone) **redirects to the posting**
+`…/job/<id>`. Within a live session the same deep link works (entry (c) reached `section/3` that way). So
+section URLs are addressable *inside* a session only, and a run that loses its session must re-enter through
+the gate — where, per the above, it will now meet the code screen.
+
+### Two scanning hazards, both measured here
+
+- **`document.querySelector("h1,h2")` returned `"Are You Still With Us?"`** — the heading of the **hidden**
+  `<session-expire>` dialog — while the visible heading was "Confirm Your Identity". A first-match query
+  reaches a hidden dialog, so **headings need the same visibility scoping the fields do**. Same family as the
+  Workday page-wide `[role="option"]` contamination: the query is right, the scope is wrong.
+- **`Runtime.evaluate` blocked past 45s on six separate occasions**, always around a route transition, and
+  in-page `setTimeout` awaits did not fire during those windows. Consequences for the implementation:
+  generous CDP timeouts, no reliance on page timers, and waits taken SW-side — which is the standing pacing
+  rule, here with a measured reason. Numbers belong in `fill-speed-log.md` once a real fill runs.
+
+### Still open (unchanged from (c), minus nothing)
+
+The group-question element for `input-row--radiogroup` is **still unanswered** — this pass was spent on the
+gate instead. Also still open: whether a combobox accepts a typed value; `region1` vs `region2`; where a
+combobox's options mount relative to `timeline-form-inline`; whether ids renumber across a section
+transition; captcha on submit; the Education entry's field set; a second tenant's form.

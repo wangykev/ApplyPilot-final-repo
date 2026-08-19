@@ -968,12 +968,25 @@ rest.** What is settled, and what must not be re-litigated:
 
 ### Through the gate — the form's shape (recon 2, 2026-08-19; Baylor + Nokia)
 
-- **NO VERIFICATION CODE IS NEEDED TO REACH THE FORM.** Measured: email → `Next` → straight to
-  `…/apply/section/1`. The gate means its words literally; the code is for **returning** to a draft. So the
-  pre-form stage is just **Apply click → email (+ terms if present) → Next → form**, and **Gmail
-  auto-verify is NOT on the critical path**. ⚠ The terms checkbox is **per-tenant optional** (Nokia has one,
-  Baylor none) — tick it when present, never require it. The honeypot's WIDTH also varies by tenant
-  (179 vs 200), so no size constant may ever enter the test.
+- **⚠ THE CODE STEP IS CONDITIONAL ON WHETHER THE EMAIL IS ALREADY KNOWN — and Gmail auto-verify IS on the
+  critical path (corrected 2026-08-19, recon 4).** Recon 2 concluded "no code is needed" from a single
+  observation: a **first-time** email at a tenant goes `Next` → straight to `…/apply/section/1`. Re-entering
+  the flow with **the same email** at the same tenant instead lands on **"Confirm Your Identity"** — a
+  six-digit code (`input#pin-code-1…6`, `type=number`, **no `name`**, Knockout-bound, `aria-label="Enter
+  verification code digit N of six."`), a `Verify` button, and `<resend-pin>` / "Send New Code".
+  **Both paths must be handled and neither may be assumed.** It matters most on the SUBMIT visit, which is by
+  construction a *second* visit with the same email — so a fill run may sail through while its submit run
+  demands a code. This is why the mechanism the operator specified (stored credentials + **Gmail
+  auto-verify**) is required, not optional. ⚠ A deep link to `…/apply/section/<n>` from a cold browser
+  **redirects to the posting** — the flow is not resumable without re-entering the gate.
+  ⚠ The terms checkbox is **per-tenant optional** (Nokia has one, Baylor none) — tick it when present, never
+  require it. The honeypot's WIDTH also varies by tenant (179 vs 200), so no size constant may ever enter the
+  test.
+- **⚠ TWO SCANNING HAZARDS MEASURED ON THIS PAGE.** `document.querySelector("h1,h2")` returned **"Are You
+  Still With Us?"** — the hidden `<session-expire>` dialog's heading, not the visible "Confirm Your Identity".
+  A first-match query reaches a hidden dialog, so headings need the same visibility scoping the fields do.
+  And `Runtime.evaluate` **blocked past 45s on six separate occasions**, always around a route transition —
+  so ORC needs generous CDP timeouts and its waits must never rely on page timers (they were not firing).
 - **⚠⚠ THE ACTIVE-SECTION SIGNAL IS THE EXACT INVERSE OF THE HONEYPOT SIGNAL — neither may become *the*
   rule.** The form is a **4-step wizard** (`…/apply/section/<n>`) and **all four steps sit in the DOM at
   once**. Measured on the inactive ones while on step 1: `hidden` = false, **`aria-hidden` = `"false"`**,
