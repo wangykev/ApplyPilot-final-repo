@@ -4700,6 +4700,180 @@ async function waitAtsPostingSettled(ceilingMs = 8000, intervalMs = 300) {
 //   • every human-needed stop returns needs_operator + a self-explaining stopped/detail.
 //   • it STOPS at the form. Nothing here submits an application.
 // Contract: `{reached_form:true}` to carry on, or `{halt:{…}}` for the caller to return.
+// ── THE ORACLE PRE-FORM STAGE (2026-08-19) ───────────────────────────────────────────────────
+// Posting → Apply Now → the quick-apply gate (email, + a terms box on some tenants) → possibly
+// "Confirm Your Identity" (a six-digit emailed code) → the form. Stops AT the form and submits
+// nothing, exactly like runCdpOnboard and runIcimsPreForm, whose invariants this carries verbatim:
+//
+//   • credentials come ONLY from chrome.storage.local.credentials, are written through
+//     atsInjSetCredential (which returns a LENGTH), and never enter a log line or a record.
+//   • a VERIFICATION CODE gets the same treatment — atsInjOrcFillPin returns a COUNT, and the code
+//     is never logged. It is a one-time secret, not ordinary field data.
+//   • federated sign-in and account-creation controls are REPORTED, never pressed.
+//   • a VISIBLE captcha challenge halts for the operator. Nothing is ever solved or bypassed.
+//   • every human-needed stop returns needs_operator + a self-explaining stopped/detail;
+//     ok:false means a CRASH only.
+//   • the BOT-DETECTION HONEYPOT is never written. atsInjOrcAuthScan excludes decoys from every
+//     candidate list it returns, so no selector for one reaches this loop at all; they are reported
+//     and logged so a run can prove it saw and skipped them.
+//
+// The view→action mapping lives in orcApplyView (pure, unit-pinned); this function only sequences.
+async function runOrcPreForm(tabId, credentials, opts) {
+  const o = opts || {};
+  const LOG = o.LOG || ((...a) => console.log("[ApplyPilot][ORC-PREFORM]", ...a));
+  const gmailEnabled = !!o.gmailEnabled;
+  const MAX_ROUNDS = 10;
+  const MAX_CODE_TRIES = 2;   // a fresh code costs an email round-trip; two is enough to survive one stale one
+  const halt = (stopped, detail, extra) => {
+    LOG(`⛔ ${stopped} — ${detail}`);
+    return { halt: { ok: true, needs_operator: true, stopped, detail, ...(extra || {}) } };
+  };
+  const consentsAccepted = [];
+  let codeTries = 0;
+  let decoysSeen = 0;
+
+  // ORC's renderer blocks Runtime.evaluate for many seconds across a route transition (measured six
+  // times during recon), and its page timers do not fire while that happens — so every wait here is
+  // SW wall-clock and polls the page's own identity, never a page-side timer.
+  const sig = async () => {
+    const r = await cdpEval(atsInjPageSignature).catch(() => null);
+    return r && r.ok ? r : null;
+  };
+  const waitForChange = async (before, budgetMs) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < (budgetMs || 12000)) {
+      await cdpDelay(700);
+      const now = await sig();
+      if (now && atsSignatureChanged(before, now)) return { changed: true, waitedMs: Date.now() - t0 };
+    }
+    return { changed: false, waitedMs: Date.now() - t0 };
+  };
+
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    const s = await cdpEval(atsInjOrcAuthScan).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    const view = orcApplyView(s);
+    LOG(`round ${round}: view=${view}` + (s && s.ok ? ` (sections=${s.sectionCount} pins=${s.pinInputs} email=${!!s.emailInput} pass=${!!s.passwordInput})` : ` — ${(s && s.error) || "unreadable"}`));
+    if (s && (s.decoys || []).length) {
+      decoysSeen = s.decoys.length;
+      // Judged SW-side by the one authority, so the log names WHY each was skipped.
+      const named = s.decoys.map((d) => `${d.name || d.sel} [${atsDecoyKind(Object.assign({ fieldName: d.name }, d)) || "unclassified"}]`);
+      LOG(`⚠ ${s.decoys.length} decoy field(s) present and EXCLUDED (never written): ${named.join(", ")}`);
+    }
+    if (s && (s.errors || []).length) LOG(`page says: ${s.errors.join(" | ")}`);
+
+    if (view === "form") {
+      LOG(`✔ reached the application form (${s.sectionCount} section(s))`);
+      return { reached_form: true, sections: s.sectionCount, consentsAccepted, decoysSeen };
+    }
+    if (view === "captcha") {
+      return halt("captcha-challenge", "Oracle is showing a visible captcha challenge on the sign-in step. ApplyPilot never solves or bypasses one — complete it yourself and re-run.");
+    }
+    if (view === "unreadable") {
+      return halt("page-unreadable", "Could not read the Oracle apply page" + (s && s.error ? ` (${s.error})` : "") + ". ORC's renderer can block for many seconds across a transition; re-run before treating this as broken.");
+    }
+    if (view === "blocked") {
+      return halt("auth-blocked", "This step offers only federated sign-in / account creation, which ApplyPilot never presses on your behalf. Sign in yourself and re-run.",
+        { federated: s.federated, createAccount: s.createAccount });
+    }
+    if (view === "none") {
+      return halt("unknown-page", `No Oracle apply control, gate, code box or form section on ${(s && s.url) || "this page"} — nothing safe to act on.`);
+    }
+
+    if (view === "posting") {
+      const before = await sig();
+      LOG(`pressing the Apply control ("${(s.applyControl && s.applyControl.caption) || "Apply"}")`);
+      const r = await cdpEval(function (sel) {
+        const b = document.querySelector(sel); if (!b) return { ok: false };
+        b.click(); return { ok: true };
+      }, s.applyControl.sel).catch(() => null);
+      if (!r || !r.ok) return halt("apply-not-followable", "Found an Apply control but could not press it.");
+      const ch = await waitForChange(before, 15000);
+      LOG(`apply click → page ${ch.changed ? "changed" : "did NOT change"} after ${ch.waitedMs}ms`);
+      continue;
+    }
+
+    if (view === "email" || view === "password") {
+      // Accept-only consents FIRST: on some tenants the gate will not advance until the terms box is
+      // ticked, and ticking it after pressing Next would be a wasted round.
+      const plan = atsConsentPlan(s.consents);
+      for (const c of plan.tick) {
+        const title = c.label || c.rowText || "(unnamed notice)";
+        // The box is CSS-clipped (rect 0×0) — click the LABEL, the Workday radio rule.
+        // ⚠ the CHECKBOX selector, not the label: atsInjTickConsent derives the label itself and
+        // then reads `el.checked` back off the input. Handing it a <label> would verify nothing.
+        const t = await cdpEval(atsInjTickConsent, c.sel).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        if (!t || !t.ok || t.checked !== true) {
+          return halt("consent-not-accepted", `Could not tick (or verify) the acceptance box "${String(title).slice(0, 120)}" — refusing to report consent that was not given.`);
+        }
+        LOG(`✔ ACCEPTED on your instruction: ${String(title).slice(0, 140)}`);
+        consentsAccepted.push(title);
+      }
+      for (const c of plan.left) {
+        if (c.kind) LOG(`left untouched (${c.kind}): ${String(c.label || c.rowText || "").slice(0, 100)}`);
+      }
+
+      const haveEmail = credentials && credentials.email;
+      if (!haveEmail) {
+        return halt("credentials-not-stored", "Oracle's apply gate asks for a login email, but no credentials are stored. Set them on the website's Credentials page (or data/credentials.json) and re-run.");
+      }
+      if (view === "password" && !(credentials && credentials.password)) {
+        return halt("credentials-not-stored", "This Oracle step asks for a password, but only an email is stored. Set the password on the Credentials page and re-run.");
+      }
+
+      // The write returns a LENGTH and a match boolean — never the string.
+      const target = view === "password" ? s.passwordInput : s.emailInput;
+      const value = view === "password" ? credentials.password : credentials.email;
+      if (!target || !target.sel) return halt("auth-field-unaddressable", `Recognised the ${view} step but its input has no usable selector.`);
+      const w = await cdpEval(atsInjSetCredential, target.sel, value).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (!w || !w.ok) return halt("credential-write-failed", `Could not write the stored ${view === "password" ? "password" : "login email"} into ${target.sel}` + (w && w.error ? ` (${w.error})` : "") + ".");
+      LOG(`wrote the stored ${view === "password" ? "password" : "login email"} (${w.length} chars) into ${target.sel}`);
+      const v = await cdpEval(atsInjVerifyCredential, target.sel, value).catch(() => null);
+      if (!v || v.matches !== true) return halt("credential-not-retained", `The ${view} field did not keep the stored value (Chrome's password manager can overwrite an autocomplete=username box). Fill this step yourself and re-run.`);
+
+      const before = await sig();
+      const clicked = await cdpEval(atsInjOrcClickButton, "^(next|continue|sign in|log ?in|submit)\b", null).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (!clicked || !clicked.ok) return halt("auth-submit-not-pressable", `Could not press "${(s.submit && s.submit.caption) || "Next"}" on the ${view} step` + (clicked && clicked.error ? ` (${clicked.error})` : "") + ".");
+      const ch = await waitForChange(before, 20000);
+      LOG(`${view} step submitted → page ${ch.changed ? "changed" : "did NOT change"} after ${ch.waitedMs}ms`);
+      continue;
+    }
+
+    if (view === "code") {
+      if (!gmailEnabled) {
+        return halt("verification-required-gmail-off", "Oracle wants an emailed verification code but Gmail auto-verify is OFF. Enable it (and Connect Gmail) in the popup, or type the code yourself and re-run.");
+      }
+      if (++codeTries > MAX_CODE_TRIES) {
+        return halt("verification-code-rejected", `Oracle did not accept the emailed code after ${MAX_CODE_TRIES} attempts. Enter it yourself and re-run.`);
+      }
+      let tok = await gmailGetToken(true);
+      if (!tok.ok) return halt("gmail-auth-failed", `Gmail auto-verify could not get a token: ${tok.error}`);
+      LOG(`waiting for Oracle's verification code by email (attempt ${codeTries}/${MAX_CODE_TRIES})…`);
+      const found = await gmailFindVerificationCode({ token: tok.token, length: s.pinInputs || 6 });
+      if (!found.ok && (found.status === 401 || found.status === 403)) {
+        await gmailRemoveCachedToken(tok.token);
+        tok = await gmailGetToken(true);
+        if (!tok.ok) return halt("gmail-auth-failed", `Gmail token refresh failed: ${tok.error}`);
+      }
+      const got = found.ok ? found : await gmailFindVerificationCode({ token: tok.token, length: s.pinInputs || 6 });
+      if (!got.ok) {
+        return halt("verification-code-not-received", `No Oracle verification code arrived by email: ${got.error}. Check the inbox for the stored login address, or type the code yourself and re-run.`);
+      }
+      // The code is NEVER logged — only that one was found, and how old it was.
+      LOG(`got a verification code from Gmail (message ${got.messageId}, ${Math.max(0, Math.round((Date.now() - got.internalDate) / 1000))}s old) — entering it`);
+      const filled = await cdpEval(atsInjOrcFillPin, s.pinSels, got.code).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (!filled || !filled.ok) return halt("verification-code-not-enterable", `Could not enter the code into Oracle's ${s.pinInputs} boxes${filled && filled.error ? ` (${filled.error})` : ""}.`);
+      LOG(`entered ${filled.filled} digit(s)`);
+      const before = await sig();
+      const clicked = await cdpEval(atsInjOrcClickButton, "^verify\b", null).catch(() => null);
+      if (!clicked || !clicked.ok) return halt("verify-not-pressable", "Entered the code but could not press Verify" + (clicked && clicked.error ? ` (${clicked.error})` : "") + ".");
+      const ch = await waitForChange(before, 20000);
+      LOG(`verify pressed → page ${ch.changed ? "changed" : "did NOT change"} after ${ch.waitedMs}ms`);
+      continue;
+    }
+  }
+  return halt("auth-rounds-exhausted", `Still not at the Oracle application form after ${MAX_ROUNDS} rounds — the flow is looping. Walk it yourself once and re-run.`);
+}
+
 async function runIcimsPreForm(tabId, credentials, LOG) {
   const MAX_ROUNDS = 8;
   const halt = (stopped, detail, extra) => {
@@ -5061,11 +5235,6 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   //     deliberately returns the posting url), so anything scanned would be the POSTING, not the form.
   // A wrong-but-plausible bundle is the failure class this pipeline exists to prevent, so this refuses
   // before touching the tab at all. Delete this guard in the same commit that adds the oracle scan.
-  if (ats === "oracle") {
-    LOG("⚠ Oracle Recruiting Cloud detected but its fill stage is not built yet — refusing before any page contact");
-    return { ok: true, needs_operator: true, stopped: "oracle-not-implemented",
-      detail: "This is an Oracle Recruiting Cloud posting. ApplyPilot recognizes the platform but its fill stage is still being built (recon landed 2026-08-19), so it will not touch the page — an ORC form needs an Apply-click stage and a scan that excludes the site's bot-detection honeypot. Apply here yourself for now." };
-  }
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
@@ -5172,6 +5341,39 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // positive test). So the pre-form stage runs BEFORE the form wait, not as a fallback after it:
     // reaching the gate and calling it "the application form" would start typing profile data into
     // a login box. Never submits; stops at the form.
+    // ⚠ ORACLE'S FORM DOES NOT EXIST UNTIL THE GATE IS CLEARED, so its pre-form stage runs here for
+    // the same reason iCIMS' does. Two ORC-specific reasons on top of that one:
+    //   • atsFormUrl deliberately returns the POSTING url for oracle (a synthesized `…/apply` 404s),
+    //     so the navigation above leaves us on the job description with nothing to fill — the Apply
+    //     control must be PRESSED, which is this stage's first act.
+    //   • the gate carries a BOT-DETECTION HONEYPOT, and the fill scan is not written yet. Reaching
+    //     the gate and treating it as "the form" would hand profile data to a login box and a decoy.
+    // Never submits; stops at the form.
+    if (ats === "oracle") {
+      emitRunProgress("Entering the Oracle application flow");
+      const gmailOn = await (async () => { try { const c = await chrome.storage.local.get("onboardConfig"); return (c.onboardConfig || {}).gmailEnabled !== false; } catch (e) { return true; } })();
+      const pre = await runOrcPreForm(tabId, store.credentials || null, { gmailEnabled: gmailOn, LOG });
+      if (pre.halt) {
+        // A dead requisition looks exactly like a broken Apply finder — the same lesson iCIMS paid
+        // for below. Consult atsPostingGone before blaming our own control finder.
+        if (pre.halt.stopped === "apply-not-followable" || pre.halt.stopped === "unknown-page") {
+          const at = await cdpEval(function () { return location.href; }).catch(() => null);
+          if (atsPostingGone(jd, originUrl || startUrl, at)) {
+            return { ok: true, needs_operator: true, stopped: "posting-gone", jd,
+              detail: "This Oracle posting is no longer live — the site redirected away from the requisition. Nothing was filled." };
+          }
+        }
+        return { ...pre.halt, jd };
+      }
+      // ⚠ THE FILL IS STILL REFUSED, DELIBERATELY. atsInjScan has no `oracle` branch, so the generic
+      // tail would run — and because ORC's controls are plain inputs it would classify them,
+      // honeypot included, producing a plausible-but-poisoned bundle. Onboarding was built first at
+      // the operator's direction; this guard comes out in the commit that adds the scan.
+      LOG("✔ pre-form complete — but the ORC fill scan is not built yet, so stopping here rather than filling");
+      return { ok: true, needs_operator: true, stopped: "oracle-fill-not-implemented", jd,
+        reached_form: true, sections: pre.sections, consents_accepted: pre.consentsAccepted,
+        detail: "Reached the Oracle application form (" + pre.sections + " section(s)). The ORC fill stage is not built yet, so nothing was typed into it — fill this one yourself, or wait for the scan." };
+    }
     if (ats === "icims") {
       emitRunProgress("Signing in to the careers portal", "iCIMS");
       const pre = await runIcimsPreForm(tabId, store.credentials || null, LOG);

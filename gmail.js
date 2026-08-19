@@ -257,6 +257,65 @@ async function gmailFindVerificationEmail(opts) {
 // Get a gmail.readonly access token. interactive:true shows Chrome's native
 // account-picker/consent (first connect); interactive:false is silent (cached/
 // refreshed by Chrome) and fails fast if consent was never granted.
+// ── POLL FOR AN EMAILED *CODE* (Oracle Recruiting Cloud, 2026-08-19) ───────────────────────
+// A deliberate SIBLING of gmailFindVerificationEmail rather than a new mode inside it. That
+// function is live on the Workday path and extracts a URL; threading a second payload type through
+// it would put the one auto-verify path that already works at risk for no benefit. This shares the
+// pieces that matter (gmailApiGet, gmailExtractBodyText, the freshness cutoff) and nothing else.
+//
+// ⚠ THE FRESHNESS CUTOFF IS THE LOAD-BEARING PART. A code is one-time and short-lived, and an ORC
+// inbox accumulates them — one per apply attempt per tenant. Returning a STALE code fails
+// verification and, worse, may consume an attempt, so the internalDate floor is not an
+// optimisation: a message older than `sinceMs` is not a candidate at all. Default 300s.
+// Returns { ok, code } | { ok:false, error } and NEVER throws. The code is returned to the caller
+// (which must not log it) and appears nowhere else.
+async function gmailFindVerificationCode(opts) {
+  const o = opts || {};
+  const fetchFn = o.fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
+  const sleep = o.sleepImpl || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const now = o.nowImpl || (() => Date.now());
+  if (!fetchFn) return { ok: false, error: "no fetch available in this context" };
+  if (!o.token) return { ok: false, error: "no Gmail token" };
+
+  const timeoutMs = o.timeoutMs != null ? o.timeoutMs : 120000;
+  const pollMs = o.pollMs != null ? o.pollMs : 5000;
+  const sinceMs = o.sinceMs != null ? o.sinceMs : 300000;
+  const maxResults = o.maxResults || 10;
+  // Oracle's candidate mail comes from the tenant's Fusion pod, so the SENDER is as unreliable as
+  // Workday's was. Key on tokens the body/subject carry instead, and let the code extractor's own
+  // guards be the decisive filter.
+  const q = o.query || ("newer_than:1h (oraclecloud OR oracle OR \"verification code\" OR \"Confirm Your Identity\")");
+
+  const start = now();
+  const cutoffMs = start - sinceMs;
+  let lastErr = null;
+
+  while (now() - start < timeoutMs) {
+    const list = await gmailApiGet(o.token, "/messages?q=" + encodeURIComponent(q) + "&maxResults=" + maxResults, fetchFn);
+    if (!list.ok) {
+      if (list.status === 401 || list.status === 403) return list; // auth — polling cannot fix it
+      lastErr = list;
+    } else {
+      const stubs = (list.data && list.data.messages) || [];
+      const msgs = [];
+      for (const stub of stubs) {
+        const full = await gmailApiGet(o.token, "/messages/" + stub.id + "?format=full", fetchFn);
+        if (full.ok && full.data) msgs.push(full.data);
+        else if (full.status === 401 || full.status === 403) return full;
+      }
+      msgs.sort((a, b) => Number(b.internalDate || 0) - Number(a.internalDate || 0)); // newest first
+      for (const m of msgs) {
+        if (Number(m.internalDate || 0) < cutoffMs) continue; // stale — see the note above
+        const code = gmailExtractVerificationCode(gmailExtractBodyText(m.payload), o);
+        if (code) return { ok: true, code, messageId: m.id, internalDate: Number(m.internalDate || 0) };
+      }
+    }
+    if (now() - start + pollMs >= timeoutMs) break;
+    await sleep(pollMs);
+  }
+  return { ok: false, error: lastErr ? ("Gmail lookup failed: " + (lastErr.error || lastErr.status)) : "no verification code found within " + Math.round(timeoutMs / 1000) + "s" };
+}
+
 function gmailGetToken(interactive) {
   return new Promise((resolve) => {
     try {
@@ -294,7 +353,7 @@ function gmailRemoveCachedToken(token) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     gmailB64UrlDecode, gmailExtractBodyText, gmailExtractVerificationUrl,
-    gmailExtractVerificationCode,
+    gmailExtractVerificationCode, gmailFindVerificationCode,
     gmailBuildQuery, gmailApiGet, gmailFindVerificationEmail,
     gmailGetToken, gmailRemoveCachedToken
   };

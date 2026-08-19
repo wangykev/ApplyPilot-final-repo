@@ -3412,6 +3412,169 @@ function icimsAuthView(s) {
   return "none";
 }
 
+// ── PRESS AN ORC FLOW BUTTON BY CAPTION (injected; 2026-08-19) ───────────────────────────
+// ⚠ atsInjClickAuthSubmit is NOT reusable here, and the reason is measured: ORC's "Next" and
+// "Verify" are plain `<button>`s with **no id** and no `type="submit"`, so that helper's selector
+// would be null and its fallback query (`input[type=submit], button[type=submit]`) finds nothing —
+// it would report `no-submit-control` on a page whose button is right there.
+//
+// The caption is therefore the only handle, which brings its own hazard the timeline already
+// demonstrated: on ORC's own experience form the entry-COMMIT button carries the SAME TEXT as the
+// entry-OPENER. So this takes an optional `withinSel` and, when given, only considers buttons
+// inside it — the caller decides the scope rather than hoping the first match is the right one.
+// A pattern SOURCE string is passed rather than a RegExp because CDP serializes arguments as JSON
+// and a RegExp arrives as `{}`.
+function atsInjOrcClickButton(patternSource, withinSel) {
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  let re;
+  try { re = new RegExp(patternSource, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const root = withinSel ? document.querySelector(withinSel) : document;
+  if (!root) return { ok: false, error: "scope-not-found:" + withinSel };
+  const btns = [...root.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]')].filter(vis);
+  const hit = btns.find((b) => re.test(clean(b.value || b.textContent)));
+  if (!hit) return { ok: false, error: "no-button-matching:" + patternSource, offered: btns.map((b) => clean(b.value || b.textContent).slice(0, 40)).slice(0, 8) };
+  if (hit.disabled || hit.getAttribute("aria-disabled") === "true") return { ok: false, error: "button-disabled", caption: clean(hit.value || hit.textContent).slice(0, 40) };
+  hit.click();
+  return { ok: true, caption: clean(hit.value || hit.textContent).slice(0, 40) };
+}
+
+// ── TYPE A ONE-TIME CODE INTO ORC'S SIX BOXES (injected; 2026-08-19) ─────────────────────
+// ⚠ A VERIFICATION CODE IS TREATED WITH THE CREDENTIAL DISCIPLINE, not as ordinary field data:
+// it returns a COUNT and never the digits, so the value cannot reach a log line, a record or the
+// review bundle by way of this function's result. Same reasoning as atsInjSetCredential returning
+// a length — the callers that log results are many, and the belt belongs at the source.
+//
+// Each box is one Knockout-bound `type=number` input with NO name, so the write is the house
+// technique (native setter → `input` → `change`; a bare assignment leaves Knockout unaware — the
+// measured ORC substrate finding). Boxes are written in the order the caller resolved them.
+// ⚠ Cleared FIRST, for the same reason iCIMS' credential write is: a setter SETS rather than
+// replaces, so a retry after a wrong or expired code would otherwise append into a 2-digit box.
+function atsInjOrcFillPin(sels, code) {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  const digits = String(code == null ? "" : code).replace(/\D+/g, "");
+  const list = Array.isArray(sels) ? sels : [];
+  if (!digits.length) return { ok: false, error: "no digits to enter" };
+  if (digits.length !== list.length) return { ok: false, error: "code length " + digits.length + " does not match " + list.length + " boxes" };
+  let filled = 0;
+  for (let i = 0; i < list.length; i++) {
+    const el = document.querySelector(list[i]);
+    if (!el) return { ok: false, error: "box " + (i + 1) + " not found", filled };
+    for (const v of ["", digits[i]]) {
+      setter.call(el, v);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    // read back the LENGTH only — never the character
+    if (String(el.value || "").length !== 1) return { ok: false, error: "box " + (i + 1) + " did not accept a digit", filled };
+    filled++;
+  }
+  return { ok: true, filled };
+}
+
+// ── THE ORACLE PRE-FORM SCAN (injected; 2026-08-19) ──────────────────────────────────────
+// Reports, classifies nothing — the judgement is orcApplyView + atsConsentKind + atsDecoyKind,
+// SW-side, so there is ONE copy of each rule rather than an injected dup that can drift. Same
+// split atsInjAuthScan / icimsAuthView already uses.
+//
+// ⚠ THE ONE PLACE THIS SCAN DOES EXERCISE JUDGEMENT IS THE HONEYPOT, AND THAT IS DELIBERATE.
+// ORC's gate ships a bot-detection decoy beside the real email box that passes every visibility
+// test (measured 179×38 and 200×38 on two tenants; see atsDecoyKind). If the scan merely
+// *reported* it and left exclusion to the caller, then any caller bug puts a value in it — and
+// that value is replayed on submit and marks the application as a bot, with no read-back able to
+// notice because the write succeeds. So decoys are excluded from the candidate lists HERE, at the
+// only point where a selector for one could be produced at all, AND reported separately so the
+// run's log can say it was seen and skipped.
+// ⚠ LOCKSTEP with atsDecoyKind (an injected fn cannot import): the generic aria-hidden + tabindex
+// pair plus the honeypot name. atsDecoyKind stays the authority for judging REPORTED fields.
+function atsInjOrcAuthScan() {
+  const vis = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+  const selOf = (e) => (e && e.id ? "#" + esc(e.id) : (e && e.name ? '[name="' + esc(e.name) + '"]' : null));
+  const labelOf = (e) => {
+    let l = e.id ? document.querySelector('label[for="' + esc(e.id) + '"]') : null;
+    if (!l) l = e.closest("label");
+    return clean(l && l.textContent).slice(0, 90);
+  };
+  // LOCKSTEP with atsDecoyKind — see the note above.
+  const isDecoy = (e) => {
+    const nm = clean((e.name || "") + " " + (e.getAttribute("aria-label") || ""));
+    if (/\bhoney[\s_-]?pot\b/i.test(nm)) return true;
+    return e.getAttribute("aria-hidden") === "true" && e.getAttribute("tabindex") === "-1";
+  };
+  const describe = (e) => (e ? { sel: selOf(e), id: e.id || null, name: e.name || null,
+    label: labelOf(e), type: String(e.type || "").toLowerCase(),
+    prefilled: !!(e.value && String(e.value).length) } : null);
+
+  const all = [...document.querySelectorAll("input:not([type=hidden]), select, textarea")];
+  const decoys = all.filter(isDecoy).map((e) => ({ sel: selOf(e), name: e.name || null,
+    ariaLabel: e.getAttribute("aria-label"), tabIndex: e.getAttribute("tabindex"),
+    ariaHidden: e.getAttribute("aria-hidden"), cssClassAttr: e.getAttribute("cssclass") }));
+  // Every candidate list below is drawn from this, so a decoy can never become a selector.
+  const shown = all.filter((e) => vis(e) && !isDecoy(e));
+
+  const pins = [...document.querySelectorAll('[id^="pin-code-"]')]
+    .filter((e) => !isDecoy(e))
+    .sort((a, b) => (parseInt(String(a.id).replace(/\D+/g, ""), 10) || 0) - (parseInt(String(b.id).replace(/\D+/g, ""), 10) || 0))
+    .map((e) => "#" + esc(e.id));
+
+  const emailEl = shown.find((e) => String(e.type || "").toLowerCase() === "email")
+    || shown.find((e) => /^primary-email/.test(e.id || "") || /\b(e-?mail|username|login)\b/i.test(clean((e.name || "") + " " + labelOf(e))));
+  const passEl = shown.find((e) => String(e.type || "").toLowerCase() === "password");
+
+  const clickables = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]')].filter(vis);
+  const cap = (b) => clean(b.value || b.textContent).slice(0, 60);
+  const byText = (re) => { const b = clickables.find((x) => re.test(cap(x))); return b ? { sel: b.id ? "#" + esc(b.id) : null, caption: cap(b) } : null; };
+
+  // The apply opener. Class is stable across tenants (`apply-now-button`); the caption is not
+  // (localised sites), so key on the class and report the caption for the log only.
+  const applyEl = document.querySelector("button.apply-now-button");
+
+  // Same VISIBLE-challenge rule as atsInjAuthScan: a dormant invisible-mode container is a
+  // full-viewport hidden iframe and must not read as a challenge.
+  const captchaChallenge = [...document.querySelectorAll('iframe[src*="hcaptcha"], iframe[src*="recaptcha"]')].some((f) => {
+    const cs = getComputedStyle(f);
+    if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) < 0.1) return false;
+    const r = f.getBoundingClientRect();
+    return r.width > 60 && r.height > 60 && r.width < 700;
+  });
+
+  // Consent boxes are REPORTED with their surrounding text; atsConsentKind decides. Only an
+  // "accept" is ever ticked, and never an opt-in or an attestation.
+  const consents = [...document.querySelectorAll('input[type="checkbox"]')].filter((e) => vis(e) || (e.getBoundingClientRect().width === 0 && e.closest("label")))
+    .filter((e) => !isDecoy(e))
+    .map((e) => {
+      const row = e.closest(".input-row, .legal-disclaimer-container, div");
+      return { sel: selOf(e), checked: !!e.checked, label: labelOf(e),
+        rowText: clean(row && row.textContent).slice(0, 220),
+        // the CSS-clipped box is clicked through its LABEL (the Workday radio rule)
+        labelSel: e.id ? 'label[for="' + esc(e.id) + '"]' : null };
+    }).slice(0, 8);
+
+  const secs = [...document.querySelectorAll("apply-flow-section")];
+  return {
+    ok: true, url: location.href, title: document.title,
+    // The form's own structural tell — measured absent (0) on the gate and the pin screen.
+    formSectionVisible: secs.some(vis), sectionCount: secs.length,
+    emailGate: !!document.querySelector("quick-email-verification-form"),
+    emailInput: describe(emailEl), passwordInput: describe(passEl),
+    pinInputs: pins.length, pinSels: pins,
+    submit: byText(/^(next|verify|continue|sign in|log ?in|submit)\b/i),
+    resend: byText(/send\s+new\s+code|resend/i),
+    applyControl: applyEl ? { sel: "button.apply-now-button", caption: cap(applyEl) } : null,
+    federated: clickables.map(cap).filter((t) => /\b(with|using)\s+(google|linkedin|apple|microsoft|facebook)\b|\b(sso|single sign[ -]?on)\b/i.test(t)).slice(0, 5),
+    createAccount: clickables.map(cap).filter((t) => /\b(create (an? )?account|register|sign ?up)\b/i.test(t)).slice(0, 5),
+    captchaChallenge, consents, decoys,
+    errors: [...document.querySelectorAll('[role="alert"], .error, .cx-error, cx-notifications')].filter(vis)
+      .map((e) => clean(e.textContent)).filter(Boolean).slice(0, 4),
+  };
+}
+
 // ── WHICH ORACLE APPLY-FLOW VIEW ARE WE LOOKING AT? (2026-08-19) ─────────────────────────
 // The ORC pre-form walk is a loop over views, exactly like the iCIMS one above, and this is the
 // judgement half — pure, so the sequencing in background.js has nothing to decide.
@@ -6347,7 +6510,8 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
-    atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView,
+    atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
+    atsInjOrcClickButton, atsInjOrcFillPin,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
