@@ -552,6 +552,62 @@ test("atsPostingGone: iCIMS answers a dead job id with notFound=1 on its own sea
 // consent surfaced as `auth-submit-unavailable … (submit-disabled)` — "the Next control could not be
 // pressed" — which sends the operator to debug a click that was fine.
 
+// ── WHAT THE PARSE LEFT BEHIND MUST REACH REVIEW (operator, 2026-08-18) ─────────────────
+//
+// "The auto parse is really bad… pretend the form is blank and refill everything." A field we CAN answer
+// was already overwritten; a field we CANNOT answer kept the parse's guess and was recorded BLANK, so the
+// review editor showed nothing while the form carried it — invisible, and submitted.
+
+test("a field the FORM populated and we did not fill reaches review WITH the value", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    // no profile mapping and no bucket — the fill has nothing to write here
+    { fieldName: "rcf9100", inputSel: "#rcf9100", widgetType: "text", inputType: "text",
+      label: "Anything else we should know", isRequired: false, value: null, domIndex: 0 },
+  ] });
+  // the PAGE holds a parse-derived value even though our fill wrote nothing
+  page.atsInjReadValue = () => ({ ok: true, value: "Robotics intern, summers 2024-2025" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", PROFILE, {}, {}, { credentials: CREDS });
+  const rec = out.results[0];
+  assert.strictEqual(rec.after, "Robotics intern, summers 2024-2025", "the live value rides the record");
+  assert.strictEqual(rec.status, "filled_review", "and it faces the human gate");
+  assert.strictEqual(rec.flag, "already-filled");
+  assert.match(rec.detail, /ALREADY on the form/);
+  assert.match(rec.detail, /parse is not trustworthy/, "on iCIMS it names the résumé parse");
+});
+
+test("surfacing NEVER touches a field we filled, nor invents a value for a blank one", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "PersonProfileFields.FirstName", inputSel: "#fn", widgetType: "text", inputType: "text",
+      label: "Legal First Name", isRequired: true, value: null, domIndex: 0 },
+    { fieldName: "rcf9101", inputSel: "#rcf9101", widgetType: "text", inputType: "text",
+      label: "Nothing here", isRequired: false, value: null, domIndex: 1 },
+  ] });
+  // the page answers with whatever was WRITTEN for the mapped field, and empty for the unmapped one
+  page.atsInjReadValue = (a, sel) => ({ ok: true, value: sel === "#fn" ? "Kevin" : "" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", PROFILE, {}, {}, { credentials: CREDS });
+  const filled = out.results.find((r) => /FirstName/.test(r.fieldName));
+  const empty = out.results.find((r) => r.fieldName === "rcf9101");
+  assert.strictEqual(filled.after, "Kevin");
+  assert.notStrictEqual(filled.flag, "already-filled", "a field WE filled is ours, not the page's");
+  assert.strictEqual(empty.status, "skipped", "a genuinely blank field stays a quiet skip");
+  assert.strictEqual(empty.after, null);
+});
+
+test("surfacing leaves CREDENTIALS alone — reading one back into a record is the thing we never do", async () => {
+  const page = icimsPage();
+  page.atsInjScan = () => ({ ...ICIMS_SCAN, fields: [
+    { fieldName: "PersonProfileFields.Password", inputSel: "#pw", widgetType: "text", inputType: "password",
+      autocomplete: "new-password", label: "Password", isRequired: false, value: null, domIndex: 0 },
+  ] });
+  page.atsInjReadValue = () => ({ ok: true, value: "a-real-secret-on-the-page" });
+  const out = await ats.driveAtsPageFill(fakeAct(page), "icims", PROFILE, {}, {}, { credentials: CREDS });
+  for (const r of out.results) {
+    assert.ok(!/a-real-secret-on-the-page/.test(JSON.stringify(r)), "no credential value may enter a record");
+  }
+});
+
 // ── AN EMPTY TENANT LIST IS THE TENANT'S, AND "No Results" IS NOT AN OPTION (live 2026-08-18) ──
 //
 // Cretex renders a REQUIRED Degree dropdown whose vocabulary is genuinely unpopulated. Probed read-only

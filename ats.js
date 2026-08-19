@@ -4566,6 +4566,71 @@ async function atsCredentialRecheck(act, ats, scan, results, credentials) {
 }
 
 // The audit + envelope — extracted with the loop (see atsFillFields).
+// ── WHAT THE FORM ALREADY HELD, AND WE DID NOT PUT THERE (operator, 2026-08-18) ─────────────────────
+// iCIMS parses the résumé and pre-populates whatever it thinks the answers are — and the operator's
+// verdict on that parse is blunt: "the auto parse is really bad… pretend the form is blank and refill
+// everything". Two halves to that, and only the first was true:
+//
+//   • A field we CAN answer is already overwritten. atsInjSetText assigns the whole value, and the choice
+//     paths commit regardless of what sits there, so nothing skips merely because the parse got there
+//     first. That half needed no change.
+//   • A field we CANNOT answer kept the parse's guess AND WENT UNRECORDED. Its record said `skipped` with
+//     `after: null`, so the review editor rendered it BLANK while the form carried the parse's value —
+//     invisible to the human, and submitted. On the Cretex form that was 45 of 81 fields' worth of blind
+//     spot. This is the gap the operator was describing.
+//
+// So: re-read every field we did not fill and, when the page holds something, put it ON the record and
+// flag it. Same convention the Workday walk has used for pre-filled fields (`already-filled` →
+// needs_review), and for the same reason — the review bundle is supposed to be the page's source of
+// truth, and a blank record about a populated field is simply false.
+//
+// ⚠ IT REPORTS, IT DOES NOT BLANK. Clearing a value we cannot vouch for is a different and riskier act:
+// on a REQUIRED field it trades a wrong answer for a blocked submit, and some of what the parse extracts
+// is correct. Surfacing puts the decision where it belongs — in review, next to the value, with an
+// editor. Blanking is a one-line change if the operator wants it.
+// ⚠ RUNS AFTER THE AUDIT, deliberately: the audit compares `rec.after` against the page for fields WE
+// filled, and these are not those. Promoting them beforehand would audit the parse's work as if it were
+// ours and report `audit-mismatch` on values nobody claimed.
+async function atsSurfacePrefilled(act, ats, scan, results) {
+  const fields = (scan && scan.fields) || [];
+  let surfaced = 0;
+  for (const rec of results) {
+    if (!rec || rec.credential) continue;
+    // Only records that claim NOTHING: a skip, or a review item we could not give a value to.
+    const claimsNothing = (rec.status === "skipped" || rec.status === "needs_review")
+      && (rec.after == null || String(rec.after).trim() === "");
+    if (!claimsNothing) continue;
+    // ⚠ ONLY FIELDS WE NEVER HAD A VALUE FOR. `resolved` is set before any actuation, so a record that
+    // carries one is a field we TRIED to fill — and if it ended without a value, that is a COMMIT FAILURE
+    // whose record must survive intact. Re-labelling it `already-filled` would both misattribute the
+    // value (we put it there, or tried to) and quietly convert a failed commit into a satisfied-looking
+    // review item — the false-verify class this codebase exists to refuse. Caught by the existing
+    // "a commit the widget does not display is NOT reported filled" test, which is precisely its job.
+    if (rec.resolved != null) continue;
+    const f = fields.find((x) => x.fieldName === rec.fieldName);
+    if (!f || f.widgetType === "file_upload") continue;
+    let live = null;
+    try { live = await act.eval(atsInjReadValue, ats, f.inputSel, f.widgetType); } catch (e) { live = null; }
+    // A read we could not make says nothing — leave the record exactly as the fill left it.
+    if (!live || !live.ok) continue;
+    const v = live.value == null ? "" : String(live.value).trim();
+    if (!v) continue;
+    rec.status = "filled_review";
+    rec.flag = "already-filled";
+    rec.after = v;
+    rec.verified = true;                 // it IS on the page — that is the whole point of the record
+    rec.detail = (rec.detail ? rec.detail + " · " : "")
+      + "this was ALREADY on the form and we did not put it there"
+      + (ats === "icims" ? " — iCIMS pre-fills fields from the résumé it parsed, and that parse is not trustworthy" : "")
+      + ". Your profile had no answer to overwrite it with, so check it or replace it here.";
+    surfaced++;
+  }
+  if (surfaced) {
+    try { console.log(`[ApplyPilot][ATS-FILL] ${surfaced} field(s) the form had ALREADY populated are now IN review with their live value — previously they were recorded blank and would have been submitted unseen`); } catch (e) { /* log only */ }
+  }
+  return surfaced;
+}
+
 async function atsFinishFill(act, ats, scan, results, credentials) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
@@ -4608,6 +4673,13 @@ async function atsFinishFill(act, ats, scan, results, credentials) {
   // Genuinely last, and BEFORE counts — a credential the page took back becomes `needs_review`
   // here, and the envelope must report that, not the status it held a moment earlier.
   await atsCredentialRecheck(act, ats, scan, results, credentials);
+
+  // …and the pre-filled sweep for the same reason: it promotes `skipped` records to `filled_review`, so
+  // running it after the tally left the envelope reporting 45 skips for a page that had 26 (measured on
+  // Cretex — the BUNDLE was right and the summary was not, which is the kind of disagreement that gets
+  // read as a bug in whichever half you look at second). Placed after the audit deliberately: see
+  // atsSurfacePrefilled.
+  try { await atsSurfacePrefilled(act, ats, scan, results); } catch (e) { /* completeness — never abort */ }
 
   const counts = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
   // DID THIS PAGE'S ASYNC WIDGETS EVER ANSWER? Greenhouse forms sometimes load in a state where their
@@ -5747,7 +5819,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
-    atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsMapKey,
+    atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
