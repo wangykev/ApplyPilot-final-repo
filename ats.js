@@ -2774,6 +2774,12 @@ function atsNearOptions(texts, query, limit) {
 // atsInjReadOptions). A healthy widget exits on its first read and pays neither. `search` is
 // sized from the live measurement that earned this: Discord's school list answered at 4049ms on
 // a hidden tab, so the old flat 2000ms could not have worked no matter how it retried.
+// ORC's picker search is server-backed and its own budget: the school/geo lookups answered in ~1.3-4s
+// during recon, and a give-up that is too short reports "no option matched" on a field whose list was
+// about to arrive — the exact failure iCIMS' 675ms settle produced. Separate from ATS_POLL because
+// nothing else in that table describes a grid-of-rows widget.
+var ATS_ORC_PICK_MS = 8000;
+
 const ATS_POLL = {
   // The first render after opening. The soft deadline only applies once the menu has actually
   // SETTLED (see pollFor): an empty read while the menu node isn't even mounted is not an answer,
@@ -4785,6 +4791,10 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // the caller derived from the approved bundle (see atsGrowIcimsEntries — it used to be skipped
   // whenever `valueFor` was present, which is exactly the submit run).
   if (ats === "icims") scan = await atsGrowIcimsEntries(act, ats, scan, profile, o.entryCounts);
+  // ⚠ BEFORE the fill, because it is what decides whether an UNFILLED field reaches review as a real
+  // picker — the operator's standing rule. Read-only, and it enriches the scan so every downstream
+  // atsAttachOptions call works unchanged.
+  if (ats === "oracle") await atsCaptureOrcOptions(act, scan, (...a) => console.log("[ApplyPilot]", ...a));
   // RECON THE LISTS BEFORE FILLING — including the OPTIONAL ones (operator, 2026-08-16). On these
   // one-page forms a field we never fill still has to be ANSWERABLE in review, and that means a
   // real picker, not a picker-shaped text box. The scan already carries every list, so the work is
@@ -5188,6 +5198,49 @@ async function atsRunAiBatchGroup(act, deferred, profile, jc, cache) {
 // The per-field fill loop — extracted so the cascade pass runs the IDENTICAL ladder. THREE phases
 // (see the DEFERRED AI block above): fill deterministically and record what needs the AI → ONE call
 // for exactly those questions → a second actuation pass that fills them.
+// ── CAPTURE ORC PICKER OPTIONS SO REVIEW DRAWS A REAL PICKER (2026-08-19) ────────────────
+// Enriches the SCAN in place rather than the records, which is the whole trick: every downstream
+// `atsAttachOptions(rec, f.options)` call site then works unchanged, and a captured list reaches
+// review by exactly the same path a natively-enumerated one does.
+//
+// Why a separate pass at all: ORC's listbox does not exist until its widget is opened, so options
+// cannot be read inline the way Greenhouse's or Lever's can. This is read-only page contact — it
+// opens with NO query, reads, and closes with Escape (the only close that works — see
+// atsInjOrcCaptureOptions).
+//
+// ⚠ COST IS BOUNDED BY POLICY, NOT BY A CAP: `atsOrcCaptureEligible` refuses geo pickers (dependent
+// and unbounded) and anything already enumerated, so this opens only fixed-vocabulary lists. On the
+// observed step 1 that is 2 fields, not 7.
+// ⚠ NO SILENT CAPS: whatever it skips or fails to read is logged, because a field that quietly
+// reaches review as a text box is indistinguishable from one the form never offered options for.
+async function atsCaptureOrcOptions(act, scan, LOG) {
+  const log = LOG || (() => {});
+  const fields = (scan && scan.fields) || [];
+  const eligible = fields.filter(atsOrcCaptureEligible);
+  const skipped = fields.filter((f) => f.widgetType === "select" && !atsOrcCaptureEligible(f));
+  if (!eligible.length) {
+    if (skipped.length) log(`[ATS-OPTIONS] ORC: 0 capturable, ${skipped.length} picker(s) left as type-it-yourself (${skipped.map((f) => f.fieldName).join(", ")})`);
+    return { captured: 0, skipped: skipped.length };
+  }
+  let captured = 0, failed = 0;
+  for (const f of eligible) {
+    let r = null;
+    try { r = await act.eval(atsInjOrcCaptureOptions, f.inputSel, ATS_ORC_PICK_MS); } catch (e) { r = null; }
+    if (r && r.ok && r.count) {
+      // Complete by construction: an empty open returns ORC's WHOLE vocabulary (measured — country
+      // 251 rows, dial 247, title 17; there is no pager to defeat us the way iCIMS' 25 did).
+      f.options = r.options;
+      captured++;
+      if (r.closed === false) log(`[ATS-OPTIONS] ⚠ ${f.fieldName}: list did NOT close after Escape — a lingering list is the standing hazard`);
+    } else {
+      failed++;
+      log(`[ATS-OPTIONS] ⚠ ${f.fieldName}: no options captured${r && r.terminalNo ? " (the widget said \"No results\")" : ""} — it will reach review as a text box`);
+    }
+  }
+  log(`[ATS-OPTIONS] ORC scan-time capture — ${captured} complete list(s), ${failed} unreadable, ${skipped.length} skipped as search-driven`);
+  return { captured, failed, skipped: skipped.length };
+}
+
 async function atsFillFields(act, ats, scan, fields, results, profile, defaults, jc, bucketIndex, o) {
   // Page-level, so a question repeated by a cascade round costs ZERO further calls (keyed by
   // QUESTION, not automation-id). Absent (a direct call, a test) ⇒ this loop keeps its own.
@@ -6089,6 +6142,71 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   }
 
   // combobox family (react-select + ashby selects + GH location + the dial composite).
+  // ── ORACLE'S PICKERS TAKE THEIR OWN PATH (2026-08-19) ──────────────────────────────────
+  // Placed AHEAD of the generic select branch because none of that branch's primitives work here:
+  // its option read queries `[role=option]` (ORC uses `div[role=row]` in a `div[role=grid]`), and its
+  // commit is a plain click (ORC needs a full pointer sequence). Every clause is measured — the full
+  // six-part recipe lives on atsInjOrcPick.
+  //
+  // The candidates still clear the SAME match ladder against the LIVE rows, and the commit is still
+  // read-back verified — this changes HOW a value is committed, never WHETHER it had to be matched.
+  if (ats === "oracle" && (wt === "select" || wt === "dial")) {
+    if (!candidates || !candidates.length) return false;
+    rec.resolved = candidates;
+    // ⚠ THE ROWS ARE THE ONLY VOCABULARY THAT COUNTS, and it is per-field: `country` wants the full
+    // name, `region2` (State) the TWO-LETTER code, `region1` (County) "County, ST", `city`
+    // "City, County, ST", and the dial picker "+1 (United States)". So each candidate is offered as
+    // its own query and matched against what comes back, rather than assuming one shape.
+    let last = null;
+    for (const cand of candidates) {
+      const q = String(cand == null ? "" : cand).trim();
+      if (!q) continue;
+      const r = await act.eval(atsInjOrcPick, ref.inputSel, q, [q], ATS_ORC_PICK_MS);
+      last = r;
+      if (r && r.ok) {
+        // ⚠ READ-BACK IS POLLED, NOT READ ONCE: a read in the same beat as the click returns the
+        // PREVIOUS value (measured — `country` read "United" straight after committing "United
+        // States", and correctly a round-trip later).
+        let back = null;
+        for (let i = 0; i < 8; i++) {
+          await act.delayFull(250);
+          back = await act.eval(atsInjOrcReadPicker, ref.inputSel);
+          if (back && back.ok && String(back.value || "").trim()) break;
+        }
+        rec.after = back && back.ok ? back.value : null;
+        // ⚠ `cx-select-input--invalid` MEANS THE WIDGET IS HOLDING TEXT IT NEVER ACCEPTED. A value
+        // being present is NOT proof: a prefilled `country` wore this from first load. A commit that
+        // leaves it set must never be reported as filled.
+        if (back && back.invalid) {
+          rec.status = "needs_review";
+          rec.flag = "commit-not-accepted";
+          rec.detail = "Oracle shows " + JSON.stringify(rec.after) + " but still marks the field invalid — it is holding text it did not accept as a selection. Pick it here.";
+          return true;
+        }
+        if (String(rec.after || "").trim()) {
+          rec.status = "filled";
+          rec.tier = "exact-normalized";
+          rec.detail = "picked " + JSON.stringify(r.committed) + " from the form's own list";
+          return true;
+        }
+      }
+      if (r && r.error === "ambiguous") {
+        // two rows matched — not a confident answer, and the standing rule refuses to guess.
+        rec.status = "needs_review";
+        rec.flag = "ambiguous-option";
+        rec.detail = "more than one Oracle option matched " + JSON.stringify(q) +
+          (r.rows ? "; the form offered " + JSON.stringify(r.rows.slice(0, 6)) : "") + " — choose here";
+        return true;
+      }
+    }
+    rec.status = f.isRequired ? "needs_review" : "skipped";
+    rec.flag = rec.flag || "no-option-match";
+    rec.detail = "none of " + JSON.stringify((candidates || []).slice(0, 4)) + " matched Oracle's list" +
+      (last && last.rows && last.rows.length ? "; it offered " + JSON.stringify(last.rows.slice(0, 6)) : "") +
+      (last && last.error === "no-results" ? " (the field returned \"No results\" — a dependent geo picker whose parent is not committed does this)" : "");
+    return true;
+  }
+
   if (wt === "select" || wt === "dial" || wt === "location") {
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
@@ -6965,7 +7083,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
-    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible,
+    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,

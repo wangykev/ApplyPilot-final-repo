@@ -5500,3 +5500,81 @@ this fix removes).
 Before this, every ORC combobox reached review in the `bare` bucket — no options at all, i.e. a plain
 text box — because the scan deliberately does not open dropdowns inline. The `[ATS-OPTIONS]` review-editor
 line is the way to check this per run: it counts `picker` vs `filter-or-type` vs `no options at all`.
+
+---
+
+## 2026-08-19 (i) — ORC pages 2 and 3: the repeating section is PER-TENANT, and the entry commit is a homonym
+
+Oracle (`eeho.fa.us2`, job 334325), steps 2 and 3, on the operator's verified session.
+
+### ⚠ THE REPEATING-SECTION CONTAINER IS NOT THE SAME ON TWO TENANTS
+
+Baylor renders its repeating entries through `<beautiful-timeline>` → `<timeline-form-inline>` →
+`<timeline-form-builder>`. **Oracle has none of those elements.** Its Add controls render the entry form
+**directly inside `<apply-flow-block>`** through the ordinary `<form-builder>`.
+
+So an ORC entry handler must NOT key on the timeline elements — they are one tenant's configuration.
+The portable structure is: `apply-flow-block` (identified by its `apply-flow-block-title`) containing an
+Add button, which on press materialises `form-builder` fields *in that block*.
+
+Oracle exposes **five** repeating families on step 2 — Add Education / Add Experience / Add License /
+Add Skill / Add Another Link — against Baylor's two.
+
+### ⚠⚠ THE ENTRY-COMMIT BUTTON IS A HOMONYM OF THE OPENER, AND SCOPING BY BLOCK DOES NOT SEPARATE THEM
+
+Recon (c) flagged this on Baylor and proposed scoping by container. **That does not work on Oracle**,
+because the opener and the committer are BOTH inside the same `apply-flow-block`:
+
+| block state | buttons present |
+|---|---|
+| closed | `Add Experience` |
+| **open** | `Cancel`, **`Add Experience`** |
+
+**The discriminator is the sibling `Cancel`** — it exists only while an entry form is open. So: no
+`Cancel` in the block ⇒ the same-captioned button is the OPENER; `Cancel` present ⇒ it is the COMMIT.
+Verified in both directions (after pressing Cancel the block returned to 0 inputs and `Cancel`
+disappeared).
+
+Experience entry fields on this tenant: `employerName`, `jobTitle`, `month/year-startDate`,
+`month/year-endDate` — month+year, no day, matching Baylor's timeline and unlike step 3's
+`earliestAvailableDate` (month+**day**+year). Arity really is per-field.
+
+### The entry-form comboboxes are the SAME widget, and NOT portaled
+
+`month-startDate-34` opened to **12 rows** — January…December, i.e. exactly the existing `ATS_MONTHS`
+vocabulary — with `aria-controls="month-startDate-34-listbox"`, and the listbox mounted **inside the
+field's own `div.input-row`** and inside the block.
+
+That closes the hazard raised in (c): a combobox pick inside an entry form is **not** a click outside
+it, so the "clicking outside the white box discards the entry" warning (Baylor's own instruction text)
+cannot be triggered by our option picks. One recipe covers page-level and entry-level pickers alike.
+
+Escape closed the entry-form list cleanly too, consistent with (h).
+
+### The candidate account already carries data
+
+- **A résumé is PRE-ATTACHED**: `Kevin_s_Resume (6).pdf`, with `<attachment-preuploaded>` and
+  `<referral-resume-block>` elements and a `Remove` control. So on a returning candidate the résumé
+  step may already be satisfied before we touch it — worth reading before attaching a second one.
+- **Skills are already populated** from the profile (Python, C Language, Software Debugging, JSON, …),
+  so the Skills block is not necessarily empty at fill time.
+
+Both argue the same thing: **on ORC a returning candidate's form arrives partly pre-filled from the
+account**, so the "already-filled" sweep matters more here than on a login-free one-page ATS.
+
+### Step 3 layout
+
+Blocks: Extra Information · Application Questions · Diversity Information · Veteran Information -
+United States · Disability Information · E-Signature. Its `earliestAvailableDate` is the
+month+day+year composite, and the three groups (Ethnicity / Race / Disability) are as recorded in (f).
+
+### Still unverified
+
+**Whether a synthetic click on a group option's `label[for]` commits it** — the test was in flight when
+the browser tab was closed, so this is genuinely unknown rather than assumed. It matters because ORC's
+group boxes are real inputs with proper labels, which is the shape the existing `atsInjCheckOption`
+already drives on other platforms, but "very likely works" is exactly the reasoning that has been
+wrong three times on this tenant. Verify before trusting it.
+
+Also unverified: the `Next` button's validation behaviour between steps, and whether ids renumber
+across a step transition.

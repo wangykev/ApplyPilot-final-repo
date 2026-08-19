@@ -2863,3 +2863,78 @@ test("atsAttachOptions: a list marked PARTIAL degrades to filter-or-type, never 
   assert.strictEqual(rec.widgetType, "typeahead");
   assert.strictEqual(rec.optionsPartial, true);
 });
+
+
+// ── the ORC option-capture PASS (driver-level, against a fake actuation) ─────────────────
+test("atsCaptureOrcOptions: opens only eligible pickers and enriches the SCAN in place", async () => {
+  const opened = [];
+  const logs = [];
+  const act = { eval: async (fn, sel) => {
+    opened.push(sel);
+    if (sel === "#title") return { ok: true, options: ["Mr.", "Ms.", "Dr."], count: 3, closed: true };
+    if (sel === "#dial") return { ok: true, options: ["+1 (United States)"], count: 1, closed: false };
+    return { ok: true, options: [], count: 0, terminalNo: true, closed: true };
+  } };
+  const scan = { fields: [
+    { fieldName: "title", inputSel: "#title", widgetType: "select" },
+    { fieldName: "phoneNumber", inputSel: "#dial", widgetType: "select" },
+    { fieldName: "country", inputSel: "#c", widgetType: "select", searchDriven: true },
+    { fieldName: "region2", inputSel: "#s", widgetType: "select", searchDriven: true },
+    { fieldName: "gender", inputSel: "#g", widgetType: "select" },
+    { fieldName: "lastName", inputSel: "#l", widgetType: "text" },
+    { fieldName: "race", inputSel: "#r", widgetType: "checkbox_group", options: ["Asian"] },
+  ] };
+  const res = await ats.atsCaptureOrcOptions(act, scan, (m) => logs.push(m));
+
+  // ONLY the three eligible pickers were opened — geo pickers, plain text and an already-enumerated
+  // group cost zero page contact.
+  assert.deepStrictEqual(opened, ["#title", "#dial", "#g"]);
+  assert.strictEqual(res.captured, 2);
+  assert.strictEqual(res.skipped, 2);
+
+  // the scan is enriched IN PLACE, which is what makes every downstream atsAttachOptions work
+  assert.deepStrictEqual(scan.fields[0].options, ["Mr.", "Ms.", "Dr."]);
+  // …and nothing else is disturbed
+  assert.strictEqual(scan.fields[2].options, undefined, "a geo picker must never be enumerated");
+  assert.strictEqual(scan.fields[3].options, undefined);
+  assert.strictEqual(scan.fields[5].options, undefined, "a text field is not a picker");
+  assert.deepStrictEqual(scan.fields[6].options, ["Asian"], "an inline-enumerated group is left alone");
+});
+
+test("atsCaptureOrcOptions: NO SILENT CAPS — a lingering list and an unreadable one are both named", async () => {
+  const logs = [];
+  const act = { eval: async (fn, sel) =>
+    (sel === "#dial" ? { ok: true, options: ["+1 (US)"], count: 1, closed: false }
+                     : { ok: true, options: [], count: 0, terminalNo: true, closed: true }) };
+  const scan = { fields: [
+    { fieldName: "phoneNumber", inputSel: "#dial", widgetType: "select" },
+    { fieldName: "gender", inputSel: "#g", widgetType: "select" },
+  ] };
+  await ats.atsCaptureOrcOptions(act, scan, (m) => logs.push(m));
+  const all = logs.join(" | ");
+  assert.ok(/phoneNumber.*did NOT close/.test(all), "a list that stayed open must be reported: " + all);
+  assert.ok(/gender.*no options captured/.test(all), "an unreadable picker must be reported: " + all);
+  assert.ok(/reach review as a text box/.test(all), "…and it must say what that COSTS the operator");
+});
+
+test("atsCaptureOrcOptions: a page with nothing capturable does no page contact", async () => {
+  let calls = 0;
+  const act = { eval: async () => { calls++; return { ok: true, options: [], count: 0 }; } };
+  const scan = { fields: [
+    { fieldName: "country", inputSel: "#c", widgetType: "select", searchDriven: true },
+    { fieldName: "lastName", inputSel: "#l", widgetType: "text" },
+  ] };
+  const res = await ats.atsCaptureOrcOptions(act, scan, () => {});
+  assert.strictEqual(calls, 0);
+  assert.strictEqual(res.captured, 0);
+  assert.strictEqual(res.skipped, 1);
+});
+
+test("atsCaptureOrcOptions: an eval that throws degrades to 'unreadable', never a crash", async () => {
+  const act = { eval: async () => { throw new Error("detached"); } };
+  const scan = { fields: [{ fieldName: "title", inputSel: "#title", widgetType: "select" }] };
+  const res = await ats.atsCaptureOrcOptions(act, scan, () => {});
+  assert.strictEqual(res.captured, 0);
+  assert.strictEqual(res.failed, 1);
+  assert.strictEqual(scan.fields[0].options, undefined);
+});
