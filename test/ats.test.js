@@ -2618,3 +2618,104 @@ test("ATS_STATIC_MAPS.oracle: every mapped path resolves against a real profile 
     assert.notStrictEqual(get(spec.path), undefined, key + " → " + spec.path + " does not exist on the profile");
   }
 });
+
+// ── ORC onboarding: which view are we on? ───────────────────────────────────────────────
+// Pure judgement half of the pre-form walk, mirroring icimsAuthView.
+
+test("orcApplyView: captcha outranks everything actionable", () => {
+  // the bot never solves or bypasses one, so no later branch that finds a fillable box may
+  // reach around this.
+  assert.strictEqual(ats.orcApplyView({ ok: true, captchaChallenge: true, emailInput: true, pinInputs: 6, formSectionVisible: true }), "captcha");
+});
+
+test("orcApplyView: a visible form section means DONE, even with an email box present", () => {
+  // ORC prefills `email` on the form from the gate, so a form still has an email input. Checking
+  // "form" before "email" is what stops the stage re-entering the gate it just cleared.
+  assert.strictEqual(ats.orcApplyView({ ok: true, formSectionVisible: true, emailInput: true }), "form");
+  assert.strictEqual(ats.orcApplyView({ ok: true, formSectionVisible: true, emailGate: true }), "form");
+});
+
+test("orcApplyView: the code screen outranks the email gate", () => {
+  // the gate LEADS to the code screen, and the gate's markup can still be in the document
+  assert.strictEqual(ats.orcApplyView({ ok: true, pinInputs: 6, emailGate: true }), "code");
+  assert.strictEqual(ats.orcApplyView({ ok: true, pinInputs: 6 }), "code");
+});
+
+test("orcApplyView: the plain views", () => {
+  assert.strictEqual(ats.orcApplyView({ ok: true, emailGate: true }), "email");
+  assert.strictEqual(ats.orcApplyView({ ok: true, emailInput: true }), "email");
+  assert.strictEqual(ats.orcApplyView({ ok: true, passwordInput: true }), "password");
+  assert.strictEqual(ats.orcApplyView({ ok: true, applyControl: true }), "posting");
+  assert.strictEqual(ats.orcApplyView({ ok: true }), "none");
+});
+
+test("orcApplyView: an email box beats a password box (the quick gate has no password)", () => {
+  // measured on Nokia and Baylor: the quick gate asks for an email and nothing else. A page with
+  // both is a real sign-in, but the login still goes in first, so "email" is the actionable view.
+  assert.strictEqual(ats.orcApplyView({ ok: true, emailInput: true, passwordInput: true }), "email");
+});
+
+test("orcApplyView: federated / create-account only is BLOCKED, never pressed", () => {
+  assert.strictEqual(ats.orcApplyView({ ok: true, federated: ["Sign in with Google"] }), "blocked");
+  assert.strictEqual(ats.orcApplyView({ ok: true, createAccount: ["Create an account"] }), "blocked");
+  // …but a fillable box outranks it: we can proceed ourselves without touching those controls
+  assert.strictEqual(ats.orcApplyView({ ok: true, emailInput: true, federated: ["Sign in with Google"] }), "email");
+});
+
+test("orcApplyView: an unreadable scan is never guessed at", () => {
+  assert.strictEqual(ats.orcApplyView(null), "unreadable");
+  assert.strictEqual(ats.orcApplyView({ ok: false }), "unreadable");
+  assert.strictEqual(ats.orcApplyView({ ok: false, emailInput: true }), "unreadable");
+});
+
+// ── The emailed verification CODE ───────────────────────────────────────────────────────
+const gmail = require("../gmail.js");
+
+test("gmailExtractVerificationCode: the ordinary ORC email", () => {
+  assert.strictEqual(gmail.gmailExtractVerificationCode(
+    "Your verification code is 481920. Enter it to confirm your identity."), "481920");
+  assert.strictEqual(gmail.gmailExtractVerificationCode(
+    "Confirm Your Identity\n\n314159\n\nType this code into the field."), "314159");
+});
+
+test("gmailExtractVerificationCode: ⚠ an ORC JOB ID IS ALSO SIX DIGITS and must never win", () => {
+  // the adversarial case that motivated the URL strip: the email links back to the posting, and
+  // `…/job/334325` is exactly code-shaped. Picking it would report "the code was rejected" and
+  // send the next debugging round to the wrong place.
+  const body = "Your verification code is 481920.\n" +
+    "View the job: https://eeho.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/jobsearch/job/334325";
+  assert.strictEqual(gmail.gmailExtractVerificationCode(body), "481920");
+  // and with NO real code present, the job id inside the URL must not be returned at all
+  const noCode = "Thanks for applying. View the job: https://eeho.fa.us2.oraclecloud.com/x/job/334325";
+  assert.strictEqual(gmail.gmailExtractVerificationCode(noCode), null);
+});
+
+test("gmailExtractVerificationCode: a 7+ digit run is rejected wholesale, not truncated", () => {
+  // \b is not a boundary between two digits, so the first six of a long number are never taken
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Reference 3000000169792650 for your records"), null);
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Your code is 1234567"), null);
+});
+
+test("gmailExtractVerificationCode: it REFUSES an ambiguous body rather than guessing", () => {
+  // two candidates, no keyword near either — guessing burns the code (a wrong submit can
+  // invalidate it) and misreports the cause. One operator stop is the cheaper failure.
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Ref 123456 and batch 654321 processed"), null);
+  // …but a LONE candidate is unambiguous even with no keyword
+  assert.strictEqual(gmail.gmailExtractVerificationCode("481920"), "481920");
+});
+
+test("gmailExtractVerificationCode: keyword proximity picks the right one of several", () => {
+  const body = "Requisition 334325 was posted. Your verification code is 481920. Batch 999888 queued.";
+  assert.strictEqual(gmail.gmailExtractVerificationCode(body), "481920");
+});
+
+test("gmailExtractVerificationCode: empty / junk never throws", () => {
+  for (const v of ["", null, undefined, 0, {}, []]) {
+    assert.strictEqual(gmail.gmailExtractVerificationCode(v), null, String(v));
+  }
+});
+
+test("gmailExtractVerificationCode: the code length is configurable", () => {
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Your code is 1234", { length: 4 }), "1234");
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Your code is 1234", { length: 6 }), null);
+});

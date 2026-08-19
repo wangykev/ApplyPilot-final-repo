@@ -3412,6 +3412,47 @@ function icimsAuthView(s) {
   return "none";
 }
 
+// ── WHICH ORACLE APPLY-FLOW VIEW ARE WE LOOKING AT? (2026-08-19) ─────────────────────────
+// The ORC pre-form walk is a loop over views, exactly like the iCIMS one above, and this is the
+// judgement half — pure, so the sequencing in background.js has nothing to decide.
+//
+// Views, and why the ORDER is what it is:
+//   "captcha"  — FIRST, ahead of anything actionable. The bot never solves or bypasses one; the
+//                only correct response is to stop for the operator, and that must not be
+//                reachable-around by a later branch that happens to find a fillable box.
+//   "form"     — a VISIBLE apply-flow-section: we have arrived, and the stage is DONE. Checked
+//                before the auth views so a form that happens to keep an email box (ORC prefills
+//                `email` from the gate) is never mistaken for the gate itself.
+//   "code"     — the six #pin-code-N boxes ("Confirm Your Identity"). Above "email" because the
+//                code screen is where the email gate LEADS, and on some tenants the flow lands
+//                straight here with the gate's markup still in the document.
+//   "email"    — the quick-apply gate (`quick-email-verification-form` / `primary-email-*`).
+//   "password" — a real sign-in. Distinct from "email" because it needs the stored password, not
+//                just the login, and because ORC's quick gate never has one (measured: Nokia and
+//                Baylor both ask for an email and nothing else).
+//   "blocked"  — no field we can fill, but federated sign-in or account creation is on offer.
+//                Those controls are REPORTED, never pressed. Saying "blocked" beats "unknown".
+//   "posting"  — still on the job description with an Apply control: the flow has not been
+//                entered yet, so the caller should press it.
+//   "none"     — nothing recognizable.
+//
+// ⚠ Deliberately NO control-count bound, unlike icimsAuthView. iCIMS needed one because its
+// sign-in card and its application form are both "a form with an email box", so only size
+// separated them. ORC declares the difference structurally — `apply-flow-section` exists on the
+// form and does not exist on the gate (measured `sections: 0` on the pin screen) — and a declared
+// signal always beats a threshold.
+function orcApplyView(s) {
+  if (!s || !s.ok) return "unreadable";
+  if (s.captchaChallenge) return "captcha";
+  if (s.formSectionVisible) return "form";
+  if (Number(s.pinInputs || 0) > 0) return "code";
+  if (s.emailGate || s.emailInput) return "email";
+  if (s.passwordInput) return "password";
+  if ((s.federated || []).length || (s.createAccount || []).length) return "blocked";
+  if (s.applyControl) return "posting";
+  return "none";
+}
+
 // ── WHAT KIND OF CHECKBOX IS THIS? (operator, 2026-08-18) ────────────────────────────────
 // The operator read ITT's and Peraton's privacy notices themselves and instructed that **accept
 // checkboxes be ticked, now and in the future**. They are the data subject, the notices govern the
@@ -6306,7 +6347,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
-    atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind,
+    atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,

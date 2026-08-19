@@ -89,6 +89,59 @@ function gmailExtractVerificationUrl(body, urlMustContain) {
   return needle ? (hostUrls[0] || null) : null;
 }
 
+// ── A NUMERIC VERIFICATION CODE, NOT A LINK (Oracle Recruiting Cloud, 2026-08-19) ──────────
+// Workday emails a clickable activation URL; ORC emails a SIX-DIGIT CODE to type into six boxes
+// ("Confirm Your Identity"). Same auto-verify purpose, a different payload, so this sits beside
+// gmailExtractVerificationUrl rather than inside it.
+//
+// ⚠ THE ADVERSARIAL CASE IS REAL, NOT HYPOTHETICAL: an ORC requisition id is itself six digits
+// (`…/job/334325`), and the verification email carries links back to the posting. A naive
+// `\d{6}` would happily return the JOB ID and then report "the code was rejected", sending the
+// next debugging round at the typing code rather than at the extraction. Two guards:
+//
+//   1. URLs are stripped FIRST, so a job id, a tracking parameter or a message id inside a link
+//      cannot be a candidate at all.
+//   2. A candidate must sit near a code-ish word. Only if the body contains EXACTLY ONE candidate
+//      overall is proximity waived — and otherwise it REFUSES. Refusing costs one operator stop;
+//      guessing burns the code (each wrong submit may invalidate it) and lies about why.
+//
+// `\b\d{6}\b` is deliberate: `\b` is not a boundary between two digits, so a 7+ digit run is
+// rejected wholesale rather than having its first six taken.
+var GMAIL_CODE_KEYWORD_RE = /(verification|verify|confirm|identity|security|access|one[\s-]?time|passcode|\bpin\b|\bcode\b|\botp\b)/gi;
+
+function gmailExtractVerificationCode(body, opts) {
+  const o = opts || {};
+  const len = Number(o.length) > 0 ? Number(o.length) : 6;
+  const windowChars = o.windowChars != null ? Number(o.windowChars) : 200;
+  const text = String(body == null ? "" : body);
+  if (!text) return null;
+
+  const noUrls = text.replace(/https?:\/\/[^\s"'<>]+/g, " ");
+
+  const cands = [];
+  const digitRe = new RegExp("\\b\\d{" + len + "}\\b", "g");
+  for (let m = digitRe.exec(noUrls); m; m = digitRe.exec(noUrls)) cands.push({ code: m[0], at: m.index });
+  if (!cands.length) return null;
+
+  const keys = [];
+  GMAIL_CODE_KEYWORD_RE.lastIndex = 0;
+  for (let m = GMAIL_CODE_KEYWORD_RE.exec(noUrls); m; m = GMAIL_CODE_KEYWORD_RE.exec(noUrls)) keys.push(m.index);
+
+  if (keys.length) {
+    let best = null;
+    for (const c of cands) {
+      for (const k of keys) {
+        const d = Math.abs(c.at - k);
+        if (d <= windowChars && (!best || d < best.d)) best = { code: c.code, d };
+      }
+    }
+    if (best) return best.code;
+  }
+  // No keyword anywhere near a candidate. A LONE candidate is still unambiguous; two or more is a
+  // guess, and this refuses to make it.
+  return cands.length === 1 ? cands[0].code : null;
+}
+
 // The Gmail search `q`. Mirrors the reference: sender + a 1h recency floor (the
 // hard freshness guard is the internalDate cutoff below; newer_than:1h just keeps
 // the result set small). Optional subject narrows further (unused by the caller).
@@ -241,6 +294,7 @@ function gmailRemoveCachedToken(token) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     gmailB64UrlDecode, gmailExtractBodyText, gmailExtractVerificationUrl,
+    gmailExtractVerificationCode,
     gmailBuildQuery, gmailApiGet, gmailFindVerificationEmail,
     gmailGetToken, gmailRemoveCachedToken
   };
