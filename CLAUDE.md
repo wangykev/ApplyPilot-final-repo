@@ -15,6 +15,7 @@ This file holds **standing rules, invariants and safety contracts only** — eve
 | `workday-onboarding` skill | pre-form: JD → Apply → sign-in → Gmail verify → the form |
 | `job-discovery` skill | the LinkedIn / Handshake / Simplify sweep (`discover.js`) |
 | `live-testing` skill | driving a real end-to-end run through Chrome |
+| `docs/adding-a-filler.md` | **adding support for a NEW ATS / platform** — the substrate decision, the recon checklist, the exact integration surface, the five widget-registration sites, and the trap catalogue organized by symptom. Read it before writing a line of code for a new platform |
 | `docs/dom-patterns.md` | the dated observed-DOM rulebook (every tenant + refutations). **Has a topic index at the top — use it; never read the file whole.** |
 | `docs/progress-log.md` | full extension milestone history. Append new entries here. **Has a topic index at the top; never read it whole.** |
 | `docs/fill-speed-log.md` | **fill SPEED / timing** — every measurement, refuted theory, per-run data and fix direction. Read before investigating any slow fill; append new speed rounds here |

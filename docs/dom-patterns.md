@@ -38,6 +38,8 @@ during 2026-08, so a later date can appear above an earlier one.
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
 | **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out`, `2026-08-18 — four more tenants: the Apply widget, the bare "Type", and the settle probe` |
+| **Oracle Recruiting Cloud (JET SPA, Knockout, honeypot)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON` |
+| **Bot-detection honeypots (a visible field you must NEVER fill)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON` |
 | **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
 | **Option lists: paging, completeness, what review can offer** | `2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE` |
 | **Job discovery (LinkedIn / Handshake)** | `2026-07-30 — LinkedIn's SDUI jobs rewrite` |
@@ -47,7 +49,8 @@ during 2026-08, so a later date can appear above an earlier one.
 
 Comcast wd5 · Cambium Learning · US Bank wd1 · LiveRamp wd5 · **Magna wd3** (the CDP proving ground) ·
 Caterpillar / Solar Turbines (cat.wd5) · waystar.wd1 · marvell · moog — plus Greenhouse, Lever and Ashby
-across many employers.
+across many employers, iCIMS (Astrion · Cretex · ITT · Peraton · Wieland) and **Oracle Recruiting Cloud
+(Nokia — recon only, 2026-08-19)**.
 
 **Add an entry when you test a new tenant**, and add its row to the table above.
 
@@ -4501,3 +4504,170 @@ per nominal-900ms tick — ~2.9s per tick in practice. A lean read of name + has
 ⚠ Both sides of that comparison must be computed the same way. A full-scan baseline against lean ticks
 differs on tick ONE, which the loop reads as "the parse changed the form" — and a false `changed` lets the
 wait finish on the first brief quiet, potentially **before the parse has started**.
+
+---
+
+## 2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON (read-only)
+
+Tenant: **Nokia** — `fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com`, site `CX_1`, job `35578`. Nothing was
+filled and nothing was submitted; the one write below was a non-personal probe string, reverted in the same
+call. Recon stopped at the email gate, because passing it enters personal data and creates a real candidate
+profile — an operator decision, not ours.
+
+### Host + URL shapes (three forms, and the third has NO region segment)
+
+```
+<tenant>.fa.<region>.oraclecloud.com          eeho.fa.us2 · ejov.fa.ca2 · hdpc.fa.us2 · efds.fa.em5 · hcmn.fa.ap1 · hdow.fa.us6
+fa-<code>-saasfaprod1.fa.ocs.oraclecloud.com  fa-evmr · fa-evcm · fa-etbx
+<tenant>.fa.oraclecloud.com                   jpmc.fa.oraclecloud.com      <-- no region segment
+```
+
+Path: `/hcmUI/CandidateExperience/<lang>/sites/<siteCode>/job/<numericId>`.
+
+⚠ **`siteCode` is a tenant setting, not a constant** — observed `CX_1`, `CX`, `CX_1001`, `CX_1003`, `nfcu`,
+`LateralHiring`. Anything keyed on the literal `CX_1` would work on one tenant and silently miss the rest.
+
+⚠ **The company lives in the SUBDOMAIN and it is OPAQUE** (`eeho`, `hdpc`, `fa-evmr-saasfaprod1`). Unlike
+iCIMS, the host cannot anchor the safety-critical employment recognizer — see the JD sources below, which can.
+
+### ⚠ THE APPLY URL IS NOT DERIVABLE — the button must be pressed
+
+Guessing `…/job/35578/apply` (the Lever/Ashby shape) **redirects to `…/sites/CX_1/404`**. The real route is
+reached only by clicking `button.apply-now-button` on the posting, which pushes `…/job/<id>/apply/email`.
+
+So `atsFormUrl` must NOT synthesize an ORC form URL — an Apply click is a required *stage*, like iCIMS'
+pre-form. (`button.apply-now-button` was the only apply control on the page, and the class is stable.)
+
+### The gate: email + a terms box, NO account, NO password
+
+Custom element `<quick-email-verification-form>`; `h1` "Job application form", `h2` "Authentication screen.
+You don't need to have an account". Body copy: *"Get started right away by simply using your email. Your
+profile will be created and kept up to date automatically as you enter details for each of your job
+applications."*
+
+| control | identity | notes |
+|---|---|---|
+| Email Address `*` | `input#primary-email-0[name=primary-email][type=email]` | `autocomplete="email"`, `aria-required="true"` |
+| "I agree with the terms and conditions" `*` | `input#legal-disclaimer-checkbox` | **CSS-clipped** — see below |
+| **honeypot** | `input#honey-pot-1[name=honey-pot]` | **see below — the finding that matters** |
+| Next / Cancel | `button` | |
+
+A candidate profile is created from the email alone. **No password is set and no account is created**, so
+this path needs no `credentials` tier and involves no prohibited action — the value is
+`personal_info.email`. Whether a verification code follows is UNVERIFIED (the gate was not passed).
+
+The terms box is an **ACCEPT** checkbox under the 2026-08-18 standing instruction (assent to terms — not an
+opt-in, not a truthfulness attestation) ⇒ ticked, logged by name, verified.
+
+### ⚠⚠ THERE IS A BOT-DETECTION HONEYPOT, AND EVERY VISIBILITY TEST WE OWN PASSES IT
+
+The single most dangerous thing in this recon. Measured on the live gate:
+
+| signal | honeypot `#honey-pot-1` | real email `#primary-email-0` |
+|---|---|---|
+| `getBoundingClientRect()` | **179 × 38 — NON-ZERO** | 620 × 38 |
+| closest `div` rect | **179 × 19 — NON-ZERO** | 620 × 38 |
+| `offsetParent === null` | **false** | false |
+| `display` | **`inline-block`** | `inline-block` |
+| `visibility` | **`visible`** | `visible` |
+| `opacity` | **`1`** | `1` |
+| `type` | `text` | `email` |
+
+**The Greenhouse/Lever scan pattern — `vis(el) = rect.width > 0 && rect.height > 0`, optionally on
+`el.closest("div")` — does NOT exclude this field.** Copying that pattern for ORC pushes the honeypot as an
+ordinary text field.
+
+It is optional, so the AI tier (REQUIRED-only) would not fill it and it would end blank — but it still
+reaches the **review editor as a fillable box**, and a value typed there is replayed on submit and marks the
+application as a bot. **No read-back catches this: the write succeeds.** The failure is invisible from
+inside the pipeline and lands on the employer's side.
+
+**Exclude it by the tells the page itself declares, never by geometry:** `aria-hidden="true"`,
+`tabindex="-1"`, `aria-label="honeypot"`, `name="honey-pot"`, and the wrapper attribute
+`cssclass="input-row--invisible"`. The first two are the general-purpose pair — a control the page hides
+from assistive tech AND from tab order is not a control a human fills — and the name match is the belt.
+
+⛔ **Do not "fix" this by tightening the visibility test.** Same dead end as the Workday dropdown-chip
+contamination (tried twice, confirmed dead): the element is genuinely visible by every computed-style
+measure. Exclusion must key on declared intent, not on layout.
+
+### Actuation substrate: KNOCKOUT on plain inputs — synthetic events DO commit
+
+Not JET components on the form path. Controls are native `<input>`s carrying a Knockout `data-bind`:
+
+```
+data-bind="value: element.value, valueUpdate: element.valueUpdateType(), attr: element.attributes, …"
+```
+
+Probed on the email box (write an invalid value — does Knockout validate?), then reverted in the same call:
+
+| step | DOM value | `aria-invalid` | verdict |
+|---|---|---|---|
+| before | `""` | `false` | |
+| native setter only, **no events** | `not-an-email` | `false` | **Knockout did NOT notice** |
+| + `input` + `change` | `not-an-email` | **`true`** | **Knockout picked it up and validated** |
+| reverted to `""` + events | `""` | `true` (touched+empty+required) | clean |
+
+⇒ **ORC belongs on the page-side synthetic substrate (`ats.js`), like Greenhouse/Lever/Ashby/iCIMS — NOT the
+Workday CDP `Input.*` pipeline.** The house technique (native setter + `input` + `change`) is exactly right,
+and the bare-write row is direct evidence that `el.value = x` alone is still not enough — the same lesson as
+React, for a different reason.
+
+⚠ `valueUpdate` is **dynamic per element** (`element.valueUpdateType()`), so always dispatch BOTH events.
+Which one Knockout is listening for is a per-field runtime decision, not something worth detecting.
+
+⚠ **Not yet verified on the application form proper** (choice widgets, dates, file upload). JET components
+DO exist on the page (`oj-text-area`, `oj-dialog`), so far only in the AI assistant and in dialogs. A JET
+`oj-select-single` binds its value as an element **property**, not through an inner input — if the form uses
+them, that is a separate widget class needing its own commit path and its own read-back.
+
+### CSS-clipped checkbox — the Workday radio lesson transfers verbatim
+
+`#legal-disclaimer-checkbox` is `position:absolute; opacity:0; clip:rect(0,0,0,0)`, rect **0 × 0**. Its
+`<label for="legal-disclaimer-checkbox">` (273 × 18) is the styled click target. Same rule as Workday
+radios: **click the label, verify `input.checked`.**
+
+Note the polarity against the honeypot: here a **0 × 0** rect means "click the label instead"; there a
+**non-zero** rect means "never touch this at all". Geometry answers neither question — which is the point.
+
+### JD sources: TWO structured ones, so the company anchor is evidence, not a heuristic
+
+1. **JSON-LD `JobPosting`** on the posting page — `title`, `datePosted`, `employmentType`, `description`,
+   `jobLocation`, `identifier`, and **`hiringOrganization.name` = `"Nokia Corporation"`**.
+2. **ORC's own CX REST endpoint — UNAUTHENTICATED, HTTP 200**, ~15KB:
+   `/hcmRestApi/resources/latest/recruitingCEJobRequisitionDetails?expand=all&onlyData=true&finder=ById;Id="<jobId>",siteNumber="<siteCode>"`
+   → `Id`, `Title`, `Category`, `RequisitionType`, `RequisitionId`, `ExternalPostedStartDate`, …
+
+**Use `hiringOrganization.name`, not the document title.** `atsPlausibleCompany` exists because an
+employer-hosted page made the scrape return a page title ("… in Mountain View, California | Astrion") as the
+company. ORC hands us the real name in structured form, and the opaque subdomain cannot serve as the
+fallback — so this is the anchor for the employment recognizer.
+
+⚠ The page is a JET SPA with **no iframe** (top document, `window.oj` present) — so no `cdpUseFormFrame`
+here. But the JD scrape's largest-text-block fallback is a **contest** on an SPA whose page is mostly
+bundled JS, which is exactly how a session token became a job description on iCIMS: prefer JSON-LD → REST →
+rendered text, and keep `redactSecrets` on the assignment.
+
+### Other page furniture (NOT form fields)
+
+`<session-expire>` (idle timeout: "Are You Still With Us?" / "End Session" / "Continue Working"),
+`<ai-assistant-container>` + `<oda-summary>` + `oj-text-area#oda-work-summary-text-area` (Oracle Digital
+Assistant), `<agreement-dialog>`, `<apply-flow-header>`, `<apply-flow-fixer>`, `<legal-disclaimer>`,
+`<minimal-dialog>`.
+
+⚠ **`oda-work-summary-text-area` carries `required="true"` and is NOT an application field.** A scan that
+sweeps the whole document for required controls picks up the AI assistant's box — and a required unmapped
+textarea is precisely the shape that buys an LLM call. **Scope the scan to the apply-flow container**, the
+same discipline as scoping a Workday dropdown scrape to its own listbox.
+
+⚠ `<session-expire>` means ORC has an idle-timeout concept, so a long fill can be logged out mid-run. The
+Workday rule applies: session death is **behavioural**, not statically detectable from the DOM.
+
+### Open questions for the next round (all need the gate passed)
+
+1. Does a verification CODE follow the email? If so, `gmail.js` auto-verify already exists (built for Workday).
+2. Is the application form ONE page or a wizard? (`<apply-flow-header>` hints at a progress rail.)
+3. Do choice widgets use JET `oj-select-single`, or Knockout-bound native `<select>`?
+4. Field identity: stable platform ids, or per-tenant generated ones?
+5. Repeating sections (experience / education) — entry container and ordinal shape.
+6. Is there a captcha on the real submit? (The honeypot suggests bot defence is at least partly passive.)
