@@ -53,6 +53,16 @@ export const DISABILITY_STATUS_OPTIONS = [
  * same dropdown, so it belongs in the same list. Interim grades are listed because forms ask for them
  * specifically and an interim Secret is not a Secret.
  */
+/** "May we contact this employer?" — the third option is the one people actually hold and no
+ *  boolean can express. Values are the STORED codes; the filler turns each into a tiered candidate
+ *  ladder against whatever the form offers. "" is unanswered, and the tool then refuses to guess. */
+export const MAY_CONTACT_OPTIONS = [
+  { value: "", label: "— not answered —" },
+  { value: "yes", label: "Yes" },
+  { value: "no", label: "No" },
+  { value: "yes_if_required", label: "Yes, if required" },
+];
+
 export const SECURITY_CLEARANCE_OPTIONS = [
   "",
   "None",
@@ -136,6 +146,7 @@ const META: Record<string, ProfileFieldMeta> = {
   "screening.willing_drug_test": { widget: "tribool", bucketWidget: "radio" },
   "screening.has_valid_drivers_license": { widget: "tribool", bucketWidget: "radio" },
   "screening.willing_to_relocate": { widget: "tribool", bucketWidget: "radio" },
+  "work_experience.0.may_contact": { widget: "dropdown", options: MAY_CONTACT_OPTIONS.map((o) => o.value), bucketWidget: "dropdown" },
   "screening.willing_to_relocate_at_own_cost": { widget: "tribool", bucketWidget: "radio" },
   "screening.remote_ok": { widget: "tribool", bucketWidget: "radio" },
   "screening.earliest_start_date": { widget: "date", granularity: "month-day-year", bucketWidget: "date" },

@@ -18,6 +18,29 @@ const str = z.string().default("");
  *  TOLERANT of legacy string values ("yes"/"no"/"true"/"false"; anything else → null) — before
  *  this, ONE string tri-bool anywhere failed the whole parse and coerceProfile silently returned
  *  an EMPTY profile (hit live: the extension's data/profile.json carries string values here). */
+/** "may we contact this employer?" — yes / no / yes-if-required / null (unanswered).
+ *  MIGRATES the tri-bool this replaced (true → "yes", false → "no"), because profiles already stored
+ *  that shape and a failed parse here silently empties the WHOLE profile (see triBool's note). Every
+ *  wording the option has been written as maps in, so a hand-edited profile.json still loads. */
+const mayContact = z
+  .preprocess((v) => {
+    if (v === true) return "yes";
+    if (v === false) return "no";
+    if (typeof v === "string") {
+      // punctuation stripped too: the STORED label spelling is "Yes, if required", and a profile
+      // hand-edited to the label rather than the code must still load as an answer, not as unanswered.
+      const t = v.trim().toLowerCase().replace(/[.,]/g, "").replace(/[\s_-]+/g, " ");
+      if (!t) return null;
+      if (/^(yes|y|true)$/.test(t)) return "yes";
+      if (/^(no|n|false)$/.test(t)) return "no";
+      // "yes if required" / "yes if necessary" / "only if required" / "if required"
+      if (/^(yes )?(if|only if) (required|requested|necessary|needed)$/.test(t)) return "yes_if_required";
+      return null;
+    }
+    return null;
+  }, z.enum(["yes", "no", "yes_if_required"]).nullable())
+  .default(null);
+
 const triBool = z
   .preprocess((v) => {
     if (v === true || v === false || v === null) return v;
@@ -174,11 +197,17 @@ export const workExperienceSchema = z.object({
   supervisor_name: str,
   supervisor_title: str,
   reason_for_leaving: str,
-  // ⚠ TRI-STATE, not a checkbox. "may we contact this employer?" is a QUESTION with a real
-  // consequence — a false yes hands a recruiter a reference you did not agree to — so an unanswered
-  // one must stay unanswered rather than defaulting to either polarity. `triBool` is the same type
-  // the work-authorization questions use for exactly this reason.
-  may_contact: triBool,
+  // ⚠ A THREE-WAY ANSWER, not a checkbox and no longer a plain tri-bool (operator, 2026-08-18).
+  // "may we contact this employer?" is a QUESTION with a real consequence — a false yes hands a
+  // recruiter a reference you did not agree to — so an unanswered one stays unanswered rather than
+  // defaulting to either polarity, exactly like the work-authorization questions.
+  //
+  // The third option exists because it is the answer many people actually hold and no boolean can
+  // express: "yes_if_required" — they may, but only if the process demands it. Forms that offer a
+  // conditional option get it; a plain Yes/No form gets "Yes", which is the truthful projection onto
+  // the options that exist (the conditionality has nowhere to live there), and the filler's tiered
+  // candidate ladder is what picks whichever the form actually offers.
+  may_contact: mayContact,
   // Only meaningful when may_contact is true; the filler enforces that, and gates on the ANSWER
   // rather than on whether these happen to be filled in.
   employer_email: str,

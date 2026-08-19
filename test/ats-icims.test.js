@@ -63,6 +63,15 @@ function icimsPage(over) {
     atsInjReadValue: (a, sel) => ({ ok: true, value: box[sel] != null ? box[sel] : null }),
     _box: box, _writes: writes,
   };
+  // The settle heartbeat reads a LEAN signature rather than a full scan (2026-08-18) — cheap on a real
+  // page, where a 479-line `atsInjScan` per tick cost ~2.9s and turned an 8.6s probe into the wait.
+  // The fake derives it from whatever scan this page is serving, via the SAME reducer the wait used
+  // before, so these tests still exercise the state machine (pre-parse → post-parse → quiet) and the
+  // per-tick scan COUNT the timing assertions read stays one-per-tick.
+  page.atsInjLeanSignature = () => {
+    const scan = page.atsInjScan();
+    return { ok: true, sig: ats.atsFormSignature(scan), n: ((scan && scan.fields) || []).length };
+  };
   return Object.assign(page, over || {});
 }
 
@@ -485,6 +494,88 @@ test("atsIcimsResumeStage: an attach that FAILED does not wait for a parse that 
   assert.strictEqual(stage.error, "no resume stored");
   assert.strictEqual(stage.isRequired, true, "the caller needs this to decide whether it blocks the gate");
   assert.strictEqual(page._st.scans, scansAtFailure, "nothing was polled after a failed upload");
+});
+
+// ── THE SETTLE HEARTBEAT IS A CHEAP READ, NOT A FULL SCAN (live 2026-08-18) ─────────────────────
+//
+// Cretex: the parse landed at 6.0s, the stage finished at 15.4s. The 8.6s between was ours — one
+// `atsInjScan` per tick (labels, every option list, the section walk, 68 field objects back over CDP)
+// made a "900ms poll" cost ~2.9s, so three stable reads took ~8.6s instead of ~2.8s.
+
+test("atsInjLeanSignature: reads only name + has-value, and notices both kinds of change", () => {
+  const el = (o) => Object.assign({ tagName: "INPUT", type: "text", name: "", id: "", value: "", checked: false }, o);
+  const run = (els) => {
+    global.document = { querySelectorAll: () => els };
+    try { return ats.atsInjLeanSignature("icims"); } finally { delete global.document; }
+  };
+  const before = run([el({ name: "a" }), el({ name: "b" })]);
+  assert.strictEqual(before.ok, true);
+  assert.strictEqual(before.n, 2);
+  // a field GAINING a value is a change (the parse filled something in)
+  const filled = run([el({ name: "a", value: "Kevin" }), el({ name: "b" })]);
+  assert.notStrictEqual(filled.sig, before.sig, "a value appearing must change the signature");
+  // …and so is a field APPEARING (the parse minted an entry)
+  const grown = run([el({ name: "a" }), el({ name: "b" }), el({ name: "c" })]);
+  assert.notStrictEqual(grown.sig, before.sig, "a new field must change the signature");
+  // whitespace is not a value — otherwise a re-render that pads a box reads as a parse landing
+  assert.strictEqual(run([el({ name: "a", value: "   " }), el({ name: "b" })]).sig, before.sig);
+});
+
+test("atsInjLeanSignature: plumbing is skipped, and index 0 is not read as unselected", () => {
+  const el = (o) => Object.assign({ tagName: "INPUT", type: "text", name: "", id: "", value: "", checked: false }, o);
+  const run = (els) => {
+    global.document = { querySelectorAll: () => els };
+    try { return ats.atsInjLeanSignature("icims"); } finally { delete global.document; }
+  };
+  // hidden/submit/button carry values that have nothing to do with the applicant's answers — an
+  // anti-forgery token that rotates on every postback would make the form NEVER look stable.
+  const r = run([
+    el({ name: "real" }),
+    el({ name: "__VIEWSTATE", type: "hidden", value: "churns-every-postback" }),
+    el({ name: "go", type: "submit", value: "Submit Profile" }),
+    el({ name: "btn", type: "button", value: "Add More" }),
+    el({ name: "rst", type: "reset", value: "Reset" }),
+  ]);
+  assert.strictEqual(r.n, 1, "only the real control counts: " + r.sig);
+  // an element with neither name nor id cannot be tracked across renders — skipped rather than guessed
+  assert.strictEqual(run([el({ name: "", id: "" })]).n, 0);
+  assert.strictEqual(run([el({ name: "", id: "byId" })]).n, 1, "…but an id is a usable key");
+  // ⚠ a <select> is judged by its VALUE, never selectedIndex > 0 — the first option may be a real
+  // choice (iCIMS' salary Currency starts at "USD $"), and an opaque iCIMS id IS a value.
+  const sel = (o) => Object.assign({ tagName: "SELECT", type: "select-one", name: "s", id: "", value: "", checked: false }, o);
+  assert.match(run([sel({ value: "12781" })]).sig, /s:1$/, "an opaque id counts as chosen");
+  assert.match(run([sel({ value: "" })]).sig, /s:0$/, "a placeholder row carries no value");
+  // a checkbox/radio is judged by CHECKED, not by its value attribute (which is always present)
+  const box = (o) => Object.assign({ tagName: "INPUT", type: "checkbox", name: "c", id: "", value: "on", checked: false }, o);
+  assert.match(run([box({ checked: false })]).sig, /c:0$/);
+  assert.match(run([box({ checked: true })]).sig, /c:1$/);
+});
+
+test("atsInjLeanSignature: a DOM read that throws reports it rather than looking like a stable form", () => {
+  global.document = { querySelectorAll: () => { throw new Error("world replaced"); } };
+  try {
+    const r = ats.atsInjLeanSignature("icims");
+    assert.strictEqual(r.ok, false, "ok:false is what makes the caller treat the tick as unreadable");
+    assert.match(r.error, /world replaced/);
+  } finally { delete global.document; }
+});
+
+test("atsIcimsAwaitParse: the BASELINE is read the same way the ticks are", async () => {
+  // ⚠ The failure this pins: a base computed from a full scan and ticks read leanly differ on tick
+  // ONE, which the loop reads as "the parse changed the form" — and a false `changed` lets it finish
+  // on the first brief quiet, possibly before the parse has even started. Mixed vocabularies are the
+  // one thing that can defeat this whole stage, so the wait reads its own baseline.
+  const page = parsingPage();
+  const seen = [];
+  const act = fakeAct(page);
+  const inner = act.eval;
+  act.eval = async (fn, ...args) => { seen.push(fn.name); return inner(fn, ...args); };
+  act.quietRead = async () => ({ ok: true, idleMs: 9000 });
+  const r = await ats.atsIcimsAwaitParse(act, "icims", { parse: FAST_PARSE });
+  assert.ok(r, "the wait must return an observation, never throw");
+  assert.ok(seen.length > 0, "it must actually read the page");
+  assert.ok(seen.every((n) => n === "atsInjLeanSignature"),
+    "every read — baseline included — goes through the lean probe: " + [...new Set(seen)].join(", "));
 });
 
 test("atsIcimsAwaitParse: NO change is not permission to proceed early", async () => {
@@ -1184,6 +1275,78 @@ test("apply finder: an unrelated link is still refused", () => {
   } finally { delete global.document; }
 });
 
+// ── "MAY WE CONTACT THIS EMPLOYER?" — THREE ANSWERS, AND UNANSWERED IS NEVER GUESSED ───────────
+//
+// The resolver already refused to default this ("not a default anyone should own") and then returned
+// null — which made it an ordinary entry-unanswered field, and those go to the AI by design. Measured
+// on Cretex, all three work-history rows: ai-choice · "Yes" · "reasoning-from-absence: default
+// affirmative". The one question the code explicitly declines to default was answered by a model.
+//
+// The operator then added a third stored answer no boolean could express (2026-08-18): "yes, if
+// required". It ends with a bare "Yes" so a plain Yes/No form still fills deterministically.
+
+test("may_contact: the stored answer becomes a TIERED ladder, and the tri-bool still migrates", () => {
+  const C = ats.atsMayContactCandidates;
+  assert.deepStrictEqual(C("yes").candidates, ["Yes", "True"]);
+  assert.deepStrictEqual(C("no").candidates, ["No", "False"]);
+  // ⚠ a profile synced before the option existed carries booleans — dropping these would make every
+  // pre-existing entry unanswered, i.e. a blocked submit on a question already answered.
+  assert.deepStrictEqual(C(true).candidates, ["Yes", "True"]);
+  assert.deepStrictEqual(C(false).candidates, ["No", "False"]);
+  const cond = C("yes_if_required");
+  assert.strictEqual(cond.conditional, true);
+  assert.strictEqual(cond.candidates[0], "Yes, if required", "most specific first");
+  assert.strictEqual(cond.candidates[cond.candidates.length - 1], "Yes",
+    "…and a bare Yes LAST, so a plain Yes/No form fills deterministically rather than reaching review");
+  // the label spellings a hand-edited profile.json may carry
+  for (const v of ["Yes, if required", "yes if necessary", "only if required", "If required"]) {
+    assert.strictEqual(C(v).answer, "yes_if_required", v);
+  }
+});
+
+test("may_contact: unanswered CLAIMS the field so the AI can never answer it", () => {
+  const es = { section: "work_experience", entryIndex: 2, spec: { kind: "may_contact" } };
+  const f = { label: "May We Contact", fieldName: "-1_PersonProfileFields.rcf3269", widgetType: "icims_dropdown" };
+  for (const entry of [{ may_contact: null }, { may_contact: "" }, {}, { may_contact: "maybe someday" }]) {
+    const r = ats.atsResolveEntryField(es, entry, f, undefined, {});
+    assert.ok(r, "must RETURN something — a null here is what let the AI have it: " + JSON.stringify(entry));
+    assert.strictEqual(r.kind, "entry-permission-unstated", JSON.stringify(entry));
+    assert.strictEqual(r.flag, "may-contact-unstated");
+    assert.strictEqual(r.review, true);
+    assert.ok(!r.candidates && r.value == null, "and it must carry NO answer of its own");
+    assert.match(r.path, /work_experience\[2\]\.may_contact/, "review must name where to set it");
+  }
+});
+
+test("may_contact: a stated answer fills deterministically and unflagged, all three of them", () => {
+  const es = { section: "work_experience", entryIndex: 1, spec: { kind: "may_contact" } };
+  const f = { label: "May We Contact", fieldName: "-1_PersonProfileFields.rcf3269", widgetType: "icims_dropdown" };
+  for (const [stored, first] of [["yes", "Yes"], ["no", "No"], ["yes_if_required", "Yes, if required"], [true, "Yes"]]) {
+    const r = ats.atsResolveEntryField(es, { may_contact: stored }, f, undefined, {});
+    assert.strictEqual(r.candidates[0], first, String(stored));
+    assert.strictEqual(r.source, "entry");
+    assert.ok(!r.flag && !r.review, "a value the operator STATED is not a review item: " + String(stored));
+    assert.match(r.path, /work_experience\[1\]\.may_contact/);
+  }
+});
+
+test("employer email/phone: a CONDITIONAL yes allows contact; no and unanswered withhold", () => {
+  const es = { section: "work_experience", entryIndex: 0, spec: { kind: "contact_if_allowed", path: "employer_email" } };
+  const f = { label: "Employer Email", fieldName: "-1_PersonProfileFields.rcf3270", widgetType: "text" };
+  const call = (mc) => ats.atsResolveEntryField(es, { may_contact: mc, employer_email: "hr@example.com" }, f, undefined, {});
+  // an answer that PERMITS contact releases the mechanism by which contact happens
+  assert.strictEqual(call("yes").raw, "hr@example.com");
+  assert.strictEqual(call("yes_if_required").raw, "hr@example.com",
+    'a conditional yes permits contact — withholding the details would answer "yes" and make it impossible');
+  assert.strictEqual(call(true).raw, "hr@example.com", "and the legacy tri-bool still releases");
+  // …and everything else withholds
+  assert.strictEqual(call("no").kind, "skip");
+  assert.match(call("no").detail, /you answered No/);
+  assert.strictEqual(call(null).kind, "skip");
+  assert.match(call(null).detail, /unanswered/);
+  assert.strictEqual(call(undefined).kind, "skip");
+});
+
 // ── A CONTACT OPT-IN ASKED AS A QUESTION IS STILL AN OPT-IN (operator's rule, live 2026-08-18) ───
 //
 // The operator authorised ticking ACCEPT boxes and explicitly NOT opt-ins. That rule lived only on the
@@ -1775,10 +1938,19 @@ test("employer contact details are withheld unless may_contact is an explicit YE
   assert.strictEqual(ask(null, "contact_if_allowed", "employer_phone").kind, "skip");
   assert.match(ask(null, "contact_if_allowed", "employer_phone").detail, /unanswered/);
 
-  // the question itself is deterministic when answered, and unanswered when not
-  assert.deepStrictEqual(ask(true, "may_contact").candidates, ["Yes"]);
-  assert.deepStrictEqual(ask(false, "may_contact").candidates, ["No"]);
-  assert.strictEqual(ask(null, "may_contact"), null, "an unanswered tri-state must not pick a side");
+  // the question itself is deterministic when answered…
+  // (a second "True" tier since 2026-08-18 — the same boolean ladder every other yes/no answer uses,
+  //  so a form whose dropdown reads True/False fills too)
+  assert.deepStrictEqual(ask(true, "may_contact").candidates, ["Yes", "True"]);
+  assert.deepStrictEqual(ask(false, "may_contact").candidates, ["No", "False"]);
+  // …and an unanswered one STILL PICKS NO SIDE — but it now CLAIMS the field rather than returning
+  // null (2026-08-18). Returning null made it an ordinary entry-unanswered field, and those go to the
+  // AI by design, which answered "Yes" from absence on all three of Cretex's work-history rows. The
+  // refusal here was being overridden one rung later; claiming is what enforces it.
+  const un = ask(null, "may_contact");
+  assert.strictEqual(un.kind, "entry-permission-unstated");
+  assert.ok(!un.candidates && un.value == null, "an unanswered tri-state must not pick a side");
+  assert.strictEqual(un.review, true, "and it must reach the human, not the model");
 });
 
 test("experience: the new employer fields route from the entry", () => {
@@ -1796,7 +1968,7 @@ test("experience: the new employer fields route from the entry", () => {
   assert.strictEqual(r("Supervisor's Name").raw, "Dana Lee");
   assert.strictEqual(r("Supervisor's Title").raw, "Staff Engineer");
   assert.strictEqual(r("Reason for Leaving").raw, "Internship ended");
-  assert.deepStrictEqual(r("May We Contact").candidates, ["Yes"]);
+  assert.deepStrictEqual(r("May We Contact").candidates, ["Yes", "True"]);
 });
 
 test("experience: a field with no mapping is still SEALED — unanswered, never borrowed", () => {

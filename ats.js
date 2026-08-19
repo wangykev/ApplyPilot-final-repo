@@ -759,6 +759,29 @@ function atsDefaultDay(defaults) {
   return Number.isFinite(n) && n >= 1 && n <= 31 ? n : null;
 }
 
+// The stored "may we contact this employer?" answer → a TIERED candidate ladder, most specific first.
+// Returns null for UNANSWERED, which is what makes the caller claim the field rather than guess.
+//
+// Accepts the tri-bool this replaced (true/false) as well as the three codes, because a profile synced
+// before 2026-08-18 still carries booleans and a migration that only worked on the website would leave
+// the extension answering nothing. Also accepts the label spellings, so a hand-edited profile.json
+// ("Yes, if required") is not silently read as unanswered.
+function atsMayContactCandidates(stored) {
+  if (stored === true) return { answer: "yes", candidates: ["Yes", "True"] };
+  if (stored === false) return { answer: "no", candidates: ["No", "False"] };
+  const t = String(stored == null ? "" : stored).trim().toLowerCase().replace(/[\s_-]+/g, " ").replace(/[.,]/g, "");
+  if (!t) return null;
+  if (/^(yes|y|true)$/.test(t)) return { answer: "yes", candidates: ["Yes", "True"] };
+  if (/^(no|n|false)$/.test(t)) return { answer: "no", candidates: ["No", "False"] };
+  if (/^(yes )?(if|only if) (required|requested|necessary|needed)$/.test(t)) {
+    return { answer: "yes_if_required", conditional: true, candidates: [
+      // every wording a form has been seen to offer, then the bare polarity as the last tier
+      "Yes, if required", "Yes if required", "Yes, if necessary", "Yes if necessary",
+      "Only if required", "Only if necessary", "If required", "Yes",
+    ] };
+  }
+  return null;                                     // prose we cannot read is UNANSWERED, never a guess
+}
 function atsResolveEntryField(es, entry, f, now, defaults) {
   const spec = es.spec;
   if (!spec || !entry) return null;
@@ -886,17 +909,51 @@ function atsResolveEntryField(es, entry, f, now, defaults) {
   if (spec.kind === "may_contact") {
     // A tri-state: unanswered stays UNANSWERED. Defaulting either way decides on the operator's
     // behalf whether a recruiter may ring a past employer, which is not a default anyone should own.
-    const v = entry.may_contact;
-    if (v === true) return { candidates: ["Yes"], source: "entry", path: es.section + "[" + es.entryIndex + "].may_contact" };
-    if (v === false) return { candidates: ["No"], source: "entry", path: es.section + "[" + es.entryIndex + "].may_contact" };
-    return null;
+    // A THREE-WAY STORED ANSWER (operator, 2026-08-18) — yes / no / yes_if_required — and each one
+    // becomes a TIERED ladder, most specific first, so the form's own vocabulary decides which lands.
+    // `atsMayContactCandidates` also migrates the tri-bool this replaced, because a profile synced
+    // before today still carries true/false.
+    //
+    // The conditional answer is the reason a boolean was not enough: it ends with a bare "Yes", so a
+    // plain Yes/No form gets "Yes" — the truthful projection onto the options that exist, since the
+    // conditionality has nowhere to live there — while a form that DOES offer "Yes, if required" gets
+    // that instead, at a higher tier. Unflagged, like every other tiered profile ladder: the operator
+    // chose an answer that entails yes, and a value they stated is not a guess we made.
+    const mc = atsMayContactCandidates(entry.may_contact);
+    if (mc) return { candidates: mc.candidates, source: "entry",
+      path: es.section + "[" + es.entryIndex + "].may_contact",
+      detail: mc.conditional
+        ? "may_contact = \"yes, if required\" — a form offering only Yes/No gets Yes"
+        : "may_contact = " + JSON.stringify(mc.answer) };
+    // ⚠ AND AN UNANSWERED ONE IS CLAIMED, NOT PASSED ON (live 2026-08-18). The refusal two lines up
+    // was being overridden one rung later: returning null made this an ordinary "entry-unanswered"
+    // field, which by design falls through to the AI — whose prompt tells it to infer from ABSENCE and
+    // never refuse. Measured on Cretex, all three work-history rows: `ai-choice · after "Yes" ·
+    // reasoning-from-absence: default affirmative`. So the one question this file explicitly declines
+    // to default was answered "Yes" by a model, handing a recruiter permission to ring a past — or
+    // CURRENT — employer that the operator never gave. A current employer learning you are job
+    // hunting is a real cost, and it is not recoverable from a review page after the fact.
+    // Same remedy as the clearance rung and the credential tier: CLAIMING the field is what keeps the
+    // AI away from it, so it is claimed even though we cannot answer it. A required one then blocks the
+    // submit gate until a human answers it — which is the honest outcome, and the fix is one profile
+    // edit ("No" is a perfectly good answer) rather than a guess.
+    return { kind: "entry-permission-unstated", review: true, flag: "may-contact-unstated", source: "entry",
+      path: es.section + "[" + es.entryIndex + "].may_contact",
+      detail: "this asks whether they may contact this employer, and your profile does not say for this role — "
+        + "answer it here, or set it on the Profile page. It is deliberately never guessed: a \"Yes\" nobody "
+        + "gave could tip off an employer you have not told you are looking." };
   }
   if (spec.kind === "contact_if_allowed") {
     // ⚠ WITHHELD UNLESS THE ANSWER IS AN EXPLICIT YES. Releasing an employer's email or phone IS
     // the consequence the "may we contact?" question governs, so `no` and UNANSWERED both withhold.
-    if (entry.may_contact !== true) {
+    // ⚠ WITHHELD UNLESS THE ANSWER ALLOWS CONTACT. "yes_if_required" DOES allow it — it permits
+    // contact when the process demands it, and an employer email/phone is the mechanism BY WHICH that
+    // contact happens, so withholding the details would answer "yes" and then make it impossible.
+    // "no" and UNANSWERED both still withhold.
+    const mcA = atsMayContactCandidates(entry.may_contact);
+    if (!mcA || mcA.answer === "no") {
       return { kind: "skip", source: "entry",
-        detail: entry.may_contact === false
+        detail: mcA && mcA.answer === "no"
           ? "withheld — you answered No to contacting this employer"
           : "withheld — \"may we contact this employer?\" is unanswered for this role" };
     }
@@ -3638,7 +3695,12 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
 // costs the whole fill.
 const ATS_ICIMS_PARSE = {
   pollMs: 900,        // one read-only scan per tick (waitAtsFormReady already polls this at 450ms)
-  quietMs: 1500,      // no mutation for this long ⇒ the postback has finished rendering
+  // ⚠ RAISED from 1500 on 2026-08-18, deliberately spending ~1s of the ~6s the lean signature probe
+  // saved. Polling faster makes a STABILITY predicate weaker, not stronger — sparse reads are stronger
+  // evidence that nothing is moving — so with a cheap probe the binding evidence has to be the quiet
+  // watch's own wall-clock idle time rather than the read count. 2500ms also covers a parse that
+  // renders in two bursts with a gap between them, which 1500ms could have called finished.
+  quietMs: 2500,      // no mutation for this long ⇒ the postback has finished rendering
   stableReads: 3,     // …and the signature agreed that many times (the waitAtsFormReady bar)
   // How long the postback gets to START before we accept "it changed nothing". ⚠ THIS IS THE ONE
   // NUMBER THAT CAN LET A PARSE LAND MID-FILL: past it, a quiet form is taken at face value, so a
@@ -3671,6 +3733,47 @@ function atsFormSignature(scan) {
     .join(",");
 }
 
+// ── THE SETTLE HEARTBEAT MUST BE CHEAP, OR IT BECOMES THE WAIT (live 2026-08-18) ────────────────
+//
+// Measured on Cretex: the parse landed after 6.0s and the stage finished at 15.4s. The 8.6s in between
+// was not iCIMS — it was US proving the form had gone quiet. `atsIcimsAwaitParse` was calling
+// `atsInjScan` once per tick, and that is a 479-line full read: every label, every option list, every
+// icims_dropdown's `<ul>` of results, the section walk, the entry ordinals, then a large JSON payload
+// back over CDP for 68 fields. So a "900ms poll" actually cost ~2.9s per tick, and the three stable
+// reads the gate asks for took ~8.6s instead of ~2.8s.
+//
+// The signature only ever needed two things per field — its NAME and whether it HOLDS a value — which
+// is one flat pass over the controls, no labels, no options, no sections. It also returns the finished
+// STRING rather than 68 field objects, so the payload stops mattering too.
+//
+// ⚠ BOTH SIDES OF THE COMPARISON MUST BE COMPUTED THE SAME WAY. A base read with the full scan and
+// ticks read leanly would differ on tick one, which the loop would read as "the parse changed the
+// form" — and a false `changed` lets it exit as soon as the page is briefly quiet, i.e. possibly
+// BEFORE the real parse lands. That is the one failure this whole stage exists to prevent, so the
+// caller no longer passes a full-scan baseline and this function reads its own.
+//
+// ⚠ Deliberately NOT `selectedIndex > 0` for a <select> (see the "index 0 is not unselected" rule):
+// a non-empty `value` is the honest test, an opaque iCIMS id counts as a value, and a real
+// placeholder row carries "" — no placeholder guessing needed for a signature.
+function atsInjLeanSignature(ats) {
+  try {
+    const parts = [];
+    for (const el of document.querySelectorAll("input, textarea, select")) {
+      const type = String(el.type || "").toLowerCase();
+      if (type === "hidden" || type === "submit" || type === "button" || type === "image" || type === "reset") continue;
+      const nm = el.name || el.id || "";
+      if (!nm) continue;
+      let has = 0;
+      if (type === "checkbox" || type === "radio") has = el.checked ? 1 : 0;
+      else has = String(el.value == null ? "" : el.value).trim() ? 1 : 0;
+      parts.push(nm + ":" + has);
+    }
+    return { ok: true, sig: parts.length + "|" + parts.join(","), n: parts.length };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
 // Wait for iCIMS' résumé parse to land and the panel to go quiet. Returns what it OBSERVED — never
 // throws, because a wait that cannot read the page must not abort a run that can still fill it.
 async function atsIcimsAwaitParse(act, ats, opts) {
@@ -3679,9 +3782,17 @@ async function atsIcimsAwaitParse(act, ats, opts) {
   const log = o.log || (() => {});
   const t0 = Date.now();
   const deadline = t0 + cfg.ceilingMs;
+  let readMs = 0, reads = 0;
   const readSig = async () => {
-    try { return atsFormSignature(await act.eval(atsInjScan, ats)); } catch (e) { return null; }
+    const t = Date.now();
+    try {
+      const r = await act.eval(atsInjLeanSignature, ats);
+      return r && r.ok ? r.sig : null;
+    } catch (e) { return null; }
+    finally { readMs += Date.now() - t; reads++; }
   };
+  // ⚠ Reads its OWN baseline — see atsInjLeanSignature's note on why a mixed comparison is unsafe.
+  // `o.baseSignature` remains honoured so a test can pin a starting point.
   const base = o.baseSignature != null ? o.baseSignature : await readSig();
   let prev = base, stable = 0, changed = false, changedAt = null, idle = 0;
   while (Date.now() < deadline) {
@@ -3706,9 +3817,14 @@ async function atsIcimsAwaitParse(act, ats, opts) {
     const settled = stable >= cfg.stableReads && idle >= cfg.quietMs;
     if (settled && (changed || Date.now() - t0 >= cfg.changeMs)) {
       const waitedMs = Date.now() - t0;
-      log(changed
+      // The breakdown matters more than the total: "the parse landed at X, then WE spent Y proving it
+      // had stopped" is what separates the server's time from our own, and reading the total as the
+      // server's is how an 8.6s probe cost went unnoticed for a day.
+      const probing = changedAt != null ? waitedMs - changedAt : waitedMs;
+      const cost = ` [${reads} signature read(s) costing ${readMs}ms; ${(probing / 1000).toFixed(1)}s of this wait was OURS, proving quiet]`;
+      log((changed
         ? `the résumé parse landed after ${(changedAt / 1000).toFixed(1)}s and the form settled at ${waitedMs > 0 ? (waitedMs / 1000).toFixed(1) : "0.0"}s — filling now, on top of whatever it wrote`
-        : `no postback changed this form within ${(waitedMs / 1000).toFixed(1)}s — the parse either produced nothing or had already landed before we looked; the form is quiet, filling now`);
+        : `no postback changed this form within ${(waitedMs / 1000).toFixed(1)}s — the parse either produced nothing or had already landed before we looked; the form is quiet, filling now`) + cost);
       return { parsed: true, changed, changedAt, waitedMs, quietMs: idle, signature: prev, baseSignature: base };
     }
   }
@@ -3761,8 +3877,11 @@ async function atsIcimsResumeStage(act, ats, opts) {
   // BASELINE AFTER THE CONFIRMATION, not before the attach: our own upload changes the résumé row, and
   // a baseline taken before it would count that as "the parse landed". If the postback beat the
   // confirmation, the no-change branch of the wait covers it (quiet + stable, then proceed).
-  const baseSignature = atsFormSignature(await act.eval(atsInjScan, ats).catch(() => null));
-  const parse = await atsIcimsAwaitParse(act, ats, { log, baseSignature, parse: o.parse });
+  // ⚠ NO baseSignature FROM HERE. It used to pass one derived from a full atsInjScan, which the wait
+  // then compared against its own lean reads — two different vocabularies, so tick one always looked
+  // like a change. A false "changed" is the dangerous direction: it lets the wait finish on the first
+  // brief quiet, potentially before the parse has even started. The wait reads its own baseline now.
+  const parse = await atsIcimsAwaitParse(act, ats, { log, parse: o.parse });
   // WHAT EVIDENCE DO WE ACTUALLY HAVE THAT THE FILE LANDED? Setting `input.files` proves nothing on
   // its own — it is a page-side write, and iCIMS uploads on the change event. Two independent kinds of
   // positive evidence, and the record is flagged for review when there is NEITHER:
@@ -4359,6 +4478,16 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // Handled before every other kind, and it `continue`s out before `rec.rawValue` /
       // `rec.resolved` are assigned further down — which is exactly how the value stays out of the
       // record, and therefore out of the review bundle and the report POSTed to the website.
+      // A PERMISSION THE OPERATOR HAS NOT GIVEN — claimed by the entry resolver precisely so that the
+      // AI cannot reach it (see the may_contact branch). Blank + flagged, exactly like an unstated
+      // clearance: the answer belongs to a human, and a required one blocking the gate is the point.
+      if (route && route.kind === "entry-permission-unstated") {
+        rec.status = "needs_review";
+        rec.flag = route.flag || "may-contact-unstated";
+        rec.mappedPath = route.path || null;
+        rec.detail = route.detail;
+        results.push(fin()); continue;
+      }
       if (route && route.kind === "credential-missing") {
         rec.status = "needs_review";
         rec.credential = true; rec.credentialKind = route.credentialKind;
@@ -5999,8 +6128,9 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
-    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
+    atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
+    atsInjLeanSignature,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
     atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,

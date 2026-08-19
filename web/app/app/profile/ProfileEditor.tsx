@@ -35,6 +35,7 @@ import {
   RACE_ETHNICITY_OPTIONS,
   VETERAN_STATUS_OPTIONS,
   DISABILITY_STATUS_OPTIONS,
+  MAY_CONTACT_OPTIONS,
   SECURITY_CLEARANCE_OPTIONS,
 } from "@/lib/profile-fields";
 import { saveProfile, saveBuckets } from "./actions";
@@ -312,20 +313,21 @@ export function ProfileEditor({ initial, initialBuckets }: { initial: Profile; i
               </div>
               <div className="mt-4 space-y-4">
                 <TextAreaField label="Reason for leaving" bucketPath={i === 0 ? "work_experience.0.reason_for_leaving" : undefined} value={w.reason_for_leaving} rows={2} onChange={(v) => update((p) => { p.work_experience[i].reason_for_leaving = v; })} />
-                {/* ⚠ TRI-STATE, and the two contact boxes appear ONLY on an explicit Yes. Answering
+                {/* ⚠ THREE-WAY, and the two contact boxes appear only on an ALLOWING answer. Answering
                     this is what authorises a recruiter to ring a past employer, so an unanswered
                     question must not look the same as "no" — and the details must not sit there
                     inviting entry when nothing has been agreed to. The filler applies the same gate,
-                    so clearing this back to unanswered withholds them again. */}
-                <TriBoolField
+                    so clearing this back to unanswered withholds them again. "Yes, if required" is an
+                    allowing answer: it permits contact, so the details are how that contact happens. */}
+                <SelectField
                   label="May we contact this employer?"
+                  hint="Forms that offer a conditional option get it; a plain Yes/No form gets Yes."
                   bucketPath={i === 0 ? "work_experience.0.may_contact" : undefined}
-                  value={w.may_contact}
-                  onChange={(v) => update((p) => { p.work_experience[i].may_contact = v; })}
-                  ladder={profile.answer_ladders?.["work_experience.0.may_contact"]}
-                  onLadderChange={(n) => update((p) => { (p.answer_ladders ||= {})["work_experience.0.may_contact"] = n; })}
+                  value={w.may_contact ?? ""}
+                  options={MAY_CONTACT_OPTIONS}
+                  onChange={(v) => update((p) => { p.work_experience[i].may_contact = (v || null) as typeof p.work_experience[number]["may_contact"]; })}
                 />
-                {w.may_contact === true && (
+                {w.may_contact != null && w.may_contact !== "no" && (
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                     <TextField label="Employer email" bucketPath={i === 0 ? "work_experience.0.employer_email" : undefined} value={w.employer_email} onChange={(v) => update((p) => { p.work_experience[i].employer_email = v; })} />
                     <TextField label="Employer phone number" bucketPath={i === 0 ? "work_experience.0.employer_phone" : undefined} value={w.employer_phone} onChange={(v) => update((p) => { p.work_experience[i].employer_phone = v; })} />
