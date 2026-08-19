@@ -1843,6 +1843,22 @@ test("review: an UNFILLED choice field still carries the form's options", async 
   assert.strictEqual(by.rcf9001.status, "skipped");
 });
 
+test("atsIsFutureYearMonth: DAY precision answers too — adding a day must not cost an answer", () => {
+  // Live 2026-08-18: this accepted month precision only, so a graduation date of "2028-05-01" (the whole
+  // point of the day-capable fields) returned null, the is_graduated rule could not decide, and "have you
+  // graduated?" fell through to the AI and came back FLAGGED. A more precise value must never answer less.
+  const now = new Date("2026-08-18T12:00:00Z");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2028-05-01", now), true, "a future day is future");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true, "…and month precision still is");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2024-08-20", now), false, "a past day is past");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2020-01-15", now), false);
+  // within the CURRENT month, only a stated day can separate the two
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026-08-25", now), true, "later this month is future");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026-08-02", now), false, "earlier this month is past");
+  assert.strictEqual(ats.atsIsFutureYearMonth("2026-08", now), true, "no day → the month is not over yet (unchanged)");
+  assert.strictEqual(ats.atsIsFutureYearMonth("junk", now), null, "and a non-date is still null");
+});
+
 test("atsIsFutureYearMonth: a bare year is past only once the year is OVER", () => {
   const now = new Date("2026-08-16T00:00:00Z").getTime();
   assert.strictEqual(ats.atsIsFutureYearMonth("2028-05", now), true);

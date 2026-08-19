@@ -701,17 +701,32 @@ function atsMonthCandidates(mi) {
   return out;
 }
 
-// Is a "YYYY" or "YYYY-MM" strictly in the future? null when it is neither shape.
+// Is a "YYYY", "YYYY-MM" or "YYYY-MM-DD" strictly in the future? null when it is none of those shapes.
 // `now` is a parameter so the rule is unit-testable without freezing the clock.
+// ⚠ THE DAY FORM WAS MISSING AND THAT REGRESSED A DETERMINISTIC ANSWER (live 2026-08-18). This accepted
+// month precision only, so the moment a graduation date carried a day — "2028-05-01", the whole point of
+// the day-capable fields — it returned null, the is_graduated rule could not decide, and "have you
+// graduated?" fell through to the AI and came back FLAGGED. Adding precision must never cost an answer:
+// same lesson as the Month/Year parts, found the same way (a run that should have had one fewer review
+// item had one more).
+// A stated DAY is compared as a day, so a graduation later this month reads as future rather than past;
+// month precision keeps its old meaning (the whole month counts as future until it is over), and a bare
+// year likewise.
 function atsIsFutureYearMonth(s, now) {
   const t = now == null ? new Date() : new Date(now);
-  const ym = /^(\d{4})-(\d{1,2})$/.exec(String(s).trim());
-  const y = /^(\d{4})$/.exec(String(s).trim());
-  if (!ym && !y) return null;
-  const yr = parseInt((ym ? ym[1] : y[1]), 10);
-  const mo = ym ? parseInt(ym[2], 10) : 12;          // a bare year is only past once the year is over
-  const nowYr = t.getFullYear(), nowMo = t.getMonth() + 1;
-  return yr > nowYr || (yr === nowYr && mo > nowMo);
+  const str = String(s).trim();
+  const ymd = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(str);
+  const ym = /^(\d{4})-(\d{1,2})$/.exec(str);
+  const y = /^(\d{4})$/.exec(str);
+  if (!ymd && !ym && !y) return null;
+  const yr = parseInt((ymd ? ymd[1] : ym ? ym[1] : y[1]), 10);
+  const mo = ymd ? parseInt(ymd[2], 10) : ym ? parseInt(ym[2], 10) : 12; // a bare year is past only once over
+  const nowYr = t.getFullYear(), nowMo = t.getMonth() + 1, nowDay = t.getDate();
+  if (yr !== nowYr) return yr > nowYr;
+  if (mo !== nowMo) return mo > nowMo;
+  // same year AND month: only a stated day can separate them. Without one, the month is not over, so it
+  // stays "future" exactly as before.
+  return ymd ? parseInt(ymd[3], 10) > nowDay : true;
 }
 
 // Resolve ONE repeating-entry field from ITS OWN entry. Returns a route, or null to fall through
