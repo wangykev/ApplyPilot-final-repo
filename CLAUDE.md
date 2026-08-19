@@ -13,7 +13,7 @@ This file holds **standing rules, invariants and safety contracts only** — eve
 | `answers-and-ai` skill | the full match ladder, answer buckets + answer ladders, `llm.js` / AI-0…AI-4, employer-match + employment-status recognizers |
 | `ats-tenants` skill | Greenhouse / Lever / Ashby (`ats.js`) — routing, the option poll, per-ATS traps, the dev loop. ⚠ Assumes a top-frame, login-free form: for **iCIMS** read the iCIMS section below first (iframe-hosted, and it creates an account), then use this skill's dev loop |
 | `workday-onboarding` skill | pre-form: JD → Apply → sign-in → Gmail verify → the form |
-| `job-discovery` skill | the LinkedIn / Handshake / Simplify sweep (`discover.js`) |
+| `job-discovery` skill | the Simplify / @zero2sudo / LinkedIn / Handshake sweep (`discover.js`) + the queue's per-source tabs |
 | `live-testing` skill | driving a real end-to-end run through Chrome |
 | `docs/dom-patterns.md` | the dated observed-DOM rulebook (every tenant + refutations). **Has a topic index at the top — use it; never read the file whole.** |
 | `docs/progress-log.md` | full extension milestone history. Append new entries here. **Has a topic index at the top; never read it whole.** |
@@ -1010,6 +1010,51 @@ that posting fills `15/9/1` cleanly. Both now refuse `run-in-flight`; safe becau
 run mutating the page under the replay's strict verify is exactly when "the page agrees with the approved
 bundle" stops meaning anything. **No silent caps:** whatever a cap drops is reported as a note.
 
+### SOURCE 4 — @zero2sudo's Instagram stories (2026-08-19)
+
+A creator who posts openings to his STORY with a tappable LINK STICKER. Read the same way as
+LinkedIn/Handshake — **cookies, not keys**: the JSON instagram.com's own client requests, from inside a tab
+on that origin, carrying the operator's session. No API key, no burner, and the standing **never attempts a
+login** invariant holds (not signed in ⇒ note + skip).
+
+- **A LINK STICKER *IS* THE JOB FILTER — that is why this source is cheap.** Traced live: 32 stories, 16 with
+  a sticker, and **every one of the 16 was a real posting** while the other 16 carried no tappable link at
+  all. So there is **no OCR, no vision call and no classifier** — and `llm.js` needs no image support.
+- **⚠ 24-HOUR WINDOW, AND HIGHLIGHTS DO NOT FIX IT — measured, not assumed.** The obvious hope (job stories
+  get archived into a Highlight, which never expires) was **TESTED AND REFUTED**: "Insider Info 4" held 65
+  items over the same dates, only 3 had a sticker, and cross-referencing by media id gave **ZERO overlap**
+  with the 16 live linked ones. He archives evergreen commentary, not the job drops. A day between sweeps is
+  a day genuinely lost, which is **reported as a note** rather than left invisible. An unattended collector
+  (the operator's existing 8h cron → a Sheet) is the only thing that closes it; this source can't.
+- **IT ENRICHES ITS OWN JOBS, and that ordering is load-bearing.** A story link is a bare url — no company,
+  no title, no JD — and the global ranking runs **BEFORE** `fillMissingDescriptions`. An unenriched story job
+  therefore scores ~0 on relevance and is dropped below the match threshold before anything ever opens it:
+  **the source would look empty rather than filtered.** So it spends its own `maxStoryReads` budget inside
+  the driver. Do not "simplify" this by deferring to the global reader pass.
+- **The shim's tracking token is DISCARDED.** A sticker url is `l.instagram.com/?u=<real>&e=<token>`;
+  `unwrapStoryLink` (pure, unit-pinned) keeps only the destination. A discovered url reaches Supabase and the
+  logs, so carrying `e=` there is the leak class `redactSecrets` exists for.
+- **⚠ READING A STORY IS OBSERVABLE** — it marks them seen and the operator appears in his viewer list. Stated
+  in the UI hint, not buried. It is the one discovery source that is not purely passive.
+- **Coverage is the real constraint, not ingestion** (measured on the same 16): only **3** were on an ATS
+  ApplyPilot can fill (2 Greenhouse + 1 Workday). The rest were Oracle Recruiting Cloud, Phenom-fronted
+  employer sites, SmartRecruiters and SAP — and **none were vanity-domain Workday**, so `atsPortalAts` does
+  not recover them either. Adding adapters, not more sources, is what raises the hit rate.
+
+### Per-source queue tabs (2026-08-19)
+
+The queue's fill view has a tab per source plus **All**. The per-source tabs deliberately **OVERLAP**; All is
+the deduped union and is the only count that sums to the queue.
+
+- **`source` answers "who found it FIRST", not "who found it".** Dedup runs at sweep time and keeps the first
+  source's copy, so a job LinkedIn really did surface would vanish from the LinkedIn tab merely because
+  Simplify ran earlier. **`foundOn` (→ `details.found_on`) is what fixes that** — both dedup passes merge the
+  dropped copy's *full* list onto the survivor, and `dedupeCrossSource` must carry the whole list, not just
+  the dropped row's own `source` (it may already have absorbed a third).
+- **Written only when MORE THAN ONE source found the row**, so an ordinary row is byte-identical to before
+  and absent means "just `source`" — never "unknown". It lives in migration 0012's `details` jsonb, needing
+  **no migration and no new query**: the queue page already loads every row and filters client-side.
+
 Mechanism (the one board driver + each board's JSON contract, the location resolver, `discoveryJobKey`
 lockstep with web/lib/discover.ts, ranking, the hidden-tab levers): **load the `job-discovery` skill.**
 
@@ -1193,4 +1238,5 @@ and "the poll didn't look often enough" is not an available explanation for a fa
   **test-enforced** (`web/test/discover.test.ts` cross-loads the real `discover.js` and fails on drift). Do
   the same for the others when convenient.
 - `normalizeLabel` (lib.js) ↔ `normalizeQuestion` (web `lib/buckets.ts`).
+- `QueueItemDetails` — `web/lib/discover.ts` ↔ `web/app/app/queue/shared.ts` (both carry the marker).
 - `summary-lib.js` ↔ `web/lib/review-approval.ts`; `summary.js` grouping ↔ `web/lib/review-model.ts`.

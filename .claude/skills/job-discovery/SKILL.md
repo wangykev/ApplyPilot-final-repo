@@ -1,12 +1,12 @@
 ---
 name: job-discovery
-description: The job-discovery sweep: LinkedIn / Handshake / SimplifyJobs -> ranked queue items (discover.js). Read this before touching the board scrapers, the location resolver, discoveryJobKey, ranking, or the Discover button.
+description: The job-discovery sweep: SimplifyJobs / @zero2sudo Instagram stories / LinkedIn / Handshake -> ranked queue items (discover.js), plus the queue's per-source tabs. Read this before touching the board scrapers, the story reader, the location resolver, discoveryJobKey, foundOn, ranking, or the Discover button.
 ---
 
 # Job discovery (find work → the website queue; reads only, NEVER applies)
 The stage BEFORE the queue. `discover.js` (SW; `importScripts` AFTER lib.js — it uses `canonicalJobUrl`) sweeps three sources for recently-posted jobs the operator hasn't applied to, scrapes a JD for each, and **RETURNS them — it writes nothing**; the WEBSITE persists them (`saveDiscovered` → `queue_items`). Entry: `AP_DISCOVER_JOBS` (the `/app/run` Discover button) + `AP_DISCOVER_RECON`; popup `RUN_DISCOVER` / `RUN_DISCOVER_RECON` are the dry-run/debug path (log-only, queues nothing). `[DISCOVER]` in the SW console.
 
-- **Three sources, cheapest substrate that works.** **simplify** = the SimplifyJobs/Summer2026-Internships board's PUBLISHED `listings.json` (`company_name/title/url/locations/terms/active/is_visible/date_posted` unix-s) — a plain `fetch`, no tab, and a REAL posted date; only `active && is_visible` rows survive (inactive = a CLOSED posting). **linkedin / handshake** = the operator's LOGGED-IN session read from a real unfocused tab **through their own cookies** — no API key, no credential handling, and discovery NEVER attempts a login (operator decision 2026-07-26).
+- **Four sources, cheapest substrate that works** (the fourth, @zero2sudo, has its own section at the bottom). **simplify** = the SimplifyJobs/Summer2026-Internships board's PUBLISHED `listings.json` (`company_name/title/url/locations/terms/active/is_visible/date_posted` unix-s) — a plain `fetch`, no tab, and a REAL posted date; only `active && is_visible` rows survive (inactive = a CLOSED posting). **linkedin / handshake** = the operator's LOGGED-IN session read from a real unfocused tab **through their own cookies** — no API key, no credential handling, and discovery NEVER attempts a login (operator decision 2026-07-26).
 - **ONE DRIVER FOR BOTH BOARDS (2026-07-30).** Once both were traced they turned out to have the same shape, so `discoverFromBoard(source, opts)` + a `BOARD_CONFIG` entry per board does LinkedIn and Handshake identically — same paging, filtering, detail read, dedup and logging, so a fix or a bug is never in only one of them. Both use the rendered **SEARCH PAGE** for discovery and the board's own **JSON RECORD** per posting. The page is the search substrate on BOTH, not a fallback: Handshake's JSON index ignores every filter param (its total never moves), and LinkedIn's page runs its newer SEMANTIC search which returns visibly better matches than its keyword API for the same words. Both pages paginate (LinkedIn `start=N`, Handshake `page=N`) — that's what lets a later sweep reach past what's already queued.
 - **⚠ THE OLD LINKEDIN SCRAPERS WERE REFUTED, NOT TIGHTENED (2026-07-30).** They shipped "structure-first" (written blind — no authenticated session at build time) and the first real trace found **all ~30 selectors matching ZERO**: LinkedIn shipped a server-driven-UI rewrite where result cards are `div[role=button]` with **no anchor inside at all**, and every class is a rotating build hash. The scrapers are rebuilt on the two stable, semantic, id-carrying anchors the trace did find — **`componentkey="job-card-component-ref-<id>"`** (LinkedIn) and **`data-hook="job-result-card | <id>"`** (Handshake) — verified 25/25 and 24/25 cards live. Full detail incl. the JSON contracts: `docs/dom-patterns.md` 2026-07-30.
 - **Fields come from reading order, and that bit once.** The SDUI card has no per-field selectors, so title/company/location are its text LINES — and the leading a11y summary varies (`"Title (Verified job)"` / `"Title"` / absent). A consecutive-dedupe misses the first shape, which **shifted every field by one on exactly the verified postings** (company took the title, location took the company) — wrong data that still looks plausible. The split is therefore done SW-side by the pure, regression-pinned **`linkedInFieldsFromLines`** (the injected scraper returns raw `lines`), tested against all three real card fixtures.
@@ -30,4 +30,64 @@ The stage BEFORE the queue. `discover.js` (SW; `importScripts` AFTER lib.js — 
 - **A CONTROL THAT TOGGLES MUST NEVER BE RE-CLICKED BLIND.** The open loop clicked, waited a flat 500ms, checked once, and looped; the panel needs longer than that to mount, so attempt 2's click CLOSED what attempt 1 opened, alternating forever (`clicked yes, box NOT found` on all 8 attempts). Now: check whether it is ALREADY open before clicking, click at most once per round, then POLL. Same invariant as the Workday dropdown "toggle-shut" rule.
 - **DIAGNOSTICS MUST TRAVEL IN THE RESULT, not just the SW log.** A sweep runs in an unfocused tab on a page nobody is watching, and `could-not-open-location-control` alone can't distinguish "no control found" from "clicked but nothing opened" from "opened but the box wasn't recognised". `resolveBoardLocation` returns a `diag` (attempts · control found + its label · clicked · box found · viewport · the filter-strip buttons it DID see · the suggestions it was offered · which it picked) and the note spells it out — which is what actually located all three bugs above. ⚠ Every failure path must carry it: one `return` omitted `diag` and the note then blamed a missing control that had in fact been found and clicked.
 - **HIDDEN-TAB SAFE BY CONSTRUCTION (operator 2026-07-30: recon must work background as well as foreground).** Every wait and all pacing is SERVICE-WORKER wall clock, and the injected functions contain **no `setTimeout` at all** — Chrome throttles page timers to ~1Hz in a background tab but does not throttle `fetch`, so a batch of awaited fetches runs at full speed hidden. The location resolver is split into rect-returning STEPS for the same reason (each injection is instantaneous; the waits are all SW-side), and trusted CDP input needs no paint. Card discovery POLLS for the cards (`pollForCards`) instead of guessing a settle delay — Handshake's list can take 15s+ even in the foreground, and reporting "0 cards" for a page that was merely still rendering is the one thing recon must never do. The recon dump reports `readyState` + `hidden` + `visibilityState` alongside the counts so a zero is always interpretable.
+
+## SOURCE 4 — @zero2sudo's Instagram stories (`discoverFromZero2Sudo`, 2026-08-19)
+
+A creator who posts openings to his STORY with a tappable **link sticker**. Same contract as the boards —
+**cookies, not keys**, read from inside a tab on instagram.com through the operator's own session, and it
+NEVER attempts a login.
+
+**The endpoints** (traced live; `X-IG-App-ID: 936619743392459` is instagram.com's own public web-client id —
+not a credential, and the calls 400 without it):
+
+```
+/api/v1/users/web_profile_info/?username=zero2sudo   → .data.user.id
+/api/v1/feed/reels_media/?reel_ids=<user_id>         → .reels_media[0].items[]
+/api/v1/highlights/<user_id>/highlights_tray/        → the tray (see the refutation below)
+```
+
+Each item carries `taken_at`, `expiring_at`, and — the only field that matters —
+`story_link_stickers[].story_link.url`.
+
+- **A LINK STICKER *IS* THE JOB FILTER.** Measured: 32 live stories, 16 with a sticker, and every one of
+  those 16 was a real posting while the other 16 carried no tappable link at all. So there is **no OCR, no
+  vision call, no classifier**, and `llm.js` needs no image support. `story_cta` (the pre-2021 swipe-up) was
+  0/32, so only the sticker field is read.
+- **⚠ HIGHLIGHTS DO NOT EXTEND THE 24h WINDOW — tested and refuted, do not re-theorise it.** "Insider Info 4"
+  held 65 items over the same date range, only 3 had a sticker, and cross-referencing by media id gave
+  **ZERO overlap** with the 16 live linked ones. He archives evergreen commentary, not the job drops. The
+  driver therefore states the window in a note on every non-empty sweep.
+- **⚠ IT ENRICHES ITS OWN JOBS — the ordering is the fix, don't "simplify" it away.** Ranking
+  (`pickByThreshold`) runs BEFORE `fillMissingDescriptions`, and a story link is a bare url with no company,
+  title or JD — so an unenriched story job scores ~0 on relevance and is dropped under the match threshold
+  **before anything opens it**: the source returns nothing and the log calls it a threshold filter. The
+  driver spends its own `maxStoryReads` budget on `fillMissingDescriptions` before returning.
+- **`unwrapStoryLink` is pure and exported** (the page reader returns RAW sticker urls; every interpretation
+  is SW-side, the same split the board adapters use). It decodes `l.instagram.com/?u=` and **drops the `e=`
+  tracking token** — a discovered url reaches Supabase and the logs.
+- **Sweep order: second, right after Simplify.** Its urls are the employer's own posting links, so when
+  cross-source dedup collapses a duplicate the direct link survives rather than a board wrapper. It is also
+  keyword-INDEPENDENT, so a blank keyword box doesn't disable it (`KEYWORD_FREE` in DiscoverPanel).
+- **No host permission** — instagram.com isn't in the manifest, so `discoverReadPage` falls through to CDP.
+  The injected reader is `async`; `cdpEval` passes `awaitPromise: true`, which is what makes that work.
+- **⚠ Reading marks the stories SEEN** — the operator appears in his viewer list. Stated in the UI hint.
+- **Coverage, measured, is the real limit:** of those 16 links only **3** were on an ATS ApplyPilot can fill
+  (2 Greenhouse + 1 Workday); the rest were Oracle Recruiting Cloud, Phenom-fronted employer sites,
+  SmartRecruiters and SAP, and **none** redirect to a vanity-domain Workday (so `atsPortalAts` misses them
+  too). More adapters, not more sources, is what raises the hit rate.
+
+## Per-source queue tabs + `foundOn`
+
+The queue's fill view has a tab per source plus **All**. Per-source tabs OVERLAP on purpose; **All** is the
+deduped union and the only count that sums to the queue.
+
+- **`source` means "who found it FIRST".** Dedup keeps the first source's copy, so without more information
+  a job LinkedIn genuinely surfaced disappears from the LinkedIn tab because Simplify ran earlier.
+- **`noteFoundOn(job, source)`** records every source on the SURVIVOR. Called from **both** dedup passes —
+  and `dedupeCrossSource` merges the dropped copy's *entire* `foundOn` list, not just its own `source`,
+  because that copy may already have absorbed a third source in the key pass.
+- **`details.found_on`** (migration 0012's jsonb, so **no migration**) is written only when >1 source found
+  the row; absent means "just `source`", never "unknown". `sourcesOf()` in QueuePanel encodes that fallback.
+  Filtering is pure client-side — the page already loads every row.
+- Rows render a badge per source, which is the only place overlap is visible on the All tab.
 

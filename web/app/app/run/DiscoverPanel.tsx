@@ -9,20 +9,29 @@ import { SectionCard } from "@/components/app/SectionCard";
 import { sendToExtension, extensionMessagingAvailable, openRunProgressPort, type RunProgress } from "@/lib/extension";
 import { linkedExtensionId } from "@/lib/extension-sync";
 import {
-  DISCOVER_DEFAULTS, DISCOVER_SOURCE_LABEL, DISCOVER_SOURCE_HINT, describeSweep,
+  DISCOVER_DEFAULTS, DISCOVER_SOURCES, DISCOVER_SOURCE_LABEL, DISCOVER_SOURCE_HINT, describeSweep,
   DISCOVER_CYCLES, DISCOVER_DEFAULT_LOCATION, buildDiscoverQueries, discoverTermLabel, isBoardUrl,
   type DiscoveredJob, type DiscoverStats, type DiscoverSourceKey, type DiscoverSearch,
 } from "@/lib/discover";
 import { getDiscoveryContext, saveDiscovered } from "./actions";
 import { clsx } from "@/lib/clsx";
 
-const SOURCES: DiscoverSourceKey[] = ["simplify", "linkedin", "handshake"];
+const SOURCES: DiscoverSourceKey[] = DISCOVER_SOURCES;
 
 const SOURCE_BADGE: Record<string, string> = {
   simplify: "border-verified/40 text-verified",
+  zero2sudo: "border-iris/40 text-iris",
   linkedin: "border-amber/40 text-amber",
   handshake: "border-ink-dim/40 text-ink-dim",
 };
+
+/**
+ * Sources that DON'T need keywords. Simplify filters its own feed by season and
+ * zero2sudo is a human's curated list, so both work with an empty keyword box —
+ * LinkedIn and Handshake cannot (a keyword-less search there returns their
+ * recommended feed, not your jobs).
+ */
+const KEYWORD_FREE: DiscoverSourceKey[] = ["simplify", "zero2sudo"];
 
 type Phase =
   | { s: "idle" }
@@ -91,7 +100,7 @@ export function DiscoverPanel({
   const [phase, setPhase] = useState<Phase>({ s: "idle" });
   const [progress, setProgress] = useState<RunProgress | null>(null);
   const [enabled, setEnabled] = useState<Record<DiscoverSourceKey, boolean>>({
-    simplify: true, linkedin: true, handshake: true,
+    simplify: true, zero2sudo: true, linkedin: true, handshake: true,
   });
   const [query, setQuery] = useState("");
   const [cycle, setCycle] = useState<string>("summer");
@@ -155,6 +164,9 @@ export function DiscoverPanel({
 
   const running = phase.s === "running";
   const anySource = SOURCES.some((s) => enabled[s]);
+  // A blank keyword box only BLOCKS the sweep when every enabled source needs keywords.
+  // Simplify and zero2sudo don't, so ticking either keeps Discover usable.
+  const anyKeywordFree = KEYWORD_FREE.some((s) => enabled[s]);
 
   async function discover() {
     if (running || !anySource) return;
@@ -456,14 +468,14 @@ export function DiscoverPanel({
       <div className="mt-4 flex flex-wrap items-center gap-3">
         <button
           onClick={discover}
-          disabled={running || !anySource || connected === false || (noKeywords && !enabled.simplify)}
+          disabled={running || !anySource || connected === false || (noKeywords && !anyKeywordFree)}
           className="btn-primary"
         >
           {running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Radar className="h-4 w-4" />}
           {running ? "Discovering…" : "Discover jobs"}
         </button>
         {!anySource && <span className="text-xs text-ink-faint">Pick at least one source.</span>}
-        {anySource && noKeywords && !enabled.simplify && (
+        {anySource && noKeywords && !anyKeywordFree && (
           <span className="text-xs text-signal">Add keywords — the selected sources can&apos;t search without them.</span>
         )}
       </div>

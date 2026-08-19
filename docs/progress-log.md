@@ -19,7 +19,7 @@ For current state and open work, see **`docs/status.md`**.
 | Topic | Grep for |
 |---|---|
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — MULTI-ATS: Greenhouse / Lever / Ashby end-to-end` (the landing milestone), then `2026-07-31 (b)`…`(f)`, `2026-08-04 — the async combobox`, `2026-08-05 — multi-ATS end to end`, `2026-08-07 — the dead first fill` |
-| **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
+| **Job discovery** | `2026-08-19 — SOURCE 4: @zero2sudo's stories`, `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
 | **iCIMS pre-form (employer portal → gate → form)** | `2026-08-16 (c) — iCIMS PRE-FORM` |
 | **Résumé attach (iCIMS: attach-then-wait)** | `2026-08-17 (b) — the résumé goes on FIRST, which makes iCIMS' parse harmless` |
 | **Option lists reaching review (pickers vs free text)** | `2026-08-16 (d) — an OPTIONAL dropdown reaches review as a real picker` |
@@ -5565,3 +5565,67 @@ the trap that both sides of the comparison must be computed the same way — a m
 "the parse changed the form", and a false `changed` can finish the wait before the parse starts.
 
 **1574 unit tests** (112 iCIMS). The baseline-vocabulary test was confirmed to FAIL on a reverted probe.
+
+## 2026-08-19 — SOURCE 4: @zero2sudo's stories, and per-source tabs on the queue
+
+Operator: *"currently it discovers from simplify, linkedin, handshake — add a zero2sudo. Make tabs so each
+time I press run I get jobs from all 4 and can see the different tabs on the queue page. Another tab with
+all, this one looks for overlap and removes them."*
+
+### The trace came first, and it changed the design twice
+
+Before writing a driver, the live endpoints were read through the operator's own signed-in session. Two
+assumptions died there, which is the whole argument for tracing first:
+
+1. **"He always uses link stickers" — actually 16 of 32.** But the half WITHOUT stickers carry no tappable
+   link at all: they are his commentary. So **the sticker IS the job filter** — every one of the 16 linked
+   stories was a genuine posting. That killed the entire vision/OCR branch of the design: `llm.js` needs no
+   image support, there is no per-story model spend, and this source ends up as cheap as the Simplify feed.
+   `story_cta` (the pre-2021 swipe-up) was 0/32, so one field is read rather than two.
+2. **Highlights DO NOT solve the 24h window.** The hopeful theory — job stories get archived into a
+   Highlight, which never expires, so a sweep could catch up at leisure — was tested and **refuted**:
+   "Insider Info 4" held 65 items spanning the same dates, only 3 carried a sticker, and cross-referencing
+   by media id gave **ZERO overlap** with the 16 live linked ones. He archives evergreen commentary, not the
+   job drops. So the window is real, a missed day is genuinely lost, and the driver **says so in a note**
+   rather than implying the list is complete. Only an unattended collector closes that gap; this source
+   cannot, and pretending otherwise would be the silent-narrowing failure.
+
+### The bug that would have made the source look empty
+
+Ranking (`pickByThreshold`) runs **before** `fillMissingDescriptions`. A story link is a bare url — no
+company, no title, no JD — so it scores ~0 on relevance, lands under the 60% threshold, and is dropped
+**before anything ever opens it**. The source would have returned nothing on a page full of real jobs, and
+the log would have called it a threshold filter. Fixed by giving the driver its **own** `maxStoryReads`
+budget and enriching inside it, so these reach the global ranking with the same fields a board record
+supplies. Deliberately not "simplified" into the global reader pass — the ordering is the fix.
+
+`unwrapStoryLink` is pure and unit-pinned: it decodes `l.instagram.com/?u=` to the destination and **drops
+the `e=` tracking token**. A discovered url reaches Supabase and the logs, so carrying that token is exactly
+the leak class `redactSecrets` exists for.
+
+### Per-source tabs, and why `source` alone couldn't drive them
+
+`source` answers *"who found it FIRST"*, not *"who found it"* — dedup keeps the first source's copy, so a
+job LinkedIn genuinely surfaced would vanish from the LinkedIn tab merely because Simplify ran earlier, and
+that tab would quietly under-report. `foundOn` (→ `details.found_on`) records **every** source; both dedup
+passes merge onto the survivor, and `dedupeCrossSource` carries the dropped copy's *whole* list because it
+may already have absorbed a third source. Per-source tabs therefore overlap on purpose; **All** is the
+deduped union and the only count that sums to the queue. Written only when >1 source found the row, so an
+ordinary row is unchanged — and it lives in migration 0012's `details` jsonb, so **no migration and no new
+query**: the queue page already loads every row and filters client-side.
+
+One new palette token (`iris`) — the other three accents were already spoken for, and a fourth source
+sharing a colour would make two sources read as the same thing.
+
+### Coverage is the real constraint, and it is worth stating plainly
+
+Of the 16 links found live, only **3** are on an ATS ApplyPilot can fill (2 Greenhouse + 1 Workday). The
+rest were Oracle Recruiting Cloud, Phenom-fronted employer career sites, SmartRecruiters and SAP — and
+checked directly, **none redirect to a vanity-domain Workday**, so `atsPortalAts` does not recover them
+either. Ingestion was the easy 20% of this feature. Oracle Recruiting Cloud is the highest-value next
+adapter (3 of 16, and ubiquitous in the defense/industrials postings he favours).
+
+**1589 unit tests**, all green (11 new: shim unwrap incl. token-stripping, `foundOn` merge across both dedup
+passes, same-source repeats left alone). Website typecheck clean, `next build` clean, 315 web tests green
+including the `discover.js` ↔ `web/lib/discover.ts` lockstep cross-load. ⚠ **Not yet live-verified** — the
+driver's tab orchestration needs a real sweep in a loaded extension.

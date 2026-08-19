@@ -12,6 +12,29 @@ discover branch).
 
 ## Active
 
+### NEXT (0a) — @zero2sudo source + queue tabs: BUILT AND GREEN, **not yet live-verified** (2026-08-19)
+
+Branch `zero2sudo-source-queue-tabs`. 1589 unit tests green, website typecheck + `next build` clean, 315 web
+tests green. What is **not** yet proven, because it needs a loaded extension and a real sweep:
+
+- the driver's **tab orchestration** — `withDiscoverTab` on instagram.com, the CDP fallback (no host
+  permission for that origin), and the async injected reader resolving through `awaitPromise`. The read
+  itself WAS verified by hand against the live endpoints; what is unverified is it running under a sweep.
+- **`fillMissingDescriptions` on story links** — 16 employer postings across 13 different ATS platforms is a
+  harsher input than the boards ever give it. Expect some to yield no description; they queue anyway.
+- the **per-source tabs** with real overlap in them (needs a sweep where two sources find the same job).
+
+**Two operator decisions waiting**, both from the live trace:
+
+1. **Coverage.** Only 3 of the 16 links found are on an ATS ApplyPilot can fill (2 Greenhouse, 1 Workday).
+   **Oracle Recruiting Cloud** is the highest-value next adapter (3 of 16, and everywhere in the
+   defense/industrials postings he favours). A **Phenom** trace would settle 4 more — Phenom is a career-site
+   front end that often hands off to a real ATS at the apply step, so those may already be reachable.
+2. **The 24h window.** This source can only ever see what is live when the sweep runs; highlights were tested
+   and do not help. The operator's existing 8h GCP cron is the only thing that closes it — and with link
+   stickers present it no longer needs a Claude call at all, just the sticker urls. Reading that collector's
+   Sheet as a FIFTH source (~80 lines, mirroring `discoverFromSimplify`) is the cheap way to get coverage.
+
 ### NEXT (0) — iCIMS: LIVE-VERIFIED through the address block; next is Education (operator 2026-08-16)
 
 **Steps 1 and 2 are LIVE-VERIFIED** on `astrioncareers-astrion.icims.com/jobs/24615`, build `icims-addr-1`:
