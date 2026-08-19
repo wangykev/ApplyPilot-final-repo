@@ -916,6 +916,12 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
         await cdpUseFormFrame(4).catch(() => null);
         const out = { ok: true, sel, tabId };
         out.opened = await cdpEval(atsInjIcimsOpen, sel).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        // ⚠ CLEAR THE SEARCH BOX BEFORE READING, or "unfiltered" is a lie. This probe was built to ask
+        // whether a list was empty, and its first run answered YES about a nine-option list — because the
+        // box still held the FILL's own query, so the rows it read were filtered by it. A tool written to
+        // check our work reproduced our bug and confirmed the wrong conclusion; clearing is what makes
+        // the word "unfiltered" mean anything. `atsInjIcimsSearch(sel, "")` sets the box empty.
+        out.cleared = await cdpEval(atsInjIcimsSearch, sel, "").catch(() => null);
         // Poll the unfiltered list: iCIMS fetches the first page on OPEN, so an immediate read is a race.
         for (let i = 0; i < 12; i++) {
           await cdpDelay(400);
