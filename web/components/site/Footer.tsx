@@ -1,3 +1,4 @@
+import Link from "next/link";
 import { Logo } from "@/components/Logo";
 
 export function Footer() {
@@ -9,9 +10,20 @@ export function Footer() {
           ApplyPilot fills the form you are already on. It never submits an
           application on its own — the review gate is yours.
         </p>
-        <span className="font-mono text-[11px] tracking-label text-ink-faint">
-          v0.1 · DEV
-        </span>
+        <div className="flex items-center gap-4">
+          {/* ⚠ Google OAuth verification for the restricted gmail.readonly scope
+              requires the privacy policy to be linked from the app's HOME PAGE,
+              not just reachable by URL. Do not remove this link. */}
+          <Link
+            href="/privacy"
+            className="font-mono text-[11px] tracking-label text-ink-faint transition-colors hover:text-amber"
+          >
+            PRIVACY
+          </Link>
+          <span className="font-mono text-[11px] tracking-label text-ink-faint">
+            v0.1 · DEV
+          </span>
+        </div>
       </div>
     </footer>
   );
