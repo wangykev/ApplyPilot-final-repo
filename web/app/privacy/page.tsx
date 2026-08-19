@@ -94,7 +94,7 @@ export default function PrivacyPage() {
         </p>
         <p className="mt-4 font-mono text-xs text-ink-faint">
           Effective {EFFECTIVE} · Applies to the ApplyPilot Chrome extension and
-          applypilot.vercel.app
+          apply-pilot-final-repo.vercel.app
         </p>
       </header>
 

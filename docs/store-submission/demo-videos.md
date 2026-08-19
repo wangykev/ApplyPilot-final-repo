@@ -85,7 +85,7 @@ ever needing an address bar.
 |---|---|---|---|
 | 1 | The published listing or `chrome://extensions` with name + **extension ID** in frame | "This is ApplyPilot, extension ID `<id>`." | App identity |
 | 2 | Cloud Console → Credentials → the OAuth client, Application ID matching shot 1 | "It is the registered OAuth client for this project — same extension ID, client ID `<...>`." | Client ID ↔ app match |
-| 3 | The privacy policy at `applypilot.vercel.app/privacy`, scrolled to **section 04**, Limited Use paragraph legible | "The privacy policy is on the app's own domain, linked from the home page, and states the Limited Use commitment." | Policy requirements |
+| 3 | The privacy policy at `apply-pilot-final-repo.vercel.app/privacy`, scrolled to **section 04**, Limited Use paragraph legible | "The privacy policy is on the app's own domain, linked from the home page, and states the Limited Use commitment." | Policy requirements |
 | 4 | The extension's Gmail toggle, **off** | "The Gmail feature is off by default. Nothing is requested until the user turns it on." | Consent is opt-in |
 | 5 | Turn it on → the consent screen, **app name and scope legible**, then Allow | "Turning it on shows Google's consent screen, requesting one scope: `gmail.readonly`, read-only." | **Consent flow — the central item** |
 | 6 | An ATS account-creation step that emails a code | "Hiring sites email a verification code during account creation. This is the only situation the scope is used in." | Context of use |

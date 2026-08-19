@@ -105,7 +105,7 @@ leaves your browser is the application you chose to send to the employer you cho
 it to — plus, only if you turn AI assist on, the prompts that go to your own provider.
 
 Full detail, including how the optional Gmail permission works and how a stored hiring-site
-password is handled: https://applypilot.vercel.app/privacy
+password is handled: https://apply-pilot-final-repo.vercel.app/privacy
 
 A NOTE ON THE PERMISSIONS
 

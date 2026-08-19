@@ -19,10 +19,10 @@
     "https://generativelanguage.googleapis.com/*",
     "https://api.openai.com/*",
     "http://localhost/*",
-    "https://applypilot.vercel.app/*"
+    "https://apply-pilot-final-repo.vercel.app/*"
   ],
   "externally_connectable": {
-    "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://applypilot.vercel.app/*"]
+    "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://apply-pilot-final-repo.vercel.app/*"]
   },
   "icons": {
     "16": "icons/icon16.png",

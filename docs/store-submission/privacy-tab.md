@@ -161,7 +161,7 @@ https://generativelanguage.googleapis.com/*
   answer for a required question their profile does not cover. Every such answer is
   flagged for the user to confirm and is never submitted unreviewed.
 
-https://applypilot.vercel.app/*
+https://apply-pilot-final-repo.vercel.app/*
   The extension's own companion site. The user's profile is authored there and read from
   there, and the record of what was filled is sent there so they can review and approve it
   before submitting.
@@ -231,7 +231,7 @@ certification is accurate.
 ## 5 · Privacy policy URL
 
 ```
-https://applypilot.vercel.app/privacy
+https://apply-pilot-final-repo.vercel.app/privacy
 ```
 
 Requirements this URL already satisfies (`web/app/privacy/page.tsx`):
