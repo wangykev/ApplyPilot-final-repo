@@ -1026,10 +1026,69 @@ rest.** What is settled, and what must not be re-litigated:
   firing. Reads must be synchronous with waits taken OUTSIDE the page, and a section transition needs real
   pacing (measure into `fill-speed-log.md` once a fill runs).
 
-**Open:** §2–§4 field detail; §3 Employment/Education repeating-entry container (0 inputs until built);
-whether a combobox accepts a typed value or strictly requires picking a suggestion; `region1`/`region2`
-semantics; whether ids renumber across a section transition; captcha on submit and
-`<apply-flow-submission-checklist>` semantics; a second tenant's form (the gate has two, the form has one).
+### Sections 2–4 and the timeline (recon 3, 2026-08-19)
+
+- **`div.input-row--<kind>` IS THE WIDGET CLASSIFIER** — declared by the framework, so classification is a
+  read rather than a guess: `--text` · `--textarea` · `--has-picker` (combobox) · `--radiogroup` (option
+  group) · `datepicker-row` (month+year). Sections are also **directly URL-addressable**
+  (`…/apply/section/3` loads with step 1 empty — validation does not gate navigation), and exactly one
+  `apply-flow-section` has a non-zero rect with its index equal to the URL's number, which confirms the
+  URL-keyed scoping rule. A real fill should still press `Next` so the tenant's validation and save fire.
+- **⚠⚠ AN OPTION GROUP IS RENDERED TWO WAYS AND ONE HAS NO `name` AT ALL.** Disability self-ID = 3
+  `type=radio` sharing a name; Baylor's enrollment question = 3 **`type=checkbox` with `name: null`**; EEO
+  race = 6 the same. So **grouping cannot be by `name`** the way every other platform does it — the group is
+  `div.input-row--radiogroup`. ⚠ **And the question text is not any option's label**: each box's `label[for]`
+  is its own OPTION text, so the question must be read from the group. Using a member's label as the field
+  label files every option as a separate question — the Gusto 12-phantom-field failure in a new costume.
+  ⚠ **`radiogroup` does NOT imply pick-one** — EEO race is legitimately multi-select inside one. The class
+  names the widget family, not the arity; treat arity as unresolved rather than inferring it.
+- **⚠⚠ A DATE IS TWO COMBOBOXES SHARING ONE `name`, month + year, NO DAY.** `month-startDate-34` and
+  `year-startDate-34` both carry `name="startDate"`, so the **`month-`/`year-` id prefix is the only
+  discriminator** — a name identifies the *pair*, not a control (same shape as the phone composite). **No day
+  means iCIMS' `atsDefaultDay` approximation must NOT be applied here** — the profile's month precision is
+  exactly right.
+- **⚠ EVERY TEXTAREA ROW HOLDS TWO TEXTAREAS** — the named one plus a clone with **empty id and empty name**,
+  both visible by rect. Push only the named one. Untreated this is the Greenhouse double-push again, and here
+  the phantom is a *textarea*, the shape that becomes a required free-text field and buys an LLM call.
+- **§3 is a repeating timeline**: `<beautiful-timeline>` with `button.work-and-education-timeline-add-button`
+  (`.timeline-work-add-button` / `.timeline-education-add-button`), opening `<timeline-form-inline>` →
+  `<timeline-form-builder>` (⚠ a *different* renderer from the page-level `<form-builder>`). Experience
+  fields: `employerName` (req) · `jobTitle` · `startDate` · `endDate` · `countryCode` · `employerCity` ·
+  `responsibilities` · `leavingReason`. ⚠ `countryCode` is the **EMPLOYER's** country — the iCIMS entry seal
+  applies verbatim. The date fields carry **no label**, so they are identifiable only structurally.
+- **⚠⚠ TWO TIMELINE TRAPS, EITHER OF WHICH DESTROYS AN ENTRY SILENTLY.** (1) **The commit button has the SAME
+  TEXT as the opener** (`Add Experience` both outside and inside the form) — disambiguate by container:
+  inside `timeline-form-inline` ⇒ commit, outside ⇒ open. (2) **Clicking outside the entry box DISCARDS it**,
+  and the tenant says so itself (*"Do not click outside the white box until you have submitted your
+  information"*). That collides directly with portaled combobox options — the entry form holds **four**
+  comboboxes, and if an option list mounts outside the white box then selecting an option *is* a click
+  outside. With the Workday findings that portaled lists share coordinates and linger while unmounting, the
+  failure is an entry that vanishes while every commit reports success. **Check where the option list mounts
+  relative to `timeline-form-inline` BEFORE writing the entry handler**, and re-read the whole entry after
+  each commit rather than trusting one field's read-back.
+- **§2** = per-tenant screening questions (`300000…` comboboxes + a checkbox group), three file inputs
+  (Résumé / Cover Letter / references Attachment — distinguished by **label AND wrapper**, a useful
+  redundancy), and `siteLink-1` whose label is the bare noun **"Link 1"** and whose trailing `-1` is a
+  **meaningful entry ordinal**, not a render counter.
+- **§4** = `Sex` / `Veteran Status` (comboboxes), disability (3 radios incl. "I do not want to answer"),
+  race/ethnicity checkbox groups, and **E-Signature → `fullName`** (required text — the Workday signature-name
+  rule applies; no signature date on this tenant). **Every self-ID field here is OPTIONAL**, so the standing
+  rule holds: unstated + optional ⇒ **blank, no AI**; stated ⇒ deterministic. ⚠ The disability wording is
+  **byte-identical to Workday cat.wd5's**, so `selfIdDisabilityCandidates` + POLARITY LEAD should land it
+  with no new matching code — verify rather than assume.
+- **⚠⚠ THE DURABLE KEY NEEDS NORMALIZING: A RADIO GROUP'S `name` CARRIES THE VOLATILE COUNTER.** Text and
+  combobox names are clean (`lastName`, `US-STANDARD-ORA_GENDER-STANDARD`) but the disability group's is
+  `…ORA_DISABILITY_STATUS-STANDARD-12`. So the durable name **strips a trailing `-<digits>`** — the same move
+  as iCIMS' `atsMapKey`. ⚠ The exceptions must be pinned before it ships: `siteLink-1` → `siteLink` is
+  *desirable* (family + ordinal), `dq-option-4` → `dq-option` is acceptable only because the group is the
+  field, and `namInformation15` ends in digits with **no hyphen** and must be left alone. Wrong in either
+  direction and the submit visit misses the field.
+
+**Open:** whether a combobox accepts a typed value or strictly requires a suggestion; `region1`/`region2`
+semantics per country (must not be guessed); **where a combobox's options mount relative to
+`timeline-form-inline`** (the discard hazard); whether ids renumber across a section transition; captcha on
+submit and `<apply-flow-submission-checklist>` semantics; the Education entry's field set; and a **second
+tenant's form** (the gate has two tenants, the form still has one).
 
 ## Multi-ATS — Greenhouse / Lever / Ashby (`ats.js`; fill + gated submit, live-verified 2026-07-31)
 

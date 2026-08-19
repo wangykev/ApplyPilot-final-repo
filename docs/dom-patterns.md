@@ -4871,3 +4871,188 @@ belongs in `fill-speed-log.md` once a real fill runs.
 6. Captcha on the real submit; `<apply-flow-submission-checklist>` semantics.
 7. Whether a second tenant's platform names match exactly (Baylor is one data point for the form; the gate
    is two).
+
+---
+
+## 2026-08-19 (c) — ORC: sections 2–4, the timeline, and the row class that classifies everything
+
+Same Baylor session, still read-only, nothing submitted. Sections 2 and 4 were read straight out of the DOM
+(they are already mounted — see the inversion rule in entry (b)); section 3 was reached by **direct URL**.
+
+### Sections are directly URL-addressable, and validation does NOT gate navigation
+
+`…/apply/section/3` loads section 3 with step 1 still empty. Confirmed by geometry: exactly one
+`apply-flow-section` has a non-zero rect, and **its index equals the URL's section number**. That validates
+the URL-keyed scoping rule from entry (b) — and it means a walk can address sections directly, though a real
+fill should still use `Next` so the tenant's own validation and save fire.
+
+### ⚠ `div.input-row--<kind>` IS THE WIDGET CLASSIFIER — declared, generic, one attribute
+
+The single most useful classification signal on an ORC form, and it comes from the framework rather than
+from guessing:
+
+| row class | meaning | controls inside |
+|---|---|---|
+| `input-row--text` | text | `input.input-row__control` + Knockout `data-bind` |
+| `input-row--textarea` | long text | `<textarea>` ⚠ **two of them** — see below |
+| `input-row--has-picker` | dropdown / combobox | `input[role=combobox].cx-select-input` |
+| `input-row--radiogroup` | an option GROUP | ⚠ `type=radio` **or** `type=checkbox` — see below |
+| `datepicker-row` | month + year composite | **two** comboboxes — see below |
+
+### ⚠⚠ AN OPTION GROUP IS RENDERED TWO DIFFERENT WAYS, AND ONE OF THEM HAS NO `name` AT ALL
+
+Both observed on the same application:
+
+| question | control type | `name` | grouping key |
+|---|---|---|---|
+| Disability (self-ID) | `type=radio` × 3 | shared `US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12` | the shared name |
+| "Currently enrolled at Baylor?" | **`type=checkbox` × 3** | **`null`** | **the row container only** |
+| EEO race | **`type=checkbox` × 6** | **`null`** | **the row container only** |
+
+So grouping **cannot** be by `name` the way Greenhouse/Lever/Workday do it — a checkbox-rendered group has no
+name to group on. The group is `div.input-row--radiogroup`, and the individual boxes are its options
+(`dq-option-<optionId>` for screening questions).
+
+⚠ **And the question text is NOT any option's label.** Each checkbox's `label[for]` is its own OPTION text
+("No, I am not currently enrolled…", "Asian"). The QUESTION belongs to the group — it must be read from the
+row/group, not from a member. A scan that used a member's label as the field label would file every option as
+a separate yes/no question, which is the Gusto 12-phantom-field failure in a new costume.
+
+⚠ **`radiogroup` may NOT mean pick-one.** EEO **race** is legitimately multi-select and still sits in an
+`input-row--radiogroup`. So the class names the *widget family*, not the arity. **Do not infer pick-one from
+it** — treat arity as unresolved and let the field's own semantics (and the human review gate) decide.
+
+### ⚠⚠ A DATE IS TWO COMBOBOXES SHARING ONE `name` — month and year, NO day
+
+```
+id="month-startDate-34"  name="startDate"   role=combobox
+id="year-startDate-34"   name="startDate"   role=combobox     row: datepicker-row
+```
+
+Both halves carry the **same** `name`, so `name` alone cannot address a date — the **`month-` / `year-` id
+prefix** is the only discriminator (and the id also carries the volatile counter). Same shape as the phone
+composite from entry (b): a name that identifies a *pair*, not a control.
+
+**There is no DAY**, which is a welcome match to the profile's month-precision dates — the iCIMS
+`atsDefaultDay` approximation is **not needed on ORC**, so it must not be applied here.
+
+### ⚠ EVERY TEXTAREA ROW CONTAINS TWO TEXTAREAS
+
+`responsibilities-39` is followed by a textarea with **empty id and empty name**; likewise
+`leavingReason-40`. Presumably an autosize/mirror clone. Both are *visible* by rect.
+
+**Push only the named one.** The tell is an empty `id` AND empty `name`. Untreated, this is the Greenhouse
+double-push failure again — and here the phantom is a *textarea*, i.e. exactly the shape that becomes a
+required free-text field and buys an LLM call.
+
+### Section 3 — the repeating timeline
+
+```
+<apply-flow-block>
+  <beautiful-timeline>                     the repeating container
+    button.work-and-education-timeline-add-button.timeline-work-add-button   "Add Experience"
+    button.work-and-education-timeline-add-button.timeline-education-add-…   "Add Education"
+  <timeline-form-inline>                   the open entry form
+    <timeline-form-builder>                ⚠ a DIFFERENT renderer from the page-level <form-builder>
+```
+
+Zero inputs until an add button is pressed. Experience entry fields (all inside `timeline-form-inline`):
+
+| name | label | widget | req |
+|---|---|---|---|
+| `employerName` | Employer Name | text | ✓ |
+| `jobTitle` | Job Title | text | |
+| `startDate` | *(none)* | month+year comboboxes | |
+| `endDate` | *(none)* | month+year comboboxes | |
+| `countryCode` | Employer Country | combobox | |
+| `employerCity` | Employer City | text | |
+| `responsibilities` | Responsibilities | textarea | |
+| `leavingReason` | Reason for Leaving | textarea | |
+
+⚠ **`countryCode` here is the EMPLOYER's country** — the iCIMS entry-seal rule applies verbatim: a field
+inside a repeating entry is sealed to that entry, and answering it from the applicant's own address is a
+*different fact*, not a near-miss. The date fields carry **no label at all**, so they can only be identified
+structurally.
+
+### ⚠⚠ TWO TRAPS IN THE TIMELINE, BOTH ABLE TO DESTROY AN ENTRY SILENTLY
+
+**1. The commit button has the SAME TEXT as the opener.** Inside `timeline-form-inline` the buttons are five
+icon buttons, then `Cancel`, then **`Add Experience`** — the identical label to the button that opened the
+form. Finding the opener by text while a form is open therefore hits the **committer**. Disambiguate by
+container: inside `timeline-form-inline` ⇒ commit; outside ⇒ open.
+
+**2. Clicking outside the entry box DISCARDS it — the tenant says so in its own instructions:**
+> *"When you click 'Add Education' or 'Add Experience' a white box will open where you may enter your
+> information. Do not click outside the white box until you have submitted your information."*
+
+That is a direct collision with a hazard this pipeline already knows: a combobox's options are portaled, and
+this entry form contains **four** comboboxes (two dates, employer country). If a portaled option list renders
+outside the white box, the click that selects an option **is** a click outside the box. Combined with the
+Workday finding that every portaled listbox renders at the same coordinates and options linger while
+unmounting, the failure mode is an entry that vanishes mid-fill with every commit having "succeeded".
+
+**Verify where the option list mounts relative to `timeline-form-inline` BEFORE writing the entry handler**,
+and re-read the entry after each commit rather than trusting the read-back of a single field.
+
+### Section 2 — questions, documents, references
+
+| field | label | widget |
+|---|---|---|
+| `300000016979265` | "The mission of Baylor University is to educate men and women for world…" | combobox, req |
+| *(no name)* × 3 | enrollment options | checkbox group |
+| `300000010623019` | "Please tell us where you first saw the job advertisement…" | combobox, req |
+| `attachment-upload` in `<resume-upload-button>` | **Upload Resume** | file |
+| `attachment-upload` in `<cover-letter-upload-button>` | **Upload Cover Letter** | file |
+| `attachment-upload` in `<attachment-upload-button>` | **Upload Attachment** (references) | file |
+| `siteLink-1` | "Link 1" | url |
+
+The three file inputs are **labelled** distinctly even though they share a `name` — so label *and* wrapper
+both disambiguate, which is a useful redundancy. ⚠ `siteLink-1`'s label is the bare noun **"Link 1"** — the
+shape that reaches the AI; and its trailing `-1` is a **meaningful entry ordinal**, not a render counter.
+
+### Section 4 — self-ID and e-signature
+
+`Sex` → `US-STANDARD-ORA_GENDER-STANDARD` (combobox) · `Veteran Status` →
+`US-STANDARD-ORA_VETERAN_STATUS-STANDARD` (combobox) · disability → 3 radios incl. **"I do not want to
+answer"** · race/ethnicity → checkbox groups · **E-Signature → `fullName`, required, text**.
+
+**Every self-ID field on this tenant is OPTIONAL**, so the standing rule applies unchanged: an optional EEO
+field the profile does not state is left **BLANK** (no AI), and a stated one fills deterministically.
+
+⚠ The disability wording is **byte-identical to Workday cat.wd5's** — *"No, I do not have a disability and
+have not had one in the past"* — so `selfIdDisabilityCandidates` + **POLARITY LEAD** should land it here with
+no new matching code. Good reuse, and worth checking rather than assuming.
+
+`fullName` is a signature field: the Workday self-ID rule applies (fill the name deterministically). No
+signature DATE was present on this tenant.
+
+### ⚠⚠ THE DURABLE KEY NEEDS NORMALIZING — A RADIO GROUP'S `name` CARRIES THE VOLATILE COUNTER
+
+Entry (b) established that `name` is durable and `id` is not. That is **not quite the whole rule**:
+
+| control | `id` | `name` | durable? |
+|---|---|---|---|
+| text | `lastName-21` | `lastName` | ✓ clean |
+| combobox | `US-STANDARD-ORA_GENDER-STANDARD-10` | `US-STANDARD-ORA_GENDER-STANDARD` | ✓ clean |
+| **radio group** | `…ORA_DISABILITY_STATUS-STANDARD-12-ORA_PER_Y` | **`…ORA_DISABILITY_STATUS-STANDARD-12`** | **✗ carries `-12`** |
+
+So the durable name must **strip a trailing `-<digits>`** — structurally the same move as iCIMS' `atsMapKey`
+stripping a leading ordinal, and it makes the disability group's key match the gender/veteran pattern.
+
+⚠ But the strip is **not** unconditional, and the exceptions must be pinned before it ships:
+- `siteLink-1` → `siteLink` **is desirable** (family + entry ordinal, the iCIMS repeating pattern).
+- `dq-option-4` → `dq-option` loses which option — acceptable only because the *group* is the field and the
+  options are labels, never keys.
+- `namInformation15` ends in digits with **no hyphen** and must be left alone.
+Get this wrong in either direction and the submit visit misses the field.
+
+### Still open
+
+1. Whether a combobox accepts a typed value or strictly requires picking a suggestion (the address block).
+2. `region1` vs `region2` semantics per country — still unresolved, still must not be guessed.
+3. **Where a combobox's option list mounts relative to `timeline-form-inline`** (the discard hazard above).
+4. Whether ids renumber across a section transition — the counter is render-assignment, so probably yes,
+   which is precisely why the durable key must not be the id.
+5. Captcha on submit; `<apply-flow-submission-checklist>` semantics.
+6. A SECOND tenant's form (the gate has two tenants, the form still has one).
+7. The Education entry's own field set (only Experience was opened).
