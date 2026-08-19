@@ -1524,6 +1524,187 @@ function atsInjScan(ats) {
     return out;
   }
 
+  // ── ORACLE RECRUITING CLOUD (Oracle JET SPA + Knockout on native inputs; observed 2026-08-19) ──
+  // Structure: <apply-flow-section> → <apply-flow-block> (+ <apply-flow-block-title>) →
+  // <form-builder> → div.input-row.input-row--<kind>. The row CLASS declares the widget, so
+  // classification here is a read rather than an inference — the opposite of every earlier platform.
+  //
+  // ⚠ SCOPED TO EVERY *VISIBLE* SECTION, and each half of that is a measured correction:
+  //   • not the whole document — all sections of all steps are mounted at once, and the inactive ones
+  //     report `hidden`=false, `aria-hidden`="false", `display`=block. Only the RECT distinguishes
+  //     them, so a document-wide scan returns every step's fields as if they were one page.
+  //   • not "the single visible section" and not the URL's number either — Baylor served 5 sections
+  //     for 4 steps (index 0 an empty shell) while Oracle serves 4 for 3, and on Oracle TWO are
+  //     visible at once (index 0 is the résumé-import banner, index 1 the real step-1 content).
+  // So: every section with a non-zero rect, and no arithmetic on indexes.
+  if (ats === "oracle") {
+    const secs = [...document.querySelectorAll("apply-flow-section")].filter(vis);
+    if (!secs.length) return out;
+    const stripStar = (s) => String(s || "").replace(/\s*[*✱]\s*$/, "").trim();
+    const blockOf = (el) => {
+      const b = el.closest("apply-flow-block");
+      return b ? txt(b.querySelector("apply-flow-block-title")) : "";
+    };
+    // ⚠ A DECOY IS EXCLUDED BY DECLARED INTENT, NEVER BY GEOMETRY. ORC's gate ships a honeypot
+    // measuring 179×38 / 200×38 with visibility:visible and a non-null offsetParent, so every
+    // visibility test here passes it. Writing to one marks the application as a bot and NO read-back
+    // notices, because the write succeeds. LOCKSTEP with atsDecoyKind (an injected fn cannot import).
+    const isDecoy = (e) => {
+      const nm = ((e.name || "") + " " + (e.getAttribute("aria-label") || "")).replace(/\s+/g, " ");
+      if (/\bhoney[\s_-]?pot\b/i.test(nm)) return true;
+      return e.getAttribute("aria-hidden") === "true" && e.getAttribute("tabindex") === "-1";
+    };
+    const reqOf = (el, rawLabel) => el.required === true || el.getAttribute("aria-required") === "true"
+      || /[*✱]\s*$/.test(String(rawLabel || ""))
+      || !!(el.id && (document.querySelector('label[for="' + esc(el.id) + '"]') || {}).classList
+            && document.querySelector('label[for="' + esc(el.id) + '"]').classList.contains("input-row__label--required"));
+
+    for (const sec of secs) {
+      // 1) OPTION GROUPS first, so their member boxes are never also emitted as standalone fields.
+      //    The group is the ROW (div.input-row--radiogroup) — NOT a shared `name`, which the
+      //    checkbox-rendered variant does not even have (measured `name: null` on race + ethnicity).
+      //    ⚠ The QUESTION is the row's own label, which is the one WITHOUT a `for` attribute; each
+      //    member's `label[for=<id>]` is its OPTION text. Using a member's label as the field label
+      //    would file every option as its own required question — the Gusto 12-phantom-field failure.
+      //    ⚠ `--radiogroup` does NOT imply pick-one: this tenant's race group asks "Select the races
+      //    you identify with." So ARITY comes from the input TYPE, never from the class name.
+      for (const row of sec.querySelectorAll("div.input-row--radiogroup")) {
+        const boxes = [...row.querySelectorAll('input[type="radio"], input[type="checkbox"]')].filter((e) => !isDecoy(e));
+        if (!boxes.length) continue;
+        const qEl = row.querySelector("form-element-label") || [...row.querySelectorAll("label")].find((l) => !l.getAttribute("for"));
+        const rawQ = txt(qEl);
+        const optOf = (b) => (b.id ? txt(document.querySelector('label[for="' + esc(b.id) + '"]')) : "") || b.value || "";
+        const isRadio = String(boxes[0].type).toLowerCase() === "radio";
+        // A shared `name` exists only on the radio variant; fall back to the group's question so a
+        // nameless checkbox group still has a stable key.
+        // ⚠ The group separator "; " is inlined — a LOCKSTEP dup of lib.js's GROUP_JOIN, because an
+        // injected fn cannot import, and the replay splits a multi-answer value on exactly this
+        // vocabulary. Change one, change both.
+        // (The helper name is deliberately not written here: the self-containment test greps this
+        //  function's SOURCE for shim references, and a comment would trip it.)
+        const key = boxes[0].name || ("group:" + String(rawQ).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48));
+        if (seen.has(key)) continue; seen.add(key);
+        push({ fieldName: key, inputSel: boxes.map((b) => "#" + esc(b.id)).join(", "),
+          widgetType: isRadio ? "radio" : (boxes.length > 1 ? "checkbox_group" : "checkbox"),
+          label: stripStar(rawQ) || key, isRequired: boxes.some((b) => reqOf(b, rawQ)),
+          value: boxes.filter((b) => b.checked).map(optOf).join("; ") || null,
+          options: boxes.map(optOf).filter(Boolean),
+          optionSels: boxes.map((b) => "#" + esc(b.id)),
+          group: isRadio ? "radio" : "checkbox", section: blockOf(boxes[0]) });
+      }
+
+      // 2) DATE COMPOSITES. Parts share ONE `name` and are told apart only by an id prefix
+      //    (`month-startDate-34` / `year-startDate-34`), so a name identifies the PAIR, not a
+      //    control. ⚠ ARITY VARIES: the timeline's dates are month+year, while this tenant's
+      //    `earliestAvailableDate` is month+DAY+year — so the parts are discovered, never assumed,
+      //    and a required day here means the profile's month precision is not always sufficient.
+      for (const row of sec.querySelectorAll("div.datepicker-row")) {
+        const parts = [...row.querySelectorAll("input")].filter((e) => !isDecoy(e));
+        if (!parts.length) continue;
+        const nm = parts[0].name || "";
+        if (!nm || seen.has("date:" + nm)) continue; seen.add("date:" + nm);
+        const order = [];
+        const bySel = {};
+        for (const p of parts) {
+          const m = /^(month|day|year)-/.exec(p.id || "");
+          if (m) { order.push(m[1]); bySel[m[1]] = "#" + esc(p.id); }
+        }
+        const rawLabel = txt(row.querySelector("form-element-label")) || txt([...row.querySelectorAll("label")].find((l) => !l.getAttribute("for")));
+        push({ fieldName: nm, inputSel: Object.values(bySel).join(", "), widgetType: "date",
+          label: stripStar(rawLabel) || nm, isRequired: parts.some((p) => reqOf(p, rawLabel)),
+          value: parts.map((p) => p.value).filter(Boolean).join("/") || null,
+          dateParts: order, datePartSels: bySel, section: blockOf(parts[0]) });
+      }
+
+      // 3) LONE CHECKBOX ROWS. ORC files a standalone checkbox in `div.input-row--checkbox` rather
+      //    than a radiogroup, so it needs its own pass — the general loop below deliberately skips
+      //    every radio and checkbox (see the note there), and without this they would be lost.
+      //    ⚠ VISIBLE ONLY: this tenant ships pre-checked, hidden communication-preference flags
+      //    (`af-checkbox-emailPreferredFlag`, `…phonePreferredFlag`). They are not questions being
+      //    asked, so surfacing them would add review noise and invite us to toggle a contact
+      //    preference nobody chose.
+      for (const row of sec.querySelectorAll("div.input-row--checkbox")) {
+        const box = [...row.querySelectorAll('input[type="checkbox"]')].filter((e) => !isDecoy(e) && vis(e))[0];
+        if (!box) continue;
+        const key = box.name || box.id;
+        if (!key || seen.has(key)) continue; seen.add(key);
+        const rawLabel = (box.id ? txt(document.querySelector('label[for="' + esc(box.id) + '"]')) : "")
+          || txt(row.querySelector("form-element-label")) || box.getAttribute("aria-label") || "";
+        push({ fieldName: key, inputSel: "#" + esc(box.id), widgetType: "checkbox",
+          label: stripStar(rawLabel) || key, isRequired: reqOf(box, rawLabel),
+          value: box.checked ? "true" : null, section: blockOf(box) });
+      }
+
+      // 4) EVERYTHING ELSE, one control at a time.
+      // ⚠ RADIO AND CHECKBOX ARE SKIPPED HERE ON PURPOSE — the grouping passes above own them.
+      // Classifying a grouped box here would push it a SECOND time as a plain field keyed on its own
+      // id, which on Greenhouse turned one 12-option question into 12 phantom REQUIRED text fields,
+      // each buying its own LLM call. Structurally enforced by a test that reads this very line.
+      for (const el of sec.querySelectorAll("input, textarea, select")) {
+        if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox" || isDecoy(el)) continue;
+        if (el.closest("div.input-row--radiogroup") || el.closest("div.datepicker-row")) continue; // handled above
+        // ⚠ EVERY TEXTAREA ROW SHIPS A CLONE with an empty id AND empty name (an autosize mirror).
+        // Pushing it creates a phantom free-text field — the shape that becomes required and buys an
+        // LLM call. The named one is the real control.
+        const isFile = el.type === "file";
+        // ⚠ THE ANONYMOUS-BUT-REAL CONTROLS MUST SURVIVE THIS GUARD. It exists to drop the textarea
+        // CLONE (empty id AND empty name — an autosize mirror), but ORC's actual phone-number input
+        // is also id-less and name-less, and it is REQUIRED. Caught by running this scan against the
+        // live form: the field silently vanished, which would leave the form uncompletable while the
+        // bundle looked clean. `type=tel` is therefore admitted here and keyed synthetically below.
+        const isAnonReal = !el.id && !el.name && el.type === "tel";
+        if (!el.id && !el.name && !isFile && !isAnonReal) continue;
+        if (!isFile && !vis(el)) continue; // file inputs are styled invisible by design
+
+        const lblEl = el.id ? document.querySelector('label[for="' + esc(el.id) + '"]') : null;
+        const rawLabel = txt(lblEl) || el.getAttribute("aria-label") || "";
+        const row = el.closest("div.input-row");
+        const rowCls = String((row && row.className) || "");
+        let widgetType, key = el.name || el.id;
+
+        if (isFile) {
+          // ⚠ THREE FILE INPUTS SHARE `name="attachment-upload"`, told apart ONLY by their wrapper
+          // (<resume-upload-button> / <cover-letter-upload-button> / <attachment-upload-button>). So
+          // `name` is NOT unique on an ORC form and the wrapper is the discriminator; the label
+          // agrees, which is a useful redundancy rather than the primary signal.
+          let wrap = null;
+          for (let p = el.parentElement; p && !wrap; p = p.parentElement) {
+            const n = p.tagName.toLowerCase();
+            if (/^(resume|cover-letter|attachment)-upload-button$/.test(n) || n === "referral-resume-block") wrap = n;
+          }
+          widgetType = "file_upload";
+          key = wrap ? wrap.replace(/-button$/, "") : (el.id || "attachment-upload");
+        } else if (el.tagName === "SELECT") {
+          widgetType = "dropdown_native";
+        } else if (el.getAttribute("role") === "combobox" || /input-row--has-picker/.test(rowCls)) {
+          // ORC's own picker. Options are NOT read here: the listbox is created on demand and holds
+          // `div[role="row"]` rows inside a `div[role="grid"]` — a `[role=option]` scrape finds
+          // NOTHING — so reading them at scan time would mean opening every dropdown on the page.
+          widgetType = "select";
+        } else if (el.tagName === "TEXTAREA" || /input-row--textarea/.test(rowCls)) {
+          widgetType = "textarea";
+        } else if (el.type === "checkbox") {
+          widgetType = "checkbox";
+        } else {
+          widgetType = "text";
+        }
+
+        // The phone composite: `name="phoneNumber"` is the DIAL-CODE picker, and the control that
+        // wants the number has NO id and NO name at all. Give it a synthetic key so it is
+        // addressable and can never collide with the picker's.
+        if (!el.name && !el.id && el.type === "tel") { key = "phoneNumber--number"; widgetType = "text"; }
+
+        if (!key || seen.has(key)) continue; seen.add(key);
+        push({ fieldName: key,
+          inputSel: el.id ? "#" + esc(el.id) : (el.name ? '[name="' + esc(el.name) + '"]' : ".phone-row__input"),
+          widgetType, label: stripStar(rawLabel) || key, isRequired: reqOf(el, rawLabel),
+          value: (el.type === "checkbox" ? (el.checked ? "true" : null) : (el.value || null)),
+          section: blockOf(el) });
+      }
+    }
+    return out;
+  }
+
   // iCIMS — a classic server-rendered form (jQuery, NO React: there are no fiber keys on its
   // inputs, traced 2026-08-16), so plain native-setter writes are enough and there is no
   // controlled-component state to re-sync. Structure is a table of `.iCIMS_TableRow` inside
@@ -3550,7 +3731,18 @@ function atsInjOrcAuthScan() {
     .filter((e) => !isDecoy(e))
     .map((e) => {
       const row = e.closest(".input-row, .legal-disclaimer-container, div");
+      // ⚠ THE PAGE'S OWN FILING BEATS ITS PROSE. Oracle wraps its job-alerts box in
+      // <job-alerts-opt-in>/<opt-in> while WORDING it as an acceptance ("I agree to receive new job
+      // opportunities…"), which the text recognizer read as `accept` — i.e. it would have been
+      // ticked. So the enclosing custom-element names travel with the report and atsConsentKind
+      // consults them FIRST. Reported, not judged, here: the rule stays in one SW-side place.
+      const containers = [];
+      for (let p = e.parentElement; p && containers.length < 6; p = p.parentElement) {
+        const n = p.tagName.toLowerCase();
+        if (n.includes("-")) containers.push(n);
+      }
       return { sel: selOf(e), checked: !!e.checked, label: labelOf(e),
+        id: e.id || null, name: e.name || null, containers,
         rowText: clean(row && row.textContent).slice(0, 220),
         // the CSS-clipped box is clicked through its LABEL (the Workday radio rule)
         labelSel: e.id ? 'label[for="' + esc(e.id) + '"]' : null };
@@ -3640,14 +3832,52 @@ function orcApplyView(s) {
 // Cookie/consent BANNERS are also out of scope — unrelated to applying, and the standing rule to
 // prefer the privacy-preserving option there is untouched.
 var ATS_CONSENT_ACCEPT_RE = /\b(i\s+(accept|agree|consent|acknowledge|have\s+read)|accept(ing)?\s+the|agree\s+to\s+the|consent\s+to\s+the)\b|\bgdpr\b|privacy\s+(notice|policy|statement)|data\s+protection|terms\s+(of\s+(use|service)|and\s+conditions)/i;
-var ATS_CONSENT_OPTIN_RE = /\b(talent\s+(community|network)|job\s+alerts?|email\s+me|notify\s+me|keep\s+me\s+(informed|posted)|marketing|newsletter|similar\s+(jobs|roles|openings)|future\s+(jobs|roles|opportunities|openings))\b/i;
+// ⚠ THE `receive … job opportunities` ARM WAS ADDED FROM A LIVE MISS (Oracle, 2026-08-19). Its
+// job-alerts box says "I agree to receive new job opportunities (see oracle.com privacy policy)" —
+// no "job alerts", no "future jobs", so none of the original arms fired and the ACCEPT arm claimed
+// it. The declared-intent check in atsConsentKind is the primary fix; this is the belt for a tenant
+// that ships the same wording without the `<opt-in>` wrapper.
+var ATS_CONSENT_OPTIN_RE = /\b(talent\s+(community|network)|job\s+alerts?|email\s+me|notify\s+me|keep\s+me\s+(informed|posted)|marketing|newsletter|similar\s+(jobs|roles|openings)|future\s+(jobs|roles|opportunities|openings))\b|\b(receive|send\s+me|text\s+me)\s+(new\s+|other\s+|additional\s+|further\s+)?(job|career|employment)\s+(opportunit|alert|posting|opening)|\bnew\s+job\s+opportunit/i;
 // A truthfulness attestation — recognized ONLY so it can be excluded on purpose rather than by
 // accident, and so a future decision about it has a name to refer to.
 var ATS_CONSENT_ATTEST_RE = /\b(i\s+certify|i\s+declare|i\s+affirm|under\s+penalty|falsif(y|ication)|to\s+the\s+best\s+of\s+my\s+knowledge)\b/i;
 // text = whatever describes the box (label, its row, the consent's own title). Most specific wins:
 // an opt-in that merely mentions "privacy" must not read as an acceptance.
-function atsConsentKind(text) {
+// ⚠ AN OPT-IN CAN BE WORDED EXACTLY LIKE AN ACCEPTANCE — so DECLARED INTENT decides first
+// (live on Oracle's own careers site, 2026-08-19). Its job-alerts box reads:
+//
+//     "I agree to receive new job opportunities (see oracle.com privacy policy)"
+//
+// which hits ATS_CONSENT_ACCEPT_RE on "i agree" and does NOT hit the opt-in wordings (it says
+// neither "job alerts" nor "future jobs"), and it even name-drops a privacy policy. Measured: it
+// classified as **accept**, i.e. it would have been TICKED — subscribing the operator to marketing
+// mail, the one thing the accept-checkbox authorisation explicitly excludes. Wording alone cannot
+// separate these two, because a marketer writes an opt-in in the language of assent.
+//
+// So `hints` (the page's own structural declaration) is consulted BEFORE any text: Oracle wraps the
+// box in `<job-alerts-opt-in>` / `<opt-in>` and ids it `job-alerts-checkbox`. A control the page
+// itself files under "opt-in" is an opt-in whatever its prose claims.
+//
+// ⚠ The remaining ambiguity is resolved toward "optin" ON PURPOSE, and the asymmetry is the reason:
+// wrongly ticking an opt-in silently signs the operator up for mail they never asked for and cannot
+// be undone from a review page, while wrongly NOT ticking an acceptance halts LOUDLY
+// (`consent-not-accepted`) and costs one operator click. Silent-and-wrong loses to loud-and-wrong.
+//
+// `hints` is optional, so every existing caller (iCIMS) behaves byte-identically.
+// ⚠ NO `\b` HERE, deliberately — and that is the difference between prose and an IDENTIFIER.
+// Hints are element names, ids and `name` attributes: `job-alerts-opt-in`, `marketingOptIn`,
+// `optInCheckbox`. camelCase has no word boundary between "marketing" and "Opt", so a
+// boundary-anchored test misses exactly the ids most likely to appear. Substring matching is safe
+// in this space because these tokens do not occur inside unrelated English words ("adoption",
+// "description" contain no "optin"), whereas in PROSE the boundaries are load-bearing — which is
+// why ATS_CONSENT_OPTIN_RE keeps them.
+var ATS_CONSENT_OPTIN_DECLARED_RE = /opt-?in|job-?alert|marketing|subscribe|newsletter/i;
+
+function atsConsentKind(text, hints) {
   const t = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+  const h = hints || {};
+  const declared = [].concat(h.containers || [], h.id ? [h.id] : [], h.name ? [h.name] : []).join(" ");
+  if (declared && ATS_CONSENT_OPTIN_DECLARED_RE.test(declared)) return "optin";
   if (!t) return null;
   if (ATS_CONSENT_OPTIN_RE.test(t)) return "optin";
   if (ATS_CONSENT_ATTEST_RE.test(t)) return "attestation";
@@ -3661,7 +3891,10 @@ function atsConsentPlan(consents) {
   const out = { tick: [], left: [] };
   for (const c of list) {
     if (!c) continue;
-    const kind = atsConsentKind([c.label, c.rowText, c.title].filter(Boolean).join(" · "));
+    // hints are FIRST-CLASS: a page that files a box under <opt-in> has told us what it is, and that
+    // outranks its prose (see atsConsentKind). Absent on iCIMS scans, so that path is unchanged.
+    const kind = atsConsentKind([c.label, c.rowText, c.title].filter(Boolean).join(" · "),
+      { containers: c.containers, id: c.id, name: c.name });
     const rec = { ...c, kind };
     if (kind === "accept" && !c.checked) out.tick.push(rec);
     else out.left.push(rec);

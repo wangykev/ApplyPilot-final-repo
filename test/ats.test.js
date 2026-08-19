@@ -2719,3 +2719,70 @@ test("gmailExtractVerificationCode: the code length is configurable", () => {
   assert.strictEqual(gmail.gmailExtractVerificationCode("Your code is 1234", { length: 4 }), "1234");
   assert.strictEqual(gmail.gmailExtractVerificationCode("Your code is 1234", { length: 6 }), null);
 });
+
+// ── An opt-in worded as an acceptance (live on Oracle's own careers site, 2026-08-19) ────
+// Its job-alerts box says "I agree to receive new job opportunities (see oracle.com privacy
+// policy)". Measured BEFORE the fix: atsConsentKind returned "accept", i.e. the box would have
+// been TICKED and the operator subscribed to marketing mail — the one thing the accept-checkbox
+// authorisation explicitly excludes. Pinned in both directions, because widening the opt-in side
+// must not start refusing genuine privacy notices.
+
+test("atsConsentKind: the Oracle job-alerts wording is an OPT-IN, not an acceptance", () => {
+  assert.strictEqual(ats.atsConsentKind("I agree to receive new job opportunities (see oracle.com privacy policy)"), "optin");
+  assert.strictEqual(ats.atsConsentKind("I agree to receive new job opportunities"), "optin");
+  // sibling phrasings a tenant might ship
+  assert.strictEqual(ats.atsConsentKind("Please send me career opportunities"), "optin");
+  assert.strictEqual(ats.atsConsentKind("I agree to receive further employment openings"), "optin");
+});
+
+test("atsConsentKind: DECLARED intent outranks the prose", () => {
+  // wording that carries no opt-in token at all, but the page files it under <opt-in>
+  const hints = { containers: ["opt-in", "job-alerts-opt-in", "form-builder"], id: "job-alerts-checkbox" };
+  assert.strictEqual(ats.atsConsentKind("I agree to receive updates", hints), "optin");
+  // and the declaration wins even over wording that looks like a privacy acceptance, because a
+  // marketer writes an opt-in in the language of assent
+  assert.strictEqual(ats.atsConsentKind("I accept the privacy policy", hints), "optin");
+  // an id alone is enough
+  assert.strictEqual(ats.atsConsentKind("I agree", { id: "job-alerts-checkbox" }), "optin");
+  assert.strictEqual(ats.atsConsentKind("I agree", { name: "marketingOptIn" }), "optin");
+});
+
+test("atsConsentKind: GENUINE acceptances still classify as accept", () => {
+  // the direction that must not regress — a missed acceptance halts the run
+  for (const t of ["I accept the Privacy Policy",
+                   "I agree to the terms and conditions",
+                   "I have read the Peraton Job Application Privacy Notice",
+                   "I acknowledge the GDPR data protection notice",
+                   "I accept the Privacy Notice governing this application"]) {
+    assert.strictEqual(ats.atsConsentKind(t), "accept", t);
+  }
+  // …and an accept box carries no opt-in container, so hints do not disturb it
+  assert.strictEqual(ats.atsConsentKind("I accept the Privacy Policy",
+    { containers: ["legal-disclaimer", "form-builder"], id: "legal-disclaimer-checkbox" }), "accept");
+});
+
+test("atsConsentKind: attestations are still excluded on purpose", () => {
+  assert.strictEqual(ats.atsConsentKind("I certify the information given is accurate"), "attestation");
+  assert.strictEqual(ats.atsConsentKind("I declare under penalty of perjury"), "attestation");
+});
+
+test("atsConsentKind: hints are OPTIONAL — the iCIMS call path is unchanged", () => {
+  assert.strictEqual(ats.atsConsentKind("I accept the Privacy Policy", undefined), "accept");
+  assert.strictEqual(ats.atsConsentKind("I accept the Privacy Policy", null), "accept");
+  assert.strictEqual(ats.atsConsentKind(""), null);
+  assert.strictEqual(ats.atsConsentKind(null), null);
+  assert.strictEqual(ats.atsConsentKind("Are you still enrolled?"), null);
+});
+
+test("atsConsentPlan: the Oracle job-alerts box is LEFT, the privacy box is TICKED", () => {
+  const plan = ats.atsConsentPlan([
+    { sel: "#job-alerts-checkbox", id: "job-alerts-checkbox", containers: ["opt-in", "job-alerts-opt-in"],
+      checked: false, label: "I agree to receive new job opportunities (see oracle.com privacy policy)" },
+    { sel: "#legal-disclaimer-checkbox", id: "legal-disclaimer-checkbox", containers: ["legal-disclaimer"],
+      checked: false, label: "I agree with the terms and conditions" },
+  ]);
+  assert.strictEqual(plan.tick.length, 1);
+  assert.strictEqual(plan.tick[0].sel, "#legal-disclaimer-checkbox");
+  assert.ok(plan.left.some((c) => c.sel === "#job-alerts-checkbox" && c.kind === "optin"),
+    "the job-alerts box must be left untouched and named as an opt-in");
+});

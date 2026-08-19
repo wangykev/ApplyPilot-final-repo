@@ -5168,3 +5168,145 @@ Two structural consequences:
 The popup loads credentials from **`data/credentials.json`**, not `data/.credentials.json` —
 `chrome.runtime.getURL` 404s on a dotfile. A repo carrying only the dotfile has a popup whose "Load
 credentials" silently cannot work.
+
+---
+
+## 2026-08-19 (f) — ORC: the scan, live-verified on a SECOND tenant (Oracle's own careers site)
+
+Tenant: **Oracle** — `eeho.fa.us2.oraclecloud.com`, site `jobsearch`, job `334325` (OCI SWE Intern), on an
+operator-verified session. Read-only; nothing filled, nothing submitted.
+
+### Section scoping was wrong TWICE — the rule is now "every visible section"
+
+| attempt | rule | why it failed |
+|---|---|---|
+| recon (b) | `apply-flow-section[n]`, n = the URL's section number | Baylor served **5** sections for 4 steps (index 0 an empty shell); Oracle serves **4** for **3** |
+| recon (c) | "the single visible section" | ⚠ on Oracle **TWO are visible at once** — index 0 is the résumé-import banner, index 1 the real step-1 content |
+| **now** | **every section with a non-zero rect**, no index arithmetic | holds on both tenants |
+
+A scan scoped to `secs.findIndex(vis)` returned **one** field (the résumé file input) on a 15-field page.
+
+### ⚠ `region2` = STATE, `region1` = COUNTY — and the obvious reading is wrong
+
+Direct evidence, stars included: `region2-43` → **"State *"**, `region1-45` → **"County *"**. The numbering
+is NOT hierarchical, so mapping `region1`→state would file the applicant's state as a county. This is
+exactly why it was left unmapped rather than guessed.
+
+The address block is a **geo-hierarchy cascade** — `country`, `city`, `region2`, `postalCode`, `region1` all
+carry `input-row--has-picker geo-hier…` and are comboboxes, so fill parent-first. Oracle also has
+`addressLine3` where Baylor had only 1–2.
+
+### The option-group question — the blocker, solved
+
+```
+div.input-row.input-row--radiogroup
+├─ form-element-label            → "Ethnicity"                      THE QUESTION
+│    └─ label.input-row__label   → "Ethnicity"   (NO `for` attribute)
+└─ div.input-row__control-item
+   ├─ input#dq-option-4
+   └─ label.apply-flow-input-checkbox[for="dq-option-4"] → "I am Hispanic or Latino."   THE OPTION
+```
+
+**The discriminator is the `for` attribute**: the question's label has none, each option's has one.
+Verified against all three groups on the page:
+
+| question | type | n | note |
+|---|---|---|---|
+| "Ethnicity" | checkbox | **1** | ⚠ a radiogroup row can hold ONE box — Workday's "2+ = a group" heuristic does not apply |
+| "Select the races you identify with." | checkbox | 5 | ⚠ **explicitly MULTI-select** |
+| "Do you have a disability?" | radio | 3 | shared `name` — the only variant that has one |
+
+⚠ **`--radiogroup` does NOT mean pick-one**, settled by that race wording. Arity comes from the input TYPE
+(`radio` ⇒ pick one, `checkbox` ⇒ group), never the class name. Groups are separated by ROW, not by name —
+the checkbox variants have `name: null`.
+
+### ⚠ The combobox listbox is a GRID of ROWS — a `[role=option]` scrape finds NOTHING
+
+```
+input[role=combobox].cx-select-input      aria-controls="<inputId>-listbox"
+  └─ div.cx-select__listbox
+       └─ div#<inputId>-listbox[role="grid"].cx-select__list
+            └─ div[role="row"] × N        ← THE OPTIONS
+```
+
+Measured on `title-24`: 17 rows (DR., De, Dipl. Ing., …, Mr., Mrs., Ms., Professor(1), …). Same family as US
+Bank's `promptOption` and iCIMS' `<li role=option>` — every platform invents its own, so the option selector
+is always a per-platform finding.
+
+- **The listbox does not exist until opened**, and a plain `.click()` DOES open it. An earlier probe read
+  `aria-expanded:"false"` only because it read SYNCHRONOUSLY in the same call. *A synchronous read straight
+  after a click measures the past.*
+- **⚠ The listbox is NOT portaled** — it sits inside the field's own `div.input-row`. Good news for the
+  timeline: selecting a combobox option inside `timeline-form-inline` is therefore **not** a click outside
+  the white box, so entry (c)'s discard hazard does not fire for picks. (Not yet confirmed for the
+  timeline's own comboboxes specifically.)
+
+### A date CAN have a day after all
+
+Recon (c) recorded "month + year, NO day" from the timeline and concluded iCIMS' default-day approximation
+was unnecessary here. Half right: this tenant's `earliestAvailableDate` is **month + day + year**
+(`month-`/`day-`/`year-earliestAvailableDate-5`, all comboboxes). Date arity is **variable** and must be
+discovered from which `<part>-<name>-<N>` ids exist — never assumed.
+
+### Oracle's layout: 3 steps, 5 repeating families
+
+| § | blocks | note |
+|---|---|---|
+| 0 | *(banner)* | "Import your profile from LinkedIn, Indeed, or your resume" — a file input, visible alongside §1 |
+| 1 | Contact Information · Address | 18 controls, 15 emitted |
+| 2 | Education · Experience · Licenses and Certificates · Skills · Supporting Documents and URLs · Miscellaneous Documents | add buttons: Education / Experience / License / Skill / Another Link |
+| 3 | Extra Information · Application Questions · Diversity · Veteran (US) · Disability · E-Signature | |
+
+Confirmed generic across both tenants: `name="phoneNumber"` is the **dial-code picker** while the real
+number input has **no id and no name**; `attachment-upload` is shared by several file inputs; `siteLink-1`
+AND `siteLink-2` both present, confirming the ordinal family.
+
+⚠ `US-STANDARD-ORA_GENDER-STANDARD` is **required** here and **optional** on Baylor — so an ORC self-ID
+field can be either, and the EEO rule must branch on the live `isRequired`, never on a platform assumption.
+
+### ⚠⚠ An OPT-IN worded as an ACCEPTANCE (a live bug, now fixed)
+
+Oracle's job-alerts box reads:
+
+> "I agree to receive new job opportunities (see oracle.com privacy policy)"
+
+Measured: `atsConsentKind` returned **"accept"** — it would have been **TICKED**, subscribing the operator to
+marketing mail, which the accept-checkbox authorisation explicitly excludes. It hits "i agree", misses every
+opt-in wording, and even name-drops a privacy policy.
+
+**Wording alone cannot separate these**, because a marketer writes an opt-in in the language of assent. The
+page declares the truth structurally: `<job-alerts-opt-in>` / `<opt-in>` wrappers, id `job-alerts-checkbox`.
+So `atsConsentKind(text, hints)` consults DECLARED intent first, with a `receive … job opportunities` arm
+added to the wording regex as a belt.
+
+⚠ The declared test is **boundary-free** (`/opt-?in|job-?alert|marketing|…/i`) while the prose test keeps
+`\b`: hints are identifiers (`marketingOptIn`), and camelCase has no word boundary between "marketing" and
+"Opt", so a boundary-anchored test misses exactly the ids most likely to appear.
+
+### The scan, live-verified — and the bug that only a live run could find
+
+Step 1 emitted **15 fields**: 7 `text`, 7 `select`, 1 `file_upload`. Labels correct with the required star
+stripped, `isRequired` correct, prefilled values captured (`email=wangykev@gmail.com`,
+`country="United States"`), and the hidden preference flags plus the hidden "Pronoun" flexfield correctly
+absent.
+
+⚠ It also **silently dropped the required phone-number input**. The guard that exists to skip the textarea
+CLONE (empty id AND empty name) also matches ORC's real phone input, which is likewise anonymous — so a
+required field vanished while the bundle looked clean. `type=tel` is now admitted and keyed
+`phoneNumber--number`; re-measured, the fix rescues exactly that one field and nothing else.
+
+Two of the repo's own guards then caught two more, which is what they exist for:
+
+- the self-containment test flagged `atsInjScan` for referencing a shim — **in a comment**. Exactly the trap
+  already documented for the iCIMS lockstep test: `toString()` includes comments, so prose *about* a helper
+  trips a grep *for* it.
+- the "no branch treats a radio or checkbox as a plain input" test rejected the general loop's skip line.
+  ORC files a lone checkbox in `div.input-row--checkbox`, so that needed its own pass before the general
+  loop could skip radios and checkboxes wholesale — the Greenhouse 12-phantom-field rule, enforced
+  structurally rather than from memory.
+
+### Still open (all actuation, not scanning)
+
+The ORC combobox needs its own open / read / commit path (the `div[role=row]` grid above); the geo cascade
+needs parent-first ordering; whether a combobox accepts a typed value or strictly requires a pick; and the
+timeline entry handler. The scan itself is done.
