@@ -252,6 +252,53 @@ const ATS_STATIC_MAPS = {
   // map would hand it a duplicate of the first. The repeat is DETECTED from the page rather than
   // declared here — see `repeatIndex` in atsAssignEntryIndexes — so only the first entry the form
   // renders is mapped, on any tenant, whether or not its blocks happen to repeat.
+  // ── ORACLE RECRUITING CLOUD (observed 2026-08-19; Baylor + Oracle's own careers site) ──────────
+  // Keys are the control's `name` after atsMapKey (render counter stripped, self-ID reduced to its
+  // ORA_ token). ONLY platform names belong here — per-tenant flexfields (`300000016979265`,
+  // `namInformation15`) and `dq-option-*` screening questions go to the LABEL ladder, which is why
+  // they are absent rather than forgotten.
+  oracle: {
+    "firstName": { path: "personal_info.first_name" },
+    "lastName": { path: "personal_info.last_name" },
+    "email": { path: "personal_info.email" },
+    // ORC's "Known As" is the preferred/known-as name (Baylor marks it REQUIRED). Falls through to
+    // the label ladder when the operator has no preferred name, which is the right behaviour.
+    "knownAs": { path: "personal_info.preferred_first_name" },
+    // ⚠⚠ `phoneNumber` IS THE DIAL-CODE PICKER, NOT THE NUMBER — measured, and the single most
+    // misleading name on an ORC form. `id="country-codes-dropdownphoneNumber"`, `role=combobox`,
+    // label "Country code", value "+1". The control that actually wants the number has NO id and NO
+    // name at all (only `aria-label="Phone Number"` + `.phone-row__input`), so it cannot be mapped
+    // here and needs a scan-side synthetic name. Mapping this to the phone NUMBER would type the
+    // number into the dial-code list — the same class of error as Greenhouse's `country`, which is
+    // why it takes the same `kind:"dial"` + tiered ladder.
+    "phoneNumber": { kind: "dial", path: "personal_info.country_phone_code", altPath: "personal_info.dialing_code" },
+    // Address. `country` is the ADDRESS country (a tiered profile array), not the phone's.
+    "country": { path: "personal_info.country" },
+    "addressLine1": { path: "personal_info.address_line_1" },
+    "addressLine2": { path: "personal_info.address_line_2" },
+    "city": { path: "personal_info.city" },
+    "postalCode": { path: "personal_info.postal_code" },
+    // ⚠ `region1` / `region2` ARE DELIBERATELY UNMAPPED. Both are required comboboxes and their
+    // labels did not render in recon, so which one is State/Province vs County is UNKNOWN — and it
+    // almost certainly varies by `country`. Mapping the wrong one files the applicant's state as a
+    // county, i.e. a confidently wrong value, which is worse than reaching review. Resolve from the
+    // live label first, then map. Left here as a named gap so it is not mistaken for an oversight.
+    // E-signature (§4). The Workday signature rule: a signature NAME is the candidate's own name and
+    // fills deterministically. ORC showed no signature DATE on the tenants observed.
+    "fullName": { compose: "full_name" },
+    // Self-ID, reduced by atsMapKey to Oracle's own ORA_ vocabulary so the map is locale-neutral.
+    // containment:true for the same reason Greenhouse's block carries it — each tenant words the
+    // long options its own way ("No, I do not have a disability" ⊂ "… and have not had one in the
+    // past"), and a unique prefix hit commits at the flagged containment tier.
+    // ⚠ These are STATED values only; an unstated one stays blank per the EEO rule (every self-ID
+    // field on the observed tenants was OPTIONAL, so unstated ⇒ blank, no AI).
+    "ORA_GENDER": { path: "self_identification.gender", containment: true },
+    "ORA_ETHNICITY": { path: "self_identification.race_ethnicity", containment: true },
+    "ORA_VETERAN_STATUS": { path: "self_identification.veteran_status", containment: true },
+    "ORA_DISABILITY_STATUS": { path: "self_identification.disability_status", containment: true },
+    // ⚠ Race/ethnicity is ALSO rendered as a checkbox GROUP whose boxes have NO `name` at all, so
+    // that shape cannot be reached by this map and needs the scan's group handling first.
+  },
   icims: {
     // ── The "Create a login" block. THIS ACCOUNT IS CREATED BY THE SUBMISSION ──────────────
     // Not a sign-in form and not a profile edit: on this class of application the account is created
@@ -412,8 +459,31 @@ function atsWebsiteValue(profile, type) {
 // multi-entry repeating sections are still open work (docs/status.md).
 function atsMapKey(ats, fieldName) {
   const n = String(fieldName == null ? "" : fieldName);
-  if (ats !== "icims") return n;
-  return n.replace(/^-?\d+_/, "");
+  if (ats === "icims") return n.replace(/^-?\d+_/, "");
+  // ── ORACLE: strip the render counter, then reduce a self-ID name to its ORA_ token ────────
+  // ⚠ THIS IS THE **MAP-LOOKUP** KEY ONLY, NOT A DURABLE/SUBMIT KEY. The two differ for ORC and
+  // conflating them would be a bug: this function is allowed to be LOSSY because the map contains
+  // only known platform names, so a collapsed per-tenant key simply fails to match and falls to the
+  // label ladder — which is the correct destination for it anyway. A submit key must instead stay
+  // UNIQUE per field, and for ORC that is deliberately still unsettled (see below).
+  //
+  // 1. A trailing `-<digits>` is the render-assignment counter. Text and combobox `name`s are clean
+  //    (`lastName`, `US-STANDARD-ORA_GENDER-STANDARD`) but a RADIO GROUP's shared name carries it
+  //    (`US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12`), so without this the disability group never
+  //    matches the map entry its gender/veteran siblings do. Observed 2026-08-19.
+  //    ⚠ Safe on every other observed name because the digits there are NOT hyphen-separated:
+  //    `region1`, `region2`, `addressLine1`, `namInformation15` are all untouched.
+  //    `siteLink-1` → `siteLink` is INTENDED (the digit is an entry ordinal; the family is the map
+  //    key, exactly as iCIMS treats its ordinals).
+  // 2. Self-ID names are `<JURISDICTION>-STANDARD-ORA_<THING>-STANDARD`. `ORA_<THING>` is Oracle's
+  //    stable vocabulary; the wrapper is jurisdiction + variant, so keying on the whole string would
+  //    silently stop matching outside the US. Reduce to the token and the map becomes locale-neutral.
+  if (ats === "oracle") {
+    const bare = n.replace(/-\d+$/, "");
+    const ora = /(ORA_[A-Z0-9_]+)/.exec(bare);
+    return ora ? ora[1] : bare;
+  }
+  return n;
 }
 
 // ── REPEATING SECTIONS ARE SCOPED TO THEIR OWN ENTRY (operator, 2026-08-16) ──────────────

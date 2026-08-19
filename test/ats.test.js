@@ -2498,3 +2498,123 @@ test("atsDecoyKind: the name match is word-anchored, so a substring cannot claim
     assert.strictEqual(ats.atsDecoyKind({ fieldName: n }), "honeypot", n);
   }
 });
+
+// ── ORC: the map-lookup key ─────────────────────────────────────────────────────────────
+// atsMapKey is the MAP key, deliberately lossy; a durable/submit key is a different thing and
+// for ORC is still unsettled (whether render counters renumber across visits is unverified).
+
+test("atsMapKey oracle: the render counter is stripped so a RADIO GROUP matches the map", () => {
+  // the whole reason this branch exists — a radio group's shared `name` carries the counter while
+  // its combobox siblings' names are clean, so without the strip the disability group never matches
+  // the entry gender/veteran do. Observed live 2026-08-19.
+  assert.strictEqual(ats.atsMapKey("oracle", "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12"), "ORA_DISABILITY_STATUS");
+  assert.strictEqual(ats.atsMapKey("oracle", "US-STANDARD-ORA_GENDER-STANDARD"), "ORA_GENDER");
+  assert.strictEqual(ats.atsMapKey("oracle", "US-STANDARD-ORA_GENDER-STANDARD-10"), "ORA_GENDER");
+  assert.strictEqual(ats.atsMapKey("oracle", "US-STANDARD-ORA_VETERAN_STATUS-STANDARD-11"), "ORA_VETERAN_STATUS");
+});
+
+test("atsMapKey oracle: the self-ID reduction is LOCALE-NEUTRAL", () => {
+  // `US-STANDARD-` is a jurisdiction prefix; keying on the whole string would silently stop
+  // matching outside the US while looking like it worked.
+  assert.strictEqual(ats.atsMapKey("oracle", "CA-STANDARD-ORA_GENDER-STANDARD-4"), "ORA_GENDER");
+  assert.strictEqual(ats.atsMapKey("oracle", "UK-LEGISLATIVE-ORA_DISABILITY_STATUS-VARIANT-9"), "ORA_DISABILITY_STATUS");
+});
+
+test("atsMapKey oracle: names whose digits are NOT hyphen-separated are untouched", () => {
+  // the guard that makes the strip safe — these all end in digits and must survive intact
+  assert.strictEqual(ats.atsMapKey("oracle", "region1"), "region1");
+  assert.strictEqual(ats.atsMapKey("oracle", "region2"), "region2");
+  assert.strictEqual(ats.atsMapKey("oracle", "addressLine1"), "addressLine1");
+  assert.strictEqual(ats.atsMapKey("oracle", "addressLine2"), "addressLine2");
+  assert.strictEqual(ats.atsMapKey("oracle", "namInformation15"), "namInformation15");
+});
+
+test("atsMapKey oracle: clean platform names pass through unchanged", () => {
+  for (const n of ["firstName", "lastName", "email", "knownAs", "phoneNumber", "country",
+                   "city", "postalCode", "fullName", "employerName", "jobTitle", "startDate"]) {
+    assert.strictEqual(ats.atsMapKey("oracle", n), n, n);
+  }
+});
+
+test("atsMapKey oracle: an entry ordinal collapses to its FAMILY, on purpose", () => {
+  // siteLink-1 / siteLink-2 are repeating link entries; the map keys the family and the ordinal is
+  // handled as an entry index — the same treatment iCIMS gives its ordinals.
+  assert.strictEqual(ats.atsMapKey("oracle", "siteLink-1"), "siteLink");
+  assert.strictEqual(ats.atsMapKey("oracle", "siteLink-2"), "siteLink");
+});
+
+test("atsMapKey oracle: a per-tenant screening key collapses, and that is HARMLESS here", () => {
+  // dq-option-* and 300000… are per-tenant questions that belong to the LABEL ladder, never the
+  // map. Collapsing them means they fail to match a map entry — which routes them exactly where
+  // they should go. ⚠ This is why atsMapKey must not be reused as a submit key: these would collide.
+  assert.strictEqual(ats.atsMapKey("oracle", "dq-option-300000016979250"), "dq-option");
+  assert.strictEqual(ats.atsMapKey("oracle", "dq-option-4"), "dq-option");
+  assert.ok(!Object.prototype.hasOwnProperty.call(ats.ATS_STATIC_MAPS.oracle, "dq-option"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(ats.ATS_STATIC_MAPS.oracle, "300000016979265"));
+});
+
+test("atsMapKey: the OTHER families are byte-identical", () => {
+  // the strip must not leak — greenhouse/lever/ashby names ending in digits are common
+  assert.strictEqual(ats.atsMapKey("greenhouse", "question_12"), "question_12");
+  assert.strictEqual(ats.atsMapKey("lever", "cards[abc][field-1]"), "cards[abc][field-1]");
+  assert.strictEqual(ats.atsMapKey("ashby", "_systemfield_name-3"), "_systemfield_name-3");
+  assert.strictEqual(ats.atsMapKey("icims", "-1_PersonProfileFields.AddressCity"), "PersonProfileFields.AddressCity");
+});
+
+// ── ORC: the static map's deliberate contents and deliberate GAPS ───────────────────────
+test("ATS_STATIC_MAPS.oracle: phoneNumber is the DIAL CODE, not the phone number", () => {
+  // the most misleading name on an ORC form. Mapping it to the number would type the number into
+  // the country-code list; `kind:"dial"` + the tiered ladder is the same fix Greenhouse's `country`
+  // needed.
+  const m = ats.ATS_STATIC_MAPS.oracle["phoneNumber"];
+  assert.strictEqual(m.kind, "dial");
+  assert.strictEqual(m.path, "personal_info.country_phone_code");
+  assert.ok(!/phone_number$/.test(m.path), "must NOT point at the phone number");
+});
+
+test("ATS_STATIC_MAPS.oracle: region1/region2 are UNMAPPED on purpose", () => {
+  // Both are required comboboxes whose labels did not render in recon, so which is State/Province
+  // vs County is unknown and probably country-dependent. Mapping the wrong one files a state as a
+  // county — a confidently wrong value, worse than reaching review. This test is the reminder that
+  // the gap is intentional, so a future change has to delete the test on purpose.
+  assert.ok(!Object.prototype.hasOwnProperty.call(ats.ATS_STATIC_MAPS.oracle, "region1"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(ats.ATS_STATIC_MAPS.oracle, "region2"));
+});
+
+test("ATS_STATIC_MAPS.oracle: the address + name block points at real profile paths", () => {
+  const m = ats.ATS_STATIC_MAPS.oracle;
+  assert.strictEqual(m["firstName"].path, "personal_info.first_name");
+  assert.strictEqual(m["lastName"].path, "personal_info.last_name");
+  assert.strictEqual(m["email"].path, "personal_info.email");
+  assert.strictEqual(m["addressLine1"].path, "personal_info.address_line_1");
+  assert.strictEqual(m["city"].path, "personal_info.city");
+  assert.strictEqual(m["postalCode"].path, "personal_info.postal_code");
+  assert.strictEqual(m["country"].path, "personal_info.country");
+  assert.strictEqual(m["fullName"].compose, "full_name");   // the e-signature name
+});
+
+test("ATS_STATIC_MAPS.oracle: self-ID is keyed on the ORA_ token and carries containment", () => {
+  const m = ats.ATS_STATIC_MAPS.oracle;
+  for (const [k, p] of [["ORA_GENDER", "self_identification.gender"],
+                        ["ORA_VETERAN_STATUS", "self_identification.veteran_status"],
+                        ["ORA_DISABILITY_STATUS", "self_identification.disability_status"]]) {
+    assert.strictEqual(m[k].path, p, k);
+    assert.strictEqual(m[k].containment, true, k + " needs containment for long-form option wording");
+  }
+});
+
+test("ATS_STATIC_MAPS.oracle: every mapped path resolves against a real profile shape", () => {
+  // catches a typo'd path, which would silently look like "the profile has no value" forever.
+  const profile = {
+    personal_info: { first_name: "A", last_name: "B", email: "e@x.com", preferred_first_name: "P",
+      country_phone_code: ["United States of America (+1)"], dialing_code: "+1",
+      country: ["United States of America"], address_line_1: "1 St", address_line_2: "",
+      city: "C", postal_code: "12345" },
+    self_identification: { gender: "Male", race_ethnicity: "Asian", veteran_status: "No", disability_status: "No" },
+  };
+  const get = (p) => p.split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
+  for (const [key, spec] of Object.entries(ats.ATS_STATIC_MAPS.oracle)) {
+    if (spec.compose || spec.kind === "resume" || spec.kind === "skip" || spec.candidates) continue;
+    assert.notStrictEqual(get(spec.path), undefined, key + " → " + spec.path + " does not exist on the profile");
+  }
+});
