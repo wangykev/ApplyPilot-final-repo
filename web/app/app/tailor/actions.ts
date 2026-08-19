@@ -1,7 +1,7 @@
 "use server";
 
 import { createClient } from "@/lib/supabase/server";
-import { isSupabaseConfigured } from "@/lib/env";
+import { isSupabaseConfigured, IS_HOSTED } from "@/lib/env";
 import { callLLM } from "@/lib/llm";
 import { loadUserData } from "@/lib/user-data";
 import { buildTailorPrompt, parseTailorReply, type TailorMode, type TailoredResume } from "@/lib/tailor";
@@ -225,7 +225,12 @@ async function runTectonic(tex: string): Promise<{ ok: true; pdf: Buffer } | { o
     const { code, err } = await run;
     if (code !== 0) {
       if (/ENOENT/.test(err)) {
-        return { ok: false, error: "LaTeX engine not found — set TECTONIC_PATH in web/.env.local (see .env.example)." };
+        return {
+          ok: false,
+          error: IS_HOSTED
+            ? "PDF compile isn't available on the hosted site — use Quick PDF, or download the .tex and compile it locally."
+            : "LaTeX engine not found — set TECTONIC_PATH in web/.env.local (see .env.example).",
+        };
       }
       return { ok: false, error: "LaTeX compile failed: " + err.slice(-400) };
     }

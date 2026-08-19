@@ -25,6 +25,19 @@ export const DEV_PREVIEW =
   process.env.NODE_ENV !== "production" &&
   process.env.NEXT_PUBLIC_DEV_PREVIEW === "1";
 
+/**
+ * True on a hosted serverless deploy — Vercel sets VERCEL=1 on every deployment.
+ *
+ * Two features shell out to NATIVE BINARIES (tectonic for LaTeX→PDF, LibreOffice
+ * for .docx→PDF) and neither can live in a serverless function bundle. On a local
+ * machine the fix really is "set the engine's path"; on a hosted deploy that advice
+ * is MISLEADING — no env var can make the binary appear. So each message is worded
+ * for WHERE IT IS RUNNING, rather than shipping one string that is wrong in one of
+ * the two places. Everything else in the app is unaffected: the AI tailoring itself
+ * still runs hosted, only the PDF COMPILE step is unavailable.
+ */
+export const IS_HOSTED = process.env.VERCEL === "1";
+
 /** Server-only. Throws if read in the browser. */
 export function serviceRoleKey(): string | undefined {
   if (typeof window !== "undefined") {

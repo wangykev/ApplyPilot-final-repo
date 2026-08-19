@@ -18,10 +18,11 @@
     "https://api.anthropic.com/*",
     "https://generativelanguage.googleapis.com/*",
     "https://api.openai.com/*",
-    "http://localhost/*"
+    "http://localhost/*",
+    "https://applypilot.vercel.app/*"
   ],
   "externally_connectable": {
-    "matches": ["http://localhost/*", "http://127.0.0.1/*"]
+    "matches": ["http://localhost/*", "http://127.0.0.1/*", "https://applypilot.vercel.app/*"]
   },
   "action": {
     "default_popup": "popup.html"
