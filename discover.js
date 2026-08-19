@@ -88,7 +88,15 @@ const DISCOVER_SIMPLIFY_URL =
 // id — it is not a credential and not ours; the endpoints simply 400 without it.
 const DISCOVER_Z2S_USERNAME = "zero2sudo";
 const DISCOVER_IG_APP_ID = "936619743392459";
-const DISCOVER_IG_ORIGIN = "https://www.instagram.com/";
+// ⚠ NOT instagram.com's home page — `robots.txt` DELIBERATELY.
+//
+// The tab exists for exactly ONE reason: to give our `fetch` an instagram.com ORIGIN so
+// the operator's session cookie rides along. We never read the DOM. Navigating to the
+// home page therefore booted Instagram's ENTIRE web app (and then waited out a 2s SPA
+// hydration beat) to obtain a property that any document on the origin already has.
+// A tiny public text/plain document is the same origin, the same cookies and the same
+// `fetch`, for a fraction of the load. Measured: ~5-8s → under a second.
+const DISCOVER_IG_ORIGIN_DOC = "https://www.instagram.com/robots.txt";
 
 const DISCOVER_DEFAULTS = {
   // The recency WINDOW. No longer an operator knob (2026-07-30: the "Posted within N
@@ -2131,7 +2139,11 @@ async function withDiscoverTab(url, opts, work) {
   const tabId = tab.id;
   try {
     await waitTabComplete(tabId, o.loadTimeoutMs || 25000);
-    await discoverDelay(o.settleMs || 2000); // SPA hydration beat — these are all React apps
+    // SPA hydration beat — the board pages are all React apps. ⚠ `!= null`, not `||`:
+    // an explicit `settleMs: 0` is a real answer ("nothing here hydrates, don't wait"),
+    // and `0 || 2000` silently turned that into the full 2s. No existing caller passes
+    // 0, so this only ever grants a request that used to be ignored.
+    await discoverDelay(o.settleMs != null ? o.settleMs : 2000);
     return await work(tabId);
   } finally {
     try { await new Promise((r) => chrome.tabs.remove(tabId, () => { void chrome.runtime.lastError; r(); })); }
@@ -2358,8 +2370,13 @@ async function discoverFromZero2Sudo(opts) {
   discoverProgress("Checking @" + DISCOVER_Z2S_USERNAME + "'s Instagram stories");
   let read;
   try {
-    read = await withDiscoverTab(DISCOVER_IG_ORIGIN, o, (tabId) =>
-      discoverReadPage(tabId, scrapeInstagramStories, [DISCOVER_Z2S_USERNAME, DISCOVER_IG_APP_ID])
+    // settleMs 0 — the sibling call sites wait 2s for a React list to hydrate; there is
+    // nothing to hydrate here and nothing in the DOM we read, so the wait would be pure
+    // latency. (withDiscoverTab had to be taught that 0 means zero — see its comment.)
+    read = await withDiscoverTab(
+      DISCOVER_IG_ORIGIN_DOC,
+      { background: o.background !== false, settleMs: 0 },
+      (tabId) => discoverReadPage(tabId, scrapeInstagramStories, [DISCOVER_Z2S_USERNAME, DISCOVER_IG_APP_ID])
     );
   } catch (e) {
     return { jobs: [], note: "Couldn't read @" + DISCOVER_Z2S_USERNAME + "'s stories: " + String((e && e.message) || e), scanned: 0 };

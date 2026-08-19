@@ -17,9 +17,10 @@ discover branch).
 Branch `zero2sudo-source-queue-tabs`. 1589 unit tests green, website typecheck + `next build` clean, 315 web
 tests green. What is **not** yet proven, because it needs a loaded extension and a real sweep:
 
-- the driver's **tab orchestration** — `withDiscoverTab` on instagram.com, the CDP fallback (no host
-  permission for that origin), and the async injected reader resolving through `awaitPromise`. The read
-  itself WAS verified by hand against the live endpoints; what is unverified is it running under a sweep.
+- the driver's **tab orchestration** — `withDiscoverTab`, the CDP fallback (no host permission for that
+  origin), and the async injected reader resolving through `awaitPromise`. Verified by hand: the live
+  endpoints, and the `robots.txt` origin trick (`text/plain`, `document.cookie` readable, both endpoints
+  200). Unverified: all of it running under an actual Discover run.
 - **`fillMissingDescriptions` on story links** — 16 employer postings across 13 different ATS platforms is a
   harsher input than the boards ever give it. Expect some to yield no description; they queue anyway.
 - the **per-source tabs** with real overlap in them (needs a sweep where two sources find the same job).

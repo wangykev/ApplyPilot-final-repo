@@ -70,6 +70,21 @@ Each item carries `taken_at`, `expiring_at`, and — the only field that matters
   keyword-INDEPENDENT, so a blank keyword box doesn't disable it (`KEYWORD_FREE` in DiscoverPanel).
 - **No host permission** — instagram.com isn't in the manifest, so `discoverReadPage` falls through to CDP.
   The injected reader is `async`; `cdpEval` passes `awaitPromise: true`, which is what makes that work.
+- **⚠ THE TAB IS ONLY THERE FOR THE ORIGIN — so it opens `robots.txt`, not instagram.com (2026-08-19).**
+  Nothing in the DOM is read; the tab exists solely so `fetch` is SAME-ORIGIN and the session cookie rides
+  along. The first cut navigated to the home page, which booted Instagram's entire web app and then waited
+  out `withDiscoverTab`'s 2s React-hydration beat — several seconds to obtain a property any document on the
+  origin already has. `DISCOVER_IG_ORIGIN_DOC` is a tiny public `text/plain` doc instead, with `settleMs: 0`.
+  **Verified live, because it is not obvious that a non-HTML document works:** `contentType "text/plain"`,
+  `origin https://www.instagram.com`, `document.cookie` readable (the signed-in check needs it), and BOTH
+  authenticated endpoints returning 200. ~5-8s → under a second.
+  ⚠ This also required fixing `withDiscoverTab`: it read `o.settleMs || 2000`, so an explicit **0 silently
+  became the full 2s**. Now `!= null`. No existing caller passes 0, so nothing else moved.
+- **The alternative — a bare SW `fetch` with NO tab — needs `instagram.com` in `host_permissions`** (the
+  Simplify pattern). Rejected as the more invasive option: adding a host permission to an INSTALLED
+  extension makes Chrome disable it until the user re-approves, and whether MV3 SW `credentials:"include"`
+  attaches IG's cookies is version-sensitive enough to need proving first. The tab costs under a second now,
+  which is the cheaper trade.
 - **⚠ Reading marks the stories SEEN** — the operator appears in his viewer list. Stated in the UI hint.
 - **Coverage, measured, is the real limit:** of those 16 links only **3** were on an ATS ApplyPilot can fill
   (2 Greenhouse + 1 Workday); the rest were Oracle Recruiting Cloud, Phenom-fronted employer sites,

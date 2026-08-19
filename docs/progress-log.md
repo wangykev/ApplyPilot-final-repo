@@ -5625,7 +5625,33 @@ checked directly, **none redirect to a vanity-domain Workday**, so `atsPortalAts
 either. Ingestion was the easy 20% of this feature. Oracle Recruiting Cloud is the highest-value next
 adapter (3 of 16, and ubiquitous in the defense/industrials postings he favours).
 
+### Follow-up the same day: the tab was doing far more than it needed to
+
+Operator: *"does it need to physically open the tab, or just request to open it — the least invasive, the
+better."* Asking that exposed real waste. The tab exists for exactly ONE reason: to give the `fetch` an
+instagram.com ORIGIN so the session cookie rides along. Nothing in the DOM is ever read. But the first cut
+navigated to the HOME PAGE, which boots Instagram's entire web app, and then sat through
+`withDiscoverTab`'s 2s React-hydration beat — several seconds spent acquiring a property that *any*
+document on the origin already has.
+
+Now `robots.txt` with `settleMs: 0`. Verified live rather than assumed, because "a non-HTML document still
+behaves like a page" is exactly the kind of thing that is usually true and occasionally isn't:
+`contentType "text/plain"`, `origin https://www.instagram.com`, **`document.cookie` readable** (the
+signed-in check depends on it), and both authenticated endpoints returning **200**. Roughly 5-8s → under a
+second.
+
+That surfaced a latent bug in `withDiscoverTab`: it read `o.settleMs || 2000`, so an explicit **`0` silently
+became the full 2s**. Now `!= null`. No existing caller passes 0, so this only grants a request that used to
+be ignored.
+
+The genuinely tab-free alternative — a bare service-worker `fetch`, the Simplify pattern — was considered
+and **declined as the MORE invasive option**: it needs `instagram.com` in `host_permissions`, and adding a
+host permission to an already-installed extension makes Chrome **disable it until the user re-approves**.
+Whether MV3's SW `credentials:"include"` attaches IG's cookies is also version-sensitive enough that it
+would need proving first. A sub-second tab is the cheaper trade.
+
 **1589 unit tests**, all green (11 new: shim unwrap incl. token-stripping, `foundOn` merge across both dedup
 passes, same-source repeats left alone). Website typecheck clean, `next build` clean, 315 web tests green
-including the `discover.js` ↔ `web/lib/discover.ts` lockstep cross-load. ⚠ **Not yet live-verified** — the
-driver's tab orchestration needs a real sweep in a loaded extension.
+including the `discover.js` ↔ `web/lib/discover.ts` lockstep cross-load. ⚠ **The full sweep is still not
+live-verified** — the endpoint reads and the origin trick both are, by hand; what remains unproven is the
+driver running under an actual Discover run in a loaded extension.

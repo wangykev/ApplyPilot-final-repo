@@ -1036,6 +1036,12 @@ login** invariant holds (not signed in ⇒ note + skip).
   logs, so carrying `e=` there is the leak class `redactSecrets` exists for.
 - **⚠ READING A STORY IS OBSERVABLE** — it marks them seen and the operator appears in his viewer list. Stated
   in the UI hint, not buried. It is the one discovery source that is not purely passive.
+- **THE TAB EXISTS ONLY TO SUPPLY THE ORIGIN, so it opens `robots.txt`, not instagram.com.** Nothing in the
+  DOM is read — the tab is there so `fetch` is same-origin and the cookie rides along. Navigating to the home
+  page booted the whole Instagram app plus a 2s hydration beat for a property any document on the origin
+  already has (~5-8s → under a second; verified live that a `text/plain` doc still gives `document.cookie` +
+  authenticated 200s). A bare SW `fetch` with no tab at all would need `instagram.com` in `host_permissions`,
+  which **disables an installed extension until the user re-approves** — the more invasive trade, declined.
 - **Coverage is the real constraint, not ingestion** (measured on the same 16): only **3** were on an ATS
   ApplyPilot can fill (2 Greenhouse + 1 Workday). The rest were Oracle Recruiting Cloud, Phenom-fronted
   employer sites, SmartRecruiters and SAP — and **none were vanity-domain Workday**, so `atsPortalAts` does
