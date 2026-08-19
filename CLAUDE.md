@@ -966,9 +966,70 @@ rest.** What is settled, and what must not be re-litigated:
   bundled JS — the shape that made a session token a job description on iCIMS. Prefer JSON-LD → REST →
   rendered text, and keep `redactSecrets` on the assignment.
 
-**Open (all need the gate passed):** does a verification CODE follow the email; is the form one page or a
-wizard (`<apply-flow-header>` hints at a progress rail); JET vs Knockout-bound `<select>` for choices;
-whether field ids are stable platform ids or per-tenant; repeating-section shape; captcha on submit.
+### Through the gate — the form's shape (recon 2, 2026-08-19; Baylor + Nokia)
+
+- **NO VERIFICATION CODE IS NEEDED TO REACH THE FORM.** Measured: email → `Next` → straight to
+  `…/apply/section/1`. The gate means its words literally; the code is for **returning** to a draft. So the
+  pre-form stage is just **Apply click → email (+ terms if present) → Next → form**, and **Gmail
+  auto-verify is NOT on the critical path**. ⚠ The terms checkbox is **per-tenant optional** (Nokia has one,
+  Baylor none) — tick it when present, never require it. The honeypot's WIDTH also varies by tenant
+  (179 vs 200), so no size constant may ever enter the test.
+- **⚠⚠ THE ACTIVE-SECTION SIGNAL IS THE EXACT INVERSE OF THE HONEYPOT SIGNAL — neither may become *the*
+  rule.** The form is a **4-step wizard** (`…/apply/section/<n>`) and **all four steps sit in the DOM at
+  once**. Measured on the inactive ones while on step 1: `hidden` = false, **`aria-hidden` = `"false"`**,
+  `display` = `block` — every declared signal says they are live — and only the **bounding rect** is 0×0.
+  > On the **GATE**, geometry lies and declared intent tells the truth (the honeypot is 179×38 yet
+  > `aria-hidden="true"`). On the **FORM**, declared intent lies and geometry tells the truth. Each signal
+  > is authoritative precisely where the other fails.
+  **So: never scan the document. Scope to the active section**, keyed primarily off the URL's section number
+  (`apply-flow-section[n]` — index 0 is an empty shell, so it lines up), with geometry as the cross-check.
+  A document-wide scan on step 1 returns all 39 fields of all four steps.
+- **⚠⚠ `name` IS THE DURABLE KEY; `id` CARRIES A VOLATILE COUNTER.** Every control is `id="<name>-<N>"` with
+  N a render-**assignment** counter (`country-19` numbers below `email-27` while appearing after it). Key
+  bundles on `name`; treat `id` as an in-visit DOM address only. Same lesson as iCIMS' per-visit entry ids
+  reached by another route, and the same consequence: an `id`-keyed bundle fails every field on the submit
+  visit. ⚠ `label[for=…]` and `aria-controls` both point at the volatile id, so resolve both **live** —
+  never reconstruct them from a remembered value.
+- **Three id families, one mappable.** Platform names (`firstName`, `lastName`, `knownAs`, `email`,
+  `country`, `addressLine1/2`, `postalCode`, `city`, `region1/2`, `title`, `fullName`) → the static map.
+  Per-tenant flexfields (`300000016979265`, `namInformation15`) → **label ladder only**. Standard self-ID
+  (`US-STANDARD-ORA_GENDER-STANDARD`, `…ORA_VETERAN_STATUS…`, `…ORA_DISABILITY_STATUS…`, radios suffixed
+  `-ORA_PER_Y`/`-ORA_PER_N`) → mappable, and must obey the EEO rules. `dq-option-<id>` are ORC's
+  **disqualification** (screening) checkboxes — ⚠ some carry a bare small integer, so a `dq-option-*` key is
+  not automatically durable.
+- **⚠⚠ `name="phoneNumber"` IS THE DIAL-CODE PICKER, NOT THE NUMBER.** The number input has **no id and no
+  name** — only `aria-label="Phone Number"` + `class="phone-row__input"` — so a name-keyed scan maps the
+  number onto the country-code combobox and leaves the real field unkeyed. Address it by class/aria-label.
+- **⚠ THREE FILE INPUTS SHARE `name="attachment-upload"`**, told apart ONLY by their wrapper
+  (`<resume-upload-button>` / `<cover-letter-upload-button>` / `<attachment-upload-button>`). So `name` is
+  **not unique** on an ORC form, and résumé-vs-cover-letter is a wrapper decision. All three report
+  `required` — a widget artifact, not the tenant's rule; do not trust it.
+- **The choice widget is `input[role="combobox"].cx-select-input` with `aria-controls="<id>-listbox"`, and
+  that aria-controls resolves to the REAL listbox** (unlike Workday's `source`) — so scope every option
+  scrape to it, never a page-wide `[role=option]` sweep. `aria-expanded` exists but the close still gates on
+  options being **GONE**. Plain text rows are `input.input-row__control` with a Knockout `data-bind`;
+  combobox inputs have none.
+- **⚠ THE WHOLE ADDRESS BLOCK IS SUGGESTION-DRIVEN.** `addressLine1` (classed `--auto-su`), `postalCode`,
+  `city`, `region1` **and** `region2` are all comboboxes; only `addressLine2` is free text. ⚠ **`region1` vs
+  `region2` is UNRESOLVED — do not guess**: both required, and which is State/Province vs County almost
+  certainly varies by country, so mapping the wrong one files a state as a county. Resolve from the live
+  label. ⚠ `country` arrived **prefilled "United States" AND classed `cx-select-input--invalid`** — a value
+  present is not a value accepted, so read-back must not treat non-empty as verified.
+- **Labels are a proper `label[for]`** (`label.input-row__label` inside `div.input-row`), so the house
+  `labelFor` helper is already correct. Required is marked **three** ways — `aria-required`, the label class
+  `input-row__label--required`, and a `<span class="input-row__label--required-star">` — detect all.
+- **`<form-builder>` is the generic renderer**, which is *why* one scan can be generic: a per-tenant question
+  and a platform field are structurally identical. Group a field by its `<apply-flow-block-title>`.
+  ⚠ `<address-form-v2>` is **versioned** — expect a v1 on older tenants.
+- **⚠ The renderer is heavy enough to break a harness:** `Runtime.evaluate` containing an in-page
+  `setTimeout` await **timed out at 45s twice** across the section-1 transition — page timers were not
+  firing. Reads must be synchronous with waits taken OUTSIDE the page, and a section transition needs real
+  pacing (measure into `fill-speed-log.md` once a fill runs).
+
+**Open:** §2–§4 field detail; §3 Employment/Education repeating-entry container (0 inputs until built);
+whether a combobox accepts a typed value or strictly requires picking a suggestion; `region1`/`region2`
+semantics; whether ids renumber across a section transition; captcha on submit and
+`<apply-flow-submission-checklist>` semantics; a second tenant's form (the gate has two, the form has one).
 
 ## Multi-ATS — Greenhouse / Lever / Ashby (`ats.js`; fill + gated submit, live-verified 2026-07-31)
 

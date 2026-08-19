@@ -4671,3 +4671,203 @@ Workday rule applies: session death is **behavioural**, not statically detectabl
 4. Field identity: stable platform ids, or per-tenant generated ones?
 5. Repeating sections (experience / education) — entry container and ordinal shape.
 6. Is there a captcha on the real submit? (The honeypot suggests bot defence is at least partly passive.)
+
+---
+
+## 2026-08-19 (b) — ORC: through the gate, and the apply form's real shape
+
+Second recon pass. Tenants: **Nokia** (`fa-evmr-saasfaprod1.fa.ocs`, site `CX_1`) and **Baylor**
+(`ejof.fa.us2`, site `BaylorCareers`) — two unrelated customers, which is what makes the shared findings
+genericity evidence rather than one tenant's configuration. The gate was passed on Baylor with the stored
+plus-addressed test login (operator-authorized); the form was **read only** and **nothing was submitted**.
+
+### The gate is a stable ORC product surface, with ONE per-tenant variable
+
+Identical on both tenants: `<quick-email-verification-form>`, `input#primary-email-<n>[name=primary-email]`,
+the honeypot, `<session-expire>`, `<apply-flow-header>`, `<apply-flow-fixer>`, `<ai-assistant-container>`,
+`<oda-summary>`.
+
+| | Nokia | Baylor |
+|---|---|---|
+| honeypot rect | 179 × 38 | **200 × 38** |
+| terms checkbox (`legal-disclaimer-checkbox`) | present, required | **ABSENT** |
+| visible gate inputs | 4 | 3 |
+
+⚠ **The honeypot's WIDTH varies between tenants** — non-zero on both, so geometry fails either way, but it
+also means no size constant can ever be part of the test. ⚠ **The terms checkbox is optional per tenant**,
+so the pre-form stage must not require one (and must still tick it when present).
+
+### ⚠⚠ NO VERIFICATION CODE IS NEEDED TO REACH THE FORM
+
+Measured: email → `Next` → straight to `…/job/<id>/apply/section/1`. **No code screen, no email round-trip.**
+The gate's own words are literal — *"You don't need to have an account"* — and the code exists for
+**returning** to a draft, not for entering the flow.
+
+This is a large simplification and it should not be designed around: the ORC pre-form stage is **Apply click
+→ email (+ terms if present) → Next → form**. Gmail auto-verify is **not on the critical path** (keep it
+available for the resume-a-draft case, which is unrecon'd).
+
+### The form is a 4-step wizard, and ALL FOUR STEPS ARE IN THE DOM AT ONCE
+
+Route `…/apply/section/<n>`. The page announces `"…application, step 1 of 4"` and
+`<apply-flow-pagination>` reads `"Back 1 2 3 4 Next"`. Five `<apply-flow-section>` elements — index 0 is an
+empty shell, so **`apply-flow-section[n]` lines up with the URL's section number**.
+
+| § | blocks | inputs |
+|---|---|---|
+| 1 | Contact Information · Address | 17 |
+| 2 | Application Questions · Required Documents · Required Professional References | 9 |
+| 3 | Employment and Education History | 0 (built on demand) |
+| 4 | Diversity Information · Veteran Information · Disability Information · E-Signature | 12 |
+
+### ⚠⚠ THE ACTIVE-SECTION SIGNAL IS THE INVERSE OF THE HONEYPOT SIGNAL
+
+Measured on all five sections while sitting on step 1:
+
+| signal | inactive sections report | usable? |
+|---|---|---|
+| `hidden` attribute | `false` | ✗ |
+| `aria-hidden` | **`"false"`** — on every one | ✗ |
+| `getComputedStyle().display` | `block` | ✗ |
+| **bounding rect** | **0 × 0** (only §1 non-zero) | **✓** |
+
+So a document-wide scan on step 1 sees **all 39 inputs across all four steps**, and every declared-intent
+signal says they are live. This is the exact mirror of the gate:
+
+> **On the GATE, geometry lies and declared intent tells the truth (the honeypot is 179×38 yet
+> `aria-hidden="true"`). On the FORM, declared intent lies and geometry tells the truth (`aria-hidden="false"`
+> on sections that are 0×0).** Each signal is authoritative precisely where the other fails, so neither may
+> be adopted as *the* rule.
+
+**Preferred primary: the URL's section number** → `apply-flow-section[n]`, because it is declared rather than
+measured. Geometry is the cross-check. Never scan the whole document.
+
+### ⚠⚠ FIELD IDENTITY: `name` IS STABLE, `id` CARRIES A VOLATILE COUNTER
+
+Every control is `id="<name>-<N>"` where **N is a render-assignment counter**, not a DOM position and not
+stable: `lastName-21`, `firstName-22`, `country-19`, `postalCode-31`, `US-STANDARD-ORA_GENDER-STANDARD-10`.
+Note `country-19` numbers *below* `email-27` while appearing *after* it in the DOM — assignment order, not
+document order.
+
+**So: the durable key is `name`; the `id` is only an in-visit DOM address.** Same lesson as iCIMS' per-visit
+entry ids (`atsSubmitKey`), reached by a different route — and the consequence is the same: a bundle keyed on
+`id` would fail every field on the submit visit.
+
+⚠ `label[for=...]` and `aria-controls` both point at the **volatile id**, so both must be resolved live at
+scan/actuation time and never reconstructed from a remembered value.
+
+### Three id families, and only one is mappable
+
+| family | example | route |
+|---|---|---|
+| **platform names** | `firstName` `lastName` `middleNames` `suffix` `knownAs` `email` `country` `addressLine1/2` `postalCode` `city` `region1/2` `title` `fullName` | the static map |
+| **per-tenant flexfields** | `300000016979265`, `300000010623019`, `namInformation15` | **label ladder only** |
+| **standard EEO / self-ID** | `US-STANDARD-ORA_GENDER-STANDARD`, `US-STANDARD-ORA_VETERAN_STATUS-STANDARD`, `US-STANDARD-ORA_DISABILITY_STATUS-STANDARD` (radios suffixed `-ORA_PER_Y` / `-ORA_PER_N`) | mappable, and must obey the EEO rules |
+
+The EEO vocabulary is clean and stable (`ORA_<THING>_STATUS`), so these are recognizable rather than
+guessable — which matters because an unrecognized required EEO field is what reaches the AI. `US-STANDARD-`
+is a jurisdiction prefix, so expect other locales.
+
+`dq-option-<id>` checkboxes are **disqualification questions** (ORC's own term) — screening. ⚠ Two shapes
+observed on one page: `dq-option-300000016979250` (a real question id) and `dq-option-4` (a bare small
+integer, i.e. **volatile**), so a `dq-option-*` key is not automatically durable.
+
+### ⚠⚠ `name="phoneNumber"` IS THE COUNTRY CODE, NOT THE NUMBER
+
+The phone control is a composite, and its naming is actively misleading:
+
+| control | identity | value |
+|---|---|---|
+| dial-code picker | `id="country-codes-dropdownphoneNumber"` **`name="phoneNumber"`**, `role=combobox`, label "Country code" | `+1` |
+| the actual number | **NO id, NO name** — `aria-label="Phone Number"`, `class="input-row__control phone-row__input"`, `aria-required="true"` | empty |
+
+A scan keying on `name` therefore maps the phone *number* onto the *dial-code picker*, and the field that
+actually wants the number has no key at all. The number must be addressed by `.phone-row__input` /
+its `aria-label`. This is the "required platform field whose label is a bare noun" hazard one step worse:
+here the misleading name belongs to a *different control*.
+
+### ⚠ THREE FILE INPUTS SHARE ONE `name`
+
+`attachment-upload-2/3/4` all carry `name="attachment-upload"`, distinguished **only** by their wrapper
+custom element: `<resume-upload-button>`, `<cover-letter-upload-button>`, `<attachment-upload-button>`. So
+`name` is **not unique** on an ORC form, and résumé vs cover letter vs other attachment is a *wrapper*
+decision. All three also report `required`, which is a widget artifact rather than the tenant's rule — do
+not trust it (a required cover letter would be unusual).
+
+### The choice widget: `input[role=combobox].cx-select-input` + its own listbox
+
+```
+<input role="combobox" class="cx-select-input" aria-expanded="false"
+       aria-controls="<volatile-id>-listbox" autocomplete="none">
+```
+
+- **`aria-controls` resolves to the REAL options container** — unlike Workday's `source`, where it pointed at
+  a `promptAriaInstruction` node. So the Workday rule (scope the option scrape to the trigger's own listbox,
+  never a page-wide `[role=option]` sweep) is directly implementable here.
+- `aria-expanded` is present and starts `"false"` — but per the standing rule the close must still be gated
+  on the options being **gone**, not on this attribute.
+- The row container encodes the widget: `div.input-row.input-row--text` (expect `--select` etc.).
+- Plain text fields are `input.input-row__control` with a Knockout `data-bind`; combobox inputs have
+  **no `data-bind`** — a useful secondary tell, though `role`/class is the primary one.
+
+### ⚠ THE WHOLE ADDRESS BLOCK IS SUGGESTION-DRIVEN, NOT FREE TEXT
+
+`addressLine1`, `postalCode`, `city`, `region1` **and** `region2` are all `role=combobox` —
+`addressLine1` additionally classed `cx-select-input--auto-su` (auto-suggest). So ORC drives the address
+through a lookup service: type a street, pick a suggestion, dependents populate. Only `addressLine2` is a
+plain text row.
+
+⚠ **`region1` vs `region2` is unresolved and must not be guessed** — both required, both comboboxes, and
+their labels did not render in this pass. Which one is State/Province vs County almost certainly varies by
+`country`, and mapping the wrong one files the applicant's state as a county. Resolve from the live label.
+
+⚠ **`country` was PREFILLED `"United States"` and simultaneously classed `cx-select-input--invalid`.** A
+value present does not mean a value accepted — so an ORC read-back must not treat non-empty as verified.
+
+### Labels and required markers (the house helper already works)
+
+`<label for="<volatile-id>" class="input-row__label input-row__label--required">Last Name</label>` — a
+proper `label[for]`, so the existing `labelFor` helper is correct. An earlier pass reported "no labels" only
+because it searched `.input-field-container`; the real row is `div.input-row`.
+
+Required is marked **three** ways, and per the standing rule detect all of them (over-flagging is the safe
+direction): `aria-required="true"` on the input, the label class `input-row__label--required`, and a
+`<span class="input-row__label--required-star">` inside the label.
+
+### The framework elements worth keying on
+
+`<form-builder>` is the **generic renderer** — the reason a per-tenant question and a platform field look
+structurally identical, and therefore the reason one scan can be generic. Around it:
+`<apply-flow-section>` → `<apply-flow-block>` + `<apply-flow-block-title>` (the section/block titles that
+give a field its group), `<name-form>`, `<address-form-v2>` (⚠ **versioned** — a v1 likely exists on older
+tenants), `<candidate-links>` (`siteLink-<n>`, `type=url`), `<apply-flow-pagination>`,
+`<apply-flow-submission-checklist>` (the submit gate), `<cx-notifications>` (the error channel).
+
+Also present and **not** application fields: `<indeed-import-handler>`, `<awli-confirm>` (Apply With
+LinkedIn), `<profile-selection-overlay>`, and `oj-text-area#oda-work-summary-text-area` (the AI assistant's
+box, which carries `required="true"`).
+
+### The gate email flows into the form
+
+`email` arrives prefilled with whatever the gate was given (`class="input-row__control
+communication-channel"`). So it is an already-answered field on arrival — the `sweepAlreadyFilled` /
+already-filled path, not something to re-actuate.
+
+### Timing: the renderer is heavy, and it broke the recon harness twice
+
+`Runtime.evaluate` containing in-page `await new Promise(r => setTimeout(r, …))` **timed out at 45s, twice**,
+around the section-1 transition — the page's main thread was busy enough that page timers did not fire. Two
+consequences: recon reads must be **synchronous** with waits taken outside the page, and this predicts a
+genuine pacing need for the fill (a section transition is not instant). Not yet measured properly — that
+belongs in `fill-speed-log.md` once a real fill runs.
+
+### Still open
+
+1. §2–§4 field detail (screening questions, documents, references, EEO wording, e-signature).
+2. §3 Employment/Education — 0 inputs until built: the repeating-entry container and its add control.
+3. Whether a combobox accepts a typed value directly or strictly requires picking a suggestion.
+4. `region1` vs `region2` semantics per country.
+5. Section transition mechanics (`Next` → does §2 mount fresh, and do ids renumber?).
+6. Captcha on the real submit; `<apply-flow-submission-checklist>` semantics.
+7. Whether a second tenant's platform names match exactly (Baylor is one data point for the form; the gate
+   is two).
