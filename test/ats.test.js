@@ -2786,3 +2786,30 @@ test("atsConsentPlan: the Oracle job-alerts box is LEFT, the privacy box is TICK
   assert.ok(plan.left.some((c) => c.sel === "#job-alerts-checkbox" && c.kind === "optin"),
     "the job-alerts box must be left untouched and named as an opt-in");
 });
+
+// ── no injected fn may call ANOTHER injected fn (2026-08-19) ─────────────────────────────
+// The existing self-containment test greps each injected fn for the SHIM names (atsLib/atsFd/…),
+// which is necessary but not sufficient: an injected fn is stringified and evaluated in the page, so
+// a reference to any other top-level function is equally undefined there.
+//
+// Found the hard way while writing atsInjOrcPick — it called a top-level atsInjOrcCommitRow, split
+// out "so the two commit paths cannot drift". Every unit test passed and the reference would have
+// thrown ReferenceError on the first live pick. Shared logic between injected fns has to be an inner
+// closure (or duplicated as a marked LOCKSTEP pair), never a call.
+test("injected fns never reference another atsInj* function", () => {
+  const names = Object.keys(ats).filter((k) => /^atsInj/.test(k) && typeof ats[k] === "function");
+  assert.ok(names.length > 15, "expected the injected-fn family, found " + names.length);
+  for (const name of names) {
+    // strip comments first — prose that NAMES a sibling is documentation, not a call. Same reason the
+    // iCIMS lockstep test strips them.
+    const src = String(ats[name])
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+    for (const other of names) {
+      if (other === name) continue;
+      assert.ok(!new RegExp("\\b" + other + "\\s*\\(").test(src),
+        name + " CALLS " + other + " — an injected fn is evaluated in the page, where that name does " +
+        "not exist. Inline it as a closure instead.");
+    }
+  }
+});

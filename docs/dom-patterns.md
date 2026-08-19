@@ -5310,3 +5310,106 @@ Two of the repo's own guards then caught two more, which is what they exist for:
 The ORC combobox needs its own open / read / commit path (the `div[role=row]` grid above); the geo cascade
 needs parent-first ordering; whether a combobox accepts a typed value or strictly requires a pick; and the
 timeline entry handler. The scan itself is done.
+
+---
+
+## 2026-08-19 (g) — ORC: the typeahead actuation recipe, and the cleanup that destroyed the block
+
+Live on Oracle (`eeho.fa.us2`, job 334325), operator-verified session. **Step 1 was filled end to end
+once** — every required field held a value — and then a bad cleanup wiped the address. Both halves are
+recorded, because the failure is the more useful half.
+
+### Every dropdown on step 1 is a TYPEAHEAD (operator), and the recipe has six clauses
+
+Each was measured, not assumed:
+
+1. **The search fires on KEY events, not on `input`.** A native-setter write + `input` sets the value and
+   even opens the listbox, but no search runs and the box sits **empty**. Typing character-by-character
+   with `keydown`/`input`/`keyup` returns rows. Knockout takes the *value* from `input`; the *search* is
+   bound to keys. (This is why an earlier probe saw an open, empty list and read it as "no options".)
+2. **Options are `div[role="row"]` inside `div#<id>-listbox[role="grid"]`** — a `[role=option]` scrape
+   finds nothing. The listbox does not exist until the widget opens, and it is **not portaled**: it lives
+   inside the field's own `div.input-row`.
+3. **A bare `.click()` on a row does NOT commit; a full pointer sequence does**
+   (`pointerdown→mousedown→pointerup→mouseup→click` with real `clientX/Y`) — independently arriving at
+   exactly `robustClick`'s first strategy.
+4. **Type the FULL option text before committing.** The widget re-syncs its input to whatever was typed,
+   so committing after a partial query ("United" for "United States") leaves the fragment behind and the
+   selection does not stick. Measured both ways.
+5. **Read and commit must be ONE evaluation.** The listbox closes between two separate CDP calls — a read
+   in one call and a click in the next finds zero rows.
+6. **A read straight after a click returns the PREVIOUS value.** `country` read `"United"` immediately
+   after committing `"United States"`, and `"United States"` a round-trip later. Poll SW-side; never
+   read once.
+
+`cx-select-input--invalid` is the widget's own "I hold text I have not accepted" marker, so it is a
+**negative verify signal**: a commit that leaves it set must not be reported as filled. ⚠ A prefilled
+`country` carried it from first load, so a non-empty value never meant an accepted one.
+
+### The geo cascade: five independent typeaheads with FIVE DIFFERENT vocabularies
+
+Nothing auto-populates from anything else — committing postal did not fill city/state/county, and
+committing city did not fill state/county. Each needs its own type-and-pick, and each speaks its own
+language:
+
+| field | vocabulary | example rows |
+|---|---|---|
+| `country` | full name | `United States` · ⚠ also `United States Minor Outlying Islands` — a **prefix collision**, so exact match only |
+| `postalCode` | the bare zip, and rows are composites | `32312, Tallahassee, Leon, FL` — **exactly one row** |
+| `city` | composite `City, County, ST` | `Tallahassee, Jefferson, FL` **and** `Tallahassee, Leon, FL` |
+| `region2` = **State** | ⚠ the **2-letter code** | `Florida` → *"No results were found."*; `FL` → 1 row |
+| `region1` = **County** | composite `County, ST` | `Leon, FL` · `Leon, TX` |
+| dial code | ⚠ `+<code> (<Country>)` | `+1 (United States)` · `+1 (United States Minor Outlying Islands)` |
+
+Three consequences worth keeping:
+
+- **City is genuinely AMBIGUOUS from the profile alone** — Tallahassee exists in Jefferson *and* Leon
+  county, and the profile stores no county. The **postal row disambiguates it**: `32312, Tallahassee,
+  Leon, FL` is unique, and parsing it yields the county and state needed to pick the right city row and
+  to answer County at all. That is the form's own authoritative geo data keyed on a stated fact (the
+  zip), not an inference — but it should still be flagged, because the operator never stated a county.
+- **State needs `REGION_ABBREV`**, which already exists in lib.js and is already on the `atsLib` shim for
+  Lever's location handler. Candidate ladder `["Florida", "FL"]`: tier 1 misses, tier 2 hits.
+- **The dial picker needs NO new code.** `atsDialMatch` strips the code and the parens and requires code
+  equality **and** name-prefix agreement, so it is order-agnostic: verified in Node that
+  `atsDialMatch(["United States of America (+1)", …], ["+1 (United States)", "+1 (United States Minor
+  Outlying Islands)"])` returns `{index:0, tier:"dial-code+name"}`. The two-independent-signals design
+  transfers from Greenhouse's `"<Country> +<code>"` for free.
+
+### ⚠⚠ NEVER PRESS ESCAPE, AND NEVER CLEAR THE PARENT
+
+Step 1 was fully filled: `Wang` / `Kevin` / `wangykev@gmail.com` / `+1 (United States)` / `8506660266` /
+`United States` / `715 Middlebrooks Circle` / `Tallahassee` / `FL` / `32312` / `Leon`, with **zero** empty
+required fields.
+
+Then a "tidy up" pass sent `Escape` to each picker and clicked `document.body`. Result:
+
+- **Escape REVERTS an ORC geo picker** rather than merely closing it, and
+- **clearing `country` UNMOUNTED its whole dependent block** — `addressLine1/2/3`, `city`, `region1`,
+  `region2`, `postalCode` all vanished from the DOM, leaving `country` alone and `--invalid`.
+
+So `country` is the parent that controls **mounting** (not value population), and the address field SET is
+conditional on it — a scan taken before country commits will not even see those fields, which is a
+cascade-pass concern, not a scan concern.
+
+⚠ **And it did not recover from synthetic events.** Repeated clear→retype→pointer-commit cycles got
+`country` to *display* `United States` while staying `--invalid`, with the block never remounting; the
+page reported *"The Country field is required."* Restoring it needs a real user gesture or a reload.
+
+**The standing rule already said this and was not followed:** *"Sequential cleanup — don't over-engineer
+per-field close. Moving to the next field blurs the prior widget and dismisses its listbox for free. We
+burned time on explicit Escape/click-outside closes before realizing the sequence handles teardown."*
+On ORC an explicit close is not merely unnecessary, it is **destructive**. `atsInjOrcPick` therefore
+provides no Escape path at all.
+
+⚠ Note the tension to respect: lingering options are a real hazard elsewhere (Workday's identical-rect
+listboxes stray the next field's open-click). Here the lists are **not portaled**, so a lingering list is
+scoped to its own row and cannot intercept another field's click — which is what makes "just move focus"
+safe on this platform specifically.
+
+### Also observed
+
+- `"Enter a valid number."` appeared against the phone after the number was written — the dial-code and
+  number halves may need to be committed in a particular order, or the number wants a different format.
+  Unresolved; worth a look before trusting the phone composite.
+- `title` (Mr./Ms./…) is optional here and the profile stores no salutation, so it is correctly left blank.

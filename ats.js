@@ -3593,6 +3593,128 @@ function icimsAuthView(s) {
   return "none";
 }
 
+// ── ORC's TYPEAHEAD PICKER: type → poll → pointer-commit, ALL IN ONE CALL (2026-08-19) ───
+// Every clause below is a measured live finding, not a precaution. Verified on Oracle's own careers
+// site (`eeho.fa.us2`, job 334325) against country / city / state / county / postal / dial-code.
+//
+//   1. THE SEARCH FIRES ON KEY EVENTS, NOT ON `input`. A native-setter write plus an `input` event
+//      sets the value and even opens the listbox, but no search runs and the box sits EMPTY. Typing
+//      character-by-character with keydown/input/keyup returns rows. (Knockout takes the value from
+//      `input`; the SEARCH is bound to keys.)
+//   2. THE OPTIONS ARE `div[role="row"]` INSIDE `div#<id>-listbox[role="grid"]`. A `[role=option]`
+//      scrape finds NOTHING. The listbox does not exist until the widget opens, and it is NOT
+//      portaled — it lives inside the field's own `div.input-row`.
+//   3. A BARE `.click()` ON A ROW DOES NOT COMMIT. A full pointer sequence does
+//      (pointerdown→mousedown→pointerup→mouseup→click with real clientX/Y) — i.e. exactly
+//      robustClick's first strategy, arrived at independently here.
+//   4. TYPE THE FULL OPTION TEXT BEFORE COMMITTING. The widget re-syncs its input to whatever was
+//      typed, so committing after a partial query ("United" for "United States") leaves the typed
+//      fragment behind and the selection does not stick.
+//   5. READ AND COMMIT MUST HAPPEN IN ONE EVALUATION. Measured: the listbox closes between two
+//      separate CDP calls, so a read in one call and a click in the next finds zero rows.
+//   6. ⚠ NEVER PRESS ESCAPE TO CLOSE ONE. On ORC's geo pickers Escape REVERTS the field — and
+//      clearing the parent (`country`) UNMOUNTS its whole dependent block (addressLine1-3, city,
+//      region1/2, postalCode vanish from the DOM). Let focus movement close the list, which is the
+//      standing Workday rule ("sequential cleanup — don't over-engineer per-field close"); this
+//      function deliberately provides no Escape path.
+//
+// `wantTexts` is a LIST so a composite row can be matched whole ("Tallahassee, Leon, FL"), and the
+// caller supplies it — the ambiguity rules stay SW-side. Commits ONLY on exactly one match: two hits
+// is not a confident answer and returns `ambiguous` with the rows, never a guess.
+// Returns the rows it saw either way, so a miss is diagnosable without a second page contact.
+async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  const wants = (Array.isArray(wantTexts) ? wantTexts : [wantTexts]).map(norm).filter(Boolean);
+  if (!wants.length) return { ok: false, error: "no-target-text" };
+
+  // clear, then type with KEY events so the search actually runs (finding 1)
+  el.focus();
+  setter.call(el, "");
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  for (const ch of String(query == null ? "" : query)) {
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
+    setter.call(el, el.value + ch);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
+  }
+
+  // ⚠ INLINED, not a call to the top-level twin: this function is stringified and evaluated in the
+  // page, so any free identifier is undefined there. Splitting it out "so the paths cannot drift"
+  // would have thrown ReferenceError on the first live pick.
+  const commitRow = (row, wantText, sawRows) => {
+    const r = row.getBoundingClientRect();
+    const o = { bubbles: true, cancelable: true, view: window,
+      clientX: Math.round(r.left + r.width / 2), clientY: Math.round(r.top + r.height / 2) };
+    for (const ty of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      row.dispatchEvent(new MouseEvent(ty, o));
+    }
+    return { ok: true, committed: wantText, rows: sawRows };
+  };
+
+  const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
+  const readRows = () => {
+    const lb = lbId ? document.getElementById(lbId) : null;
+    return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
+  };
+  const deadline = Date.now() + (budgetMs || 8000);
+  let lastRows = [];
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    const rows = readRows();
+    if (!rows.length) {
+      // the widget's own terminal "nothing here" — stop early rather than burning the budget
+      const box = document.querySelector(".cx-select__listbox");
+      if (box && /no results/i.test(t(box))) return { ok: false, error: "no-results", query, rows: [] };
+      continue;
+    }
+    lastRows = rows.map(t);
+    const hits = rows.filter((r) => wants.indexOf(norm(t(r))) !== -1);
+    if (hits.length > 1) return { ok: false, error: "ambiguous", query, rows: lastRows, matched: hits.length };
+    if (hits.length === 1) {
+      const row = hits[0];
+      const want = t(row);
+      // finding 4: make the typed text agree with the option before committing
+      if (norm(el.value) !== norm(want)) {
+        setter.call(el, "");
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        for (const ch of want) {
+          el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
+          setter.call(el, el.value + ch);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
+        }
+        // re-resolve the row: retyping re-renders the list
+        await new Promise((r) => setTimeout(r, 400));
+        const again = readRows().filter((r) => norm(t(r)) === norm(want));
+        if (again.length === 1) return commitRow(again[0], want, lastRows);
+        // fall through and try again on the next tick rather than clicking a stale node
+        continue;
+      }
+      return commitRow(row, want, lastRows);
+    }
+  }
+  return { ok: false, error: "no-match", query, rows: lastRows };
+}
+
+// Read an ORC picker back. ⚠ THE VALUE ALONE IS NOT PROOF: the widget keeps typed text that it has
+// not accepted as a selection, and marks that state with `cx-select-input--invalid` (measured — a
+// prefilled "United States" carried it from first load). So `invalid` is a NEGATIVE verify signal and
+// a commit that leaves it set must not be reported as filled.
+// ⚠ It is also LAGGY: a read in the same evaluation as the click returns the PREVIOUS value, so the
+// caller must poll this SW-side rather than reading once.
+function atsInjOrcReadPicker(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  return { ok: true, value: el.value || null,
+    invalid: /cx-select-input--invalid/.test(String(el.className || "")),
+    expanded: el.getAttribute("aria-expanded") === "true",
+    openRows: [...document.querySelectorAll(".cx-select__listbox [role=\"row\"]")].length };
+}
+
 // ── PRESS AN ORC FLOW BUTTON BY CAPTION (injected; 2026-08-19) ───────────────────────────
 // ⚠ atsInjClickAuthSubmit is NOT reusable here, and the reason is measured: ORC's "Next" and
 // "Verify" are plain `<button>`s with **no id** and no `type="submit"`, so that helper's selector
@@ -6744,7 +6866,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
-    atsInjOrcClickButton, atsInjOrcFillPin,
+    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
