@@ -5638,3 +5638,40 @@ fill 106.3s for 50 field(s) across 3 step(s) — 6 to review
   widget, worth a pacing round if it matters.
 - Generic-tenant work: only one ORC tenant has been driven end to end. Baylor was recon'd (5 sections /
   4 steps) and every count-based assumption was removed because of it, but it has not been run.
+
+## 2026-08-20 — ORC: the SUBMIT stage (rehearsal live-verified end to end)
+
+The rehearsal refused with `oracle-not-implemented`. That guard had stood since the first ORC commit
+and says to delete it "in the same commit that adds the scan"; the fill run's twin went when the scan
+landed and this one did not, because the submit path needed more than a scan. `runAtsSubmitRun` was
+written when every ATS here was single-page, and it still was: one `driveAtsPageFill`, then the gate.
+Replaying an approved ORC bundle into step 1 and opening the gate would have verified a third of an
+application and submitted the rest unseen.
+
+**Built:** the advance extracted into `orcAdvanceAfterStep` and shared by both walks (guard 1, the
+disabled-Next wait, guard 2, the monotone predicate, the settle) with a test pinning that guard 1
+exists exactly once in the file; `orcAwaitBlocksPopulated` shared the same way; a replay walk that
+unions every step's results and verifies once; a refusal (`replay-incomplete`) on any stop other than
+`reached-final-step`, ahead of both the verify and the click; the ORC pre-form ahead of the form wait;
+and `reportOnly`, which reads the repeating-entry tiles instead of rebuilding them.
+
+**Live result (wangykev+26):** gate cleared — stored login written, code fetched from Gmail, entered,
+and the honeypot excluded (`1 decoy field(s) present and EXCLUDED [aria-hidden+untabbable]`). Walk
+reached step 3 of 3. Step 1 replayed 15 fields; step 2's report-only pass found `Experience: 3
+entries` / `Education: 1 entry` still on the form and reported them without touching them. Bundle
+blockers 0. **2 verify failures, so the gate refused — correctly, and nothing was clicked.**
+
+1. **`phoneNumber` (the dial-code picker) — FIXED.** `rec.after` stored the picker's read-back `"+1"`
+   while the option reads `"+1 (United States)"`, and `rec.after` is what becomes the bundle's
+   `current_value` and therefore the replay's candidate. The ladder refused it, correctly: +1 is the
+   US *and* Canada. Fixed by recording the OPTION, not the read-back — the ambiguity is real and the
+   ladder must not be loosened. Generalises to any widget whose display differs from its option text.
+2. **The ex-Oracle screening question — OPEN.** `read null` after 2 presses over 8s (34.7s on the
+   field), on the replay's own fill pass. Hypothesis, untested: ORC renders an option group two ways
+   (radios sharing a `name`; `type=checkbox` with `name: null`) and the yes/no reader handles only the
+   first. Needs a live widget recon.
+
+**Process note:** four live failures in one day were code written against a scope it did not have
+(`profile`, `apMatch.cdpPageKey`, `preCreds`, the entry pass). Every one passed the full suite,
+because the guards scan source text. There is no linter in this repo; adding one with `no-undef` is
+the standing suggestion.

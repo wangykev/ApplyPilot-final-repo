@@ -6134,7 +6134,12 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (ats === "oracle") {
       emitRunProgress(arm ? "Signing in to submit" : "Signing in to rehearse", "Oracle sends a verification code on every re-entry");
       const gmailOn = await (async () => { try { const c = await chrome.storage.local.get("onboardConfig"); return (c.onboardConfig || {}).gmailEnabled !== false; } catch (e) { return true; } })();
-      const pre = await runOrcPreForm(tabId, (preCreds && preCreds.credentials) || null, { gmailEnabled: gmailOn, LOG });
+      // ⚠ ITS OWN READ. `preCreds` above is const-scoped INSIDE the iCIMS branch, so borrowing the
+      // name from there threw `preCreds is not defined` on the first live rehearsal — the fourth
+      // scope-boundary bite in this file today, and the same shape each time: code written against a
+      // scope it does not actually have.
+      const orcCreds = await new Promise((r) => chrome.storage.local.get(["credentials"], r));
+      const pre = await runOrcPreForm(tabId, (orcCreds && orcCreds.credentials) || null, { gmailEnabled: gmailOn, LOG });
       if (pre.halt) {
         if (pre.halt.stopped === "apply-not-followable" || pre.halt.stopped === "unknown-page") {
           const at = await cdpEval(function () { return location.href; }).catch(() => null);

@@ -1107,6 +1107,52 @@ rest.** What is settled, and what must not be re-litigated:
   field, and `namInformation15` ends in digits with **no hyphen** and must be left alone. Wrong in either
   direction and the submit visit misses the field.
 
+### The SUBMIT stage — a REPLAY WALKS the wizard (2026-08-20, rehearsal live-verified)
+
+`runAtsSubmitRun` was single-page from the day it was written, because every ATS on this path was.
+ORC is the first that is not, and the `oracle-not-implemented` guard is now deleted from BOTH runs.
+
+- **ANY WALK STOP OTHER THAN `reached-final-step` REFUSES THE GATE** (`replay-incomplete`), before the
+  verify and before the click. The fill run marks a short walk's bundle PARTIAL; here the consequence
+  is a submitted application missing whatever the walk never reached, so it is not interpreted at all.
+- **THE ADVANCE IS ONE SHARED FUNCTION** — `orcAdvanceAfterStep` (guard 1, the disabled-Next wait,
+  guard 2, the monotone predicate, the settle), called by both walks; `orcAwaitBlocksPopulated` the
+  same. A test pins that guard 1 appears **exactly once in the file**. This is the double guard on the
+  one irreversible act in the pipeline: a near-duplicate keeps working until the day it stops agreeing
+  with the other about what "the last step" is, and the disagreement surfaces as a submitted form.
+- **RESULTS ARE UNIONED ACROSS STEPS, then verified ONCE.** The strict verify's "approved value has no
+  matching field" check is a set difference over the WHOLE bundle, so a per-step verify would flag
+  every other step's fields on every step.
+- **THE PRE-FORM RUNS BEFORE THE FORM WAIT** — ORC's gate passes `atsLooksLikeApplicationForm`, so a
+  run that waited for "a form" would find the GATE and replay approved values into a login box. And
+  because the fill created the candidate, **the emailed code is required on every submit run** —
+  Gmail auto-verify is on this path by construction, not as an edge case.
+- **A REPLAY *REPORTS* THE REPEATING ENTRIES; IT MUST NEVER REBUILD OR DELETE THEM.** `profile:{}` is
+  by design, so the entry plan is empty — correct as an ACTION (ORC saves entries server-side; live,
+  the rehearsal found Experience 3 / Education 1 still there) but not as an ANSWER, because the bundle
+  carries a record per entry and emitting none fails every one at verify. `reportOnly` reads the tiles
+  and records them, so the verify means "the entries you approved are still on the form". ⚠ It must
+  not actuate: with `profile:{}` a reconcile reads "wants 0, form has 3" and **deletes the work
+  history**. Pinned in both directions.
+- **⚠ A CHOICE RECORD MUST STORE THE OPTION THAT WAS CHOSEN, NOT THE WIDGET'S READ-BACK.** `rec.after`
+  becomes the bundle's `current_value`, which is what the replay matches against the live options. The
+  dial-code picker DISPLAYS `"+1"` while its option reads `"+1 (United States)"`, so the fill recorded
+  `"+1"` and the rehearsal correctly REFUSED it — `+1` is the United States **and** Canada, so a bare
+  code is a guess between two real countries. The fix is never to loosen the ladder (the ambiguity is
+  real) but to record a value that reproduces the decision; the read-back stays the VERIFICATION.
+  Safe because `atsSurfacePrefilled` skips any record carrying `resolved`, so nothing re-reads and
+  compares the two. *Suspect this shape on any widget whose display differs from its option text.*
+- **⚠ SCOPE BITES IN THIS FILE.** Four separate live failures in one day were code written against a
+  scope it did not have (`profile`, `apMatch.cdpPageKey`, `preCreds`, and the entry pass). The tests
+  scan source TEXT and cannot catch it. **There is no linter in this repo** — adding one with
+  `no-undef` is the standing suggestion, and until then a new branch that borrows a name from a
+  sibling `if (ats === …)` block is the thing to re-read before running.
+
+**Open (submit):** the ex-Oracle screening question fails the replay `read null` after 2 presses over
+8s (34.7s on the field) — ORC renders an option group **two ways** (radios sharing a `name`, and
+`type=checkbox` with `name: null`), so the yes/no reader likely handles only the first. Needs a live
+widget recon, not a guess.
+
 **Open:** whether a combobox accepts a typed value or strictly requires a suggestion; `region1`/`region2`
 semantics per country (must not be guessed); **where a combobox's options mount relative to
 `timeline-form-inline`** (the discard hazard); whether ids renumber across a section transition; captcha on

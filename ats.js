@@ -8232,14 +8232,30 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
             back = await act.eval(atsInjOrcReadPicker, ref.inputSel);
             if (back && back.ok && String(back.value || "").trim()) break;
           }
-          rec.after = back && back.ok ? back.value : null;
+          // ⚠⚠ RECORD THE OPTION THAT WAS CHOSEN, NOT THE PICKER'S READ-BACK (live rehearsal,
+          // 2026-08-20). The widget DISPLAYS the compact code ("+1") while its option reads
+          // "+1 (United States)", and `rec.after` becomes the bundle's `current_value` — which is
+          // what the submit run replays. So a fill that had recorded the read-back handed the replay
+          // the candidate "+1", and the ladder correctly REFUSED it: +1 is the United States AND
+          // Canada, so a bare code is genuinely ambiguous and matching it would be a guess between
+          // two real countries. The rehearsal caught it as `no dial-code option agreed with ["+1"]`.
+          //
+          // The fix is not to loosen the ladder — the ambiguity is real — but to store a value that
+          // reproduces the decision. The read-back stays the VERIFICATION (it is what proves the
+          // commit landed on the page); the recorded value is the option. Safe because
+          // atsSurfacePrefilled skips any record carrying `resolved`, so no audit re-reads this
+          // field and compares the two.
+          const shown = back && back.ok ? back.value : null;
           rec.resolved = candidates;
-          if (String(rec.after || "").trim() && !(back && back.invalid)) {
+          if (String(shown || "").trim() && !(back && back.invalid)) {
+            rec.after = want;
             rec.status = "filled";
             rec.tier = hit.tier;
-            rec.detail = "dial code matched on code+name → " + JSON.stringify(want);
+            rec.detail = "dial code matched on code+name → " + JSON.stringify(want)
+              + " (the picker displays it as " + JSON.stringify(shown) + ")";
             return true;
           }
+          rec.after = shown;
         }
       }
       rec.status = f.isRequired ? "needs_review" : "skipped";
