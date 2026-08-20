@@ -4785,14 +4785,23 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
 
   const deadline = Date.now() + (budgetMs || 6000);
   let fields = [];
+  const before = [...block0.querySelectorAll("input, textarea, select")]
+    .filter((e) => e.type !== "hidden" && vis(e)).length;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 80));
     const block = findBlock();
     if (!block) continue;
-    const open = [...block.querySelectorAll("button")].filter(vis).some((b) => /^cancel$/i.test(t(b)));
+    // ⚠⚠ THE EVIDENCE THAT A FORM OPENED IS THAT **INPUTS APPEARED**, not that a button says
+    // "Cancel" (operator, 2026-08-20). Requiring the Cancel caption made this report
+    // `pressed "Add Experience" but no entry form appeared` on a form whose entry fields were
+    // plainly there — the tenant simply does not render that button, or words it differently.
+    // A caption is tenant wording; a control that did not exist a moment ago is structure.
+    //
+    // The Cancel test still earns its keep on the COMMIT side, where it disambiguates the Add
+    // homonym — but even there it is now backed up by the input count, below.
     const live = [...block.querySelectorAll("input, textarea, select")]
       .filter((e) => e.type !== "hidden" && vis(e));
-    if (open && live.length) {
+    if (live.length > before) {
       fields = live.map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
         role: e.getAttribute("role") || null,
         label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
@@ -4816,7 +4825,11 @@ async function atsInjOrcCommitEntryAndWait(blockTitlePattern, budgetMs) {
   if (!block0) return { ok: false, error: "block-not-found" };
   const btns0 = [...block0.querySelectorAll("button")].filter(vis);
   // ⚠ REFUSE if nothing is open: the SAME caption would OPEN a blank entry instead of committing one.
-  if (!btns0.some((b) => /^cancel$/i.test(t(b)))) return { ok: false, error: "no-open-entry-to-commit" };
+  // "Open" is a Cancel button OR live inputs — the caption is tenant wording, the inputs are
+  // structure, and a tenant that renders no Cancel must still be able to commit.
+  const liveNow = [...block0.querySelectorAll("input, textarea, select")]
+    .filter((e) => e.type !== "hidden" && vis(e)).length;
+  if (!btns0.some((b) => /^cancel$/i.test(t(b))) && !liveNow) return { ok: false, error: "no-open-entry-to-commit" };
   const add = btns0.find((b) => /^add\b/i.test(t(b)));
   if (!add) return { ok: false, error: "no-add-control" };
   add.click();
@@ -4827,7 +4840,9 @@ async function atsInjOrcCommitEntryAndWait(blockTitlePattern, budgetMs) {
     await new Promise((r) => setTimeout(r, 80));
     const block = findBlock();
     if (!block) { closed = true; break; }
-    if (![...block.querySelectorAll("button")].filter(vis).some((b) => /^cancel$/i.test(t(b)))) { closed = true; break; }
+    const stillOpen = [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e)).length > 0;
+    if (!stillOpen) { closed = true; break; }
   }
   return { ok: true, pressed: t(add), closed };
 }

@@ -5796,12 +5796,33 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         LOG(`⛔ ${walkStopped} — ${walkDetail}`);
         break;
       }
-      if (!after.nextEnabled) {
-        walkStopped = "next-disabled";
-        walkDetail = `Oracle has DISABLED ${JSON.stringify(after.nextCaption)} on step ${stepNo}, which is how it refuses an incomplete step.` +
-          (after.errors.length ? ` The form says: ${after.errors.join(" | ")}` : " The form gave no error text.");
-        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
-        break;
+      // ⚠⚠ A DISABLED NEXT IS USUALLY TEMPORARY — WAIT FOR IT, DO NOT HALT ON IT (operator,
+      // 2026-08-20). Live: `⛔ next-disabled … The form says: Saved`. "Saved" is a STATUS, not an
+      // error: Oracle disables its own Next while it persists the step and re-enables it a moment
+      // later. Treating that instant as a refusal ended the walk two steps in, on a step that had
+      // filled perfectly (12 fields, 0 to review).
+      //
+      // So the disabled state is polled to a budget and only a Next that STAYS disabled is a refusal
+      // — which is the real thing this branch exists to catch, an incomplete step Oracle will not let
+      // past. The halt then carries the page's own words, as before.
+      let nextState = after;
+      if (!nextState.nextEnabled) {
+        const nT0 = Date.now(), NEXT_BUDGET = 15000;
+        LOG(`${JSON.stringify(nextState.nextCaption)} is disabled on step ${stepNo} — waiting, since Oracle disables it while it saves` +
+            (nextState.errors.length ? ` (the form says: ${nextState.errors.join(" | ")})` : ""));
+        while (Date.now() - nT0 < NEXT_BUDGET) {
+          await cdpDelay(600);
+          const now = await cdpEval(atsInjOrcStepState).catch(() => null);
+          if (now && now.ok) { nextState = now; if (now.nextEnabled) break; }
+        }
+        if (!nextState.nextEnabled) {
+          walkStopped = "next-disabled";
+          walkDetail = `Oracle kept ${JSON.stringify(nextState.nextCaption)} DISABLED on step ${stepNo} for ${((Date.now() - nT0) / 1000).toFixed(1)}s, which is how it refuses an incomplete step.` +
+            (nextState.errors.length ? ` The form says: ${nextState.errors.join(" | ")}` : " The form gave no error text.");
+          LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+          break;
+        }
+        LOG(`…${JSON.stringify(nextState.nextCaption)} re-enabled after ${((Date.now() - nT0) / 1000).toFixed(1)}s — continuing`);
       }
 
       // ── GUARD 2 rides along on the click itself ───────────────────────────────────────
