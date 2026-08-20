@@ -3924,8 +3924,18 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear, segm
     return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
   };
   const deadline = Date.now() + (budgetMs || 8000);
-  let lastRows = [];
+  const openedAt = Date.now();
+  let lastRows = [], reopens = 0;
   while (Date.now() < deadline) {
+    // ⚠ AN OPEN THAT DID NOT TAKE IS RE-CLICKED, not waited out (speed round, 2026-08-20). ORC's
+    // combobox is sometimes not wired when the first click lands — measured on the Education entry's
+    // School picker at ~17s, which was one dead 8s visit followed by a retry that worked. Two extra
+    // clicks cost nothing next to that, and they also cure the "it lags until I click the page"
+    // symptom: without them the run sits in a poll on a picker that never opened.
+    if (!lastRows.length && reopens < 2 && Date.now() - openedAt > (reopens + 1) * 700) {
+      reopens++;
+      try { el.click(); } catch (e) { /* the poll below is the judge */ }
+    }
     await new Promise((r) => setTimeout(r, 250));
     const rows = readRows();
     if (!rows.length) {
@@ -4507,6 +4517,70 @@ function atsInjOrcScrollBlocks(titles) {
 // The `<candidate-links>` repeating family. Its control is `name="siteLink-<n>"` `type="url"` and the
 // add control is `button.candidate-links__add-link` ("Add Another Link"). The ordinal lives in the
 // NAME (the trailing `-7` on the id is the render counter), so it is a POSITION and safe to index by.
+// ⚠⚠ ONE OPEN PER PICKER: CLASSIFY AND COMMIT IN THE SAME VISIT (speed round, 2026-08-20).
+// The date pair used to CAPTURE each half's options (open → poll → Escape) and then PICK it
+// (open → type → match → click) — four opens per pair, and the operator noticed exactly that: "it
+// opens the dropdown before going back and filling it when it could definitely fill it just once."
+//
+// Measured cost of the split: `startDate` ~11s while `endDate` — same widget, same code — cost ~2s.
+// The difference is that startDate is the FIRST picker touched in a freshly-created entry form, where
+// the open-click does not register because the combobox is not wired yet. The capture then polled its
+// WHOLE 8s budget for rows that were never going to appear, and only the retry's second click worked.
+// That is ~8s wasted per entry, ~24s across three — and it is also the "sometimes it lags until I
+// click the page" symptom, because the run is sitting in a poll on a picker that never opened.
+//
+// So: open, and if no rows appear quickly, CLICK AGAIN (the cheap, targeted fix for an open that did
+// not take) rather than waiting out a budget. Then classify from the rows in front of us and click the
+// matching one. Classification stays evidence-based — each half is still judged by its OWN options, so
+// a tenant that renders year-then-month is still handled — it just no longer costs a second visit.
+async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const norm = (v) => String(v == null ? "" : v).toLowerCase().replace(/\s+/g, " ").trim();
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
+  const readRows = () => {
+    const lb = lbId ? document.getElementById(lbId) : null;
+    return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
+  };
+  const deadline = Date.now() + (budgetMs || 6000);
+  el.focus();
+  el.click();
+  let rows = [], reopens = 0;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 120));
+    rows = readRows();
+    if (rows.length) break;
+    // ⚠ AN OPEN THAT DID NOT TAKE IS RE-CLICKED, not waited out. Two extra clicks at ~700ms and
+    // ~1400ms cost almost nothing and replace an 8-second stall.
+    const waited = Date.now() - (deadline - (budgetMs || 6000));
+    if (reopens < 2 && waited > (reopens + 1) * 700) { reopens++; el.click(); }
+  }
+  if (!rows.length) return { ok: false, error: "no-rows", reopens };
+
+  const texts = rows.map(t);
+  const yearish = texts.filter((x) => /^\s*(19|20)\d{2}\s*$/.test(x)).length;
+  const monthish = texts.filter((x) => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(x)).length;
+  const kind = yearish > monthish ? "year" : (monthish > 0 ? "month" : null);
+  if (!kind) return { ok: false, error: "unclassified", rows: texts.slice(0, 4), reopens };
+
+  const cands = (kind === "year" ? yearCands : monthCands) || [];
+  let hit = null;
+  for (const c of cands) {
+    hit = rows.find((r) => norm(t(r)) === norm(c));
+    if (hit) break;
+  }
+  if (!hit) return { ok: false, error: "no-match", kind, rows: texts.slice(0, 6), reopens };
+
+  hit.scrollIntoView({ block: "nearest" });
+  const rect = hit.getBoundingClientRect();
+  const at = { bubbles: true, cancelable: true, clientX: Math.round(rect.left + rect.width / 2), clientY: Math.round(rect.top + rect.height / 2) };
+  for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+    hit.dispatchEvent(type.indexOf("pointer") === 0 ? new PointerEvent(type, at) : new MouseEvent(type, at));
+  }
+  return { ok: true, kind, committed: t(hit), reopens };
+}
+
 function atsInjOrcLinks() {
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -5076,66 +5150,36 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             records.push(rec0); continue;
           }
           const t0 = Date.now();
-          // Classify each half by its OWN option list: a month picker offers month names, a year
-          // picker offers 4-digit years. Position would work on this tenant and file every date
-          // backwards on one that renders year first — and that failure would not look like an
-          // ordering bug, it would look like the dates were wrong.
-          const halves = [];
-          for (const g of group.slice(0, 2)) {
-            if (!g.id) { halves.push({ g, kind: null, rows: [] }); continue; }
-            const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
-            // ⚠⚠ A ZERO-ROW READ IS ABSENCE OF EVIDENCE, NOT AN EMPTY LIST — so it is retried once,
-            // after confirming the PREVIOUS half's list is gone. Live 2026-08-19: entry 2's startDate
-            // reported `offered [["January","February","March"],[]]` — the month half read fine and
-            // the YEAR half came back empty after burning its whole 8s budget, on the same entry
-            // whose endDate pair read both halves correctly moments later. The capture Escapes and
-            // waits 300ms page-side, but ORC will not open a second picker while the first is still
-            // unmounting, and the standing rule here is that a close is confirmed by the options
-            // being GONE rather than by a delay having elapsed.
-            //
-            // The cost of the retry is one wasted open; the cost of believing the empty read is a
-            // date the pass cannot identify, which refuses the whole entry — measured, twice.
-            let cap = await act.eval(atsInjOrcCaptureOptions, sel, ATS_ORC_PICK_MS).catch(() => null);
-            let rows = (cap && cap.options) || [];
-            if (!rows.length) {
-              await act.delayFull(600);
-              cap = await act.eval(atsInjOrcCaptureOptions, sel, ATS_ORC_PICK_MS).catch(() => null);
-              rows = (cap && cap.options) || [];
-              if (rows.length) log(`  (${key}: an empty option read was retried and came back with ${rows.length} row(s) — the previous half's list was still unmounting)`);
-            }
-            // Pace before the NEXT half opens, and only when this one did not confirm its close:
-            // a confirmed close needs no wait, and an unconfirmed one is exactly the state that
-            // makes the next open read nothing.
-            if (cap && cap.closed === false) await act.delayFull(500);
-            const yearish = rows.filter((r) => /^\s*(19|20)\d{2}\s*$/.test(String(r))).length;
-            const monthish = rows.filter((r) => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(String(r))).length;
-            halves.push({ g, sel, rows, kind: yearish > monthish ? "year" : (monthish > 0 ? "month" : null) });
-          }
-          const yearHalf = halves.find((h) => h.kind === "year");
-          const monthHalf = halves.find((h) => h.kind === "month");
-          if (!yearHalf || !monthHalf) {
-            rec0.status = "needs_review"; rec0.flag = "date-halves-unidentified";
-            rec0.elapsedMs = Date.now() - t0;
-            rec0.detail = "could not tell the month picker from the year picker by their options" +
-              ` (offered ${JSON.stringify(halves.map((h) => (h.rows || []).slice(0, 3)))}) — set this date here`;
-            records.push(rec0); continue;
-          }
-          // The month picker's own wording for this month, taken from its list rather than from a
-          // hardcoded name table: "May" / "05" / "5" are all shapes a tenant may use.
+          // ⚠ ONE VISIT PER HALF. Each picker is opened once, classified from the rows it shows, and
+          // committed in the same visit — see atsInjOrcPickFromOwnList for the measurement that made
+          // this necessary (the capture-then-pick split cost ~8s per entry on a picker whose first
+          // open never registered, and it is what the operator saw as the dropdown opening twice).
+          // Classification is still per-half and still evidence-based; it just no longer costs a
+          // second open.
           const mNum = Number(ym.month);
           const NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
           const monthCands = mNum >= 1 && mNum <= 12
             ? [NAMES[mNum - 1], NAMES[mNum - 1].slice(0, 3), String(mNum).padStart(2, "0"), String(mNum)]
             : [];
-          let okAll = true; const got_by = {};
-          for (const [half, cands] of [[monthHalf, monthCands], [yearHalf, [String(ym.year)]]]) {
-            const wanted = cands.find((c) => half.rows.some((r) => String(r).trim().toLowerCase() === String(c).trim().toLowerCase())) || cands[0];
-            if (!wanted) { okAll = false; continue; }
-            const r = await act.eval(atsInjOrcPick, half.sel, String(wanted), [String(wanted)], ATS_ORC_PICK_MS, false, false).catch(() => null);
-            const back = await act.eval(atsInjOrcReadPicker, half.sel).catch(() => null);
-            const got = back && back.ok ? back.value : null;
-            if (!(r && r.ok && String(got || "").trim() && !(back && back.invalid))) okAll = false;
-            got_by[half.kind] = got;
+          const yearCands = [String(ym.year)];
+          const got_by = {}; const failed = [];
+          let reopenTotal = 0;
+          for (const g of group.slice(0, 2)) {
+            if (!g.id) { failed.push("a half with no id"); continue; }
+            const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
+            const r = await act.eval(atsInjOrcPickFromOwnList, sel, monthCands, yearCands, ATS_ORC_PICK_MS).catch(() => null);
+            reopenTotal += (r && r.reopens) || 0;
+            if (!r || !r.ok) { failed.push((r && r.error) || "unknown"); continue; }
+            // READ-BACK VERIFIED like every other commit here — the click reporting a row is not proof
+            // the widget accepted it.
+            let got = null;
+            for (let w = 0; w < 8; w++) {
+              await act.delayFull(150);
+              const back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
+              if (back && back.ok && String(back.value || "").trim() && !back.invalid) { got = back.value; break; }
+            }
+            if (got == null) { failed.push(r.kind + " not retained"); continue; }
+            got_by[r.kind] = got;
           }
           rec0.elapsedMs = Date.now() - t0;
           // ⚠⚠ THIS VALUE GOES ON THE REVIEW PAGE AND INTO THE SUBMIT REPLAY — it is not a log line.
@@ -5143,11 +5187,17 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           // rendered as a TEXT BOX for the operator to edit as raw markup, and which a replay would
           // have typed at the form verbatim. `current_value` is copied straight from `rec.after`, so
           // anything convenient for a log becomes the application's answer.
-          // "May 2026" reads correctly to a human and is what the pair actually holds.
           rec0.after = [got_by.month, got_by.year].filter(Boolean).join(" ") || null;
+          const okAll = !failed.length && got_by.month != null && got_by.year != null;
           rec0.status = okAll ? "filled" : "needs_review";
-          if (!okAll) { rec0.flag = "commit-not-accepted"; rec0.detail = `Oracle did not accept ${ym.month}/${ym.year} — got ${rec0.after || "nothing"}`; }
-          else rec0.detail = `month+year pair set from ${JSON.stringify(String(ym.month) + "/" + ym.year)} (halves identified by their own option lists)`;
+          if (!okAll) {
+            rec0.flag = failed.some((x) => /unclassified/.test(String(x))) ? "date-halves-unidentified" : "commit-not-accepted";
+            rec0.detail = `Oracle did not accept ${ym.month}/${ym.year} — got ${rec0.after || "nothing"}` +
+              (failed.length ? ` (${failed.join("; ")})` : "");
+          } else {
+            rec0.detail = `month+year pair set from ${JSON.stringify(String(ym.month) + "/" + ym.year)}` +
+              ` in one visit per half${reopenTotal ? ` (${reopenTotal} re-open(s) — the first click did not register)` : ""}`;
+          }
           records.push(rec0); continue;
         }
 
@@ -5192,6 +5242,11 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           // So the whole candidate ladder is retried ONCE, and ONLY when the last attempt saw no rows
           // at all. A ladder that saw rows and matched none has genuinely answered, and retrying that
           // would just spend another 8s to be told the same thing.
+          // ⚠ THE PRIMITIVE NOW SELF-HEALS A DEAD OPEN (it re-clicks), so this outer retry exists only
+          // for the case it cannot fix: a server-backed search that genuinely answered nothing in
+          // time. That is still worth one more try — zero rows is "the search did not answer", not
+          // "your value is not in the list" — but it no longer has to cover a click that never
+          // landed, which is what made it a full second 8s pass on every School pick.
           for (let attempt = 0; attempt < 2; attempt++) {
             for (const c of cands) {
               r = await act.eval(atsInjOrcPick, sel, c, [c], ATS_ORC_PICK_MS, false, true).catch(() => null);
@@ -5202,8 +5257,8 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             const sawRows = !!(r && r.rows && r.rows.length);
             if (good || sawRows) break;
             if (attempt === 0) {
-              await act.delayFull(900);
-              log(`  (${key}: the picker returned NO rows at all — retrying once; a silent search is not the same as a search that answered)`);
+              await act.delayFull(400);
+              log(`  (${key}: the picker returned NO rows at all — one more try; a silent search is not the same as a search that answered)`);
             }
           }
           rec.after = back && back.ok ? back.value : null;
@@ -8441,14 +8496,17 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // Ashby is on this path too and only gains: the loop exits the moment the value agrees, so a
     // widget that was already fast is not slowed, and one that is slow now succeeds instead of
     // failing. The predicate is monotone — the value can only be noticed late, never missed.
+    // ⚠ GRANULARITY IS THE COST HERE, not the widget. At 10 × 200ms plus a CDP round-trip each, a
+    // flip that lands late pays the WHOLE loop — measured 5227ms and 3378ms on commits that had
+    // already succeeded. More, shorter reads exit at the first agreeing read instead.
     let back = null;
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 24; i++) {
       // ⚠⚠ `delayFull`, NOT `delay`. `act.delay` is the ADAPTIVE pace — it collapses to ~15ms on a
       // visible tab, which is right for spacing actuation and WRONG for a settle. With it, this
       // "10 × 150ms" poll finished in 196ms and 234ms on a live run and reported both required
       // yes/no fields as "click not reflected (read null)". Exactly the trap CLAUDE.md names for
       // Workday's settles: an adaptive delay makes a half-rendered page look stable.
-      await act.delayFull(200);
+      await act.delayFull(120);
       back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
       if (back && back.ok && atsLib.normalize(String(back.value || "")) === atsLib.normalize(want)) break;
     }
@@ -8695,7 +8753,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE, atsInjOrcBlocks, atsOrcEntryValue, atsOrcFillEntries,
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
-    atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks,
+    atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
