@@ -3888,41 +3888,50 @@ test("the ORC date pair reaches review as a readable value, not a debug string",
     'the label must split camelCase so review shows "Start Date", not "startDate"');
 });
 
-test("the yes/no commit POLLS its read-back rather than reading once after a fixed delay", () => {
+test("every yes/no commit goes through ONE implementation, and it waits on a DEADLINE", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
-  const i = src.indexOf('if (wt === "yesno") {');
-  assert.ok(i > 0);
   const stripComments = (t) => String(t)
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
-  const branch = stripComments(src.slice(i, i + 3000));   // the branch grew with its comment
-  // ⚠ a single read after a fixed delay is what the standing pacing rule forbids, and it bit:
-  // two of three REQUIRED ORC yes/no questions came back "click not reflected (read null)" at 22ms
-  // on a run where the same fields had committed at 31ms minutes earlier. ORC's pill flips its
-  // aria-pressed on a Knockout re-render.
-  // ⚠⚠ A DEADLINE, NOT AN ITERATION COUNT. An iteration count is a PROXY for time and every proxy
-  // breaks when the clock underneath it changes — this bit three times in one day: a single read at
-  // 150ms; then 10 iterations on the ADAPTIVE pace, which collapsed 1.5s into 196ms; then 24
-  // iterations that only passed because the STARVED SW clock made each one ~500ms, and went blank
-  // again the moment page-clock pacing made the paces honest.
-  assert.ok(/Date\.now\(\) < ynDeadline/.test(branch),
-    "the read-back must poll against a DEADLINE, so it does not care which clock is underneath it");
-  assert.ok(!/for \(let i = 0; i < \d+; i\+\+\)[\s\S]{0,200}atsInjReadValue/.test(branch),
+
+  // ⚠⚠ ONE implementation for all THREE call sites. Live 2026-08-20 (hidden run): the two
+  // DETERMINISTIC yes/no questions both reported "took 2 press(es)" and landed, while the
+  // AI-answered one on the SAME page came back needs_review seconds later — because only the
+  // deterministic path had the deadline-and-re-press logic. Which rung answered a question must not
+  // decide whether the answer sticks.
+  const i = src.indexOf("async function atsCommitYesNo");
+  assert.ok(i > 0, "the shared yes/no commit must exist");
+  const body = stripComments(src.slice(i, src.indexOf("\n// Actuate one field", i)));
+
+  // A DEADLINE, not an iteration count — an iteration count is a proxy for time, and every proxy
+  // breaks when the clock beneath it changes (this bit three times in one day: a fixed 150ms read;
+  // 10 iterations on the ADAPTIVE pace, which collapsed 1.5s into 196ms; 24 iterations that only
+  // passed because the STARVED worker clock made each ~500ms).
+  assert.ok(/Date\.now\(\) < deadline/.test(body), "the read-back must poll against a DEADLINE");
+  assert.ok(!/for \(let \w+ = 0; \w+ < \d+; \w+\+\+\)[\s\S]{0,160}atsInjReadValue/.test(body),
     "an iteration count is not a budget");
-  // …and a press that never registered is re-clicked, gated on nothing being pressed yet — a blind
-  // second click on a TOGGLE would un-press what the first one set.
-  assert.ok(/nothingPressed/.test(branch),
-    "a re-click must be gated on the read-back still showing nothing pressed");
-  assert.ok(/break;/.test(branch),
-    "and it must exit the moment the value agrees, so a widget that was already fast is not slowed");
-  // ⚠⚠ AND IT MUST PACE ON WALL CLOCK. `act.delay` is the ADAPTIVE pace and collapses to ~15ms on a
-  // visible tab, so the first version of this poll finished in 196ms and 234ms and reported both
-  // required yes/no fields as "click not reflected (read null)" — a settle that does not wait is not
-  // a settle. Same trap CLAUDE.md names for Workday: an adaptive delay makes a half-rendered page
-  // look stable.
-  assert.ok(/await act\.delayFull\(/.test(branch),
-    "the poll must use delayFull (wall clock), never the adaptive act.delay");
-  assert.ok(!/await act\.delay\(\d/.test(branch), "act.delay in a settle loop is the bug");
+  // wall-clock pacing, never the adaptive pace
+  assert.ok(/await act\.delayFull\(/.test(body) && !/await act\.delay\(\d/.test(body),
+    "a settle must pace on delayFull; act.delay is the ADAPTIVE pace and collapses on a visible tab");
+  // re-press, gated on nothing being pressed — a blind second press un-presses a TOGGLE
+  assert.ok(/nothingPressed/.test(body) && /presses < 3/.test(body),
+    "a press that did not register must be re-pressed, gated on nothing being pressed yet");
+  // and the press count must be reported, so a widget that habitually needs two is visible
+  assert.ok(/press\(es\)/.test(body), "the press count must reach the record");
+
+  // ⚠ EVERY call site must use it — the deterministic rung, the AI choice commit, and the EEO
+  // decline path. A direct atsInjClickYesNo outside the helper is the bug this test exists for.
+  const whole = stripComments(src);
+  const direct = [...whole.matchAll(/act\.eval\(atsInjClickYesNo/g)];
+  assert.strictEqual(direct.length, 2,
+    "atsInjClickYesNo may only be called from INSIDE atsCommitYesNo (the initial press and the " +
+    "re-press) — found " + direct.length + " call(s), so a path is committing without the settle");
+  for (const m of direct) {
+    const before = whole.slice(Math.max(0, m.index - 2000), m.index);
+    assert.ok(before.lastIndexOf("async function atsCommitYesNo") > before.lastIndexOf("\nasync function ")
+      || /atsCommitYesNo/.test(before.slice(-2000)),
+      "the only atsInjClickYesNo calls must sit inside atsCommitYesNo");
+  }
 });
 
 

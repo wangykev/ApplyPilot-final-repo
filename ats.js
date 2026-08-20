@@ -7673,6 +7673,47 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
     needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
 }
 
+// ⚠⚠ PRESS A YES/NO AND CONFIRM IT STUCK — ONE implementation for all THREE call sites.
+// Live 2026-08-20, hidden run: the two DETERMINISTIC yes/no questions both reported
+// `took 2 press(es) — the first did not register` and landed, while the AI-answered one came back
+// `needs_review` from the same page seconds later. The difference was not the widget and not the
+// answer: the deterministic path had the deadline-and-re-press logic and the AI path still did one
+// click plus a short read. A commit that only works on one of three paths is a coin flip about which
+// rung happened to answer the question.
+//
+// The rules, all of them earned the hard way today:
+//   • A DEADLINE, NOT AN ITERATION COUNT. An iteration count is a proxy for time and every proxy
+//     breaks when the clock beneath it changes — this bit three times in one day (a fixed 150ms read;
+//     10 iterations on the ADAPTIVE pace, which collapsed 1.5s into 196ms; 24 iterations that only
+//     passed because the STARVED worker clock made each one ~500ms, then went blank once page-clock
+//     pacing made the paces honest).
+//   • RE-PRESS a press that did not register, GATED on nothing being pressed yet — on a toggle a
+//     blind second press would un-press what the first one set.
+//   • Report the PRESS COUNT, so a widget that habitually needs two is visible rather than merely
+//     slow.
+async function atsCommitYesNo(act, ats, ref, want, wt) {
+  const kind = wt || "yesno";
+  let r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
+  const t0 = Date.now(), deadline = t0 + 8000;
+  let back = null, presses = 1;
+  while (Date.now() < deadline) {
+    await act.delayFull(120);
+    back = await act.eval(atsInjReadValue, ats, ref.inputSel, kind);
+    if (back && back.ok && atsLib.normalize(String(back.value || "")) === atsLib.normalize(want)) break;
+    const nothingPressed = !(back && back.ok && String(back.value || "").trim());
+    if (nothingPressed && presses < 3 && Date.now() - t0 > presses * 1800) {
+      presses++;
+      r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
+    }
+  }
+  const value = back && back.ok ? back.value : null;
+  const ok = !!(r && r.ok) && atsLib.normalize(String(value || "")) === atsLib.normalize(want);
+  return { ok, value, presses, elapsedMs: Date.now() - t0,
+    detail: ok
+      ? (presses > 1 ? "took " + presses + " press(es) — the first did not register" : null)
+      : "yes/no click not reflected after " + presses + " press(es) over 8s (read " + JSON.stringify(value) + ")" };
+}
+
 // Actuate one field with the resolved candidates. Returns true when it produced an outcome
 // (filled / filled_review / needs_review with a real attempt), false when nothing was
 // attempted (→ AI/blank fallback). Every commit is read-back-verified.
@@ -8690,53 +8731,12 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
     const want = candidates.find((c) => c === "Yes" || c === "No") || candidates[0];
-    let r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
-    // ⚠⚠ POLL THE READ-BACK — a single read after a fixed delay is the one thing the standing pacing
-    // rule forbids, and it bit exactly as predicted. Live 2026-08-20 on ORC, two of three required
-    // yes/no questions came back `needs_review · yes/no click not reflected (read null)` at 22ms,
-    // on a run where the identical fields had committed cleanly minutes earlier at 31ms. ORC's pill
-    // flips its `aria-pressed` on a Knockout re-render, so 150ms is sometimes simply early — and the
-    // cost of being early here is a REQUIRED field reported unfilled, with the AI's answer discarded
-    // after it had already been paid for.
-    //
-    // Ashby is on this path too and only gains: the loop exits the moment the value agrees, so a
-    // widget that was already fast is not slowed, and one that is slow now succeeds instead of
-    // failing. The predicate is monotone — the value can only be noticed late, never missed.
-    // ⚠⚠ A BUDGET, NOT AN ITERATION COUNT — and this is the THIRD time the same trap has bitten in
-    // one day, so it is worth stating as a rule: an iteration count is a PROXY for time, and every
-    // proxy breaks when the clock underneath it changes.
-    //   • first written as one read after a fixed 150ms  → too early, both fields unfilled;
-    //   • then 10 × 150ms with `act.delay`               → the ADAPTIVE pace collapsed to ~15ms, so
-    //                                                      the "1.5s" poll finished in 196ms;
-    //   • then 24 × 120ms with `delayFull` on the STARVED SW clock → each pace really cost ~500ms,
-    //     so it accidentally waited ~5s and PASSED. Turning the page clock on made the paces honest,
-    //     the same 24 iterations became ~2.9s, and both fields went blank again.
-    // A deadline does not care which clock is underneath it.
-    //
-    // ⚠ AND RE-CLICK A PRESS THAT DID NOT REGISTER. Same finding as ORC's pickers: this widget
-    // sometimes ignores the first activation. Re-clicking is safe here precisely BECAUSE it is gated
-    // on the read-back still showing nothing pressed — on a toggle, a blind second click would
-    // un-press what the first one set.
-    let back = null;
-    const ynDeadline = Date.now() + 8000;
-    let clicks = 1;
-    while (Date.now() < ynDeadline) {
-      await act.delayFull(120);
-      back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
-      if (back && back.ok && atsLib.normalize(String(back.value || "")) === atsLib.normalize(want)) break;
-      const nothingPressed = !(back && back.ok && String(back.value || "").trim());
-      if (nothingPressed && clicks < 3 && Date.now() - (ynDeadline - 8000) > clicks * 1800) {
-        clicks++;
-        r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
-      }
-    }
-    rec.after = back && back.ok ? back.value : null;
+    const yn = await atsCommitYesNo(act, ats, ref, want, wt);
+    rec.after = yn.value;
     rec.options = f.options || ["Yes", "No"];
-    const okv = !!(r && r.ok) && atsLib.normalize(String(rec.after || "")) === atsLib.normalize(want);
-    rec.status = okv ? "filled" : "needs_review";
-    rec.verified = okv;
-    if (!okv) rec.detail = "yes/no click not reflected after " + clicks + " press(es) over 8s (read " + JSON.stringify(rec.after) + ")";
-    else if (clicks > 1) rec.detail = "took " + clicks + " press(es) — the first did not register";
+    rec.status = yn.ok ? "filled" : "needs_review";
+    rec.verified = yn.ok;
+    if (yn.detail) rec.detail = yn.detail;
     return true;
   }
 
@@ -8894,7 +8894,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       if (!dec) { rec.status = "needs_review"; rec.detail = why + " — pick from the options here"; return false; }
       let c;
       if (wt === "radio" || wt === "checkbox_group") c = await act.eval(atsInjCheckOption, ref.inputSel, dec, true);
-      else if (wt === "yesno") c = await act.eval(atsInjClickYesNo, ref.inputSel, dec);
+      else if (wt === "yesno") c = await atsCommitYesNo(act, ats, ref, dec, wt);   // …and here (see above)
       else if (wt === "dropdown_native") c = await act.eval(atsInjSelectNative, ref.inputSel, dec);
       else if (wt === "icims_dropdown") c = await act.eval(atsInjIcimsCommit, ref.inputSel, dec);
       else c = await act.eval(atsInjCommitOption, ref.inputSel, dec);
@@ -8930,7 +8930,11 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     const pick = texts[m.targetIndex];
     let committed;
     if (wt === "radio" || wt === "checkbox_group") committed = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
-    else if (wt === "yesno") committed = await act.eval(atsInjClickYesNo, ref.inputSel, pick);
+    // ⚠ THE SAME COMMIT AS THE DETERMINISTIC RUNG. Live: the two deterministic yes/no questions both
+    // needed two presses and landed, while the AI-answered one on the SAME page came back
+    // needs_review from a single click plus a short read. Which rung answered a question must not
+    // decide whether the answer sticks.
+    else if (wt === "yesno") committed = await atsCommitYesNo(act, ats, ref, pick, wt);
     else if (wt === "dropdown_native") committed = await act.eval(atsInjSelectNative, ref.inputSel, pick);
     else if (wt === "icims_dropdown") committed = await act.eval(atsInjIcimsCommit, ref.inputSel, pick);
     else committed = await act.eval(atsInjCommitOption, ref.inputSel, pick);
