@@ -6006,7 +6006,10 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
     await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined); // see the fill run: its sign-in gate's invisible hCaptcha will not initialise under the polyfill
     if (ats === "icims") cdpSetFastWhenHidden(true); // …and the same compensation the fill run makes
-    cdpSetPageClock(true);                           // …and the same page-clock pacing (see the fill run)
+    // …and the same page-clock pacing, honouring the SAME flag — otherwise a submit run would ignore
+    // `atsPageClock` and the A/B would only cover half the pipeline.
+    const submitPageClock = await new Promise((r) => chrome.storage.local.get(["atsPageClock"], (v) => r(v && v.atsPageClock)));
+    cdpSetPageClock(submitPageClock !== false);
     await cdpSetFocusEmulation(true).catch(() => {});
     // SAY WHICH PACING REGIME THIS RUN GOT — the fill run has logged this since the CDP path existed
     // and the submit run never did, which leaves a rehearsal unable to state whether it ran visible or
