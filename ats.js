@@ -4944,7 +4944,11 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         // ── the date pair: WHICH half is month and which is year is READ, not assumed ──
         if (spec.kind === "date_pair" && group.length >= 2) {
           const ym = atsOrcEntryValue(spec, entry);
-          const rec0 = { fieldName: `${item.source}[${i}].${key}`, label: group[0].label || key,
+          // ⚠ THE HALVES CARRY NO LABEL AT ALL on this form, so the review page showed the raw
+          // platform name ("startDate"). Split the camelCase into words so the operator reads
+          // "Start Date" — the same string a human sees above the pickers.
+          const prettyDate = String(key).replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+          const rec0 = { fieldName: `${item.source}[${i}].${key}`, label: group[0].label || prettyDate,
                          widgetType: "dropdown", isRequired: false, entrySection: item.source, entryIndex: i,
                          mappedPath: `${item.source}[${i}].${spec.path}`, status: "skipped", after: null, elapsedMs: 0 };
           if (ym == null) {
@@ -5006,7 +5010,7 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           const monthCands = mNum >= 1 && mNum <= 12
             ? [NAMES[mNum - 1], NAMES[mNum - 1].slice(0, 3), String(mNum).padStart(2, "0"), String(mNum)]
             : [];
-          let okAll = true; const parts = [];
+          let okAll = true; const got_by = {};
           for (const [half, cands] of [[monthHalf, monthCands], [yearHalf, [String(ym.year)]]]) {
             const wanted = cands.find((c) => half.rows.some((r) => String(r).trim().toLowerCase() === String(c).trim().toLowerCase())) || cands[0];
             if (!wanted) { okAll = false; continue; }
@@ -5014,10 +5018,16 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             const back = await act.eval(atsInjOrcReadPicker, half.sel).catch(() => null);
             const got = back && back.ok ? back.value : null;
             if (!(r && r.ok && String(got || "").trim() && !(back && back.invalid))) okAll = false;
-            parts.push(`${half.kind}=${JSON.stringify(got)}`);
+            got_by[half.kind] = got;
           }
           rec0.elapsedMs = Date.now() - t0;
-          rec0.after = parts.join(" ");
+          // ⚠⚠ THIS VALUE GOES ON THE REVIEW PAGE AND INTO THE SUBMIT REPLAY — it is not a log line.
+          // It used to be `month="May" year="2026"`, my own debug string, which the review editor then
+          // rendered as a TEXT BOX for the operator to edit as raw markup, and which a replay would
+          // have typed at the form verbatim. `current_value` is copied straight from `rec.after`, so
+          // anything convenient for a log becomes the application's answer.
+          // "May 2026" reads correctly to a human and is what the pair actually holds.
+          rec0.after = [got_by.month, got_by.year].filter(Boolean).join(" ") || null;
           rec0.status = okAll ? "filled" : "needs_review";
           if (!okAll) { rec0.flag = "commit-not-accepted"; rec0.detail = `Oracle did not accept ${ym.month}/${ym.year} — got ${rec0.after || "nothing"}`; }
           else rec0.detail = `month+year pair set from ${JSON.stringify(String(ym.month) + "/" + ym.year)} (halves identified by their own option lists)`;
@@ -8277,8 +8287,23 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     rec.resolved = candidates;
     const want = candidates.find((c) => c === "Yes" || c === "No") || candidates[0];
     const r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
-    await act.delay(150);
-    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    // ⚠⚠ POLL THE READ-BACK — a single read after a fixed delay is the one thing the standing pacing
+    // rule forbids, and it bit exactly as predicted. Live 2026-08-20 on ORC, two of three required
+    // yes/no questions came back `needs_review · yes/no click not reflected (read null)` at 22ms,
+    // on a run where the identical fields had committed cleanly minutes earlier at 31ms. ORC's pill
+    // flips its `aria-pressed` on a Knockout re-render, so 150ms is sometimes simply early — and the
+    // cost of being early here is a REQUIRED field reported unfilled, with the AI's answer discarded
+    // after it had already been paid for.
+    //
+    // Ashby is on this path too and only gains: the loop exits the moment the value agrees, so a
+    // widget that was already fast is not slowed, and one that is slow now succeeds instead of
+    // failing. The predicate is monotone — the value can only be noticed late, never missed.
+    let back = null;
+    for (let i = 0; i < 10; i++) {
+      await act.delay(150);
+      back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+      if (back && back.ok && atsLib.normalize(String(back.value || "")) === atsLib.normalize(want)) break;
+    }
     rec.after = back && back.ok ? back.value : null;
     rec.options = f.options || ["Yes", "No"];
     const okv = !!(r && r.ok) && atsLib.normalize(String(rec.after || "")) === atsLib.normalize(want);

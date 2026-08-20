@@ -3862,3 +3862,45 @@ test("atsInjOrcTiles: a committed entry is a TILE whose controls are ICON-ONLY",
     'a one-character tile text (the skill "C", or R, or Go) must not be discarded');
   assert.ok(!/txt\.length > 1/.test(src), "the `> 1` guard is the bug, not the fix");
 });
+
+
+// ── what reaches the review page is the APPLICATION'S ANSWER, not a log line ──────────────
+test("the ORC date pair reaches review as a readable value, not a debug string", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf('spec.kind === "date_pair" && group.length >= 2');
+  assert.ok(i > 0, "the date-pair branch must exist");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const branch = stripComments(src.slice(i, i + 9000));   // the branch is ~85 lines long
+
+  // ⚠ it used to write `month="May" year="2026"` — my own debug string — which the review editor
+  // rendered as a TEXT BOX of raw markup and a submit replay would have typed at the form verbatim.
+  // `current_value` is copied straight from `rec.after`, so anything convenient for a log becomes
+  // the application's answer.
+  assert.ok(!/\$\{half\.kind\}=/.test(branch),
+    'the record must not carry `month="…" year="…"` — that is a log format, and it lands in ' +
+    "current_value and then in the replay");
+  assert.ok(/\[got_by\.month, got_by\.year\]/.test(branch),
+    'the value must be the human-readable pair ("May 2026")');
+  // and the label must not be the raw platform name: these halves carry no label at all
+  assert.ok(/replace\(\/\(\[a-z\]\)\(\[A-Z\]\)\//.test(branch),
+    'the label must split camelCase so review shows "Start Date", not "startDate"');
+});
+
+test("the yes/no commit POLLS its read-back rather than reading once after a fixed delay", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf('if (wt === "yesno") {');
+  assert.ok(i > 0);
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const branch = stripComments(src.slice(i, i + 1800));
+  // ⚠ a single read after a fixed delay is what the standing pacing rule forbids, and it bit:
+  // two of three REQUIRED ORC yes/no questions came back "click not reflected (read null)" at 22ms
+  // on a run where the same fields had committed at 31ms minutes earlier. ORC's pill flips its
+  // aria-pressed on a Knockout re-render.
+  assert.ok(/for \(let i = 0; i < \d+; i\+\+\)/.test(branch), "the read-back must be polled");
+  assert.ok(/break;/.test(branch),
+    "and it must exit the moment the value agrees, so a widget that was already fast is not slowed");
+});
