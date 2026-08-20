@@ -4767,7 +4767,10 @@ async function runOrcPreForm(tabId, credentials, opts) {
         : `did NOT change after ${ch.waitedMs}ms (${ch.readOk}/${ch.reads} reads landed)`);
 
   for (let round = 1; round <= MAX_ROUNDS; round++) {
-    const s = await cdpEval(atsInjOrcAuthScan).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+    // `let`, not `const`: the auth-field settle below re-reads the page and adopts the fresher scan,
+    // so the rest of the round reasons about what is on the page NOW rather than the read that was
+    // taken before the field mounted.
+    let s = await cdpEval(atsInjOrcAuthScan).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
     const view = orcApplyView(s);
     LOG(`round ${round}: view=${view}` + (s && s.ok ? ` (sections=${s.sectionCount} pins=${s.pinInputs} email=${!!s.emailInput} pass=${!!s.passwordInput})` : ` — ${(s && s.error) || "unreadable"}`));
     if (s && (s.decoys || []).length) {
@@ -4868,9 +4871,37 @@ async function runOrcPreForm(tabId, credentials, opts) {
       }
 
       // The write returns a LENGTH and a match boolean — never the string.
-      const target = view === "password" ? s.passwordInput : s.emailInput;
+      // ⚠⚠ A FIELD THAT IS NOT THERE YET IS NOT A FIELD THAT DOES NOT EXIST (live 2026-08-20).
+      // The run halted `auth-field-unaddressable` on the gate, and the scan line said exactly what
+      // had happened: `round 2: view=email (… email=false …)` — the view was recognised from the
+      // gate's own markers while its INPUT had not mounted, so the very next read found nothing to
+      // write to. This is the third time today the same shape has bitten (`view=none` on a
+      // half-rendered form, and the entry form judged absent because its Cancel button had not
+      // rendered): a conclusion drawn from one read of a page that is still arriving.
+      //
+      // So the field is polled to a budget, through the SAME scan the view came from, and only its
+      // continued absence is a halt. The halt then reports how long it waited, so a settled halt can
+      // never again be mistaken in the log for an instant one.
+      let target = view === "password" ? s.passwordInput : s.emailInput;
       const value = view === "password" ? credentials.password : credentials.email;
-      if (!target || !target.sel) return halt("auth-field-unaddressable", `Recognised the ${view} step but its input has no usable selector.`);
+      if (!target || !target.sel) {
+        const fT0 = Date.now(), FIELD_BUDGET = 15000;
+        let reads = 0;
+        while (Date.now() - fT0 < FIELD_BUDGET) {
+          await cdpDelay(600);
+          reads++;
+          const again = await cdpEval(atsInjOrcAuthScan).catch(() => null);
+          if (!again || !again.ok) continue;
+          const t2 = view === "password" ? again.passwordInput : again.emailInput;
+          if (t2 && t2.sel) { target = t2; s = again; break; }
+        }
+        if (!target || !target.sel) {
+          return halt("auth-field-unaddressable",
+            `Recognised the ${view} step but its input never became addressable — waited `
+            + `${((Date.now() - fT0) / 1000).toFixed(1)}s over ${reads} read(s).`);
+        }
+        LOG(`the ${view} field mounted after ${((Date.now() - fT0) / 1000).toFixed(1)}s — continuing`);
+      }
       const w = await cdpEval(atsInjSetCredential, target.sel, value).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
       if (!w || !w.ok) return halt("credential-write-failed", `Could not write the stored ${view === "password" ? "password" : "login email"} into ${target.sel}` + (w && w.error ? ` (${w.error})` : "") + ".");
       LOG(`wrote the stored ${view === "password" ? "password" : "login email"} (${w.len} chars) into ${target.sel}`);
