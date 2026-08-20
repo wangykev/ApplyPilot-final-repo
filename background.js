@@ -5346,7 +5346,20 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // ⚠ It requires the worker-timer polyfill, which iCIMS DECLINES so its captcha can initialise —
     // cdpDelay checks `_workerTimersActive` itself, so iCIMS simply keeps SW pacing and its
     // cdpSetFastWhenHidden compensation above is untouched.
-    cdpSetPageClock(true);
+    // ⚠ AND IT IS A/B-ABLE, because I could not settle it by measurement on a loaded machine.
+    // The page clock cured the operator's random lag (step 2 19.1s -> 8.2s on one run), but on a
+    // later run a plain `siteLink-1` text write cost 13.1s and step 1 cost 23.5s where the identical
+    // code path had cost 6.5s — and nothing in that change touches either. That is consistent with
+    // machine load, and ALSO consistent with a real trade: page-clock pacing turns every pace into a
+    // Runtime.evaluate, so on a renderer as busy as ORC's the paces can inherit the page's own
+    // slowness. Those two explanations cannot be separated on a machine that costs 13s for a text
+    // write, so the flag exists to separate them on one that does not — rather than my picking a
+    // side and writing a confident comment about it.
+    // `chrome.storage.local.atsPageClock = false` restores SW pacing for this path.
+    const pageClockPref = await new Promise((r) => chrome.storage.local.get(["atsPageClock"], (v) => r(v && v.atsPageClock)));
+    const usePageClock = pageClockPref !== false;      // default ON
+    cdpSetPageClock(usePageClock);
+    if (!usePageClock) LOG("[ATS-PACING] page clock DISABLED by atsPageClock=false — paces ride the service worker's clock");
     await cdpSetFocusEmulation(true).catch(() => {});
     // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
     // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
