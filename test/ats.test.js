@@ -4079,27 +4079,38 @@ test("the tile-match skip does not weaken the operator's delete-before-fill inst
 
 // ── three things that were flagged while being certain (operator, 2026-08-20) ────────────
 
-test("atsGeoAgreesWithProfile: FL and Florida are the SAME answer; a wrong value is not", () => {
-  const p = { personal_info: { city: "Tallahassee", state_province: "Florida", postal_code: "32312" } };
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("City", "Tallahassee", p), true);
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("City", "Orlando", p), false);
-  // ⚠ Oracle's cascade returns the ABBREVIATION while the profile stores the full name, so a raw
-  // compare called every state a mismatch. REGION_ABBREV is consulted both ways.
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("State", "FL", p), true);
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("State", "Florida", p), true);
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("State", "GA", p), false);
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("Postal Code", "32312", p), true);
-  // ⚠ NULL, not false, for a field the profile does not model — "we cannot check this" and "this is
-  // wrong" are different answers, and only the second is a review item.
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("County", "Leon", p), null);
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("City", "Tallahassee", {}), null, "no profile value ⇒ nothing to say");
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("City", "", p), null, "no live value ⇒ nothing to say");
-  // ⚠ THE SEMANTIC COMES FROM THE LABEL, because ORC's region1/region2 are deliberately unmapped —
-  // which is State and which is County varies by country and only the label distinguishes them.
-  assert.strictEqual(ats.atsGeoAgreesWithProfile("Province", "FL", p), true);
+test("atsGeoValueInProfile: does the profile CONTAIN this value — no label patterns, no per-field map", () => {
+  const p = { personal_info: { city: "Tallahassee", state_province: "Florida", postal_code: "32312",
+                               country: "United States", address_line_1: "715 Middlebrooks Circle" } };
+  // ⚠ NO LABEL PATTERNS (operator's instruction). The first version matched the label against
+  // /city|state|county|postal/ and looked each up under a named profile key — a list that has to be
+  // extended for every tenant's wording and every locale's idea of a region, and which silently
+  // answers "no opinion" the moment a label is worded unexpectedly.
+  assert.strictEqual(ats.atsGeoValueInProfile("Tallahassee", p), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("32312", p), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("United States", p), true);
+  // the ONLY normalization is FORM: "FL" and "Florida" are the same answer, both directions
+  assert.strictEqual(ats.atsGeoValueInProfile("FL", p), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("Florida", p), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("FL", { personal_info: { state_province: "FL" } }), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("Florida", { personal_info: { state_province: "FL" } }), true);
+
+  // ⚠⚠ AND "NOT IN THE PROFILE" MEANS REVIEW — also the operator's instruction, and a correction to
+  // my first version, which CLEARED the County because Oracle had derived it from a verified anchor.
+  // That reasoning is not wrong, but it is reasoning: the profile is the authority on what the
+  // operator has actually told us, so a value it does not contain is something a human looks at once.
+  assert.strictEqual(ats.atsGeoValueInProfile("Leon", p), false, "a county the profile never mentions");
+  assert.strictEqual(ats.atsGeoValueInProfile("Orlando", p), false, "a wrong city");
+  assert.strictEqual(ats.atsGeoValueInProfile("GA", p), false, "a wrong state");
+  assert.strictEqual(ats.atsGeoValueInProfile("", p), false);
+  assert.strictEqual(ats.atsGeoValueInProfile("Tallahassee", {}), false, "no profile ⇒ nothing verified");
+
+  // it also draws on `locations`, so a value stated there counts
+  assert.strictEqual(ats.atsGeoValueInProfile("Pittsburgh",
+    { locations: [{ city: "Pittsburgh", state: "PA" }] }), true);
 });
 
-test("a cascade field that agrees is FILLED; one that disagrees is a real review item", () => {
+test("a cascade value the profile contains is FILLED; one it does not is a review item", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
   const i = src.indexOf("async function atsSurfacePrefilled");
   const stripComments = (t) => String(t)
@@ -4107,14 +4118,13 @@ test("a cascade field that agrees is FILLED; one that disagrees is a real review
     .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
   const body = stripComments(src.slice(i, src.indexOf("\n  return surfaced;", i)));
 
-  assert.ok(/agrees === true[\s\S]{0,220}status = "filled"/.test(body),
-    "agreement is verification — the value came from an anchor the profile itself supplied");
-  assert.ok(/agrees === false[\s\S]{0,220}geo-cascade-mismatch/.test(body),
-    "disagreement is a genuine review item and must be flagged as a MISMATCH, not as pre-populated");
-  // ⚠ a field the profile cannot check (County) is cleared only if the checkable siblings agreed —
-  // if the anchor's other outputs are wrong, everything it derived is suspect.
-  assert.ok(/cascadeTrustworthy = geoMismatch === 0 && geoAgreed > 0/.test(body),
-    "an unmodelled sibling may only be cleared when nothing disagreed AND something positively agreed");
+  assert.ok(/atsGeoValueInProfile\(v, profile\)[\s\S]{0,200}status = "filled"/.test(body),
+    "a value the profile contains is verified — the cascade ran off an anchor the profile supplied");
+  assert.ok(/geo-not-in-profile/.test(body),
+    "a value the profile does not contain must be flagged, and the flag must say WHY");
+  // ⚠ TWO STATES ONLY — no third bucket that gets cleared by reasoning about derived values.
+  assert.ok(!/cascadeTrustworthy|geoUnknown/.test(body),
+    "the derived-value clearing is gone: verified, or reviewed");
 });
 
 test("an UNCHECKED checkbox holds no value — `false` is not content", () => {
@@ -4163,4 +4173,43 @@ test("the ORC disability self-ID commits at a DETERMINISTIC tier, not containmen
     { fieldName: "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12", widgetType: "radio", label: "Do you have a disability?" },
     { self_identification: {} }, {}, {}, null, null);
   assert.strictEqual(r2.eeoUnstated, true);
+});
+
+
+// ── one predicate for "is this tier deterministic", and it must be ADDITIVE ──────────────
+test("atsTierIsDeterministic: keeps the ATS-local tier the shared grader has never heard of", () => {
+  // ⚠ Both choice-commit paths used to hardcode `exact-normalized || label-exact`, a list that
+  // cannot learn — so **polarity-lead**, the tier that exists precisely so a stored "No" can land
+  // "No, I do not have a disability and have not had one in the past" deterministically, was graded
+  // filled_review anyway.
+  assert.strictEqual(ats.atsTierIsDeterministic("polarity-lead"), true);
+  assert.strictEqual(ats.atsTierIsDeterministic("exact-normalized"), true);
+
+  // ⚠⚠ AND THIS IS WHY IT IS ADDITIVE RATHER THAN A SWAP: fill-driver's flagTierCategory returns
+  // `none` for label-exact, an ATS-LOCAL tier it has never seen. Swapping outright would have
+  // demoted every label-exact commit from filled to filled_review — a silent regression on
+  // Greenhouse, Lever and Ashby in the name of fixing Oracle.
+  const fd = require("../fill-driver.js");
+  assert.strictEqual(fd.flagTierCategory("label-exact"), "none", "the shared grader does not know it");
+  assert.strictEqual(ats.atsTierIsDeterministic("label-exact"), true, "…and this predicate must");
+
+  // everything that IS a guess stays flagged
+  for (const t of ["containment", "fuzzy", "autocommit", "skills-containment", undefined, null, ""]) {
+    assert.strictEqual(ats.atsTierIsDeterministic(t), false, String(t) + " must stay flagged");
+  }
+});
+
+test("both choice-commit paths grade through the one predicate", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const code = stripComments(src);
+  const hardcoded = [...code.matchAll(/=== "exact-normalized" \|\| \w+(\.\w+)? === "label-exact"/g)];
+  assert.strictEqual(hardcoded.length, 1,
+    "the tier pair may appear ONCE, inside atsTierIsDeterministic — found " + hardcoded.length +
+    " site(s), so a commit path is grading tiers on its own again");
+  assert.ok(/function atsTierIsDeterministic/.test(code));
+  assert.ok((code.match(/atsTierIsDeterministic\(/g) || []).length >= 3,
+    "both commit paths plus the definition must reference it");
 });

@@ -47,7 +47,9 @@ const atsFd = (typeof module !== "undefined" && module.exports)
       boolLadderCandidates: boolLadderCandidates, appendFieldVariants: appendFieldVariants,
       // The disability self-ID ladder: the stored wording FIRST, the bare polarity token LAST, so
       // POLARITY LEAD can commit it deterministically. See the ORA_DISABILITY_STATUS map entry.
-      selfIdDisabilityCandidates: selfIdDisabilityCandidates };
+      selfIdDisabilityCandidates: selfIdDisabilityCandidates,
+      // Grades a match tier as exact / containment / fuzzy / none. See atsTierIsDeterministic.
+      flagTierCategory: flagTierCategory };
 
 // ── ATS detection + URL shaping (pure) ───────────────────────────────────────────────────
 
@@ -7516,59 +7518,63 @@ async function atsCredentialRecheck(act, ats, scan, results, credentials) {
 // ⚠ RUNS AFTER THE AUDIT, deliberately: the audit compares `rec.after` against the page for fields WE
 // filled, and these are not those. Promoting them beforehand would audit the parse's work as if it were
 // ours and report `audit-mismatch` on values nobody claimed.
-// ⚠⚠ A CASCADE-FILLED GEO FIELD THAT AGREES WITH THE PROFILE IS NOT A REVIEW ITEM
-// (operator, 2026-08-20). Oracle fills City / State / County from the postal code, and the fill
-// deliberately never types into them (typing clears the anchor). atsSurfacePrefilled then surfaced
-// them as "PRE-POPULATED — double-check this field", so three fields were flagged on EVERY run while
-// being correct every time. Review fatigue is a real cost: three always-wrong-to-flag items teach
-// the operator to click past the panel that also carries the AI guesses.
+// ⚠⚠ IS THIS VALUE SOMETHING THE PROFILE ACTUALLY SAYS? (operator, 2026-08-20)
+// Oracle fills City / State / County from the postal code and the fill never types into them (typing
+// clears the anchor), so they arrived in review as "PRE-POPULATED — double-check this field" on every
+// run while being correct every time. Agreement with the profile is verification, not coincidence:
+// the value came from an anchor the profile itself supplied.
 //
-// So: compare the live value with the profile. Agreement is verification, not a coincidence — the
-// value came from an anchor the profile itself supplied.
+// ⚠ NO LABEL PATTERNS, NO PER-FIELD MAPPING — the operator's instruction, and the first version of
+// this got it wrong: it matched the label against /city|state|county|postal/ and looked each one up
+// under a named profile key. That is a list that has to be extended for every tenant's wording and
+// every locale's idea of a region, and it silently answers "no opinion" the moment a label is worded
+// unexpectedly. Instead: build the set of strings the profile's address ACTUALLY contains, and ask
+// whether the live value is one of them. A field whose value the profile does not contain is not
+// verifiable, whatever it happens to be called.
 //
-// ⚠ THE SEMANTIC COMES FROM THE **LABEL**, not the field name. ORC's `region1`/`region2` are
-// deliberately unmapped because which is State and which is County varies by country, and only the
-// rendered label distinguishes them. Reading it here is the same rule the map obeys by staying out.
+// ⚠ AND "NOT IN THE PROFILE" MEANS REVIEW — also the operator's instruction, and a correction to my
+// first version, which cleared the County because Oracle had derived it from a verified anchor. That
+// reasoning is not wrong, but it is REASONING, and the operator's rule is the safer one: the profile
+// is the authority on what the operator has actually told us, and a value it does not contain is
+// something a human should look at once. There is no third state here — verified, or reviewed.
 //
-// Returns TRUE (profile agrees), FALSE (profile says something else — a genuine review item), or
-// NULL (the profile does not model this field, so it has nothing to say).
-function atsGeoAgreesWithProfile(label, liveValue, profile) {
+// The only normalization is FORM: "FL" and "Florida" are the same answer, so each profile value
+// contributes its own spelling AND its abbreviation/expansion. That is data shape, not a per-field
+// rule, and it is what lets the State field verify at all.
+function atsProfileAddressValues(profile) {
   const pi = (profile && profile.personal_info) || {};
-  const L = String(label || "").toLowerCase();
-  const live = atsLib.normalize(String(liveValue == null ? "" : liveValue));
-  if (!live) return null;
-
-  const cmp = (want) => {
-    const w = atsLib.normalize(String(want == null ? "" : want));
-    if (!w) return null;                       // profile blank ⇒ nothing to say
-    return w === live;
-  };
-
-  if (/\bcity\b|\btown\b|municipal/.test(L)) return cmp(pi.city);
-  if (/postal|\bzip\b/.test(L)) return cmp(pi.postal_code);
-  if (/\bstate\b|province|region/.test(L)) {
-    const want = pi.state_province;
-    if (!want) return null;
-    if (cmp(want) === true) return true;
-    // ⚠ "FL" and "Florida" are the SAME ANSWER. Oracle's cascade returns the abbreviation while the
-    // profile stores the full name, so a raw compare called every state a mismatch. REGION_ABBREV is
-    // the table lib.js already keeps for exactly this, and it is consulted BOTH ways.
+  const out = new Set();
+  const add = (v) => {
+    const n = atsLib.normalize(String(v == null ? "" : v));
+    if (!n) return;
+    out.add(n);
+    // both directions through the region table, so a stored "Florida" also accepts "FL" and a stored
+    // "FL" also accepts "Florida"
     const ab = atsLib.REGION_ABBREV || {};
-    const full = atsLib.normalize(want);
-    const abbr = ab[full] ? atsLib.normalize(ab[full]) : null;
-    if (abbr && abbr === live) return true;
-    const fullFromLive = Object.keys(ab).find((k) => atsLib.normalize(ab[k]) === live);
-    if (fullFromLive && atsLib.normalize(fullFromLive) === full) return true;
-    return false;
+    if (ab[n]) out.add(atsLib.normalize(ab[n]));
+    const full = Object.keys(ab).find((k) => atsLib.normalize(ab[k]) === n);
+    if (full) out.add(atsLib.normalize(full));
+  };
+  // every address-ish value the profile holds, whatever the form chooses to call its fields
+  for (const k of ["city", "state_province", "postal_code", "country", "address_line_1", "address_line_2"]) add(pi[k]);
+  for (const loc of (Array.isArray(profile && profile.locations) ? profile.locations : [])) {
+    if (typeof loc === "string") { for (const part of loc.split(",")) add(part); }
+    else if (loc) { add(loc.city); add(loc.state); add(loc.state_province); add(loc.country); }
   }
-  // County, district, and anything else the profile does not model.
-  return null;
+  return out;
+}
+
+// TRUE when the profile contains this value, FALSE when it does not. Deliberately two-valued: a value
+// the profile does not contain is a review item, not an "unknown" to be reasoned about.
+function atsGeoValueInProfile(liveValue, profile) {
+  const live = atsLib.normalize(String(liveValue == null ? "" : liveValue));
+  if (!live) return false;
+  return atsProfileAddressValues(profile).has(live);
 }
 
 async function atsSurfacePrefilled(act, ats, scan, results, profile) {
   const fields = (scan && scan.fields) || [];
-  let surfaced = 0, geoAgreed = 0, geoMismatch = 0;
-  const geoUnknown = [];
+  let surfaced = 0, geoAgreed = 0, geoUnverified = 0;
   for (const rec of results) {
     if (!rec || rec.credential) continue;
     // Only records that claim NOTHING: a skip, or a review item we could not give a value to.
@@ -7602,37 +7608,28 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile) {
     const v = live.value == null ? "" : String(live.value).trim();
     if (!v || v === "false") continue;
 
-    // ⚠⚠ A CASCADE-FILLED GEO FIELD THAT AGREES WITH THE PROFILE IS NOT A REVIEW ITEM. See
-    // atsGeoAgreesWithProfile: the value came from an anchor the profile itself supplied, so
-    // agreement is verification rather than coincidence. Three fields were being flagged on every
-    // run while being correct every time, which teaches the operator to click past the same panel
-    // that carries the AI guesses.
+    // ⚠ TWO STATES ONLY: either the profile CONTAINS this value (verified — the cascade was driven
+    // by an anchor the profile itself supplied) or it does not (a review item). No label patterns and
+    // no reasoning about derived values; see atsGeoValueInProfile.
     if (f.geoDependent) {
-      const agrees = atsGeoAgreesWithProfile(f.label || rec.label, v, profile);
       rec.after = v;
       rec.verified = true;
-      if (agrees === true) {
+      if (atsGeoValueInProfile(v, profile)) {
         rec.status = "filled";
         rec.flag = null;
         rec.detail = "Oracle filled this from " + (f.geoAnchorName || "the postal code")
-          + ", and it MATCHES your profile — verified, nothing to check";
+          + ", and your profile contains this value — verified, nothing to check";
         geoAgreed++;
-        continue;
-      }
-      if (agrees === false) {
-        // A REAL review item: the cascade produced something your profile contradicts.
+      } else {
         rec.status = "needs_review";
-        rec.flag = "geo-cascade-mismatch";
+        rec.flag = "geo-not-in-profile";
         rec.detail = "Oracle filled this from " + (f.geoAnchorName || "the postal code")
-          + " as " + JSON.stringify(v) + ", which does NOT match your profile — check which is right";
-        geoMismatch++; surfaced++;
-        continue;
+          + " as " + JSON.stringify(v) + ", and your profile does not contain that value — check it here";
+        geoUnverified++; surfaced++;
       }
-      // agrees === null — the profile does not model this field (a County, typically). Held for the
-      // second pass below, which can only clear it once the fields that COULD be checked have agreed.
-      geoUnknown.push({ rec, f, v });
       continue;
     }
+
 
     rec.status = "filled_review";
     rec.flag = "already-filled";
@@ -7644,35 +7641,11 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile) {
       + ". Your profile had no answer to overwrite it with, so check it or replace it here.";
     surfaced++;
   }
-  // ⚠ A FIELD THE PROFILE DOES NOT MODEL (County) IS CLEARED ONLY IF ITS CHECKABLE SIBLINGS AGREED.
-  // The county is Oracle's OWN lookup from the postal code — we did not guess it — but that is only
-  // reassuring while the cascade is demonstrably producing the right answers. If City or State
-  // disagreed with the profile then the anchor itself is in doubt, and everything it derived has to
-  // be looked at. So: no mismatches anywhere AND at least one sibling positively verified.
-  const cascadeTrustworthy = geoMismatch === 0 && geoAgreed > 0;
-  for (const g of geoUnknown) {
-    g.rec.after = g.v;
-    g.rec.verified = true;
-    if (cascadeTrustworthy) {
-      g.rec.status = "filled";
-      g.rec.flag = null;
-      g.rec.detail = "Oracle derived this from " + (g.f.geoAnchorName || "the postal code")
-        + ", which your profile supplied and whose other outputs match your profile — your profile does not"
-        + " record this field, so there is nothing to check it against and nothing was guessed";
-    } else {
-      g.rec.status = "filled_review";
-      g.rec.flag = "already-filled";
-      g.rec.detail = "Oracle filled this from " + (g.f.geoAnchorName || "the postal code")
-        + ", and your profile does not record it — check it here"
-        + (geoMismatch ? " (another field from the same cascade did NOT match your profile)" : "");
-      surfaced++;
-    }
+  if (geoAgreed || geoUnverified) {
+    try { console.log(`[ApplyPilot][ATS-FILL] geo cascade: ${geoAgreed} value(s) your profile CONTAINS (not flagged)`
+      + `${geoUnverified ? `, ${geoUnverified} it does NOT (flagged for review)` : ""}`); } catch (e) { /* log only */ }
   }
-  if (geoAgreed || geoUnknown.length || geoMismatch) {
-    try { console.log(`[ApplyPilot][ATS-FILL] geo cascade: ${geoAgreed} field(s) MATCH your profile (not flagged)`
-      + `${geoMismatch ? `, ${geoMismatch} DISAGREE (flagged)` : ""}`
-      + `${geoUnknown.length ? `, ${geoUnknown.length} the profile does not record (${cascadeTrustworthy ? "cleared — the cascade's checkable outputs all matched" : "flagged"})` : ""}`); } catch (e) { /* log only */ }
-  }
+
   if (surfaced) {
     try { console.log(`[ApplyPilot][ATS-FILL] ${surfaced} field(s) the form had ALREADY populated are now IN review with their live value — previously they were recorded blank and would have been submitted unseen`); } catch (e) { /* log only */ }
   }
@@ -7862,6 +7835,26 @@ async function atsCommitYesNo(act, ats, ref, want, wt) {
     detail: ok
       ? (presses > 1 ? "took " + presses + " press(es) — the first did not register" : null)
       : "yes/no click not reflected after " + presses + " press(es) over 8s (read " + JSON.stringify(value) + ")" };
+}
+
+// ⚠⚠ IS THIS TIER DETERMINISTIC — i.e. does it commit `filled` rather than `filled_review`?
+// Both choice-commit paths used to hardcode `tier === "exact-normalized" || tier === "label-exact"`,
+// which is a list that cannot learn. Live 2026-08-20: the disability self-ID matched at
+// **polarity-lead** — the tier that exists precisely so a stored "No" can land "No, I do not have a
+// disability and have not had one in the past" DETERMINISTICALLY — and the hardcoded pair graded it
+// `filled_review` anyway. The operator asked the right question: "it filled deterministically, why
+// is that for review."
+//
+// ⚠ IT IS ADDITIVE, NOT A SWAP. `flagTierCategory` is fill-driver's shared grader and it returns
+// `exact` for exact-normalized and polarity-lead — but `none` for **label-exact**, which is an
+// ATS-LOCAL tier it has never heard of. Replacing the pair outright would therefore have demoted
+// every label-exact commit from filled to filled_review: a silent regression on Greenhouse, Lever
+// and Ashby, in the name of fixing Oracle. So the ATS-local tier stays named here and the shared
+// grader is consulted for everything else, which means a future tier it calls exact is picked up for
+// free while nothing already working changes.
+function atsTierIsDeterministic(tier) {
+  if (tier === "exact-normalized" || tier === "label-exact") return true;
+  try { return atsFd.flagTierCategory(tier) === "exact"; } catch (e) { return false; }
 }
 
 // Actuate one field with the resolved candidates. Returns true when it produced an outcome
@@ -8777,7 +8770,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // clicked is still strong evidence of the right commit (a wrong option isn't a superstring).
     const okv = backNorm === wantNorm || (backNorm && wantNorm.includes(backNorm)) || (wt === "location" && !!backNorm);
     if (c && c.ok && okv) {
-      rec.status = hit.tier === "exact-normalized" || hit.tier === "label-exact" ? "filled" : "filled_review";
+      rec.status = atsTierIsDeterministic(hit.tier) ? "filled" : "filled_review";
       rec.matchTier = hit.tier; rec.verified = true;
       // Record the COMMITTED OPTION TEXT, not the chip display: the dial chip renders "+1"
       // while the option we clicked is "United States +1" — a bundle holding "+1" can never
@@ -8861,7 +8854,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // equal value also reads correct — same "state, not click outcome" rule as Workday).
     const readNorm = atsLib.normalize(String(rec.after || ""));
     const okv = readNorm === atsLib.normalize(pick) || (!!(r && r.ok) && readNorm.includes(atsLib.normalize(pick).slice(0, 40)));
-    rec.status = okv ? (tier === "exact-normalized" || tier === "label-exact" ? "filled" : "filled_review") : "needs_review";
+    rec.status = okv ? (atsTierIsDeterministic(tier) ? "filled" : "filled_review") : "needs_review";
     // RECORD THE OPTION WE CHOSE, not the read-back display — the dial-chip rule, earned again on a
     // radio. Lever's EEO options render their whole DESCRIPTION inside the label ("Asian (Not
     // Hispanic or Latino)A person having origins in any of the original peoples of the Far East…"),
@@ -9117,7 +9110,7 @@ if (typeof module !== "undefined" && module.exports) {
     detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue, atsFirstWebsiteValue, atsProfileWebsites,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
-    atsGeoAgreesWithProfile,
+    atsGeoValueInProfile, atsProfileAddressValues, atsTierIsDeterministic,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
     atsInjLeanSignature,
