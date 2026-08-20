@@ -4476,6 +4476,88 @@ function atsInjOrcScrollBlocks(titles) {
   return { ok: true, scrolled: n };
 }
 
+// ⚠⚠ A COMMITTED ENTRY IS A **TILE**, AND ITS CONTROLS ARE ICON-ONLY (live 2026-08-20).
+// Measured on a returning candidate's form:
+//   <button class="apply-flow-profile-item-tile__edit-item-icon"  aria-label="Edit">    (no text)
+//   <button class="apply-flow-profile-item-tile__delete-icon"     aria-label="Delete">  (no text)
+//   …and the Add control is button.apply-flow-profile-item-tile__new-tile ("Add Experience")
+// The tile's own text is the entry summary:
+//   "Characterization and Test Automation Intern Rivian and Volkswagon Technologies 05/2026 - 08/2026"
+//
+// The first attempt at detecting pre-existing entries matched button CAPTIONS against
+// /^(edit|delete|remove)/ and counted ZERO, because these buttons have no textContent at all — so the
+// guard did not fire and a second run duplicated the history again. The label is in `aria-label`
+// and `title`, never in the text. Skills render ONE TILE PER SKILL, which is what makes
+// "only add the ones that are missing" possible at all.
+function atsInjOrcTiles(blockTitlePattern) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const block = [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  if (!block) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+
+  // A tile is identified by its DELETE control, then walked up to the smallest ancestor that holds
+  // exactly that one control — the tile itself. Keyed off the control rather than a tile class so a
+  // tenant that renames the wrapper still works.
+  const dels = [...block.querySelectorAll("button, a[role=button]")].filter(vis)
+    .filter((b) => /delete|remove/i.test(String(b.getAttribute("aria-label") || b.getAttribute("title") || "")));
+  const tiles = dels.map((del) => {
+    let tile = del.parentElement;
+    for (let i = 0; i < 5 && tile; i++) {
+      if (tile.querySelectorAll("button, a[role=button]").length > 3) break;   // walked too far — into the block
+      const txt = t(tile);
+      // ⚠ `> 0`, NOT `> 1`. The text is already trimmed, so a length test above zero drops nothing
+      // real — and `> 1` dropped the skill **"C"**, which came back as "" and would have looked
+      // ABSENT on every visit, re-added forever. One-character skills are ordinary (C, R, Go).
+      if (txt && txt.length > 0) return { text: txt.slice(0, 140) };
+      tile = tile.parentElement;
+    }
+    return { text: t(del.parentElement).slice(0, 140) };
+  });
+  const add = [...block.querySelectorAll("button, a[role=button]")].filter(vis)
+    .find((b) => /^add\b/i.test(t(b)));
+  return { ok: true, count: tiles.length, tiles, addCaption: add ? t(add) : null };
+}
+
+// Press a tile's Delete, then REPORT whatever appeared. ORC may put a confirmation in front of it,
+// and a surprise modal is exactly what wedges a run — so this never assumes, it describes.
+// ⚠ It reports the dialog rather than dismissing it: the judgement about pressing a confirm belongs
+// SW-side, like every other consequential decision in this file.
+function atsInjOrcDeleteTile(blockTitlePattern, index) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const block = [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  if (!block) return { ok: false, error: "block-not-found" };
+  const dels = [...block.querySelectorAll("button, a[role=button]")].filter(vis)
+    .filter((b) => /delete|remove/i.test(String(b.getAttribute("aria-label") || b.getAttribute("title") || "")));
+  const i = index == null ? dels.length - 1 : index;      // last-first keeps earlier indexes stable
+  if (i < 0 || i >= dels.length) return { ok: false, error: "no-such-tile", count: dels.length };
+  dels[i].click();
+  const dlg = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], oj-dialog')].filter(vis);
+  return { ok: true, remaining: dels.length - 1,
+    dialog: dlg.length ? { present: true, text: t(dlg[0]).slice(0, 160),
+      buttons: [...dlg[0].querySelectorAll("button")].filter(vis).map((b) => t(b)).slice(0, 6) } : { present: false } };
+}
+
+// Press a named control inside a visible dialog. Separate from the delete so the caller decides.
+function atsInjOrcDialogPress(patternSource) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(patternSource, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const dlg = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], oj-dialog')].filter(vis)[0];
+  if (!dlg) return { ok: false, error: "no-dialog" };
+  const hit = [...dlg.querySelectorAll("button")].filter(vis).find((b) => re.test(t(b)));
+  if (!hit) return { ok: false, error: "no-button", offered: [...dlg.querySelectorAll("button")].filter(vis).map((b) => t(b)).slice(0, 6) };
+  hit.click();
+  return { ok: true, pressed: t(hit) };
+}
+
 function atsInjOrcEntryState(blockTitlePattern) {
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -4737,29 +4819,85 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       log(`⚠ ${item.block}: profile has ${item.capped} entries and the cap is ${ATS_ORC_ENTRY_MAX} — filling ${item.want}, the rest are NOT on the form`);
       notes.push(`${item.block}: only ${item.want} of ${item.capped} entries filled (cap)`);
     }
-    // ⚠⚠ NEVER ADD ON TOP OF ENTRIES THAT ARE ALREADY THERE. Live 2026-08-20: a run landed on a form
-    // Oracle had PREFILLED from an existing candidate record and this loop pressed Add three times
-    // anyway, leaving TWO copies of every job on a real application.
+    // ⚠⚠ RECONCILE BEFORE FILLING — the form arrives PREPOPULATED (operator, 2026-08-20).
+    // Oracle keeps a candidate record, so a RETURNING applicant's Experience / Education / Skills
+    // blocks already hold tiles, and pressing Add once per profile entry left TWO copies of every job
+    // on a real application. This is Workday's rule verbatim — "reconcile to exactly N, then fill each
+    // entry — true idempotency, proven from ARBITRARY dirty state" — and only the second half of it
+    // had ever been built here.
     //
-    // The conservative rule until a populated block has been properly observed: if the block already
-    // holds entries, TOUCH NOTHING and say so. A duplicate is worse than a gap in both directions —
-    // it is a false statement about the applicant's history, it is invisible in our own log (every
-    // entry "committed" successfully), and the operator has to delete rows by hand. A skip is visible,
-    // costs nothing false, and reaches review.
+    // ⚠ The FIRST attempt at detecting this counted button CAPTIONS matching /^(edit|delete|remove)/
+    // and found ZERO, so a second run duplicated the history again: a committed entry's controls are
+    // ICON-ONLY, with the word in `aria-label` and nothing in textContent. Measured, not guessed.
     //
-    // ⚠ Deliberately NOT "add the difference": with no way yet to tell WHICH entries are present, N-M
-    // more Adds can still duplicate. That needs the reconcile the discovery log below is for.
-    const pre = await act.eval(atsInjOrcEntryState, item.pattern).catch(() => null);
-    const already = pre && pre.ok ? Number(pre.entryControls || 0) : 0;
-    if (already > 0) {
-      log(`⚠ ${item.block}: the form ALREADY holds entries here (${already} row control(s): ${JSON.stringify((pre.entryControlCaptions || []).slice(0, 6))}) — adding ${item.want} more would DUPLICATE them, so this block is left untouched`);
-      log(`   ${item.block} — captions present: ${JSON.stringify(pre.allCaptions || [])}`);
-      notes.push(`${item.block}: left untouched — the form already had ${already} entry row control(s) (a prefilled/returning application); ${item.want} profile entr(y/ies) NOT added, so check this section by hand`);
-      continue;
+    // ⚠⚠ TWO DIFFERENT POLICIES, on the operator's instruction, because the blocks mean different
+    // things:
+    //   • HISTORY (Experience / Education / Licenses) — DELETE the old tiles, then fill from the
+    //     profile. The profile is the source of truth for a history, and a stale tile from an earlier
+    //     application is not something to merge with: keeping it risks an outdated employer, an old
+    //     end date, or a job the operator has since removed.
+    //   • SKILLS — ADD ONLY WHAT IS MISSING. A skills list is a SET, so deleting and re-adding eight
+    //     tiles to reach the same set is pure page contact — and the profile's 33 skills are CAPPED at
+    //     8, so deleting first would throw away skills the operator had that we could not restore.
+    const tiles0 = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
+    const present = (tiles0 && tiles0.ok && tiles0.tiles) || [];
+    const isSkills = item.source === "skills";
+
+    if (present.length && !isSkills) {
+      log(`${item.block}: ${present.length} existing tile(s) on the form — deleting before filling: ${JSON.stringify(present.map((x) => x.text.slice(0, 50)))}`);
+      let removed = 0;
+      // LAST-FIRST so earlier indexes stay valid, and gated on the count actually DROPPING — a delete
+      // that did not take must stop the loop rather than spin it.
+      for (let guard = 0; guard < present.length + 4; guard++) {
+        const before = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
+        const n = before && before.ok ? before.count : 0;
+        if (!n) break;
+        const del = await act.eval(atsInjOrcDeleteTile, item.pattern, null).catch(() => null);
+        if (!del || !del.ok) { log(`⛔ ${item.block}: could not press Delete (${(del && del.error) || "unknown"})`); break; }
+        // ⚠ A CONFIRMATION MAY APPEAR, and a surprise modal is what wedges a run. The primitive
+        // REPORTS it rather than dismissing it; the decision to confirm a delete belongs here.
+        if (del.dialog && del.dialog.present) {
+          log(`${item.block}: a confirmation appeared — ${JSON.stringify(del.dialog.text)} offering ${JSON.stringify(del.dialog.buttons)}`);
+          const okd = await act.eval(atsInjOrcDialogPress, "^(yes|delete|remove|confirm|ok)\\b").catch(() => null);
+          if (!okd || !okd.ok) { log(`⛔ ${item.block}: the confirmation could not be answered (${(okd && okd.error) || "unknown"}) — stopping`); break; }
+        }
+        let dropped = false;
+        for (let w = 0; w < 12; w++) {
+          await act.delayFull(300);
+          const after = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
+          if (after && after.ok && after.count < n) { dropped = true; removed++; break; }
+        }
+        if (!dropped) { log(`⛔ ${item.block}: pressed Delete but the tile count did not drop from ${n} — stopping rather than spinning`); break; }
+      }
+      const leftover = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
+      const still = leftover && leftover.ok ? leftover.count : -1;
+      log(`${item.block}: deleted ${removed} of ${present.length} existing tile(s)${still > 0 ? ` — ${still} could NOT be removed` : ""}`);
+      if (still > 0) {
+        // ⚠ DO NOT FILL ON TOP OF WHAT WE COULD NOT CLEAR — that is precisely the duplicate this
+        // block exists to prevent, and a PARTIAL clear is exactly when it would happen quietly.
+        notes.push(`${item.block}: ${still} pre-existing entr(y/ies) could not be deleted, so nothing was added — check this section by hand`);
+        continue;
+      }
     }
-    for (let i = 0; i < item.want; i++) {
+
+    // SKILLS: the set already on the form, so only the missing ones get added.
+    const haveSkills = isSkills ? present.map((x) => atsLib.normalize(x.text)).filter(Boolean) : [];
+    if (isSkills && haveSkills.length) {
+      log(`${item.block}: ${haveSkills.length} skill(s) already on the form — only missing ones will be added: ${JSON.stringify(present.map((x) => x.text).slice(0, 10))}`);
+    }
+    let added = 0;
+    for (let i = 0; i < arr.length && added < item.want; i++) {
       const entry = arr[i];
-      const tag = `${item.block} entry ${i + 1}`;
+      // ⚠ A SKILL ALREADY ON THE FORM IS SKIPPED, NOT RE-ADDED (operator, 2026-08-20). The cap counts
+      // what we ADD, which is why this walks the whole profile list and stops once `want` NEW ones are
+      // in — capping the loop at `want` iterations instead would let eight already-present skills
+      // consume the entire budget and add nothing at all.
+      if (isSkills && typeof entry === "string" && haveSkills.indexOf(atsLib.normalize(entry)) !== -1) {
+        log(`  ${item.block}: "${entry}" is already on the form — skipped`);
+        continue;
+      }
+      added++;
+      const tag = `${item.block} entry ${added}`;
 
       // ── OPEN ────────────────────────────────────────────────────────────────────────
       const opened = await act.eval(atsInjOrcEntryAction, item.pattern, "open").catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
@@ -8383,7 +8521,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE, atsInjOrcBlocks, atsOrcEntryValue, atsOrcFillEntries,
-    atsInjOrcUnclaimed, atsInjOrcScrollBlocks,
+    atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,

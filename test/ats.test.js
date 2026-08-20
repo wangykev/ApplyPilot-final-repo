@@ -3810,7 +3810,7 @@ test("the Hispanic/Latino question is recognized by its OPTIONS when the label w
 // rule is "reconcile to exactly N, then fill each entry — true idempotency, proven from ARBITRARY
 // dirty state"; only the second half of that had been built for ORC. Add-N-times is correct on a
 // blank form and duplicates on every other kind.
-test("the ORC entry pass refuses to add when the block already holds entries", () => {
+test("the ORC entry pass RECONCILES before filling — and history and skills get different policies", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
   const stripComments = (t) => String(t)
     .replace(/\/\*[\s\S]*?\*\//g, " ")
@@ -3818,29 +3818,47 @@ test("the ORC entry pass refuses to add when the block already holds entries", (
   const i = src.indexOf("async function atsOrcFillEntries");
   const pass = stripComments(src.slice(i, src.indexOf("\nfunction atsOrcEntryPlan", i)));
 
-  // it must READ the block before adding anything…
-  assert.ok(/const pre = await act\.eval\(atsInjOrcEntryState/.test(pass),
-    "the pass must read the block's existing state BEFORE pressing Add");
-  // …and bail out of the whole block when entries are present
-  assert.ok(/already > 0/.test(pass) && /continue;/.test(pass),
-    "a block that already holds entries must be left untouched");
-  // ⚠ and it must NOT try to be clever by adding the difference: with no way yet to tell WHICH
-  // entries are present, N-M more Adds can still duplicate.
-  assert.ok(!/item\.want - already|want - already/.test(pass),
-    "adding the DIFFERENCE is not safe without knowing which entries are present — that needs a real " +
-    "reconcile, not arithmetic");
-  // the skip must be reported, not silent: a duplicate is invisible in our own log (every entry
-  // "committed" fine), so the skip is the only thing that can make the state visible
-  assert.ok(/notes\.push\(/.test(pass), "the skip must reach the run's notes, not just the console");
+  // it must READ the tiles already on the form before adding anything
+  assert.ok(/const tiles0 = await act\.eval\(atsInjOrcTiles/.test(pass),
+    "the pass must read the block's existing TILES before pressing Add — a returning candidate's form " +
+    "arrives prepopulated, and Add-once-per-profile-entry duplicated every job on a real application");
+
+  // HISTORY: delete first
+  assert.ok(/atsInjOrcDeleteTile/.test(pass), "history blocks must DELETE existing tiles before filling");
+  // …last-first, and gated on the count actually dropping rather than on a delay
+  assert.ok(/after\.count < n/.test(pass),
+    "each delete must be confirmed by the tile count DROPPING — a delete that did not take must stop " +
+    "the loop rather than spin it");
+  // a confirmation dialog is answered here, not inside the injected primitive
+  assert.ok(/del\.dialog && del\.dialog\.present/.test(pass) && /atsInjOrcDialogPress/.test(pass),
+    "a delete confirmation must be REPORTED by the primitive and decided SW-side");
+  // ⚠ and a PARTIAL clear must not be filled on top of — that is the duplicate this exists to prevent
+  assert.ok(/still > 0/.test(pass) && /continue;/.test(pass),
+    "if tiles could not be cleared, nothing may be added on top of them");
+
+  // SKILLS: add only what is missing, never delete
+  assert.ok(/const isSkills = item\.source === "skills"/.test(pass), "skills must be distinguished");
+  assert.ok(/present\.length && !isSkills/.test(pass),
+    "the DELETE path must be gated OFF for skills: a skills list is a SET, and the profile's skills are " +
+    "capped, so deleting first would discard skills we could not restore");
+  assert.ok(/haveSkills\.indexOf\(atsLib\.normalize\(entry\)\) !== -1/.test(pass),
+    "a skill already on the form must be skipped, not re-added");
+  // the cap must count ADDITIONS, or already-present skills eat the whole budget
+  assert.ok(/added < item\.want/.test(pass),
+    "the loop must stop after `want` NEW entries — capping the iteration count instead would let eight " +
+    "already-present skills consume the budget and add nothing");
 });
 
-test("atsInjOrcEntryState reports pre-existing entry rows, and describes a populated block", () => {
-  const src = String(ats.atsInjOrcEntryState);
-  assert.ok(/entryControls/.test(src), "it must count the per-row controls a committed entry renders");
-  assert.ok(/edit\|delete\|remove/i.test(src),
-    "a saved entry leaves no live inputs, so its per-row controls are the only count available");
-  // discovery-first: the structure of a POPULATED block has never been observed, so one run must
-  // describe it completely
-  assert.ok(/entryControlCaptions/.test(src) && /allCaptions/.test(src),
-    "the captions must come back so a single run describes a populated block for the real reconcile");
+test("atsInjOrcTiles: a committed entry is a TILE whose controls are ICON-ONLY", () => {
+  const src = String(ats.atsInjOrcTiles);
+  // ⚠ THE LABEL IS IN aria-label / title, NEVER IN textContent. The first version of this detector
+  // matched button CAPTIONS against /^(edit|delete|remove)/ and counted ZERO on a form that plainly
+  // held three jobs, so the guard never fired and a second run duplicated the history again.
+  assert.ok(/getAttribute\("aria-label"\)/.test(src) && /getAttribute\("title"\)/.test(src),
+    "tiles must be found by their controls' aria-label/title — these buttons have NO text at all");
+  // ⚠ and a ONE-CHARACTER tile text must survive: the skill "C" came back as "" under a `length > 1`
+  // guard, which would make it look ABSENT on every visit and be re-added forever.
+  assert.ok(/txt\.length > 0/.test(src),
+    'a one-character tile text (the skill "C", or R, or Go) must not be discarded');
+  assert.ok(!/txt\.length > 1/.test(src), "the `> 1` guard is the bug, not the fix");
 });
