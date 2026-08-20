@@ -11,6 +11,10 @@ data/*
 # Dev tooling (tests) — the extension itself ships no node_modules.
 node_modules/
 
+# Web Store build output (scripts/build-store-zip.mjs). Regenerable, and the zip is a
+# build artifact, not source — keep it out of git so a stale one can't be uploaded.
+dist/
+
 # Any local secrets dropped in secrets/ (guard). NOTE: the extension SIGNING KEY
 # (ext-key.pem) is stored OUTSIDE this folder entirely — Chrome warns if a .pem sits
 # in a loaded unpacked extension, and it must never be packaged. See docs/gmail-setup.md.
