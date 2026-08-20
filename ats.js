@@ -4493,7 +4493,22 @@ function atsInjOrcEntryState(blockTitlePattern) {
       role: e.getAttribute("role") || null,
       label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
       value: e.value || null }));
+  // ⚠⚠ WHAT IS ALREADY HERE? (live 2026-08-20) A run landed on a form Oracle had PREFILLED from an
+  // existing candidate record, and the pass pressed Add three times on top of it — leaving TWO copies
+  // of every job. Workday's repeating-section rule is "reconcile to exactly N, then fill each entry —
+  // true idempotency, proven from ARBITRARY dirty state", and only the second half of that was ever
+  // built here. Add-N-times is correct on a blank form and duplicates on every other kind.
+  //
+  // Counting is a READ, and it is reported rather than interpreted: `entryControls` are the per-row
+  // controls a committed entry renders (Edit / Delete / Remove), which is the only count available —
+  // a saved entry leaves no live inputs behind. The captions come back too, because the structure of a
+  // POPULATED block has never been observed and this log is what will describe it.
+  const rowCtl = [...block.querySelectorAll("button, a[role=button]")].filter(vis)
+    .map((b) => t(b)).filter((c) => /^(edit|delete|remove)\b/i.test(c));
   return { ok: true, title: t(block.querySelector("apply-flow-block-title")), open, buttons, fields,
+    entryControls: rowCtl.length, entryControlCaptions: rowCtl.slice(0, 8),
+    // every distinct caption in the block, so one run describes a populated block completely
+    allCaptions: buttons.slice(0, 12),
     // rows already committed: a saved entry leaves no live inputs, so the block's own list length is
     // the only count available. Reported, not interpreted.
     addCaption: buttons.find((c) => /^add\b/i.test(c)) || null };
@@ -4721,6 +4736,26 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       // NO SILENT CAPS — the standing rule. Whatever a cap drops is named.
       log(`⚠ ${item.block}: profile has ${item.capped} entries and the cap is ${ATS_ORC_ENTRY_MAX} — filling ${item.want}, the rest are NOT on the form`);
       notes.push(`${item.block}: only ${item.want} of ${item.capped} entries filled (cap)`);
+    }
+    // ⚠⚠ NEVER ADD ON TOP OF ENTRIES THAT ARE ALREADY THERE. Live 2026-08-20: a run landed on a form
+    // Oracle had PREFILLED from an existing candidate record and this loop pressed Add three times
+    // anyway, leaving TWO copies of every job on a real application.
+    //
+    // The conservative rule until a populated block has been properly observed: if the block already
+    // holds entries, TOUCH NOTHING and say so. A duplicate is worse than a gap in both directions —
+    // it is a false statement about the applicant's history, it is invisible in our own log (every
+    // entry "committed" successfully), and the operator has to delete rows by hand. A skip is visible,
+    // costs nothing false, and reaches review.
+    //
+    // ⚠ Deliberately NOT "add the difference": with no way yet to tell WHICH entries are present, N-M
+    // more Adds can still duplicate. That needs the reconcile the discovery log below is for.
+    const pre = await act.eval(atsInjOrcEntryState, item.pattern).catch(() => null);
+    const already = pre && pre.ok ? Number(pre.entryControls || 0) : 0;
+    if (already > 0) {
+      log(`⚠ ${item.block}: the form ALREADY holds entries here (${already} row control(s): ${JSON.stringify((pre.entryControlCaptions || []).slice(0, 6))}) — adding ${item.want} more would DUPLICATE them, so this block is left untouched`);
+      log(`   ${item.block} — captions present: ${JSON.stringify(pre.allCaptions || [])}`);
+      notes.push(`${item.block}: left untouched — the form already had ${already} entry row control(s) (a prefilled/returning application); ${item.want} profile entr(y/ies) NOT added, so check this section by hand`);
+      continue;
     }
     for (let i = 0; i < item.want; i++) {
       const entry = arr[i];

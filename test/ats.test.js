@@ -3802,3 +3802,45 @@ test("the Hispanic/Latino question is recognized by its OPTIONS when the label w
   assert.strictEqual(r4.eeoUnstated, true,
     "with no hispanic_or_latino stored it must report UNSTATED — never borrow the race answer");
 });
+
+
+// ── never add repeating entries on top of entries already on the form (live 2026-08-20) ──
+// A run landed on a form Oracle had PREFILLED from an existing candidate record and the entry pass
+// pressed Add three times anyway, leaving TWO copies of every job on a real application. Workday's
+// rule is "reconcile to exactly N, then fill each entry — true idempotency, proven from ARBITRARY
+// dirty state"; only the second half of that had been built for ORC. Add-N-times is correct on a
+// blank form and duplicates on every other kind.
+test("the ORC entry pass refuses to add when the block already holds entries", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const i = src.indexOf("async function atsOrcFillEntries");
+  const pass = stripComments(src.slice(i, src.indexOf("\nfunction atsOrcEntryPlan", i)));
+
+  // it must READ the block before adding anything…
+  assert.ok(/const pre = await act\.eval\(atsInjOrcEntryState/.test(pass),
+    "the pass must read the block's existing state BEFORE pressing Add");
+  // …and bail out of the whole block when entries are present
+  assert.ok(/already > 0/.test(pass) && /continue;/.test(pass),
+    "a block that already holds entries must be left untouched");
+  // ⚠ and it must NOT try to be clever by adding the difference: with no way yet to tell WHICH
+  // entries are present, N-M more Adds can still duplicate.
+  assert.ok(!/item\.want - already|want - already/.test(pass),
+    "adding the DIFFERENCE is not safe without knowing which entries are present — that needs a real " +
+    "reconcile, not arithmetic");
+  // the skip must be reported, not silent: a duplicate is invisible in our own log (every entry
+  // "committed" fine), so the skip is the only thing that can make the state visible
+  assert.ok(/notes\.push\(/.test(pass), "the skip must reach the run's notes, not just the console");
+});
+
+test("atsInjOrcEntryState reports pre-existing entry rows, and describes a populated block", () => {
+  const src = String(ats.atsInjOrcEntryState);
+  assert.ok(/entryControls/.test(src), "it must count the per-row controls a committed entry renders");
+  assert.ok(/edit\|delete\|remove/i.test(src),
+    "a saved entry leaves no live inputs, so its per-row controls are the only count available");
+  // discovery-first: the structure of a POPULATED block has never been observed, so one run must
+  // describe it completely
+  assert.ok(/entryControlCaptions/.test(src) && /allCaptions/.test(src),
+    "the captions must come back so a single run describes a populated block for the real reconcile");
+});
