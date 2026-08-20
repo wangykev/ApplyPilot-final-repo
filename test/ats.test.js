@@ -2593,14 +2593,25 @@ test("ATS_STATIC_MAPS.oracle: the address + name block points at real profile pa
   assert.strictEqual(m["fullName"].compose, "full_name");   // the e-signature name
 });
 
-test("ATS_STATIC_MAPS.oracle: self-ID is keyed on the ORA_ token and carries containment", () => {
+test("ATS_STATIC_MAPS.oracle: self-ID is keyed on the ORA_ token, and DISABILITY does not use containment", () => {
   const m = ats.ATS_STATIC_MAPS.oracle;
+  // Gender and veteran status keep containment: their stored values are short and the tenants word the
+  // options long, so a unique prefix hit at the flagged containment tier is the best available.
   for (const [k, p] of [["ORA_GENDER", "self_identification.gender"],
-                        ["ORA_VETERAN_STATUS", "self_identification.veteran_status"],
-                        ["ORA_DISABILITY_STATUS", "self_identification.disability_status"]]) {
+                        ["ORA_VETERAN_STATUS", "self_identification.veteran_status"]]) {
     assert.strictEqual(m[k].path, p, k);
     assert.strictEqual(m[k].containment, true, k + " needs containment for long-form option wording");
   }
+  // ⚠ DISABILITY IS DIFFERENT, and this is the operator's question answered: "it filled
+  // deterministically, why is that for review". It committed the right option — at the CONTAINMENT
+  // tier, which is graded `filled_review` BY DESIGN because containment is a guess. The polarity
+  // ladder reaches the same option at a tier graded `exact`, so the answer stops being a review item
+  // without becoming any less verified. Containment must NOT come back here.
+  assert.strictEqual(m.ORA_DISABILITY_STATUS.path, "self_identification.disability_status");
+  assert.strictEqual(m.ORA_DISABILITY_STATUS.kind, "selfid_disability");
+  assert.ok(!m.ORA_DISABILITY_STATUS.containment,
+    "the disability ladder ends in a bare polarity token that lands exactly — containment would " +
+    "re-flag an answer we are certain about");
 });
 
 test("ATS_STATIC_MAPS.oracle: every mapped path resolves against a real profile shape", () => {
@@ -4063,4 +4074,93 @@ test("the tile-match skip does not weaken the operator's delete-before-fill inst
   // the skip must come BEFORE the delete, or it can never fire
   assert.ok(pass.indexOf("atsOrcTilesAlreadyMatch") < pass.indexOf("atsInjOrcDeleteTile"),
     "the match check has to precede the delete loop");
+});
+
+
+// ── three things that were flagged while being certain (operator, 2026-08-20) ────────────
+
+test("atsGeoAgreesWithProfile: FL and Florida are the SAME answer; a wrong value is not", () => {
+  const p = { personal_info: { city: "Tallahassee", state_province: "Florida", postal_code: "32312" } };
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("City", "Tallahassee", p), true);
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("City", "Orlando", p), false);
+  // ⚠ Oracle's cascade returns the ABBREVIATION while the profile stores the full name, so a raw
+  // compare called every state a mismatch. REGION_ABBREV is consulted both ways.
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("State", "FL", p), true);
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("State", "Florida", p), true);
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("State", "GA", p), false);
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("Postal Code", "32312", p), true);
+  // ⚠ NULL, not false, for a field the profile does not model — "we cannot check this" and "this is
+  // wrong" are different answers, and only the second is a review item.
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("County", "Leon", p), null);
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("City", "Tallahassee", {}), null, "no profile value ⇒ nothing to say");
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("City", "", p), null, "no live value ⇒ nothing to say");
+  // ⚠ THE SEMANTIC COMES FROM THE LABEL, because ORC's region1/region2 are deliberately unmapped —
+  // which is State and which is County varies by country and only the label distinguishes them.
+  assert.strictEqual(ats.atsGeoAgreesWithProfile("Province", "FL", p), true);
+});
+
+test("a cascade field that agrees is FILLED; one that disagrees is a real review item", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsSurfacePrefilled");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const body = stripComments(src.slice(i, src.indexOf("\n  return surfaced;", i)));
+
+  assert.ok(/agrees === true[\s\S]{0,220}status = "filled"/.test(body),
+    "agreement is verification — the value came from an anchor the profile itself supplied");
+  assert.ok(/agrees === false[\s\S]{0,220}geo-cascade-mismatch/.test(body),
+    "disagreement is a genuine review item and must be flagged as a MISMATCH, not as pre-populated");
+  // ⚠ a field the profile cannot check (County) is cleared only if the checkable siblings agreed —
+  // if the anchor's other outputs are wrong, everything it derived is suspect.
+  assert.ok(/cascadeTrustworthy = geoMismatch === 0 && geoAgreed > 0/.test(body),
+    "an unmodelled sibling may only be cleared when nothing disagreed AND something positively agreed");
+});
+
+test("an UNCHECKED checkbox holds no value — `false` is not content", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsSurfacePrefilled");
+  const body = src.slice(i, src.indexOf("\n  return surfaced;", i));
+  // ⚠ atsInjReadValue answers a checkbox with a BOOLEAN and `String(false)` is "false" — a non-empty
+  // string. So every unchecked box on EVERY platform read as "the form already has something here"
+  // and was surfaced as PRE-POPULATED, on a box deliberately left alone because the profile says No.
+  assert.ok(/live\.value === false/.test(body), "a boolean false must short-circuit before stringifying");
+  assert.ok(/v === "false"/.test(body), "…and the stringified form must be caught too");
+  assert.strictEqual(String(false), "false", "this is the whole trap, in one line");
+});
+
+test("the ORC disability self-ID commits at a DETERMINISTIC tier, not containment", () => {
+  const p = { self_identification: { disability_status: "No, I do not have a disability" } };
+  const r = ats.atsRouteField("oracle",
+    { fieldName: "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12", widgetType: "radio", label: "Do you have a disability?" },
+    p, {}, {}, null, null);
+  // the stored wording FIRST, the bare polarity token LAST
+  assert.deepStrictEqual(r.candidates, ["No, I do not have a disability", "No"]);
+  assert.ok(!r.containment, "containment must NOT be requested — the ladder ends in a token that lands exactly");
+
+  // …and against the real option list it lands on POLARITY LEAD, which grades `exact` ⇒ unflagged
+  const opts = ["Yes, I have a disability, or have had one in the past",
+                "No, I do not have a disability and have not had one in the past",
+                "I do not want to answer"];
+  const lib = require("../lib.js");
+  const fd2 = require("../fill-driver.js");
+  const m = lib.matchCandidates(r.candidates, opts, { containment: false });
+  assert.strictEqual(m.targetIndex, 1);
+  assert.strictEqual(m.matchTier, "polarity-lead");
+  assert.strictEqual(fd2.flagTierCategory(m.matchTier), "exact",
+    "polarity lead is graded exact, which is what makes this `filled` rather than `filled_review`");
+
+  // ⚠ and a tenant that splits one polarity into TWO meanings must still escalate rather than guess
+  const split = ["Yes, I have a disability",
+                 "No, I do not now have a disability",
+                 "No, I do not now have one BUT HAVE HAD one in the past"];
+  const m2 = lib.matchCandidates(r.candidates, split, { containment: false });
+  assert.ok(m2.targetIndex === -1 || m2.matchTier !== "polarity-lead",
+    "two options leading with the same polarity is ambiguous — it must not be guessed");
+
+  // an UNSTATED disability is still never inferred
+  const r2 = ats.atsRouteField("oracle",
+    { fieldName: "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12", widgetType: "radio", label: "Do you have a disability?" },
+    { self_identification: {} }, {}, {}, null, null);
+  assert.strictEqual(r2.eeoUnstated, true);
 });
