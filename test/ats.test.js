@@ -3710,3 +3710,95 @@ test("the code-prefix rule is structural, not the containment the ladder refuses
   // 4. and it is gated on segmentMatch, so a plain picker is unaffected
   assert.ok(/segmentMatch && afterCode/.test(src), "the rule must only apply where segment matching is on");
 });
+
+
+// ── ORC's yes/no questions are a pair of BUTTONS (live 2026-08-20) ───────────────────────
+// The operator reported three REQUIRED yes/no questions on step 3 that no run ever filled. They
+// were there the whole time and every sweep in this file was blind to them at once: no
+// input/select/textarea exists, the ARIA roles are list/listitem (not radio), and the
+// block-population settle counted 0 "inputs" and spent 15s deciding the block was still loading —
+// of a block visible at 680×331 with all three questions rendered.
+test("the ORC scan finds a pill yes/no group, keyed on its flexfield id with the counter stripped", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("ul.cx-select-pills-container");
+  assert.ok(i > 0, "the pill widget must be scanned");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const pass = stripComments(src.slice(src.indexOf("for (const ul of sec.querySelectorAll(\"ul.cx-select-pills-container\")"), i + 4000));
+
+  // ⚠ its own pass, NOT a branch in the control loop: the row class is `input-row--has-picker`,
+  // the SAME as a combobox, so the classifier would call it a picker, look for an inner
+  // input[role=combobox], find none, and drop the field silently.
+  assert.ok(/widgetType: "yesno"/.test(pass), "it must classify as the existing yesno widget");
+  // the durable key strips the volatile render counter, like every other ORC field
+  assert.ok(/replace\(\/-\\d\+\$\/, ""\)/.test(pass),
+    "the key must strip the trailing -<digits> render counter (lastName-21 -> lastName)");
+  // required lives on the LABEL class, not the row's
+  assert.ok(/input-row__label--required/.test(pass),
+    "required is marked on the label class; reading the ROW class reports these as OPTIONAL, and an " +
+    "optional unmapped field is deliberately left blank — they would stay unfilled AND unexplained");
+  // aria-pressed is the selected state
+  assert.ok(/aria-pressed/.test(pass), "the current answer is read from aria-pressed");
+});
+
+test("atsInjClickYesNo/atsInjReadValue: the container is the Ashby entry OR the element itself", () => {
+  for (const fn of [ats.atsInjClickYesNo, ats.atsInjReadValue]) {
+    const src = String(fn);
+    assert.ok(/ashby-application-form-field-entry"\) \|\| (cb|el)/.test(src),
+      "requiring the Ashby wrapper made ORC's pill group `no-field-entry`; the fallback keeps Ashby " +
+      "byte-identical while making the primitive shape-agnostic");
+  }
+});
+
+test("an ORC block's control count includes pill groups", () => {
+  const src = String(ats.atsInjOrcBlocks);
+  assert.ok(/cx-select-pills-container/.test(src),
+    "a block holding three button-pair questions counted 0 controls, so the settle spent its whole " +
+    "budget deciding a fully-rendered block was still loading. 'Zero inputs' and 'nothing to " +
+    "answer' are different claims");
+});
+
+// ── the two US EEO demographics must never be answered from each other ───────────────────
+test("the Hispanic/Latino question is recognized by its OPTIONS when the label will not say", () => {
+  const p = { self_identification: { hispanic_or_latino: "No", race_ethnicity: "Asian" } };
+  // live shape: label "Ethnicity", a single checkbox, option "I am Hispanic or Latino."
+  const r = ats.atsRouteLabel("Ethnicity", { options: ["I am Hispanic or Latino."] }, p, {});
+  assert.strictEqual(r.path, "self_identification.hispanic_or_latino",
+    '"Ethnicity" carries no hispanic token, so it fell into the RACE rung and was answered "Asian" — ' +
+    "a demographic answered from a different demographic field");
+  assert.deepStrictEqual(r.candidates, ["No"]);
+
+  // …and the race question still answers from race
+  const r2 = ats.atsRouteLabel("Select the races you identify with.",
+    { options: ["American Indian or Alaska Native", "Asian", "Black or African American"] }, p, {});
+  assert.strictEqual(r2.path, "self_identification.race_ethnicity");
+  assert.deepStrictEqual(r2.candidates, ["Asian"]);
+
+  // an explicit label still works with no options at all
+  const r3 = ats.atsRouteLabel("Are you Hispanic or Latino?", { options: ["Yes", "No"] }, p, {});
+  assert.strictEqual(r3.path, "self_identification.hispanic_or_latino");
+
+  // ⚠⚠ AND "AN OPTION MENTIONS HISPANIC" IS NOT THE TEST. EEO-1 race categories are routinely
+  // SUFFIXED with the phrase as a negation, so both "any option mentions it" and "every option
+  // mentions it" misroute a RACE question into the Hispanic field. A regression test caught the
+  // first version of this within minutes; these pin the rule that replaced it.
+  for (const opts of [
+    ["Asian (Not Hispanic or Latino)", "White (Not Hispanic or Latino)", "Decline to self identify"],
+    ["Asian (Not Hispanic or Latino)", "White (Not Hispanic or Latino)", "Black (Not Hispanic or Latino)"],
+    ["Asian", "Black or African American", "Hispanic or Latino"],
+  ]) {
+    const rr = ats.atsRouteLabel("Race", { options: opts }, p, {});
+    assert.strictEqual(rr.path, "self_identification.race_ethnicity",
+      "a list offering OTHER RACES is a race question however it qualifies them: " + JSON.stringify(opts));
+  }
+  // …and a list that talks about nothing but Hispanic identity is the ethnicity question
+  const re = ats.atsRouteLabel("Ethnicity", { options: ["Hispanic or Latino", "Not Hispanic or Latino"] }, p, {});
+  assert.strictEqual(re.path, "self_identification.hispanic_or_latino");
+
+  // ⚠ and an UNSTATED one is still never inferred
+  const r4 = ats.atsRouteLabel("Ethnicity", { options: ["I am Hispanic or Latino."] },
+    { self_identification: { race_ethnicity: "Asian" } }, {});
+  assert.strictEqual(r4.eeoUnstated, true,
+    "with no hispanic_or_latino stored it must report UNSTATED — never borrow the race answer");
+});

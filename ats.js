@@ -1409,7 +1409,37 @@ function atsRouteLabel(label, f, profile, defaults) {
   // ("No, I do not have a disability" ⊂ "…, or have had one in the past") commits at the
   // CONTAINMENT tier, which the driver grades filled_review (flagged, human verifies) —
   // never silent, and the ambiguity guard still refuses a 2+-option hit.
-  if (/hispanic|latino/i.test(L)) { if (has(si.hispanic_or_latino)) return { candidates: [si.hispanic_or_latino], source: "eeo", containment: true, path: "self_identification.hispanic_or_latino" }; return { eeoUnstated: true }; }
+  // ⚠⚠ THE QUESTION CAN BE IN THE OPTIONS RATHER THAN THE LABEL, and on a US EEO form the two
+  // demographics that get confused this way are the two that must never be swapped. Live on Oracle:
+  //
+  //     label "Ethnicity"  ·  single checkbox  ·  option "I am Hispanic or Latino."
+  //
+  // "Ethnicity" carries no hispanic/latino token, so it fell past this rung into the race one and was
+  // answered from `race_ethnicity` ("Asian") — a demographic answered from a DIFFERENT demographic
+  // field. It could not commit (the form offers no such option), so it reached review rather than
+  // submitting something false; but the next tenant to word it as a yes/no dropdown would have taken
+  // the wrong value silently.
+  //
+  // The US EEO standard asks TWO questions — "are you Hispanic or Latino?" then "what race?" — and
+  // the profile models them as two fields precisely so each is answered from its own. Reading the
+  // OPTIONS is what tells them apart when the label will not: an option naming Hispanic/Latino IS the
+  // Hispanic/Latino question, whatever the heading above it says. Evidence, not inference.
+  // ⚠⚠ AND "AN OPTION MENTIONS HISPANIC" IS NOT THE TEST — a regression test caught that within
+  // minutes. EEO-1 race categories are routinely SUFFIXED with the phrase as a negation:
+  //     ["Asian (Not Hispanic or Latino)", "White (Not Hispanic or Latino)", "Decline to self identify"]
+  // so both "any option mentions it" and "every option mentions it" misroute a RACE question to the
+  // Hispanic field. The discriminator is whether the options offer OTHER RACES as alternatives: a
+  // list of races qualified by ethnicity is a race question; a list that only ever talks about
+  // Hispanic identity is the ethnicity question.
+  const opts = ((f && f.options) || []).map(String);
+  const RACE_TOKEN = /\basian\b|\bwhite\b|\bblack\b|african|american indian|alaska|hawaiian|pacific islander|two or more races|caucasian/i;
+  const optsAreOnlyHispanic = opts.length > 0
+    && opts.every((o) => /hispanic|latino/i.test(o))
+    && !opts.some((o) => RACE_TOKEN.test(o));
+  if (/hispanic|latino/i.test(L) || optsAreOnlyHispanic) {
+    if (has(si.hispanic_or_latino)) return { candidates: [si.hispanic_or_latino], source: "eeo", containment: true, path: "self_identification.hispanic_or_latino" };
+    return { eeoUnstated: true };
+  }
   if (/race|ethnicit/i.test(L)) { if (has(si.race_ethnicity)) return { candidates: [si.race_ethnicity], source: "eeo", containment: true, path: "self_identification.race_ethnicity" }; return { eeoUnstated: true }; }
   if (/veteran/i.test(L)) { if (has(si.veteran_status)) return { candidates: [si.veteran_status], source: "eeo", containment: true, path: "self_identification.veteran_status" }; return { eeoUnstated: true }; }
   if (/disabilit/i.test(L)) { if (has(si.disability_status)) return { candidates: [si.disability_status], source: "eeo", containment: true, path: "self_identification.disability_status" }; return { eeoUnstated: true }; }
@@ -1679,6 +1709,57 @@ function atsInjScan(ats) {
         push({ fieldName: key, inputSel: "#" + esc(box.id), widgetType: "checkbox",
           label: stripStar(rawLabel) || key, isRequired: reqOf(box, rawLabel),
           value: box.checked ? "true" : null, section: blockOf(box) });
+      }
+
+      // 3b) ⚠⚠ ORC'S YES/NO QUESTIONS ARE A PAIR OF **BUTTONS**, NOT A CONTROL (live 2026-08-20).
+      // The operator reported three REQUIRED yes/no questions on step 3 that no run ever filled. They
+      // were there the whole time, and every sweep this file owns was blind to them at once:
+      //   • `input, select, textarea` finds nothing — there is no form control of any kind;
+      //   • the ARIA sweep finds nothing — the roles are `list` / `listitem`, not radio/radiogroup;
+      //   • the block-population settle read 0 "inputs" and spent 15s deciding the block was still
+      //     loading, then said so — while the block sat there VISIBLE at 680×331 with all three
+      //     questions rendered.
+      // The widget is `ul.cx-select-pills-container` → `li` → `button.cx-select-pill-section`, with
+      // **`aria-pressed`** as the selected state. So "count the controls" was never the right
+      // question; the right one is "what can be answered here".
+      //
+      // ⚠ AND THE ROW CLASS IS `input-row--has-picker` — THE SAME AS A COMBOBOX. That is why this
+      // must be its own pass rather than a branch in the loop below: the classifier would call it a
+      // picker, look for `input[role=combobox]` inside, find none, and drop the field silently.
+      //
+      // ⚠ IDENTITY: there is no id and no name anywhere on the widget. The row's own
+      // `<label for="302960759052341-13">` points at an id that DOES NOT EXIST as an element, but it
+      // names the per-tenant flexfield — so the durable key is that id with the volatile render
+      // counter stripped, exactly the rule every other ORC field follows (`lastName-21` → lastName).
+      // The FULL id is used only for the live selector, which is what an id is for here.
+      for (const ul of sec.querySelectorAll("ul.cx-select-pills-container")) {
+        if (!vis(ul)) continue;
+        const row = ul.closest("div.input-row");
+        if (!row) continue;
+        const forId = (row.querySelector("label[for]") || {}).getAttribute
+          ? row.querySelector("label[for]").getAttribute("for") : null;
+        if (!forId) continue;
+        const key = String(forId).replace(/-\d+$/, "");
+        if (!key || seen.has(key)) continue; seen.add(key);
+        // The ul's OWN aria-label carries the whole question, untruncated and without the required
+        // star — cleaner than the label element, whose text is the same string plus decoration.
+        const rawLabel = ul.getAttribute("aria-label") || txt(row.querySelector("form-element-label")) || "";
+        const btns = [...ul.querySelectorAll("li button")];
+        if (!btns.length) continue;
+        const picked = btns.find((b) => b.getAttribute("aria-pressed") === "true");
+        // ⚠ REQUIRED IS ON THE **LABEL** CLASS, not the row's. A first probe looked at the row and
+        // concluded these were optional — which would have been the worst possible outcome, because
+        // the AI rescue is gated on `isRequired` and an optional unmapped field is deliberately left
+        // blank. They would have stayed unfilled AND unexplained.
+        const lblEl2 = row.querySelector("label.input-row__label");
+        const isReq = !!(lblEl2 && /input-row__label--required/.test(String(lblEl2.className || "")))
+          || !!row.querySelector(".input-row__label--required-star")
+          || /[*✱]\s*$/.test(String(rawLabel || ""));
+        push({ fieldName: key,
+          inputSel: 'div.input-row:has(label[for="' + esc(forId) + '"]) ul.cx-select-pills-container',
+          widgetType: "yesno", label: stripStar(rawLabel) || key, isRequired: isReq,
+          value: picked ? txt(picked) : null,
+          options: btns.map((b) => txt(b)).filter(Boolean), section: blockOf(ul) });
       }
 
       // 4) EVERYTHING ELSE, one control at a time.
@@ -2427,7 +2508,9 @@ function atsInjReadValue(ats, inputSel, widgetType) {
   }
   if (widgetType === "checkbox") return { ok: true, value: !!el.checked };
   if (widgetType === "yesno") {
-    const entry = el.closest(".ashby-application-form-field-entry");
+    // …and the same container fallback as atsInjClickYesNo, for the same reason. `aria-pressed` was
+    // already the signal it reads, which is exactly what ORC's pills use.
+    const entry = el.closest(".ashby-application-form-field-entry") || el;
     const picked = entry && [...entry.querySelectorAll("button")].find((b) => /_selected|active/i.test(String(b.className || "")) || b.getAttribute("aria-pressed") === "true");
     return { ok: true, value: picked ? txt(picked) : (el.checked ? "Yes" : null) };
   }
@@ -2595,8 +2678,13 @@ function atsInjSetChecked(inputSel, on) {
 function atsInjClickYesNo(inputSel, want) {
   const cb = document.querySelector(inputSel);
   if (!cb) return { ok: false, error: "not-found:" + inputSel };
-  const entry = cb.closest(".ashby-application-form-field-entry");
-  if (!entry) return { ok: false, error: "no-field-entry" };
+  // ⚠ THE BUTTON CONTAINER IS THE ASHBY FIELD ENTRY **OR THE ELEMENT ITSELF**. Ashby hands this a
+  // hidden checkbox whose sibling buttons live in an ancestor wrapper; ORC's pill widget IS the
+  // container (`ul.cx-select-pills-container` holding the Yes/No buttons), so requiring the Ashby
+  // wrapper made a perfectly answerable question `no-field-entry`. Falling back to the element keeps
+  // Ashby byte-identical while making the primitive shape-agnostic — which is the whole reason ORC
+  // needed no new commit path, no new review widget and no new AI kind: `yesno` already existed.
+  const entry = cb.closest(".ashby-application-form-field-entry") || cb;
   const btn = [...entry.querySelectorAll("button")].find((b) => (b.textContent || "").trim().toLowerCase() === String(want).toLowerCase());
   if (!btn) return { ok: false, error: "button-not-found", offered: [...entry.querySelectorAll("button")].map((b) => (b.textContent || "").trim()) };
   btn.click();
@@ -4230,8 +4318,13 @@ function atsInjOrcBlocks() {
   // VISIBLE blocks only, and for the standing ORC reason: every step is mounted at once and the
   // inactive ones report aria-hidden="false" at 0×0, so geometry is the trustworthy signal here.
   return { ok: true, blocks: [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    // ⚠ COUNT WHAT CAN BE ANSWERED, NOT WHAT IS AN `<input>`. ORC's yes/no questions are BUTTON
+    // pairs, so a block holding three of them counted 0 and the settle spent 15s concluding it was
+    // still loading — of a block that was visible at 680×331 with every question rendered. "Zero
+    // inputs" and "nothing to answer" are different claims and this read was making the wrong one.
     .map((b) => ({ title: t(b.querySelector("apply-flow-block-title")),
-                   inputs: b.querySelectorAll("input, textarea, select").length,
+                   inputs: b.querySelectorAll("input, textarea, select").length
+                         + b.querySelectorAll("ul.cx-select-pills-container").length,
                    addCaption: ([...b.querySelectorAll("button")].filter(vis).map(t)
                      .find((c) => /^add\b/i.test(c))) || null }))
     .filter((b) => b.title) };
