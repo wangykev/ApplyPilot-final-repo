@@ -3083,3 +3083,73 @@ test("atsActuateField oracle: the pick is called with noClear taken from f.searc
   assert.match(String(ats.atsActuateField), /atsInjOrcPick[\s\S]{0,160}f\.searchDriven/,
     "the pick call must pass noClear from f.searchDriven");
 });
+
+
+// ── ORC repeating blocks: the entry lifecycle ────────────────────────────────────────────
+// The commit button is a HOMONYM of the opener ("Add Experience" both times) and on Oracle both live
+// in the SAME block, so scoping by container cannot separate them. The discriminator is the sibling
+// Cancel, present only while an entry form is open. Each action therefore REFUSES in the state where
+// it would press the other's button.
+
+test("atsInjOrcEntryAction: open/commit each REFUSE in the state where they'd press the wrong button", () => {
+  const src = String(ats.atsInjOrcEntryAction);
+  // the Cancel-derived open/closed test must exist…
+  assert.match(src, /\/\^cancel\$\/i/, "openness must be derived from a sibling Cancel");
+  // …and both directions must refuse rather than click blindly
+  assert.match(src, /entry-already-open/, "open must refuse when a form is already open (that button COMMITS)");
+  assert.match(src, /no-open-entry-to-commit/, "commit must refuse when no form is open (that button OPENS)");
+});
+
+test("atsInjOrcEntry*: keyed on the BLOCK, never on the timeline elements", () => {
+  // Baylor renders entries through beautiful-timeline/timeline-form-inline; Oracle has neither and
+  // renders in-block. Keying on those elements would work on exactly one tenant.
+  for (const fn of [ats.atsInjOrcEntryState, ats.atsInjOrcEntryAction]) {
+    const src = String(fn);
+    assert.match(src, /apply-flow-block/, "must locate the block");
+    assert.match(src, /apply-flow-block-title/, "must identify it by its title");
+    assert.ok(!/beautiful-timeline|timeline-form-inline|timeline-form-builder/.test(src),
+      "must NOT key on the timeline elements — they are one tenant's configuration");
+  }
+});
+
+test("atsOrcEntryPlan: counts entries per block, and skips what it cannot source", () => {
+  const profile = {
+    work_experience: [{ company: "A" }, { company: "B" }, { company: "C" }],
+    education: [{ school_or_university: "CMU" }],
+    skills: ["Python", "C"],
+    certifications: [],                      // present but EMPTY → no plan entry
+  };
+  const blocks = ["Experience", "Education", "Licenses and Certificates", "Skills",
+                  "Supporting Documents and URLs"];
+  const plan = ats.atsOrcEntryPlan(profile, blocks);
+  const byBlock = {};
+  for (const p of plan) byBlock[p.block] = p;
+  assert.strictEqual(byBlock.Experience.want, 3);
+  assert.strictEqual(byBlock.Experience.source, "work_experience");
+  assert.strictEqual(byBlock.Education.want, 1);
+  assert.strictEqual(byBlock.Skills.want, 2);
+  assert.ok(!byBlock["Licenses and Certificates"], "an empty profile array yields no plan entry");
+  // a block that is not on the page is not planned for
+  assert.ok(!ats.atsOrcEntryPlan(profile, ["Experience"]).some((p) => p.block === "Education"));
+  // nothing to source ⇒ nothing planned
+  assert.deepStrictEqual(ats.atsOrcEntryPlan({}, blocks), []);
+});
+
+test("atsOrcEntryPlan: NO SILENT CAPS — a history longer than the backstop reports what it dropped", () => {
+  const many = Array.from({ length: ats.ATS_ORC_ENTRY_MAX + 3 }, (_, i) => ({ company: "C" + i }));
+  const plan = ats.atsOrcEntryPlan({ work_experience: many }, ["Experience"]);
+  assert.strictEqual(plan[0].want, ats.ATS_ORC_ENTRY_MAX);
+  assert.strictEqual(plan[0].capped, many.length,
+    "the ORIGINAL count must survive so the run can say what it left out");
+});
+
+test("ATS_ORC_ENTRY_MAPS: the Experience entry maps to real profile keys, and leaves the unknowable alone", () => {
+  const m = ats.ATS_ORC_ENTRY_MAPS.work_experience;
+  assert.strictEqual(m.employerName.path, "company");
+  assert.strictEqual(m.jobTitle.path, "job_title");
+  assert.strictEqual(m.startDate.kind, "date");
+  assert.strictEqual(m.endDate.kind, "date");
+  // ⚠ deliberately absent: the profile stores no reason for leaving, and inventing one on a form an
+  // employer reads is the confidently-wrong class. This test is the reminder that the gap is chosen.
+  assert.ok(!m.leavingReason, "leavingReason must stay unmapped");
+});

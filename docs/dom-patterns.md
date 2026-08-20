@@ -5733,3 +5733,50 @@ have not had one in the past" via **POLARITY LEAD**, but `"No, I"` is not a bare
 falls through to containment — which is deliberately OFF for radios — and escalates to review. The
 other four self-ID values are clean (`Male`, `No, I am not Hispanic`, `Asian`, `I am not a protected
 veteran`). One profile edit fixes it; no code change is warranted.
+
+---
+
+## 2026-08-19 (l) — ORC repeating blocks: the entry lifecycle, verified live
+
+### The homonym trap, closed and measured
+
+The Add control and the entry-COMMIT control carry the same caption ("Add Experience"), and on Oracle
+both live in the SAME `apply-flow-block` — so recon (c)'s proposal to scope by container cannot
+separate them. **The discriminator is the sibling `Cancel`,** present only while an entry form is open.
+
+Measured on the live form, two blocks, both states:
+
+| call | block state | outcome |
+|---|---|---|
+| `open` | form OPEN (`["Cancel","Add Experience"]`) | **refused** `entry-already-open` — that button COMMITS |
+| `commit` | form OPEN | allowed → presses "Add Experience" |
+| `cancel` | form OPEN | allowed |
+| `commit` | Education, CLOSED (`["Add Education"]`) | **refused** `no-open-entry-to-commit` — that button would OPEN a blank entry |
+
+So each action refuses in exactly the state where it would press the other's button. Without that, a
+commit on a closed block silently creates an empty entry and an open on an open block silently commits
+a half-filled one — both of which look like success.
+
+⚠ **Keyed on the BLOCK, never on the timeline elements.** Baylor renders entries through
+`<beautiful-timeline>` → `<timeline-form-inline>` → `<timeline-form-builder>`; Oracle has none of
+them. `apply-flow-block` + its `apply-flow-block-title` is the only portable handle, so the primitives
+take a title PATTERN (titles are tenant wording) and a test forbids the timeline selectors outright.
+
+### The block map
+
+`ATS_ORC_ENTRY_BLOCKS` pairs a title pattern with a profile array: Experience→`work_experience`,
+Education→`education`, Licenses and Certificates→`certifications`, Skills→`skills`. Anything not
+listed is left alone — a block we cannot source is the operator's to fill, not ours to guess at.
+
+`ATS_ORC_ENTRY_MAPS.work_experience` maps the measured Experience fields: `employerName`→company,
+`jobTitle`→job_title, `startDate`/`endDate`→from/to (the month+year composite), `employerCity` and
+`countryCode`→location, `responsibilities`→bullets. ⚠ `leavingReason` is DELIBERATELY unmapped: the
+profile stores no reason for leaving, and inventing one on a form an employer reads is the
+confidently-wrong class. Pinned by a test so the gap stays chosen rather than forgotten.
+
+⚠ `atsOrcEntryPlan` reports `capped` with the ORIGINAL count when a history exceeds
+`ATS_ORC_ENTRY_MAX`, so a truncated section can say what it dropped — the no-silent-caps rule.
+
+⚠ **A returning candidate's blocks are not empty.** Skills arrived already populated and a résumé
+already attached from the account, so an entry pass must reconcile UP only and never assume it starts
+from zero.

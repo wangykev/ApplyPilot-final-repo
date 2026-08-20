@@ -3983,6 +3983,133 @@ function atsInjOrcAuthScan() {
   };
 }
 
+// ── ORC REPEATING BLOCKS: the entry lifecycle (2026-08-19) ───────────────────────────────
+// A repeating section on ORC is an `<apply-flow-block>` identified by its `<apply-flow-block-title>`,
+// holding an Add control. Pressing it materialises the entry form's fields INSIDE THAT BLOCK through
+// the ordinary `<form-builder>`.
+//
+// ⚠ DO NOT KEY ON THE TIMELINE ELEMENTS. Baylor renders entries through `<beautiful-timeline>` →
+// `<timeline-form-inline>` → `<timeline-form-builder>`; Oracle has NONE of those and renders in-block.
+// The block + its title is the only portable handle, which is why this takes a title pattern.
+//
+// ⚠⚠ THE COMMIT BUTTON IS A HOMONYM OF THE OPENER. Both read "Add Experience", and on Oracle both
+// live in the SAME block — so scoping by container cannot separate them (recon (c) proposed exactly
+// that, and it does not work here). The discriminator is the sibling **Cancel**, which exists only
+// while an entry form is open:
+//
+//     block closed → [ "Add Experience" ]
+//     block OPEN   → [ "Cancel", "Add Experience" ]   ← the second one COMMITS
+//
+// Verified in both directions: after pressing Cancel the block returned to 0 inputs and Cancel
+// disappeared. So `open` refuses when a form is already open, and `commit` refuses when one is not —
+// each would otherwise press the other's button.
+var ATS_ORC_ENTRY_MAX = 8;   // same backstop as ATS_ENTRY_MAX: a runaway Add loop is worse than a short history
+
+function atsInjOrcEntryState(blockTitlePattern) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const block = [...document.querySelectorAll("apply-flow-block")]
+    .filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  if (!block) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+  const buttons = [...block.querySelectorAll("button")].filter(vis).map((b) => t(b)).filter(Boolean);
+  // An OPEN entry form is the one state we can read without ambiguity.
+  const open = buttons.some((c) => /^cancel$/i.test(c));
+  const fields = [...block.querySelectorAll("input, textarea, select")].filter((e) => e.type !== "hidden" && vis(e))
+    .map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
+      role: e.getAttribute("role") || null,
+      label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
+      value: e.value || null }));
+  return { ok: true, title: t(block.querySelector("apply-flow-block-title")), open, buttons, fields,
+    // rows already committed: a saved entry leaves no live inputs, so the block's own list length is
+    // the only count available. Reported, not interpreted.
+    addCaption: buttons.find((c) => /^add\b/i.test(c)) || null };
+}
+
+// `action`: "open" | "commit" | "cancel". Refuses rather than pressing the wrong homonym.
+function atsInjOrcEntryAction(blockTitlePattern, action) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const block = [...document.querySelectorAll("apply-flow-block")]
+    .filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  if (!block) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+  const buttons = [...block.querySelectorAll("button")].filter(vis);
+  const cap = (b) => t(b);
+  const isOpen = buttons.some((b) => /^cancel$/i.test(cap(b)));
+
+  if (action === "cancel") {
+    const c = buttons.find((b) => /^cancel$/i.test(cap(b)));
+    if (!c) return { ok: false, error: "no-open-entry" };
+    c.click();
+    return { ok: true, pressed: "Cancel" };
+  }
+  const addBtn = buttons.find((b) => /^add\b/i.test(cap(b)));
+  if (!addBtn) return { ok: false, error: "no-add-control", offered: buttons.map(cap).slice(0, 6) };
+  if (action === "open") {
+    // ⚠ REFUSE if a form is already open: the same caption would COMMIT the entry instead.
+    if (isOpen) return { ok: false, error: "entry-already-open", caption: cap(addBtn) };
+    addBtn.click();
+    return { ok: true, pressed: cap(addBtn), was: "closed" };
+  }
+  if (action === "commit") {
+    // ⚠ REFUSE if no form is open: the same caption would OPEN a blank entry instead.
+    if (!isOpen) return { ok: false, error: "no-open-entry-to-commit", caption: cap(addBtn) };
+    addBtn.click();
+    return { ok: true, pressed: cap(addBtn), was: "open" };
+  }
+  return { ok: false, error: "unknown-action:" + action };
+}
+
+// ── WHICH ORC BLOCKS REPEAT, AND FROM WHAT (pure) ────────────────────────────────────────
+// Block titles are the tenant's own wording, so these are PATTERNS rather than exact strings, and the
+// profile source is named explicitly. Anything not listed is left alone — a block we cannot source is
+// the operator's to fill, not ours to guess at.
+// ⚠ `Skills` and the résumé arrive PREFILLED from a returning candidate's account (measured: skills
+// already populated, `Kevin_s_Resume (6).pdf` already attached), so an entry pass here must reconcile
+// UP only and never assume a block starts empty.
+var ATS_ORC_ENTRY_BLOCKS = [
+  { pattern: "^Experience", source: "work_experience", label: "Experience" },
+  { pattern: "^Education", source: "education", label: "Education" },
+  { pattern: "^Licenses? and Certificates?", source: "certifications", label: "Licenses and Certificates" },
+  { pattern: "^Skills", source: "skills", label: "Skills" },
+];
+
+// The Experience entry's own fields, as measured on Oracle. Dates are the month+year composite (NO
+// day here, unlike step 3's earliestAvailableDate — arity is per-field and is read from the ids).
+var ATS_ORC_ENTRY_MAPS = {
+  work_experience: {
+    "employerName": { path: "company" },
+    "jobTitle": { path: "job_title" },
+    "startDate": { path: "from", kind: "date" },
+    "endDate": { path: "to", kind: "date" },
+    "employerCity": { path: "location", kind: "city_of" },
+    "countryCode": { path: "location", kind: "country_of" },
+    "responsibilities": { path: "bullets", kind: "join" },
+    // deliberately unmapped: the profile stores no reason for leaving, and inventing one on a form
+    // an employer reads is exactly the confidently-wrong class.
+  },
+};
+
+function atsOrcEntryPlan(profile, blocks) {
+  const present = Array.isArray(blocks) ? blocks : [];
+  const out = [];
+  for (const spec of ATS_ORC_ENTRY_BLOCKS) {
+    const re = new RegExp(spec.pattern, "i");
+    if (present.length && !present.some((b) => re.test(String(b || "")))) continue;
+    const arr = (profile || {})[spec.source];
+    const n = Array.isArray(arr) ? arr.filter((e) => e != null && String(e).trim() !== "").length : 0;
+    if (!n) continue;
+    out.push({ block: spec.label, pattern: spec.pattern, source: spec.source, want: Math.min(n, ATS_ORC_ENTRY_MAX),
+      capped: n > ATS_ORC_ENTRY_MAX ? n : 0 });
+  }
+  return out;
+}
+
 // ── ORC's ADDRESS IS ONE ANSWER, NOT FIVE (operator, 2026-08-19) ─────────────────────────
 // Measured with the operator: typing a postal code and pressing Enter on its single row fills CITY,
 // STATE and COUNTY by itself -- "32312" -> "32312, Tallahassee, Leon, FL" -> city Tallahassee, state
@@ -7191,7 +7318,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
-    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR,
+    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
