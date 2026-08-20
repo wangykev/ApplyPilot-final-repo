@@ -2938,3 +2938,74 @@ test("atsCaptureOrcOptions: an eval that throws degrades to 'unreadable', never 
   assert.strictEqual(res.failed, 1);
   assert.strictEqual(scan.fields[0].options, undefined);
 });
+
+
+// ── ORC's address is ONE answer expressed through its most specific field ────────────────
+// Measured with the operator: typing a postal code and pressing Enter on its single row fills city,
+// state and county by itself. So the block is one decision, not five — and the five-independent-picks
+// approach failed only because the house clear-before-typing step cascades on a geo picker.
+
+test("atsOrcGeoPlan: the postal code is the anchor and the rest are DEPENDENTS", () => {
+  const fields = [
+    { fieldName: "country", widgetType: "select", searchDriven: true },
+    { fieldName: "city", widgetType: "select", searchDriven: true },
+    { fieldName: "region2", widgetType: "select", searchDriven: true },
+    { fieldName: "postalCode", widgetType: "select", searchDriven: true },
+    { fieldName: "region1", widgetType: "select", searchDriven: true },
+    { fieldName: "addressLine1", widgetType: "text" },
+  ];
+  const plan = ats.atsOrcGeoPlan(fields, { personal_info: { postal_code: "32312", city: "Tallahassee", state_province: "Florida" } });
+  assert.strictEqual(plan.anchor.fieldName, "postalCode");
+  assert.strictEqual(plan.anchorValue, "32312");
+  assert.strictEqual(plan.exact, true);
+  // city / state / county are VERIFIED, never actuated — typing into one clears the anchor
+  assert.deepStrictEqual(plan.dependents.map((d) => d.fieldName).sort(), ["city", "region1", "region2"]);
+  // ⚠ country is the geo ROOT: it mounts the block and is filled normally, so it is neither the
+  // anchor nor a dependent of it.
+  assert.ok(plan.dependents.every((d) => d.fieldName !== "country"));
+});
+
+test("atsOrcGeoPlan: with NO postal code it falls back to city and SAYS the risk", () => {
+  // measured: "32312" resolved to ONE row while "Tallahassee" resolved to TWO (Jefferson and Leon),
+  // and the profile stores no county — so the city route is genuinely ambiguous from our data.
+  const fields = [
+    { fieldName: "city", widgetType: "select", searchDriven: true },
+    { fieldName: "region2", widgetType: "select", searchDriven: true },
+  ];
+  const plan = ats.atsOrcGeoPlan(fields, { personal_info: { city: "Tallahassee", state_province: "Florida" } });
+  assert.strictEqual(plan.anchor.fieldName, "city");
+  assert.strictEqual(plan.exact, false, "a city anchor is NOT an exact resolution");
+  assert.match(plan.detail, /more than one county/i, "the ambiguity has to be stated, not hidden");
+});
+
+test("atsOrcGeoPlan: no geo pickers, or no usable profile value, yields no plan", () => {
+  assert.strictEqual(ats.atsOrcGeoPlan([{ fieldName: "lastName", widgetType: "text" }], { personal_info: { postal_code: "32312" } }), null);
+  // geo present but the profile has nothing to anchor on
+  const fields = [{ fieldName: "postalCode", widgetType: "select", searchDriven: true }];
+  assert.strictEqual(ats.atsOrcGeoPlan(fields, { personal_info: {} }), null);
+  assert.strictEqual(ats.atsOrcGeoPlan(null, null), null);
+});
+
+test("atsOrcGeoPlan: a blank/whitespace profile value is not an anchor", () => {
+  const fields = [
+    { fieldName: "postalCode", widgetType: "select", searchDriven: true },
+    { fieldName: "city", widgetType: "select", searchDriven: true },
+  ];
+  // an empty zip must fall through to city rather than anchoring on nothing
+  const plan = ats.atsOrcGeoPlan(fields, { personal_info: { postal_code: "   ", city: "Tallahassee" } });
+  assert.strictEqual(plan.anchor.fieldName, "city");
+});
+
+test("atsInjOrcPick: ENTER is the commit, with a pointer fallback, and noClear is honoured", () => {
+  // Structural, because the primitive needs a live widget to exercise. Each of these is a measured
+  // behaviour: a pointer click leaves the list OPEN and the selection unmade; clearing a geo picker
+  // cascades to its siblings.
+  const src = String(ats.atsInjOrcPick);
+  assert.match(src, /keyCode: 13/, "Enter must be the commit");
+  assert.match(src, /commitRowByPointer/, "the pointer sequence must survive as a fallback");
+  assert.match(src, /if \(!noClear\)/, "the clear must be skippable for cascading geo pickers");
+  // and it must stay evaluable in the page
+  for (const shim of ["atsLib", "atsFd", "atsInjOrcReadPicker", "atsInjOrcCaptureOptions"]) {
+    assert.ok(!src.includes(shim), "atsInjOrcPick must not reference " + shim);
+  }
+});

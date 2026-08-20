@@ -5578,3 +5578,110 @@ wrong three times on this tenant. Verify before trusting it.
 
 Also unverified: the `Next` button's validation behaviour between steps, and whether ids renumber
 across a step transition.
+
+---
+
+## 2026-08-19 (j) — ORC: the login works end to end; the dependent geo pickers DO NOT commit reliably
+
+Oracle (`eeho.fa.us2`, job 334325), fresh signed-out session, operator watching. The gate was driven by
+the verified recipe and the operator entered the code.
+
+### The pre-form path is confirmed working, by hand
+
+Posting → `button.apply-now-button` → `…/apply/email` → tick the accept box → write the login email →
+`Next` → `…/apply/pin` → (operator entered the code) → `…/apply/section/1`. Every step behaved as
+`runOrcPreForm` expects.
+
+Two things worth keeping:
+
+- **The decoy recognizer works live, and the honeypot's width is a THIRD value**: 183×38 here against
+  179 at Nokia and 200 at Baylor. No size constant could ever have been part of that test. The
+  `aria-hidden="true"` + `tabindex="-1"` pair classified it correctly, alongside a hidden `file` input
+  it also (correctly) refused, while the 0×0 clipped terms checkbox was correctly NOT called a decoy.
+- **The code screen names the address when WE supplied it** ("sent to this email address:
+  wangykev@gmail.com") and says only "sent to you" when it came from the session cookie. That confirms
+  the earlier reading of the generic message and is a useful diagnostic: a generic message means the
+  flow is using an existing candidate identity, not the email just typed.
+
+An account also arrives PREFILLED: `lastName`, `firstName`, `email`, dial code and phone number were
+already populated from the candidate profile before anything was typed. Only the address block was
+empty. ⚠ Ids renumbered again across the visit (`lastName-17` here vs `-22` earlier), which is the
+volatile-counter rule holding.
+
+### ⚠⚠ THE FOUR DEPENDENT GEO PICKERS DID NOT COMMIT — and this is UNRESOLVED
+
+`country` (the geo root, prefilled) commits and reads `invalid: false`. Plain text rows commit.
+`city`, `region2` (State), `postalCode` and `region1` (County) **do not**, and the failure is
+consistent rather than flaky:
+
+Committing each in turn, snapshotting immediately after every one:
+
+| after committing | State | County | City | Postal |
+|---|---|---|---|---|
+| State | `FL` | — | — | — |
+| County | **cleared** | `Leon` | — | — |
+| City | — | **cleared** | `Tallahassee` | — |
+| Postal | — | — | **cleared** | `32312` |
+
+Then, after a 6s settle, **all four are empty and `--invalid`**. A single field committed alone and
+left to settle keeps its text (`postalCode` = "32312") but *still* reads `--invalid`, i.e. the widget
+never accepted the pick as a geography selection — and the surviving text is indistinguishable from
+the query that was typed into it.
+
+Two hypotheses were tested and BOTH failed to explain it:
+
+- **Hierarchy order** (Country → State → County → City → Postal, top-down): the snapshots above are
+  top-down, and each commit still cleared its predecessor.
+- **The full-text retype** from entry (g) finding 4: removing it changed the DISPLAY (fields hold the
+  short `FL` / `Leon` / `Tallahassee` / `32312` instead of the full composite row text) but did NOT
+  stop the clearing. So finding 4 governs display, not commit — worth knowing, and worth restricting
+  to non-composite pickers, but it is not the cause here.
+
+The remaining difference from the ONE session where these did stick: there each field was committed in
+its **own CDP call**, seconds apart, with read-backs between. Here four commits happened inside a
+single page evaluation, ~250ms apart. That points at per-field settle time — which is what the standing
+pacing rule already requires (`act.delay`, read-back gated) and what a hand-driven single evaluation
+violates. **Not verified**, because the tab's session was spent by then. It is the first thing to test.
+
+⚠ **The verify contract behaved correctly throughout, which is the one reassuring part.**
+`cx-select-input--invalid` refused to report any of these as filled. A driver running this today would
+produce `needs_review` + `commit-not-accepted` on four required fields — honest, and exactly the
+outcome the negative signal exists to produce. It would NOT silently claim a filled address.
+
+### What that means for the driver
+
+`atsActuateField`'s oracle branch is correct in shape but **cannot yet fill an ORC address**. Do not
+treat step 1 as working. The open question is narrow and testable: does one geo commit per settle
+cycle, with a polled read-back that waits for `--invalid` to CLEAR (not merely for a value to appear),
+make them stick? If yes, the fix is pacing rather than mechanism.
+
+### ⚠⚠ CORRECTION (operator, 2026-08-19): NOTHING deletes the fields — CLEARING does, and ENTER commits
+
+Entry (j) recorded "each geo commit clears the others" and treated it as the platform behaving oddly.
+Both halves of that were wrong, and the operator established the truth by hand:
+
+1. **ENTER is the commit, not a click.** A full pointer sequence on the row returns cleanly and the
+   field shows the typed query — but **the list stays OPEN and the selection is never made**. Seen in
+   a screenshot: City and County red/required with `32312, Tallahassee, Leon, FL` still displayed
+   underneath Postal Code. Pressing Enter with exactly one row showing selects it, closes the list,
+   and fires the cascade. Measured immediately after: postal `32312`, **city `Tallahassee`**, state
+   `FL`, **county `Leon`** — 0 empty required, 0 `--invalid`, 0 errors on the whole page.
+   ⚠ This narrows recon (g) finding 3: the pointer sequence commits ORC's *country* picker but NOT
+   these. Enter is the primary; the pointer sequence survives only as a fallback.
+2. **THE POSTAL CODE AUTOFILLS CITY, STATE AND COUNTY.** The address block is ONE answer expressed
+   through its most specific field, not five independent ones. Fill the postal code, then VERIFY the
+   rest — do not actuate them.
+3. **CLEARING a geo picker cascades to its siblings.** This is what I was actually observing. The
+   house "clear before typing" rule — which exists to stop residual text poisoning a re-fill — is
+   DESTRUCTIVE here: every pick was wiping what the previous pick had auto-filled. The fields were
+   never deleting each other; the clear was. `atsInjOrcPick` takes `noClear` for these.
+
+⚠ The lesson is the one this file keeps recording: **I inferred a platform behaviour from a sequence I
+had contaminated myself.** The tell was available and ignored — a screenshot showed the option list
+still open, which said "not committed" long before I theorised about mutual exclusion. When a commit
+"succeeds" but the value does not stick, LOOK AT THE WIDGET before theorising about the tenant.
+
+`atsOrcGeoPlan` encodes it: anchor on `postalCode` (measured — "32312" gives ONE row where
+"Tallahassee" gives TWO, Jefferson and Leon, and the profile stores no county), dependents are
+verify-only, and a city fallback is flagged `exact:false` because it can resolve to the wrong county.
+`country` is excluded from both roles — it is the ROOT that mounts the block.

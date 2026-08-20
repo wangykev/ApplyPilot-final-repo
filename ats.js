@@ -3638,7 +3638,7 @@ function icimsAuthView(s) {
 // caller supplies it — the ambiguity rules stay SW-side. Commits ONLY on exactly one match: two hits
 // is not a confident answer and returns `ambiguous` with the rows, never a guess.
 // Returns the rows it saw either way, so a miss is diagnosable without a second page contact.
-async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs) {
+async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear) {
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
   const el = document.querySelector(inputSel);
@@ -3647,10 +3647,16 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs) {
   const wants = (Array.isArray(wantTexts) ? wantTexts : [wantTexts]).map(norm).filter(Boolean);
   if (!wants.length) return { ok: false, error: "no-target-text" };
 
-  // clear, then type with KEY events so the search actually runs (finding 1)
+  // CLEARING A GEO PICKER CASCADES (operator, 2026-08-19): emptying city/state/postal/county can
+  // empty its siblings too, so the house "clear before typing" rule -- which exists to stop residual
+  // text contaminating a re-fill -- is DESTRUCTIVE here. It is what made a sequence of picks look
+  // like the fields were deleting each other. `noClear` skips it for those fields; everything else
+  // keeps the clear, because a stale query really would poison the search.
   el.focus();
-  setter.call(el, "");
-  el.dispatchEvent(new Event("input", { bubbles: true }));
+  if (!noClear) {
+    setter.call(el, "");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
   for (const ch of String(query == null ? "" : query)) {
     el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
     setter.call(el, el.value + ch);
@@ -3661,14 +3667,27 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs) {
   // ⚠ INLINED, not a call to the top-level twin: this function is stringified and evaluated in the
   // page, so any free identifier is undefined there. Splitting it out "so the paths cannot drift"
   // would have thrown ReferenceError on the first live pick.
+  // ENTER IS THE COMMIT (operator, then measured 2026-08-19). A full pointer sequence on the row
+  // LOOKS like it works -- it returns cleanly and the field shows the typed query -- but the list
+  // stays OPEN and the selection is never made, which is how four required address fields sat empty
+  // with a visible option row underneath them. Pressing Enter while exactly one row is showing
+  // selects it, closes the list, AND fires the tenant's own cascade. The pointer sequence is kept
+  // only as a fallback for a widget that ignores Enter.
   const commitRow = (row, wantText, sawRows) => {
+    el.focus();
+    for (const type of ["keydown", "keypress", "keyup"]) {
+      el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+    }
+    return { ok: true, committed: wantText, rows: sawRows, via: "enter" };
+  };
+  const commitRowByPointer = (row, wantText, sawRows) => {
     const r = row.getBoundingClientRect();
     const o = { bubbles: true, cancelable: true, view: window,
       clientX: Math.round(r.left + r.width / 2), clientY: Math.round(r.top + r.height / 2) };
     for (const ty of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
       row.dispatchEvent(new MouseEvent(ty, o));
     }
-    return { ok: true, committed: wantText, rows: sawRows };
+    return { ok: true, committed: wantText, rows: sawRows, via: "pointer" };
   };
 
   const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
@@ -3694,7 +3713,7 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs) {
       const row = hits[0];
       const want = t(row);
       // finding 4: make the typed text agree with the option before committing
-      if (norm(el.value) !== norm(want)) {
+      if (!noClear && norm(el.value) !== norm(want)) {
         setter.call(el, "");
         el.dispatchEvent(new Event("input", { bubbles: true }));
         for (const ch of want) {
@@ -3962,6 +3981,59 @@ function atsInjOrcAuthScan() {
     errors: [...document.querySelectorAll('[role="alert"], .error, .cx-error, cx-notifications')].filter(vis)
       .map((e) => clean(e.textContent)).filter(Boolean).slice(0, 4),
   };
+}
+
+// ── ORC's ADDRESS IS ONE ANSWER, NOT FIVE (operator, 2026-08-19) ─────────────────────────
+// Measured with the operator: typing a postal code and pressing Enter on its single row fills CITY,
+// STATE and COUNTY by itself -- "32312" -> "32312, Tallahassee, Leon, FL" -> city Tallahassee, state
+// FL, county Leon, all accepted, no further actuation. So the address block is ONE decision expressed
+// through the most specific field, not five independent ones.
+//
+// That also explains a failure I mis-diagnosed for most of a session. Filling the five in sequence
+// looked like "each commit deletes the others", and I wrote that down. The real cause was the house
+// CLEAR-BEFORE-TYPING step: clearing a geo picker cascades to its siblings, so every pick was wiping
+// what the previous pick had auto-filled. The fields were never deleting each other -- I was.
+//
+// So the plan is: actuate the ANCHOR only, then VERIFY the dependents. A dependent that came back
+// correct is `already-filled` (audit-excluded, never re-actuated -- the standing rule for a field
+// that holds a live value); one that came back wrong or empty is a review item, NOT something to
+// type into, because typing into it would clear the anchor that produced the rest.
+//
+// The anchor is the postal code because it is the most specific: measured, "32312" resolved to
+// exactly ONE row while "Tallahassee" resolved to TWO (Jefferson and Leon counties) -- and the
+// profile stores no county at all, so the city route is genuinely ambiguous from the data we hold.
+// Falling back to city when there is no postal code is deliberate and flagged: it can pick the wrong
+// county, which is exactly the kind of confidently-wrong value that belongs in review.
+var ATS_ORC_GEO_ANCHOR = ["postalCode", "city", "region2", "region1"];
+
+function atsOrcGeoPlan(fields, profile) {
+  const list = Array.isArray(fields) ? fields : [];
+  const geo = list.filter((f) => f && f.searchDriven && f.widgetType === "select");
+  if (!geo.length) return null;
+  const byName = {};
+  for (const f of geo) byName[f.fieldName] = f;
+  const pi = (profile && profile.personal_info) || {};
+  // `country` is the geo ROOT and mounts the rest -- it is not an anchor candidate and is filled
+  // normally (measured: clearing it unmounts the whole block).
+  const value = { postalCode: pi.postal_code, city: pi.city, region2: pi.state_province, region1: null };
+  for (const name of ATS_ORC_GEO_ANCHOR) {
+    const f = byName[name];
+    const v = value[name];
+    if (f && v != null && String(v).trim()) {
+      return {
+        anchor: f,
+        anchorValue: String(v).trim(),
+        // everything else in the block is verified, never actuated
+        dependents: geo.filter((g) => g !== f && g.fieldName !== "country"),
+        exact: name === "postalCode",
+        detail: name === "postalCode"
+          ? "Oracle resolves the whole address from the postal code"
+          : "no postal code in profile, so the address is anchored on " + name +
+            " -- that can resolve to more than one county, so the result needs checking",
+      };
+    }
+  }
+  return null;
 }
 
 // ── SHOULD THIS ORC PICKER BE ENUMERATED FOR REVIEW? (2026-08-19) ────────────────────────
@@ -7083,7 +7155,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
-    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS,
+    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
