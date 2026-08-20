@@ -5192,17 +5192,28 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           for (const g of group.slice(0, 2)) {
             if (!g.id) { failed.push("a half with no id"); continue; }
             const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
-            const r = await act.eval(atsInjOrcPickFromOwnList, sel, monthCands, yearCands, ATS_ORC_PICK_MS).catch(() => null);
-            reopenTotal += (r && r.reopens) || 0;
-            if (!r || !r.ok) { failed.push((r && r.error) || "unknown"); continue; }
-            // READ-BACK VERIFIED like every other commit here — the click reporting a row is not proof
-            // the widget accepted it.
-            let got = null;
-            for (let w = 0; w < 8; w++) {
-              await act.delayFull(150);
-              const back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
-              if (back && back.ok && String(back.value || "").trim() && !back.invalid) { got = back.value; break; }
+            // ⚠ ONE RETRY PER HALF, and only on failure. Committing the first half re-renders the
+            // widget, so the second half's open can land mid-render — measured as
+            // `after="May" … (year not retained)`: the month took and the year did not, on the FIRST
+            // pair of a freshly-created entry form (endDate, moments later, took both halves in
+            // 804ms). A retry costs nothing when the commit works and saves the whole entry when it
+            // does not — Oracle refuses an entry whose required date is incomplete, so this one flake
+            // was costing the other two work-history entries as well.
+            let r = null, got = null;
+            for (let attempt = 0; attempt < 2 && got == null; attempt++) {
+              if (attempt) await act.delayFull(400);
+              r = await act.eval(atsInjOrcPickFromOwnList, sel, monthCands, yearCands, ATS_ORC_PICK_MS).catch(() => null);
+              reopenTotal += (r && r.reopens) || 0;
+              if (!r || !r.ok) continue;
+              // READ-BACK VERIFIED like every other commit here — a primitive reporting a row is not
+              // proof the widget accepted it.
+              for (let w = 0; w < 8; w++) {
+                await act.delayFull(150);
+                const back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
+                if (back && back.ok && String(back.value || "").trim() && !back.invalid) { got = back.value; break; }
+              }
             }
+            if (!r || !r.ok) { failed.push((r && r.error) || "unknown"); continue; }
             if (got == null) { failed.push(r.kind + " not retained"); continue; }
             got_by[r.kind] = got;
           }
