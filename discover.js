@@ -82,6 +82,22 @@
 const DISCOVER_SIMPLIFY_URL =
   "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json";
 
+// ── SOURCE 4 — zero2sudo's Instagram stories (traced live 2026-08-19) ───────
+// The creator posts openings to his STORY with a tappable LINK STICKER pointing at
+// the employer's real posting. `X-IG-App-ID` is instagram.com's own public web-client
+// id — it is not a credential and not ours; the endpoints simply 400 without it.
+const DISCOVER_Z2S_USERNAME = "zero2sudo";
+const DISCOVER_IG_APP_ID = "936619743392459";
+// ⚠ NOT instagram.com's home page — `robots.txt` DELIBERATELY.
+//
+// The tab exists for exactly ONE reason: to give our `fetch` an instagram.com ORIGIN so
+// the operator's session cookie rides along. We never read the DOM. Navigating to the
+// home page therefore booted Instagram's ENTIRE web app (and then waited out a 2s SPA
+// hydration beat) to obtain a property that any document on the origin already has.
+// A tiny public text/plain document is the same origin, the same cookies and the same
+// `fetch`, for a fraction of the load. Measured: ~5-8s → under a second.
+const DISCOVER_IG_ORIGIN_DOC = "https://www.instagram.com/robots.txt";
+
 const DISCOVER_DEFAULTS = {
   // The recency WINDOW. No longer an operator knob (2026-07-30: the "Posted within N
   // days" control was removed) — matchPercent scores freshness directly, so a wide
@@ -103,6 +119,14 @@ const DISCOVER_DEFAULTS = {
   //     record (Simplify's ATS links, or a record read that failed). Still tight.
   maxRecords: 25,
   maxJdOpens: 10,
+  //   maxStoryReads — zero2sudo's OWN description budget, spent inside its driver and
+  //     separate from maxJdOpens on purpose. A story link is a bare url: no company, no
+  //     title, no JD. Ranking runs BEFORE the global reader pass, so a story job that
+  //     reached it unenriched would score ~0 on relevance and be dropped below the match
+  //     threshold before its page was ever opened — the source would look empty rather
+  //     than filtered. Reading them in the driver makes their score honest, and 16 links
+  //     a day (measured) fits comfortably.
+  maxStoryReads: 16,
   maxPages: 3,        // how many result PAGES to sweep per board (scrape wide…)
   // …queue narrow, by a MATCH THRESHOLD rather than a count (operator 2026-07-30):
   // everything scoring at or above this is queued, however many that is. 0 ⇒ queue
@@ -1045,9 +1069,32 @@ function comparePostedDesc(a, b) {
 // in a stable order so that's deterministic). Returns { jobs, skippedKnown,
 // skippedDupe } so the UI can say WHY a sweep found fewer than it scanned —
 // "0 new" must be distinguishable from "0 found".
+/**
+ * Record that `source` also found this job, on the job that SURVIVED dedup.
+ *
+ * WHY THE SURVIVOR CARRIES THE FULL LIST (operator 2026-08-19): the queue page shows a
+ * tab per source plus an "All" tab, and the useful question there is "what did LinkedIn
+ * actually find for me?" — not "what did LinkedIn find that no earlier source had
+ * already found?". Dedup runs at sweep time and keeps the first source's copy, so
+ * WITHOUT this the later source's contribution silently vanishes from its own tab and
+ * that tab under-reports. `foundOn` is what lets the per-source tabs legitimately
+ * overlap while "All" stays the deduplicated union — one row, listed under each source
+ * that saw it.
+ *
+ * Always includes the job's own source, order-stable and unique.
+ */
+function noteFoundOn(job, source) {
+  if (!job) return job;
+  const list = Array.isArray(job.foundOn) && job.foundOn.length ? job.foundOn.slice() : (job.source ? [job.source] : []);
+  const add = String(source || "").trim();
+  if (add && !list.includes(add)) list.push(add);
+  job.foundOn = list;
+  return job;
+}
+
 function dedupeDiscovered(jobs, knownKeys) {
   const known = new Set((knownKeys || []).map((k) => String(k || "").trim()).filter(Boolean));
-  const seen = new Set();
+  const seen = new Map();
   const out = [];
   let skippedKnown = 0;
   let skippedDupe = 0;
@@ -1055,9 +1102,17 @@ function dedupeDiscovered(jobs, knownKeys) {
     if (!job || !job.url) continue;
     const key = job.jobKey || discoveryJobKey(job.url);
     if (known.has(key)) { skippedKnown++; continue; }
-    if (seen.has(key)) { skippedDupe++; continue; }
-    seen.add(key);
-    out.push({ ...job, jobKey: key });
+    const prev = seen.get(key);
+    if (prev) {
+      // Same posting, seen again — usually from a LATER source. The survivor records
+      // that this source found it too, so that source's tab still shows the job.
+      noteFoundOn(prev, job.source);
+      skippedDupe++;
+      continue;
+    }
+    const kept = noteFoundOn({ ...job, jobKey: key }, job.source);
+    seen.set(key, kept);
+    out.push(kept);
   }
   return { jobs: out, skippedKnown, skippedDupe };
 }
@@ -1106,7 +1161,14 @@ function dedupeCrossSource(jobs) {
     if (!pair) { kept.push(job); continue; }
     const prev = byPair.get(pair);
     // Only a DIFFERENT source collapses; a same-source repeat is a real second posting.
-    if (prev && prev.source !== job.source) { dropped.push({ job, keptFrom: prev.source }); continue; }
+    if (prev && prev.source !== job.source) {
+      // Same posting under two different employer urls. Carry EVERY source the dropped
+      // copy knew about, not just its own — it may already have absorbed a third source
+      // in the key-based pass above, and losing that would under-report that tab.
+      for (const s of (job.foundOn && job.foundOn.length ? job.foundOn : [job.source])) noteFoundOn(prev, s);
+      dropped.push({ job, keptFrom: prev.source });
+      continue;
+    }
     if (!prev) byPair.set(pair, job);
     kept.push(job);
   }
@@ -2077,7 +2139,11 @@ async function withDiscoverTab(url, opts, work) {
   const tabId = tab.id;
   try {
     await waitTabComplete(tabId, o.loadTimeoutMs || 25000);
-    await discoverDelay(o.settleMs || 2000); // SPA hydration beat — these are all React apps
+    // SPA hydration beat — the board pages are all React apps. ⚠ `!= null`, not `||`:
+    // an explicit `settleMs: 0` is a real answer ("nothing here hydrates, don't wait"),
+    // and `0 || 2000` silently turned that into the full 2s. No existing caller passes
+    // 0, so this only ever grants a request that used to be ignored.
+    await discoverDelay(o.settleMs != null ? o.settleMs : 2000);
     return await work(tabId);
   } finally {
     try { await new Promise((r) => chrome.tabs.remove(tabId, () => { void chrome.runtime.lastError; r(); })); }
@@ -2176,6 +2242,231 @@ async function discoverFromSimplify(opts) {
   dlog(`simplify: ${jobs.length} match${jobs.length === 1 ? "" : "es"}`);
   for (let i = 0; i < jobs.length; i++) dlog(`  ${String(i + 1).padStart(2, "0")}. ${jobLine(jobs[i])}`);
   return { jobs, note: "", scanned: total };
+}
+
+// ── SOURCE 4 — zero2sudo's Instagram stories ────────────────────────────────
+//
+// WHAT: a creator who posts internship / new-grad openings to his STORY, each with a
+// tappable LINK STICKER pointing at the employer's real posting. Traced live against a
+// signed-in session on 2026-08-19, and the two measurements that shaped this driver:
+//
+//   · 32 live stories, 16 carrying a link sticker — and every one of those 16 was a
+//     genuine job posting, while the 16 without carried no tappable link at all (they
+//     are his commentary). So **"has a link sticker" IS the job filter**: no OCR, no
+//     vision call, no classifier, no per-story LLM spend. That is what makes this
+//     source as cheap as the Simplify feed rather than as expensive as a page scrape.
+//   · `story_cta` — the pre-2021 swipe-up — was 0/32. Link stickers are the only
+//     mechanism in use, so we read one field rather than two.
+//
+// ⚠ 24-HOUR WINDOW, AND HIGHLIGHTS DO NOT FIX IT (measured, not assumed). A story
+// expires after 24h, so a sweep only ever sees what is live when it runs. The obvious
+// hope — that job stories get archived into a Highlight, which never expires — was
+// TESTED AND REFUTED: "Insider Info 4" held 65 items spanning the same dates, only 3
+// carried a link sticker, and cross-referencing by media id gave ZERO overlap with the
+// 16 live linked ones. He archives evergreen commentary, not the job drops. A day
+// between sweeps is therefore a day of postings genuinely missed, which is REPORTED as
+// a note rather than left invisible (the standing no-silent-caps rule).
+//
+// COOKIES, NOT KEYS — the same contract as LinkedIn/Handshake. This reads the JSON
+// instagram.com's own web client requests, from inside a tab on that origin, so it
+// carries the operator's own session. No API key, no burner account, and — per the
+// discovery safety invariant — NO LOGIN ATTEMPT: not signed in ⇒ say so and skip.
+//
+// ⚠ READING A STORY IS OBSERVABLE. `reels_media` marks those stories seen, so the
+// operator shows up in his viewer list. Normal for a follower, but it is the one
+// source here that is not purely passive, so it is stated plainly in the UI hint
+// rather than buried in a comment.
+
+/**
+ * Unwrap Instagram's outbound link shim to the real destination.
+ *
+ * A sticker's url is `https://l.instagram.com/?u=<percent-encoded real url>&e=<token>`.
+ * PURE + exported so it is unit-testable against recorded values — the page-side reader
+ * returns raw sticker urls and every interpretation happens here, the same split the
+ * board adapters use.
+ *
+ * The `e=` parameter is a per-view tracking token and is DISCARDED with the rest of the
+ * shim, which matters beyond tidiness: a discovered url is written to Supabase and
+ * echoed into logs, so carrying a session-scoped token there is the leak class
+ * `redactSecrets` exists for. Returns "" for anything that isn't a usable http(s) url.
+ */
+function unwrapStoryLink(raw) {
+  const s = String(raw == null ? "" : raw).trim();
+  if (!s) return "";
+  let u;
+  try { u = new URL(s); } catch (e) { return ""; }
+  if (/(^|\.)l\.instagram\.com$/i.test(u.hostname)) {
+    const inner = u.searchParams.get("u");
+    if (!inner) return "";
+    try { u = new URL(decodeURIComponent(inner)); } catch (e) { return ""; }
+  }
+  if (!/^https?:$/i.test(u.protocol)) return "";
+  // ⚠ META APPENDS ITS OWN TRACKER TO THE DESTINATION TOO (live 2026-08-19). Stripping the
+  // `l.instagram.com` shim is not enough: the real url comes back carrying `?fbclid=<~90 chars>`,
+  // which then reaches Supabase, every log line and the Run pipeline's navigation.
+  // A DENYLIST, never "drop the query": the destination's own params are load-bearing (an Oracle
+  // posting id lives in one, and a test pins that `mode=location` survives). These three are
+  // click identifiers Meta injects at click time — no ATS reads them.
+  // NOT a dedup fix: discoveryJobKey already ignores the query (step 5 → _canonicalJobUrl).
+  for (const junk of STORY_LINK_TRACKERS) u.searchParams.delete(junk);
+  return u.toString();
+}
+
+const STORY_LINK_TRACKERS = ["fbclid", "igshid", "igsh"];
+
+/**
+ * INJECTED into an instagram.com tab. Self-contained — closes over NOTHING.
+ *
+ * Returns the RAW sticker urls; unwrapping, filtering and job-shaping all happen
+ * service-worker side in `discoverFromZero2Sudo` so they stay pure and testable.
+ */
+async function scrapeInstagramStories(username, appId) {
+  const headers = { "X-IG-App-ID": appId, accept: "*/*" };
+  const out = { signedIn: true, items: [], total: 0, linked: 0, note: "" };
+
+  if (!/ds_user_id=/.test(document.cookie)) {
+    return { ...out, signedIn: false, note: "not signed in to Instagram in this Chrome profile." };
+  }
+
+  let userId = "";
+  try {
+    const r = await fetch("/api/v1/users/web_profile_info/?username=" + encodeURIComponent(username), { headers });
+    if (r.status === 401 || r.status === 403) return { ...out, signedIn: false, note: "Instagram rejected the session (HTTP " + r.status + ")." };
+    if (!r.ok) return { ...out, note: "Instagram profile lookup returned HTTP " + r.status + "." };
+    const j = await r.json();
+    userId = String(((j || {}).data || {}).user?.id || "");
+    if (!userId) return { ...out, note: "Instagram returned no user id for @" + username + " (renamed or removed?)." };
+  } catch (e) {
+    return { ...out, note: "Instagram profile lookup failed: " + String((e && e.message) || e) };
+  }
+
+  try {
+    const r = await fetch("/api/v1/feed/reels_media/?reel_ids=" + encodeURIComponent(userId), { headers });
+    if (r.status === 401 || r.status === 403) return { ...out, signedIn: false, note: "Instagram rejected the story read (HTTP " + r.status + ")." };
+    if (!r.ok) return { ...out, note: "Instagram story read returned HTTP " + r.status + "." };
+    const j = await r.json();
+    const reel = (j && j.reels_media && j.reels_media[0]) || null;
+    const items = (reel && reel.items) || [];
+    out.total = items.length;
+    for (const it of items) {
+      const stickers = (it && it.story_link_stickers) || [];
+      for (const s of stickers) {
+        const url = s && s.story_link && s.story_link.url;
+        if (!url) continue;
+        out.linked++;
+        out.items.push({
+          url: String(url),
+          takenAt: Number(it.taken_at) || 0,
+          title: String((s.story_link && s.story_link.link_title) || ""),
+        });
+      }
+    }
+  } catch (e) {
+    return { ...out, note: "Instagram story read failed: " + String((e && e.message) || e) };
+  }
+  return out;
+}
+
+/**
+ * SOURCE 4 driver. Opens ONE tab on instagram.com, reads the live story reel, turns
+ * every link sticker into a job, and — unlike the other sources — reads each posting's
+ * page HERE rather than leaving it to the global reader pass. See `maxStoryReads`:
+ * a story link arrives with no company, title or JD, and the global ranking runs
+ * BEFORE that pass, so unenriched story jobs would be scored on nothing and dropped
+ * below the match threshold before anything ever opened them.
+ */
+async function discoverFromZero2Sudo(opts) {
+  const o = opts || {};
+  discoverProgress("Checking @" + DISCOVER_Z2S_USERNAME + "'s Instagram stories");
+  let read;
+  try {
+    // settleMs 0 — the sibling call sites wait 2s for a React list to hydrate; there is
+    // nothing to hydrate here and nothing in the DOM we read, so the wait would be pure
+    // latency. (withDiscoverTab had to be taught that 0 means zero — see its comment.)
+    read = await withDiscoverTab(
+      DISCOVER_IG_ORIGIN_DOC,
+      { background: o.background !== false, settleMs: 0 },
+      (tabId) => discoverReadPage(tabId, scrapeInstagramStories, [DISCOVER_Z2S_USERNAME, DISCOVER_IG_APP_ID])
+    );
+  } catch (e) {
+    return { jobs: [], note: "Couldn't read @" + DISCOVER_Z2S_USERNAME + "'s stories: " + String((e && e.message) || e), scanned: 0 };
+  }
+  if (!read) {
+    dlog(`zero2sudo: the story read returned NOTHING (the injected reader gave no result)`);
+    return { jobs: [], note: "@" + DISCOVER_Z2S_USERNAME + ": the story read returned nothing.", scanned: 0 };
+  }
+  // ⚠ SIGNED OUT MUST BE LOUD IN THE SW LOG, not only in the returned note (live 2026-08-19).
+  // The first live run on a fresh Chrome profile logged nothing but `scanned {"zero2sudo":0}`,
+  // which reads exactly like "he posted nothing today" — the note explaining why existed, but
+  // only on the RESULT, so the console (the primary debugging surface) showed a silent zero.
+  // `signedOut: true` mirrors what the boards return, so a caller can tell "fix your session"
+  // apart from "nothing found".
+  if (read.signedIn === false) {
+    dlog(`zero2sudo: NOT SIGNED IN — ${read.note || "no ds_user_id cookie on instagram.com"}`);
+    return {
+      jobs: [], scanned: 0, signedOut: true,
+      note: "@" + DISCOVER_Z2S_USERNAME + " skipped — you're not signed in to Instagram. "
+        + "Sign in to Instagram in this Chrome profile, then run Discover again.",
+    };
+  }
+  if (read.note && !read.items.length) {
+    dlog(`zero2sudo: read FAILED — ${read.note}`);
+    return { jobs: [], note: "@" + DISCOVER_Z2S_USERNAME + ": " + read.note, scanned: read.total || 0 };
+  }
+
+  dlog(`zero2sudo: ${read.total} live stor${read.total === 1 ? "y" : "ies"}, ${read.linked} carrying a link sticker`);
+
+  // Unwrap → drop anything unusable → dedupe within the sweep (he re-posts the same
+  // opening across a day). `seen` is keyed on discoveryJobKey so two stories pointing
+  // at one posting collapse before either is opened.
+  const seen = new Set();
+  let unusable = 0;
+  const jobs = [];
+  for (const it of read.items) {
+    const url = unwrapStoryLink(it.url);
+    if (!url) { unusable++; continue; }
+    const key = discoveryJobKey(url);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    jobs.push({
+      source: "zero2sudo",
+      url,
+      jobKey: key,
+      company: "",
+      title: "",
+      location: "",
+      // A story's own post time IS the posting's freshness signal here — he posts
+      // openings as he finds them, so taken_at is the best date available and it
+      // always lands inside the recency window.
+      postedAt: it.takenAt > 0 ? it.takenAt * 1000 : null,
+    });
+  }
+  if (unusable) dlog(`zero2sudo: ${unusable} sticker${unusable === 1 ? "" : "s"} didn't unwrap to an http(s) url — skipped`);
+
+  const capped = jobs.slice(0, Math.max(0, Number(o.maxPerSource) || DISCOVER_DEFAULTS.maxPerSource));
+
+  // Enrich HERE — see the doc comment. Its own budget, and whatever it can't reach is
+  // reported rather than silently queued unranked.
+  const budget = Math.max(0, Number(o.maxStoryReads != null ? o.maxStoryReads : DISCOVER_DEFAULTS.maxStoryReads));
+  const jd = await fillMissingDescriptions(capped, { ...o, maxJdOpens: budget });
+
+  const notes = [];
+  if (read.total > 0 && read.linked === 0) {
+    notes.push(`@${DISCOVER_Z2S_USERNAME} had ${read.total} stor${read.total === 1 ? "y" : "ies"} live but none carried a link sticker — nothing to queue.`);
+  }
+  if (jd.skipped > 0) {
+    notes.push(`${jd.skipped} of @${DISCOVER_Z2S_USERNAME}'s links weren't opened (the ${budget}-read cap), so they rank without a description.`);
+  }
+  // The 24h window, stated every time there was anything to find. A sweep that runs a
+  // day late cannot know what it missed, so the honest thing is to say the window
+  // exists rather than imply the list is complete.
+  if (read.linked > 0) {
+    notes.push(`@${DISCOVER_Z2S_USERNAME}: ${read.linked} link${read.linked === 1 ? "" : "s"} from the last 24h of stories. Stories expire after 24h — anything posted before that is already gone, so sweep daily to keep up.`);
+  }
+
+  dlog(`zero2sudo: ${capped.length} job${capped.length === 1 ? "" : "s"} after unwrap + dedupe`);
+  for (let i = 0; i < capped.length; i++) dlog(`  ${String(i + 1).padStart(2, "0")}. ${jobLine(capped[i])}`);
+  return { jobs: capped, note: notes.join(" "), scanned: read.total || 0 };
 }
 
 // ── Shared board plumbing ───────────────────────────────────────────────────
@@ -3112,7 +3403,7 @@ async function fillMissingDescriptions(jobs, opts) {
 async function runJobDiscovery(opts) {
   const o = { ...DISCOVER_DEFAULTS, ...(opts || {}) };
   const now = typeof o.nowMs === "number" ? o.nowMs : Date.now();
-  const want = { simplify: true, linkedin: true, handshake: true, ...(o.sources || {}) };
+  const want = { simplify: true, zero2sudo: true, linkedin: true, handshake: true, ...(o.sources || {}) };
   const notes = [];
   const scanned = {};
   let all = [];
@@ -3149,6 +3440,17 @@ async function runJobDiscovery(opts) {
     const r = await discoverFromSimplify({ ...o, keywords, location, termPattern: term, nowMs: now });
     if (r.note) notes.push(r.note);
     scanned.simplify = r.scanned;
+    all = all.concat(r.jobs);
+  }
+  // zero2sudo runs SECOND, ahead of the keyword boards, for the same reason Simplify
+  // runs first: its urls are the employer's own posting links, so when the cross-source
+  // dedup below collapses a duplicate it is the direct link that survives rather than a
+  // board wrapper. It is also keyword-INDEPENDENT — a human curated these, so a blank
+  // keyword box doesn't disable it the way it disables LinkedIn/Handshake.
+  if (want.zero2sudo) {
+    const r = await discoverFromZero2Sudo({ ...o, nowMs: now });
+    if (r.note) notes.push(r.note);
+    scanned.zero2sudo = r.scanned;
     all = all.concat(r.jobs);
   }
   let boardRewrites = 0;
@@ -3452,5 +3754,10 @@ if (typeof module !== "undefined" && module.exports) {
     crossSourceKey,
     dedupeCrossSource,
     summarizeDiscovery,
+    // Source 4 — zero2sudo. Only the PURE parts are exported: the driver itself needs
+    // chrome.tabs, but every interpretation it does is here and unit-tested.
+    DISCOVER_Z2S_USERNAME,
+    unwrapStoryLink,
+    noteFoundOn,
   };
 }
