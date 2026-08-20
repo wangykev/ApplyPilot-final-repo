@@ -4348,6 +4348,21 @@ function atsInjOrcUnclaimed(claimedNames) {
   return { ok: true, unclaimed: [...seen.values()], aria };
 }
 
+// Scroll named blocks into view. READ-ONLY in the sense that matters: it moves the viewport and
+// touches nothing else, so it cannot change an answer — which is what makes it a safe probe for
+// "does this block render only when looked at?".
+function atsInjOrcScrollBlocks(titles) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const want = new Set((titles || []).map(String));
+  let n = 0;
+  for (const b of document.querySelectorAll("apply-flow-block")) {
+    const title = t(b.querySelector("apply-flow-block-title"));
+    if (!want.has(title)) continue;
+    try { b.scrollIntoView({ block: "center" }); n++; } catch (e) { /* older engines */ }
+  }
+  return { ok: true, scrolled: n };
+}
+
 function atsInjOrcEntryState(blockTitlePattern) {
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -4762,7 +4777,19 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           rec.elapsedMs = Date.now() - t0;
           const ok = r && r.ok && String(rec.after || "").trim() && !(back && back.invalid);
           rec.status = ok ? "filled" : "needs_review";
-          if (!ok) { rec.flag = "no-option-match"; rec.detail = `Oracle's list did not accept any of ${JSON.stringify(cands.slice(0, 4))}` + (r && r.rows ? `; it offered ${JSON.stringify(r.rows.slice(0, 4))}` : ""); }
+          if (!ok) {
+            rec.flag = "no-option-match";
+            rec.detail = `Oracle's list did not accept any of ${JSON.stringify(cands.slice(0, 4))}`;
+            // ⚠ ONE OPTION PER LINE, deliberately. The single combined line carrying a picker's
+            // option list was unreadable through the dev-log channel (its content tripped a filter),
+            // and "the list did not accept our value" without knowing what the list HELD is the
+            // least actionable message a picker can produce — it was the whole reason the Education
+            // entry stayed unexplained for two runs.
+            const rows = (r && r.rows) || [];
+            log(`  ↳ ${key}: wanted ${JSON.stringify(cands.slice(0, 4))}, and the picker offered ${rows.length} row(s):`);
+            for (const row of rows.slice(0, 10)) log(`      · ${String(row).slice(0, 60)}`);
+            if (!rows.length) log("      (none — the search returned nothing at all)");
+          }
           else rec.detail = `picked ${JSON.stringify(rec.after)} from the form's own list`;
         } else {
           // A tiered value in a TEXT box takes the most specific wording — there is no list to
@@ -8188,7 +8215,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE, atsInjOrcBlocks, atsOrcEntryValue, atsOrcFillEntries,
-    atsInjOrcUnclaimed,
+    atsInjOrcUnclaimed, atsInjOrcScrollBlocks,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,

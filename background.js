@@ -5678,12 +5678,23 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         // That distinction is what makes this a settle and not a guess — and it is why the block
         // inventory had to exist before this could be written.
         const blkT0 = Date.now(), BLK_BUDGET = 15000;
-        let pending = null;
+        let pending = null, scrolled = false;
         while (Date.now() - blkT0 < BLK_BUDGET) {
           const bl = await cdpEval(atsInjOrcBlocks).catch(() => null);
           const list = (bl && bl.ok && bl.blocks) || [];
           pending = list.filter((b) => !b.inputs && !b.addCaption).map((b) => b.title);
           if (!list.length || !pending.length) break;
+          // ⚠ WAITING LONGER IS NOT THE ONLY REASON A BLOCK STAYS EMPTY. Measured: "Application
+          // Questions" was still empty after the FULL 15.4s budget, which rules out "the fetch is
+          // slow" and leaves lazy rendering — a block whose contents mount when it scrolls into
+          // view. So the wait scrolls it into view ONCE, halfway through the budget, and keeps
+          // polling. Scrolling is read-only and cannot change an answer; it is the cheapest probe
+          // that distinguishes "not loaded yet" from "not loaded until looked at".
+          if (!scrolled && Date.now() - blkT0 > BLK_BUDGET / 3) {
+            scrolled = true;
+            const sc = await cdpEval(atsInjOrcScrollBlocks, pending).catch(() => null);
+            LOG(`⚠ block(s) ${JSON.stringify(pending)} still empty after ${((Date.now() - blkT0) / 1000).toFixed(1)}s — scrolled ${(sc && sc.scrolled) || 0} into view in case they render lazily`);
+          }
           await cdpDelay(700);
         }
         if (pending && pending.length) {
