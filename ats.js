@@ -5065,6 +5065,25 @@ async function atsOrcFillLinks(act, profile, opts) {
   const have = st0.links.map((l) => norm(l.value)).filter(Boolean);
   const missing = want.filter((u) => have.indexOf(norm(u)) === -1);
   log(`links: profile has ${want.length}, the form holds ${have.length} (${JSON.stringify(st0.links.map((l) => l.value).filter(Boolean))}) — ${missing.length} to add`);
+
+  // ⚠ REPORT THE LINKS ALREADY ON THE FORM, for the same reason as the entries above: a link the run
+  // did not have to add is still part of the application, and a review page that omits it tells the
+  // operator their links are missing.
+  // ⚠ THE FLAT LOOP ALREADY RECORDED `siteLink-1` (it is in the static map), so reporting every link
+  // here would DOUBLE it in review — the field would appear twice, which reads as two links.
+  const already = new Set((o.recorded || []).map(String));
+  for (const l of st0.links) {
+    if (!l.value) continue;
+    if (l.name && already.has(l.name)) continue;
+    records.push({
+      fieldName: l.name || "siteLink", label: "Link " + ((String(l.name || "").split("-")[1]) || "?"),
+      widgetType: "text", isRequired: false, mappedPath: "websites[].url",
+      status: "filled", verified: true, after: l.value, elapsedMs: 0,
+      detail: want.indexOf(l.value) !== -1 || have.indexOf(norm(l.value)) !== -1
+        ? "already on the form" + (want.some((u) => norm(u) === norm(l.value)) ? " and it is one of your profile's links — verified, not re-entered" : "")
+        : "already on the form",
+    });
+  }
   if (!missing.length) return { records, notes };
 
   if (!st0.addPresent) {
@@ -5192,7 +5211,26 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
     const isSkills = item.source === "skills";
 
     if (present.length && !isSkills && atsOrcTilesAlreadyMatch(item.source, arr, item.want, present)) {
-      log(`${item.block}: the ${present.length} tile(s) on the form ALREADY match the profile — nothing to do (deleting and retyping them would change nothing and cost an open, ${item.want * 2} picker visits and a commit each)`);
+      log(`${item.block}: the ${present.length} tile(s) on the form ALREADY match the profile — nothing to retype (deleting and re-entering them would change nothing and cost an open, ${item.want * 2} picker visits and a commit each)`);
+      // ⚠⚠ BUT STILL REPORT THEM. Skipping the WORK must not skip the RECORD: the review page has to
+      // show what the application CONTAINS, not merely what this run happened to type. Live
+      // 2026-08-20 the operator found Experience, Education and Links missing from review entirely on
+      // a run where all three were correctly on the form — the optimisation had quietly deleted them
+      // from the bundle.
+      //
+      // That is worse than the slowness it replaced: a reviewer cannot approve an application whose
+      // work history they cannot see, and "absent" reads as "not filled" rather than "already right".
+      // One record per entry, carrying the tile's own summary as the value, `filled` and unflagged
+      // because it was verified against the profile by the very check that let us skip it.
+      for (let k = 0; k < present.length; k++) {
+        records.push({
+          fieldName: `${item.source}[${k}]`, label: `${item.block} entry ${k + 1}`,
+          widgetType: "text", isRequired: false,
+          entrySection: item.source, entryIndex: k,
+          status: "filled", verified: true, after: present[k].text, elapsedMs: 0,
+          detail: "already on the form and it MATCHES your profile — verified, not re-entered",
+        });
+      }
       continue;
     }
     if (present.length && !isSkills) {
@@ -7761,7 +7799,8 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
     // LINKS FIRST: it only ever ADDS rows, so doing it before the entry pass keeps its new inputs out
     // of anything the entry pass reads.
     try {
-      const lp = await atsOrcFillLinks(act, profile, { log: (m) => console.log("[ApplyPilot][ORC-LINK]", m) });
+      const lp = await atsOrcFillLinks(act, profile, { log: (m) => console.log("[ApplyPilot][ORC-LINK]", m),
+        recorded: results.map((r) => r && r.fieldName).filter(Boolean) });
       if (lp && lp.records && lp.records.length) results.push(...lp.records);
       if (lp && lp.notes && lp.notes.length) entryNotes = entryNotes.concat(lp.notes);
     } catch (e) {

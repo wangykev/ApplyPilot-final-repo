@@ -4213,3 +4213,48 @@ test("both choice-commit paths grade through the one predicate", () => {
   assert.ok((code.match(/atsTierIsDeterministic\(/g) || []).length >= 3,
     "both commit paths plus the definition must reference it");
 });
+
+
+// ── skipping the WORK must never skip the RECORD (operator, 2026-08-20) ──────────────────
+// The tile-match skip and the "0 links to add" path saved real time and quietly deleted Experience,
+// Education and Links from the review bundle — on a run where all three were correctly on the form.
+// That is worse than the slowness it replaced: a reviewer cannot approve an application whose work
+// history they cannot see, and "absent" reads as "not filled" rather than "already right".
+test("a block skipped because it already matches STILL reports its entries", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("atsOrcTilesAlreadyMatch(item.source, arr, item.want, present)");
+  assert.ok(i > 0, "the skip must exist");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const branch = stripComments(src.slice(i, i + 1800));
+
+  assert.ok(/records\.push\(/.test(branch),
+    "a skipped-because-correct block must still emit one record per entry — the review page shows " +
+    "what the application CONTAINS, not what this run happened to type");
+  assert.ok(/entrySection: item\.source/.test(branch) && /entryIndex: k/.test(branch),
+    "the records must carry the section and index so review groups them as entries");
+  assert.ok(/status: "filled"/.test(branch) && /verified: true/.test(branch),
+    "they are verified — the very check that allowed the skip compared them against the profile");
+  assert.ok(!/flag:/.test(branch), "and they are NOT flagged: nothing here needs a human");
+  // the skip must still actually skip the work
+  assert.ok(/continue;/.test(branch), "the entry-filling work is still skipped");
+});
+
+test("links already on the form are reported, and not DOUBLED by the flat loop's record", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsOrcFillLinks");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const pass = stripComments(src.slice(i, src.indexOf("\n// ── THE ENTRY PASS", i)));
+
+  assert.ok(/for \(const l of st0\.links\)[\s\S]{0,400}records\.push\(/.test(pass),
+    "a link already on the form is still part of the application and must reach review");
+  // ⚠ `siteLink-1` is in the static map, so the flat loop already recorded it — reporting every link
+  // here without a guard makes the field appear TWICE, which reads as two links.
+  assert.ok(/already\.has\(l\.name\)/.test(pass),
+    "links the flat loop already recorded must be skipped, or review shows the same link twice");
+  assert.ok(/recorded: results\.map/.test(src),
+    "…and the caller must actually pass the recorded field names");
+});
