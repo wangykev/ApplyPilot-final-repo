@@ -4793,7 +4793,37 @@ async function runOrcPreForm(tabId, credentials, opts) {
         { federated: s.federated, createAccount: s.createAccount });
     }
     if (view === "none") {
-      return halt("unknown-page", `No Oracle apply control, gate, code box or form section on ${(s && s.url) || "this page"} — nothing safe to act on.`);
+      // ⚠⚠ "NOTHING HERE" IS A CONCLUSION THAT REQUIRES STABILITY, AND THIS DREW IT FROM ONE READ.
+      // Live 2026-08-19, immediately after the change-detection fix above started working: the gate
+      // submitted, the page changed in 1387ms, and the very next scan of `…/apply/section/1` reported
+      // sections=0 pins=0 email=false pass=false — every signal zero, which is the fingerprint of a
+      // half-rendered SPA rather than of an unknown page. The run halted `unknown-page` on the form
+      // it had just reached.
+      //
+      // ⚠ AND IT WAS MY OWN FIX THAT EXPOSED IT. The same wait used to burn its full 20228ms budget
+      // because the signature comparison could never return true, and that accidental 20s delay was
+      // the settle this loop was silently relying on. Making the wait honest removed it. The lesson
+      // is the general one: when a wait stops being slow, look for what depended on its slowness —
+      // the previous run reached `view=form (sections=4)` for no better reason than that it was late.
+      //
+      // So: poll for the view to become READABLE before concluding anything. A view that stays
+      // `none` for the whole budget is a real unknown page and still halts, with the wait reported so
+      // the halt cannot be mistaken for the instant one again. Monotone predicate — the view becoming
+      // actionable can only be noticed late, never missed.
+      const noneT0 = Date.now(), NONE_BUDGET = 20000;
+      let settled = null, reads = 0;
+      while (Date.now() - noneT0 < NONE_BUDGET) {
+        await cdpDelay(700);
+        reads++;
+        const again = await cdpEval(atsInjOrcAuthScan).catch(() => null);
+        const v = orcApplyView(again);
+        if (v && v !== "none" && v !== "unreadable") { settled = { s: again, v }; break; }
+      }
+      if (!settled) {
+        return halt("unknown-page", `No Oracle apply control, gate, code box or form section on ${(s && s.url) || "this page"} after ${((Date.now() - noneT0) / 1000).toFixed(1)}s and ${reads} read(s) — nothing safe to act on.`);
+      }
+      LOG(`the page was still rendering — view settled to ${settled.v} after ${((Date.now() - noneT0) / 1000).toFixed(1)}s`);
+      continue;   // re-enter the loop and route on the settled view, never on the stale one
     }
 
     if (view === "posting") {

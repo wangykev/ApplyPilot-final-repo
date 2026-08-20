@@ -3511,3 +3511,33 @@ test("a partial ORC bundle NAMES the step it stopped on and why", () => {
   assert.ok(/walkStopped !== "reached-final-step"/.test(src),
     "a walk that reached the last step produces a COMPLETE bundle");
 });
+
+
+// ── "nothing here" needs stability, not one read (live 2026-08-19) ───────────────────────
+// The gate submitted, the page changed in 1387ms, and the next scan of `…/apply/section/1` reported
+// every signal zero — the fingerprint of a half-rendered SPA, not of an unknown page. The run halted
+// `unknown-page` on the form it had just reached. The same wait had previously burned a full 20228ms
+// because its signature comparison could never return true, and that accidental delay WAS the settle
+// this loop relied on; making the wait honest removed it.
+test("the ORC pre-form SETTLES before concluding a page is unknown", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf('if (view === "none") {');
+  assert.ok(i > 0, "the none branch must exist");
+  const branch = src.slice(i, i + 2600);
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const code = stripComments(branch);
+  // it must POLL rather than halt on the first read
+  assert.ok(/while \(Date\.now\(\) - noneT0/.test(code),
+    "a `none` view must be re-read against a budget — one read cannot distinguish 'nothing here' from 'not yet'");
+  assert.ok(/orcApplyView\(again\)/.test(code), "and the re-read must go through the same view judgement");
+  // …and it must still be able to halt, so a genuinely unknown page is not walked blindly
+  assert.ok(/halt\("unknown-page"/.test(code), "a view that stays none for the whole budget must still halt");
+  // the halt must REPORT the wait, so it can never again be mistaken for the instant one
+  assert.ok(/reads/.test(code) && /toFixed\(1\)/.test(code),
+    "the halt must say how long it waited and how many reads landed — otherwise a settled halt and an " +
+    "instant one read identically in the log");
+  // and it must resume the loop on the settled view rather than acting on the stale one
+  assert.ok(/continue;/.test(code), "a settled view must be routed by the loop, not by the stale read");
+});
