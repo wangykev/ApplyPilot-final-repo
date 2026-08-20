@@ -1720,3 +1720,80 @@ one, the fill-loop number is provider variance.
 **Diagnose with the log line itself**, which now prints the split rather than only the total:
 `[N signature read(s) costing Xms; Y s of this wait was OURS, proving quiet]`. Reading a total as the
 server's time is how an 8.6s probe cost went unnoticed for a day.
+
+
+## Round 13 — Oracle Recruiting Cloud: 100s → 38.5s (2026-08-20)
+
+Operator target: the whole form in ~30s, each page ~6s, "page 2 maybe taking longer". Same tenant
+and posting throughout (`eeho.fa.us2.oraclecloud.com` job 334325), each run on a fresh account.
+
+| | before | after |
+|---|---|---|
+| step 1 (Personal Info) | ~10s | **5.9s** |
+| step 2 (Experience) | ~40–96s | **19.1s** |
+| step 3 (More About You) | ~13s | **5.3s** |
+| **page fill total** | | **30.3s** |
+| **run total** | **~100s** | **38.5s** (45 fields, 856ms/field) |
+| `work_experience[N].startDate` | ~11s ×3 | **~1.09s ×3** |
+| `work_experience[N].endDate` | ~2s ×3 | **~1.07s ×3** |
+| `education[0].educationalEstablishment` | ~17s | **1.3s** |
+
+### ⚠ FIRST: THROW AWAY THE CONTAMINATED RUN
+
+One run took 641.5s at 13.9s/field with `employerName` at 12908ms and `fullName` at 11325ms —
+plain text writes that cost ~30ms when the browser is healthy. Chrome's renderer was wedging
+(screenshots timing out while `Runtime.evaluate` still answered). Optimising from those numbers
+would have sent the whole round at the wrong fields. **A per-field table is only usable once the
+cheapest fields in it look cheap.**
+
+### The finding: `startDate` cost ~11s and `endDate` ~2s — same widget, same code
+
+The only difference is that `startDate` is the first picker touched in a freshly-created entry
+form. Three causes, one insight — **an open that did not register must be RE-CLICKED, not waited
+out**:
+
+1. **Two opens per half.** The date pair CAPTURED each half's options (open → poll → Escape) and
+   then PICKED it (open → type → Enter). The operator spotted it unprompted: *"it opens the
+   dropdown before going back and filling it when it could definitely fill it just once."*
+   `atsInjOrcPickFromOwnList` opens once, classifies from the rows in front of it, and commits.
+   Classification is still per-half and still evidence-based — a tenant rendering year-then-month
+   is still handled — it just no longer costs a second visit.
+2. **A dead open was waited out for the full 8s budget.** ORC's combobox is sometimes not wired
+   when the first click lands; the capture then polled 8s for rows that were never coming, and only
+   a retry's second click worked. Both the fused primitive and `atsInjOrcPick` now re-click at
+   ~700ms and ~1400ms. This is also the operator's *"sometimes it lags and I need to click the page
+   to get it to keep going"* — without the re-click the run sits in a poll on a picker that never
+   opened, and the human's click is what finally wires it. **The School picker's 17s → 1.3s is
+   entirely this.**
+3. **Poll granularity, not widget speed.** The yes/no read-back at 10 × 200ms plus a CDP round-trip
+   each meant a late flip paid the WHOLE loop — 5227ms and 3378ms on commits that had already
+   succeeded. 24 × 120ms exits at the first agreeing read.
+
+### ⚠ Two mistakes worth keeping
+
+- **Fusing the visits was right; changing the commit with it was not.** The first fused version
+  clicked the matching row with a full pointer sequence and ORC ignored it — every date came back
+  `commit-not-accepted … got nothing`. This widget commits by TYPING the value and pressing ENTER
+  on the input, which `atsInjOrcPick` had always done. Two changes rode in on one commit and only a
+  live run could separate them.
+- **`act.delay` is not a settle.** The yes/no poll was first written with `act.delay`, the ADAPTIVE
+  pace, which collapses to ~15ms on a visible tab: a loop written as "10 × 150ms" finished in 196ms
+  and reported both required fields unfilled. `act.delayFull` is wall clock. Same trap this file
+  already records for Workday's settles, and the test that passed alongside the bug only checked
+  that a loop existed.
+
+### And a retry that fired every time is a missing pace
+
+After the fusion, `startDate` still cost ~4.1s on every entry (4108/4181/4168ms) against
+`endDate`'s ~0.8s (809/834/795ms) — the retry firing *systematically*, not occasionally.
+Committing the first half re-renders the widget and the second half's open lands mid-render.
+Waiting 250ms between halves is cheaper than spending a failed attempt plus a 400ms recovery pace
+to rediscover it on every entry. Result: all six halves at ~1.07s, retry idle.
+
+### What is left
+
+Page fill is 30.3s and the run is 38.5s, so ~8.2s sits in the three step transitions (Next click +
+advance poll + `waitAtsFormReady` + the block-population settle). Step 3's AI call is ~8s of
+provider latency inside its 5.3s–13.2s spread — one call, and the standing rule applies: **a slow
+page is the LLM until proven otherwise.** The block settle can spend up to 15s, but only when a
+block genuinely never populates; it did not fire on this run.
