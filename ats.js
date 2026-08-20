@@ -1702,8 +1702,27 @@ function atsInjScan(ats) {
         if (!el.name && !el.id && el.type === "tel") { key = "phoneNumber--number"; widgetType = "text"; }
 
         if (!key || seen.has(key)) continue; seen.add(key);
-        push({ fieldName: key,
-          inputSel: el.id ? "#" + esc(el.id) : (el.name ? '[name="' + esc(el.name) + '"]' : ".phone-row__input"),
+        // ⚠ THE SELECTOR MUST BE THE FIELD'S OWN, and `.phone-row__input` is NOT a general fallback.
+        // Caught by running this scan through the extension: ORC's résumé-IMPORT input has no id and
+        // no name, so it inherited the phone fallback and came back as
+        // `{fieldName:"attachment-upload", inputSel:".phone-row__input"}` — an attach would have
+        // written a file into the PHONE box. A fallback that is right for one field and silently
+        // wrong for every other is worse than no fallback.
+        let sel = el.id ? "#" + esc(el.id) : (el.name ? '[name="' + esc(el.name) + '"]' : null);
+        if (!sel && key === "phoneNumber--number") sel = ".phone-row__input";
+        if (!sel && isFile) {
+          // A file input is addressable through the wrapper that identifies it, when there is one.
+          for (let p = el.parentElement; p && !sel; p = p.parentElement) {
+            const n = p.tagName.toLowerCase();
+            if (/^(resume|cover-letter|attachment)-upload-button$/.test(n)) sel = n + ' input[type="file"]';
+          }
+        }
+        // ⚠ NO SELECTOR ⇒ NOT EMITTED. An unaddressable field cannot be actuated OR verified, so
+        // emitting it would put a record in the bundle that no later pass can act on. ORC's
+        // résumé-import banner is exactly this, and skipping it is also what the operator asked for:
+        // that control is the résumé AUTOFILL, which must not run before the deterministic fill.
+        if (!sel) continue;
+        push({ fieldName: key, inputSel: sel,
           widgetType, label: stripStar(rawLabel) || key, isRequired: reqOf(el, rawLabel),
           value: (el.type === "checkbox" ? (el.checked ? "true" : null) : (el.value || null)),
           searchDriven: searchDriven || undefined,
