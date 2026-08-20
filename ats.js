@@ -5059,6 +5059,10 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
     const present = (tiles0 && tiles0.ok && tiles0.tiles) || [];
     const isSkills = item.source === "skills";
 
+    if (present.length && !isSkills && atsOrcTilesAlreadyMatch(item.source, arr, item.want, present)) {
+      log(`${item.block}: the ${present.length} tile(s) on the form ALREADY match the profile — nothing to do (deleting and retyping them would change nothing and cost an open, ${item.want * 2} picker visits and a commit each)`);
+      continue;
+    }
     if (present.length && !isSkills) {
       log(`${item.block}: ${present.length} existing tile(s) on the form — deleting before filling: ${JSON.stringify(present.map((x) => x.text.slice(0, 50)))}`);
       let removed = 0;
@@ -5078,8 +5082,8 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           if (!okd || !okd.ok) { log(`⛔ ${item.block}: the confirmation could not be answered (${(okd && okd.error) || "unknown"}) — stopping`); break; }
         }
         let dropped = false;
-        for (let w = 0; w < 12; w++) {
-          await act.delayFull(300);
+        for (let w = 0; w < 24; w++) {
+          await act.delayFull(150);
           const after = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
           if (after && after.ok && after.count < n) { dropped = true; removed++; break; }
         }
@@ -5124,8 +5128,11 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       }
       // MONOTONE wait: the form exists once it has inputs. Polled, never a fixed sleep.
       let st = null;
-      for (let tries = 0; tries < 14; tries++) {
-        await act.delayFull(300);
+      // ⚠ 150ms, not 300: these polls do not make the page faster, they decide how long we take to
+      // NOTICE. Every one is read-back gated, so a short poll costs an extra read and never a wrong
+      // value — the same trade the pacing rules already allow for visible-tab runs.
+      for (let tries = 0; tries < 28; tries++) {
+        await act.delayFull(150);
         st = await act.eval(atsInjOrcEntryState, item.pattern).catch(() => null);
         if (st && st.ok && st.open && (st.fields || []).length) break;
       }
@@ -5198,7 +5205,7 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             // 809/834/795ms with no retry at all. That is systematic, not flaky, so it is cheaper to
             // wait 250ms once than to spend a failed attempt plus a 400ms recovery pace rediscovering
             // it on every entry.
-            if (halfIdx) await act.delayFull(250);
+            if (halfIdx) await act.delayFull(150);
             if (!g.id) { failed.push("a half with no id"); continue; }
             const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
             // ⚠ ONE RETRY PER HALF, and only on failure. Committing the first half re-renders the
@@ -5216,8 +5223,8 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
               if (!r || !r.ok) continue;
               // READ-BACK VERIFIED like every other commit here — a primitive reporting a row is not
               // proof the widget accepted it.
-              for (let w = 0; w < 8; w++) {
-                await act.delayFull(150);
+              for (let w = 0; w < 16; w++) {
+                await act.delayFull(80);
                 const back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
                 if (back && back.ok && String(back.value || "").trim() && !back.invalid) { got = back.value; break; }
               }
@@ -5370,8 +5377,8 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       // CANCELS to leave the block clean rather than abandoning a half-open form that would block
       // Next, and says so.
       let closed = false;
-      for (let tries = 0; tries < 14; tries++) {
-        await act.delayFull(300);
+      for (let tries = 0; tries < 28; tries++) {
+        await act.delayFull(150);
         const now = await act.eval(atsInjOrcEntryState, item.pattern).catch(() => null);
         if (now && now.ok && !now.open) { closed = true; break; }
       }
@@ -5385,6 +5392,55 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
     }
   }
   return { records, notes };
+}
+
+// ⚠⚠ DOES THIS TILE ALREADY SAY WHAT WE WOULD WRITE? (speed round, 2026-08-20)
+// On a re-run the form arrives holding exactly the entries the profile would produce, and the pass
+// deleted all of them and typed the identical thing back — the single largest waste on step 2, since
+// each entry costs an open, four fields (two of them date pairs) and a commit.
+//
+// The tile's own summary is the evidence: "Characterization and Test Automation Intern Rivian and
+// Volkswagon Technologies 05/2026 - 08/2026". A match requires EVERY identifying string to be present,
+// which is the conservative direction — anything unrecognised falls through to delete-and-refill, so a
+// changed employer, a corrected title or an edited date still rewrites the block.
+//
+// ⚠ This does NOT relax the operator's "delete old entries before filling" instruction. An entry that
+// already states the right thing is not an old entry; deleting and retyping it changes nothing on the
+// application and costs seconds. A PARTIAL match is still a full delete-and-refill.
+function atsOrcEntryIdentity(source, entry) {
+  if (!entry) return null;
+  const val = (k) => {
+    const v = entry[k];
+    if (v == null) return "";
+    return Array.isArray(v) ? String(v[0] || "") : String(v);
+  };
+  if (source === "work_experience") {
+    const parts = [val("company"), val("job_title")].map((x) => x.trim()).filter(Boolean);
+    return parts.length === 2 ? parts : null;      // both, or we cannot claim a match
+  }
+  if (source === "education") {
+    const parts = [val("school_or_university")].map((x) => x.trim()).filter(Boolean);
+    return parts.length ? parts : null;
+  }
+  if (source === "skills") return typeof entry === "string" && entry.trim() ? [entry.trim()] : null;
+  return null;                                     // an unknown section never claims a match
+}
+
+// True when the tiles on the form already are the entries we would write — same count, and each
+// wanted entry matched by a DISTINCT tile (order-independent, because the form may sort them).
+function atsOrcTilesAlreadyMatch(source, entries, want, tiles) {
+  if (!Array.isArray(tiles) || !Array.isArray(entries)) return false;
+  if (!want || tiles.length !== want) return false;
+  const norm = (v) => atsLib.normalize(String(v || ""));
+  const pool = tiles.map((x) => norm(x && x.text));
+  for (let i = 0; i < want; i++) {
+    const id = atsOrcEntryIdentity(source, entries[i]);
+    if (!id) return false;                          // cannot identify ⇒ cannot claim a match
+    const at = pool.findIndex((tx) => tx && id.every((part) => tx.indexOf(norm(part)) !== -1));
+    if (at === -1) return false;
+    pool[at] = null;                                // consume it — two entries cannot share a tile
+  }
+  return true;
 }
 
 function atsOrcEntryPlan(profile, blocks) {
@@ -8799,6 +8855,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE, atsInjOrcBlocks, atsOrcEntryValue, atsOrcFillEntries,
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
+    atsOrcEntryIdentity, atsOrcTilesAlreadyMatch,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,

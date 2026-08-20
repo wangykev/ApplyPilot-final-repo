@@ -3975,3 +3975,71 @@ test("the links pass's notes are not discarded by the entry pass", () => {
   assert.ok(/entryNotes = entryNotes\.concat\(\(ep && ep\.notes\)/.test(src),
     "the entry pass must CONCAT onto entryNotes, never assign over it");
 });
+
+
+// ── a block whose tiles already match the profile is left alone (speed round, 2026-08-20) ──
+// On a re-run the form arrives holding exactly the entries the profile would produce, and the pass
+// deleted all of them and typed the identical thing back — the single largest waste on step 2, where
+// each entry costs an open, four fields (two of them date pairs) and a commit.
+test("atsOrcTilesAlreadyMatch: order-independent, and CONSERVATIVE in every uncertain direction", () => {
+  const we = [
+    { company: "Rivian and Volkswagon Technologies", job_title: "Characterization and Test Automation Intern" },
+    { company: "Carnegie Mellon Racing", job_title: "Firmware Team Member" },
+  ];
+  const tiles = [
+    { text: "Firmware Team Member Carnegie Mellon Racing 09/2024 - 05/2026" },
+    { text: "Characterization and Test Automation Intern Rivian and Volkswagon Technologies 05/2026 - 08/2026" },
+  ];
+  // the form may sort its tiles, so matching is order-independent
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", we, 2, tiles), true);
+
+  // ⚠ EVERY uncertain case must fall through to delete-and-refill:
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", we, 2, tiles.slice(0, 1)), false,
+    "a different COUNT is not a match");
+  const corrected = [{ company: "Rivian and Volkswagen Technologies", job_title: we[0].job_title }, we[1]];
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", corrected, 2, tiles), false,
+    "a one-letter employer correction must rewrite the block, not be waved through");
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", [{ company: "X" }], 1, [{ text: "X" }]), false,
+    "an entry we cannot fully identify (no job title) can never claim a match");
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("unknown_section", [{ a: 1 }], 1, [{ text: "a" }]), false,
+    "an unknown section never claims a match");
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", we, 2, null), false);
+
+  // ⚠ two entries may not share one tile
+  const dup = [we[1], we[1]];
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", dup, 2, tiles), false,
+    "a tile is consumed once — two entries cannot both match the same row");
+
+  // education identifies on the school
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("education",
+    [{ school_or_university: "Carnegie Mellon University" }], 1,
+    [{ text: "Electrical and Computer Engineering Carnegie Mellon University" }]), true);
+});
+
+test("atsOrcEntryIdentity: a tiered profile value identifies on its most specific wording", () => {
+  assert.deepStrictEqual(ats.atsOrcEntryIdentity("work_experience", { company: "C", job_title: "T" }), ["C", "T"]);
+  assert.strictEqual(ats.atsOrcEntryIdentity("work_experience", { company: "C" }), null, "both are required");
+  assert.deepStrictEqual(ats.atsOrcEntryIdentity("education", { school_or_university: "CMU" }), ["CMU"]);
+  assert.deepStrictEqual(ats.atsOrcEntryIdentity("skills", "Python"), ["Python"]);
+  assert.strictEqual(ats.atsOrcEntryIdentity("work_experience", null), null);
+});
+
+test("the tile-match skip does not weaken the operator's delete-before-fill instruction", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const i = src.indexOf("async function atsOrcFillEntries");
+  const pass = stripComments(src.slice(i, src.indexOf("\n// ⚠⚠ DOES THIS TILE", i) > 0
+    ? src.indexOf("\n// ⚠⚠ DOES THIS TILE", i) : src.indexOf("\nfunction atsOrcEntryPlan", i)));
+
+  // the skip must be gated on a FULL match…
+  assert.ok(/atsOrcTilesAlreadyMatch\(item\.source, arr, item\.want, present\)/.test(pass),
+    "the skip must require the whole block to match");
+  // …and the delete path must still be there for everything else
+  assert.ok(/atsInjOrcDeleteTile/.test(pass),
+    "a partial match must still delete and refill — that is the operator's instruction");
+  // the skip must come BEFORE the delete, or it can never fire
+  assert.ok(pass.indexOf("atsOrcTilesAlreadyMatch") < pass.indexOf("atsInjOrcDeleteTile"),
+    "the match check has to precede the delete loop");
+});
