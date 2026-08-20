@@ -3541,3 +3541,54 @@ test("the ORC pre-form SETTLES before concluding a page is unknown", () => {
   // and it must resume the loop on the settled view rather than acting on the stale one
   assert.ok(/continue;/.test(code), "a settled view must be routed by the loop, not by the stale read");
 });
+
+
+// ── a function's body may only use what its signature receives (live 2026-08-19) ─────────
+// The ORC entry pass was written against driveAtsPageFill's scope while living inside
+// atsFinishFill's, so it threw `profile is not defined` on a real run. Node cannot catch that
+// statically for a whole file, but it CAN check the specific pair: the finish stage now uses
+// `profile` and `jobContext`, so both must be parameters AND must be passed at the one call site.
+test("atsFinishFill receives what its body uses — profile and jobContext", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const sig = /async function atsFinishFill\(([^)]*)\)/.exec(src);
+  assert.ok(sig, "atsFinishFill must exist");
+  const params = sig[1].split(",").map((x) => x.trim());
+
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const start = src.indexOf("async function atsFinishFill(");
+  const body = stripComments(src.slice(start, src.indexOf("\n}\n", start)));
+
+  for (const name of ["profile", "jobContext"]) {
+    if (new RegExp("\\b" + name + "\\b").test(body.slice(body.indexOf("{")))) {
+      assert.ok(params.includes(name),
+        `atsFinishFill's body uses \`${name}\` but its signature does not receive it — that is a ` +
+        `ReferenceError at runtime and every Node test still passes, because no test calls this ` +
+        `function with an ORC scan`);
+    }
+  }
+  // …and the single call site must actually pass them, in the right positions
+  const call = /return await atsFinishFill\(([^)]*)\)/.exec(src);
+  assert.ok(call, "the call site must exist");
+  const args = call[1].split(",").map((x) => x.trim());
+  assert.strictEqual(args.length, params.length,
+    "the call site passes " + args.length + " argument(s) for " + params.length + " parameter(s) — a " +
+    "trailing parameter left unpassed is `undefined`, which fails silently rather than loudly");
+});
+
+test("the ORC diagnostics report their OWN failure — a silent completeness catch hides a bug forever", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // both ORC completeness guards must say something when they fail. The entry pass's catch is what
+  // surfaced the scope bug in ONE run; the unclaimed check's catch was silent, so an identical
+  // failure there would have read as "no unclaimed controls" — a clean step, on the very diagnostic
+  // built because a clean-looking step was hiding three required fields.
+  for (const marker of ["ORC-ENTRY", "ORC-UNCLAIMED"]) {
+    const i = src.indexOf("[ApplyPilot][" + marker + "] ⛔");
+    assert.ok(i > 0, `the ${marker} guard must log its own failure, not swallow it`);
+  }
+  // and neither may be an empty catch
+  const emptyCatches = [...src.matchAll(/catch \(e\) \{ \/\* a diagnostic must never break a fill \*\/ \}/g)];
+  assert.strictEqual(emptyCatches.length, 0,
+    "an empty diagnostic catch makes a broken check indistinguishable from a clean result");
+});

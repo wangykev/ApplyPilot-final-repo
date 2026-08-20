@@ -5617,7 +5617,13 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     const bare = ch.length - picker - freeText;
     if (ch.length) console.log(`[ApplyPilot][ATS-OPTIONS] review editors — ${picker} picker · ${freeText} filter-or-type (list unproven) · ${bare} with no options at all, of ${ch.length} choice record(s)`);
   } catch (e) { /* diagnostic only */ }
-  return await atsFinishFill(act, ats, scan, results, o.credentials);
+  // ⚠ `profile` and `jobContext` are handed on because the ORC entry pass runs inside the finish
+  // stage — see the entry block there for why that ORDERING is the right one (after the audit and
+  // the pre-filled sweep, before the counts). It threw `profile is not defined` on a live run when
+  // the pass was written against driveAtsPageFill's scope while sitting in atsFinishFill's; the
+  // completeness guard around it kept the flat fields and reported the failure, which is the only
+  // reason a whole step's employment history was not silently missing again.
+  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext);
 }
 
 // ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
@@ -6555,7 +6561,7 @@ async function atsSurfacePrefilled(act, ats, scan, results) {
   return surfaced;
 }
 
-async function atsFinishFill(act, ats, scan, results, credentials) {
+async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
   await act.delayFull(600);
@@ -6636,7 +6642,17 @@ async function atsFinishFill(act, ats, scan, results, credentials) {
         console.log(`[ApplyPilot][ORC-UNCLAIMED] ⚠ ${miss.length} control(s) on this step were NOT scanned and so were never filled:`);
         for (const n of unclaimedNotes) console.log("[ApplyPilot][ORC-UNCLAIMED]   • " + n);
       }
-    } catch (e) { /* a diagnostic must never break a fill */ }
+    } catch (e) {
+      // ⚠ A SILENT COMPLETENESS CATCH HIDES A BUG FOREVER, and the pair of blocks here proved it in
+      // one run: the entry pass beside this one threw `profile is not defined` (written against a
+      // different function's scope) and its catch SAID SO, which is the only reason it was found
+      // immediately. This catch swallowed everything, so an identical failure here would have left
+      // "no unclaimed controls" — indistinguishable from a clean step, on the very diagnostic built
+      // because a clean-looking step was hiding three required fields.
+      // Still never fatal: a diagnostic must not break a fill. It just has to admit it failed.
+      unclaimedNotes.push("the unclaimed-control check failed: " + String((e && e.message) || e));
+      console.log("[ApplyPilot][ORC-UNCLAIMED] ⛔ the check itself failed, so this step's coverage is UNKNOWN:", String((e && e.message) || e));
+    }
   }
 
   let entryNotes = [];
