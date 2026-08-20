@@ -3078,10 +3078,16 @@ test("driveAtsPageFill oracle: a geo dependent is left alone on the REPLAY path 
   assert.strictEqual(city.status, "skipped");
 });
 
-test("atsActuateField oracle: the pick is called with noClear taken from f.searchDriven", () => {
-  // structural — clearing a geo picker empties its siblings, so the call site must pass the flag
-  assert.match(String(ats.atsActuateField), /atsInjOrcPick[\s\S]{0,160}f\.searchDriven/,
-    "the pick call must pass noClear from f.searchDriven");
+test("atsActuateField oracle: the pick ALWAYS clears before searching", () => {
+  // ⚠ REVERSED from an earlier assertion, and the reversal is the lesson (operator, 2026-08-19).
+  // noClear was passed for geo pickers because clearing one cascades to its siblings — true, but it
+  // solved a problem the old approach created, when all five geo fields were actuated in sequence.
+  // Now only the ANCHOR is actuated and its cascade repopulates the rest, so the sibling clear is
+  // wanted. Leaving it off was actively harmful: a live run APPENDED its query to a field that
+  // already held a value ("United States" + "United States of America"), and the widget answered
+  // "No results" on a field whose option was right there.
+  assert.match(String(ats.atsActuateField), /atsInjOrcPick[\s\S]{0,400}ATS_ORC_PICK_MS,\s*false\)/,
+    "the pick call must pass noClear=false — a search box must be cleared before it is searched");
 });
 
 
@@ -3152,4 +3158,48 @@ test("ATS_ORC_ENTRY_MAPS: the Experience entry maps to real profile keys, and le
   // ⚠ deliberately absent: the profile stores no reason for leaving, and inventing one on a form an
   // employer reads is the confidently-wrong class. This test is the reminder that the gap is chosen.
   assert.ok(!m.leavingReason, "leavingReason must stay unmapped");
+});
+
+
+// ── a regex passed as a STRING must survive the JS string literal (2026-08-19) ───────────
+// Found by a real run, not by a test: the caller passed "^(next|…|submit)\b", and in a JavaScript
+// string literal `\b` is U+0008 (BACKSPACE), not a word boundary. new RegExp therefore received a
+// control character and could never match, so a run reached Oracle's email gate and stopped with
+// `auth-submit-not-pressable` on a page whose Next button was plainly there.
+//
+// ⚠ My earlier test asserted the pattern STRING was present in the source. That is exactly the kind
+// of test that passes while the thing is broken — it checked the spelling, not the behaviour. This
+// one decodes the literal the way the engine does and matches it against real captions.
+const fs = require("node:fs");
+
+test("the ORC button patterns MATCH real captions once decoded from their JS literals", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const found = [...src.matchAll(/atsInjOrcClickButton,\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+  assert.ok(found.length >= 2, "expected the Next and Verify call sites, found " + found.length);
+
+  // decode each JS string literal exactly as the engine would, then build the regex from it
+  const decoded = found.map((lit) => JSON.parse('"' + lit + '"'));
+  for (const pat of decoded) {
+    assert.ok(!/[ -]/.test(pat),
+      "the decoded pattern contains a CONTROL CHARACTER — a \\b in a JS literal is backspace, not a " +
+      "word boundary: " + JSON.stringify(pat));
+  }
+
+  const nextPat = decoded.find((p) => /next/i.test(p));
+  const verifyPat = decoded.find((p) => /verify/i.test(p));
+  assert.ok(nextPat && verifyPat, "both call-site patterns must be present");
+
+  const next = new RegExp(nextPat, "i");
+  for (const cap of ["Next", "Next ", "NEXT", "Continue", "Sign In", "Submit"]) {
+    assert.ok(next.test(cap), "the Next pattern must match " + JSON.stringify(cap));
+  }
+  // …and must not claim the buttons that sit beside it on Oracle's own gate
+  for (const cap of ["Cancel", "Do you want to communicate by phone instead?", "Add Experience"]) {
+    assert.ok(!next.test(cap), "the Next pattern must NOT match " + JSON.stringify(cap));
+  }
+
+  const verify = new RegExp(verifyPat, "i");
+  assert.ok(verify.test("Verify"), "the Verify pattern must match Verify");
+  assert.ok(verify.test("VERIFY"), "…including the caption as Oracle renders it");
+  assert.ok(!verify.test("Send New Code"), "and must not claim the resend control");
 });

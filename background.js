@@ -4831,7 +4831,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
       if (!v || v.matches !== true) return halt("credential-not-retained", `The ${view} field did not keep the stored value (Chrome's password manager can overwrite an autocomplete=username box). Fill this step yourself and re-run.`);
 
       const before = await sig();
-      const clicked = await cdpEval(atsInjOrcClickButton, "^(next|continue|sign in|log ?in|submit)\b", null).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      const clicked = await cdpEval(atsInjOrcClickButton, "^(next|continue|sign in|log ?in|submit)\\b", null).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
       if (!clicked || !clicked.ok) return halt("auth-submit-not-pressable", `Could not press "${(s.submit && s.submit.caption) || "Next"}" on the ${view} step` + (clicked && clicked.error ? ` (${clicked.error})` : "") + ".");
       const ch = await waitForChange(before, 20000);
       LOG(`${view} step submitted → page ${ch.changed ? "changed" : "did NOT change"} after ${ch.waitedMs}ms`);
@@ -4864,7 +4864,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
       if (!filled || !filled.ok) return halt("verification-code-not-enterable", `Could not enter the code into Oracle's ${s.pinInputs} boxes${filled && filled.error ? ` (${filled.error})` : ""}.`);
       LOG(`entered ${filled.filled} digit(s)`);
       const before = await sig();
-      const clicked = await cdpEval(atsInjOrcClickButton, "^verify\b", null).catch(() => null);
+      const clicked = await cdpEval(atsInjOrcClickButton, "^verify\\b", null).catch(() => null);
       if (!clicked || !clicked.ok) return halt("verify-not-pressable", "Entered the code but could not press Verify" + (clicked && clicked.error ? ` (${clicked.error})` : "") + ".");
       const ch = await waitForChange(before, 20000);
       LOG(`verify pressed → page ${ch.changed ? "changed" : "did NOT change"} after ${ch.waitedMs}ms`);

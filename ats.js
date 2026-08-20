@@ -2723,6 +2723,21 @@ function atsInjSubmitState(ats) {
   // clicks only behind the arm gate.
   if (ats === "icims") btn = [...document.querySelectorAll('#cp_form_submit_i, input[type="submit"], button[type="submit"]')].find((b) => vis(b)) || null;
   if (!btn) btn = [...document.querySelectorAll('button[type="submit"], button')].find((b) => /submit application|submit$/i.test((b.textContent || "").trim()) && vis(b));
+  // ⚠ ORACLE'S STEP PAGES HAVE **NEXT**, NOT SUBMIT — Submit appears only on the last step. So the
+  // generic finder returns nothing and atsLooksLikeApplicationForm rejected a perfectly good form as
+  // "not an application form" (measured: a run reached …/apply/section/1 and stopped
+  // `form-not-rendered`). Third instance of this exact lesson after Lever's #btn-submit and iCIMS'
+  // <input type=submit>.
+  //
+  // ⚠⚠ REPORTED SEPARATELY, NOT FOLDED INTO `hasSubmit`, and that separation is the safety property:
+  // `hasSubmit` is what the SUBMIT GATE clicks. Letting a "Next" satisfy it would mean a submit run
+  // pressing Next — advancing a step while believing it had submitted the application. Recognition
+  // and submission are different questions and get different fields.
+  let flowNext = null;
+  if (ats === "oracle") {
+    const pag = document.querySelector("apply-flow-pagination") || document;
+    flowNext = [...pag.querySelectorAll("button")].find((b) => /^(next|continue)\b/i.test((b.textContent || "").trim()) && vis(b)) || null;
+  }
   const r = btn ? btn.getBoundingClientRect() : null;
   // a VISIBLE captcha challenge. ⚠ Lever's DORMANT invisible-mode hCaptcha container is a
   // FULL-VIEWPORT iframe (1547×720 live) with `visibility:hidden` — a size-only test calls
@@ -2736,7 +2751,9 @@ function atsInjSubmitState(ats) {
   });
   const bodyText = (document.body.innerText || "").slice(0, 4000);
   const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText) || /\/thanks(\?|$)/.test(location.href);
-  return { ok: true, hasSubmit: !!btn, rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
+  return { ok: true, hasSubmit: !!btn, hasFlowControl: !!flowNext,
+    flowCaption: flowNext ? (flowNext.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30) : null,
+    rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
     disabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null, captchaChallenge: challenge, confirmed, url: location.href };
 }
 
@@ -3326,11 +3343,18 @@ function atsLooksLikeApplicationForm(fields, submitState) {
   const hasResume = list.some((x) => (x && x.widgetType === "file_upload") || /resume|\bcv\b/.test(txt(x)));
   const hasName = list.some((x) => /(^|[^a-z])(first|last|full|preferred|legal)?[ _-]*name([^a-z]|$)/.test(txt(x)));
   const hasSubmit = !!(submitState && submitState.hasSubmit);
+  // ⚠ A MULTI-STEP FLOW CONTROL COUNTS FOR RECOGNITION. On Oracle, step 1 of 3 has "Next" and no
+  // Submit at all, so requiring a submit control refused a form we could fill perfectly well. What
+  // this function answers is "is this a fillable application page", and a Next answers that.
+  // It does NOT make the page submittable — that stays keyed on `hasSubmit`, which the submit gate
+  // reads, so nothing here can cause a Next to be pressed in place of a Submit.
+  const hasFlow = !!(submitState && submitState.hasFlowControl);
+  const canAct = hasSubmit || hasFlow;
   return {
-    ok: hasSubmit && (hasResume || hasEmail || hasName),
-    hasSubmit, hasResume, hasEmail, hasName,
-    why: hasSubmit ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
-                   : "no submit control on the page — this isn't a form we could ever submit",
+    ok: canAct && (hasResume || hasEmail || hasName),
+    hasSubmit, hasFlowControl: hasFlow, hasResume, hasEmail, hasName,
+    why: canAct ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
+                : "no submit or next control on the page — this isn't a form we could fill or advance",
   };
 }
 
@@ -6410,12 +6434,61 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // name, `region2` (State) the TWO-LETTER code, `region1` (County) "County, ST", `city`
     // "City, County, ST", and the dial picker "+1 (United States)". So each candidate is offered as
     // its own query and matched against what comes back, rather than assuming one shape.
+    // ⚠ THE DIAL PICKER SPEAKS "+<code> (<Country>)" AND NO PROFILE VALUE WILL EVER EQUAL THAT.
+    // Live: candidates ["United States of America (+1)", …, "+1"] against rows
+    // ["+1 (American Samoa)", "+1 (Anguilla)", …] matched nothing, and a REQUIRED field reached
+    // review for no reason. atsDialMatch already solves this — it strips the code and the parens and
+    // requires the CODE and the NAME to agree, which is order-agnostic — so route the dial picker
+    // through it and pick by the row it returns rather than by string equality.
+    const isDial = (mopts && mopts.dial) || f.fieldName === "phoneNumber"
+      || /country\s*code/i.test(String(f.label || ""));
+    if (isDial) {
+      const opened = await act.eval(atsInjOrcCaptureOptions, ref.inputSel, ATS_ORC_PICK_MS);
+      const rows = (opened && opened.options) || [];
+      const hit = rows.length ? atsDialMatch(candidates, rows) : null;
+      if (hit) {
+        const want = rows[hit.index];
+        const r = await act.eval(atsInjOrcPick, ref.inputSel, want, [want], ATS_ORC_PICK_MS, false);
+        if (r && r.ok) {
+          let back = null;
+          for (let i = 0; i < 8; i++) {
+            await act.delayFull(250);
+            back = await act.eval(atsInjOrcReadPicker, ref.inputSel);
+            if (back && back.ok && String(back.value || "").trim()) break;
+          }
+          rec.after = back && back.ok ? back.value : null;
+          rec.resolved = candidates;
+          if (String(rec.after || "").trim() && !(back && back.invalid)) {
+            rec.status = "filled";
+            rec.tier = hit.tier;
+            rec.detail = "dial code matched on code+name → " + JSON.stringify(want);
+            return true;
+          }
+        }
+      }
+      rec.status = f.isRequired ? "needs_review" : "skipped";
+      rec.flag = "no-option-match";
+      rec.resolved = candidates;
+      rec.detail = "no dial-code option agreed with " + JSON.stringify((candidates || []).slice(0, 3))
+        + (rows.length ? "; the field offered " + JSON.stringify(rows.slice(0, 4)) : " (no options read)");
+      return true;
+    }
     let last = null;
     for (const cand of candidates) {
       const q = String(cand == null ? "" : cand).trim();
       if (!q) continue;
-      // `noClear` for a cascading geo picker: clearing it empties its siblings (measured).
-      const r = await act.eval(atsInjOrcPick, ref.inputSel, q, [q], ATS_ORC_PICK_MS, !!f.searchDriven);
+      // ⚠ ALWAYS CLEAR FIRST (operator, 2026-08-19). `noClear` was passed here for geo pickers on the
+      // grounds that clearing one cascades to its siblings — true, but it solved a problem my own
+      // earlier approach created, back when all five geo fields were actuated in sequence. Now only
+      // the ANCHOR is actuated and its cascade repopulates the rest, so the sibling clear is exactly
+      // what we want.
+      //
+      // Leaving it OFF was actively harmful and a live run showed it: the fields already held values,
+      // so the query was APPENDED to them — `country` held "United States", typing
+      // "United States of America" produced a nonsense query, and the widget answered "No results"
+      // on a field whose option was right there. Same for postalCode ("32312" typed onto "32312").
+      // A search box must be cleared before it is searched; that is why the house rule exists.
+      const r = await act.eval(atsInjOrcPick, ref.inputSel, q, [q], ATS_ORC_PICK_MS, false);
       last = r;
       if (r && r.ok) {
         // ⚠ READ-BACK IS POLLED, NOT READ ONCE: a read in the same beat as the click returns the
