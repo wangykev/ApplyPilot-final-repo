@@ -3642,3 +3642,71 @@ test("the ORC diagnostics report their OWN failure — a silent completeness cat
   assert.strictEqual(emptyCatches.length, 0,
     "an empty diagnostic catch makes a broken check indistinguishable from a clean result");
 });
+
+
+// ── ORC labels some lists "<CODE> - <Name>" (live 2026-08-19) ────────────────────────────
+// The Education entry's Degree picker returned exactly ONE row for a search of "Bachelor of
+// Science" — `"BS - Bachelor of Science"` — and an exact compare refused it, leaving a REQUIRED
+// field empty and Oracle refusing the whole Education entry on three consecutive runs.
+test("atsInjOrcPick: a code-prefixed option is matched on the form's own \" - \" separator", async () => {
+  const prevDoc = global.document, prevWin = global.window;
+  try {
+    // the injected fn writes through the NATIVE value setter (the React-fill technique), so the
+    // fixture has to provide one — a plain object property would not be a descriptor with a `set`.
+    let held = "";
+    global.window = { HTMLInputElement: { prototype: {} }, HTMLTextAreaElement: { prototype: {} } };
+    // the pick TYPES into the search box, so the event constructors it uses must exist
+    global.KeyboardEvent = class { constructor(t, o) { Object.assign(this, o || {}); this.type = t; } };
+    global.Event = global.Event || class { constructor(t, o) { Object.assign(this, o || {}); this.type = t; } };
+    global.MouseEvent = class { constructor(t, o) { Object.assign(this, o || {}); this.type = t; } };
+    global.PointerEvent = class { constructor(t, o) { Object.assign(this, o || {}); this.type = t; } };
+    Object.defineProperty(global.window.HTMLInputElement.prototype, "value", {
+      configurable: true, get() { return held; }, set(v) { held = v; },
+    });
+    const mkRow = (text) => ({
+      textContent: text,
+      getBoundingClientRect: () => ({ width: 300, height: 24, x: 10, y: 10 }),
+      dispatchEvent() { this.clicked = true; return true; },
+      scrollIntoView() {},
+    });
+    const rows = [mkRow("BS - Bachelor of Science")];
+    const listbox = { querySelectorAll: () => rows };
+    const input = {
+      id: "contentItemId-9", value: "", className: "cx-select-input",
+      getAttribute: (a) => (a === "aria-controls" ? "lb1" : null),
+      focus() {}, click() {}, dispatchEvent() { return true; },
+      getBoundingClientRect: () => ({ width: 200, height: 30, x: 0, y: 0 }),
+      closest: () => null,
+    };
+    global.document = {
+      querySelector: (q) => (/contentItemId/.test(q) ? input : null),
+      getElementById: (id) => (id === "lb1" ? listbox : null),
+      querySelectorAll: () => [],
+    };
+
+    const r = await ats.atsInjOrcPick("#contentItemId-9", "Bachelor of Science",
+      ["bachelor of science"], 1500, false, /* segmentMatch */ true);
+    assert.ok(r && r.ok, "the code-prefixed row must be accepted: " + JSON.stringify(r));
+    assert.strictEqual(r.committed, "BS - Bachelor of Science",
+      "and the COMMITTED value is the form's own full label, not our candidate");
+  } finally { global.document = prevDoc; global.window = prevWin; }
+});
+
+test("the code-prefix rule is structural, not the containment the ladder refuses", () => {
+  // The rule lives inside atsInjOrcPick, so its guarantees are asserted on the source: each of the
+  // three is what separates this from a substring guess, and losing any one of them turns it into
+  // exactly the thing the match ladder exists to refuse.
+  const src = String(ats.atsInjOrcPick);
+  // 1. the separator is " - " WITH SPACES — a bare hyphen lives inside ordinary words and names
+  assert.ok(/indexOf\(" - "\)/.test(src),
+    'the split must be on " - " with spaces; a bare "-" matches inside "Jean-Luc" and "Add-On"');
+  assert.ok(!/split\("-"\)|indexOf\("-"\)/.test(src), "a bare hyphen must never be the separator");
+  // 2. what remains must EQUAL the candidate, never merely contain it
+  assert.ok(/wants\.indexOf\(afterCode\(t\(r\)\)\) !== -1/.test(src),
+    "the remainder must be looked up in `wants` (an exact, normalized compare), not substring-tested");
+  // 3. the ambiguity guard is untouched — two matching rows still refuse
+  assert.ok(/hits\.length > 1[\s\S]{0,80}ambiguous/.test(src),
+    "two rows matching must still be `ambiguous` and commit nothing");
+  // 4. and it is gated on segmentMatch, so a plain picker is unaffected
+  assert.ok(/segmentMatch && afterCode/.test(src), "the rule must only apply where segment matching is on");
+});

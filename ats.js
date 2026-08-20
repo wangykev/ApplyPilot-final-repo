@@ -3747,6 +3747,25 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear, segm
   // rather than a guess — so it is structured matching, NOT the loose containment the match ladder
   // deliberately refuses. "32312" matches "32312, …" and still cannot match "323120, …".
   const firstSeg = (v) => norm(String(v).split(",")[0]);
+  // ⚠ AND ORC LABELS SOME LISTS WITH A LEADING CODE: `"<CODE> - <Name>"`. Measured on the Education
+  // entry's Degree picker — a search for "Bachelor of Science" returned exactly ONE row,
+  // `"BS - Bachelor of Science"`, and an exact compare refused it, so the required field stayed empty
+  // and Oracle refused the whole Education entry on three consecutive runs.
+  //
+  // ⚠ THIS IS NOT THE CONTAINMENT THE MATCH LADDER REFUSES, and the difference is structural rather
+  // than a matter of degree:
+  //   • the split is on the FORM'S OWN separator, " - " WITH SPACES — never a bare hyphen, which
+  //     lives inside ordinary words and names ("Jean-Luc", "e-mail", "Add-On");
+  //   • what remains must equal the candidate EXACTLY after normalize, not contain it. "Bachelor"
+  //     still cannot claim "BS - Bachelor of Science";
+  //   • the ambiguity guard above is untouched — two rows matching is still `ambiguous` and refuses.
+  // Same reasoning as the postal composite ("32312" → "32312, Tallahassee, Leon, FL"): a delimiter
+  // the tenant chose is structure, and reading it is not guessing.
+  const afterCode = (v) => {
+    const str = String(v);
+    const i = str.indexOf(" - ");
+    return i > 0 ? norm(str.slice(i + 3)) : null;
+  };
   const el = document.querySelector(inputSel);
   if (!el) return { ok: false, error: "not-found:" + inputSel };
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
@@ -3814,7 +3833,8 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear, segm
     }
     lastRows = rows.map(t);
     const hits = rows.filter((r) => wants.indexOf(norm(t(r))) !== -1
-      || (segmentMatch && wants.indexOf(firstSeg(t(r))) !== -1));
+      || (segmentMatch && wants.indexOf(firstSeg(t(r))) !== -1)
+      || (segmentMatch && afterCode(t(r)) !== null && wants.indexOf(afterCode(t(r))) !== -1));
     if (hits.length > 1) return { ok: false, error: "ambiguous", query, rows: lastRows, matched: hits.length };
     if (hits.length === 1) {
       const row = hits[0];
