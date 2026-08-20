@@ -4006,7 +4006,13 @@ function atsInjOrcAuthScan() {
 // county, which is exactly the kind of confidently-wrong value that belongs in review.
 var ATS_ORC_GEO_ANCHOR = ["postalCode", "city", "region2", "region1"];
 
-function atsOrcGeoPlan(fields, profile) {
+// ⚠ `valueFor` EXISTS BECAUSE A REPLAY PASSES `profile: {}` BY DESIGN. Without it this returned null
+// on the submit run -- no profile, so nothing to anchor on, so no roles stamped -- and `city` was
+// typed straight back in from the approved bundle, clearing the anchor that had just produced it.
+// Caught by a test rather than live, but it is the SAME failure iCIMS paid for with 28 of a
+// rehearsal's 32 verify failures ("grow repeating entries from the BUNDLE, not the profile"): any
+// pass that derives structure from the profile is silently disabled on replay.
+function atsOrcGeoPlan(fields, profile, valueFor) {
   const list = Array.isArray(fields) ? fields : [];
   const geo = list.filter((f) => f && f.searchDriven && f.widgetType === "select");
   if (!geo.length) return null;
@@ -4015,10 +4021,11 @@ function atsOrcGeoPlan(fields, profile) {
   const pi = (profile && profile.personal_info) || {};
   // `country` is the geo ROOT and mounts the rest -- it is not an anchor candidate and is filled
   // normally (measured: clearing it unmounts the whole block).
-  const value = { postalCode: pi.postal_code, city: pi.city, region2: pi.state_province, region1: null };
+  const fromProfile = { postalCode: pi.postal_code, city: pi.city, region2: pi.state_province, region1: null };
   for (const name of ATS_ORC_GEO_ANCHOR) {
     const f = byName[name];
-    const v = value[name];
+    // On a replay the approved bundle is the ONLY source; on a fill it is the profile.
+    const v = (typeof valueFor === "function" && f) ? valueFor(f) : fromProfile[name];
     if (f && v != null && String(v).trim()) {
       return {
         anchor: f,
@@ -4867,6 +4874,20 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // picker — the operator's standing rule. Read-only, and it enriches the scan so every downstream
   // atsAttachOptions call works unchanged.
   if (ats === "oracle") await atsCaptureOrcOptions(act, scan, (...a) => console.log("[ApplyPilot]", ...a));
+  // ORACLE'S ADDRESS IS ONE ANSWER. Stamp the anchor/dependent roles onto the scan so the field loop
+  // does not have to re-derive them, and so a dependent is never actuated -- typing into one clears
+  // the anchor that produced it (see atsOrcGeoPlan).
+  if (ats === "oracle") {
+    const geo = atsOrcGeoPlan((scan && scan.fields) || [], profile, o.valueFor);
+    if (geo) {
+      geo.anchor.geoAnchor = true;
+      geo.anchor.geoAnchorValue = geo.anchorValue;
+      for (const d of geo.dependents) { d.geoDependent = true; d.geoAnchorName = geo.anchor.label || geo.anchor.fieldName; }
+      console.log(`[ApplyPilot][ATS-GEO] address anchored on ${geo.anchor.fieldName}=${JSON.stringify(geo.anchorValue)}`
+        + `${geo.exact ? "" : " (NOT exact -- " + geo.detail + ")"}; ${geo.dependents.length} dependent(s) will be VERIFIED, not typed into: `
+        + geo.dependents.map((d) => d.fieldName).join(", "));
+    }
+  }
   // RECON THE LISTS BEFORE FILLING — including the OPTIONAL ones (operator, 2026-08-16). On these
   // one-page forms a field we never fill still has to be ANSWERABLE in review, and that means a
   // real picker, not a picker-shaped text box. The scan already carries every list, so the work is
@@ -5377,6 +5398,20 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       return rec;
     };
     try {
+      // A GEO DEPENDENT IS NEVER ACTUATED, ON EITHER PATH. Oracle fills city/state/county from the
+      // postal code, and typing into one of them CLEARS the anchor that produced it -- so this is
+      // placed above the replay branch deliberately: an approved bundle carrying "Tallahassee" must
+      // not cause it to be typed back in on the submit run either.
+      // Left claiming NOTHING on purpose: atsSurfacePrefilled then re-reads the live page and, when
+      // the cascade did fill it, promotes the record to filled_review + `already-filled` with the
+      // real value. That is the existing, tested path for "the form holds something we did not type",
+      // and reusing it beats a parallel verify of my own.
+      if (f.geoDependent) {
+        rec.status = "skipped";
+        rec.detail = "Oracle fills this from " + (f.geoAnchorName || "the postal code")
+          + " -- left for the cascade, because typing here would clear that anchor";
+        results.push(fin()); continue;
+      }
       // Replay mode: the value comes from the APPROVED bundle, not the profile (the submit
       // run re-fills a blank form). Everything else — actuation + verify — is identical.
       let route = null;
@@ -6233,7 +6268,8 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     for (const cand of candidates) {
       const q = String(cand == null ? "" : cand).trim();
       if (!q) continue;
-      const r = await act.eval(atsInjOrcPick, ref.inputSel, q, [q], ATS_ORC_PICK_MS);
+      // `noClear` for a cascading geo picker: clearing it empties its siblings (measured).
+      const r = await act.eval(atsInjOrcPick, ref.inputSel, q, [q], ATS_ORC_PICK_MS, !!f.searchDriven);
       last = r;
       if (r && r.ok) {
         // ⚠ READ-BACK IS POLLED, NOT READ ONCE: a read in the same beat as the click returns the

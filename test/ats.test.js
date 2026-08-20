@@ -3009,3 +3009,77 @@ test("atsInjOrcPick: ENTER is the commit, with a pointer fallback, and noClear i
     assert.ok(!src.includes(shim), "atsInjOrcPick must not reference " + shim);
   }
 });
+
+
+// ── the geo plan, wired through the driver ───────────────────────────────────────────────
+// The dependents must reach review WITHOUT being actuated, on the fill path AND the replay path.
+// Typing into one clears the anchor that produced it, so "we have an approved value for city" is
+// NOT a licence to type it back in.
+
+function orcGeoAct(picks, evals) {
+  return {
+    eval: async (fn, ...a) => {
+      const name = fn && fn.name;
+      if (evals) evals.push({ fn: name, sel: a[0] });
+      if (name === "atsInjScan") return {
+        ats: "oracle", url: "https://eeho.fa.us2.oraclecloud.com/x", title: "t", fields: [
+          { fieldName: "postalCode", inputSel: "#postal", widgetType: "select", searchDriven: true, isRequired: true, label: "Postal Code", domIndex: 0 },
+          { fieldName: "city", inputSel: "#city", widgetType: "select", searchDriven: true, isRequired: true, label: "City", domIndex: 1 },
+          { fieldName: "region2", inputSel: "#state", widgetType: "select", searchDriven: true, isRequired: true, label: "State", domIndex: 2 },
+          { fieldName: "region1", inputSel: "#county", widgetType: "select", searchDriven: true, isRequired: true, label: "County", domIndex: 3 },
+        ] };
+      if (name === "atsInjOrcPick") { if (picks) picks.push(a[0]); return { ok: true, committed: String(a[1]) }; }
+      if (name === "atsInjOrcCaptureOptions") return { ok: true, options: [], count: 0, closed: true };
+      if (name === "atsInjOrcReadPicker") return { ok: true, value: "32312", invalid: false };
+      if (name === "atsInjReadValue") return { ok: true, value: null };
+      if (name === "atsInjSubmitState") return { ok: true, hasSubmit: true };
+      if (name === "atsInjErrors") return { ok: true, errors: [] };
+      return { ok: true };
+    },
+    delay: async () => {}, delayFull: async () => {}, aiEnabled: false,
+    attachResume: async () => ({ ok: false }),
+  };
+}
+
+test("driveAtsPageFill oracle: only the ANCHOR is actuated; dependents are left for the cascade", async () => {
+  const picks = [], evals = [];
+  const profile = { personal_info: { postal_code: "32312", city: "Tallahassee", state_province: "Florida" } };
+  const out = await ats.driveAtsPageFill(orcGeoAct(picks, evals), "oracle", profile, {}, {}, {});
+  const results = (out && out.results) || out || [];
+  const by = {};
+  for (const r of results) if (r && r.fieldName) by[r.fieldName] = r;
+
+  // the postal anchor WAS picked…
+  assert.ok(picks.includes("#postal"), "the postal anchor must be actuated; picks=" + JSON.stringify(picks));
+  // …and none of its dependents were
+  for (const sel of ["#city", "#state", "#county"]) {
+    assert.ok(!picks.includes(sel), sel + " must NOT be actuated — typing into it clears the anchor");
+  }
+  // each dependent claims nothing, and SAYS why (atsSurfacePrefilled promotes it later from the page)
+  for (const name of ["city", "region2", "region1"]) {
+    assert.ok(by[name], name + " must still produce a record");
+    assert.strictEqual(by[name].status, "skipped", name + " should claim nothing");
+    assert.match(by[name].detail || "", /cascade|clear that anchor/i,
+      name + " must say why it was left: " + by[name].detail);
+  }
+});
+
+test("driveAtsPageFill oracle: a geo dependent is left alone on the REPLAY path too", async () => {
+  // an approved bundle carrying "Tallahassee" must not cause it to be typed back in on submit
+  const picks = [];
+  // ⚠ A REAL bundle carries BOTH — the fill recorded postalCode as filled and city as
+  // already-filled — so postal is still the anchor and city is still a dependent. Handing the
+  // replay ONLY a city would legitimately make city the anchor, which is not what this pins.
+  const out = await ats.driveAtsPageFill(orcGeoAct(picks, null), "oracle", {}, {}, {},
+    { valueFor: (f) => ({ postalCode: "32312", city: "Tallahassee", region2: "FL", region1: "Leon" })[f.fieldName] });
+  const results = (out && out.results) || out || [];
+  const city = results.find((r) => r && r.fieldName === "city");
+  assert.ok(!picks.includes("#city"), "the replay must not type into a geo dependent; picks=" + JSON.stringify(picks));
+  assert.strictEqual(city.status, "skipped");
+});
+
+test("atsActuateField oracle: the pick is called with noClear taken from f.searchDriven", () => {
+  // structural — clearing a geo picker empties its siblings, so the call site must pass the flag
+  assert.match(String(ats.atsActuateField), /atsInjOrcPick[\s\S]{0,160}f\.searchDriven/,
+    "the pick call must pass noClear from f.searchDriven");
+});
