@@ -1797,3 +1797,97 @@ advance poll + `waitAtsFormReady` + the block-population settle). Step 3's AI ca
 provider latency inside its 5.3s–13.2s spread — one call, and the standing rule applies: **a slow
 page is the LLM until proven otherwise.** The block settle can spend up to 15s, but only when a
 block genuinely never populates; it did not fire on this run.
+
+
+## Round 14 — ORC hidden vs visible, and the lag's actual cause (2026-08-20)
+
+### The lag was the SERVICE WORKER'S CLOCK, and the operator's workaround proved it
+
+Reported as: *"the fill including the onboarding will just lag at seemingly random times and to fix
+it I need to click the page once and it goes back to filling fast."* Measured on a **freshly
+restarted** Chrome, so not a tired browser:
+
+```
+⚠ a 700ms pace took 3322ms (sw) — overran by 2622ms
+⚠ a 150ms pace took 2436ms (sw) — overran by 2286ms
+⚠ an  80ms pace took 1226ms (sw) — overran by 1146ms
+```
+
+MV3 deprioritises a background worker's timers, and a real click restores focus, which un-throttles
+them. That is *why the lag looked random*: it tracked window focus, not the form.
+
+⚠ **`cdpSetPageClock` already existed for this and the `ats.js` path never called it.** The Workday
+fill and replay walks turn it on; Greenhouse, Lever, Ashby, iCIMS and Oracle had been pacing on the
+starved clock since that path was written. The fix is one unconditional line in the shared entry
+point (plus the submit run), not a new mechanism.
+
+**Scope:** GH / Lever / Ashby / Oracle get it. **iCIMS is inert by design** — it passes
+`noWorkerTimers: true` so its invisible hCaptcha can initialise, so `_workerTimersActive` is false
+and `cdpDelay` takes the SW branch itself. iCIMS keeps its own `cdpSetFastWhenHidden` compensation.
+
+**Why it cannot be worse than before:** `cdpDelay` races the page sleep against an SW timeout
+(`page-abandoned`, costing `want + slack`) and finishes the remainder on the SW clock if the context
+is destroyed (`sw-fallback`).
+
+### Hidden vs visible, back-to-back on the same form state
+
+| | hidden | visible |
+|---|---|---|
+| pacing label | `hidden-fast (worker timers)` | `visible-fast` |
+| step 1 · 2 · 3 | 6.3s · 2.3s · 11.2s | 5.9s · 1.6s · 9.1s |
+| total | **28.3s** (30 fields, 944ms/f) | **25.0s** (29 fields, 860ms/f) |
+| walk | `reached-final-step`, nothing pressed | same |
+
+**Hidden is within 13% of visible** — the first measurement showing the page clock and the
+worker-timer polyfill compose. A hidden tab's own page timers quantize to ~1Hz; blob-worker timers
+do not, which is precisely what the polyfill exists for.
+
+⚠ Contrast with iCIMS round 11–12, where hidden was 2.24× visible and the gap was per-field page
+contact. Do not carry that conclusion here: ORC pays its cost in picker round-trips, not in throttled
+page reactions.
+
+### ⚠ The cost of a poll is the NUMBER of SW awaits, not their length
+
+Shortening the polls (300→150ms, 150→80ms) bought **nothing**, because on a starved clock an 80ms
+request costs ~1.2s regardless. The timestamp deltas inside step 2 showed the real shape: gaps of
+**5067ms, 3200ms and 1701ms** between an entry form's discovery read and its first *20ms* text write
+— entirely inside "has the form appeared yet". So the long settles moved INTO injected functions
+(entry open, entry commit, date read-back): one `cdpEval` with a real page-side loop instead of ~28
+starved worker awaits.
+
+### ⚠⚠ AN ITERATION COUNT IS NOT A BUDGET — this bit three times in one day
+
+The yes/no read-back, in order:
+
+1. one read after a fixed 150ms → too early, both required fields unfilled;
+2. 10 × 150ms on `act.delay` → the **adaptive** pace collapses to ~15ms on a visible tab, so the
+   "1.5s" poll finished in **196ms**;
+3. 24 × 120ms on `delayFull` → each pace really cost ~500ms on the **starved** clock, so it
+   accidentally waited ~5s and PASSED. Turning the page clock on made the paces honest, the same 24
+   iterations became ~2.9s, and both fields went blank again.
+
+**A deadline does not care which clock is underneath it.** Every proxy for time breaks when the clock
+beneath it changes.
+
+### ⚠ ORC's pill IGNORES THE FIRST PRESS, reliably
+
+Both deterministic yes/no questions reported `took 2 press(es) — the first did not register` on
+**every** run once the press count was recorded, hidden and visible. So the re-press is load-bearing,
+not a rare safety net. It is gated on the read-back still showing NOTHING pressed — on a toggle a
+blind second press would un-press what the first one set.
+
+### ⚠ And the hidden run caught a bug the press count made obvious
+
+Both deterministic questions landed with 2 presses while the AI-answered one on the SAME page came
+back `needs_review` seconds later. Not the widget and not the answer: only the deterministic rung had
+the deadline-and-re-press logic, while the AI choice commit and the EEO decline path still did one
+click plus a short read. **Which rung answers a question must not decide whether the answer sticks.**
+There is now one `atsCommitYesNo` for all three sites, and a test that counts direct
+`atsInjClickYesNo` calls — exactly two are allowed, both inside the helper.
+
+### Still open
+
+`atsPageClock` is a flag (default ON) because one run showed step 2 at 8.2s and a later one showed a
+plain text write at 13.1s. Page-clock pacing turns every pace into a `Runtime.evaluate`, so a very
+busy renderer could hand its own slowness to the paces — indistinguishable from machine load on a
+machine that costs 13s for a text write. One run each way on an idle machine settles it.
