@@ -4826,7 +4826,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
       if (!target || !target.sel) return halt("auth-field-unaddressable", `Recognised the ${view} step but its input has no usable selector.`);
       const w = await cdpEval(atsInjSetCredential, target.sel, value).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
       if (!w || !w.ok) return halt("credential-write-failed", `Could not write the stored ${view === "password" ? "password" : "login email"} into ${target.sel}` + (w && w.error ? ` (${w.error})` : "") + ".");
-      LOG(`wrote the stored ${view === "password" ? "password" : "login email"} (${w.length} chars) into ${target.sel}`);
+      LOG(`wrote the stored ${view === "password" ? "password" : "login email"} (${w.len} chars) into ${target.sel}`);
       const v = await cdpEval(atsInjVerifyCredential, target.sel, value).catch(() => null);
       if (!v || v.matches !== true) return halt("credential-not-retained", `The ${view} field did not keep the stored value (Chrome's password manager can overwrite an autocomplete=username box). Fill this step yourself and re-run.`);
 

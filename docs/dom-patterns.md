@@ -5780,3 +5780,44 @@ confidently-wrong class. Pinned by a test so the gap stays chosen rather than fo
 ⚠ **A returning candidate's blocks are not empty.** Skills arrived already populated and a résumé
 already attached from the account, so an entry pass must reconcile UP only and never assume it starts
 from zero.
+
+### ⚠⚠ READING AP_DEV_LOGS: "fresh" MUST BE `t >= workerStartedAt`, NEVER CONTENT (2026-08-19)
+
+I read three "runs" off the log ring and reported two of them as real. Only the FIRST was.
+
+The ring **persists across service-worker restarts** — its oldest entry was 48 minutes and two
+restarts old. So after an `AP_RELOAD` the old lines are still there, and a content-based freshness
+check ("no phoneNumber needs_review line") sampled only the tail (`limit: 8`, which returned nothing
+but worker-started lines) and reported FRESH while the fill lines sat further back in the ring.
+
+The tell I ignored: **byte-identical millisecond timings across supposedly separate runs** — 2992ms,
+9071ms, 3787ms, "fill 40.3s". Two real executions of a network-bound fill cannot agree to the
+millisecond, and I noticed the repetition twice before acting on it.
+
+The reply carries everything needed to do this correctly and I was not using it:
+
+| field | use |
+|---|---|
+| `workerStartedAt` | the only valid freshness boundary |
+| `lines[].t` | per-entry epoch ms |
+| `lines[].n` | monotonic sequence — survives restarts, so a cursor works too |
+| `runInFlight` | whether a run is still going |
+
+Done properly, the third attempt showed `linesSinceWorkerStart: 1` and **`fillLinesSinceStart: 0`** —
+the re-runs produced no fill at all. ⚠ The worker had restarted at 03:21:14, AFTER the run was fired,
+so an MV3 teardown mid-run is the likely cause: a run stranded by a worker restart leaves the ring
+looking exactly like a run that never started.
+
+⚠ Also unresolved and worth stating as a hypothesis rather than a finding: **`AP_RELOAD` restarts the
+worker but may not re-read the files from disk** — Chrome refreshes an unpacked package on an
+extension reload, not on a worker restart. If so, every fix made after the extension was loaded is
+absent from the running code, which would independently explain identical behaviour. The decisive
+check is behavioural (a dev scan proved the oracle branch was live at load time); the way to settle it
+is a hard reload on the extension card and then compare.
+
+### A smaller one, real: `(undefined chars)`
+
+`atsInjSetCredential` returns `len`; the pre-form logged `w.length`, so a successful credential write
+reported "wrote the stored login email (undefined chars)". Cosmetic in itself, but it is a
+length-only log that exists precisely so a credential write can be confirmed WITHOUT printing the
+value — and it was confirming nothing.
