@@ -5223,6 +5223,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // Notices accepted by the iCIMS pre-form on the operator's standing instruction (2026-08-18), so the
   // run's own result says what was agreed to rather than requiring a log dig.
   let icimsConsentsAccepted = [];
+  // ⚠ Set for Oracle: this path fills ONE step of a multi-step form, so the result must say so
+  // rather than letting a one-step bundle read as a finished application.
+  let orcSinglePageOnly = false;
   // ⚠ ORACLE IS DETECTED BUT NOT YET DRIVEABLE — REFUSE LOUDLY RATHER THAN FALL THROUGH (2026-08-19).
   // `detectAts` learned Oracle Recruiting Cloud one increment ahead of its scan branch, and the two
   // must not be allowed to disagree quietly. `atsInjScan` has no `oracle` branch, so an ORC page would
@@ -5365,14 +5368,20 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         }
         return { ...pre.halt, jd };
       }
-      // ⚠ THE FILL IS STILL REFUSED, DELIBERATELY. atsInjScan has no `oracle` branch, so the generic
-      // tail would run — and because ORC's controls are plain inputs it would classify them,
-      // honeypot included, producing a plausible-but-poisoned bundle. Onboarding was built first at
-      // the operator's direction; this guard comes out in the commit that adds the scan.
-      LOG("✔ pre-form complete — but the ORC fill scan is not built yet, so stopping here rather than filling");
-      return { ok: true, needs_operator: true, stopped: "oracle-fill-not-implemented", jd,
-        reached_form: true, sections: pre.sections, consents_accepted: pre.consentsAccepted,
-        detail: "Reached the Oracle application form (" + pre.sections + " section(s)). The ORC fill stage is not built yet, so nothing was typed into it — fill this one yourself, or wait for the scan." };
+      // The fill guard is GONE as of the scan landing — the run now falls through to the ordinary ATS
+      // fill path below, which scans, captures picker options and actuates.
+      //
+      // ⚠⚠ BUT ORC IS A MULTI-PAGE FORM AND THIS PATH FILLS ONE PAGE. Greenhouse, Lever, Ashby and
+      // iCIMS are all single-page, so `ats.js` has never needed a page walk; ORC serves 3-4 numbered
+      // steps behind a `Next` (measured: `…/apply/section/<n>`, "step 1 of 3"). So a run fills the
+      // step it lands on and stops there, and the bundle covers THAT STEP ONLY.
+      //
+      // Saying so loudly is the point: a bundle that silently covered one of three steps would look
+      // like a complete application and would pass its own review gate, which is the
+      // plausible-but-incomplete failure this codebase refuses. The walk is the next increment; until
+      // it exists the run result carries `pages_filled: 1` and the caller must not read it as done.
+      LOG(`✔ pre-form complete — filling this step. ⚠ ORC is multi-page (${pre.sections} section(s) mounted) and this path fills ONE step; the bundle will cover only the step we land on`);
+      orcSinglePageOnly = true;
     }
     if (ats === "icims") {
       emitRunProgress("Signing in to the careers portal", "iCIMS");
@@ -5579,10 +5588,32 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
 
     // ONE page ⇒ one bundle write (the walk's clear-once + accumulate collapses to a set).
     const pageKey = (() => { try { return new URL(out.url).pathname; } catch (e) { return "application"; } })();
+    // ⚠ ORACLE IS MULTI-STEP, so "page 1 of Application" would be a lie. The step number is in the
+    // url (`…/apply/section/<n>`) and the step NAME is in the document title ("Personal Info",
+    // "Experience", "More About You"), so the bundle can say which step it actually covers.
+    const orcStep = ats === "oracle" ? (() => {
+      const m = /\/apply\/section\/?(\d+)/.exec(out.url || "");
+      const n = m ? Number(m[1]) : null;
+      const name = String(out.title || "").split(" - ")[0].trim();
+      return n ? { n, label: name && !/^oracle/i.test(name) ? name : "Step " + n } : null;
+    })() : null;
     const bundle = buildReviewBundle(out.results, {
-      page: pageKey, pageNumber: 1, pageLabel: "Application",
+      page: pageKey,
+      pageNumber: orcStep ? orcStep.n : 1,
+      pageLabel: orcStep ? orcStep.label : "Application",
       url: out.url, tenant: jobContext.company || null, capturedAt: new Date().toISOString(),
     });
+    // ⚠ AND SAY THAT IT IS PARTIAL. A one-step bundle from a three-step form would otherwise pass its
+    // own review gate and read as a finished application — the plausible-but-incomplete failure this
+    // codebase exists to refuse. Carried ON THE BUNDLE, not only in a log line, because the log is
+    // gone by the time anyone reviews it.
+    if (orcSinglePageOnly) {
+      bundle.partial = true;
+      bundle.partialReason = "Oracle serves this application as multiple numbered steps and this run filled only "
+        + (orcStep ? "step " + orcStep.n + " (" + orcStep.label + ")" : "the step it landed on")
+        + ". The remaining steps have not been filled or reviewed — do not treat this bundle as a complete application.";
+      LOG(`⚠ bundle marked PARTIAL — ${bundle.partialReason}`);
+    }
     // WHICH PIPELINE filled this, recorded on the bundle. A submit run detects the ATS from the
     // URL, but an employer-HOSTED form (careers.<company>.com — Greenhouse/Lever/Ashby all serve
     // under the employer's own domain) detects as nothing and used to fall through to the Workday
