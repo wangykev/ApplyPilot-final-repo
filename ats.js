@@ -4291,7 +4291,50 @@ function atsInjOrcUnclaimed(claimedNames) {
       });
     }
   }
-  return { ok: true, unclaimed: [...seen.values()] };
+  // ⚠⚠ AND THE CONTROLS THAT ARE NOT NATIVE ELEMENTS AT ALL. The sweep above queries
+  // `input, select, textarea`, which is every control ORC has used so far — and it reported NOTHING
+  // on a step the operator could see three REQUIRED yes/no application questions on. Oracle JET
+  // renders its own widgets as custom elements (`oj-radioset`, `oj-select-single`, …) with ARIA
+  // roles instead of native inputs, so a question can be plainly visible, plainly required, and
+  // invisible to every selector this file uses.
+  //
+  // Reported SEPARATELY from the native list because the two mean different things: a native control
+  // we missed is a classifier gap, while an ARIA-only control is a whole widget FAMILY with no
+  // handler. Conflating them would make the second look like the first and send the fix at the row
+  // classifier, which cannot see these at all.
+  const aria = [];
+  const ROLES = "[role=radiogroup], [role=radio], [role=combobox], [role=listbox], [role=checkbox], [role=spinbutton], [role=switch]";
+  for (const sec of secs) {
+    // Custom elements first: their tag name is the most useful single fact about them, because it
+    // names the JET component and therefore what a handler would have to drive.
+    const custom = [...sec.querySelectorAll("*")].filter((e) => e.tagName.indexOf("-") > 0 && vis(e));
+    for (const e of custom) {
+      const tag = e.tagName.toLowerCase();
+      if (!/^oj-|-form$|^apply-flow|^form-builder|^cx-/.test(tag)) continue;
+      // only leaves that actually look like a CONTROL — a layout custom element is not a field
+      if (!e.matches(ROLES) && !e.querySelector(ROLES) && !e.hasAttribute("required") && e.getAttribute("aria-required") !== "true") continue;
+      // …and skip one that merely CONTAINS native controls the sweep above already accounted for
+      if (e.querySelector("input, select, textarea")) continue;
+      const lbl = t(e.querySelector("[class*=label], label, legend")) || e.getAttribute("aria-label") || "";
+      aria.push({ tag, role: e.getAttribute("role") || (e.querySelector(ROLES) ? e.querySelector(ROLES).getAttribute("role") : null),
+        id: e.id || null, question: (lbl || "").slice(0, 120),
+        required: e.hasAttribute("required") || e.getAttribute("aria-required") === "true",
+        options: [...e.querySelectorAll("[role=radio], [role=option]")].map((o) => t(o).slice(0, 40)).filter(Boolean).slice(0, 6),
+        block: (e.closest("apply-flow-block") ? t(e.closest("apply-flow-block").querySelector("apply-flow-block-title")).slice(0, 60) : null) });
+    }
+    // …then any bare ARIA control that is not inside one of those and not a native element.
+    for (const e of [...sec.querySelectorAll(ROLES)].filter(vis)) {
+      if (/^(input|select|textarea)$/i.test(e.tagName)) continue;
+      if (e.closest("oj-radioset, oj-select-single, oj-select-many, oj-combobox-one")) continue;
+      if (aria.some((a) => a.id && a.id === e.id)) continue;
+      aria.push({ tag: e.tagName.toLowerCase(), role: e.getAttribute("role"), id: e.id || null,
+        question: (t(e.closest("[class*=input-row]") ? e.closest("[class*=input-row]").querySelector("[class*=label], label, legend") : null) || e.getAttribute("aria-label") || "").slice(0, 120),
+        required: e.getAttribute("aria-required") === "true",
+        options: [...e.querySelectorAll("[role=radio], [role=option]")].map((o) => t(o).slice(0, 40)).filter(Boolean).slice(0, 6),
+        block: (e.closest("apply-flow-block") ? t(e.closest("apply-flow-block").querySelector("apply-flow-block-title")).slice(0, 60) : null) });
+    }
+  }
+  return { ok: true, unclaimed: [...seen.values()], aria };
 }
 
 function atsInjOrcEntryState(blockTitlePattern) {
@@ -4368,19 +4411,51 @@ var ATS_ORC_ENTRY_BLOCKS = [
   { pattern: "^Skills", source: "skills", label: "Skills" },
 ];
 
-// The Experience entry's own fields, as measured on Oracle. Dates are the month+year composite (NO
-// day here, unlike step 3's earliestAvailableDate — arity is per-field and is read from the ids).
+// The entry forms, MEASURED — each one was read off the live DOM by the entry pass's own discovery
+// log (2026-08-19), which is why the shapes here are shorter and stranger than a guess would be.
+//
+// ⚠⚠ A DATE IS **TWO COMBOBOXES SHARING ONE `name`**, not one field. Measured verbatim:
+//   Experience entry 1 — 6 field(s): employerName[text], jobTitle[text],
+//                        startDate[combobox], startDate[combobox], endDate[combobox], endDate[combobox]
+// The first pass treated `startDate` as a single field, wrote "2025-05" into whichever id came
+// first, and burned 8.2s failing — the slowest field of the whole run. `date_pair` says so, and the
+// pass decides WHICH half is which by reading each picker's own options (a month list vs a year
+// list) rather than by position: a tenant that renders year-then-month would otherwise file every
+// start date backwards, and nothing about that failure would look like an ordering bug.
+//
+// ⚠ AND EXPERIENCE HAS NO CITY, COUNTRY OR RESPONSIBILITIES ON THIS TENANT. The earlier map carried
+// all three from the iCIMS shape; they never existed here. Left OUT rather than kept "just in case",
+// because a map entry that matches nothing is indistinguishable from one that is broken.
 var ATS_ORC_ENTRY_MAPS = {
   work_experience: {
     "employerName": { path: "company" },
     "jobTitle": { path: "job_title" },
-    "startDate": { path: "from", kind: "date" },
-    "endDate": { path: "to", kind: "date" },
-    "employerCity": { path: "location", kind: "city_of" },
-    "countryCode": { path: "location", kind: "country_of" },
-    "responsibilities": { path: "bullets", kind: "join" },
-    // deliberately unmapped: the profile stores no reason for leaving, and inventing one on a form
-    // an employer reads is exactly the confidently-wrong class.
+    "startDate": { path: "from", kind: "date_pair" },
+    // ⚠ A JOB YOU STILL HOLD HAS NO END DATE — the entry pass skips this when
+    // `currently_work_here` is true, exactly as the iCIMS entry resolver does. Writing today's date
+    // there would assert you had left.
+    "endDate": { path: "to", kind: "date_pair", blankWhenCurrent: true },
+  },
+  education: {
+    // `contentItemId` is Oracle's own name for the DEGREE picker — an opaque platform id whose label
+    // is the only thing that says so, which is why the discovery log prints the label next to the
+    // name. The profile stores degree and field-of-study as TIERED ARRAYS ("Bachelor of Science" →
+    // "Bachelor's Degree" → "Bachelors"), so both go through the ladder as candidates and the form's
+    // own vocabulary picks the wording it has.
+    "contentItemId": { path: "degree", kind: "tiered" },
+    "educationalEstablishment": { path: "school_or_university" },
+    "major": { path: "field_of_study", kind: "tiered" },
+    "gpa": { path: "gpa" },
+  },
+  skills: {
+    // ⚠ A SKILLS ENTRY IS A BARE STRING, NOT AN OBJECT. `profile.skills` is an array of names, so
+    // there is no property to read — `kind:"self"` says "the entry IS the value". Without it the
+    // resolver would index a string and answer nothing, which is what left every skill blank.
+    "skills": { kind: "self" },
+    // `yearsOfExperience` is deliberately unmapped: the profile does not record per-skill years, and
+    // inventing a number on a form an employer reads is the confidently-wrong class. If Oracle
+    // REQUIRES it the entry is refused and the pass says so — which is the honest outcome, and the
+    // evidence for either adding the data or dropping this block.
   },
 };
 
@@ -4399,6 +4474,28 @@ function atsOrcEntryValue(spec, entry) {
   };
   if (spec.kind === "skip") return null;
   if (!spec.kind) { const v = raw(spec.path); return v == null ? null : String(v); }
+  // The entry IS the value (profile.skills is an array of bare strings).
+  if (spec.kind === "self") {
+    const v = typeof entry === "string" ? entry : null;
+    return v && v.trim() ? v.trim() : null;
+  }
+  // A TIERED profile array passes through as a ready-made candidate list, most-specific first —
+  // the same contract `resolve()` has everywhere else here, so the form's vocabulary decides.
+  if (spec.kind === "tiered") {
+    const v = raw(spec.path);
+    if (v == null) return null;
+    if (Array.isArray(v)) { const list = v.map((x) => String(x)).filter((x) => x.trim()); return list.length ? list : null; }
+    return String(v);
+  }
+  if (spec.kind === "date_pair") {
+    // A job still held has no end date; asserting one would say you had left.
+    if (spec.blankWhenCurrent && entry.currently_work_here === true) return null;
+    const v = raw(spec.path);
+    if (v == null) return null;
+    const m = /^(\d{4})-(\d{1,2})/.exec(String(v));
+    if (!m) { const y = /^(\d{4})$/.exec(String(v).trim()); return y ? { year: y[1], month: null } : null; }
+    return { year: m[1], month: String(Number(m[2])) };
+  }
 
   // "Tallahassee, FL" → the city half. The profile stores one `location` string per entry and ORC
   // asks for the parts separately, so the comma is the form's own delimiter, not an inference.
@@ -4508,12 +4605,87 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       log(`${tag} — the form offers ${st.fields.length} field(s): ${st.fields.map((f) => `${f.name || f.id}[${f.role || f.type}]${f.label ? " “" + f.label + "”" : ""}`).join(", ")}`);
 
       // ── FILL ────────────────────────────────────────────────────────────────────────
+      // ⚠ GROUP BY `name` FIRST. A date is TWO comboboxes sharing one name (measured: `startDate`
+      // twice, `endDate` twice), so a field-at-a-time loop handed the same spec to both halves and
+      // wrote the whole "2025-05" into whichever id came first — the slowest failing field of the
+      // run at 8.2s. Grouping is also what makes the month/year split decidable at all.
       const map = ATS_ORC_ENTRY_MAPS[item.source] || {};
       const unmapped = [];
+      const byName = new Map();
       for (const f of st.fields) {
-        const key = f.name || "";
+        const k = f.name || f.id || "";
+        if (!k) continue;
+        if (!byName.has(k)) byName.set(k, []);
+        byName.get(k).push(f);
+      }
+      for (const [key, group] of byName) {
         const spec = map[key] || null;
-        if (!spec) { if (key) unmapped.push(key + (f.label ? " (" + f.label + ")" : "")); continue; }
+        if (!spec) { unmapped.push(key + (group[0].label ? " (" + group[0].label + ")" : "")); continue; }
+
+        // ── the date pair: WHICH half is month and which is year is READ, not assumed ──
+        if (spec.kind === "date_pair" && group.length >= 2) {
+          const ym = atsOrcEntryValue(spec, entry);
+          const rec0 = { fieldName: `${item.source}[${i}].${key}`, label: group[0].label || key,
+                         widgetType: "dropdown", isRequired: false, entrySection: item.source, entryIndex: i,
+                         mappedPath: `${item.source}[${i}].${spec.path}`, status: "skipped", after: null, elapsedMs: 0 };
+          if (ym == null) {
+            rec0.detail = spec.blankWhenCurrent && entry && entry.currently_work_here === true
+              ? "you still work here — the end date is deliberately left blank"
+              : "this entry has no date for it — left blank rather than answered from elsewhere";
+            rec0.flag = spec.blankWhenCurrent && entry && entry.currently_work_here === true ? null : "entry-unanswered";
+            records.push(rec0); continue;
+          }
+          const t0 = Date.now();
+          // Classify each half by its OWN option list: a month picker offers month names, a year
+          // picker offers 4-digit years. Position would work on this tenant and file every date
+          // backwards on one that renders year first — and that failure would not look like an
+          // ordering bug, it would look like the dates were wrong.
+          const halves = [];
+          for (const g of group.slice(0, 2)) {
+            if (!g.id) { halves.push({ g, kind: null, rows: [] }); continue; }
+            const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
+            const cap = await act.eval(atsInjOrcCaptureOptions, sel, ATS_ORC_PICK_MS).catch(() => null);
+            const rows = (cap && cap.options) || [];
+            const yearish = rows.filter((r) => /^\s*(19|20)\d{2}\s*$/.test(String(r))).length;
+            const monthish = rows.filter((r) => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(String(r))).length;
+            halves.push({ g, sel, rows, kind: yearish > monthish ? "year" : (monthish > 0 ? "month" : null) });
+          }
+          const yearHalf = halves.find((h) => h.kind === "year");
+          const monthHalf = halves.find((h) => h.kind === "month");
+          if (!yearHalf || !monthHalf) {
+            rec0.status = "needs_review"; rec0.flag = "date-halves-unidentified";
+            rec0.elapsedMs = Date.now() - t0;
+            rec0.detail = "could not tell the month picker from the year picker by their options" +
+              ` (offered ${JSON.stringify(halves.map((h) => (h.rows || []).slice(0, 3)))}) — set this date here`;
+            records.push(rec0); continue;
+          }
+          // The month picker's own wording for this month, taken from its list rather than from a
+          // hardcoded name table: "May" / "05" / "5" are all shapes a tenant may use.
+          const mNum = Number(ym.month);
+          const NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+          const monthCands = mNum >= 1 && mNum <= 12
+            ? [NAMES[mNum - 1], NAMES[mNum - 1].slice(0, 3), String(mNum).padStart(2, "0"), String(mNum)]
+            : [];
+          let okAll = true; const parts = [];
+          for (const [half, cands] of [[monthHalf, monthCands], [yearHalf, [String(ym.year)]]]) {
+            const wanted = cands.find((c) => half.rows.some((r) => String(r).trim().toLowerCase() === String(c).trim().toLowerCase())) || cands[0];
+            if (!wanted) { okAll = false; continue; }
+            const r = await act.eval(atsInjOrcPick, half.sel, String(wanted), [String(wanted)], ATS_ORC_PICK_MS, false, false).catch(() => null);
+            const back = await act.eval(atsInjOrcReadPicker, half.sel).catch(() => null);
+            const got = back && back.ok ? back.value : null;
+            if (!(r && r.ok && String(got || "").trim() && !(back && back.invalid))) okAll = false;
+            parts.push(`${half.kind}=${JSON.stringify(got)}`);
+          }
+          rec0.elapsedMs = Date.now() - t0;
+          rec0.after = parts.join(" ");
+          rec0.status = okAll ? "filled" : "needs_review";
+          if (!okAll) { rec0.flag = "commit-not-accepted"; rec0.detail = `Oracle did not accept ${ym.month}/${ym.year} — got ${rec0.after || "nothing"}`; }
+          else rec0.detail = `month+year pair set from ${JSON.stringify(String(ym.month) + "/" + ym.year)} (halves identified by their own option lists)`;
+          records.push(rec0); continue;
+        }
+
+        const f = group[0];
+        if (group.length > 1) unmapped.push(`${key} ×${group.length} (only the first was filled)`);
         const value = atsOrcEntryValue(spec, entry);
         const rec = { fieldName: `${item.source}[${i}].${key}`, label: f.label || key,
                       widgetType: f.role === "combobox" ? "dropdown" : (f.type === "textarea" ? "textarea" : "text"),
@@ -4537,18 +4709,30 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         if (f.role === "combobox") {
           // ORC's own typeahead — the same primitive step 1 uses, including the composite
           // first-segment match, because an entry's city picker offers "Tallahassee, Leon, FL" too.
-          const r = await act.eval(atsInjOrcPick, sel, String(value), [String(value)], ATS_ORC_PICK_MS, false, true).catch(() => null);
-          const back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
+          // ⚠ A TIERED VALUE IS TRIED MOST-SPECIFIC FIRST and stops at the first hit, which is the
+          // whole point of the profile storing degrees as ["Bachelor of Science", "Bachelor's
+          // Degree", "Bachelors"]: the form's own vocabulary decides, and nothing is guessed.
+          const cands = Array.isArray(value) ? value.map(String) : [String(value)];
+          let r = null, back = null;
+          for (const c of cands) {
+            r = await act.eval(atsInjOrcPick, sel, c, [c], ATS_ORC_PICK_MS, false, true).catch(() => null);
+            back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
+            if (r && r.ok && String((back && back.value) || "").trim() && !(back && back.invalid)) break;
+          }
           rec.after = back && back.ok ? back.value : null;
           rec.elapsedMs = Date.now() - t0;
           const ok = r && r.ok && String(rec.after || "").trim() && !(back && back.invalid);
           rec.status = ok ? "filled" : "needs_review";
-          if (!ok) { rec.flag = "no-option-match"; rec.detail = `Oracle's list did not accept ${JSON.stringify(String(value))}` + (r && r.rows ? `; it offered ${JSON.stringify(r.rows.slice(0, 4))}` : ""); }
+          if (!ok) { rec.flag = "no-option-match"; rec.detail = `Oracle's list did not accept any of ${JSON.stringify(cands.slice(0, 4))}` + (r && r.rows ? `; it offered ${JSON.stringify(r.rows.slice(0, 4))}` : ""); }
           else rec.detail = `picked ${JSON.stringify(rec.after)} from the form's own list`;
         } else {
-          const w = await act.eval(atsInjSetText, sel, String(value)).catch(() => null);
+          // A tiered value in a TEXT box takes the most specific wording — there is no list to
+          // negotiate with, so the fallback tiers have nothing to add.
+          const flat = Array.isArray(value) ? String(value[0]) : String(value);
+          const w = await act.eval(atsInjSetText, sel, flat).catch(() => null);
           const back = await act.eval(atsInjReadValue, "oracle", sel, "text").catch(() => null);
           rec.after = back && back.ok ? back.value : null;
+          rec.resolved = Array.isArray(value) ? value : undefined;
           rec.elapsedMs = Date.now() - t0;
           // Read-back verified like every other commit here: a write that did not stick is
           // needs_review, never a silent pass.
@@ -6633,6 +6817,16 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
         for (const m of String(f.inputSel || "").matchAll(/#([\w-]+)/g)) claimed.push(m[1]);
       }
       const u = await act.eval(atsInjOrcUnclaimed, claimed).catch(() => null);
+      const ariaOnly = (u && u.aria) || [];
+      if (ariaOnly.length) {
+        console.log(`[ApplyPilot][ORC-UNCLAIMED] ⚠⚠ ${ariaOnly.length} ARIA-ONLY control(s) — a JET widget family with NO handler in this file, so they were never even scanned:`);
+        for (const a of ariaOnly) {
+          const line = `${a.required ? "REQUIRED " : ""}<${a.tag}> role=${a.role} ${JSON.stringify(a.question || a.id || "")}` +
+            `${a.options.length ? " options=" + JSON.stringify(a.options) : ""}${a.block ? " block=" + JSON.stringify(a.block) : ""}`;
+          unclaimedNotes.push(line);
+          console.log("[ApplyPilot][ORC-UNCLAIMED]   • " + line);
+        }
+      }
       const miss = (u && u.unclaimed) || [];
       if (miss.length) {
         for (const m of miss) {

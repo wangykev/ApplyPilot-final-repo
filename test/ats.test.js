@@ -3158,15 +3158,65 @@ test("atsOrcEntryPlan: NO SILENT CAPS — a history longer than the backstop rep
     "the ORIGINAL count must survive so the run can say what it left out");
 });
 
-test("ATS_ORC_ENTRY_MAPS: the Experience entry maps to real profile keys, and leaves the unknowable alone", () => {
-  const m = ats.ATS_ORC_ENTRY_MAPS.work_experience;
-  assert.strictEqual(m.employerName.path, "company");
-  assert.strictEqual(m.jobTitle.path, "job_title");
-  assert.strictEqual(m.startDate.kind, "date");
-  assert.strictEqual(m.endDate.kind, "date");
-  // ⚠ deliberately absent: the profile stores no reason for leaving, and inventing one on a form an
-  // employer reads is the confidently-wrong class. This test is the reminder that the gap is chosen.
-  assert.ok(!m.leavingReason, "leavingReason must stay unmapped");
+test("ATS_ORC_ENTRY_MAPS: the entry forms match what the live DOM actually offered", () => {
+  const we = ats.ATS_ORC_ENTRY_MAPS.work_experience;
+  assert.strictEqual(we.employerName.path, "company");
+  assert.strictEqual(we.jobTitle.path, "job_title");
+  // ⚠ A DATE IS TWO COMBOBOXES SHARING ONE `name`, measured off the live form:
+  //   Experience entry 1 — 6 field(s): employerName[text], jobTitle[text],
+  //                        startDate[combobox], startDate[combobox], endDate[combobox], endDate[combobox]
+  // The first version of this map called it one field of kind "date"; the pass wrote the whole
+  // "2025-05" into whichever id came first and burned 8.2s failing — the slowest field of the run.
+  assert.strictEqual(we.startDate.kind, "date_pair");
+  assert.strictEqual(we.endDate.kind, "date_pair");
+  assert.strictEqual(we.endDate.blankWhenCurrent, true, "a job you still hold has no end date");
+  // ⚠ measured ABSENT on this tenant, and so deliberately unmapped rather than kept "just in case":
+  // a map entry that matches nothing is indistinguishable from one that is broken.
+  for (const gone of ["employerCity", "countryCode", "responsibilities", "leavingReason"]) {
+    assert.ok(!we[gone], gone + " is not on Oracle's Experience entry and must not be mapped");
+  }
+
+  const ed = ats.ATS_ORC_ENTRY_MAPS.education;
+  // `contentItemId` is Oracle's own opaque name for the DEGREE picker — only its label says so.
+  assert.strictEqual(ed.contentItemId.path, "degree");
+  assert.strictEqual(ed.contentItemId.kind, "tiered", "the profile stores degrees as an ordered ladder");
+  assert.strictEqual(ed.major.kind, "tiered");
+  assert.strictEqual(ed.educationalEstablishment.path, "school_or_university");
+  assert.strictEqual(ed.gpa.path, "gpa");
+
+  const sk = ats.ATS_ORC_ENTRY_MAPS.skills;
+  // ⚠ a skills entry is a BARE STRING, so there is no property to read.
+  assert.strictEqual(sk.skills.kind, "self");
+  assert.ok(!sk.yearsOfExperience,
+    "per-skill years are not in the profile, and inventing a number on a form an employer reads is " +
+    "the confidently-wrong class — an entry Oracle refuses over it is the honest outcome");
+});
+
+test("atsOrcEntryValue: the measured kinds, including the ones that must answer NOTHING", () => {
+  const M = ats.ATS_ORC_ENTRY_MAPS;
+  const we = { company: "X", job_title: "Y", from: "2025-05", to: "2025-08", currently_work_here: false };
+  assert.deepStrictEqual(ats.atsOrcEntryValue(M.work_experience.startDate, we), { year: "2025", month: "5" });
+  assert.deepStrictEqual(ats.atsOrcEntryValue(M.work_experience.endDate, we), { year: "2025", month: "8" });
+  // still there ⇒ no end date. Writing one would assert you had left.
+  assert.strictEqual(ats.atsOrcEntryValue(M.work_experience.endDate, { ...we, currently_work_here: true }), null);
+  // a year-only value yields a year and no month — never a guessed month
+  assert.deepStrictEqual(ats.atsOrcEntryValue(M.work_experience.startDate, { from: "2024" }), { year: "2024", month: null });
+  assert.strictEqual(ats.atsOrcEntryValue(M.work_experience.startDate, { from: "" }), null);
+
+  const ed = { degree: ["Bachelor of Science", "Bachelors"], school_or_university: "CMU",
+               field_of_study: ["ECE", "EE"], gpa: "3.95" };
+  assert.deepStrictEqual(ats.atsOrcEntryValue(M.education.contentItemId, ed), ["Bachelor of Science", "Bachelors"],
+    "a tiered value passes through as an ordered candidate list, most-specific first");
+  assert.strictEqual(ats.atsOrcEntryValue(M.education.educationalEstablishment, ed), "CMU");
+  assert.strictEqual(ats.atsOrcEntryValue(M.education.gpa, ed), "3.95");
+
+  assert.strictEqual(ats.atsOrcEntryValue(M.skills.skills, "Python"), "Python", "the entry IS the value");
+  assert.strictEqual(ats.atsOrcEntryValue(M.skills.skills, { name: "Python" }), null,
+    "an object where a bare string was expected answers nothing rather than something wrong");
+
+  // ⚠ THE SEAL: every value comes from the ENTRY. Nothing here may consult a profile root.
+  assert.strictEqual(ats.atsOrcEntryValue(M.education.gpa, {}), null);
+  assert.strictEqual(ats.atsOrcEntryValue(M.work_experience.employerName, {}), null);
 });
 
 
