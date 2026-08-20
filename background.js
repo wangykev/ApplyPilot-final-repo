@@ -5290,6 +5290,170 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
     detail: "The iCIMS sign-in did not reach the application form within " + MAX_ROUNDS + " steps. Sign in yourself in the tab, then re-run." } };
 }
 
+
+// ── THE BLOCK-POPULATION SETTLE — SHARED BY BOTH ORC WALKS ───────────────────────────────────
+// ⚠⚠ A BLOCK CAN BE MOUNTED WITH ITS CONTENTS STILL IN FLIGHT, and the field-set settle cannot see
+// it. Live 2026-08-19 step 3 reported `"Application Questions" (0 input(s))` alongside Diversity (7),
+// Veteran (1), Disability (3) and E-Signature (1) — the page was plainly rendered, and the block
+// holding THREE REQUIRED yes/no questions was empty because Oracle fetches a requisition's questions
+// separately. The fill then recorded 7 fields on a step that has 10, and nothing was flagged: not
+// filled, not reviewed, not mentioned.
+//
+// The predicate is precise rather than "wait for more fields": a block with an ADD button
+// legitimately has zero controls (Education / Experience / Skills / Licenses are all built on
+// demand), so the only suspicious shape is a block with NEITHER controls NOR an add button. That
+// distinction is what makes this a settle and not a guess — and it is why the block inventory had to
+// exist before this could be written.
+//
+// Shared with the submit walk 2026-08-20: a replay that starts before a step's questions have
+// arrived replays nothing into them, and the strict verify then blames the BUNDLE for a field the
+// page had not rendered yet.
+async function orcAwaitBlocksPopulated(LOG) {
+  const blkT0 = Date.now(), BLK_BUDGET = 15000;
+  let pending = null, scrolled = false;
+  while (Date.now() - blkT0 < BLK_BUDGET) {
+    const bl = await cdpEval(atsInjOrcBlocks).catch(() => null);
+    const list = (bl && bl.ok && bl.blocks) || [];
+    pending = list.filter((b) => !b.inputs && !b.addCaption).map((b) => b.title);
+    if (!list.length || !pending.length) break;
+    // ⚠ WAITING LONGER IS NOT THE ONLY REASON A BLOCK STAYS EMPTY. Measured: "Application
+    // Questions" was still empty after the FULL 15.4s budget, which rules out "the fetch is
+    // slow" and leaves lazy rendering — a block whose contents mount when it scrolls into
+    // view. So the wait scrolls it into view ONCE, halfway through the budget, and keeps
+    // polling. Scrolling is read-only and cannot change an answer; it is the cheapest probe
+    // that distinguishes "not loaded yet" from "not loaded until looked at".
+    if (!scrolled && Date.now() - blkT0 > BLK_BUDGET / 3) {
+      scrolled = true;
+      const sc = await cdpEval(atsInjOrcScrollBlocks, pending).catch(() => null);
+      LOG(`⚠ block(s) ${JSON.stringify(pending)} still empty after ${((Date.now() - blkT0) / 1000).toFixed(1)}s — scrolled ${(sc && sc.scrolled) || 0} into view in case they render lazily`);
+    }
+    await cdpDelay(700);
+  }
+  if (pending && pending.length) {
+    // Reported, never fatal: a block that never populates may simply be a heading. But it must
+    // be SAID, because the alternative is a step that looks complete in the log.
+    LOG(`⚠ after ${((Date.now() - blkT0) / 1000).toFixed(1)}s these block(s) still have no controls and no Add button: ${JSON.stringify(pending)} — anything inside them was NOT filled`);
+  }
+  return pending || [];
+}
+
+// ── THE ORC STEP ADVANCE — ONE COPY, SHARED BY THE FILL WALK AND THE SUBMIT WALK ─────────────
+// Extracted 2026-08-20, when the submit run grew its own ORC walk. It is deliberately the FIRST
+// thing that was shared rather than the last: this is the double guard on the one irreversible act
+// in the whole pipeline, and a second hand-written copy of it is exactly the kind of near-duplicate
+// that drifts silently — the submit path would keep working right up until the day its copy stopped
+// agreeing with the fill path's about what "the last step" means.
+//
+// Returns { advanced: true, state } when the wizard genuinely moved on, or
+// { advanced: false, stopped, detail, state } for every stop — including the NORMAL terminal one,
+// `reached-final-step`, which the caller distinguishes by the stop reason rather than by a throw.
+// `state` is the post-fill read, so a caller that needs to know whether a Submit control is showing
+// (the submit run does, to open its gate) reads it from here rather than taking another read.
+async function orcAdvanceAfterStep(stepNo, stepLabel, LOG, ats) {
+  let walkStopped = null, walkDetail = null;
+  // ── GUARD 1: re-read AFTER the fill, because a cascade can reveal the final step ───
+  const after = await cdpEval(atsInjOrcStepState).catch(() => null);
+  if (!after || !after.ok) {
+    walkStopped = "step-state-unreadable";
+    walkDetail = `Filled step ${stepNo} but could not re-read the wizard's state, so the walk stopped rather than pressing Next blind.`;
+    return { advanced: false, stopped: walkStopped, detail: walkDetail, state: after };
+  }
+  if (!after.hasNext) {
+    // The terminal condition, and it is the ABSENCE of an advance control rather than
+    // `step >= total`: the section count is not the step count on either observed tenant.
+    walkStopped = "reached-final-step";
+    walkDetail = `Step ${stepNo} (${stepLabel}) has no Next control` +
+      (after.hasSubmit ? ` and shows ${JSON.stringify(after.submitCaption)} — the last step. NOTHING was pressed.`
+                       : " and no Submit either, which is unexpected — treated as the end and nothing was pressed.");
+    LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+    return { advanced: false, stopped: walkStopped, detail: walkDetail, state: after };
+  }
+  // ⚠⚠ A DISABLED NEXT IS USUALLY TEMPORARY — WAIT FOR IT, DO NOT HALT ON IT (operator,
+  // 2026-08-20). Live: `⛔ next-disabled … The form says: Saved`. "Saved" is a STATUS, not an
+  // error: Oracle disables its own Next while it persists the step and re-enables it a moment
+  // later. Treating that instant as a refusal ended the walk two steps in, on a step that had
+  // filled perfectly (12 fields, 0 to review).
+  //
+  // So the disabled state is polled to a budget and only a Next that STAYS disabled is a refusal
+  // — which is the real thing this branch exists to catch, an incomplete step Oracle will not let
+  // past. The halt then carries the page's own words, as before.
+  let nextState = after;
+  if (!nextState.nextEnabled) {
+    const nT0 = Date.now(), NEXT_BUDGET = 15000;
+    LOG(`${JSON.stringify(nextState.nextCaption)} is disabled on step ${stepNo} — waiting, since Oracle disables it while it saves` +
+        (nextState.errors.length ? ` (the form says: ${nextState.errors.join(" | ")})` : ""));
+    while (Date.now() - nT0 < NEXT_BUDGET) {
+      await cdpDelay(600);
+      const now = await cdpEval(atsInjOrcStepState).catch(() => null);
+      if (now && now.ok) { nextState = now; if (now.nextEnabled) break; }
+    }
+    if (!nextState.nextEnabled) {
+      walkStopped = "next-disabled";
+      walkDetail = `Oracle kept ${JSON.stringify(nextState.nextCaption)} DISABLED on step ${stepNo} for ${((Date.now() - nT0) / 1000).toFixed(1)}s, which is how it refuses an incomplete step.` +
+        (nextState.errors.length ? ` The form says: ${nextState.errors.join(" | ")}` : " The form gave no error text.");
+      LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+      return { advanced: false, stopped: walkStopped, detail: walkDetail, state: after };
+    }
+    LOG(`…${JSON.stringify(nextState.nextCaption)} re-enabled after ${((Date.now() - nT0) / 1000).toFixed(1)}s — continuing`);
+  }
+
+  // ── GUARD 2 rides along on the click itself ───────────────────────────────────────
+  const clicked = await cdpEval(atsInjOrcClickButton, ATS_ORC_NEXT_RE, "apply-flow-pagination", ATS_ORC_FORBID_RE)
+    .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (!clicked || !clicked.ok) {
+    walkStopped = clicked && clicked.error === "refused-forbidden-caption" ? "next-refused" : "next-not-pressable";
+    walkDetail = `Could not advance past step ${stepNo}: ${(clicked && clicked.error) || "unknown"}` +
+      (clicked && clicked.caption ? ` (caption ${JSON.stringify(clicked.caption)})` : "") +
+      (clicked && clicked.offered ? `; the bar offered ${JSON.stringify(clicked.offered)}` : "");
+    LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+    return { advanced: false, stopped: walkStopped, detail: walkDetail, state: after };
+  }
+  LOG(`pressed ${JSON.stringify(clicked.caption)} on step ${stepNo}`);
+
+  // ── the MONOTONE wait: the declared step number goes UP ───────────────────────────
+  const advT0 = Date.now(), ADV_BUDGET = 25000;
+  let moved = null, reads = 0, readOk = 0;
+  while (Date.now() - advT0 < ADV_BUDGET) {
+    await cdpDelay(700);
+    reads++;
+    const now = await cdpEval(atsInjOrcStepState).catch(() => null);
+    if (!now || !now.ok) continue;
+    readOk++;
+    const numberWentUp = now.step != null && after.step != null && now.step > after.step;
+    // Fallback for a tenant that swaps sections without touching the url. Compared as a SET, not
+    // a count: two sections are visible at once on Oracle (index 0 is the résumé-import banner).
+    const sectionsChanged = JSON.stringify(now.visibleSections) !== JSON.stringify(after.visibleSections);
+    if (numberWentUp || sectionsChanged) { moved = { now, by: numberWentUp ? "step-number" : "visible-sections" }; break; }
+  }
+  if (!moved) {
+    // ORC refuses Next on an incomplete step exactly as Workday refuses Save & Continue. That is
+    // a graceful halt carrying the page's own words — never a retry and never a guessed answer.
+    const now = await cdpEval(atsInjOrcStepState).catch(() => null);
+    walkStopped = "step-did-not-advance";
+    walkDetail = `Pressed ${JSON.stringify(clicked.caption)} on step ${stepNo} but the wizard stayed put for ${((Date.now() - advT0) / 1000).toFixed(1)}s (${readOk}/${reads} reads landed).` +
+      (readOk === 0 ? " NOT ONE read landed, so this is blindness rather than evidence the page stood still."
+                    : (now && now.errors && now.errors.length ? ` The form says: ${now.errors.join(" | ")}`
+                       : " The form showed no error text — check the step by hand for an empty required field."));
+    LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+    return { advanced: false, stopped: walkStopped, detail: walkDetail, state: after };
+  }
+  LOG(`advanced to step ${moved.now.step != null ? moved.now.step : "?"} after ${((Date.now() - advT0) / 1000).toFixed(1)}s (by ${moved.by})`);
+  // NEVER scan an unsettled page — the standing rule on every platform here.
+  // ⚠ ITS FLAG IS `ready`, NOT `ok`. Gating on `ok` here would have halted `step-not-rendered` on
+  // every SUCCESSFUL advance — the same caller-gates-on-a-field-the-callee-never-returns shape as
+  // atsInjPageSignature's missing `ok`, found the same day. A settle that reports `ready:false`
+  // with fields > 0 is a step whose form is there but unrecognized, which is worth saying apart.
+  const ready = await waitAtsFormReady(ats, LOG, 25000);
+  if (!ready || !ready.ready) {
+    walkStopped = "step-not-rendered";
+    walkDetail = `Advanced past step ${stepNo} but the next step never settled into a readable form` +
+      ` (${(ready && ready.why) || (ready && ready.fields ? ready.fields + " field(s) present but the page did not settle" : "no fields appeared")}).`;
+    LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+    return { advanced: false, stopped: walkStopped, detail: walkDetail, state: after };
+  }
+  return { advanced: true, state: moved.now };
+}
+
 async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // THE JOB IDENTITY IS THE LINK WE WERE GIVEN, not wherever the form turned out to live. A
   // landing hop (employer redirect, embedded frame, apply link) changes the URL, and keying the
@@ -5751,31 +5915,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         // demand), so the only suspicious shape is a block with NEITHER controls NOR an add button.
         // That distinction is what makes this a settle and not a guess — and it is why the block
         // inventory had to exist before this could be written.
-        const blkT0 = Date.now(), BLK_BUDGET = 15000;
-        let pending = null, scrolled = false;
-        while (Date.now() - blkT0 < BLK_BUDGET) {
-          const bl = await cdpEval(atsInjOrcBlocks).catch(() => null);
-          const list = (bl && bl.ok && bl.blocks) || [];
-          pending = list.filter((b) => !b.inputs && !b.addCaption).map((b) => b.title);
-          if (!list.length || !pending.length) break;
-          // ⚠ WAITING LONGER IS NOT THE ONLY REASON A BLOCK STAYS EMPTY. Measured: "Application
-          // Questions" was still empty after the FULL 15.4s budget, which rules out "the fetch is
-          // slow" and leaves lazy rendering — a block whose contents mount when it scrolls into
-          // view. So the wait scrolls it into view ONCE, halfway through the budget, and keeps
-          // polling. Scrolling is read-only and cannot change an answer; it is the cheapest probe
-          // that distinguishes "not loaded yet" from "not loaded until looked at".
-          if (!scrolled && Date.now() - blkT0 > BLK_BUDGET / 3) {
-            scrolled = true;
-            const sc = await cdpEval(atsInjOrcScrollBlocks, pending).catch(() => null);
-            LOG(`⚠ block(s) ${JSON.stringify(pending)} still empty after ${((Date.now() - blkT0) / 1000).toFixed(1)}s — scrolled ${(sc && sc.scrolled) || 0} into view in case they render lazily`);
-          }
-          await cdpDelay(700);
-        }
-        if (pending && pending.length) {
-          // Reported, never fatal: a block that never populates may simply be a heading. But it must
-          // be SAID, because the alternative is a step that looks complete in the log.
-          LOG(`⚠ after ${((Date.now() - blkT0) / 1000).toFixed(1)}s these block(s) still have no controls and no Add button: ${JSON.stringify(pending)} — anything inside them was NOT filled`);
-        }
+        await orcAwaitBlocksPopulated(LOG);
         emitRunProgress(`Filling step ${st.step != null ? st.step : iter}${st.total ? " of " + st.total : ""}`, "Oracle wizard (never submits)");
       }
 
@@ -5823,106 +5963,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       for (const n of out.entryNotes || []) LOG(`⚠ step ${stepNo}: ${n}`);
       if (!MULTI) break;
 
-      // ── GUARD 1: re-read AFTER the fill, because a cascade can reveal the final step ───
-      const after = await cdpEval(atsInjOrcStepState).catch(() => null);
-      if (!after || !after.ok) {
-        walkStopped = "step-state-unreadable";
-        walkDetail = `Filled step ${stepNo} but could not re-read the wizard's state, so the walk stopped rather than pressing Next blind.`;
-        break;
-      }
-      if (!after.hasNext) {
-        // The terminal condition, and it is the ABSENCE of an advance control rather than
-        // `step >= total`: the section count is not the step count on either observed tenant.
-        walkStopped = "reached-final-step";
-        walkDetail = `Step ${stepNo} (${stepLabel}) has no Next control` +
-          (after.hasSubmit ? ` and shows ${JSON.stringify(after.submitCaption)} — the last step. NOTHING was pressed.`
-                           : " and no Submit either, which is unexpected — treated as the end and nothing was pressed.");
-        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
-        break;
-      }
-      // ⚠⚠ A DISABLED NEXT IS USUALLY TEMPORARY — WAIT FOR IT, DO NOT HALT ON IT (operator,
-      // 2026-08-20). Live: `⛔ next-disabled … The form says: Saved`. "Saved" is a STATUS, not an
-      // error: Oracle disables its own Next while it persists the step and re-enables it a moment
-      // later. Treating that instant as a refusal ended the walk two steps in, on a step that had
-      // filled perfectly (12 fields, 0 to review).
-      //
-      // So the disabled state is polled to a budget and only a Next that STAYS disabled is a refusal
-      // — which is the real thing this branch exists to catch, an incomplete step Oracle will not let
-      // past. The halt then carries the page's own words, as before.
-      let nextState = after;
-      if (!nextState.nextEnabled) {
-        const nT0 = Date.now(), NEXT_BUDGET = 15000;
-        LOG(`${JSON.stringify(nextState.nextCaption)} is disabled on step ${stepNo} — waiting, since Oracle disables it while it saves` +
-            (nextState.errors.length ? ` (the form says: ${nextState.errors.join(" | ")})` : ""));
-        while (Date.now() - nT0 < NEXT_BUDGET) {
-          await cdpDelay(600);
-          const now = await cdpEval(atsInjOrcStepState).catch(() => null);
-          if (now && now.ok) { nextState = now; if (now.nextEnabled) break; }
-        }
-        if (!nextState.nextEnabled) {
-          walkStopped = "next-disabled";
-          walkDetail = `Oracle kept ${JSON.stringify(nextState.nextCaption)} DISABLED on step ${stepNo} for ${((Date.now() - nT0) / 1000).toFixed(1)}s, which is how it refuses an incomplete step.` +
-            (nextState.errors.length ? ` The form says: ${nextState.errors.join(" | ")}` : " The form gave no error text.");
-          LOG(`⛔ ${walkStopped} — ${walkDetail}`);
-          break;
-        }
-        LOG(`…${JSON.stringify(nextState.nextCaption)} re-enabled after ${((Date.now() - nT0) / 1000).toFixed(1)}s — continuing`);
-      }
-
-      // ── GUARD 2 rides along on the click itself ───────────────────────────────────────
-      const clicked = await cdpEval(atsInjOrcClickButton, ATS_ORC_NEXT_RE, "apply-flow-pagination", ATS_ORC_FORBID_RE)
-        .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
-      if (!clicked || !clicked.ok) {
-        walkStopped = clicked && clicked.error === "refused-forbidden-caption" ? "next-refused" : "next-not-pressable";
-        walkDetail = `Could not advance past step ${stepNo}: ${(clicked && clicked.error) || "unknown"}` +
-          (clicked && clicked.caption ? ` (caption ${JSON.stringify(clicked.caption)})` : "") +
-          (clicked && clicked.offered ? `; the bar offered ${JSON.stringify(clicked.offered)}` : "");
-        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
-        break;
-      }
-      LOG(`pressed ${JSON.stringify(clicked.caption)} on step ${stepNo}`);
-
-      // ── the MONOTONE wait: the declared step number goes UP ───────────────────────────
-      const advT0 = Date.now(), ADV_BUDGET = 25000;
-      let moved = null, reads = 0, readOk = 0;
-      while (Date.now() - advT0 < ADV_BUDGET) {
-        await cdpDelay(700);
-        reads++;
-        const now = await cdpEval(atsInjOrcStepState).catch(() => null);
-        if (!now || !now.ok) continue;
-        readOk++;
-        const numberWentUp = now.step != null && after.step != null && now.step > after.step;
-        // Fallback for a tenant that swaps sections without touching the url. Compared as a SET, not
-        // a count: two sections are visible at once on Oracle (index 0 is the résumé-import banner).
-        const sectionsChanged = JSON.stringify(now.visibleSections) !== JSON.stringify(after.visibleSections);
-        if (numberWentUp || sectionsChanged) { moved = { now, by: numberWentUp ? "step-number" : "visible-sections" }; break; }
-      }
-      if (!moved) {
-        // ORC refuses Next on an incomplete step exactly as Workday refuses Save & Continue. That is
-        // a graceful halt carrying the page's own words — never a retry and never a guessed answer.
-        const now = await cdpEval(atsInjOrcStepState).catch(() => null);
-        walkStopped = "step-did-not-advance";
-        walkDetail = `Pressed ${JSON.stringify(clicked.caption)} on step ${stepNo} but the wizard stayed put for ${((Date.now() - advT0) / 1000).toFixed(1)}s (${readOk}/${reads} reads landed).` +
-          (readOk === 0 ? " NOT ONE read landed, so this is blindness rather than evidence the page stood still."
-                        : (now && now.errors && now.errors.length ? ` The form says: ${now.errors.join(" | ")}`
-                           : " The form showed no error text — check the step by hand for an empty required field."));
-        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
-        break;
-      }
-      LOG(`advanced to step ${moved.now.step != null ? moved.now.step : "?"} after ${((Date.now() - advT0) / 1000).toFixed(1)}s (by ${moved.by})`);
-      // NEVER scan an unsettled page — the standing rule on every platform here.
-      // ⚠ ITS FLAG IS `ready`, NOT `ok`. Gating on `ok` here would have halted `step-not-rendered` on
-      // every SUCCESSFUL advance — the same caller-gates-on-a-field-the-callee-never-returns shape as
-      // atsInjPageSignature's missing `ok`, found the same day. A settle that reports `ready:false`
-      // with fields > 0 is a step whose form is there but unrecognized, which is worth saying apart.
-      const ready = await waitAtsFormReady(ats, LOG, 25000);
-      if (!ready || !ready.ready) {
-        walkStopped = "step-not-rendered";
-        walkDetail = `Advanced past step ${stepNo} but the next step never settled into a readable form` +
-          ` (${(ready && ready.why) || (ready && ready.fields ? ready.fields + " field(s) present but the page did not settle" : "no fields appeared")}).`;
-        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
-        break;
-      }
+      // The advance is SHARED with the submit walk — see orcAdvanceAfterStep. Guard 1, the
+      // disabled-Next wait, guard 2 and the monotone advance all live there, in one copy.
+      const adv = await orcAdvanceAfterStep(stepNo, stepLabel, LOG, ats);
+      if (!adv.advanced) { walkStopped = adv.stopped; walkDetail = adv.detail; break; }
       if (iter === ORC_MAX_STEPS) {
         walkStopped = "max-steps";
         walkDetail = `Walked ${ORC_MAX_STEPS} steps without reaching a step that has no Next — stopping rather than looping.`;
@@ -6023,15 +6067,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
 async function runAtsSubmitRun(tabId, ats, bundle, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][ATS-SUBMIT]", ...a);
   const arm = !!(opts && opts.arm);
-  // ⚠ THE SAME ORACLE GUARD THE FILL RUN CARRIES, AND IT MATTERS MORE HERE. This is the path that can
-  // press Submit, and there is no ORC bundle it could legitimately be replaying: the fill run refuses,
-  // so any bundle reaching this point for `oracle` was not produced by an ORC fill. Refuse before the
-  // attach. Delete in the same commit that adds the oracle scan.
-  if (ats === "oracle") {
-    LOG("⚠ Oracle Recruiting Cloud detected but its submit stage is not built yet — refusing before any page contact");
-    return { ok: true, needs_operator: true, stopped: "oracle-not-implemented",
-      detail: "Oracle Recruiting Cloud submit is not built yet — no approved bundle can have come from an ORC fill, so this run will not touch the page." };
-  }
+  // The Oracle guard that stood here is GONE as of the submit walk landing (2026-08-20) — the same
+  // deletion the fill run got when its scan landed, and deliberately not one moment earlier. What
+  // replaces it is not "nothing": the ORC pre-form below, the multi-step replay walk, and the rule
+  // that any walk stop other than `reached-final-step` REFUSES the gate.
   try {
     const attached = await cdpAttach(tabId);
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
@@ -6074,6 +6113,34 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
             LOG(`this posting is GONE — ${gone}`);
             return { ok: true, needs_operator: true, submitted: false, replayed: false, stopped: "posting-gone", ats,
               detail: "This job is no longer posted — " + gone + ". Nothing was replayed or submitted." };
+          }
+        }
+        return { ...pre.halt, submitted: false, replayed: false, ats };
+      }
+    }
+    // ⚠ ORACLE: SIGN IN BEFORE THE FORM WAIT, NEVER AS A FALLBACK AFTER IT — the iCIMS rule verbatim,
+    // and for the same reason. ORC's gate is a login page whose email box and submit control PASS
+    // `atsLooksLikeApplicationForm`, so a run that waited for "a form" would find the GATE, and a
+    // replay that treated the gate as the form would type approved application values into a login
+    // box. Two ORC-specific reasons on top: `atsFormUrl` deliberately returns the POSTING url (a
+    // synthesized `…/apply` 404s) so the Apply control must be PRESSED, and the gate carries a
+    // bot-detection honeypot.
+    //
+    // ⚠⚠ AND THE CODE IS REQUIRED ON EVERY RE-ENTRY once the candidate exists (operator, 2026-08-19),
+    // which is ALWAYS true on a submit run — the fill created the account. So Gmail auto-verify is on
+    // the critical path here by construction, not as an edge case. The flow state also lives in
+    // per-tab `sessionStorage`, so this run must clear the gate in the SAME TAB it then replays into;
+    // it cannot borrow the fill's session or the operator's own signed-in tab.
+    if (ats === "oracle") {
+      emitRunProgress(arm ? "Signing in to submit" : "Signing in to rehearse", "Oracle sends a verification code on every re-entry");
+      const gmailOn = await (async () => { try { const c = await chrome.storage.local.get("onboardConfig"); return (c.onboardConfig || {}).gmailEnabled !== false; } catch (e) { return true; } })();
+      const pre = await runOrcPreForm(tabId, (preCreds && preCreds.credentials) || null, { gmailEnabled: gmailOn, LOG });
+      if (pre.halt) {
+        if (pre.halt.stopped === "apply-not-followable" || pre.halt.stopped === "unknown-page") {
+          const at = await cdpEval(function () { return location.href; }).catch(() => null);
+          if (atsPostingGone(null, startUrl, at)) {
+            return { ok: true, needs_operator: true, submitted: false, replayed: false, stopped: "posting-gone", ats,
+              detail: "This Oracle posting is no longer live — the site redirected away from the requisition. Nothing was replayed or submitted." };
           }
         }
         return { ...pre.halt, submitted: false, replayed: false, ats };
@@ -6191,7 +6258,58 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
           detail: "The form's required résumé upload did not attach (" + (resumePre.error || "unknown") + ") — nothing was replayed or submitted. Upload a résumé in the extension/website, then re-run." };
       }
     }
-    let out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre });
+    const replayOpts = { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre };
+    let out;
+    if (ats === "oracle") {
+      // ⚠⚠ ORC IS THE FIRST MULTI-STEP FORM ON THIS PATH, AND A REPLAY MUST WALK IT (2026-08-20).
+      // Greenhouse, Lever, Ashby and iCIMS are all ONE page, which is why this run has always been a
+      // single fill. Replaying an approved ORC bundle into step 1 and then opening the gate would
+      // verify a third of the application and submit the rest unseen: every field of steps 2..N would
+      // report "approved value has NO matching field on the live form".
+      //
+      // So the replay walks exactly as the fill did, through the SAME shared advance — guard 1, the
+      // disabled-Next wait, guard 2, the monotone predicate — accumulating every step's results into
+      // ONE union. The verify below is then completely unchanged, and that is the point of the union
+      // rather than a per-step verify: its "approved value has no matching field" check is a set
+      // difference over the WHOLE bundle, so running it per step would flag every other step's fields
+      // on every step, and the gate must open once, at the end, on evidence from all of it.
+      const union = new Map();
+      let stepNo = 0, walkStop = null, walkWhy = null, lastUrl = null, stepsSeen = [];
+      for (let iter = 1; iter <= 8; iter++) {
+        const st = await cdpEval(atsInjOrcStepState).catch(() => null);
+        if (!st || !st.ok) {
+          walkStop = "step-state-unreadable";
+          walkWhy = "Could not read which step of the Oracle wizard the replay was on, so it stopped rather than pressing controls blind.";
+          break;
+        }
+        stepNo = st.step != null ? st.step : iter;
+        LOG(`replaying step ${stepNo}${st.total ? " of " + st.total : ""} — next=${st.hasNext ? JSON.stringify(st.nextCaption) : "none"} · submit=${st.hasSubmit ? JSON.stringify(st.submitCaption) : "none"}`);
+        emitRunProgress(`${arm ? "Submitting" : "Rehearsing"} — step ${stepNo}${st.total ? " of " + st.total : ""}`, "Oracle wizard");
+        await orcAwaitBlocksPopulated(LOG);
+        const step = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, replayOpts);
+        lastUrl = step.url || lastUrl;
+        for (const r of step.results || []) union.set(durable(r), r);
+        stepsSeen.push(stepNo);
+        LOG(`step ${stepNo}: ${(step.results || []).length} field(s) replayed · ${union.size} accumulated`);
+        const adv = await orcAdvanceAfterStep(stepNo, "step " + stepNo, LOG, ats);
+        if (!adv.advanced) { walkStop = adv.stopped; walkWhy = adv.detail; break; }
+      }
+      // ⚠⚠ ANY STOP OTHER THAN `reached-final-step` REFUSES THE GATE. Reaching a Submit button having
+      // walked three of four steps is exactly the plausible-but-incomplete state the FILL run marks
+      // its bundle PARTIAL for — but here the consequence is not a misleading review page, it is a
+      // submitted application missing whatever the walk never got to. There is no safe way to
+      // interpret a short walk, so it is not interpreted.
+      if (walkStop !== "reached-final-step") {
+        LOG(`⛔ REFUSING to ${arm ? "submit" : "rehearse"} — the replay never reached the final step (stopped: ${walkStop || "max-steps"})`);
+        return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "replay-incomplete", ats,
+          detail: `The Oracle wizard stopped at step ${stepNo} after walking ${JSON.stringify(stepsSeen)} — ${walkStop || "max-steps"}. `
+            + (walkWhy || "") + " Nothing was submitted, and the steps after it were never replayed." };
+      }
+      LOG(`replay walk complete — steps ${JSON.stringify(stepsSeen)}, ${union.size} field(s) accumulated across the whole wizard`);
+      out = { url: lastUrl, results: [...union.values()] };
+    } else {
+      out = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, replayOpts);
+    }
 
     // CASCADE RE-REPLAY (2026-08-01). A value committed during the replay can REVEAL more
     // questions — live on an Ashby form, two work-authorization questions mount only after an
@@ -6208,7 +6326,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (missingAfter(out.results).length) {
       const before = out.results.length;
       LOG(`${missingAfter(out.results).length} approved value(s) had no field yet — re-scanning for questions the replay revealed`);
-      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre });
+      const again = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, replayOpts);
       // Keep the LATER record for any field seen twice: it reflects the form as it stands now.
       const merged = new Map(out.results.map((r) => [durable(r), r]));
       for (const r of again.results) merged.set(durable(r), r);

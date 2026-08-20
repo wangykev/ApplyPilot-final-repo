@@ -5168,6 +5168,40 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
   // (the read already happened).
   log(`blocks on this step: ${blocks.map((b) => JSON.stringify(b.title) + " (" + b.inputs + " input(s)" + (b.addCaption ? ", add=" + JSON.stringify(b.addCaption) : "") + ")").join(", ") || "none"}`);
   const plan = atsOrcEntryPlan(profile, blocks.map((b) => b.title));
+
+  // ⚠⚠ A SUBMIT/REHEARSAL VISIT REPORTS THE ENTRIES; IT MUST NOT REBUILD THEM (2026-08-20).
+  // The replay passes `profile: {}` by design — every value comes from the approved bundle — so the
+  // plan above is EMPTY on a submit run. Doing nothing is the right ACTION (ORC saves entries to the
+  // candidate profile server-side, so the tiles the fill created are still on the form, and re-adding
+  // them would duplicate the work history) but it is not a complete ANSWER: the approved bundle
+  // carries one record per entry, and a replay that emits none of them makes the strict verify report
+  // every Experience and Education row as "approved value has NO matching field on the live form".
+  // That is the exact shape that produced 28 of an iCIMS rehearsal's 32 failures — except here it
+  // would block a submit whose entries are all present and correct.
+  //
+  // So a report-only visit READS the tiles and records them, and clicks nothing. The verify then
+  // means what it should — "the entries you approved are still on the form" — and a tile that changed
+  // or vanished between the fill and the submit FAILS the gate instead of passing unnoticed.
+  if (o.reportOnly) {
+    for (const spec of ATS_ORC_ENTRY_BLOCKS) {
+      const re = new RegExp(spec.pattern, "i");
+      if (!blocks.some((b) => re.test(String(b.title || "")))) continue;
+      const t = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+      const tiles = (t && t.ok && t.tiles) || [];
+      log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — reported, NOT re-entered (this is a replay)`);
+      for (let k = 0; k < tiles.length; k++) {
+        records.push({
+          fieldName: `${spec.source}[${k}]`, label: `${spec.label} entry ${k + 1}`,
+          widgetType: "text", isRequired: false,
+          entrySection: spec.source, entryIndex: k,
+          status: "filled", verified: true, after: tiles[k].text, elapsedMs: 0,
+          detail: "already on the form — read back on the replay visit, not re-entered",
+        });
+      }
+    }
+    return { records, notes };
+  }
+
   if (!plan.length) {
     // Say WHICH blocks were present but not planned — a repeating block we cannot fill must never be
     // silently absent from the log, because "step 2 had 4 fields" reads as a complete step.
@@ -6658,7 +6692,11 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // the pass was written against driveAtsPageFill's scope while sitting in atsFinishFill's; the
   // completeness guard around it kept the flat fields and reported the failure, which is the only
   // reason a whole step's employment history was not silently missing again.
-  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext);
+  // ⚠ `replay` is threaded EXPLICITLY rather than read off a variable that happens to be in scope.
+  // atsFinishFill does not receive `o`, and the entry pass inside it already cost one live run by
+  // being written against driveAtsPageFill's scope — `profile is not defined`, thrown into a silent
+  // catch. `o.valueFor` is this file's established "this is a replay" signal (see the match opts).
+  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext, !!o.valueFor);
 }
 
 // ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
@@ -7690,7 +7728,7 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile) {
   return surfaced;
 }
 
-async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext) {
+async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext, replay) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
   await act.delayFull(600);
@@ -7808,7 +7846,7 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
       console.log("[ApplyPilot][ORC-LINK] ⛔ the links pass threw:", String((e && e.message) || e));
     }
     try {
-      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m) });
+      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m), reportOnly: !!replay });
       if (ep && ep.records && ep.records.length) results.push(...ep.records);
       // ⚠ CONCAT, never assign: the LINKS pass above writes into the same list, and an assignment
       // here silently discarded its notes — the one channel that reports a link we could not add.

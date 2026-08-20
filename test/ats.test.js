@@ -8,6 +8,15 @@ const assert = require("node:assert");
 const ats = require("../ats.js");
 
 // ── detection + URL shaping ─────────────────────────────────────────────────────────────
+// Shared by the source-scanning guards below. ⚠ Every one of them must strip comments FIRST: the
+// code documents the shapes it refuses, and a textual scan cannot tell explaining a bug apart from
+// committing it — three separate guards have failed on their own prose.
+function stripJsComments(t) {
+  return String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+}
+
 test("detectAts: the four families + null for everything else", () => {
   assert.strictEqual(ats.detectAts("https://job-boards.greenhouse.io/figma/jobs/61191"), "greenhouse");
   assert.strictEqual(ats.detectAts("https://boards.greenhouse.io/figma/jobs/61191"), "greenhouse");
@@ -3518,7 +3527,7 @@ test("the ORC advance and forbid patterns are DISJOINT — no caption can satisf
 });
 
 // ── the walk's structure, asserted on source because it is I/O-shaped ────────────────────
-test("the ORC walk: clear-once OUTSIDE the loop, write-per-step, terminal on no-Next", () => {
+test("the ORC walk: clear-once OUTSIDE the loop, write-per-step", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
   const i = src.indexOf("const MULTI = ats === \"oracle\"");
   assert.ok(i > 0, "the walk must exist");
@@ -3527,10 +3536,7 @@ test("the ORC walk: clear-once OUTSIDE the loop, write-per-step, terminal on no-
   // cannot tell that apart from doing it — this assertion failed on its own explanation. Third time
   // today, after the sw-globals lockstep guards and the injected-fn guard before them: a guard that
   // reads prose punishes the comment written to prevent the bug.
-  const stripComments = (t) => String(t)
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
-  const walk = stripComments(src.slice(i, src.indexOf("if (!bundle) return", i)));
+  const walk = stripJsComments(src.slice(i, src.indexOf("if (!bundle) return", i)));
   assert.ok(walk.length > 1000, "found the walk body");
 
   // the clear must happen BEFORE the loop — a clear inside wipes the steps already walked
@@ -3544,20 +3550,42 @@ test("the ORC walk: clear-once OUTSIDE the loop, write-per-step, terminal on no-
     "steps must merge through the pure accumulateBundle so other pages' entries (and their edits) survive");
   // …and be persisted per step, so an evicted worker cannot lose a walked step
   assert.ok(/chrome\.storage\.local\.set\(\{ reviewSummary: bundle \}/.test(walk), "write-per-step");
+});
+
+// ── THE ADVANCE IS SHARED, AND THAT IS THE POINT (2026-08-20) ────────────────────────────────
+// Extracted when the submit run grew its own ORC walk. Both guards on the one irreversible act in
+// the pipeline live in ONE function now, so the assertions follow them there — and one new
+// assertion covers the thing the extraction exists to prevent: a second, drifting copy.
+test("orcAdvanceAfterStep: guard 1, guard 2 and the monotone predicate — in one shared copy", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("async function orcAdvanceAfterStep");
+  assert.ok(i > 0, "the shared advance must exist");
+  const fn = stripJsComments(src.slice(i, src.indexOf("\n}", src.indexOf("return { advanced: true", i))));
 
   // GUARD 1 — terminal on the ABSENCE of Next, never on step >= total
-  assert.ok(/if \(!after\.hasNext\)/.test(walk), "the terminal test is the absence of an advance control");
-  assert.ok(!/after\.step >= after\.total|step >= total/.test(walk),
+  assert.ok(/if \(!after\.hasNext\)/.test(fn), "the terminal test is the absence of an advance control");
+  assert.ok(!/after\.step >= after\.total|step >= total/.test(fn),
     "the step count must NOT be derived from the section count or compared to a total — Baylor serves " +
     "5 sections for 4 steps and Oracle 4 for 3");
   // GUARD 2 — the forbid pattern is actually passed at the call site
-  assert.ok(/atsInjOrcClickButton, ATS_ORC_NEXT_RE, "apply-flow-pagination", ATS_ORC_FORBID_RE/.test(walk),
-    "the walk must pass the forbid pattern — guard 2 is worthless if the call site omits it");
+  assert.ok(/atsInjOrcClickButton, ATS_ORC_NEXT_RE, "apply-flow-pagination", ATS_ORC_FORBID_RE/.test(fn),
+    "the advance must pass the forbid pattern — guard 2 is worthless if the call site omits it");
   // the advance predicate must be monotone
-  assert.ok(/now\.step > after\.step/.test(walk), "advancement is 'the declared step number went UP' — a monotone predicate");
+  assert.ok(/now\.step > after\.step/.test(fn), "advancement is 'the declared step number went UP' — a monotone predicate");
   // a stalled advance is a graceful halt carrying the form's own words
-  assert.ok(/step-did-not-advance/.test(walk) && /now\.errors/.test(walk),
+  assert.ok(/step-did-not-advance/.test(fn) && /now\.errors/.test(fn),
     "a refused advance must halt with the page's own error text, never retry and never guess");
+  // a disabled Next is WAITED OUT, not treated as a refusal (Oracle disables it while it saves)
+  assert.ok(/nextEnabled/.test(fn) && /next-disabled/.test(fn),
+    "the disabled-Next wait must be here too — it is what keeps 'Saved' from ending the walk");
+
+  // ⚠⚠ ONE COPY. The submit walk must CALL this, never carry its own — a near-duplicate of the
+  // double guard would keep working right up until the day it stopped agreeing with this one about
+  // what "the last step" means, and the disagreement would surface as a submitted application.
+  const calls = (src.match(/await orcAdvanceAfterStep\(/g) || []).length;
+  assert.ok(calls >= 2, "both the fill walk and the submit walk must go through the shared advance (found " + calls + ")");
+  const guard1 = (src.match(/if \(!after\.hasNext\)/g) || []).length;
+  assert.strictEqual(guard1, 1, "guard 1 must exist exactly ONCE in the file — a second copy is the drift this prevents");
 });
 
 test("a partial ORC bundle NAMES the step it stopped on and why", () => {
@@ -4257,4 +4285,85 @@ test("links already on the form are reported, and not DOUBLED by the flat loop's
     "links the flat loop already recorded must be skipped, or review shows the same link twice");
   assert.ok(/recorded: results\.map/.test(src),
     "…and the caller must actually pass the recorded field names");
+});
+
+
+// ══ THE ORC SUBMIT WALK (2026-08-20) ═══════════════════════════════════════════════════════
+// The submit run was single-page from the day it was written, because every ATS on this path was.
+// ORC is the first that is not, and the failure mode of getting it wrong is the worst one available:
+// a gate opened on a third of an application.
+
+test("the ORC submit run WALKS the wizard and unions the results", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("async function runAtsSubmitRun");
+  assert.ok(i > 0);
+  const run = stripJsComments(src.slice(i, src.indexOf("\n  } catch (e) {", i)));
+
+  // the guard is GONE — and its absence is the thing under test, since it was correct until today
+  assert.ok(!/oracle-not-implemented/.test(run),
+    "the oracle-not-implemented guard must be deleted in the commit that adds the submit stage");
+
+  // it must sign in BEFORE waiting for a form: ORC's gate PASSES atsLooksLikeApplicationForm, so a
+  // run that waited for 'a form' first would find the GATE and replay approved values into a login box
+  const preAt = run.indexOf("runOrcPreForm");
+  const waitAt = run.indexOf("waitAtsFormReady");
+  assert.ok(preAt > 0, "the submit run must run the ORC pre-form");
+  assert.ok(preAt < waitAt, "the ORC pre-form must run BEFORE the form wait, never as a fallback after it");
+
+  // the walk goes through the SHARED advance, not a second copy of the double guard
+  assert.ok(/orcAdvanceAfterStep/.test(run), "the submit walk must use the shared advance");
+  // …and the results are UNIONED, because the verify is a set difference over the whole bundle
+  assert.ok(/union\.set\(durable\(r\), r\)/.test(run),
+    "each step's results must accumulate into one union keyed by the durable submit key");
+});
+
+test("SAFETY: an ORC replay that did not reach the final step REFUSES the gate", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("async function runAtsSubmitRun");
+  const run = stripJsComments(src.slice(i, src.indexOf("\n  } catch (e) {", i)));
+
+  const at = run.indexOf('walkStop !== "reached-final-step"');
+  assert.ok(at > 0, "there must be an explicit test that the walk reached the END");
+  const branch = run.slice(at, at + 700);
+  assert.ok(/return \{/.test(branch) && /replay-incomplete/.test(branch),
+    "a short walk must RETURN, not fall through to the gate");
+  assert.ok(/submitted: false/.test(branch), "and it must say nothing was submitted");
+
+  // ⚠ the refusal must come BEFORE the verify and the click — falling through with a partial union
+  // would let the strict verify pass on the steps it did walk and open the gate on the rest.
+  // ⚠ ANCHOR ON CODE, NOT PROSE: "STRICT verify" lives in a comment, and this very test strips
+  // comments before scanning — so that anchor was -1 and the ordering assertion passed vacuously in
+  // one direction and failed in the other. The fourth prose-vs-code scanning bite today.
+  const verifyAt = run.indexOf("const failures = [];");
+  const clickAt = run.indexOf("WOULD CLICK SUBMIT");
+  assert.ok(at < verifyAt && at < clickAt,
+    "the incomplete-walk refusal must precede both the verify and the submit gate");
+});
+
+test("SAFETY: a replay REPORTS the repeating entries and never rebuilds or deletes them", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("if (o.reportOnly) {");
+  assert.ok(i > 0, "the report-only branch must exist");
+  const branch = stripJsComments(src.slice(i, src.indexOf("\n  if (!plan.length) {", i)));
+
+  assert.ok(/atsInjOrcTiles/.test(branch), "it must READ the tiles that are on the form");
+  assert.ok(/records\.push\(/.test(branch), "…and report them, or the strict verify flags every entry as missing");
+  assert.ok(/entrySection: spec\.source/.test(branch) && /entryIndex: k/.test(branch),
+    "the records must carry section+index so atsSubmitKey lines them up with the bundle's");
+  // ⚠⚠ NOTHING may be actuated here. A replay passes profile:{}, so a reconcile would see
+  // "profile wants 0, the form has 3" and DELETE the work history.
+  assert.ok(!/atsInjOrcDeleteTile|atsInjOrcOpenEntryAndWait|atsInjOrcCommitEntryAndWait/.test(branch),
+    "a report-only pass must not open, commit or DELETE an entry — profile:{} would read as 'wants 0'");
+  assert.ok(/return \{ records, notes \};/.test(branch), "and it must return before the filling plan runs");
+});
+
+test("the replay flag is threaded EXPLICITLY into atsFinishFill", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // atsFinishFill does not receive `o`; the entry pass inside it already cost one live run by being
+  // written against a scope it did not have.
+  assert.ok(/async function atsFinishFill\(act, ats, scan, results, credentials, profile, jobContext, replay\)/.test(src),
+    "atsFinishFill must take the replay flag as a parameter");
+  assert.ok(/atsFinishFill\(act, ats, scan, results, o\.credentials, profile, jobContext, !!o\.valueFor\)/.test(src),
+    "…and the caller must pass it from o.valueFor, this file's established replay signal");
+  assert.ok(/reportOnly: !!replay/.test(src), "…which becomes the entry pass's reportOnly");
 });
