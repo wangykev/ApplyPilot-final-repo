@@ -38,7 +38,9 @@ during 2026-08, so a later date can appear above an earlier one.
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
 | **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out`, `2026-08-18 — four more tenants: the Apply widget, the bare "Type", and the settle probe` |
-| **Oracle Recruiting Cloud (JET SPA, Knockout, honeypot)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON` |
+| **Oracle Recruiting Cloud (JET SPA, Knockout, honeypot)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON`, `2026-08-19 (j)`, `2026-08-19 (k)`, `2026-08-19 (l)`, `2026-08-20 (a) — ORC: the whole wizard walked` |
+| **ORC repeating entries (`Add` is a homonym) + `"<CODE> - <Name>"` options** | `2026-08-19 (l) — ORC repeating blocks`, `2026-08-20 (a) — ORC: the whole wizard walked` |
+| **A zero-row option read is ABSENCE OF EVIDENCE** | `2026-08-20 (a) — ORC: the whole wizard walked` (date halves + a server-backed degree search, two widgets, same lesson) |
 | **Bot-detection honeypots (a visible field you must NEVER fill)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON` |
 | **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
 | **Option lists: paging, completeness, what review can offer** | `2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE` |
@@ -5821,3 +5823,136 @@ is a hard reload on the extension card and then compare.
 reported "wrote the stored login email (undefined chars)". Cosmetic in itself, but it is a
 length-only log that exists precisely so a credential write can be confirmed WITHOUT printing the
 value — and it was confirming nothing.
+
+
+## 2026-08-20 (a) — ORC: the whole wizard walked, and the entry forms measured from the live DOM
+
+Seven consecutive live runs on `eeho.fa.us2.oraclecloud.com` job 334325, each on a fresh
+`wangykev+N@gmail.com` account so nothing was prefilled and every value on the form was provably ours.
+End state: **3 steps walked, 48–50 fields, 7 to review, `reached-final-step — NOTHING was pressed`.**
+
+### The wizard: 3 steps, 4 sections, and the section count is not the step count
+
+```
+step 1 of 3 — sections [0,1] visible of 4 · next="Next" · submit=none
+step 2 of 3 — sections [2]   visible of 4 · next="Next" · submit=none
+step 3 of 3 — sections [3]   visible of 4 · next=none   · submit="Submit"
+```
+
+- The step number is **declared in the url** (`…/apply/section/<n>`), which is why the walk's advance
+  predicate is "the number went up" — monotone, so it can be noticed late but never missed.
+- **TWO sections are visible on step 1** (index 0 is the résumé-import banner), so the active-section
+  signal is a SET and never a count. Baylor served 5 sections for 4 steps; this tenant serves 4 for 3.
+- The terminal test is therefore the **absence of a Next control**, never `step >= total`.
+- `<apply-flow-pagination>` reads `"Back 1 2 3 4 Next"` — the numbered buttons are step JUMPS, so the
+  advance matcher is anchored (`^(next|continue|…)`) and can never take one.
+
+### The block inventory per step (the read that made everything else diagnosable)
+
+| step | blocks (controls) |
+|---|---|
+| 1 | `Contact Information` (10), `Address` (8) |
+| 2 | `Education` (0, add="Add Education"), `Experience` (0, add="Add Experience"), `Licenses and Certificates` (0, add="Add License"), `Skills` (0, add="Add Skill"), `Supporting Documents and URLs` (2, add="Add Another Link"), `Miscellaneous Documents` (1) |
+| 3 | `Extra Information` (3), **`Application Questions` (0)**, `Diversity Information` (7), `Veteran Information - United States` (1), `Disability Information` (3), `E-Signature` (1) |
+
+**A block with an ADD button legitimately has zero controls** — Education / Experience / Licenses /
+Skills are all built on demand. So the only suspicious shape is a block with **neither controls nor an
+add button**, and that is the settle predicate. Without this inventory, "step 2 filled 4 fields" and
+"step 2 filled 4 fields and skipped two whole sections" read identically.
+
+### ⚠ `Application Questions` was EMPTY, and it is neither slow nor lazy
+
+The operator reported three REQUIRED yes/no questions on step 3 that no run ever recorded. Measured:
+
+- 0 controls at scan time, while every other block on the same step had its controls;
+- **still 0 after the full 15.4s settle budget** ⇒ not a late fetch;
+- **still 0 after being scrolled into view** ⇒ not an IntersectionObserver mount;
+- 0 native `input/select/textarea` AND 0 ARIA-role controls anywhere in the section.
+
+So on **this requisition** the block is genuinely empty. Two candidates remain and neither is settled:
+the questions belong to a different posting, or they mount under a condition no run has hit. The walk
+now reports it in those words rather than implying the step filled cleanly.
+
+⚠ A false lead worth recording: the ARIA sweep first reported `<div role=radiogroup> "Do you have a
+disability?"` as an unhandled JET widget — on a run where that same field came back `filled_review`.
+ORC wraps **native** radio inputs in a `role=radiogroup` div. A sweep for "widgets we cannot see" must
+exclude anything containing native controls, or it buries its own signal.
+
+### The repeating entries: open → fill → commit, and `Add` is a HOMONYM
+
+Confirmed by the operator and then live: press **Add**, fill the fields that appear, press **Add
+again** to confirm. The same button does both, so both actions are gated on whether a **Cancel** is
+present — pressing it twice on a misread state creates an empty entry. A commit ORC refuses leaves the
+form open; the pass then **cancels**, so the block is left clean rather than half-open where it would
+block Next.
+
+The forms, read off the live DOM (the discovery log prints these every run):
+
+```
+Experience entry — 6 field(s): employerName[text] "Employer Name", jobTitle[text] "Job Title",
+                               startDate[combobox], startDate[combobox], endDate[combobox], endDate[combobox]
+Education  entry — 4 field(s): contentItemId[combobox] "Degree", major[text] "Major",
+                               educationalEstablishment[combobox] "School", gpa[text] "GPA"
+Skills     entry — 2 field(s): skills[text] "Skill", yearsOfExperience[text] "Years of Experience"
+```
+
+- ⚠⚠ **A DATE IS TWO COMBOBOXES SHARING ONE `name`.** Treating `startDate` as one field wrote the whole
+  `"2025-05"` into whichever id came first and burned 8.2s failing. Fields must be grouped by `name`
+  before filling.
+- **Which half is month and which is year is READ, not assumed** — each picker's own option list
+  decides (month names vs four-digit years). Position works here and would file every date backwards
+  on a tenant rendering year first, and that failure would look like wrong data, not like an ordering
+  bug.
+- **Experience has NO city, country or responsibilities field** on this tenant.
+- `contentItemId` is Oracle's own opaque name for the **Degree** picker; only its label says so.
+- **A Skills entry is a BARE STRING** (`profile.skills` is an array of names), so there is no property
+  to read.
+- `yearsOfExperience` is **optional** — all 8 skills entries committed with it blank, which is why
+  leaving it unmapped was correct rather than a gap.
+
+### ⚠ ORC labels some lists `"<CODE> - <Name>"`
+
+The Degree picker, searched for `"Bachelor of Science"`, returned exactly one row:
+
+```
+· BS - Bachelor of Science
+```
+
+An exact compare refused it, leaving a REQUIRED field empty and Oracle refusing the whole Education
+entry on three consecutive runs. Matched on the form's own **`" - "` separator (with spaces — a bare
+hyphen lives inside `Jean-Luc`, `e-mail`, `Add-On`)**, remainder must EQUAL the candidate, ambiguity
+guard untouched. Same class as the postal composite (`"32312"` → `"32312, Tallahassee, Leon, FL"`): a
+delimiter the tenant chose is structure, and reading it is not guessing. The COMMITTED value is the
+form's own full label, so review shows what the application will actually say.
+
+### ⚠ A ZERO-ROW READ IS ABSENCE OF EVIDENCE — measured twice, two different widgets
+
+1. **The date pair.** `startDate` reported `offered [["January","February","March"],[]]` — the month
+   half read fine, the year half came back empty after its whole 8s budget, on the same entry whose
+   `endDate` read both halves correctly moments later. ORC will not open a second picker while the
+   first is still unmounting, and the capture's Escape-then-300ms is a delay rather than a confirmed
+   close.
+2. **The Degree search.** Two consecutive runs of the same posting: one offered `1` row, the next
+   offered `0` after the same full 8s. The list is server-backed and its answer is sometimes simply
+   late — the identical shape as iCIMS' ~4s school search.
+
+Both now retry once, and **only** on a zero-row read. A list that showed rows and matched none has
+genuinely answered; retrying that spends another 8s to be told the same thing.
+
+### Timing
+
+`fill 124–137s for 48–50 fields across 3 steps`. The dominant cost is the **first date picker of each
+entry at ~11.5s** (the zero-row retry doubles it) against ~2s for the second — a cold-start cost in the
+widget, not in us. Résumé attach 4.0s. `postalCode` ~1.1s. Everything else is sub-second.
+
+### What is filled, end to end
+
+Step 1: names, email, phone (dial code matched on code+name), address line 1, postal code — with
+**city / State / County left to Oracle's own cascade**, which fills them from the postal code.
+Step 2: résumé (`"Kevin's Resume.pdf"`, the widget replaces its control with the attachment),
+`siteLink-1` from the first non-empty profile website, 3 Experience entries, 8 Skills entries.
+Step 3: race/ethnicity group, disability, veteran status, e-signature name.
+
+Still reaching review: `group:ethnicity` (the profile's `"Asian"` is not one of that field's options),
+`ORA_GENDER` (shows "Male" but keeps `cx-select-input--invalid` — holding text it never accepted), and
+the Education entry's Degree.

@@ -4788,10 +4788,30 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           // Degree", "Bachelors"]: the form's own vocabulary decides, and nothing is guessed.
           const cands = Array.isArray(value) ? value.map(String) : [String(value)];
           let r = null, back = null;
-          for (const c of cands) {
-            r = await act.eval(atsInjOrcPick, sel, c, [c], ATS_ORC_PICK_MS, false, true).catch(() => null);
-            back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
-            if (r && r.ok && String((back && back.value) || "").trim() && !(back && back.invalid)) break;
+          // ⚠⚠ ZERO ROWS OFFERED IS "THE SEARCH DID NOT ANSWER", NOT "YOUR VALUE IS NOT IN THE LIST",
+          // and only the second is a finding. Measured on the Education Degree picker across two
+          // consecutive runs of the same posting: one run offered exactly one row
+          // ("BS - Bachelor of Science"), the next offered ZERO after burning the same full 8s budget.
+          // The list is server-backed and its answer is sometimes simply late — the identical shape
+          // as iCIMS' school search, where a 675ms give-up reported "no option matched" for a value
+          // that returns first when typed by hand.
+          //
+          // So the whole candidate ladder is retried ONCE, and ONLY when the last attempt saw no rows
+          // at all. A ladder that saw rows and matched none has genuinely answered, and retrying that
+          // would just spend another 8s to be told the same thing.
+          for (let attempt = 0; attempt < 2; attempt++) {
+            for (const c of cands) {
+              r = await act.eval(atsInjOrcPick, sel, c, [c], ATS_ORC_PICK_MS, false, true).catch(() => null);
+              back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
+              if (r && r.ok && String((back && back.value) || "").trim() && !(back && back.invalid)) break;
+            }
+            const good = r && r.ok && String((back && back.value) || "").trim() && !(back && back.invalid);
+            const sawRows = !!(r && r.rows && r.rows.length);
+            if (good || sawRows) break;
+            if (attempt === 0) {
+              await act.delayFull(900);
+              log(`  (${key}: the picker returned NO rows at all — retrying once; a silent search is not the same as a search that answered)`);
+            }
           }
           rec.after = back && back.ok ? back.value : null;
           rec.elapsedMs = Date.now() - t0;
