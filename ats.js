@@ -4327,6 +4327,17 @@ function atsInjOrcUnclaimed(claimedNames) {
       if (/^(input|select|textarea)$/i.test(e.tagName)) continue;
       if (e.closest("oj-radioset, oj-select-single, oj-select-many, oj-combobox-one")) continue;
       if (aria.some((a) => a.id && a.id === e.id)) continue;
+      // ⚠⚠ A WRAPPER AROUND NATIVE INPUTS IS NOT AN UNHANDLED WIDGET. ORC marks a native radio group
+      // with `<div role="radiogroup">` around real `<input type=radio>`s, and this reported the
+      // disability question as "an ARIA-only control with NO handler" on a run where that very field
+      // came back `filled_review`. The custom-element branch above already excluded this shape; the
+      // bare-ARIA branch did not.
+      //
+      // Left unfixed it is worse than a cosmetic bug: this sweep exists to surface a REAL missing
+      // widget family, and a false positive on every native radiogroup is precisely the noise that
+      // would bury the thing it was built to find. Over-reporting is the safe direction for the
+      // NATIVE list, where the cost is a line; here the cost is the signal itself.
+      if (e.querySelector("input, select, textarea")) continue;
       aria.push({ tag: e.tagName.toLowerCase(), role: e.getAttribute("role"), id: e.id || null,
         question: (t(e.closest("[class*=input-row]") ? e.closest("[class*=input-row]").querySelector("[class*=label], label, legend") : null) || e.getAttribute("aria-label") || "").slice(0, 120),
         required: e.getAttribute("aria-required") === "true",
@@ -4557,7 +4568,13 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
   const records = [], notes = [];
   const read = await act.eval(atsInjOrcBlocks).catch(() => null);
   const blocks = (read && read.ok && read.blocks) || [];
-  if (!blocks.length) return { records, notes };
+  if (!blocks.length) { log("no visible apply-flow-block on this step"); return { records, notes }; }
+  // ⚠ THE WHOLE BLOCK INVENTORY, EVERY STEP. The operator reported three REQUIRED yes/no application
+  // questions that no pass has ever recorded — and with no inventory there is no way to tell whether
+  // the block holding them is on a step we walked, on one we did not, or present with zero controls.
+  // Printing the blocks and their control counts answers that in one line per step, and costs nothing
+  // (the read already happened).
+  log(`blocks on this step: ${blocks.map((b) => JSON.stringify(b.title) + " (" + b.inputs + " input(s)" + (b.addCaption ? ", add=" + JSON.stringify(b.addCaption) : "") + ")").join(", ") || "none"}`);
   const plan = atsOrcEntryPlan(profile, blocks.map((b) => b.title));
   if (!plan.length) {
     // Say WHICH blocks were present but not planned — a repeating block we cannot fill must never be
@@ -4601,6 +4618,7 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         break;
       }
 
+      const recordsBefore = records.length;
       // ── THE RECON RECORD, EVERY RUN ─────────────────────────────────────────────────
       log(`${tag} — the form offers ${st.fields.length} field(s): ${st.fields.map((f) => `${f.name || f.id}[${f.role || f.type}]${f.label ? " “" + f.label + "”" : ""}`).join(", ")}`);
 
@@ -4741,6 +4759,16 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           if (!ok) { rec.flag = "commit-not-accepted"; rec.detail = "wrote the value but the field did not keep it"; }
         }
         records.push(rec);
+      }
+      // ⚠ LOG EVERY ENTRY FIELD'S OUTCOME, not just whether the entry committed. Without this an
+      // "Oracle refused the entry" line is unactionable: three entries failed on one run and the log
+      // could not say whether the cause was a date half misidentified, a picker that rejected the
+      // value, or a field written and taken back. The flat loop has printed per-field outcomes from
+      // the start and that is exactly why its failures were one-run diagnoses.
+      for (const r of records.slice(recordsBefore)) {
+        log(`  ${r.fieldName} (${r.widgetType}) → ${r.status}${r.flag ? " · " + r.flag : ""}` +
+            `${r.after != null ? ' · after=' + JSON.stringify(String(r.after).slice(0, 60)) : ""}` +
+            ` · ${r.elapsedMs || 0}ms${r.detail ? " · " + r.detail : ""}`);
       }
       if (unmapped.length) {
         // Evidence for the next map line, and a review note so an unfilled entry field is visible
