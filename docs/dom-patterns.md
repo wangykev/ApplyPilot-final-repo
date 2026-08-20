@@ -5685,3 +5685,51 @@ still open, which said "not committed" long before I theorised about mutual excl
 "Tallahassee" gives TWO, Jefferson and Leon, and the profile stores no county), dependents are
 verify-only, and a city fallback is flagged `exact:false` because it can resolve to the wrong county.
 `country` is excluded from both roles — it is the ROOT that mounts the block.
+
+---
+
+## 2026-08-19 (k) — ORC: the two open mechanisms, measured
+
+Oracle (`eeho.fa.us2`, job 334325), live session, steps 1→3.
+
+### ✅ `Next` VALIDATES AND TRANSITIONS CLEANLY
+
+With step 1 valid (0 empty required, 0 `--invalid`), `Next` advanced 1→2 and 2→3 with **no validation
+errors** and no halt. So the walk does not need a special validation probe: a valid page advances, and
+the existing `.input-row__error` read is what reports a page that does not.
+
+⚠ Ids renumber across a transition, as predicted — step 2's attachments came back as
+`attachment-upload-4` / `siteLink-1-7` where the same fields were `-0` / `-3` on the previous visit.
+That is the volatile-counter rule confirmed for transitions, not just for visits, and it is why the
+durable key is `name`.
+
+⚠ The SPA can also move BACKWARD on its own: one read found the page on `section/2` after a Next that
+had reported `section/3`. So a walk must re-read where it actually is rather than assuming its own
+click landed — the standing "page signature" rule, and worth an explicit check on this platform.
+
+### ✅ A GROUP COMMITS BY CLICKING ITS LABEL — both kinds
+
+**Every option box is CLIPPED to width 0** on this tenant, so the Workday radio rule is mandatory:
+click the `<label for=…>`, never the input. Measured with the operator's own stated values:
+
+| group | kind | action | result |
+|---|---|---|---|
+| "Select the races you identify with." | checkbox × 5 | clicked label for `Asian` | `Asian` **true**, other four **false** |
+| "Do you have a disability?" | radio × 3 | clicked label for the "No, I do not have…" option | that one **true**, Yes and "I do not want to answer" **false** |
+| "Ethnicity" | checkbox × 1 | not clicked | remained **false** |
+
+So `atsInjCheckOption`'s existing approach transfers: a label click commits, `input.checked` is the
+read-back, and radio exclusivity holds. This was the last unverified mechanism on the ORC path.
+
+⚠ The disability option-id suffixes are `ORA_PER_YES_US` / `ORA_PER_NO_US` / `ORA_PER_NO_ANSWER_US`
+here, against Baylor's `ORA_PER_Y` / `ORA_PER_N`. Another per-tenant variation, and a reason the OPTION
+is matched on its label text rather than on its id suffix.
+
+### ⚠ A PROFILE DATA FAULT FOUND ON THE WAY
+
+`self_identification.disability_status` is stored as **`"No, I"`** — truncated. It matters for matching
+rather than being cosmetic: a bare `"No"` would land on this form's "No, I do not have a disability and
+have not had one in the past" via **POLARITY LEAD**, but `"No, I"` is not a bare polarity token, so it
+falls through to containment — which is deliberately OFF for radios — and escalates to review. The
+other four self-ID values are clean (`Male`, `No, I am not Hispanic`, `Asian`, `I am not a protected
+veteran`). One profile edit fixes it; no code change is warranted.
