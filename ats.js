@@ -3896,7 +3896,80 @@ function atsInjOrcReadPicker(inputSel) {
 // inside it — the caller decides the scope rather than hoping the first match is the right one.
 // A pattern SOURCE string is passed rather than a RegExp because CDP serializes arguments as JSON
 // and a RegExp arrives as `{}`.
-function atsInjOrcClickButton(patternSource, withinSel) {
+// WHERE THE WIZARD IS, AND WHAT MAY BE PRESSED. Read as a whole rather than field by field,
+// because the walk's two decisions ("is this the last step" / "did Next actually advance") each need
+// several of these at the same instant, and reading them across separate evals lets the page move in
+// between.
+//
+// ⚠ THE STEP NUMBER COMES FROM THE URL FIRST. It is DECLARED (`…/apply/section/<n>`), where every
+// other candidate is measured — and the standing ORC rule is that on the FORM geometry tells the
+// truth while declared intent lies (inactive sections report aria-hidden="false" at 0×0), so a
+// signal that is declared *and* corroborated by geometry is the only one worth building a loop on.
+// The announced "step N of M" gives the TOTAL, which the URL cannot.
+//
+// ⚠ AND THE TOTAL IS NEVER THE SECTION COUNT. Measured: Baylor serves 5 <apply-flow-section> for 4
+// steps (index 0 an empty shell), Oracle 4 for 3, and on Oracle TWO are visible at once (index 0 is
+// the résumé-import banner). Any arithmetic on that count is wrong on one of the two tenants, which
+// is why the walk's terminal test is the PRESENCE OF A NEXT CONTROL and not `step >= total`.
+// ⚠ THE ADVANCE PATTERN AND THE REFUSAL PATTERN ARE DEFINED AS A PAIR, deliberately adjacent: the
+// safety property is that no caption can satisfy both, and that is only checkable by reading them
+// together. The pre-form's own click pattern DOES include `submit` (a sign-in step's control is
+// legitimately captioned Submit) — this pair is the WALK's, where a submit press is the one
+// irreversible act in the whole pipeline.
+// ⚠ `\\b` not `\b`: in a JS string literal `\b` is U+0008 (BACKSPACE), so the regex could never
+// match. That exact slip halted a run at Oracle's email gate with `auth-submit-not-pressable` on a
+// page whose Next button was plainly there, and a test that asserted the pattern's SPELLING passed
+// the whole time. test/ats.test.js decodes these literals and matches them against real captions.
+const ATS_ORC_NEXT_RE = "^(next|continue|save and continue|save & continue)\\b";
+const ATS_ORC_FORBID_RE = "submit|apply now|finish|send application";
+
+function atsInjOrcStepState() {
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const url = String(location.href).split("#")[0];
+  const um = /\/apply\/section\/?(\d+)/.exec(url);
+  const step = um ? Number(um[1]) : null;
+
+  // "…application, step 1 of 4" — announced for screen readers, so it is text on the page rather
+  // than an attribute. Searched over a bounded set of small nodes, never the whole body's text.
+  let total = null, announced = null;
+  const cands = [...document.querySelectorAll("apply-flow-pagination, [aria-live], [role=status], h1, h2, .progress-bar-text")];
+  for (const el of cands) {
+    const m = /step\s+(\d+)\s+of\s+(\d+)/i.exec(clean(el.textContent));
+    if (m) { announced = Number(m[1]); total = Number(m[2]); break; }
+  }
+
+  const secs = [...document.querySelectorAll("apply-flow-section")];
+  const visibleIdx = secs.map((el, i) => (vis(el) ? i : -1)).filter((i) => i >= 0);
+
+  // Pagination. The bar reads "Back 1 2 3 4 Next", so the NUMBERED buttons are step jumps and must
+  // never be mistaken for the advance control — hence an anchored caption match, not a position.
+  const pag = document.querySelector("apply-flow-pagination");
+  const btns = pag ? [...pag.querySelectorAll('button, a[role="button"], input[type="button"], input[type="submit"]')].filter(vis) : [];
+  const cap = (b) => clean(b.value || b.textContent);
+  const enabled = (b) => !(b.disabled || b.getAttribute("aria-disabled") === "true");
+  const next = btns.find((b) => /^(next|continue|save and continue|save & continue)\b/i.test(cap(b))) || null;
+  const back = btns.find((b) => /^back\b/i.test(cap(b))) || null;
+
+  // The submit control, document-wide but VISIBLE-filtered: ORC mounts every step at once, so an
+  // inactive step's submit is present in the DOM at 0×0. Geometry is what excludes it, and on this
+  // form geometry is the trustworthy signal.
+  const submit = [...document.querySelectorAll('button, input[type="submit"]')]
+    .filter(vis).find((b) => /^(submit|submit application)\b/i.test(cap(b))) || null;
+
+  return {
+    ok: true, url, step, announcedStep: announced, total,
+    sectionCount: secs.length, visibleSections: visibleIdx,
+    hasNext: !!next, nextCaption: next ? cap(next).slice(0, 40) : null, nextEnabled: !!(next && enabled(next)),
+    hasBack: !!back,
+    hasSubmit: !!submit, submitCaption: submit ? cap(submit).slice(0, 40) : null,
+    // the error channel, so a refused advance can say WHY without a second read
+    errors: [...document.querySelectorAll("cx-notifications [role=alert], .oj-messages-message, [role=alert]")]
+      .filter(vis).map((e) => clean(e.textContent).slice(0, 160)).filter(Boolean).slice(0, 6),
+  };
+}
+
+function atsInjOrcClickButton(patternSource, withinSel, forbidSource) {
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
   let re;
@@ -3907,8 +3980,20 @@ function atsInjOrcClickButton(patternSource, withinSel) {
   const hit = btns.find((b) => re.test(clean(b.value || b.textContent)));
   if (!hit) return { ok: false, error: "no-button-matching:" + patternSource, offered: btns.map((b) => clean(b.value || b.textContent).slice(0, 40)).slice(0, 8) };
   if (hit.disabled || hit.getAttribute("aria-disabled") === "true") return { ok: false, error: "button-disabled", caption: clean(hit.value || hit.textContent).slice(0, 40) };
+  // ⚠⚠ SECOND GUARD ON THE ONE CLICK THAT COULD SUBMIT AN APPLICATION. The walk already refuses to
+  // advance off a step that has no Next; this refuses to PRESS a caption the caller has forbidden,
+  // inside the injected fn, using the caption actually resolved rather than the pattern that found
+  // it. Defense in depth, exactly as Workday's clickPageNext refuses `review-page` independently of
+  // the walk's own top-of-loop check — that footer button reuses Submit's automation-id, and the
+  // whole reason two guards exist there is that one of them was once enough right up until it wasn't.
+  const capHit = clean(hit.value || hit.textContent);
+  if (forbidSource) {
+    let bad = null;
+    try { bad = new RegExp(forbidSource, "i"); } catch (e) { return { ok: false, error: "bad-forbid-pattern" }; }
+    if (bad.test(capHit)) return { ok: false, error: "refused-forbidden-caption", caption: capHit.slice(0, 40) };
+  }
   hit.click();
-  return { ok: true, caption: clean(hit.value || hit.textContent).slice(0, 40) };
+  return { ok: true, caption: capHit.slice(0, 40) };
 }
 
 // ── TYPE A ONE-TIME CODE INTO ORC'S SIX BOXES (injected; 2026-08-19) ─────────────────────
@@ -7451,6 +7536,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
+    atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,

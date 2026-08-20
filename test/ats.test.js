@@ -3290,3 +3290,215 @@ test("a no-results diagnosis is only attributed to the geo cascade on a geo fiel
       "the next debugging round at the wrong subsystem");
   }
 });
+
+
+// ── the ORC multi-step walk ──────────────────────────────────────────────────────────────
+// ORC is the first MULTI-PAGE form on the ats.js path. The safety property under test is the one
+// this whole codebase is built around: the walk must reach the end of the wizard and NEVER press
+// the control that submits an application.
+
+const mkBtn = (caption, opts = {}) => ({
+  value: opts.isInput ? caption : undefined,
+  textContent: opts.isInput ? "" : caption,
+  disabled: !!opts.disabled,
+  getAttribute: (a) => (a === "aria-disabled" ? (opts.ariaDisabled ? "true" : null) : null),
+  getBoundingClientRect: () => (opts.invisible ? { width: 0, height: 0 } : { width: 90, height: 32 }),
+  click() { this.clicked = true; },
+});
+const mkSection = (visible) => ({ getBoundingClientRect: () => (visible ? { width: 800, height: 400 } : { width: 0, height: 0 }) });
+
+// A document whose querySelectorAll answers by selector family — enough for the step reader.
+const mkOrcDoc = ({ pagButtons = [], sections = [], submitButtons = [], announce = null, errors = [] } = {}) => {
+  const pag = {
+    textContent: announce || "Back 1 2 3 4 Next",
+    querySelectorAll: () => pagButtons,
+    getBoundingClientRect: () => ({ width: 700, height: 60 }),
+  };
+  return {
+    querySelector: (q) => (/apply-flow-pagination/.test(q) ? pag : null),
+    querySelectorAll: (q) => {
+      if (/apply-flow-pagination/.test(q) && /aria-live/.test(q)) return [pag];
+      if (/^apply-flow-section$/.test(q)) return sections;
+      if (/input\[type="submit"\]/.test(q) || /^button, input/.test(q)) return submitButtons;
+      if (/role=alert/.test(q)) return errors;
+      return [];
+    },
+    getElementById: () => null,
+  };
+};
+
+test("atsInjOrcStepState: the step comes from the URL and the TOTAL from the announced text", () => {
+  const prevDoc = global.document, prevLoc = global.location;
+  try {
+    global.location = { href: "https://x.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/js/job/1/apply/section/2#z" };
+    const next = mkBtn("Next"), back = mkBtn("Back"), one = mkBtn("1"), two = mkBtn("2");
+    global.document = mkOrcDoc({
+      pagButtons: [back, one, two, next],
+      sections: [mkSection(false), mkSection(true), mkSection(true), mkSection(false), mkSection(false)],
+      announce: "Job application, step 2 of 4",
+    });
+    const st = ats.atsInjOrcStepState();
+    assert.strictEqual(st.ok, true);
+    assert.strictEqual(st.step, 2, "the step number is DECLARED in the url — the primary signal");
+    assert.strictEqual(st.total, 4, "the total is only available from the announced text");
+    assert.strictEqual(st.hasNext, true);
+    assert.strictEqual(st.nextCaption, "Next");
+    assert.strictEqual(st.hasBack, true);
+    // ⚠ the bar reads "Back 1 2 3 4 Next" — the NUMBERED buttons are step jumps and must never be
+    // mistaken for the advance control.
+    assert.strictEqual(st.hasSubmit, false, "no visible submit on a middle step");
+    // TWO sections are visible at once on Oracle (index 0 is the résumé-import banner), so the
+    // active-section signal is a SET and never a count.
+    assert.deepStrictEqual(st.visibleSections, [1, 2]);
+    assert.strictEqual(st.sectionCount, 5, "…and the section count is NOT the step count (5 sections, 4 steps)");
+  } finally { global.document = prevDoc; global.location = prevLoc; }
+});
+
+test("atsInjOrcStepState: a 0×0 submit does NOT count — every step is mounted at once", () => {
+  const prevDoc = global.document, prevLoc = global.location;
+  try {
+    global.location = { href: "https://x.fa.us2.oraclecloud.com/a/apply/section/1" };
+    // ORC mounts all four steps, so the LAST step's Submit is in the DOM while we sit on step 1 —
+    // at 0×0. Geometry is the trustworthy signal on the form (declared intent is not: inactive
+    // sections report aria-hidden="false"), so the invisible one must be excluded.
+    global.document = mkOrcDoc({
+      pagButtons: [mkBtn("Next")],
+      sections: [mkSection(true)],
+      submitButtons: [mkBtn("Submit Application", { invisible: true })],
+    });
+    assert.strictEqual(ats.atsInjOrcStepState().hasSubmit, false,
+      "an inactive step's Submit is mounted at 0×0 and must not make the walk think it is finished");
+
+    global.document = mkOrcDoc({
+      pagButtons: [],
+      sections: [mkSection(true)],
+      submitButtons: [mkBtn("Submit Application")],
+    });
+    const st = ats.atsInjOrcStepState();
+    assert.strictEqual(st.hasSubmit, true, "a VISIBLE submit is the last step");
+    assert.strictEqual(st.hasNext, false, "…and the terminal condition the walk keys on is the absence of Next");
+  } finally { global.document = prevDoc; global.location = prevLoc; }
+});
+
+test("atsInjOrcStepState: a DISABLED Next is reported, not hidden — that is how ORC refuses a step", () => {
+  const prevDoc = global.document, prevLoc = global.location;
+  try {
+    global.location = { href: "https://x.fa.us2.oraclecloud.com/a/apply/section/1" };
+    global.document = mkOrcDoc({
+      pagButtons: [mkBtn("Next", { disabled: true })],
+      sections: [mkSection(true)],
+      errors: [{ textContent: "  You must answer   all required questions ", getBoundingClientRect: () => ({ width: 400, height: 20 }) }],
+    });
+    const st = ats.atsInjOrcStepState();
+    assert.strictEqual(st.hasNext, true, "it is present…");
+    assert.strictEqual(st.nextEnabled, false, "…but not pressable, which is a different halt from 'no Next'");
+    assert.deepStrictEqual(st.errors, ["You must answer all required questions"],
+      "and the page's OWN words come back with it, so the halt does not need a second read");
+  } finally { global.document = prevDoc; global.location = prevLoc; }
+});
+
+// ── GUARD 2: the click itself refuses a forbidden caption ────────────────────────────────
+test("atsInjOrcClickButton REFUSES a forbidden caption, judged on what it actually resolved", () => {
+  const prevDoc = global.document;
+  try {
+    // A bar whose only control is captioned Submit: the Next pattern must not find it, and even if a
+    // widened pattern did, the forbid list must refuse the press.
+    const submit = mkBtn("Submit Application");
+    global.document = {
+      querySelector: () => ({ querySelectorAll: () => [submit] }),
+      querySelectorAll: () => [submit],
+    };
+    const byNext = ats.atsInjOrcClickButton(ats.ATS_ORC_NEXT_RE, "apply-flow-pagination", ats.ATS_ORC_FORBID_RE);
+    assert.strictEqual(byNext.ok, false, "the Next pattern must not match Submit");
+    assert.ok(/no-button-matching/.test(byNext.error));
+    assert.ok(!submit.clicked, "nothing may be pressed");
+
+    // now the belt: a pattern that WOULD match it is still refused by the forbid list
+    const widened = ats.atsInjOrcClickButton("^(next|submit)\\b", "apply-flow-pagination", ats.ATS_ORC_FORBID_RE);
+    assert.strictEqual(widened.ok, false, "the forbid list is the second guard and must hold on its own");
+    assert.strictEqual(widened.error, "refused-forbidden-caption");
+    assert.strictEqual(widened.caption, "Submit Application", "and it must name what it refused");
+    assert.ok(!submit.clicked, "STILL nothing pressed — this is the one irreversible click in the pipeline");
+
+    // …and a real Next goes through
+    const next = mkBtn("Next");
+    global.document = { querySelector: () => ({ querySelectorAll: () => [next] }), querySelectorAll: () => [next] };
+    const ok = ats.atsInjOrcClickButton(ats.ATS_ORC_NEXT_RE, "apply-flow-pagination", ats.ATS_ORC_FORBID_RE);
+    assert.strictEqual(ok.ok, true);
+    assert.strictEqual(next.clicked, true);
+  } finally { global.document = prevDoc; }
+});
+
+test("the ORC advance and forbid patterns are DISJOINT — no caption can satisfy both", () => {
+  const next = new RegExp(ats.ATS_ORC_NEXT_RE, "i"), forbid = new RegExp(ats.ATS_ORC_FORBID_RE, "i");
+  for (const cap of ["Next", "Continue", "Save and Continue", "Save & Continue"]) {
+    assert.ok(next.test(cap), "must advance on " + JSON.stringify(cap));
+    assert.ok(!forbid.test(cap), JSON.stringify(cap) + " must not be forbidden");
+  }
+  for (const cap of ["Submit", "Submit Application", "Apply Now", "Finish", "Send Application"]) {
+    assert.ok(!next.test(cap), JSON.stringify(cap) + " must NEVER match the advance pattern");
+    assert.ok(forbid.test(cap), JSON.stringify(cap) + " must be on the forbid list");
+  }
+  for (const cap of ["Back", "1", "2", "3", "4"]) {
+    assert.ok(!next.test(cap), "a step-jump button is not the advance control: " + JSON.stringify(cap));
+  }
+  // a decoded-literal check, because `\b` in a JS string literal is BACKSPACE and that exact slip
+  // already halted one live run with a pattern that could never match.
+  assert.ok(!/[\x00-\x1f]/.test(ats.ATS_ORC_NEXT_RE), "the advance pattern must not contain a control character");
+});
+
+// ── the walk's structure, asserted on source because it is I/O-shaped ────────────────────
+test("the ORC walk: clear-once OUTSIDE the loop, write-per-step, terminal on no-Next", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("const MULTI = ats === \"oracle\"");
+  assert.ok(i > 0, "the walk must exist");
+  // ⚠ STRIP COMMENTS BEFORE ASSERTING ON SOURCE. The walk DOCUMENTS the shapes it refuses ("the
+  // terminal test is the presence of a Next control and not `step >= total`"), and a textual scan
+  // cannot tell that apart from doing it — this assertion failed on its own explanation. Third time
+  // today, after the sw-globals lockstep guards and the injected-fn guard before them: a guard that
+  // reads prose punishes the comment written to prevent the bug.
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const walk = stripComments(src.slice(i, src.indexOf("if (!bundle) return", i)));
+  assert.ok(walk.length > 1000, "found the walk body");
+
+  // the clear must happen BEFORE the loop — a clear inside wipes the steps already walked
+  const clearAt = walk.indexOf("reviewSummary: null");
+  const loopAt = walk.indexOf("for (let iter");
+  assert.ok(clearAt > 0 && loopAt > 0 && clearAt < loopAt,
+    "reviewSummary must be cleared ONCE before the loop — a mid-walk clear wipes the accumulated steps");
+
+  // accumulation must go through the PURE merge, not a rebuild
+  assert.ok(/accumulateBundle\(accEntries, pageBundle\)/.test(walk),
+    "steps must merge through the pure accumulateBundle so other pages' entries (and their edits) survive");
+  // …and be persisted per step, so an evicted worker cannot lose a walked step
+  assert.ok(/chrome\.storage\.local\.set\(\{ reviewSummary: bundle \}/.test(walk), "write-per-step");
+
+  // GUARD 1 — terminal on the ABSENCE of Next, never on step >= total
+  assert.ok(/if \(!after\.hasNext\)/.test(walk), "the terminal test is the absence of an advance control");
+  assert.ok(!/after\.step >= after\.total|step >= total/.test(walk),
+    "the step count must NOT be derived from the section count or compared to a total — Baylor serves " +
+    "5 sections for 4 steps and Oracle 4 for 3");
+  // GUARD 2 — the forbid pattern is actually passed at the call site
+  assert.ok(/atsInjOrcClickButton, ATS_ORC_NEXT_RE, "apply-flow-pagination", ATS_ORC_FORBID_RE/.test(walk),
+    "the walk must pass the forbid pattern — guard 2 is worthless if the call site omits it");
+  // the advance predicate must be monotone
+  assert.ok(/now\.step > after\.step/.test(walk), "advancement is 'the declared step number went UP' — a monotone predicate");
+  // a stalled advance is a graceful halt carrying the form's own words
+  assert.ok(/step-did-not-advance/.test(walk) && /now\.errors/.test(walk),
+    "a refused advance must halt with the page's own error text, never retry and never guess");
+});
+
+test("a partial ORC bundle NAMES the step it stopped on and why", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("if (orcSinglePageOnly) {");
+  assert.ok(i > 0);
+  const blk = src.slice(i, i + 900);
+  assert.ok(/bundle\.partial = true/.test(blk), "partial must be carried ON THE BUNDLE, not only logged");
+  assert.ok(/walkStopped/.test(blk) && /walkDetail/.test(blk),
+    "the reason must reach the reviewer — 'incomplete' without WHICH step and WHAT the form said is not actionable");
+  // and it must only be partial when the walk did NOT reach the end
+  assert.ok(/walkStopped !== "reached-final-step"/.test(src),
+    "a walk that reached the last step produces a COMPLETE bundle");
+});

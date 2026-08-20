@@ -5240,8 +5240,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // Notices accepted by the iCIMS pre-form on the operator's standing instruction (2026-08-18), so the
   // run's own result says what was agreed to rather than requiring a log dig.
   let icimsConsentsAccepted = [];
-  // ⚠ Set for Oracle: this path fills ONE step of a multi-step form, so the result must say so
-  // rather than letting a one-step bundle read as a finished application.
+  // ⚠ Set for Oracle when the WALK did not reach the last step, so a bundle covering some of the
+  // steps can never read as a finished application. It used to be set unconditionally, because the
+  // path filled exactly one step and stopped.
   let orcSinglePageOnly = false;
   // ⚠ ORACLE IS DETECTED BUT NOT YET DRIVEABLE — REFUSE LOUDLY RATHER THAN FALL THROUGH (2026-08-19).
   // `detectAts` learned Oracle Recruiting Cloud one increment ahead of its scan branch, and the two
@@ -5397,8 +5398,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       // like a complete application and would pass its own review gate, which is the
       // plausible-but-incomplete failure this codebase refuses. The walk is the next increment; until
       // it exists the run result carries `pages_filled: 1` and the caller must not read it as done.
-      LOG(`✔ pre-form complete — filling this step. ⚠ ORC is multi-page (${pre.sections} section(s) mounted) and this path fills ONE step; the bundle will cover only the step we land on`);
-      orcSinglePageOnly = true;
+      LOG(`✔ pre-form complete — walking the wizard (${pre.sections} section(s) mounted; ORC mounts every step at once, so that count is NOT the step count)`);
     }
     if (ats === "icims") {
       emitRunProgress("Signing in to the careers portal", "iCIMS");
@@ -5561,7 +5561,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // throws in the browser.)
     if (jdText) jobContext.description = redactSecrets(String(jdText));
 
-    emitRunProgress("Filling the application", "single-page " + ats + " form (never submits)");
+    emitRunProgress("Filling the application", (ats === "oracle" ? "Oracle's multi-step wizard" : "single-page " + ats + " form") + " (never submits)");
     const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
     const prepared = prepareProfile(store.profile);
@@ -5590,46 +5590,209 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       resumeStageMs = Date.now() - rsT0;
       LOG(`[ATS-TIME] résumé stage ${(resumeStageMs / 1000).toFixed(1)}s — ${resumePre.ok ? (resumePre.already ? "already on the form" : "attached" + (resumePre.parse ? `, parse ${resumePre.parse.parsed ? "settled" : "STILL CHANGING"}` : "")) : "NOT attached (" + (resumePre.error || "unknown") + ")"}`);
     }
-    let out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], credentials: store.credentials || null, resumePreattached: resumePre });
+    // ══ THE WALK ═════════════════════════════════════════════════════════════════════════════
+    // ORC is the first MULTI-PAGE form on the ats.js path — Greenhouse, Lever, Ashby and iCIMS are
+    // all one page, which is why this file never needed a walk before. The invariants are Workday's,
+    // because they were all bought with a live failure there:
+    //
+    //   • STOP AT THE END, NEVER SUBMIT — DOUBLE GUARD. Guard 1: the loop refuses to advance off a
+    //     step with no Next control, checked from a read taken AFTER the fill (a cascade can reveal
+    //     the submit step). Guard 2: atsInjOrcClickButton independently refuses a forbidden caption,
+    //     judged on the caption it actually resolved. Workday needed both because its footer Next
+    //     reuses Submit's automation-id; here the captions differ, and two guards still cost nothing
+    //     against the one irreversible act in the pipeline.
+    //   • ACCUMULATE WRITE-PER-PAGE, CLEAR ONCE OUTSIDE THE LOOP. A clear inside would wipe the steps
+    //     already walked. accumulateBundle is the same pure merge the Workday walk uses: it drops
+    //     THIS page's prior entries and keeps every other page's VERBATIM, so a review edit survives.
+    //   • THE MERGE KEY IS cdpPageKey, NOT THE PATHNAME. §3 (Employment and Education) has ZERO flat
+    //     inputs until its entries are built, and a field-less page keyed `<path>|` overwrote a
+    //     populated one on kiongroup.wd3 — four pages recorded for five filled, discovered only when
+    //     a rehearsal halted. cdpPageKey keys a field-less page as `<path>|#<ordinal>` for exactly
+    //     this case, and ORC §3 is that case by construction.
+    //   • THE ADVANCE PREDICATE IS MONOTONE. The step number is DECLARED in the url
+    //     (`…/apply/section/<n>`), so "the number went up" can only be noticed late, never missed —
+    //     the standing rule for every wall-clock poll on this codebase. The visible-section set is
+    //     the fallback signal for a tenant that advances without touching the url.
+    //   • A REFUSED ADVANCE IS A GRACEFUL HALT WITH THE PAGE'S OWN ERRORS, never a guess and never a
+    //     retry loop: ORC blocks Next on an empty required field exactly as Workday blocks Save.
+    const MULTI = ats === "oracle";
+    const ORC_MAX_STEPS = 8;               // backstop, not an expectation (observed: 3 and 4 steps)
+    let out = null;                        // the LAST step's raw result
+    let allResults = [];                   // every step's, so the timing log covers the whole walk
+    let accEntries = [], bundle = null;
+    let stepsFilled = 0, walkStopped = MULTI ? null : "ats-single-page", walkDetail = null;
+    const stepsWalked = [];
+    // CLEAR ONCE, before the first step (the Workday rule — a clear inside the loop is the bug).
+    if (MULTI) await new Promise((r) => chrome.storage.local.set({ reviewSummary: null, reviewAudit: null }, r));
 
-    // An async widget that never answered is REPORTED, not retried. There used to be a reload-and-refill
+    for (let iter = 1; iter <= (MULTI ? ORC_MAX_STEPS : 1); iter++) {
+      const stepT0 = Date.now();
+      let st = MULTI ? await cdpEval(atsInjOrcStepState).catch(() => null) : null;
+      if (MULTI) {
+        if (!st || !st.ok) {
+          walkStopped = "step-state-unreadable";
+          walkDetail = "Could not read which step of the Oracle wizard the page is on, so the walk stopped rather than pressing controls blind.";
+          break;
+        }
+        LOG(`step ${st.step != null ? st.step : "?"}${st.total ? " of " + st.total : ""} — sections ${JSON.stringify(st.visibleSections)} visible of ${st.sectionCount} · next=${st.hasNext ? JSON.stringify(st.nextCaption) + (st.nextEnabled ? "" : " (DISABLED)") : "none"} · submit=${st.hasSubmit ? JSON.stringify(st.submitCaption) : "none"}`);
+        emitRunProgress(`Filling step ${st.step != null ? st.step : iter}${st.total ? " of " + st.total : ""}`, "Oracle wizard (never submits)");
+      }
+
+      out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], credentials: store.credentials || null, resumePreattached: resumePre });
+      allResults = allResults.concat(out.results || []);
+      stepsFilled++;
+
+      // ── this step's bundle, merged into the accumulation ──────────────────────────────
+      const stepNo = MULTI ? (st.step != null ? st.step : iter) : 1;
+      const stepLabel = (() => {
+        if (!MULTI) return "Application";
+        const name = String(out.title || "").split(" - ")[0].trim();
+        return name && !/^oracle/i.test(name) ? name : "Step " + stepNo;
+      })();
+      // cdpPageKey over the fill's OWN field names — see the kiongroup note above.
+      // ⚠ BARE `cdpPageKey`, NOT `apMatch.cdpPageKey`. lib.js is loaded by importScripts into the SW's
+      // ONE global scope, so its helpers are bare globals here (background.js:cdpPageKey(preScan, …)
+      // already relies on that). `apMatch` is fill-driver.js's HAND-WRITTEN literal and does not
+      // carry this name — `apMatch.cdpPageKey` would pass every Node test, where apMatch is the whole
+      // of lib.js, and throw "is not a function" in the browser. That is the documented lockstep trap
+      // that killed a replay walk mid-run on apMatch.dateOrderOf.
+      const pageKey = MULTI
+        ? (cdpPageKey({ url: out.url, fields: (out.results || []).map((r) => ({ fieldName: r.fieldName })) }, stepNo)
+           || ("section-" + stepNo))
+        : (() => { try { return new URL(out.url).pathname; } catch (e) { return "application"; } })();
+      const pageBundle = buildReviewBundle(out.results, {
+        page: pageKey, pageNumber: stepNo, pageLabel: stepLabel,
+        url: out.url, tenant: jobContext.company || null, capturedAt: new Date().toISOString(),
+      });
+      const merged = accumulateBundle(accEntries, pageBundle);
+      accEntries = merged.entries;
+      bundle = merged;
+      stepsWalked.push({ step: stepNo, label: stepLabel, fields: (out.results || []).length, needs_review: pageBundle.needs_review_count });
+      if (MULTI) {
+        // WRITE-PER-PAGE: persisted now, so an evicted worker cannot lose the steps already walked.
+        await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle }, r));
+        LOG(`[ATS-TIME] step ${stepNo} (${stepLabel}) ${((Date.now() - stepT0) / 1000).toFixed(1)}s — ${(out.results || []).length} field(s), ${pageBundle.needs_review_count} to review; ${bundle.total} field(s) accumulated`);
+      }
+      if ((out.deadAsync || []).length) {
+        LOG(`the form's own async widget(s) never answered: ${out.deadAsync.join(", ")} — left for review rather than retried`);
+      }
+      if (!MULTI) break;
+
+      // ── GUARD 1: re-read AFTER the fill, because a cascade can reveal the final step ───
+      const after = await cdpEval(atsInjOrcStepState).catch(() => null);
+      if (!after || !after.ok) {
+        walkStopped = "step-state-unreadable";
+        walkDetail = `Filled step ${stepNo} but could not re-read the wizard's state, so the walk stopped rather than pressing Next blind.`;
+        break;
+      }
+      if (!after.hasNext) {
+        // The terminal condition, and it is the ABSENCE of an advance control rather than
+        // `step >= total`: the section count is not the step count on either observed tenant.
+        walkStopped = "reached-final-step";
+        walkDetail = `Step ${stepNo} (${stepLabel}) has no Next control` +
+          (after.hasSubmit ? ` and shows ${JSON.stringify(after.submitCaption)} — the last step. NOTHING was pressed.`
+                           : " and no Submit either, which is unexpected — treated as the end and nothing was pressed.");
+        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+        break;
+      }
+      if (!after.nextEnabled) {
+        walkStopped = "next-disabled";
+        walkDetail = `Oracle has DISABLED ${JSON.stringify(after.nextCaption)} on step ${stepNo}, which is how it refuses an incomplete step.` +
+          (after.errors.length ? ` The form says: ${after.errors.join(" | ")}` : " The form gave no error text.");
+        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+        break;
+      }
+
+      // ── GUARD 2 rides along on the click itself ───────────────────────────────────────
+      const clicked = await cdpEval(atsInjOrcClickButton, ATS_ORC_NEXT_RE, "apply-flow-pagination", ATS_ORC_FORBID_RE)
+        .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (!clicked || !clicked.ok) {
+        walkStopped = clicked && clicked.error === "refused-forbidden-caption" ? "next-refused" : "next-not-pressable";
+        walkDetail = `Could not advance past step ${stepNo}: ${(clicked && clicked.error) || "unknown"}` +
+          (clicked && clicked.caption ? ` (caption ${JSON.stringify(clicked.caption)})` : "") +
+          (clicked && clicked.offered ? `; the bar offered ${JSON.stringify(clicked.offered)}` : "");
+        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+        break;
+      }
+      LOG(`pressed ${JSON.stringify(clicked.caption)} on step ${stepNo}`);
+
+      // ── the MONOTONE wait: the declared step number goes UP ───────────────────────────
+      const advT0 = Date.now(), ADV_BUDGET = 25000;
+      let moved = null, reads = 0, readOk = 0;
+      while (Date.now() - advT0 < ADV_BUDGET) {
+        await cdpDelay(700);
+        reads++;
+        const now = await cdpEval(atsInjOrcStepState).catch(() => null);
+        if (!now || !now.ok) continue;
+        readOk++;
+        const numberWentUp = now.step != null && after.step != null && now.step > after.step;
+        // Fallback for a tenant that swaps sections without touching the url. Compared as a SET, not
+        // a count: two sections are visible at once on Oracle (index 0 is the résumé-import banner).
+        const sectionsChanged = JSON.stringify(now.visibleSections) !== JSON.stringify(after.visibleSections);
+        if (numberWentUp || sectionsChanged) { moved = { now, by: numberWentUp ? "step-number" : "visible-sections" }; break; }
+      }
+      if (!moved) {
+        // ORC refuses Next on an incomplete step exactly as Workday refuses Save & Continue. That is
+        // a graceful halt carrying the page's own words — never a retry and never a guessed answer.
+        const now = await cdpEval(atsInjOrcStepState).catch(() => null);
+        walkStopped = "step-did-not-advance";
+        walkDetail = `Pressed ${JSON.stringify(clicked.caption)} on step ${stepNo} but the wizard stayed put for ${((Date.now() - advT0) / 1000).toFixed(1)}s (${readOk}/${reads} reads landed).` +
+          (readOk === 0 ? " NOT ONE read landed, so this is blindness rather than evidence the page stood still."
+                        : (now && now.errors && now.errors.length ? ` The form says: ${now.errors.join(" | ")}`
+                           : " The form showed no error text — check the step by hand for an empty required field."));
+        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+        break;
+      }
+      LOG(`advanced to step ${moved.now.step != null ? moved.now.step : "?"} after ${((Date.now() - advT0) / 1000).toFixed(1)}s (by ${moved.by})`);
+      // NEVER scan an unsettled page — the standing rule on every platform here.
+      // ⚠ ITS FLAG IS `ready`, NOT `ok`. Gating on `ok` here would have halted `step-not-rendered` on
+      // every SUCCESSFUL advance — the same caller-gates-on-a-field-the-callee-never-returns shape as
+      // atsInjPageSignature's missing `ok`, found the same day. A settle that reports `ready:false`
+      // with fields > 0 is a step whose form is there but unrecognized, which is worth saying apart.
+      const ready = await waitAtsFormReady(ats, LOG, 25000);
+      if (!ready || !ready.ready) {
+        walkStopped = "step-not-rendered";
+        walkDetail = `Advanced past step ${stepNo} but the next step never settled into a readable form` +
+          ` (${(ready && ready.why) || (ready && ready.fields ? ready.fields + " field(s) present but the page did not settle" : "no fields appeared")}).`;
+        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+        break;
+      }
+      if (iter === ORC_MAX_STEPS) {
+        walkStopped = "max-steps";
+        walkDetail = `Walked ${ORC_MAX_STEPS} steps without reaching a step that has no Next — stopping rather than looping.`;
+        LOG(`⛔ ${walkStopped} — ${walkDetail}`);
+      }
+    }
+    if (!bundle) return { ok: false, error: "walk-produced-no-bundle", jd };
+    // ⚠ PARTIAL UNLESS WE REACHED THE END. Anything other than reached-final-step means steps were
+    // left unfilled, and a bundle that covered some of them would pass its own review gate and read
+    // as a finished application — the plausible-but-incomplete failure this codebase refuses.
+    if (MULTI && walkStopped !== "reached-final-step") orcSinglePageOnly = true;
+
+    // (The per-step deadAsync report is inside the walk above, so each step names its own.)
+    // There used to be a reload-and-refill
     // here, added when Greenhouse forms would land in a state where every server-backed combobox returned
     // nothing at all; that state was our own page overrides landing on an already-running document, and
     // it is fixed at the cause now (see the install above). What is left is the honest kind: a form whose
     // places/search service genuinely does not respond — live, Ashby's location combobox, which fails
     // identically on a reload, under screen capture, and by hand. Retrying that costs a second full fill
     // and changes nothing, so the field reaches review self-explaining and we name it here.
-    if ((out.deadAsync || []).length) {
-      LOG(`the form's own async widget(s) never answered: ${out.deadAsync.join(", ")} — left for review rather than retried`);
-    }
+    // (Per-step deadAsync is reported inside the walk, so each step names its own widgets.)
 
-    // ONE page ⇒ one bundle write (the walk's clear-once + accumulate collapses to a set).
-    const pageKey = (() => { try { return new URL(out.url).pathname; } catch (e) { return "application"; } })();
-    // ⚠ ORACLE IS MULTI-STEP, so "page 1 of Application" would be a lie. The step number is in the
-    // url (`…/apply/section/<n>`) and the step NAME is in the document title ("Personal Info",
-    // "Experience", "More About You"), so the bundle can say which step it actually covers.
-    const orcStep = ats === "oracle" ? (() => {
-      const m = /\/apply\/section\/?(\d+)/.exec(out.url || "");
-      const n = m ? Number(m[1]) : null;
-      const name = String(out.title || "").split(" - ")[0].trim();
-      return n ? { n, label: name && !/^oracle/i.test(name) ? name : "Step " + n } : null;
-    })() : null;
-    const bundle = buildReviewBundle(out.results, {
-      page: pageKey,
-      pageNumber: orcStep ? orcStep.n : 1,
-      pageLabel: orcStep ? orcStep.label : "Application",
-      url: out.url, tenant: jobContext.company || null, capturedAt: new Date().toISOString(),
-    });
-    // ⚠ AND SAY THAT IT IS PARTIAL. A one-step bundle from a three-step form would otherwise pass its
+    // ⚠ AND SAY THAT IT IS PARTIAL. A bundle covering three of four steps would otherwise pass its
     // own review gate and read as a finished application — the plausible-but-incomplete failure this
     // codebase exists to refuse. Carried ON THE BUNDLE, not only in a log line, because the log is
-    // gone by the time anyone reviews it.
+    // gone by the time anyone reviews it. The walk's own stop reason is quoted, so the reviewer is
+    // told WHICH step it got stuck on and what the form said, not merely that something was missed.
     if (orcSinglePageOnly) {
       bundle.partial = true;
-      bundle.partialReason = "Oracle serves this application as multiple numbered steps and this run filled only "
-        + (orcStep ? "step " + orcStep.n + " (" + orcStep.label + ")" : "the step it landed on")
-        + ". The remaining steps have not been filled or reviewed — do not treat this bundle as a complete application.";
+      bundle.partialReason = "Oracle serves this application as a multi-step wizard and this run stopped at step "
+        + (stepsWalked.length ? stepsWalked[stepsWalked.length - 1].step + " (" + stepsWalked[stepsWalked.length - 1].label + ")" : "?")
+        + " — " + (walkStopped || "unknown") + ". " + (walkDetail || "")
+        + " The remaining steps have not been filled or reviewed — do not treat this bundle as a complete application.";
       LOG(`⚠ bundle marked PARTIAL — ${bundle.partialReason}`);
+    } else if (MULTI) {
+      LOG(`✔ walked all ${stepsFilled} step(s) to the end: ${stepsWalked.map((x) => x.step + " " + x.label + " (" + x.fields + "f/" + x.needs_review + "r)").join(" → ")}`);
     }
     // WHICH PIPELINE filled this, recorded on the bundle. A submit run detects the ATS from the
     // URL, but an employer-HOSTED form (careers.<company>.com — Greenhouse/Lever/Ashby all serve
@@ -5643,7 +5806,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
     // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
     const fillMs = Date.now() - fillT0;
-    const perField = out.results.length ? Math.round(fillMs / out.results.length) : 0;
+    // ⚠ ACROSS THE WHOLE WALK, not the last step. `out` is the final step's result, so using it here
+    // would divide a four-step wall clock by one step's field count and report a per-field cost
+    // several times the truth.
+    const perField = allResults.length ? Math.round(fillMs / allResults.length) : 0;
     let visNow = null; try { visNow = await cdpVisible(); } catch (e) {}
     // MEASURED paint state next to Chrome's visibility (the Workday branch's rule): "visible but
     // not painting" is the state that used to be invisible in the logs, and it is exactly when a
@@ -5656,14 +5822,14 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // ⚠ ON iCIMS THE RÉSUMÉ'S COST IS NOT IN ITS RECORD. The attach + parse wait happen BEFORE the
     // fill loop (see the résumé stage above), so its record's own elapsedMs is ~0 and printing that
     // would report the most expensive stage of the run as free. Prefer the stage's measured time.
-    const res = out.results.find((r) => /resume|\bcv\b/i.test(r.fieldName || "") || r.widgetType === "file_upload");
+    const res = allResults.find((r) => /resume|\bcv\b/i.test(r.fieldName || "") || r.widgetType === "file_upload");
     const resPart = resumeStageMs != null ? ` | resume ${(resumeStageMs / 1000).toFixed(1)}s (attach + parse, before the fill)`
       : res ? ` | resume ${((res.elapsedMs || 0) / 1000).toFixed(1)}s` : "";
-    const slow = out.results
+    const slow = allResults
       .filter((r) => (r.elapsedMs || 0) >= 1500)
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
       .map((r) => `${r.fieldName} ${(r.elapsedMs / 1000).toFixed(1)}s`).join(", ");
-    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${out.results.length} field(s) — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`);
+    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${allResults.length} field(s)${MULTI ? ` across ${stepsFilled} step(s)` : ""} — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`);
     // Say what ACTUALLY happened to the report. reportApplication used to return nothing, so this
     // line claimed "Reported to the website." even when the line directly above it was the ⛔ saying
     // the tracker had rejected it.
@@ -5672,7 +5838,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. ${landed}`);
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
-    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts, needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok), consents_accepted: icimsConsentsAccepted, walk: { ok: true, pages: 1, stopped: "ats-single-page" } };
+    return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts,
+      needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok),
+      consents_accepted: icimsConsentsAccepted, partial: !!bundle.partial,
+      walk: { ok: true, pages: stepsFilled, steps: stepsWalked, stopped: walkStopped || "ats-single-page", detail: walkDetail || null } };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };
   } finally {
