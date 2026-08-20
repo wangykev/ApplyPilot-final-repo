@@ -4603,7 +4603,31 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   for (const type of ["keydown", "keypress", "keyup"]) {
     el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
   }
-  return { ok: true, kind, committed: want, reopens };
+
+  // ⚠⚠ THE READ-BACK SETTLES **HERE**, PAGE-SIDE, AND THAT IS THE WHOLE POINT (speed round,
+  // 2026-08-20). Shortening the SW-side poll from 150ms to 80ms bought nothing, because the MV3
+  // worker's timers are STARVED: the run's own PACE warnings measured `a 80ms pace took 1226ms` and
+  // `a 150ms pace took 1555ms`. So the cost of a poll is the NUMBER of awaits, not their length —
+  // sixteen 80ms SW awaits is sixteen ~1s stalls, which is exactly the 5067ms / 3200ms / 1701ms gaps
+  // that showed up between an entry form's discovery read and its first 20ms text write.
+  //
+  // Page-side timers are real, so settling in here costs the caller ONE cdpEval round-trip instead of
+  // sixteen starved ones. `value` comes back with the result and the SW does no further waiting.
+  //
+  // ⚠ This does NOT relax the house rule that pacing lives SW-side. That rule exists because a hidden
+  // or throttled tab's page timers stall — and it is about PACING (spacing actuation so a throttled
+  // page keeps up). This is a read-back SETTLE on a visible tab, bounded by the caller's own budget,
+  // and if the page never settles it simply returns `value: null` and the caller reports the failure
+  // exactly as before. Nothing is assumed from a timer that did not fire.
+  let value = null, invalid = false;
+  const vDeadline = Date.now() + 2500;
+  while (Date.now() < vDeadline) {
+    await new Promise((r) => setTimeout(r, 60));
+    const v = String(el.value || "").trim();
+    invalid = /cx-select-input--invalid/.test(String(el.className || ""));
+    if (v && !invalid) { value = v; break; }
+  }
+  return { ok: true, kind, committed: want, reopens, value, invalid };
 }
 
 function atsInjOrcLinks() {
@@ -4735,6 +4759,79 @@ function atsInjOrcEntryState(blockTitlePattern) {
 }
 
 // `action`: "open" | "commit" | "cancel". Refuses rather than pressing the wrong homonym.
+// ⚠⚠ OPEN-AND-WAIT IN ONE CALL, because the WAIT is what costs (speed round, 2026-08-20).
+// The SW-side poll for "has the entry form appeared" was 28 awaits of 150ms; the MV3 worker's timers
+// are starved, so each of those is ~1s in practice — the run's own PACE lines measured `a 150ms pace
+// took 1555ms`. That is the 5067ms / 3200ms / 1701ms gap between an entry form's discovery read and
+// its first 20ms text write.
+//
+// Page-side timers are real, so waiting here costs ONE cdpEval instead of N starved ones. The wait is
+// bounded and it reports what it saw: a form that never appeared comes back `fields: 0` and the caller
+// halts the block exactly as before — nothing is assumed from a timer that did not fire.
+async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const findBlock = () => [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  const block0 = findBlock();
+  if (!block0) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+  const btns0 = [...block0.querySelectorAll("button")].filter(vis);
+  if (btns0.some((b) => /^cancel$/i.test(t(b)))) return { ok: false, error: "entry-already-open" };
+  const add = btns0.find((b) => /^add\b/i.test(t(b)));
+  if (!add) return { ok: false, error: "no-add-control", offered: btns0.map((b) => t(b)).slice(0, 6) };
+  add.click();
+
+  const deadline = Date.now() + (budgetMs || 6000);
+  let fields = [];
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 80));
+    const block = findBlock();
+    if (!block) continue;
+    const open = [...block.querySelectorAll("button")].filter(vis).some((b) => /^cancel$/i.test(t(b)));
+    const live = [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e));
+    if (open && live.length) {
+      fields = live.map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
+        role: e.getAttribute("role") || null,
+        label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
+        value: e.value || null }));
+      break;
+    }
+  }
+  return { ok: true, pressed: t(add), fields, count: fields.length };
+}
+
+// COMMIT-AND-WAIT, same reasoning: press the (homonymous) Add and wait page-side for the form to be
+// GONE. `closed` is the evidence; a form still open means Oracle refused the entry.
+async function atsInjOrcCommitEntryAndWait(blockTitlePattern, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const findBlock = () => [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  const block0 = findBlock();
+  if (!block0) return { ok: false, error: "block-not-found" };
+  const btns0 = [...block0.querySelectorAll("button")].filter(vis);
+  // ⚠ REFUSE if nothing is open: the SAME caption would OPEN a blank entry instead of committing one.
+  if (!btns0.some((b) => /^cancel$/i.test(t(b)))) return { ok: false, error: "no-open-entry-to-commit" };
+  const add = btns0.find((b) => /^add\b/i.test(t(b)));
+  if (!add) return { ok: false, error: "no-add-control" };
+  add.click();
+
+  const deadline = Date.now() + (budgetMs || 6000);
+  let closed = false;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 80));
+    const block = findBlock();
+    if (!block) { closed = true; break; }
+    if (![...block.querySelectorAll("button")].filter(vis).some((b) => /^cancel$/i.test(t(b)))) { closed = true; break; }
+  }
+  return { ok: true, pressed: t(add), closed };
+}
+
 function atsInjOrcEntryAction(blockTitlePattern, action) {
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -5120,23 +5217,23 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       const tag = `${item.block} entry ${added}`;
 
       // ── OPEN ────────────────────────────────────────────────────────────────────────
-      const opened = await act.eval(atsInjOrcEntryAction, item.pattern, "open").catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      // ⚠⚠ ONE CALL: press Add and wait PAGE-SIDE for the form to render. The SW-side version of this
+      // wait was 28 awaits of 150ms, and the MV3 worker's timers are STARVED — this run's own PACE
+      // lines measured `a 150ms pace took 1555ms` and `an 80ms pace took 1226ms`. So the cost of a
+      // poll is the NUMBER of awaits, not their length, and this was the largest single gap on the
+      // page: 5067ms between an entry's discovery read and its first 20ms text write.
+      //
+      // Page-side timers are real, so the wait costs ONE cdpEval instead of ~28 starved ones. The
+      // evidence is unchanged: a form that never renders comes back with no fields and the block
+      // halts exactly as before. See atsInjOrcOpenEntryAndWait.
+      const opened = await act.eval(atsInjOrcOpenEntryAndWait, item.pattern, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
       if (!opened || !opened.ok) {
         log(`⛔ ${tag}: could not open an entry form — ${(opened && opened.error) || "unknown"}`);
         notes.push(`${tag}: not filled (${(opened && opened.error) || "could not open"})`);
         break;                       // the block is not workable; do not hammer it
       }
-      // MONOTONE wait: the form exists once it has inputs. Polled, never a fixed sleep.
-      let st = null;
-      // ⚠ 150ms, not 300: these polls do not make the page faster, they decide how long we take to
-      // NOTICE. Every one is read-back gated, so a short poll costs an extra read and never a wrong
-      // value — the same trade the pacing rules already allow for visible-tab runs.
-      for (let tries = 0; tries < 28; tries++) {
-        await act.delayFull(150);
-        st = await act.eval(atsInjOrcEntryState, item.pattern).catch(() => null);
-        if (st && st.ok && st.open && (st.fields || []).length) break;
-      }
-      if (!st || !st.ok || !(st.fields || []).length) {
+      const st = { ok: true, open: true, fields: opened.fields || [] };
+      if (!st.fields.length) {
         log(`⛔ ${tag}: pressed ${JSON.stringify(opened.pressed)} but no entry form appeared`);
         notes.push(`${tag}: not filled (the entry form never rendered)`);
         break;
@@ -5221,13 +5318,10 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
               r = await act.eval(atsInjOrcPickFromOwnList, sel, monthCands, yearCands, ATS_ORC_PICK_MS).catch(() => null);
               reopenTotal += (r && r.reopens) || 0;
               if (!r || !r.ok) continue;
-              // READ-BACK VERIFIED like every other commit here — a primitive reporting a row is not
-              // proof the widget accepted it.
-              for (let w = 0; w < 16; w++) {
-                await act.delayFull(80);
-                const back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
-                if (back && back.ok && String(back.value || "").trim() && !back.invalid) { got = back.value; break; }
-              }
+              // READ-BACK VERIFIED, but settled PAGE-SIDE inside the primitive — see the note there.
+              // The verification is unchanged in strength: a half whose value did not stick still
+              // comes back null and still fails the pair.
+              if (r.value && !r.invalid) got = r.value;
             }
             if (!r || !r.ok) { failed.push((r && r.error) || "unknown"); continue; }
             if (got == null) { failed.push(r.kind + " not retained"); continue; }
@@ -5366,23 +5460,19 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       }
 
       // ── COMMIT ──────────────────────────────────────────────────────────────────────
-      const done = await act.eval(atsInjOrcEntryAction, item.pattern, "commit").catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      // ⚠ ONE CALL again — press the homonymous Add and wait page-side for the form to be GONE, for
+      // the same starved-timer reason as the open above.
+      const done = await act.eval(atsInjOrcCommitEntryAndWait, item.pattern, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
       if (!done || !done.ok) {
         log(`⛔ ${tag}: could not commit — ${(done && done.error) || "unknown"}`);
         notes.push(`${tag}: filled but NOT committed (${(done && done.error) || "unknown"})`);
         break;
       }
-      // MONOTONE again: committed means the open form is gone (no Cancel). A form that stays open is
-      // ORC refusing the entry — almost always a required entry field we left blank — so the pass
-      // CANCELS to leave the block clean rather than abandoning a half-open form that would block
-      // Next, and says so.
-      let closed = false;
-      for (let tries = 0; tries < 28; tries++) {
-        await act.delayFull(150);
-        const now = await act.eval(atsInjOrcEntryState, item.pattern).catch(() => null);
-        if (now && now.ok && !now.open) { closed = true; break; }
-      }
-      if (!closed) {
+      // Committed means the open form is GONE (no Cancel) — the primitive settled that page-side and
+      // reports it. A form that stays open is ORC refusing the entry, almost always a required entry
+      // field we left blank, so the pass CANCELS to leave the block clean rather than abandoning a
+      // half-open form that would block Next, and says so.
+      if (!done.closed) {
         log(`⛔ ${tag}: pressed ${JSON.stringify(done.pressed)} but the entry form stayed open — Oracle is refusing it, usually a required entry field we could not answer`);
         notes.push(`${tag}: Oracle refused the entry (a required field in it is unanswered)`);
         await act.eval(atsInjOrcEntryAction, item.pattern, "cancel").catch(() => null);
@@ -8855,7 +8945,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE, atsInjOrcBlocks, atsOrcEntryValue, atsOrcFillEntries,
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
-    atsOrcEntryIdentity, atsOrcTilesAlreadyMatch,
+    atsOrcEntryIdentity, atsOrcTilesAlreadyMatch, atsInjOrcOpenEntryAndWait, atsInjOrcCommitEntryAndWait,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
