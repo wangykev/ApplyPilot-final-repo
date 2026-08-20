@@ -5317,6 +5317,36 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // reply or a synchronous DOM write — so the fast pace is allowed while hidden. See cdpSetFastWhenHidden
     // for why that is latency-safe rather than lucky: every pace site is read-back or poll gated.
     if (ats === "icims") cdpSetFastWhenHidden(true);
+    // ⚠⚠ PACE ON THE PAGE'S CLOCK, NOT THE WORKER'S (operator bug, 2026-08-20).
+    // Reported as: "the fill including the onboarding will just lag at seemingly random times and to
+    // fix it I need to click the page once and it goes back to filling fast." Measured on a FRESHLY
+    // RESTARTED Chrome, so it is not a tired browser:
+    //
+    //     ⚠ a 700ms pace took 3322ms (sw) — the clock overran by 2622ms
+    //     ⚠ a 150ms pace took 2436ms (sw) — the clock overran by 2286ms
+    //     ⚠ an 80ms pace took 1226ms (sw) — the clock overran by 1146ms
+    //
+    // That is MV3 service-worker timer starvation, which this repo already documents at 3–69×. The
+    // worker's timers are deprioritised while nothing is driving the browser, and a real click is
+    // what un-throttles it — which is exactly the operator's workaround, and exactly why the lag
+    // looks random: it tracks focus, not the form.
+    //
+    // `cdpSetPageClock` already exists for this and the Workday fill/replay walks turn it on; the
+    // whole ats.js path never did, so every pace on Greenhouse, Lever, Ashby, iCIMS and Oracle rode
+    // the starved clock. Turning it on here is the fix, not a new mechanism.
+    //
+    // ⚠ Why this is safe rather than lucky, and why it does not contradict "onboarding stays
+    // SW-timed": cdpDelay RACES the page sleep against an SW timeout (`page-abandoned`) and, on a
+    // destroyed context, finishes the REMAINDER on the SW clock (`sw-fallback`). So a page whose
+    // timer never fires costs `want + slack` — no worse than today — while a responsive page costs
+    // what was asked for. The reason onboarding was excluded was that a NAVIGATING document starves
+    // poll samples; the guards make that a bounded cost instead of a hang, and the ORC pre-form's
+    // own polls re-read the page every iteration, so responsiveness is continuously proven.
+    //
+    // ⚠ It requires the worker-timer polyfill, which iCIMS DECLINES so its captcha can initialise —
+    // cdpDelay checks `_workerTimersActive` itself, so iCIMS simply keeps SW pacing and its
+    // cdpSetFastWhenHidden compensation above is untouched.
+    cdpSetPageClock(true);
     await cdpSetFocusEmulation(true).catch(() => {});
     // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
     // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
@@ -5942,6 +5972,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (!attached.ok) return { ok: false, error: "attach-failed:" + attached.error };
     await cdpInstallPageOverrides(ats === "icims" ? { noWorkerTimers: true } : undefined); // see the fill run: its sign-in gate's invisible hCaptcha will not initialise under the polyfill
     if (ats === "icims") cdpSetFastWhenHidden(true); // …and the same compensation the fill run makes
+    cdpSetPageClock(true);                           // …and the same page-clock pacing (see the fill run)
     await cdpSetFocusEmulation(true).catch(() => {});
     // SAY WHICH PACING REGIME THIS RUN GOT — the fill run has logged this since the CDP path existed
     // and the submit run never did, which leaves a rehearsal unable to state whether it ran visible or
