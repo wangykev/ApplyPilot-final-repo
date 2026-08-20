@@ -480,9 +480,24 @@ function atsComposeValue(kind, profile) {
 // gives a candidate who filled only GitHub a real link, and gives nobody a blank one.
 // ONE row is filled because ORC renders one `siteLink-<n>` at a time; adding more is the operator's.
 function atsFirstWebsiteValue(profile) {
+  const list = atsProfileWebsites(profile);
+  return list.length ? list[0] : null;
+}
+
+// EVERY non-empty website, in the profile's own order, https-normalized. The profile keeps blank
+// slots (the portfolio and "other" rows are usually empty strings), so the list is compacted here —
+// which is what makes an ORDINAL meaningful: "link 2" is the second website that EXISTS, not the
+// second row of the editor.
+function atsProfileWebsites(profile) {
   const ws = Array.isArray(profile && profile.websites) ? profile.websites : [];
-  const hit = ws.find((w) => w && String(w.url || "").trim());
-  return hit ? atsLib.ensureHttps(String(hit.url).trim()) : null;
+  const out = [];
+  for (const w of ws) {
+    const u = w && typeof w.url === "string" ? w.url.trim() : "";
+    if (!u) continue;
+    const full = atsLib.ensureHttps(u);
+    if (full && out.indexOf(full) === -1) out.push(full);
+  }
+  return out;
 }
 
 function atsWebsiteValue(profile, type) {
@@ -4489,6 +4504,30 @@ function atsInjOrcScrollBlocks(titles) {
 // guard did not fire and a second run duplicated the history again. The label is in `aria-label`
 // and `title`, never in the text. Skills render ONE TILE PER SKILL, which is what makes
 // "only add the ones that are missing" possible at all.
+// The `<candidate-links>` repeating family. Its control is `name="siteLink-<n>"` `type="url"` and the
+// add control is `button.candidate-links__add-link` ("Add Another Link"). The ordinal lives in the
+// NAME (the trailing `-7` on the id is the render counter), so it is a POSITION and safe to index by.
+function atsInjOrcLinks() {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const inputs = [...document.querySelectorAll('input[name^="siteLink"]')].filter(vis);
+  const add = [...document.querySelectorAll("button, a[role=button]")].filter(vis)
+    .find((b) => /add another link/i.test(t(b)) || /candidate-links__add-link/.test(String(b.className || "")));
+  return { ok: true, count: inputs.length, addPresent: !!add,
+    links: inputs.map((e) => ({ name: e.name || null, id: e.id || null, value: String(e.value || "").trim() })) };
+}
+
+function atsInjOrcAddLink() {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const add = [...document.querySelectorAll("button, a[role=button]")].filter(vis)
+    .find((b) => /add another link/i.test(t(b)) || /candidate-links__add-link/.test(String(b.className || "")));
+  if (!add) return { ok: false, error: "no-add-link-control" };
+  if (add.disabled || add.getAttribute("aria-disabled") === "true") return { ok: false, error: "add-link-disabled" };
+  add.click();
+  return { ok: true };
+}
+
 function atsInjOrcTiles(blockTitlePattern) {
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -4766,6 +4805,84 @@ function atsOrcEntryValue(spec, entry) {
   // how it is entered, which is read live rather than assumed — see the entry pass's field report.
   if (spec.kind === "date") { const v = raw(spec.path); return v == null ? null : String(v); }
   return null;
+}
+
+// ── THE LINKS PASS ───────────────────────────────────────────────────────────────────────
+// `siteLink` is a REPEATING section (operator, 2026-08-20): "Add Another Link" creates siteLink-2,
+// -3… and ALL of the operator's profile links belong on the form, not just the first.
+//
+// The flat loop already fills whichever link inputs EXIST at scan time — and correctly, one url each,
+// because the map's `website` kind indexes the profile list by the ordinal in the field name. This
+// pass exists for the urls with nowhere to go yet: it presses Add Another Link and fills the input
+// that appears.
+//
+// ⚠ IDEMPOTENT BY URL, like skills. Oracle's form arrives prepopulated for a returning candidate, so
+// a url already on the form is SKIPPED rather than added again — otherwise every run would grow the
+// list. Comparison is on the https-normalized string, which is what both sides already hold.
+async function atsOrcFillLinks(act, profile, opts) {
+  const o = opts || {};
+  const log = o.log || (() => {});
+  const records = [], notes = [];
+  const want = atsProfileWebsites(profile);
+  if (!want.length) return { records, notes };
+
+  const st0 = await act.eval(atsInjOrcLinks).catch(() => null);
+  if (!st0 || !st0.ok) return { records, notes };
+  if (!st0.count && !st0.addPresent) return { records, notes };   // no links section on this step
+
+  const norm = (v) => atsLib.normalize(String(v || "")).replace(/\/+$/, "");
+  const have = st0.links.map((l) => norm(l.value)).filter(Boolean);
+  const missing = want.filter((u) => have.indexOf(norm(u)) === -1);
+  log(`links: profile has ${want.length}, the form holds ${have.length} (${JSON.stringify(st0.links.map((l) => l.value).filter(Boolean))}) — ${missing.length} to add`);
+  if (!missing.length) return { records, notes };
+
+  if (!st0.addPresent) {
+    notes.push(`${missing.length} profile link(s) could not be added — this form has no "Add Another Link" control`);
+    return { records, notes };
+  }
+
+  for (const url of missing.slice(0, ATS_ORC_ENTRY_MAX)) {
+    const before = await act.eval(atsInjOrcLinks).catch(() => null);
+    const n = before && before.ok ? before.count : 0;
+    // An EMPTY input already on the form is used before creating another one — pressing Add with a
+    // blank row sitting there would leave a hole the operator has to notice.
+    let slot = (before && before.ok ? before.links : []).find((l) => !l.value);
+    if (!slot) {
+      const add = await act.eval(atsInjOrcAddLink).catch(() => null);
+      if (!add || !add.ok) {
+        log(`⛔ links: could not press "Add Another Link" (${(add && add.error) || "unknown"})`);
+        notes.push(`could not add a row for ${url}`);
+        break;
+      }
+      // MONOTONE: a new input exists. Polled, never a fixed sleep.
+      for (let i = 0; i < 12 && !slot; i++) {
+        await act.delayFull(250);
+        const now = await act.eval(atsInjOrcLinks).catch(() => null);
+        if (now && now.ok && now.count > n) slot = now.links.find((l) => !l.value) || null;
+      }
+      if (!slot) {
+        log("⛔ links: pressed \"Add Another Link\" but no new empty input appeared");
+        notes.push(`could not add a row for ${url}`);
+        break;
+      }
+    }
+    const sel = slot.id ? "#" + slot.id.replace(/([^\w-])/g, "\\$1") : 'input[name="' + slot.name + '"]';
+    const rec = { fieldName: slot.name || "siteLink", label: "Link " + ((slot.name || "").split("-")[1] || "?"),
+                  widgetType: "text", isRequired: false, mappedPath: "websites[].url",
+                  status: "skipped", after: null, elapsedMs: 0 };
+    const t0 = Date.now();
+    await act.eval(atsInjSetText, sel, url).catch(() => null);
+    const back = await act.eval(atsInjReadValue, "oracle", sel, "text").catch(() => null);
+    rec.after = back && back.ok ? back.value : null;
+    rec.elapsedMs = Date.now() - t0;
+    const ok = String(rec.after || "").trim() === url;
+    rec.status = ok ? "filled" : "needs_review";
+    if (!ok) { rec.flag = "commit-not-accepted"; rec.detail = `wrote ${JSON.stringify(url)} but the field holds ${JSON.stringify(rec.after)}`; }
+    else rec.detail = "added a link row for this profile website";
+    records.push(rec);
+    log(`  ${rec.fieldName} → ${rec.status} · after=${JSON.stringify(rec.after)}`);
+  }
+  return { records, notes };
 }
 
 // ── THE ENTRY PASS ───────────────────────────────────────────────────────────────────────
@@ -5721,9 +5838,23 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
     if (map.kind === "skip") return { kind: "skip", source: "map", detail: map.detail };
+  // ⚠⚠ `siteLink` IS A REPEATING FAMILY, so the ORDINAL picks WHICH website (operator, 2026-08-20).
+  // The control is `name="siteLink-1"` inside `<candidate-links>`, with "Add Another Link" creating
+  // `siteLink-2`, `-3`… — and atsMapKey strips a trailing `-<digits>` for Oracle, so EVERY one of
+  // them reduces to the same map key. Returning "the first website" therefore filled link 1 correctly
+  // and would have written that SAME url into every further link the moment a second input existed:
+  // a duplicate the operator would have to delete, from a rung that looked like it was working.
+  //
+  // The ordinal is a POSITION, not a render counter (unlike the `-7` on the id), so it indexes the
+  // profile's own ordered list of non-empty websites. Beyond the end ⇒ null, which leaves the extra
+  // input blank rather than repeating the last url.
   if (map.kind === "website") {
-    const url = atsFirstWebsiteValue(profile);
-    return url ? { raw: url, path: "websites[].url", source: "map" } : null;
+    const list = atsProfileWebsites(profile);
+    if (!list.length) return null;
+    const m = /-(\d+)$/.exec(String(f.fieldName || ""));
+    const idx = m ? Math.max(0, Number(m[1]) - 1) : 0;
+    const hit = list[idx];
+    return hit ? { raw: hit, path: "websites[" + idx + "].url", source: "map" } : null;
   }
     // ⚠ A LITERAL ANSWER, for a question whose answer is a fact about the FORM, not about the applicant.
     // Used by the address Type below: the one address a profile holds is the candidate's own residence, so
@@ -7243,10 +7374,22 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
 
   let entryNotes = [];
   if (ats === "oracle") {
+    // LINKS FIRST: it only ever ADDS rows, so doing it before the entry pass keeps its new inputs out
+    // of anything the entry pass reads.
+    try {
+      const lp = await atsOrcFillLinks(act, profile, { log: (m) => console.log("[ApplyPilot][ORC-LINK]", m) });
+      if (lp && lp.records && lp.records.length) results.push(...lp.records);
+      if (lp && lp.notes && lp.notes.length) entryNotes = entryNotes.concat(lp.notes);
+    } catch (e) {
+      entryNotes.push("the links pass failed: " + String((e && e.message) || e));
+      console.log("[ApplyPilot][ORC-LINK] ⛔ the links pass threw:", String((e && e.message) || e));
+    }
     try {
       const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m) });
       if (ep && ep.records && ep.records.length) results.push(...ep.records);
-      entryNotes = (ep && ep.notes) || [];
+      // ⚠ CONCAT, never assign: the LINKS pass above writes into the same list, and an assignment
+      // here silently discarded its notes — the one channel that reports a link we could not add.
+      entryNotes = entryNotes.concat((ep && ep.notes) || []);
     } catch (e) {
       // Completeness over abort, like the sweep above: a broken entry pass must not lose the flat
       // fields this page already filled. It IS reported, because a silently skipped employment
@@ -8533,7 +8676,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
 // ── UMD-lite export (Node tests) ─────────────────────────────────────────────────────────
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue, atsFirstWebsiteValue,
+    detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue, atsFirstWebsiteValue, atsProfileWebsites,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
@@ -8547,6 +8690,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
     atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE, atsInjOrcBlocks, atsOrcEntryValue, atsOrcFillEntries,
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
+    atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,

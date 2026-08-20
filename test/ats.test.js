@@ -3904,3 +3904,66 @@ test("the yes/no commit POLLS its read-back rather than reading once after a fix
   assert.ok(/break;/.test(branch),
     "and it must exit the moment the value agrees, so a widget that was already fast is not slowed");
 });
+
+
+// ── `siteLink` is a REPEATING family, so the ordinal picks WHICH website (operator, 2026-08-20) ──
+test("atsProfileWebsites: every non-empty link, in order, https-normalized and deduped", () => {
+  const p = { websites: [
+    { type: "linkedin", url: "linkedin.com/in/wangykev" },
+    { type: "github", url: "github.com/wangykev" },
+    { type: "portfolio", url: "" },      // the editor keeps blank slots
+    { type: "other", url: "   " },
+  ] };
+  assert.deepStrictEqual(ats.atsProfileWebsites(p),
+    ["https://www.linkedin.com/in/wangykev", "https://www.github.com/wangykev"]);
+  // compaction is what makes an ORDINAL meaningful: "link 2" is the second website that EXISTS,
+  // not the second row of the profile editor.
+  assert.deepStrictEqual(ats.atsProfileWebsites({}), []);
+  // the same url written two ways collapses to one row
+  const dup = ats.atsProfileWebsites({ websites: [{ url: "x.com" }, { url: "https://www.x.com" }] });
+  assert.strictEqual(dup.length, 1, "a url listed twice must not claim two link rows: " + JSON.stringify(dup));
+});
+
+test("the Nth siteLink resolves to the Nth website — not the first one repeated", () => {
+  const p = { websites: [{ url: "linkedin.com/in/kev" }, { url: "github.com/kev" }] };
+  const route = (name) => ats.atsRouteField("oracle", { fieldName: name, widgetType: "text", label: "Link" }, p, {}, {}, null, null);
+  // ⚠ atsMapKey strips a trailing `-<digits>` for Oracle, so EVERY siteLink-N reduces to one map key.
+  // Returning "the first website" filled link 1 correctly and would have written that SAME url into
+  // every further link the moment a second input existed — a duplicate from a rung that looked fine.
+  const r1 = route("siteLink-1"), r2 = route("siteLink-2"), r3 = route("siteLink-3");
+  assert.strictEqual(r1 && r1.raw, "https://www.linkedin.com/in/kev");
+  assert.strictEqual(r2 && r2.raw, "https://www.github.com/kev");
+  assert.ok(!r3 || r3.raw == null,
+    "past the end of the list the extra input stays BLANK — never the last url repeated");
+});
+
+test("the links pass only ADDS what is missing, and is idempotent by url", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsOrcFillLinks");
+  assert.ok(i > 0, "the links pass must exist");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const pass = stripComments(src.slice(i, src.indexOf("\n// ── THE ENTRY PASS", i)));
+
+  // idempotent by url — the form arrives prepopulated for a returning candidate, so without this
+  // every run would grow the list
+  assert.ok(/have\.indexOf\(norm\(u\)\) === -1/.test(pass), "a url already on the form must be skipped");
+  // an existing EMPTY row is used before creating another
+  assert.ok(/\.find\(\(l\) => !l\.value\)/.test(pass),
+    "an empty row already on the form must be filled before pressing Add — otherwise a blank row is " +
+    "left behind for the operator to notice");
+  // the new input is awaited with a monotone poll, never a fixed sleep
+  assert.ok(/now\.count > n/.test(pass), "the new input must be awaited by a monotone poll");
+  // and every write is read-back verified like every other commit here
+  assert.ok(/atsInjReadValue/.test(pass) && /needs_review/.test(pass),
+    "each link write must be read-back verified, and a failure must reach review");
+});
+
+test("the links pass's notes are not discarded by the entry pass", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // ⚠ an assignment here silently dropped the links pass's notes — the one channel that reports a
+  // link we could not add.
+  assert.ok(/entryNotes = entryNotes\.concat\(\(ep && ep\.notes\)/.test(src),
+    "the entry pass must CONCAT onto entryNotes, never assign over it");
+});
