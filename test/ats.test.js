@@ -3900,7 +3900,19 @@ test("the yes/no commit POLLS its read-back rather than reading once after a fix
   // two of three REQUIRED ORC yes/no questions came back "click not reflected (read null)" at 22ms
   // on a run where the same fields had committed at 31ms minutes earlier. ORC's pill flips its
   // aria-pressed on a Knockout re-render.
-  assert.ok(/for \(let i = 0; i < \d+; i\+\+\)/.test(branch), "the read-back must be polled");
+  // ⚠⚠ A DEADLINE, NOT AN ITERATION COUNT. An iteration count is a PROXY for time and every proxy
+  // breaks when the clock underneath it changes — this bit three times in one day: a single read at
+  // 150ms; then 10 iterations on the ADAPTIVE pace, which collapsed 1.5s into 196ms; then 24
+  // iterations that only passed because the STARVED SW clock made each one ~500ms, and went blank
+  // again the moment page-clock pacing made the paces honest.
+  assert.ok(/Date\.now\(\) < ynDeadline/.test(branch),
+    "the read-back must poll against a DEADLINE, so it does not care which clock is underneath it");
+  assert.ok(!/for \(let i = 0; i < \d+; i\+\+\)[\s\S]{0,200}atsInjReadValue/.test(branch),
+    "an iteration count is not a budget");
+  // …and a press that never registered is re-clicked, gated on nothing being pressed yet — a blind
+  // second click on a TOGGLE would un-press what the first one set.
+  assert.ok(/nothingPressed/.test(branch),
+    "a re-click must be gated on the read-back still showing nothing pressed");
   assert.ok(/break;/.test(branch),
     "and it must exit the moment the value agrees, so a widget that was already fast is not slowed");
   // ⚠⚠ AND IT MUST PACE ON WALL CLOCK. `act.delay` is the ADAPTIVE pace and collapses to ~15ms on a

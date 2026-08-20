@@ -8675,7 +8675,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
     const want = candidates.find((c) => c === "Yes" || c === "No") || candidates[0];
-    const r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
+    let r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
     // ⚠⚠ POLL THE READ-BACK — a single read after a fixed delay is the one thing the standing pacing
     // rule forbids, and it bit exactly as predicted. Live 2026-08-20 on ORC, two of three required
     // yes/no questions came back `needs_review · yes/no click not reflected (read null)` at 22ms,
@@ -8687,26 +8687,41 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // Ashby is on this path too and only gains: the loop exits the moment the value agrees, so a
     // widget that was already fast is not slowed, and one that is slow now succeeds instead of
     // failing. The predicate is monotone — the value can only be noticed late, never missed.
-    // ⚠ GRANULARITY IS THE COST HERE, not the widget. At 10 × 200ms plus a CDP round-trip each, a
-    // flip that lands late pays the WHOLE loop — measured 5227ms and 3378ms on commits that had
-    // already succeeded. More, shorter reads exit at the first agreeing read instead.
+    // ⚠⚠ A BUDGET, NOT AN ITERATION COUNT — and this is the THIRD time the same trap has bitten in
+    // one day, so it is worth stating as a rule: an iteration count is a PROXY for time, and every
+    // proxy breaks when the clock underneath it changes.
+    //   • first written as one read after a fixed 150ms  → too early, both fields unfilled;
+    //   • then 10 × 150ms with `act.delay`               → the ADAPTIVE pace collapsed to ~15ms, so
+    //                                                      the "1.5s" poll finished in 196ms;
+    //   • then 24 × 120ms with `delayFull` on the STARVED SW clock → each pace really cost ~500ms,
+    //     so it accidentally waited ~5s and PASSED. Turning the page clock on made the paces honest,
+    //     the same 24 iterations became ~2.9s, and both fields went blank again.
+    // A deadline does not care which clock is underneath it.
+    //
+    // ⚠ AND RE-CLICK A PRESS THAT DID NOT REGISTER. Same finding as ORC's pickers: this widget
+    // sometimes ignores the first activation. Re-clicking is safe here precisely BECAUSE it is gated
+    // on the read-back still showing nothing pressed — on a toggle, a blind second click would
+    // un-press what the first one set.
     let back = null;
-    for (let i = 0; i < 24; i++) {
-      // ⚠⚠ `delayFull`, NOT `delay`. `act.delay` is the ADAPTIVE pace — it collapses to ~15ms on a
-      // visible tab, which is right for spacing actuation and WRONG for a settle. With it, this
-      // "10 × 150ms" poll finished in 196ms and 234ms on a live run and reported both required
-      // yes/no fields as "click not reflected (read null)". Exactly the trap CLAUDE.md names for
-      // Workday's settles: an adaptive delay makes a half-rendered page look stable.
+    const ynDeadline = Date.now() + 8000;
+    let clicks = 1;
+    while (Date.now() < ynDeadline) {
       await act.delayFull(120);
       back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
       if (back && back.ok && atsLib.normalize(String(back.value || "")) === atsLib.normalize(want)) break;
+      const nothingPressed = !(back && back.ok && String(back.value || "").trim());
+      if (nothingPressed && clicks < 3 && Date.now() - (ynDeadline - 8000) > clicks * 1800) {
+        clicks++;
+        r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
+      }
     }
     rec.after = back && back.ok ? back.value : null;
     rec.options = f.options || ["Yes", "No"];
     const okv = !!(r && r.ok) && atsLib.normalize(String(rec.after || "")) === atsLib.normalize(want);
     rec.status = okv ? "filled" : "needs_review";
     rec.verified = okv;
-    if (!okv) rec.detail = "yes/no click not reflected (read " + JSON.stringify(rec.after) + ")";
+    if (!okv) rec.detail = "yes/no click not reflected after " + clicks + " press(es) over 8s (read " + JSON.stringify(rec.after) + ")";
+    else if (clicks > 1) rec.detail = "took " + clicks + " press(es) — the first did not register";
     return true;
   }
 
