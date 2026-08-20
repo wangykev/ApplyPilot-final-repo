@@ -35,7 +35,9 @@ const atsLib = (typeof module !== "undefined" && module.exports)
       recognizeRelocationQuestion: recognizeRelocationQuestion, relocationCandidates: relocationCandidates,
       // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
       // join/split exactly the way groups do — see the multiselect commit path.
-      joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN };
+      joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN,
+      // Work-experience bullets → one prose block for a "Responsibilities" textarea.
+      joinBullets: joinBullets };
 const atsFd = (typeof module !== "undefined" && module.exports)
   ? require("./fill-driver.js")
   : { resolve: resolve, buildReviewBundle: buildReviewBundle, buildBucketIndex: buildBucketIndex,
@@ -297,6 +299,24 @@ const ATS_STATIC_MAPS = {
     // almost certainly varies by `country`. Mapping the wrong one files the applicant's state as a
     // county, i.e. a confidently wrong value, which is worse than reaching review. Resolve from the
     // live label first, then map. Left here as a named gap so it is not mistaken for an oversight.
+    // ── §2 documents. The résumé route + attach already exist (kind:"resume" → act.attachResume);
+    // ORC only ever needed the map entry, which is why a REQUIRED résumé reached review as
+    // "no profile mapping for this question" on a run that was otherwise clean.
+    //
+    // ⚠ ORDER IS THE OPPOSITE OF iCIMS, AND THAT IS DELIBERATE. iCIMS parses the upload SERVER-SIDE
+    // and re-renders the whole panel with the result, so its résumé must go on BEFORE any value is
+    // written (atsIcimsResumeStage). Oracle's résumé sits on a LATER STEP than the fields it could
+    // disturb, and Oracle's own parse offer is the section-0 résumé-import banner, which we never
+    // press — so the ordinary in-loop attach is correct here and no pre-stage is needed. Do not
+    // "unify" the two: the reason they differ is WHEN the tenant re-renders the form.
+    "resume-upload": { kind: "resume" },
+    // Operator-supplied documents. Same reasoning as iCIMS' cover_letter: a cover letter is the
+    // operator's own voice and an extra attachment is theirs to choose, so neither is invented.
+    "cover-letter-upload": { kind: "skip", detail: "cover letter — operator-supplied (not modeled)" },
+    "attachment-upload": { kind: "skip", detail: "extra attachment — the operator's to choose" },
+    // ⚠ `siteLink-<n>` IS A NUMBERED FAMILY (<candidate-links>), and atsMapKey strips the trailing
+    // `-<digits>` for Oracle, so this one key serves every rendered row.
+    "siteLink": { kind: "website" },
     // E-signature (§4). The Workday signature rule: a signature NAME is the candidate's own name and
     // fills deterministically. ORC showed no signature DATE on the tenants observed.
     "fullName": { compose: "full_name" },
@@ -451,6 +471,18 @@ function atsComposeValue(kind, profile) {
     return (v && String(v).trim()) || null;
   }
   return null;
+}
+
+// ⚠ THE FIRST NON-EMPTY WEBSITE, IN THE PROFILE'S OWN ORDER — not "the LinkedIn one". The profile
+// keeps `websites` as an ordered list WITH BLANK SLOTS (the portfolio and "other" rows are usually
+// empty strings), so a type-keyed lookup answers nothing for a generic "Website" field while a naive
+// `websites[0].url` can hand a form an empty string to type into a url input. "First that exists"
+// gives a candidate who filled only GitHub a real link, and gives nobody a blank one.
+// ONE row is filled because ORC renders one `siteLink-<n>` at a time; adding more is the operator's.
+function atsFirstWebsiteValue(profile) {
+  const ws = Array.isArray(profile && profile.websites) ? profile.websites : [];
+  const hit = ws.find((w) => w && String(w.url || "").trim());
+  return hit ? atsLib.ensureHttps(String(hit.url).trim()) : null;
 }
 
 function atsWebsiteValue(profile, type) {
@@ -4165,6 +4197,103 @@ function atsInjOrcAuthScan() {
 // each would otherwise press the other's button.
 var ATS_ORC_ENTRY_MAX = 8;   // same backstop as ATS_ENTRY_MAX: a runaway Add loop is worse than a short history
 
+// ⚠ A REPEATING BLOCK WITH ZERO INPUTS CANNOT BE FOUND BY THE FIELD SCAN, which is the whole reason
+// this read exists. ORC builds Experience / Education entries ON DEMAND — recon measured §3 at "0
+// inputs" — so the block is a heading and an Add button and nothing else until something is pressed.
+// The scan derives a field's block from its ANCESTOR, so a block with no fields contributes nothing
+// and the entry pass would conclude the section is absent. Live 2026-08-19 that is exactly what
+// happened: step 2 reported 4 fields (three uploads and a link) and the whole employment history
+// went unfilled, with nothing in the log saying a block had been skipped.
+function atsInjOrcBlocks() {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // VISIBLE blocks only, and for the standing ORC reason: every step is mounted at once and the
+  // inactive ones report aria-hidden="false" at 0×0, so geometry is the trustworthy signal here.
+  return { ok: true, blocks: [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .map((b) => ({ title: t(b.querySelector("apply-flow-block-title")),
+                   inputs: b.querySelectorAll("input, textarea, select").length,
+                   addCaption: ([...b.querySelectorAll("button")].filter(vis).map(t)
+                     .find((c) => /^add\b/i.test(c))) || null }))
+    .filter((b) => b.title) };
+}
+
+// ⚠⚠ WHAT DID THE SCAN NOT SEE? A scan is a CONVENIENCE LIST, NOT AN INVENTORY — the Workday lesson,
+// written down there after an approved field turned out to be absent from `cdpPageScan.fields` twice
+// live. This makes the same gap VISIBLE on Oracle instead of leaving it to be noticed by a human
+// reading the form: live 2026-08-19 step 3 recorded 7 fields while the operator could see THREE
+// REQUIRED yes/no application questions on it, and nothing anywhere said a control had been missed.
+// A missing required field is not a cosmetic gap — it blocks the step and the walk halts on a page
+// that looks, in the log, like it filled cleanly.
+//
+// It reports rather than classifies (the standing split: the page answers what it can observe, the
+// judgement lives SW-side), and it reports the ROW CLASS specifically, because the ORC classifier
+// keys the widget off `div.input-row--<kind>` — so an unrecognised row class is the answer to "why
+// was this not scanned?" in the same line that raises the question.
+function atsInjOrcUnclaimed(claimedNames) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const claimed = new Set((claimedNames || []).map(String));
+  const secs = [...document.querySelectorAll("apply-flow-section")].filter(vis);
+  if (!secs.length) return { ok: true, unclaimed: [] };
+
+  const seen = new Map();   // group key → report
+  for (const sec of secs) {
+    const controls = [...sec.querySelectorAll("input, select, textarea")]
+      .filter((e) => e.type !== "hidden" && vis(e));
+    for (const e of controls) {
+      // ⚠ A DECOY IS NOT AN OVERSIGHT. Same declared-intent test as the scan (LOCKSTEP with
+      // atsDecoyKind): reporting the honeypot as "a field we missed" would invite someone to fix it
+      // by filling it, which is the one thing that must never happen.
+      const nm = ((e.name || "") + " " + (e.getAttribute("aria-label") || "")).replace(/\s+/g, " ");
+      if (/\bhoney[\s_-]?pot\b/i.test(nm)) continue;
+      if (e.getAttribute("aria-hidden") === "true" && e.getAttribute("tabindex") === "-1") continue;
+
+      // Radios and checkboxes group by `name`, so a yes/no pair reports ONCE rather than twice —
+      // otherwise a three-question step reads as six missing controls.
+      const isGroup = e.type === "radio" || e.type === "checkbox";
+      const key = (isGroup && e.name) ? "group:" + e.name : (e.name || e.id || "");
+      if (!key) continue;
+      // ⚠ THE SCAN KEYS A GROUP TWO WAYS — `group:<name>` when the inputs share a name, and
+      // `group:<label-slug>` when they do not (measured: `group:ethnicity` next to
+      // `group:select-the-races-you-identify-with` on one step). Testing only one shape makes the
+      // OTHER one look unscanned, so a correctly-filled races group would be reported as missing
+      // every run and the real signal would be lost in it.
+      const slug = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      const rowEl = e.closest("div.input-row") || e.closest("[class*=input-row]");
+      const q = isGroup
+        ? ((e.closest("fieldset") && e.closest("fieldset").querySelector("legend") ? t(e.closest("fieldset").querySelector("legend")) : "")
+           || t(rowEl ? rowEl.querySelector(".input-row__label, label") : null))
+        : "";
+      if (claimed.has(e.name || "") || claimed.has(e.id || "") || claimed.has(key)) continue;
+      if (isGroup && q && claimed.has("group:" + slug(q))) continue;
+      // ⚠ OVER-REPORTING IS THE SAFE DIRECTION and this stays a DIAGNOSTIC: a false positive costs
+      // one noisy log line, while a miss costs a required field that silently never gets filled. The
+      // line carries the row class, the block and the question, which is enough to dismiss a false
+      // positive at a glance.
+      if (seen.has(key)) { const r = seen.get(key); r.count++; if (isGroup && t(e.closest("label")) ) r.options.push(t(e.closest("label")).slice(0, 40)); continue; }
+
+      const row = e.closest("div.input-row") || e.closest("[class*=input-row]");
+      const rowClass = row ? String(row.className || "").split(/\s+/).filter((c) => /input-row/.test(c)).join(" ") : null;
+      const block = e.closest("apply-flow-block");
+      const lbl = (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "")
+        || t(e.closest("label")) || e.getAttribute("aria-label") || "";
+      // The QUESTION for a grouped control is the fieldset's legend, not the option's own label.
+      const legend = isGroup ? (t((e.closest("fieldset") || {}).querySelector ? e.closest("fieldset").querySelector("legend") : null)
+        || t(row ? row.querySelector(".input-row__label, label") : null)) : "";
+      seen.set(key, {
+        key, name: e.name || null, id: e.id || null, type: e.type, tag: e.tagName.toLowerCase(),
+        role: e.getAttribute("role") || null, grouped: isGroup, count: 1,
+        question: (legend || lbl || "").slice(0, 120),
+        options: isGroup && t(e.closest("label")) ? [t(e.closest("label")).slice(0, 40)] : [],
+        rowClass, block: block ? t(block.querySelector("apply-flow-block-title")).slice(0, 60) : null,
+        required: e.required === true || e.getAttribute("aria-required") === "true"
+          || !!(row && /required/.test(String(row.className || ""))),
+      });
+    }
+  }
+  return { ok: true, unclaimed: [...seen.values()] };
+}
+
 function atsInjOrcEntryState(blockTitlePattern) {
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -4254,6 +4383,216 @@ var ATS_ORC_ENTRY_MAPS = {
     // an employer reads is exactly the confidently-wrong class.
   },
 };
+
+// Resolve ONE field of ONE entry. Pure, so the kinds are unit-pinnable without a page.
+//
+// ⚠ EVERY VALUE COMES FROM THE ENTRY, NEVER FROM THE PROFILE ROOT — the iCIMS seal, and it holds for
+// the same reason: a "City" inside an Experience entry is the EMPLOYER's city, so answering it from
+// the candidate's home address is a DIFFERENT FACT, not a near-miss. A kind that cannot answer
+// returns null and the caller reports the field UNANSWERED rather than falling through to a wider
+// scope.
+function atsOrcEntryValue(spec, entry) {
+  if (!spec || !entry) return null;
+  const raw = (k) => {
+    const v = entry[k];
+    return v === undefined || v === null || (typeof v === "string" && !v.trim()) ? null : v;
+  };
+  if (spec.kind === "skip") return null;
+  if (!spec.kind) { const v = raw(spec.path); return v == null ? null : String(v); }
+
+  // "Tallahassee, FL" → the city half. The profile stores one `location` string per entry and ORC
+  // asks for the parts separately, so the comma is the form's own delimiter, not an inference.
+  if (spec.kind === "city_of") {
+    const loc = raw(spec.path);
+    if (!loc) return null;
+    const first = String(loc).split(",")[0].trim();
+    return first || null;
+  }
+  // ⚠ THE COUNTRY IS IMPLIED BY THE STATE, AND ONLY WHEN THE STATE IS ONE WE RECOGNISE. A US state
+  // abbreviation implies the US; anything else returns null rather than guessing a country from a
+  // city name. Same rule the iCIMS education entry uses, and the same reason: a wrong country on an
+  // employment record is a confidently wrong fact, and blank is recoverable at review.
+  if (spec.kind === "country_of") {
+    const loc = raw(spec.path);
+    if (!loc) return null;
+    const parts = String(loc).split(",").map((x) => x.trim()).filter(Boolean);
+    const tail = parts.length > 1 ? parts[parts.length - 1] : "";
+    if (!tail) return null;
+    const ab = atsLib.REGION_ABBREV || {};
+    const up = tail.toUpperCase();
+    const known = Object.prototype.hasOwnProperty.call(ab, up)
+      || Object.keys(ab).some((k) => String(ab[k]).toLowerCase() === tail.toLowerCase());
+    return known ? "United States" : null;
+  }
+  if (spec.kind === "join") {
+    const v = raw(spec.path);
+    if (!v) return null;
+    return Array.isArray(v) ? (atsLib.joinBullets ? atsLib.joinBullets(v) : v.join("\n")) : String(v);
+  }
+  // A month-precision date, passed through as the profile stores it ("2025-05"). The WIDGET decides
+  // how it is entered, which is read live rather than assumed — see the entry pass's field report.
+  if (spec.kind === "date") { const v = raw(spec.path); return v == null ? null : String(v); }
+  return null;
+}
+
+// ── THE ENTRY PASS ───────────────────────────────────────────────────────────────────────
+// One entry at a time: OPEN → read the form ORC just built → fill → COMMIT → confirm it closed.
+//
+// ⚠ DISCOVERY-FIRST, AND DELIBERATELY SO. Recon could not describe this form because it does not
+// exist until an Add is pressed ("0 inputs, built on demand"), and the standing rule on this
+// codebase is to trace the real DOM before writing a handler — every hard widget here only cracked
+// after blind guesses failed. So the pass READS the entry form it just created, LOGS every field it
+// found (always, not behind a debug flag: that log is the recon record for the next tenant), fills
+// what the map claims by NAME, and reports the rest as unanswered rather than pretending they were
+// absent. A field the map does not know about is then one line to add, evidenced.
+//
+// ⚠ THE FIELD KEY IS `name`, NEVER `id`. Measured: every ORC control is `id="<name>-<N>"` where N is
+// a render-assignment counter — `country-19` numbers BELOW `email-27` while appearing after it — so
+// an id is an in-visit address and nothing more. The id IS used for the actuation selector, resolved
+// from the same read that produced it, which is the only safe way to use it.
+//
+// ⚠ AND `Add` IS A HOMONYM. The same button opens a blank entry and commits the open one, so both
+// actions are gated on whether a Cancel is present (atsInjOrcEntryAction refuses the wrong one).
+// Pressing it twice in a row on a misread state would silently create an empty entry.
+async function atsOrcFillEntries(act, profile, jc, opts) {
+  const o = opts || {};
+  const log = o.log || (() => {});
+  const records = [], notes = [];
+  const read = await act.eval(atsInjOrcBlocks).catch(() => null);
+  const blocks = (read && read.ok && read.blocks) || [];
+  if (!blocks.length) return { records, notes };
+  const plan = atsOrcEntryPlan(profile, blocks.map((b) => b.title));
+  if (!plan.length) {
+    // Say WHICH blocks were present but not planned — a repeating block we cannot fill must never be
+    // silently absent from the log, because "step 2 had 4 fields" reads as a complete step.
+    const repeat = blocks.filter((b) => b.addCaption);
+    if (repeat.length) {
+      log(`repeating block(s) present but nothing to fill from the profile: ${repeat.map((b) => JSON.stringify(b.title) + " (" + b.addCaption + ")").join(", ")}`);
+      notes.push(`repeating blocks left empty (profile has no entries): ${repeat.map((b) => b.title).join(", ")}`);
+    }
+    return { records, notes };
+  }
+
+  for (const item of plan) {
+    const arr = (profile || {})[item.source] || [];
+    if (item.capped) {
+      // NO SILENT CAPS — the standing rule. Whatever a cap drops is named.
+      log(`⚠ ${item.block}: profile has ${item.capped} entries and the cap is ${ATS_ORC_ENTRY_MAX} — filling ${item.want}, the rest are NOT on the form`);
+      notes.push(`${item.block}: only ${item.want} of ${item.capped} entries filled (cap)`);
+    }
+    for (let i = 0; i < item.want; i++) {
+      const entry = arr[i];
+      const tag = `${item.block} entry ${i + 1}`;
+
+      // ── OPEN ────────────────────────────────────────────────────────────────────────
+      const opened = await act.eval(atsInjOrcEntryAction, item.pattern, "open").catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (!opened || !opened.ok) {
+        log(`⛔ ${tag}: could not open an entry form — ${(opened && opened.error) || "unknown"}`);
+        notes.push(`${tag}: not filled (${(opened && opened.error) || "could not open"})`);
+        break;                       // the block is not workable; do not hammer it
+      }
+      // MONOTONE wait: the form exists once it has inputs. Polled, never a fixed sleep.
+      let st = null;
+      for (let tries = 0; tries < 14; tries++) {
+        await act.delayFull(300);
+        st = await act.eval(atsInjOrcEntryState, item.pattern).catch(() => null);
+        if (st && st.ok && st.open && (st.fields || []).length) break;
+      }
+      if (!st || !st.ok || !(st.fields || []).length) {
+        log(`⛔ ${tag}: pressed ${JSON.stringify(opened.pressed)} but no entry form appeared`);
+        notes.push(`${tag}: not filled (the entry form never rendered)`);
+        break;
+      }
+
+      // ── THE RECON RECORD, EVERY RUN ─────────────────────────────────────────────────
+      log(`${tag} — the form offers ${st.fields.length} field(s): ${st.fields.map((f) => `${f.name || f.id}[${f.role || f.type}]${f.label ? " “" + f.label + "”" : ""}`).join(", ")}`);
+
+      // ── FILL ────────────────────────────────────────────────────────────────────────
+      const map = ATS_ORC_ENTRY_MAPS[item.source] || {};
+      const unmapped = [];
+      for (const f of st.fields) {
+        const key = f.name || "";
+        const spec = map[key] || null;
+        if (!spec) { if (key) unmapped.push(key + (f.label ? " (" + f.label + ")" : "")); continue; }
+        const value = atsOrcEntryValue(spec, entry);
+        const rec = { fieldName: `${item.source}[${i}].${key}`, label: f.label || key,
+                      widgetType: f.role === "combobox" ? "dropdown" : (f.type === "textarea" ? "textarea" : "text"),
+                      isRequired: false, entrySection: item.source, entryIndex: i,
+                      mappedPath: `${item.source}[${i}].${spec.path}`, status: "skipped", after: null, elapsedMs: 0 };
+        if (value == null) {
+          // The seal: an entry field with no answer IN ITS OWN ENTRY stops here. It does NOT fall
+          // through to the label ladder or the AI, either of which would answer it from page-level
+          // profile data — a different fact about a different subject.
+          rec.detail = "this entry has no value for it — left blank rather than answered from elsewhere";
+          rec.flag = "entry-unanswered";
+          records.push(rec); continue;
+        }
+        if (!f.id) {
+          rec.status = "needs_review"; rec.flag = "field-unaddressable";
+          rec.detail = "the entry form rendered this field with no id, so it has no selector to actuate";
+          records.push(rec); continue;
+        }
+        const sel = "#" + (f.id.replace(/([^\w-])/g, "\\$1"));
+        const t0 = Date.now();
+        if (f.role === "combobox") {
+          // ORC's own typeahead — the same primitive step 1 uses, including the composite
+          // first-segment match, because an entry's city picker offers "Tallahassee, Leon, FL" too.
+          const r = await act.eval(atsInjOrcPick, sel, String(value), [String(value)], ATS_ORC_PICK_MS, false, true).catch(() => null);
+          const back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
+          rec.after = back && back.ok ? back.value : null;
+          rec.elapsedMs = Date.now() - t0;
+          const ok = r && r.ok && String(rec.after || "").trim() && !(back && back.invalid);
+          rec.status = ok ? "filled" : "needs_review";
+          if (!ok) { rec.flag = "no-option-match"; rec.detail = `Oracle's list did not accept ${JSON.stringify(String(value))}` + (r && r.rows ? `; it offered ${JSON.stringify(r.rows.slice(0, 4))}` : ""); }
+          else rec.detail = `picked ${JSON.stringify(rec.after)} from the form's own list`;
+        } else {
+          const w = await act.eval(atsInjSetText, sel, String(value)).catch(() => null);
+          const back = await act.eval(atsInjReadValue, "oracle", sel, "text").catch(() => null);
+          rec.after = back && back.ok ? back.value : null;
+          rec.elapsedMs = Date.now() - t0;
+          // Read-back verified like every other commit here: a write that did not stick is
+          // needs_review, never a silent pass.
+          const ok = w && w.ok && String(rec.after || "").trim();
+          rec.status = ok ? "filled" : "needs_review";
+          if (!ok) { rec.flag = "commit-not-accepted"; rec.detail = "wrote the value but the field did not keep it"; }
+        }
+        records.push(rec);
+      }
+      if (unmapped.length) {
+        // Evidence for the next map line, and a review note so an unfilled entry field is visible
+        // rather than merely absent.
+        log(`${tag} — UNMAPPED entry field(s), left blank: ${unmapped.join(", ")}`);
+        notes.push(`${tag}: unmapped field(s) ${unmapped.join(", ")}`);
+      }
+
+      // ── COMMIT ──────────────────────────────────────────────────────────────────────
+      const done = await act.eval(atsInjOrcEntryAction, item.pattern, "commit").catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (!done || !done.ok) {
+        log(`⛔ ${tag}: could not commit — ${(done && done.error) || "unknown"}`);
+        notes.push(`${tag}: filled but NOT committed (${(done && done.error) || "unknown"})`);
+        break;
+      }
+      // MONOTONE again: committed means the open form is gone (no Cancel). A form that stays open is
+      // ORC refusing the entry — almost always a required entry field we left blank — so the pass
+      // CANCELS to leave the block clean rather than abandoning a half-open form that would block
+      // Next, and says so.
+      let closed = false;
+      for (let tries = 0; tries < 14; tries++) {
+        await act.delayFull(300);
+        const now = await act.eval(atsInjOrcEntryState, item.pattern).catch(() => null);
+        if (now && now.ok && !now.open) { closed = true; break; }
+      }
+      if (!closed) {
+        log(`⛔ ${tag}: pressed ${JSON.stringify(done.pressed)} but the entry form stayed open — Oracle is refusing it, usually a required entry field we could not answer`);
+        notes.push(`${tag}: Oracle refused the entry (a required field in it is unanswered)`);
+        await act.eval(atsInjOrcEntryAction, item.pattern, "cancel").catch(() => null);
+        break;
+      }
+      log(`✔ ${tag} committed`);
+    }
+  }
+  return { records, notes };
+}
 
 function atsOrcEntryPlan(profile, blocks) {
   const present = Array.isArray(blocks) ? blocks : [];
@@ -4806,6 +5145,10 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
     if (map.kind === "skip") return { kind: "skip", source: "map", detail: map.detail };
+  if (map.kind === "website") {
+    const url = atsFirstWebsiteValue(profile);
+    return url ? { raw: url, path: "websites[].url", source: "map" } : null;
+  }
     // ⚠ A LITERAL ANSWER, for a question whose answer is a fact about the FORM, not about the applicant.
     // Used by the address Type below: the one address a profile holds is the candidate's own residence, so
     // "Home" is not a guess and there is no profile field to read it from. Still a CANDIDATE list through
@@ -6262,6 +6605,55 @@ async function atsFinishFill(act, ats, scan, results, credentials) {
   // atsSurfacePrefilled.
   try { await atsSurfacePrefilled(act, ats, scan, results); } catch (e) { /* completeness — never abort */ }
 
+  // ⚠ THE REPEATING ENTRIES, AND THEY MUST RUN AFTER THE FLAT LOOP. Every ORC step is scanned for
+  // flat fields; a repeating block contributes NOTHING to that scan until an Add is pressed, because
+  // ORC builds Experience / Education entries on demand. So the flat pass finishing is exactly the
+  // moment to build them — before it, the fields do not exist; after the counts, the envelope would
+  // under-report (the same ordering mistake atsSurfacePrefilled documents two comments above).
+  //
+  // ⚠ AND ITS RECORDS JOIN `results`, so they reach the review bundle like any other field. An entry
+  // filled but absent from review is worse than one left blank: nobody would know to check it.
+  // ⚠ REPORT WHAT WE DID NOT SEE, BEFORE the entry pass builds anything — otherwise the entry forms
+  // it creates would themselves read as "unclaimed controls" and drown the signal.
+  let unclaimedNotes = [];
+  if (ats === "oracle") {
+    try {
+      const claimed = [];
+      for (const r of results) { if (r.fieldName) claimed.push(r.fieldName); }
+      // The scan's own identity keys: `fieldName` (the durable `name`) plus every id inside its
+      // `inputSel`, since a composite (a date's three spinbuttons) claims several controls at once.
+      for (const f of (scan.fields || [])) {
+        if (f.fieldName) claimed.push(f.fieldName);
+        for (const m of String(f.inputSel || "").matchAll(/#([\w-]+)/g)) claimed.push(m[1]);
+      }
+      const u = await act.eval(atsInjOrcUnclaimed, claimed).catch(() => null);
+      const miss = (u && u.unclaimed) || [];
+      if (miss.length) {
+        for (const m of miss) {
+          unclaimedNotes.push(`${m.required ? "REQUIRED " : ""}${m.grouped ? m.type + " group" : m.tag + "/" + m.type} ${JSON.stringify(m.question || m.key)}` +
+            ` [name=${m.name} row=${m.rowClass || "none"}${m.block ? " block=" + JSON.stringify(m.block) : ""}${m.options.length ? " options=" + JSON.stringify(m.options) : ""}]`);
+        }
+        console.log(`[ApplyPilot][ORC-UNCLAIMED] ⚠ ${miss.length} control(s) on this step were NOT scanned and so were never filled:`);
+        for (const n of unclaimedNotes) console.log("[ApplyPilot][ORC-UNCLAIMED]   • " + n);
+      }
+    } catch (e) { /* a diagnostic must never break a fill */ }
+  }
+
+  let entryNotes = [];
+  if (ats === "oracle") {
+    try {
+      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m) });
+      if (ep && ep.records && ep.records.length) results.push(...ep.records);
+      entryNotes = (ep && ep.notes) || [];
+    } catch (e) {
+      // Completeness over abort, like the sweep above: a broken entry pass must not lose the flat
+      // fields this page already filled. It IS reported, because a silently skipped employment
+      // history reads as a step that had nothing on it.
+      entryNotes = ["the repeating-entry pass failed: " + String((e && e.message) || e)];
+      console.log("[ApplyPilot][ORC-ENTRY] ⛔ the entry pass threw — flat fields are kept:", String((e && e.message) || e));
+    }
+  }
+
   const counts = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
   // DID THIS PAGE'S ASYNC WIDGETS EVER ANSWER? Greenhouse forms sometimes load in a state where their
   // server-backed comboboxes (school / degree / discipline / location) never return anything — the
@@ -6270,7 +6662,7 @@ async function atsFinishFill(act, ats, scan, results, credentials) {
   // full budget on each such field and hand them all to review. This flag lets the RUN decide to
   // reload once and try again, which is the same remedy a human applies.
   const deadAsync = results.filter((r) => r.listUnproven || /never answered our search|suggestions never loaded/i.test(String(r.detail || "")));
-  return { url: scan.url, title: scan.title, results, counts,
+  return { url: scan.url, title: scan.title, results, counts, entryNotes, unclaimedNotes,
     deadAsync: deadAsync.map((r) => r.fieldName),
     needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
 }
@@ -7524,7 +7916,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
 // ── UMD-lite export (Node tests) ─────────────────────────────────────────────────────────
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
+    detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue, atsFirstWebsiteValue,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
@@ -7536,7 +7928,8 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
-    atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE,
+    atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE, atsInjOrcBlocks, atsOrcEntryValue, atsOrcFillEntries,
+    atsInjOrcUnclaimed,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,

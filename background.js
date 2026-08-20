@@ -5676,6 +5676,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       if ((out.deadAsync || []).length) {
         LOG(`the form's own async widget(s) never answered: ${out.deadAsync.join(", ")} — left for review rather than retried`);
       }
+      // ⚠ A REPEATING BLOCK LEFT EMPTY MUST BE SAID OUT LOUD. Live 2026-08-19 step 2 reported "4
+      // field(s)" and the whole employment history was missing — and nothing in the log distinguished
+      // "this step has four fields" from "this step has four fields plus two blocks we did not fill".
+      for (const n of out.entryNotes || []) LOG(`⚠ step ${stepNo}: ${n}`);
       if (!MULTI) break;
 
       // ── GUARD 1: re-read AFTER the fill, because a cascade can reveal the final step ───

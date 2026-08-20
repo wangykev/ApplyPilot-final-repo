@@ -2614,7 +2614,16 @@ test("ATS_STATIC_MAPS.oracle: every mapped path resolves against a real profile 
   };
   const get = (p) => p.split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
   for (const [key, spec] of Object.entries(ats.ATS_STATIC_MAPS.oracle)) {
-    if (spec.compose || spec.kind === "resume" || spec.kind === "skip" || spec.candidates) continue;
+    if (spec.compose || spec.candidates) continue;
+    // ⚠ SKIP BY SHAPE, NOT BY A LIST OF KIND NAMES. This used to name resume/skip explicitly, so
+    // adding `kind:"website"` — which resolves from a LIST and carries no `path` — crashed the guard
+    // instead of skipping it. A kind-named allowlist has to be edited every time a kind is added,
+    // and the failure it produces looks like a broken map rather than a stale test.
+    if (spec.kind && spec.path === undefined) continue;
+    // …but a spec with NEITHER a path nor a kind is exactly what this guard exists to catch.
+    assert.ok(spec.path !== undefined || spec.kind,
+      key + " has neither a `path` nor a `kind` — it can never resolve to anything");
+    if (spec.path === undefined) continue;
     assert.notStrictEqual(get(spec.path), undefined, key + " → " + spec.path + " does not exist on the profile");
   }
 });
