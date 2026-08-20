@@ -272,6 +272,20 @@ const ATS_STATIC_MAPS = {
     // number into the dial-code list — the same class of error as Greenhouse's `country`, which is
     // why it takes the same `kind:"dial"` + tiered ladder.
     "phoneNumber": { kind: "dial", path: "personal_info.country_phone_code", altPath: "personal_info.dialing_code" },
+    // ⚠ `title` IS A SALUTATION (Mr./Mrs./Dr./Professor/Frau/Dipl. Ing. — 17 rows measured), NOT a
+    // job title, and it sits in the NAME block between lastName and middleNames. The profile stores
+    // no salutation, so the right value is BLANK.
+    //
+    // It is CLAIMED rather than left unmapped, and that is the whole point: unmapped, its label
+    // normalizes to "title", which collides with one of the most common taught-bucket wordings there
+    // is — live 2026-08-19 an operator bucket answered it "Characterization and Test Automation
+    // Intern", i.e. a job title typed into a salutation picker. The bucket is not even wrong in
+    // general ("Title" means job title on nearly every other form); only the PLATFORM ID can tell the
+    // two apart, which is why recognition has to happen here. Same shape as the clearance rung and
+    // `may_contact`: claiming a question we cannot answer is what keeps the guessers off it.
+    // (It committed nothing that run — the salutation list held no such row — but on a form whose
+    // picker accepts free text it would have.)
+    "title": { kind: "skip", detail: "salutation (Mr./Ms./Dr.) — the profile stores none, so it stays blank; claimed so a \"Title\" bucket cannot answer it with a JOB title" },
     // Address. `country` is the ADDRESS country (a tiered profile array), not the phone's.
     "country": { path: "personal_info.country" },
     "addressLine1": { path: "personal_info.address_line_1" },
@@ -3441,6 +3455,16 @@ function atsInjPageSignature() {
   const fr = document.getElementById("icims_content_iframe") || document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
   const h = document.querySelector("h1, h2");
   return {
+    // ⚠ `ok` IS LOAD-BEARING, NOT DECORATION (live 2026-08-19). Every other atsInj* fn returns it, so
+    // a caller naturally writes `r && r.ok ? r : null` — and runOrcPreForm's did. This function did
+    // NOT return it, so that guard turned EVERY successful read into null: both sides of the compare
+    // were null, atsSignatureChanged's deliberately-conservative "an unreadable side is no change"
+    // rule then said false forever, and every ORC waitForChange ran its FULL budget every time
+    // (measured: 15697ms of a 15000ms budget, 20228ms of 20000ms — 36s per run). The flow still
+    // worked, because the loop's next round re-scans and sees the new view, which is exactly why it
+    // hid: a wait that always times out looks like a slow page, and the tempting fix is a bigger
+    // budget. Nothing was wrong with the budget.
+    ok: true,
     url: String(location.href).split("#")[0],
     frameSrc: fr ? String(fr.getAttribute("src") || fr.src || "").split("#")[0] : null,
     controls: document.querySelectorAll(q).length,
@@ -6539,7 +6563,17 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     rec.flag = rec.flag || "no-option-match";
     rec.detail = "none of " + JSON.stringify((candidates || []).slice(0, 4)) + " matched Oracle's list" +
       (last && last.rows && last.rows.length ? "; it offered " + JSON.stringify(last.rows.slice(0, 6)) : "") +
-      (last && last.error === "no-results" ? " (the field returned \"No results\" — a dependent geo picker whose parent is not committed does this)" : "");
+      // ⚠ ATTRIBUTE THE CAUSE ONLY WHERE IT CAN APPLY. This said "a dependent geo picker whose parent
+      // is not committed does this" on EVERY no-results field, so a live run printed that explanation
+      // for `title` — a salutation list in the name block, with no parent and no cascade. A confident
+      // wrong diagnosis is worse than none: the standing lesson is that a misattributed message sends
+      // the next debugging round at the wrong subsystem (it cost one round on iCIMS' "no options" vs
+      // "awaiting parent"). A non-geo field gets the plain fact instead.
+      (last && last.error === "no-results"
+        ? (f.searchDriven
+            ? " (the field returned \"No results\" — a dependent geo picker whose parent is not committed does this)"
+            : " (the field returned \"No results\" — the form's list does not contain this answer)")
+        : "");
     return true;
   }
 

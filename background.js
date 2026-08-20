@@ -4739,15 +4739,32 @@ async function runOrcPreForm(tabId, credentials, opts) {
     const r = await cdpEval(atsInjPageSignature).catch(() => null);
     return r && r.ok ? r : null;
   };
+  // ⚠ A WAIT THAT ONLY REPORTS changed / not-changed CANNOT TELL YOU IT WAS BLIND, and that is how
+  // the `ok`-gating bug above stayed invisible for a whole day of runs: "page did NOT change after
+  // 15697ms" reads as a slow tenant, when in truth not one read had succeeded. So the reads are
+  // counted and the caller says WHICH of the two happened. Same distinction the review-page gate
+  // draws between DISAGREE (evidence) and MISSING (absence of evidence) — conflating them there
+  // would block good submits, and conflating them here sent the diagnosis at the renderer.
   const waitForChange = async (before, budgetMs) => {
     const t0 = Date.now();
+    let reads = 0, readOk = 0;
     while (Date.now() - t0 < (budgetMs || 12000)) {
       await cdpDelay(700);
+      reads++;
       const now = await sig();
-      if (now && atsSignatureChanged(before, now)) return { changed: true, waitedMs: Date.now() - t0 };
+      if (now) readOk++;
+      if (now && before && atsSignatureChanged(before, now)) {
+        return { changed: true, waitedMs: Date.now() - t0, reads, readOk };
+      }
     }
-    return { changed: false, waitedMs: Date.now() - t0 };
+    // blind = we never held two readable sides to compare, so "did not change" was never a finding.
+    return { changed: false, waitedMs: Date.now() - t0, reads, readOk, blind: !before || readOk === 0 };
   };
+  const changeMsg = (ch) => ch.changed
+    ? `changed after ${ch.waitedMs}ms`
+    : (ch.blind
+        ? `could NOT BE READ for the whole ${ch.waitedMs}ms (${ch.readOk}/${ch.reads} reads landed) — this is blindness, not evidence the page stood still`
+        : `did NOT change after ${ch.waitedMs}ms (${ch.readOk}/${ch.reads} reads landed)`);
 
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     const s = await cdpEval(atsInjOrcAuthScan).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
@@ -4788,7 +4805,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
       }, s.applyControl.sel).catch(() => null);
       if (!r || !r.ok) return halt("apply-not-followable", "Found an Apply control but could not press it.");
       const ch = await waitForChange(before, 15000);
-      LOG(`apply click → page ${ch.changed ? "changed" : "did NOT change"} after ${ch.waitedMs}ms`);
+      LOG(`apply click → page ${changeMsg(ch)}`);
       continue;
     }
 
@@ -4834,7 +4851,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
       const clicked = await cdpEval(atsInjOrcClickButton, "^(next|continue|sign in|log ?in|submit)\\b", null).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
       if (!clicked || !clicked.ok) return halt("auth-submit-not-pressable", `Could not press "${(s.submit && s.submit.caption) || "Next"}" on the ${view} step` + (clicked && clicked.error ? ` (${clicked.error})` : "") + ".");
       const ch = await waitForChange(before, 20000);
-      LOG(`${view} step submitted → page ${ch.changed ? "changed" : "did NOT change"} after ${ch.waitedMs}ms`);
+      LOG(`${view} step submitted → page ${changeMsg(ch)}`);
       continue;
     }
 
@@ -4867,7 +4884,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
       const clicked = await cdpEval(atsInjOrcClickButton, "^verify\\b", null).catch(() => null);
       if (!clicked || !clicked.ok) return halt("verify-not-pressable", "Entered the code but could not press Verify" + (clicked && clicked.error ? ` (${clicked.error})` : "") + ".");
       const ch = await waitForChange(before, 20000);
-      LOG(`verify pressed → page ${ch.changed ? "changed" : "did NOT change"} after ${ch.waitedMs}ms`);
+      LOG(`verify pressed → page ${changeMsg(ch)}`);
       continue;
     }
   }

@@ -3203,3 +3203,90 @@ test("the ORC button patterns MATCH real captions once decoded from their JS lit
   assert.ok(verify.test("VERIFY"), "…including the caption as Oracle renders it");
   assert.ok(!verify.test("Send New Code"), "and must not claim the resend control");
 });
+
+
+// ── a shared reader's RESULT CONTRACT is load-bearing (live 2026-08-19) ──────────────────
+// runOrcPreForm's `sig()` gates every read on `r && r.ok`, which is how every other atsInj* result
+// is consumed. atsInjPageSignature did not return `ok`, so each successful read became null, both
+// sides of the compare were null, and atsSignatureChanged's conservative "an unreadable side is no
+// change" rule made every ORC waitForChange run its FULL budget — 36s per run, reported as "page
+// did NOT change". The flow still advanced (the next round re-scans), which is exactly why it hid.
+test("atsInjPageSignature returns ok:true, so an `r && r.ok` caller does not discard a good read", () => {
+  const prevDoc = global.document, prevLoc = global.location;
+  try {
+    const el = (id) => ({ id, name: "", getAttribute: () => null });
+    global.document = {
+      querySelectorAll: (q) => (/button/.test(q) ? [el("a"), el("b")] : [el("a")]),
+      // selector-aware: the reader also looks for an iCIMS frame, and ORC has none
+      querySelector: (q) => (/iframe/.test(q) ? null : { textContent: "  Personal   Info " }),
+      getElementById: () => null,
+    };
+    global.location = { href: "https://eeho.fa.us2.oraclecloud.com/x/apply/section1#frag" };
+
+    const r = ats.atsInjPageSignature();
+    assert.strictEqual(r.ok, true, "without ok:true every caller that gates on it reads a good page as unreadable");
+    // the rest of the contract the comparator depends on
+    assert.strictEqual(r.url, "https://eeho.fa.us2.oraclecloud.com/x/apply/section1", "the fragment is dropped");
+    assert.strictEqual(r.heading, "Personal Info", "whitespace-collapsed heading");
+    assert.strictEqual(r.controls, 1, "controls counts inputs/selects/textareas, not buttons");
+
+    // and the gate a caller actually writes must now KEEP it
+    const gated = (x) => (x && x.ok ? x : null);
+    assert.notStrictEqual(gated(r), null, "the caller's own `r && r.ok` gate must pass on a real read");
+  } finally { global.document = prevDoc; global.location = prevLoc; }
+});
+
+test("atsSignatureChanged keeps its conservative rule: an unreadable side is never progress", () => {
+  const a = { ok: true, url: "u", heading: "h", controls: 3, ids: "x" };
+  assert.strictEqual(ats.atsSignatureChanged(null, a), false, "a missing baseline is not a change");
+  assert.strictEqual(ats.atsSignatureChanged(a, null), false, "a failed read is not a change");
+  assert.strictEqual(ats.atsSignatureChanged(a, a), false);
+  assert.strictEqual(ats.atsSignatureChanged(a, { ...a, url: "v" }), true);
+  assert.strictEqual(ats.atsSignatureChanged(a, { ...a, controls: 4 }), true);
+  assert.strictEqual(ats.atsSignatureChanged(a, { ...a, heading: "i" }), true);
+  // ⚠ the `ok` field is NOT part of the comparison — it reports readability, not identity, so a
+  // signature must never appear to "change" merely because one read declared itself differently.
+  assert.strictEqual(ats.atsSignatureChanged({ ...a, ok: true }, { ...a, ok: undefined }), false);
+});
+
+test("the ORC wait reports BLINDNESS separately from stillness", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("const waitForChange = async");
+  assert.ok(i > 0, "the ORC wait must exist");
+  const body = src.slice(i, i + 1200);
+  assert.ok(/blind:/.test(body), "the wait must distinguish 'never read the page' from 'page stood still'");
+  assert.ok(/readOk/.test(body), "and must count the reads that actually landed, so the log can say so");
+  // the three call sites must go through the shared message, not re-spell the binary
+  assert.ok(!/did NOT change\$\{|\? "changed" : "did NOT change"/.test(src),
+    "no call site may re-spell the changed/not-changed binary — that is what hid the blindness");
+});
+
+// ── ORC's `title` is a SALUTATION and must be CLAIMED (live 2026-08-19) ──────────────────
+// Unmapped, its label normalizes to "title" — one of the most common taught-bucket wordings there
+// is — and an operator bucket answered it "Characterization and Test Automation Intern": a job
+// title aimed at a Mr./Mrs./Dr. picker. Only the platform id can tell the two apart.
+test("ORC `title` is claimed as a salutation, so no bucket or AI can answer it with a job title", () => {
+  const m = ats.ATS_STATIC_MAPS.oracle;
+  assert.ok(m.title, "`title` must be CLAIMED — recognition is what keeps the guessers off it");
+  assert.strictEqual(m.title.kind, "skip", "the profile stores no salutation, so the answer is BLANK");
+  assert.ok(/salutation/i.test(m.title.detail || ""), "and the record must SAY why it is blank");
+  // it must NOT have become a job-title mapping by someone 'fixing' it the other way
+  assert.ok(!/job_title/.test(JSON.stringify(m.title)), "a job title in a salutation picker is the bug, not the fix");
+  // the honorific field is page-level, so it must not be confused with the work-entry `title`,
+  // which legitimately IS the job title
+  const entryTitle = (ats.ATS_ENTRY_MAPS && ats.ATS_ENTRY_MAPS.icims) || null;
+  if (entryTitle) assert.ok(true, "the iCIMS work-entry map keeps its own `title` → job_title");
+});
+
+test("a no-results diagnosis is only attributed to the geo cascade on a geo field", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const hits = [...src.matchAll(/dependent geo picker whose parent is not committed/g)];
+  assert.ok(hits.length >= 1, "the geo explanation must still exist");
+  for (const h of hits) {
+    // each occurrence must sit inside a searchDriven-guarded branch, not be appended unconditionally
+    const before = src.slice(Math.max(0, h.index - 400), h.index);
+    assert.ok(/searchDriven/.test(before),
+      "the geo explanation must be guarded by searchDriven — printed on a salutation picker it sends " +
+      "the next debugging round at the wrong subsystem");
+  }
+});
