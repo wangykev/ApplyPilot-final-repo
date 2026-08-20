@@ -4565,20 +4565,45 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   if (!kind) return { ok: false, error: "unclassified", rows: texts.slice(0, 4), reopens };
 
   const cands = (kind === "year" ? yearCands : monthCands) || [];
-  let hit = null;
+  // The wording the picker itself uses for this value ("May" / "05" / "5" are all shapes a tenant
+  // may render), taken from the rows in front of us rather than from a hardcoded table.
+  let want = null;
   for (const c of cands) {
-    hit = rows.find((r) => norm(t(r)) === norm(c));
-    if (hit) break;
+    const row = rows.find((r) => norm(t(r)) === norm(c));
+    if (row) { want = t(row); break; }
   }
-  if (!hit) return { ok: false, error: "no-match", kind, rows: texts.slice(0, 6), reopens };
+  if (!want) return { ok: false, error: "no-match", kind, rows: texts.slice(0, 6), reopens };
 
-  hit.scrollIntoView({ block: "nearest" });
-  const rect = hit.getBoundingClientRect();
-  const at = { bubbles: true, cancelable: true, clientX: Math.round(rect.left + rect.width / 2), clientY: Math.round(rect.top + rect.height / 2) };
-  for (const type of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
-    hit.dispatchEvent(type.indexOf("pointer") === 0 ? new PointerEvent(type, at) : new MouseEvent(type, at));
+  // ⚠⚠ THE COMMIT IS TYPE-THEN-**ENTER**, NOT A CLICK ON THE ROW. Measured 2026-08-20: the first
+  // version of this clicked the matching row with the full pointer sequence and ORC ignored it —
+  // both halves of every date came back `commit-not-accepted … got nothing`. atsInjOrcPick has always
+  // committed by typing the value and pressing Enter on the INPUT, and that is the mechanism this
+  // widget actually honours. Fusing the visits was the right idea; changing the commit with it was
+  // not, and it cost a run to find out.
+  //
+  // Typing re-filters the list, which is fine — it filters TO the value we already confirmed is
+  // present, so this cannot invent a match that was not there.
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  el.focus();
+  setter.call(el, "");
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  for (const ch of String(want)) {
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
+    setter.call(el, el.value + ch);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
   }
-  return { ok: true, kind, committed: t(hit), reopens };
+  // Let the filtered list settle before Enter — polled on the rows, not a flat sleep.
+  for (let i = 0; i < 14; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const now = readRows().map(t);
+    if (now.some((x) => norm(x) === norm(want))) break;
+  }
+  el.focus();
+  for (const type of ["keydown", "keypress", "keyup"]) {
+    el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+  }
+  return { ok: true, kind, committed: want, reopens };
 }
 
 function atsInjOrcLinks() {
