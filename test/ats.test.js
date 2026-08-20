@@ -4084,24 +4084,24 @@ test("atsOrcEntryIdentity: a tiered profile value identifies on its most specifi
   assert.strictEqual(ats.atsOrcEntryIdentity("work_experience", null), null);
 });
 
-test("the tile-match skip does not weaken the operator's delete-before-fill instruction", () => {
+test("the FILL always deletes and refills a repeating block — no already-matches skip", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
-  const stripComments = (t) => String(t)
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
   const i = src.indexOf("async function atsOrcFillEntries");
-  const pass = stripComments(src.slice(i, src.indexOf("\n// ⚠⚠ DOES THIS TILE", i) > 0
-    ? src.indexOf("\n// ⚠⚠ DOES THIS TILE", i) : src.indexOf("\nfunction atsOrcEntryPlan", i)));
+  const end = src.indexOf("\nfunction atsOrcEntryPlan", i);
+  const pass = stripJsComments(src.slice(i, end > 0 ? end : i + 20000));
 
-  // the skip must be gated on a FULL match…
-  assert.ok(/atsOrcTilesAlreadyMatch\(item\.source, arr, item\.want, present\)/.test(pass),
-    "the skip must require the whole block to match");
-  // …and the delete path must still be there for everything else
+  // ⚠ THE SKIP IS GONE (operator, 2026-08-20). It left correct tiles in place, which meant the entry
+  // FIELDS never reached review — first not at all, then as opaque one-row summaries. The operator's
+  // division of labour puts leaving-alone on the REHEARSAL, not the fill: the fill clicks Add,
+  // exposes the entry form and fills it, so those fields are reviewable and editable.
+  assert.ok(!/atsOrcTilesAlreadyMatch\(item\.source/.test(pass),
+    "the fill must not skip a block because its tiles already match — the fields must reach review");
   assert.ok(/atsInjOrcDeleteTile/.test(pass),
-    "a partial match must still delete and refill — that is the operator's instruction");
-  // the skip must come BEFORE the delete, or it can never fire
-  assert.ok(pass.indexOf("atsOrcTilesAlreadyMatch") < pass.indexOf("atsInjOrcDeleteTile"),
-    "the match check has to precede the delete loop");
+    "delete-before-fill is the operator's instruction and must remain");
+
+  // …and the per-field records are what makes the entries reviewable at all
+  assert.ok(/fieldName: `\$\{item\.source\}\[\$\{i\}\]\.\$\{key\}`/.test(pass),
+    "each entry field gets its OWN record — a per-entry summary row cannot be checked or corrected");
 });
 
 
@@ -4248,26 +4248,8 @@ test("both choice-commit paths grade through the one predicate", () => {
 // Education and Links from the review bundle — on a run where all three were correctly on the form.
 // That is worse than the slowness it replaced: a reviewer cannot approve an application whose work
 // history they cannot see, and "absent" reads as "not filled" rather than "already right".
-test("a block skipped because it already matches STILL reports its entries", () => {
-  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
-  const i = src.indexOf("atsOrcTilesAlreadyMatch(item.source, arr, item.want, present)");
-  assert.ok(i > 0, "the skip must exist");
-  const stripComments = (t) => String(t)
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
-  const branch = stripComments(src.slice(i, i + 1800));
-
-  assert.ok(/records\.push\(/.test(branch),
-    "a skipped-because-correct block must still emit one record per entry — the review page shows " +
-    "what the application CONTAINS, not what this run happened to type");
-  assert.ok(/entrySection: item\.source/.test(branch) && /entryIndex: k/.test(branch),
-    "the records must carry the section and index so review groups them as entries");
-  assert.ok(/status: "filled"/.test(branch) && /verified: true/.test(branch),
-    "they are verified — the very check that allowed the skip compared them against the profile");
-  assert.ok(!/flag:/.test(branch), "and they are NOT flagged: nothing here needs a human");
-  // the skip must still actually skip the work
-  assert.ok(/continue;/.test(branch), "the entry-filling work is still skipped");
-});
+// (The "a skipped block still reports its entries" test retired with the skip itself — the fill now
+// always refills, so the per-field records above are the only shape an entry reaches review in.)
 
 test("links already on the form are reported, and not DOUBLED by the flat loop's record", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");

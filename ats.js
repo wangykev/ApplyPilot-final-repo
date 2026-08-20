@@ -1696,7 +1696,16 @@ function atsInjScan(ats) {
         const key = boxes[0].name || ("group:" + String(rawQ).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48));
         if (seen.has(key)) continue; seen.add(key);
         push({ fieldName: key, inputSel: boxes.map((b) => "#" + esc(b.id)).join(", "),
-          widgetType: isRadio ? "radio" : (boxes.length > 1 ? "checkbox_group" : "checkbox"),
+          // ⚠⚠ A ONE-BOX GROUP IS STILL A GROUP (operator, 2026-08-20). Typing it `checkbox` made the
+          // review editor render a bare boolean and DROP the options, so the Hispanic/Latino question
+          // reached the operator as `Ethnicity — Unchecked`: the group's question with an opaque
+          // state word, and no sign of what was being declined. The distinction that matters is
+          // structural, not arity — in a `--radiogroup` row the QUESTION and the OPTION TEXT are
+          // different elements ("Ethnicity" vs "I am Hispanic or Latino"), so collapsing to a boolean
+          // always loses the half that carries the meaning. A genuine standalone checkbox (branch 3,
+          // `div.input-row--checkbox`, e.g. a terms box) keeps `checkbox`, because there the label IS
+          // the meaning and a boolean says everything.
+          widgetType: isRadio ? "radio" : "checkbox_group",
           label: stripStar(rawQ) || key, isRequired: boxes.some((b) => reqOf(b, rawQ)),
           value: boxes.filter((b) => b.checked).map(optOf).join("; ") || null,
           options: boxes.map(optOf).filter(Boolean),
@@ -5244,29 +5253,25 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
     const present = (tiles0 && tiles0.ok && tiles0.tiles) || [];
     const isSkills = item.source === "skills";
 
-    if (present.length && !isSkills && atsOrcTilesAlreadyMatch(item.source, arr, item.want, present)) {
-      log(`${item.block}: the ${present.length} tile(s) on the form ALREADY match the profile — nothing to retype (deleting and re-entering them would change nothing and cost an open, ${item.want * 2} picker visits and a commit each)`);
-      // ⚠⚠ BUT STILL REPORT THEM. Skipping the WORK must not skip the RECORD: the review page has to
-      // show what the application CONTAINS, not merely what this run happened to type. Live
-      // 2026-08-20 the operator found Experience, Education and Links missing from review entirely on
-      // a run where all three were correctly on the form — the optimisation had quietly deleted them
-      // from the bundle.
-      //
-      // That is worse than the slowness it replaced: a reviewer cannot approve an application whose
-      // work history they cannot see, and "absent" reads as "not filled" rather than "already right".
-      // One record per entry, carrying the tile's own summary as the value, `filled` and unflagged
-      // because it was verified against the profile by the very check that let us skip it.
-      for (let k = 0; k < present.length; k++) {
-        records.push({
-          fieldName: `${item.source}[${k}]`, label: `${item.block} entry ${k + 1}`,
-          widgetType: "text", isRequired: false,
-          entrySection: item.source, entryIndex: k,
-          status: "filled", verified: true, after: present[k].text, elapsedMs: 0,
-          detail: "already on the form and it MATCHES your profile — verified, not re-entered",
-        });
-      }
-      continue;
-    }
+    // ⚠⚠ THE TILE-MATCH SKIP IS GONE (operator, 2026-08-20). It fired when the tiles already agreed
+    // with the profile and left them in place, which saved an open, ~2 picker visits per field and a
+    // commit per entry. It cost the review page twice, and the second cost is the one that settles it:
+    //
+    //   • first it emitted NOTHING, so Experience, Education and Links were missing from review
+    //     entirely on a run where all three were correctly on the form;
+    //   • then it emitted one summary record per entry, so review showed four opaque rows
+    //     ("Experience entry 1", "Education entry 1") instead of the FIELDS. A reviewer cannot check
+    //     an employer name they cannot see, and cannot correct one they cannot edit.
+    //
+    // The operator's division of labour is explicit: the FILL clicks Add, exposes the entry form and
+    // fills it — so those fields reach review — and it is the REHEARSAL that leaves a correct value
+    // alone and repairs only a wrong one. Leaving-alone therefore belongs on the replay, not here.
+    // Deleting and re-entering is also what was asked for directly ("make sure you delete old entries
+    // before filling the repeating sections"), and it makes the fill's behaviour uniform: one path,
+    // one shape of record, whatever state the form arrives in.
+    //
+    // The cost is real but it is paid on the ABNORMAL case — a form that arrives prepopulated —
+    // and correctness of the review page outranks it.
     if (present.length && !isSkills) {
       log(`${item.block}: ${present.length} existing tile(s) on the form — deleting before filling: ${JSON.stringify(present.map((x) => x.text.slice(0, 50)))}`);
       let removed = 0;
