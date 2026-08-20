@@ -40,6 +40,8 @@ during 2026-08, so a later date can appear above an earlier one.
 | **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out`, `2026-08-18 — four more tenants: the Apply widget, the bare "Type", and the settle probe` |
 | **Oracle Recruiting Cloud (JET SPA, Knockout, honeypot)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON`, `2026-08-19 (j)`, `2026-08-19 (k)`, `2026-08-19 (l)`, `2026-08-20 (a) — ORC: the whole wizard walked` |
 | **ORC repeating entries (`Add` is a homonym) + `"<CODE> - <Name>"` options** | `2026-08-19 (l) — ORC repeating blocks`, `2026-08-20 (a) — ORC: the whole wizard walked` |
+| **A control that is not a control (button-pair yes/no)** | `2026-08-20 (b) — ORC: a yes/no question is a pair of BUTTONS` — three sweeps blind at once; row class same as a combobox; required on the LABEL class |
+| **The two US EEO demographics must not answer each other** | `2026-08-20 (b)` — label "Ethnicity" + option "I am Hispanic or Latino."; why "an option mentions hispanic" is the wrong test |
 | **A zero-row option read is ABSENCE OF EVIDENCE** | `2026-08-20 (a) — ORC: the whole wizard walked` (date halves + a server-backed degree search, two widgets, same lesson) |
 | **Bot-detection honeypots (a visible field you must NEVER fill)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON` |
 | **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
@@ -5956,3 +5958,103 @@ Step 3: race/ethnicity group, disability, veteran status, e-signature name.
 Still reaching review: `group:ethnicity` (the profile's `"Asian"` is not one of that field's options),
 `ORA_GENDER` (shows "Male" but keeps `cx-select-input--invalid` — holding text it never accepted), and
 the Education entry's Degree.
+
+
+## 2026-08-20 (b) — ORC: a yes/no question is a pair of BUTTONS, and three sweeps missed it at once
+
+The operator filled a form and found step 3's yes/no questions empty. The run's tab was still open on
+`…/apply/section/3`, which settled it immediately: the `Application Questions` block is **VISIBLE at
+680×331** with all three questions rendered, and holds **zero `input` / `select` / `textarea`**.
+
+### The widget
+
+```html
+<div class="input-row input-row--has-picker" data-bind="…">
+  <form-element-label params="…">
+    <label class="input-row__label input-row__label--required" for="302960759052341-13">
+      Are you an ex-Oracle employee? Answer “Yes” if …
+  <div class="input-row__control-container reset-z-index">
+    <div>
+      <ul role="list" class="cx-select-pills-container" aria-label="Are you an ex-Oracle employee? …">
+        <li role="listitem"><button type="button" class="cx-select-pill-section" aria-pressed="false">Yes</button>
+        <li role="listitem"><button type="button" class="cx-select-pill-section" aria-pressed="false">No</button>
+```
+
+- **`aria-pressed`** is the selected state. No inputs, no `role=radio`, no `radiogroup`.
+- **`ul[aria-label]` carries the whole question**, untruncated and without the required star — cleaner
+  than the label element.
+
+### ⚠⚠ Why every sweep in `ats.js` was blind to it simultaneously
+
+| sweep | why it saw nothing |
+|---|---|
+| the control loop | queries `input, select, textarea` — there is no form control of any kind |
+| the ARIA-only sweep | looks for `radio` / `radiogroup`; these roles are `list` / `listitem` |
+| the block-population settle | counted 0 "inputs" and spent 15s concluding the block was still loading |
+
+So *nothing anywhere* said a field had been skipped. **"Count the controls" was never the right
+question; the right one is "what can be answered here."** The settle now counts pill containers too.
+
+### ⚠ The row class is `input-row--has-picker` — THE SAME as a combobox
+
+Which is why this needs its own scan pass rather than a branch in the control loop: the classifier
+calls the row a picker, looks for an inner `input[role=combobox]`, finds none, and drops the field
+**silently**.
+
+### ⚠ Identity: no id, no name, and the `label[for]` points at an element that does not exist
+
+`<label for="302960759052341-13">` names the per-tenant flexfield, and there is **no element with that
+id** — no input exists. So the durable key is that id with the volatile render counter stripped
+(`302960759052341`), exactly the rule every other ORC field follows (`lastName-21` → `lastName`), and
+the full id is used only for the live selector:
+`div.input-row:has(label[for="<full-id>"]) ul.cx-select-pills-container` (`:has()` confirmed supported).
+
+### ⚠ REQUIRED IS ON THE LABEL CLASS, NOT THE ROW'S
+
+`label.input-row__label.input-row__label--required`. A first probe read the ROW class and concluded
+these were optional — the worst outcome available, because the AI rescue is gated on `isRequired` and
+an optional unmapped field is deliberately left blank. They would have stayed unfilled **and**
+unexplained.
+
+### Almost no new machinery was needed
+
+`yesno` already existed for Ashby — `ATS_CHOICE_WIDGETS`, `ATS_REVIEW_WIDGET`, `atsAiBatchKind`, the
+commit path, and a read branch **already keyed on `aria-pressed`**. Only two things were Ashby-scoped
+(`atsInjClickYesNo` and `atsInjReadValue` both required `.ashby-application-form-field-entry`); both
+now fall back to the element itself as the button container, leaving Ashby byte-identical.
+
+### Live outcome — each question takes a different route, and that is the point
+
+```
+302960759052341 (radio, req) → filled        · "No"  · no known employer matches the company "Oracle"
+                                                       or appears in the question → No (clean miss vs 1 known employer)
+302934951014360 (radio, req) → filled        · "Yes" · work_authorization.authorized_to_work_in_us
+300012168048247 (radio, req) → deferred_ai → filled_review · ai-choice · "No"
+        AI: "…work history includes private companies and academic labs … no prior government
+             employment or contracting."
+```
+
+The ex-Oracle question is the **safety-critical employer-match** one and fills deterministically and
+unflagged (a grounded fact, not absence-reasoning); work authorization comes from the profile; only the
+government question — which no profile field answers — reaches the AI, and it is `filled_review` +
+`ai-choice` with its reasoning attached.
+
+### ⚠ And the same scan settled the ethnicity misroute
+
+`group:ethnicity` has label **"Ethnicity"** and the single option **"I am Hispanic or Latino."** — so it
+is the Hispanic/Latino question, and it had been answered from `race_ethnicity` (`"Asian"`): a
+demographic answered from a DIFFERENT demographic field. It could not commit, so it reached review
+rather than submitting something false, but a tenant wording it as a yes/no dropdown would have taken
+the wrong value silently.
+
+⚠ **"An option mentions Hispanic" is NOT the test**, and an existing regression test caught that version
+within minutes. EEO-1 race categories are routinely SUFFIXED with the phrase as a negation —
+`["Asian (Not Hispanic or Latino)", "White (Not Hispanic or Latino)", "Decline to self identify"]` — so
+both "any option mentions it" and "every option mentions it" misroute a race question. The rule: the
+options talk about **nothing but Hispanic identity** AND offer **no other race** as an alternative.
+Live after the fix:
+
+```
+group:ethnicity                          → skipped · your profile answers this ("No"), so the box stays unchecked
+group:select-the-races-you-identify-with → filled  · "Asian"
+```
