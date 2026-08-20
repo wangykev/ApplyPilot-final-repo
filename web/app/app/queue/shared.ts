@@ -37,6 +37,19 @@ export type QueueItemDetails = {
   reposted?: boolean;
   original_posted_at?: string;
   apply_note?: string;
+  /**
+   * TODO(dup): lockstep with web/lib/discover.ts QueueItemDetails.
+   *
+   * EVERY source that found this posting, including the one in `source`. Written only
+   * when more than one did, so an ordinary single-source row is unchanged and absent
+   * means "just `source`".
+   *
+   * WHY IT EXISTS: discovery dedups at sweep time and keeps the FIRST source's copy, so
+   * `source` answers "who found it first", not "who found it". The per-source tabs need
+   * the second question — without this, a job LinkedIn really did surface vanishes from
+   * the LinkedIn tab because Simplify happened to run earlier.
+   */
+  found_on?: string[];
 };
 
 /** Pull http(s) URLs out of pasted text (one per line or whitespace-separated). */

@@ -518,6 +518,7 @@ document.getElementById("gmail-connect").addEventListener("click", () => {
 // only LOGS. It's the debugging / first-look path — the real flow is /app/run → Discover.
 const discoverSources = () => ({
   simplify: document.getElementById("discover-simplify").checked,
+  zero2sudo: document.getElementById("discover-zero2sudo").checked,
   linkedin: document.getElementById("discover-linkedin").checked,
   handshake: document.getElementById("discover-handshake").checked,
 });
