@@ -4662,8 +4662,29 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           for (const g of group.slice(0, 2)) {
             if (!g.id) { halves.push({ g, kind: null, rows: [] }); continue; }
             const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
-            const cap = await act.eval(atsInjOrcCaptureOptions, sel, ATS_ORC_PICK_MS).catch(() => null);
-            const rows = (cap && cap.options) || [];
+            // ⚠⚠ A ZERO-ROW READ IS ABSENCE OF EVIDENCE, NOT AN EMPTY LIST — so it is retried once,
+            // after confirming the PREVIOUS half's list is gone. Live 2026-08-19: entry 2's startDate
+            // reported `offered [["January","February","March"],[]]` — the month half read fine and
+            // the YEAR half came back empty after burning its whole 8s budget, on the same entry
+            // whose endDate pair read both halves correctly moments later. The capture Escapes and
+            // waits 300ms page-side, but ORC will not open a second picker while the first is still
+            // unmounting, and the standing rule here is that a close is confirmed by the options
+            // being GONE rather than by a delay having elapsed.
+            //
+            // The cost of the retry is one wasted open; the cost of believing the empty read is a
+            // date the pass cannot identify, which refuses the whole entry — measured, twice.
+            let cap = await act.eval(atsInjOrcCaptureOptions, sel, ATS_ORC_PICK_MS).catch(() => null);
+            let rows = (cap && cap.options) || [];
+            if (!rows.length) {
+              await act.delayFull(600);
+              cap = await act.eval(atsInjOrcCaptureOptions, sel, ATS_ORC_PICK_MS).catch(() => null);
+              rows = (cap && cap.options) || [];
+              if (rows.length) log(`  (${key}: an empty option read was retried and came back with ${rows.length} row(s) — the previous half's list was still unmounting)`);
+            }
+            // Pace before the NEXT half opens, and only when this one did not confirm its close:
+            // a confirmed close needs no wait, and an unconfirmed one is exactly the state that
+            // makes the next open read nothing.
+            if (cap && cap.closed === false) await act.delayFull(500);
             const yearish = rows.filter((r) => /^\s*(19|20)\d{2}\s*$/.test(String(r))).length;
             const monthish = rows.filter((r) => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(String(r))).length;
             halves.push({ g, sel, rows, kind: yearish > monthish ? "year" : (monthish > 0 ? "month" : null) });

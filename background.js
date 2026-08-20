@@ -5665,6 +5665,32 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
           break;
         }
         LOG(`step ${st.step != null ? st.step : "?"}${st.total ? " of " + st.total : ""} — sections ${JSON.stringify(st.visibleSections)} visible of ${st.sectionCount} · next=${st.hasNext ? JSON.stringify(st.nextCaption) + (st.nextEnabled ? "" : " (DISABLED)") : "none"} · submit=${st.hasSubmit ? JSON.stringify(st.submitCaption) : "none"}`);
+        // ⚠⚠ A BLOCK CAN BE MOUNTED WITH ITS CONTENTS STILL IN FLIGHT, and the field-set settle
+        // cannot see it. Live 2026-08-19 step 3 reported `"Application Questions" (0 input(s))`
+        // alongside Diversity (7), Veteran (1), Disability (3) and E-Signature (1) — the page was
+        // plainly rendered, and the block holding THREE REQUIRED yes/no questions was empty because
+        // Oracle fetches a requisition's questions separately. The fill then recorded 7 fields on a
+        // step that has 10, and nothing was flagged: not filled, not reviewed, not mentioned.
+        //
+        // The predicate is precise rather than "wait for more fields": a block with an ADD button
+        // legitimately has zero controls (Education / Experience / Skills / Licenses are all built on
+        // demand), so the only suspicious shape is a block with NEITHER controls NOR an add button.
+        // That distinction is what makes this a settle and not a guess — and it is why the block
+        // inventory had to exist before this could be written.
+        const blkT0 = Date.now(), BLK_BUDGET = 15000;
+        let pending = null;
+        while (Date.now() - blkT0 < BLK_BUDGET) {
+          const bl = await cdpEval(atsInjOrcBlocks).catch(() => null);
+          const list = (bl && bl.ok && bl.blocks) || [];
+          pending = list.filter((b) => !b.inputs && !b.addCaption).map((b) => b.title);
+          if (!list.length || !pending.length) break;
+          await cdpDelay(700);
+        }
+        if (pending && pending.length) {
+          // Reported, never fatal: a block that never populates may simply be a heading. But it must
+          // be SAID, because the alternative is a step that looks complete in the log.
+          LOG(`⚠ after ${((Date.now() - blkT0) / 1000).toFixed(1)}s these block(s) still have no controls and no Add button: ${JSON.stringify(pending)} — anything inside them was NOT filled`);
+        }
         emitRunProgress(`Filling step ${st.step != null ? st.step : iter}${st.total ? " of " + st.total : ""}`, "Oracle wizard (never submits)");
       }
 
