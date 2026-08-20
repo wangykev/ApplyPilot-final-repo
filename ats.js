@@ -3681,9 +3681,16 @@ function icimsAuthView(s) {
 // caller supplies it — the ambiguity rules stay SW-side. Commits ONLY on exactly one match: two hits
 // is not a confident answer and returns `ambiguous` with the rows, never a guess.
 // Returns the rows it saw either way, so a miss is diagnosable without a second page contact.
-async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear) {
+async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear, segmentMatch) {
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
+  // ⚠ ORC's GEO ROWS ARE COMPOSITES and no profile value will ever equal one: a postal code offers
+  // "32312, Tallahassee, Leon, FL", a city "Tallahassee, Leon, FL", a county "Leon, FL". Exact
+  // matching therefore refused a REQUIRED field while the widget was showing the answer (live).
+  // `segmentMatch` compares against the row's FIRST comma-segment, which is the form's own delimiter
+  // rather than a guess — so it is structured matching, NOT the loose containment the match ladder
+  // deliberately refuses. "32312" matches "32312, …" and still cannot match "323120, …".
+  const firstSeg = (v) => norm(String(v).split(",")[0]);
   const el = document.querySelector(inputSel);
   if (!el) return { ok: false, error: "not-found:" + inputSel };
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
@@ -3750,13 +3757,14 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear) {
       continue;
     }
     lastRows = rows.map(t);
-    const hits = rows.filter((r) => wants.indexOf(norm(t(r))) !== -1);
+    const hits = rows.filter((r) => wants.indexOf(norm(t(r))) !== -1
+      || (segmentMatch && wants.indexOf(firstSeg(t(r))) !== -1));
     if (hits.length > 1) return { ok: false, error: "ambiguous", query, rows: lastRows, matched: hits.length };
     if (hits.length === 1) {
       const row = hits[0];
       const want = t(row);
       // finding 4: make the typed text agree with the option before committing
-      if (!noClear && norm(el.value) !== norm(want)) {
+      if (!segmentMatch && !noClear && norm(el.value) !== norm(want)) {
         setter.call(el, "");
         el.dispatchEvent(new Event("input", { bubbles: true }));
         for (const ch of want) {
@@ -6488,7 +6496,8 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // "United States of America" produced a nonsense query, and the widget answered "No results"
       // on a field whose option was right there. Same for postalCode ("32312" typed onto "32312").
       // A search box must be cleared before it is searched; that is why the house rule exists.
-      const r = await act.eval(atsInjOrcPick, ref.inputSel, q, [q], ATS_ORC_PICK_MS, false);
+      // ⚠ segmentMatch for a geo picker: its rows are composites keyed on the form's own comma.
+      const r = await act.eval(atsInjOrcPick, ref.inputSel, q, [q], ATS_ORC_PICK_MS, false, !!f.searchDriven);
       last = r;
       if (r && r.ok) {
         // ⚠ READ-BACK IS POLLED, NOT READ ONCE: a read in the same beat as the click returns the
