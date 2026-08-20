@@ -5189,7 +5189,16 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           const yearCands = [String(ym.year)];
           const got_by = {}; const failed = [];
           let reopenTotal = 0;
+          let halfIdx = -1;
           for (const g of group.slice(0, 2)) {
+            halfIdx++;
+            // ⚠ PACE BETWEEN THE HALVES. Committing the first half re-renders the widget, and the
+            // second half's open lands mid-render — measured as a retry firing on EVERY startDate
+            // (4108/4181/4168ms) while endDate, whose widget family is already warm, took
+            // 809/834/795ms with no retry at all. That is systematic, not flaky, so it is cheaper to
+            // wait 250ms once than to spend a failed attempt plus a 400ms recovery pace rediscovering
+            // it on every entry.
+            if (halfIdx) await act.delayFull(250);
             if (!g.id) { failed.push("a half with no id"); continue; }
             const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
             // ⚠ ONE RETRY PER HALF, and only on failure. Committing the first half re-renders the
