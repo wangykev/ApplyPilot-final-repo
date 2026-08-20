@@ -5565,3 +5565,76 @@ the trap that both sides of the comparison must be computed the same way — a m
 "the parse changed the form", and a false `changed` can finish the wait before the parse starts.
 
 **1574 unit tests** (112 iCIMS). The baseline-vocabulary test was confirmed to FAIL on a reverted probe.
+
+
+## 2026-08-20 — Oracle Recruiting Cloud: the wizard walks end to end
+
+Branch `oracle-recruiting`. Twelve live runs on `eeho.fa.us2.oraclecloud.com` job 334325, each on a
+fresh `wangykev+N@gmail.com` account set through the website's Credentials page, so nothing on the form
+was prefilled and every filled value was provably ours.
+
+**Final state of the run:**
+
+```
+✔ walked all 3 step(s) to the end: 1 Personal Info (15f/3r) → 2 Experience (28f/0r) → 3 More About You (7f/3r)
+⛔ reached-final-step — Step 3 has no Next control and shows "Submit" — the last step. NOTHING was pressed.
+fill 106.3s for 50 field(s) across 3 step(s) — 6 to review
+```
+
+### What landed
+
+- **The multi-page walk** — the first one on the `ats.js` path (Greenhouse, Lever, Ashby and iCIMS are
+  all single-page). Workday's invariants throughout: stop at the end and never submit behind a DOUBLE
+  guard, accumulate write-per-page through the pure `accumulateBundle`, clear once outside the loop,
+  `cdpPageKey` as the merge key, a monotone advance predicate, and a graceful halt carrying the form's
+  own error text when Next is refused.
+- **The repeating-entry pass** — open (press Add) → fill → commit (press Add again), with both actions
+  gated on whether a Cancel exists, because `Add` is a homonym. Experience ×3, Education ×1, Skills ×8
+  all commit. A refused commit is cancelled so the block is left clean.
+- **The résumé** attaches on step 2 (`"Kevin's Resume.pdf"`), which is the order the operator asked for:
+  last, so page 1 could be verified without résumé autofill in the way.
+- **Onboarding** clears the Apply → email gate → form unattended, accepting the terms box on the
+  operator's standing instruction and excluding the honeypot by declared intent every round.
+
+### The bugs worth remembering
+
+1. **A wait that always timed out.** `atsInjPageSignature` was the one reader that did not return `ok`,
+   and `sig()` gates on `r && r.ok` — so both sides of every comparison were null and every ORC
+   `waitForChange` ran its full budget. 36s per run, reported as "page did NOT change", which reads as
+   a slow tenant whose tempting fix is a bigger budget. The tell was EXACT exhaustion: 15697ms of
+   15000, 20228ms of 20000. A genuinely slow transition does not land twice within 700ms of its ceiling.
+2. **And fixing it removed a settle nothing knew was there.** With the comparison working, the gate's
+   transition is detected in ~1.4s instead of ~20s, the loop scanned before the form mounted, and the
+   run halted `unknown-page` on the form it had just reached. Those 20 accidental seconds had been the
+   settle. **When a wait stops being slow, look for what depended on its slowness.**
+3. **Three source-scanning tests failed on the PROSE documenting what they forbid** — `sw-globals`
+   matched `apMatch.cdpPageKey` inside the comment warning against it. They strip comments now. A guard
+   that reads prose punishes the comment written to prevent the bug.
+4. **A silent completeness catch hides a bug forever.** The entry pass and the unclaimed check sat side
+   by side; the first REPORTED its failure and was diagnosed in one run, the second swallowed
+   everything and would have read as "no unclaimed controls" — a clean step, on the very diagnostic
+   built because a clean-looking step was hiding required fields.
+5. **A zero-row option read is absence of evidence** — measured on two different widgets (a date half
+   and a server-backed degree search, one row on one run and zero on the next). Both retry once, and
+   only on zero rows: a list that showed rows and matched none has genuinely answered.
+6. **`"<CODE> - <Name>"` option labels.** `"Bachelor of Science"` could not match
+   `"BS - Bachelor of Science"`, so a required field stayed empty and Oracle refused the whole Education
+   entry for three runs. Matched on the form's own `" - "` separator with the remainder required to be
+   EXACT — structural, like the postal composite, not the containment the ladder refuses. 8121ms → 603ms.
+7. **A taught bucket answered a salutation picker with a job title.** ORC's `title` is Mr./Mrs./Dr.,
+   and unmapped its label normalizes to "title" — one of the most common bucket wordings there is. Only
+   the platform id can separate them, so it is CLAIMED in the map as a deliberate blank.
+
+### Open
+
+- **`Application Questions` is empty on this requisition** — measured three ways (not a late fetch, not
+  lazy-mounted on scroll, no ARIA-only controls). The operator saw three required yes/no questions on a
+  step-3 block by that name, so either it is a different posting or it mounts under a condition no run
+  has reached. The walk reports it rather than implying the step filled cleanly.
+- **`ORA_GENDER`** commits "Male" but keeps `cx-select-input--invalid` — the widget is holding text it
+  never accepted as a selection, so it correctly reaches review rather than being reported filled.
+- **`group:ethnicity`** — the profile's `"Asian"` is not among that particular field's options.
+- The first date picker of each entry costs ~11.5s against ~2s for the second: a cold start in the
+  widget, worth a pacing round if it matters.
+- Generic-tenant work: only one ORC tenant has been driven end to end. Baylor was recon'd (5 sections /
+  4 steps) and every count-based assumption was removed because of it, but it has not been run.
