@@ -8443,7 +8443,12 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // failing. The predicate is monotone — the value can only be noticed late, never missed.
     let back = null;
     for (let i = 0; i < 10; i++) {
-      await act.delay(150);
+      // ⚠⚠ `delayFull`, NOT `delay`. `act.delay` is the ADAPTIVE pace — it collapses to ~15ms on a
+      // visible tab, which is right for spacing actuation and WRONG for a settle. With it, this
+      // "10 × 150ms" poll finished in 196ms and 234ms on a live run and reported both required
+      // yes/no fields as "click not reflected (read null)". Exactly the trap CLAUDE.md names for
+      // Workday's settles: an adaptive delay makes a half-rendered page look stable.
+      await act.delayFull(200);
       back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
       if (back && back.ok && atsLib.normalize(String(back.value || "")) === atsLib.normalize(want)) break;
     }

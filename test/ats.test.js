@@ -3895,7 +3895,7 @@ test("the yes/no commit POLLS its read-back rather than reading once after a fix
   const stripComments = (t) => String(t)
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
-  const branch = stripComments(src.slice(i, i + 1800));
+  const branch = stripComments(src.slice(i, i + 3000));   // the branch grew with its comment
   // ⚠ a single read after a fixed delay is what the standing pacing rule forbids, and it bit:
   // two of three REQUIRED ORC yes/no questions came back "click not reflected (read null)" at 22ms
   // on a run where the same fields had committed at 31ms minutes earlier. ORC's pill flips its
@@ -3903,6 +3903,14 @@ test("the yes/no commit POLLS its read-back rather than reading once after a fix
   assert.ok(/for \(let i = 0; i < \d+; i\+\+\)/.test(branch), "the read-back must be polled");
   assert.ok(/break;/.test(branch),
     "and it must exit the moment the value agrees, so a widget that was already fast is not slowed");
+  // ⚠⚠ AND IT MUST PACE ON WALL CLOCK. `act.delay` is the ADAPTIVE pace and collapses to ~15ms on a
+  // visible tab, so the first version of this poll finished in 196ms and 234ms and reported both
+  // required yes/no fields as "click not reflected (read null)" — a settle that does not wait is not
+  // a settle. Same trap CLAUDE.md names for Workday: an adaptive delay makes a half-rendered page
+  // look stable.
+  assert.ok(/await act\.delayFull\(/.test(branch),
+    "the poll must use delayFull (wall clock), never the adaptive act.delay");
+  assert.ok(!/await act\.delay\(\d/.test(branch), "act.delay in a settle loop is the bug");
 });
 
 
