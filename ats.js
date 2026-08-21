@@ -8470,6 +8470,25 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
 // ends. The detail then says WHICH of the two happened, so this never has to be diagnosed twice.
 async function atsCommitYesNo(act, ats, ref, want, wt) {
   const kind = wt || "yesno";
+  // ⚠⚠ READ BEFORE CLICKING — THE PILL IS A TOGGLE (operator, 2026-08-21): "if it is already
+  // answered, clicking it again actually clears the answer, so you see that and re-click it. instead
+  // if it is correct already, just don't click it, leave it be."
+  //
+  // That is exactly what was happening, and it explains both the flakiness and the seconds: this
+  // clicked unconditionally, so an already-correct pill got CLEARED, the read-back then saw an empty
+  // widget, `nothingPressed` fired the re-press at ~1800ms, and the second click put back what the
+  // first one removed. Two pointless clicks and a multi-second round trip to reach the answer the
+  // form already held — and if a run ended between the two clicks, it ended with the answer WIPED.
+  //
+  // A pill that already holds the wanted answer needs no click at all. A pill holding the WRONG
+  // answer is unaffected: that is a different button, so selecting it is not a toggle.
+  let pre = null;
+  try { pre = await act.eval(atsInjReadValue, ats, ref.inputSel, kind); } catch (e) { pre = null; }
+  if (pre && pre.ok && atsLib.normalize(String(pre.value || "")) === atsLib.normalize(want)) {
+    return { ok: true, value: pre.value, presses: 0, cycles: 0, starved: false, elapsedMs: 0,
+      detail: "already answered " + JSON.stringify(String(pre.value))
+        + " — left alone (clicking it again would clear it)" };
+  }
   let r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
   const t0 = Date.now();
   const BUDGET_MS = 8000, HARD_CEILING_MS = 30000, MIN_CYCLES = 3;

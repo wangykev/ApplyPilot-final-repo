@@ -4407,7 +4407,8 @@ test("atsCommitYesNo: a normal commit still lands inside the ordinary budget", a
   const out = await ats.atsCommitYesNo(act, "oracle", { inputSel: "#q" }, "No", "yesno");
   assert.strictEqual(out.ok, true);
   assert.strictEqual(out.starved, false, "a healthy clock must never trip the extension");
-  assert.ok(out.cycles >= 2 && out.cycles < 10, "it stops as soon as the read agrees");
+  assert.ok(out.cycles >= 1 && out.cycles < 10, "it stops as soon as the read agrees");
+  assert.ok(clicks >= 1, "a pill NOT already holding the answer must still be clicked");
 });
 
 test("the yes/no budget extends ONLY when it ran out without looking", () => {
@@ -4594,4 +4595,45 @@ test("the entry waits poll finely and look BEFORE sleeping", () => {
     assert.ok(!/await new Promise\(\(r\) => setTimeout\(r, 80\)\)/.test(fn),
       name + " must not sleep 80ms before its first look");
   }
+});
+
+// ── THE PILL IS A TOGGLE: AN ALREADY-CORRECT ANSWER MUST NOT BE CLICKED (operator, 2026-08-21) ──
+// "if it is already answered, clicking it again actually clears the answer, so you see that and
+// re-click it. instead if it is correct already, just don't click it, leave it be."
+test("atsCommitYesNo: an already-correct pill is left alone, never clicked", async () => {
+  let clicks = 0, reads = 0;
+  const act = {
+    // arity discriminates: the click is eval(fn, sel, want), the read is eval(fn, ats, sel, kind)
+    eval: async (fn, a, b, c) => {
+      if (c === undefined) { clicks++; return { ok: true }; }
+      reads++;
+      return { ok: true, value: "No" };            // the form ALREADY holds the wanted answer
+    },
+    delayFull: async () => {},
+  };
+  const out = await ats.atsCommitYesNo(act, "oracle", { inputSel: "#q" }, "No", "yesno");
+
+  assert.strictEqual(out.ok, true, "an answer already on the form is a success");
+  assert.strictEqual(clicks, 0, "⚠ it must NOT click — clicking a pill that already holds the answer CLEARS it");
+  assert.strictEqual(out.presses, 0);
+  assert.strictEqual(out.value, "No", "and it reports what the form holds");
+  assert.match(String(out.detail || ""), /left alone/i, "the record should say why nothing was pressed");
+  assert.ok(reads >= 1, "it has to LOOK before deciding not to click");
+});
+
+test("atsCommitYesNo: a pill holding the WRONG answer is still clicked", async () => {
+  let clicks = 0, reads = 0;
+  const act = {
+    eval: async (fn, a, b, c) => {
+      if (c === undefined) { clicks++; return { ok: true }; }
+      reads++;
+      // holds "Yes" until the click lands, then "No"
+      return { ok: true, value: clicks ? "No" : "Yes" };
+    },
+    delayFull: async () => {},
+  };
+  const out = await ats.atsCommitYesNo(act, "oracle", { inputSel: "#q" }, "No", "yesno");
+  assert.strictEqual(out.ok, true);
+  assert.ok(clicks >= 1, "a different option is a different button — selecting it is not a toggle");
+  assert.strictEqual(out.value, "No");
 });
