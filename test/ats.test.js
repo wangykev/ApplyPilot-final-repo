@@ -4555,3 +4555,43 @@ test("the replay checks the tile BEFORE opening an entry", () => {
   // one record per FIELD, so the keys line up with the fill's
   assert.ok(/fieldName: e\.fieldName/.test(seg), "records are per-field, matching the fill's keys");
 });
+
+// ── ORC IGNORES A CLICK THAT LANDS TOO EARLY (measured on the live form, 2026-08-21) ─────────
+test("the entry COMMIT re-presses, but can never add a second entry", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsInjOrcCommitEntryAndWait");
+  assert.ok(i > 0);
+  const fn = stripJsComments(src.slice(i, src.indexOf("\n}", src.indexOf("return { ok: true, pressed", i))));
+
+  // the re-press itself — the commit is pressed immediately after the field write, so it is even
+  // more exposed to the early-click no-op than Cancel was
+  assert.ok(/for \(let round = 0; round < 3/.test(fn), "it must be willing to press again");
+  assert.ok(/pickCommit\(\)/.test(fn), "…re-resolving the control each round");
+
+  // ⚠⚠ THE SAFETY PROPERTY. A commit is not a cancel: pressing twice must never be able to create a
+  // SECOND entry. The already-closed check has to come BEFORE the press, so a first press that
+  // worked exits the loop instead of pressing again.
+  const roundAt = fn.indexOf("for (let round");
+  const guardAt = fn.indexOf("openNow() === 0", roundAt);
+  const clickAt = fn.indexOf("ctl.click()", roundAt);
+  assert.ok(guardAt > 0 && clickAt > 0 && guardAt < clickAt,
+    "the already-closed check must precede the click, or a re-press could add a duplicate entry");
+
+  // and the caption is resolved live, because it differs by mode: "Add Skill" while adding,
+  // "Save" while editing (both measured)
+  assert.ok(/\^\(add\|save\|update\)/.test(fn), "the commit caption differs between add and edit mode");
+});
+
+test("the entry waits poll finely and look BEFORE sleeping", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // Measured: ORC renders an entry form in 36ms and tears it down in 33ms, so an 80ms sleep taken
+  // BEFORE the first look cost 80-160ms per phase on every one of twelve entries.
+  for (const name of ["atsInjOrcOpenEntryAndWait", "atsInjOrcOpenTileAndWait", "atsInjOrcCommitEntryAndWait"]) {
+    const i = src.indexOf("async function " + name);
+    assert.ok(i > 0, name + " must exist");
+    const fn = stripJsComments(src.slice(i, i + 5200));   // the commit grew with the re-press logic
+    assert.ok(/setTimeout\(r, 25\)/.test(fn), name + " must poll finely — these are PAGE timers, not SW pacing");
+    assert.ok(!/await new Promise\(\(r\) => setTimeout\(r, 80\)\)/.test(fn),
+      name + " must not sleep 80ms before its first look");
+  }
+});

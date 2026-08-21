@@ -4844,12 +4844,22 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
   if (!add) return { ok: false, error: "no-add-control", offered: btns0.map((b) => t(b)).slice(0, 6) };
   add.click();
 
+  // ⚠ POLL FINE AND CHECK FIRST — measured on the live form: ORC renders the entry form in **36ms**
+  // and tears it down in **33ms**. Sleeping 80ms before the first look therefore paid 80–160ms per
+  // phase for nothing, on every entry: with twelve entries (8 skills + 3 experience + 1 education)
+  // that is over a second of pure floor, and it is the "half a second before every action" the
+  // operator could feel on the skills block.
+  // ⚠ AND POLLING DENSELY HERE IS FREE, unlike SW-side pacing. These are PAGE timers inside an
+  // injected function — real, unthrottled, and not a starvation exposure. The "cost of a poll is the
+  // NUMBER of awaits" rule applies to act.delay in the service worker, NOT to this loop.
   const deadline = Date.now() + (budgetMs || 6000);
   let fields = [];
   const before = [...block0.querySelectorAll("input, textarea, select")]
     .filter((e) => e.type !== "hidden" && vis(e)).length;
+  let first = true;
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 80));
+    if (!first) await new Promise((r) => setTimeout(r, 25));
+    first = false;
     const block = findBlock();
     if (!block) continue;
     // ⚠⚠ THE EVIDENCE THAT A FORM OPENED IS THAT **INPUTS APPEARED**, not that a button says
@@ -4976,8 +4986,10 @@ async function atsInjOrcOpenTileAndWait(blockTitlePattern, tileIndex, budgetMs) 
 
   const deadline = Date.now() + (budgetMs || 6000);
   let fields = [];
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 80));
+  let firstT = true;
+  while (Date.now() < deadline) {                 // fine + check-first; see the note on the open above
+    if (!firstT) await new Promise((r) => setTimeout(r, 25));
+    firstT = false;
     const block = findBlock();
     if (!block) continue;
     const live = [...block.querySelectorAll("input, textarea, select")]
@@ -5061,8 +5073,10 @@ async function atsInjOrcCloseEntry(blockTitlePattern, budgetMs) {
     ctl.click();
     attempts.push(label);
     const deadline = Date.now() + perRound;
-    while (Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 80));
+    let firstC = true;
+    while (Date.now() < deadline) {               // fine + check-first; see the note on the open above
+      if (!firstC) await new Promise((r) => setTimeout(r, 25));
+      firstC = false;
       if (openCount() === 0) return { ok: true, via: label, attempts };
     }
   }
@@ -5094,21 +5108,49 @@ async function atsInjOrcCommitEntryAndWait(blockTitlePattern, budgetMs) {
   const liveNow = [...block0.querySelectorAll("input, textarea, select")]
     .filter((e) => e.type !== "hidden" && vis(e)).length;
   if (!btns0.some((b) => /^cancel$/i.test(t(b))) && !liveNow) return { ok: false, error: "no-open-entry-to-commit" };
-  const add = btns0.find((b) => /^add\b/i.test(t(b)));
-  if (!add) return { ok: false, error: "no-add-control" };
-  add.click();
-
-  const deadline = Date.now() + (budgetMs || 6000);
-  let closed = false;
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 80));
+  // ⚠⚠ RE-PRESS, FOR THE SAME REASON CANCEL HAD TO (2026-08-21). Measured on the live form: ORC
+  // ignores a click that lands before it has wired the handler — that is what made the verify pass's
+  // Cancel a no-op on every entry after the first. The commit is pressed even sooner (immediately
+  // after the field write), so it is exposed to the same thing, and the symptom is a skill that
+  // silently never got added — the flakiness the operator reported.
+  // Safe because the predicate is MONOTONE: once the form is closed we have already returned, so a
+  // second press can only ever hit a form that is still open. The caption is re-resolved each round
+  // ("Add Skill" while adding, "Save" while editing).
+  // ⚠ A commit is NOT a cancel: pressing twice must never be able to add a SECOND entry. The
+  // already-closed check at the top of each round is what guarantees that — if the first press
+  // worked, the loop exits before pressing anything again.
+  const openNow = () => {
     const block = findBlock();
-    if (!block) { closed = true; break; }
-    const stillOpen = [...block.querySelectorAll("input, textarea, select")]
-      .filter((e) => e.type !== "hidden" && vis(e)).length > 0;
-    if (!stillOpen) { closed = true; break; }
+    if (!block) return 0;
+    return [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e)).length;
+  };
+  const pickCommit = () => {
+    const block = findBlock();
+    if (!block) return null;
+    return [...block.querySelectorAll("button")].filter(vis)
+      .find((b) => /^(add|save|update)\b/i.test(t(b))) || null;
+  };
+  const add0 = pickCommit();
+  if (!add0) return { ok: false, error: "no-add-control" };
+  const perRound = Math.max(500, Math.round((budgetMs || 6000) / 3));
+  let closed = false, presses = 0, pressed = t(add0) || "?";
+  for (let round = 0; round < 3 && !closed; round++) {
+    if (openNow() === 0) { closed = true; break; }
+    const ctl = pickCommit();
+    if (!ctl) break;
+    pressed = t(ctl) || pressed;
+    ctl.click();
+    presses++;
+    const deadline = Date.now() + perRound;
+    let firstP = true;
+    while (Date.now() < deadline) {
+      if (!firstP) await new Promise((r) => setTimeout(r, 25));
+      firstP = false;
+      if (openNow() === 0) { closed = true; break; }
+    }
   }
-  return { ok: true, pressed: t(add), closed };
+  return { ok: true, pressed, closed, presses };
 }
 
 function atsInjOrcEntryAction(blockTitlePattern, action) {
