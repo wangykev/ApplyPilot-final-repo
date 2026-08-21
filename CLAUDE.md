@@ -1142,11 +1142,14 @@ ORC is the first that is not, and the `oracle-not-implemented` guard is now dele
   real) but to record a value that reproduces the decision; the read-back stays the VERIFICATION.
   Safe because `atsSurfacePrefilled` skips any record carrying `resolved`, so nothing re-reads and
   compares the two. *Suspect this shape on any widget whose display differs from its option text.*
-- **⚠ SCOPE BITES IN THIS FILE.** Four separate live failures in one day were code written against a
-  scope it did not have (`profile`, `apMatch.cdpPageKey`, `preCreds`, and the entry pass). The tests
-  scan source TEXT and cannot catch it. **There is no linter in this repo** — adding one with
-  `no-undef` is the standing suggestion, and until then a new branch that borrows a name from a
-  sibling `if (ats === …)` block is the thing to re-read before running.
+- **⚠ SCOPE BITES IN THIS FILE — AND `npm test` NOW CATCHES IT.** Five live failures were code
+  written against a scope it did not have (`profile`, `apMatch.cdpPageKey`, `preCreds`, the entry
+  pass, and `startUrl` in the submit run's Oracle branch). The unit guards scan source TEXT and
+  cannot evaluate a scope, so every one of them passed the suite and cost a live run.
+  **`eslint.config.mjs` runs `no-undef` as `pretest`** — it found the fifth in under a second, in
+  code that had already passed 1693 tests and a rehearsal. It reads the SW file list from
+  background.js's own `importScripts` call and each page's from its HTML, so the "one shared global
+  scope" model can never drift from reality; `no-undef` is the ONLY rule on, deliberately.
 
 **Open (submit):** the ex-Oracle screening question fails the replay `read null` after 2 presses over
 8s (34.7s on the field) — ORC renders an option group **two ways** (radios sharing a `name`, and

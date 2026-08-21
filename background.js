@@ -6147,7 +6147,11 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       if (pre.halt) {
         if (pre.halt.stopped === "apply-not-followable" || pre.halt.stopped === "unknown-page") {
           const at = await cdpEval(function () { return location.href; }).catch(() => null);
-          if (atsPostingGone(null, startUrl, at)) {
+          // ⚠ `bundle.url || opts.startUrl`, NOT a bare `startUrl` — this function has no such
+          // binding. Caught by eslint no-undef the first time it ran; it had survived 1693 unit
+          // tests and a live rehearsal because this branch only fires when the pre-form halts.
+          // The iCIMS branch above spells it exactly this way, which is where it was copied from.
+          if (atsPostingGone(null, bundle.url || (opts && opts.startUrl), at)) {
             return { ok: true, needs_operator: true, submitted: false, replayed: false, stopped: "posting-gone", ats,
               detail: "This Oracle posting is no longer live — the site redirected away from the requisition. Nothing was replayed or submitted." };
           }
