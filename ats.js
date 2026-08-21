@@ -3273,6 +3273,16 @@ function atsDialMatch(candidates, optionTexts) {
   for (const cand of candidates || []) {
     const cc = atsDialCode(cand), cn = atsDialName(cand);
     if (!cc || !cn) continue;
+    // ⚠⚠ AN EXACT NAME MATCH WINS OUTRIGHT (live rehearsal, 2026-08-20). The prefix fallback below
+    // exists so a form's shorter or longer wording still lands, but it made "United States" match
+    // BOTH "+1 (United States)" and "+1 (United States Minor Outlying Islands)" — two hits, so the
+    // ambiguity guard refused, and the replay reported `no dial-code option agreed with
+    // ["+1 (United States)"]` while the form was offering that exact string as its FIRST option.
+    // The guard was right to distrust two prefix hits; it should never have been asked, because one
+    // of them was an exact match. Exact first; ambiguity only among equally-good candidates.
+    const exact = [];
+    opts.forEach((o, i) => { if (atsDialCode(o) === cc && atsDialName(o) === cn) exact.push(i); });
+    if (exact.length === 1) return { index: exact[0], tier: "dial-code+name" };
     const hits = [];
     opts.forEach((o, i) => {
       if (atsDialCode(o) !== cc) return;
@@ -4912,19 +4922,32 @@ async function atsInjOrcCloseEntry(blockTitlePattern, budgetMs) {
   if (!block0) return { ok: false, error: "block-not-found" };
   const btns0 = [...block0.querySelectorAll("button")].filter(vis);
   const cancel = btns0.find((b) => /^cancel$/i.test(t(b)));
-  const ctl = cancel || btns0.find((b) => /^(add|save|update)\b/i.test(t(b)));
-  if (!ctl) return { ok: false, error: "no-close-control" };
-  ctl.click();
-  const deadline = Date.now() + (budgetMs || 6000);
-  while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 80));
+  const commit = btns0.find((b) => /^(add|save|update)\b/i.test(t(b)));
+  const openCount = () => {
     const block = findBlock();
-    if (!block) continue;
-    const open = [...block.querySelectorAll("input, textarea, select")]
-      .filter((e) => e.type !== "hidden" && vis(e)).length;
-    if (!open) return { ok: true, via: cancel ? "cancel" : t(ctl) };
+    return block ? [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e)).length : -1;
+  };
+  // ⚠⚠ TRY THE OTHER CONTROL BEFORE GIVING UP (live 2026-08-20). Measured on the first rehearsal to
+  // run this path: entry 1 closed via Cancel every time and **entry 2's close always failed**, in
+  // BOTH the Experience and the Skills block — deterministic, not flaky. A form left open then made
+  // every later tile unopenable (`entry-already-open`), so ONE stuck close cost 10 of that run's 16
+  // verify failures. Whatever makes the second Cancel a no-op, a second press of the OTHER control
+  // is a cheap way out, and it is safe HERE for the same reason the fallback already was: this path
+  // writes nothing, so committing re-saves the entry unchanged.
+  const attempts = [];
+  for (const ctl of [cancel, commit].filter(Boolean)) {
+    ctl.click();
+    attempts.push(t(ctl) || "?");
+    const deadline = Date.now() + (budgetMs || 6000);
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 80));
+      if (openCount() === 0) return { ok: true, via: t(ctl), attempts };
+    }
   }
-  return { ok: false, error: "entry-still-open", via: cancel ? "cancel" : t(ctl) };
+  if (!attempts.length) return { ok: false, error: "no-close-control", offered: btns0.map((b) => t(b)).slice(0, 6) };
+  return { ok: false, error: "entry-still-open", attempts, stillOpen: openCount(),
+    offered: btns0.map((b) => t(b)).slice(0, 6) };
 }
 
 // COMMIT-AND-WAIT, same reasoning: press the (homonymous) Add and wait page-side for the form to be
@@ -5305,7 +5328,16 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — opening each to check it against your approved values (nothing is rewritten)`);
 
       for (let k = 0; k < tiles.length; k++) {
-        const opened = await act.eval(atsInjOrcOpenTileAndWait, spec.pattern, k, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        let opened = await act.eval(atsInjOrcOpenTileAndWait, spec.pattern, k, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        // ⚠ SELF-HEAL A STUCK-OPEN FORM. A close that did not take is a local failure; letting it
+        // block every REMAINING tile turns one lost entry into a whole lost section — measured, one
+        // stuck close cost 10 of a rehearsal's 16 verify failures. Clear it and try this tile once
+        // more, so the damage stops at the entry that actually went wrong.
+        if (opened && opened.error === "entry-already-open") {
+          log(`${spec.label} entry ${k + 1}: an entry form was still open — closing it and retrying`);
+          await act.eval(atsInjOrcCloseEntry, spec.pattern, ATS_ORC_PICK_MS).catch(() => null);
+          opened = await act.eval(atsInjOrcOpenTileAndWait, spec.pattern, k, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        }
         if (!opened || !opened.ok) {
           // A tile we could not open is NOT a tile we can vouch for.
           log(`⛔ ${spec.label} entry ${k + 1}: could not open it to check — ${(opened && opened.error) || "unknown"}`);
@@ -5351,8 +5383,11 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         }
         const closed = await act.eval(atsInjOrcCloseEntry, spec.pattern, ATS_ORC_PICK_MS).catch(() => null);
         if (!closed || !closed.ok) {
-          notes.push(`${spec.label} entry ${k + 1}: its form was left OPEN (${(closed && closed.error) || "unknown"}) — check the page by hand`);
-          log(`⛔ ${spec.label} entry ${k + 1}: could not close the entry form — ${(closed && closed.error) || "unknown"}`);
+          const why = (closed && closed.error) || "unknown";
+          const extra = closed && closed.attempts ? ` after pressing ${JSON.stringify(closed.attempts)}` : "";
+          notes.push(`${spec.label} entry ${k + 1}: its form was left OPEN (${why})${extra} — check the page by hand`);
+          log(`⛔ ${spec.label} entry ${k + 1}: could not close the entry form — ${why}${extra}`
+            + (closed && closed.offered ? `; the block offered ${JSON.stringify(closed.offered)}` : ""));
         }
         log(`  ${spec.label} entry ${k + 1}: ${same} field(s) match${diff ? `, ${diff} DIFFER` : ""}${closed && closed.ok ? ` (closed via ${closed.via})` : ""}`);
       }
@@ -7833,7 +7868,7 @@ function atsGeoValueInProfile(liveValue, profile) {
   return atsProfileAddressValues(profile).has(live);
 }
 
-async function atsSurfacePrefilled(act, ats, scan, results, profile) {
+async function atsSurfacePrefilled(act, ats, scan, results, profile, valueFor) {
   const fields = (scan && scan.fields) || [];
   let surfaced = 0, geoAgreed = 0, geoUnverified = 0;
   for (const rec of results) {
@@ -7875,6 +7910,26 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile) {
     if (f.geoDependent) {
       rec.after = v;
       rec.verified = true;
+      // ⚠⚠ ON A REPLAY THE AUTHORITY IS THE APPROVED BUNDLE, NOT THE PROFILE (live rehearsal,
+      // 2026-08-20). A submit run passes `profile: {}` by design — every value comes from the
+      // bundle — so atsGeoValueInProfile could only ever answer NO, and City / State / County were
+      // all flagged `geo-not-in-profile` and BLOCKED THE GATE on a form holding exactly the values
+      // the human had already approved. The profile test is right on a FILL, where the profile is
+      // what we know; on a replay the human's approval is strictly better evidence, and it is the
+      // thing the rest of this run is verifying against anyway.
+      const approvedHere = typeof valueFor === "function" ? valueFor(f) : undefined;
+      if (approvedHere !== undefined) {
+        const agrees = atsLib.normalize(String(approvedHere)) === atsLib.normalize(v);
+        rec.status = agrees ? "filled" : "needs_review";
+        rec.flag = agrees ? null : "geo-not-approved";
+        rec.detail = agrees
+          ? "Oracle filled this from " + (f.geoAnchorName || "the postal code")
+            + ", and it matches the value you approved — verified"
+          : "Oracle filled this from " + (f.geoAnchorName || "the postal code") + " as " + JSON.stringify(v)
+            + ", but you approved " + JSON.stringify(String(approvedHere)) + " — check it here";
+        if (agrees) geoAgreed++; else { geoUnverified++; surfaced++; }
+        continue;
+      }
       if (atsGeoValueInProfile(v, profile)) {
         rec.status = "filled";
         rec.flag = null;
@@ -7961,7 +8016,7 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
   // Cretex — the BUNDLE was right and the summary was not, which is the kind of disagreement that gets
   // read as a bug in whichever half you look at second). Placed after the audit deliberately: see
   // atsSurfacePrefilled.
-  try { await atsSurfacePrefilled(act, ats, scan, results, profile); } catch (e) { /* completeness — never abort */ }
+  try { await atsSurfacePrefilled(act, ats, scan, results, profile, valueFor); } catch (e) { /* completeness — never abort */ }
 
   // ⚠ THE REPEATING ENTRIES, AND THEY MUST RUN AFTER THE FLAT LOOP. Every ORC step is scanned for
   // flat fields; a repeating block contributes NOTHING to that scan until an Add is pressed, because
@@ -8076,13 +8131,35 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
 //     blind second press would un-press what the first one set.
 //   • Report the PRESS COUNT, so a widget that habitually needs two is visible rather than merely
 //     slow.
+// ⚠⚠ A WALL-CLOCK BUDGET CAN BE EATEN WHOLE BY ONE STARVED PACE (live 2026-08-20).
+// This reported `yes/no click not reflected after 2 press(es) over 8s (read null)` on Oracle's
+// ex-Oracle-employee question, and the field was billed 34.7s. It was read as a widget bug and it
+// was not one: the same question filled first time on the next clean run. What actually happened is
+// that the service worker was starved — measured elsewhere that run, a 120ms pace took 10883ms — so
+// `delayFull(120)` inside this loop consumed the ENTIRE 8s budget before a single read cycle
+// completed. The loop then concluded "not reflected" having gathered no evidence at all.
+//
+// ⚠ THIS IS NOT THE ATTEMPTS FLOOR THE STANDING RULE FORBIDS. That rule ("a wait that timed out
+// wants a bigger BUDGET; never add an attempts floor") is about COVERAGE of a monotone predicate,
+// where sparse sampling can only notice late and never miss. The distinction drawn here is the one
+// orcAdvanceAfterStep already draws on its own advance wait — "NOT ONE read landed, so this is
+// blindness rather than evidence the page stood still". A budget that expired before the loop could
+// look even once has measured nothing, and reporting that as a failed commit is a false negative on
+// a field that was very likely fine.
+//
+// So the budget is spent in WALL CLOCK as before, and only extended when it ran out having completed
+// fewer than MIN_CYCLES read cycles — bounded by a hard ceiling so a genuinely dead widget still
+// ends. The detail then says WHICH of the two happened, so this never has to be diagnosed twice.
 async function atsCommitYesNo(act, ats, ref, want, wt) {
   const kind = wt || "yesno";
   let r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
-  const t0 = Date.now(), deadline = t0 + 8000;
-  let back = null, presses = 1;
+  const t0 = Date.now();
+  const BUDGET_MS = 8000, HARD_CEILING_MS = 30000, MIN_CYCLES = 3;
+  let deadline = t0 + BUDGET_MS;
+  let back = null, presses = 1, cycles = 0, starved = false;
   while (Date.now() < deadline) {
     await act.delayFull(120);
+    cycles++;
     back = await act.eval(atsInjReadValue, ats, ref.inputSel, kind);
     if (back && back.ok && atsLib.normalize(String(back.value || "")) === atsLib.normalize(want)) break;
     const nothingPressed = !(back && back.ok && String(back.value || "").trim());
@@ -8090,13 +8167,21 @@ async function atsCommitYesNo(act, ats, ref, want, wt) {
       presses++;
       r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
     }
+    // Out of budget, but we have barely looked — the clock was starved, not the widget.
+    if (Date.now() >= deadline && cycles < MIN_CYCLES && Date.now() - t0 < HARD_CEILING_MS) {
+      starved = true;
+      deadline = Math.min(t0 + HARD_CEILING_MS, Date.now() + BUDGET_MS);
+    }
   }
   const value = back && back.ok ? back.value : null;
   const ok = !!(r && r.ok) && atsLib.normalize(String(value || "")) === atsLib.normalize(want);
-  return { ok, value, presses, elapsedMs: Date.now() - t0,
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+  return { ok, value, presses, cycles, starved, elapsedMs: Date.now() - t0,
     detail: ok
       ? (presses > 1 ? "took " + presses + " press(es) — the first did not register" : null)
-      : "yes/no click not reflected after " + presses + " press(es) over 8s (read " + JSON.stringify(value) + ")" };
+      : "yes/no click not reflected after " + presses + " press(es) over " + secs + "s"
+        + " (read " + JSON.stringify(value) + ", " + cycles + " read cycle(s)"
+        + (starved ? " — the budget was EXTENDED because the service worker's clock was starved" : "") + ")" };
 }
 
 // ⚠⚠ IS THIS TIER DETERMINISTIC — i.e. does it commit `filled` rather than `filled_review`?
@@ -9464,7 +9549,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,

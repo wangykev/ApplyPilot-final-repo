@@ -4390,3 +4390,36 @@ test("the commit branch applies it ONLY to a one-option checkbox group", () => {
   assert.ok(/texts\.length === 1/.test(guard),
     "exactly one option — a multi-option group has no single assertion for a bare 'no' to deny");
 });
+
+// ── A WALL-CLOCK BUDGET EATEN BY A STARVED PACE IS NOT EVIDENCE (live 2026-08-20) ────────────
+test("atsCommitYesNo: a normal commit still lands inside the ordinary budget", async () => {
+  let clicks = 0, reads = 0;
+  // Discriminate on ARITY, not on the function's name: the click is eval(fn, inputSel, want) and the
+  // read is eval(fn, ats, inputSel, kind), so only the read is passed a third argument.
+  const act = {
+    eval: async (fn, a, b, c) => {
+      if (c === undefined) { clicks++; return { ok: true }; }
+      reads++;
+      return { ok: true, value: reads >= 2 ? "No" : null };   // the pill settles on the 2nd read
+    },
+    delayFull: async () => {},
+  };
+  const out = await ats.atsCommitYesNo(act, "oracle", { inputSel: "#q" }, "No", "yesno");
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.starved, false, "a healthy clock must never trip the extension");
+  assert.ok(out.cycles >= 2 && out.cycles < 10, "it stops as soon as the read agrees");
+});
+
+test("the yes/no budget extends ONLY when it ran out without looking", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsCommitYesNo");
+  const fn = stripJsComments(src.slice(i, src.indexOf("\n}", src.indexOf("return { ok, value", i))));
+
+  assert.ok(/cycles < MIN_CYCLES/.test(fn),
+    "the extension is gated on having completed too FEW read cycles — a budget that expired before " +
+    "the loop could look even once has measured nothing");
+  assert.ok(/HARD_CEILING_MS/.test(fn), "…and it is bounded, so a genuinely dead widget still ends");
+  assert.ok(/starved/.test(fn), "the outcome must say which of the two happened");
+  // ⚠ the ordinary path is unchanged: the budget is still spent in wall clock
+  assert.ok(/Date\.now\(\) < deadline/.test(fn), "the loop is still wall-clock bounded");
+});
