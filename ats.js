@@ -5599,8 +5599,20 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           if (want === undefined || String(want).trim() === "") continue;
           expected.push({ key, fieldName, want: String(want) });
         }
+        // ⚠⚠ NOTHING APPROVED FOR THIS ENTRY ⇒ NOTHING TO VERIFY. SKIP IT (live 2026-08-21).
+        // This fell through to the per-field open, and on a form that had accumulated 33 skills tiles
+        // that meant opening, reading and closing THIRTY-THREE entries one at a time — about a second
+        // each, for no information. The operator saw it as the rehearsal "adding skills super slowly";
+        // it was not adding anything, it was inspecting tiles it had no expectation for.
+        //
+        // A replay verifies what the human APPROVED. An entry the bundle says nothing about cannot
+        // disagree with the bundle, so there is nothing to check and nothing to report.
+        if (!expected.length) {
+          log(`  ${spec.label} entry ${k + 1}: nothing approved for it — skipped (a replay only verifies what you approved)`);
+          continue;
+        }
         const missing = expected.filter((e) => !atsOrcTileHoldsValue(tiles[k].text, e.want));
-        if (expected.length && !missing.length) {
+        if (!missing.length) {
           log(`  ${spec.label} entry ${k + 1}: all ${expected.length} approved value(s) are visible on the tile — verified from the DOM, not opened`);
           for (const e of expected) {
             records.push({
@@ -5792,7 +5804,23 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       // in — capping the loop at `want` iterations instead would let eight already-present skills
       // consume the entire budget and add nothing at all.
       if (isSkills && typeof entry === "string" && haveSkills.indexOf(atsLib.normalize(entry)) !== -1) {
-        log(`  ${item.block}: "${entry}" is already on the form — skipped`);
+        log(`  ${item.block}: "${entry}" is already on the form — not re-added, but recorded`);
+        // ⚠⚠ SKIPPING THE WORK MUST NOT SKIP THE RECORD — the same rule the repeating entries already
+        // obey, and skills were missed (live 2026-08-21). A skill already on the form is still part of
+        // the application, and with no record it was ABSENT from the review page entirely: the
+        // operator could not see what the run had put there, and the replay then had nothing approved
+        // to verify against, which is what sent it opening 33 tiles for no reason.
+        //
+        // `filled` and unflagged: it IS on the form and it came from the profile, so there is nothing
+        // for a human to decide. Keyed exactly as a freshly-added skill would be, so the fill and the
+        // replay agree on the name.
+        records.push({
+          fieldName: `${item.source}[${added - 1 >= 0 ? added : 0}].skills`,
+          label: `${item.block} — ${entry}`, widgetType: "text", isRequired: false,
+          entrySection: item.source, entryIndex: added,
+          status: "filled", verified: true, after: entry, elapsedMs: 0,
+          detail: "already on the form from an earlier run — verified against your profile, not re-added",
+        });
         continue;
       }
       added++;
