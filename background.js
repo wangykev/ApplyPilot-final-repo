@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-leansig-1";
+const AP_BUILD_MARKER = "orc-gatetime-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4538,6 +4538,10 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
   const start = Date.now();
   const deadline = start + (ceilingMs || 25000);
   let prev = -1, stable = 0;
+  // ⚠ FUNCTION SCOPE, NOT LOOP SCOPE: the TIMEOUT path below reads this after the loop has exited.
+  // Declared inside the `while` it would be a ReferenceError there — the exact shape eslint's
+  // no-undef pretest exists to catch on this file (five live ORC failures were scope, not logic).
+  let lastScan = null;
   // ⚠ HOW LONG THIS TOOK IS EVIDENCE, NOT NOISE (ORC, 2026-08-21). The operator reported the form
   // rendering promptly and then a long pause before anything filled, and this settle is one of the
   // three that sit in that window — but it only ever announced itself on FAILURE, so a run that
@@ -4559,8 +4563,19 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
       const fr = await cdpUseFormFrame(4).catch(() => ({ ok: false }));
       if (fr && fr.ok) LOG(`the application is inside an iframe — driving it there (${fr.controls} controls)`);
     }
+    // ⚠ KEEP THE SCAN, DON'T RE-FETCH IT (2026-08-21). This loop used to discard the scan object and
+    // keep only its COUNT, so the settle below immediately asked the page for the same read again —
+    // one extra full round-trip on every settle, on every ATS. Measured on ORC that is expensive for a
+    // reason that has nothing to do with the scan: this whole phase runs through a STARVED MV3 worker
+    // (`[PACE] a 450ms pace took 3898ms (sw-starved)`), so the cost of a phase is the NUMBER of awaits
+    // it makes, not the work each one does — round 15's conclusion, and the only lever measured to
+    // work. Unattended, this settle spent 27.1s over 3 polls (~9s per round-trip) while the form was
+    // already on screen and interactive; with the operator present the identical code cost 6.4s.
+    // ⚠ AND REUSING IT IS MORE CORRECT, not just cheaper: the re-fetch identified the page from a
+    // DIFFERENT read than the one whose count was just proven stable, so a set that changed in between
+    // was judged on a count nothing had validated.
     let n = 0;
-    try { const s = await cdpEval(atsInjScan, ats); n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; }
+    try { const s = await cdpEval(atsInjScan, ats); lastScan = s; n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; lastScan = null; }
     // THREE consecutive equal non-zero reads AND ≥2.5s elapsed — two reads 450ms apart
     // accepted Ashby's form at 9 fields while its survey/consent entries (4 more) were
     // still mounting (live 2026-07-31). Sections mount in bursts; a stable count between
@@ -4570,7 +4585,8 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
     if (stable > 0) everStable = true;
     if (stable >= 2 && Date.now() - start >= 2500) {
       // Settled — but settled on WHAT? Identify the page positively before calling it a form.
-      const scan = await cdpEval(atsInjScan, ats).catch(() => null);
+      // The scan is the one that just produced the stable `n` — see the note above.
+      const scan = lastScan;
       const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
       const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
       if (!id.ok) {
@@ -4590,7 +4606,8 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
     + `the count ${everStable ? "held still but never for 3 consecutive reads" : "NEVER held still — the form was still mounting"})`);
   // Same rule on the timeout path: fields we never identified as a form are not a form.
   if (prev > 0) {
-    const scan = await cdpEval(atsInjScan, ats).catch(() => null);
+    // Same reuse as the settle path: `lastScan` is the read that produced `prev`.
+    const scan = lastScan;
     const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
     const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
     if (!id.ok) { LOG(`the ${prev} field(s) here are not an application form — ${id.why}`); return { ready: false, fields: prev, notAForm: true, why: id.why, waitedMs: Date.now() - start, polls, timedOut: true }; }
@@ -4747,6 +4764,26 @@ async function runOrcPreForm(tabId, credentials, opts) {
   const consentsAccepted = [];
   let codeTries = 0;
   let decoysSeen = 0;
+  // ⚠⚠ A REJECTED AUTH STEP MUST BACK OFF, NOT HAMMER (live 2026-08-21). Observed: Oracle answered the
+  // email step with its OWN server error — "Failed to lock the record in table IRC_ACCESS_TOKENS …
+  // another user holds the lock", a row lock left by the PREVIOUS run's candidate session — and this
+  // loop re-submitted the step SEVEN times in five seconds before `auth-rounds-exhausted`.
+  //
+  // Why it did not notice: each rejection RE-RENDERS the field under a new volatile id
+  // (`#primary-email-1` → `-2` → `-4` → `-6` — ORC's render-assignment counter, the documented rule),
+  // so `atsSignatureChanged` sees fresh ids, reports "the page changed", and the loop reads that as
+  // PROGRESS. A changed page is not an advanced page, and nothing here was checking the VIEW.
+  //
+  // ⚠ AND THE ERROR IS TRANSIENT (operator, 2026-08-21) — it shows briefly and clears, so the right
+  // response is a PAUSE, not a refusal. Halting on first sight would fail a flow that recovers on its
+  // own; re-submitting at 0.7s intervals is what cannot work, because a lock needs time to be
+  // released, and hammering someone else's auth endpoint is not ours to do either way. So: growing
+  // backoff, then give up in Oracle's own words rather than the generic looping message.
+  //
+  // Deliberately narrow: it engages ONLY when the same view repeats AND the page reports an error, so
+  // every path that worked before is byte-identical. The `code` view keeps its own MAX_CODE_TRIES.
+  let lastView = null, sameView = 0, authRetries = 0;
+  const ORC_AUTH_RETRY_MAX = 3;
 
   // ORC's renderer blocks Runtime.evaluate for many seconds across a route transition (measured six
   // times during recon), and its page timers do not fire while that happens — so every wait here is
@@ -4788,6 +4825,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
     // taken before the field mounted.
     let s = await cdpEval(atsInjOrcAuthScan).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
     const view = orcApplyView(s);
+    if (view === lastView) sameView++; else { sameView = 0; lastView = view; }
     LOG(`round ${round}: view=${view}` + (s && s.ok ? ` (sections=${s.sectionCount} pins=${s.pinInputs} email=${!!s.emailInput} pass=${!!s.passwordInput})` : ` — ${(s && s.error) || "unreadable"}`));
     if (s && (s.decoys || []).length) {
       decoysSeen = s.decoys.length;
@@ -4843,6 +4881,26 @@ async function runOrcPreForm(tabId, credentials, opts) {
       }
       LOG(`the page was still rendering — view settled to ${settled.v} after ${((Date.now() - noneT0) / 1000).toFixed(1)}s`);
       continue;   // re-enter the loop and route on the settled view, never on the stale one
+    }
+
+    // The backoff described at `lastView` above. Positive evidence only: the SAME auth view again AND
+    // the page carrying its own error text. Anything else falls through to the unchanged routing.
+    if (sameView > 0 && (view === "email" || view === "password") && (s.errors || []).length) {
+      const pageErr = s.errors.join(" | ");
+      authRetries++;
+      if (authRetries > ORC_AUTH_RETRY_MAX) {
+        return halt("auth-step-rejected",
+          `Oracle rejected the ${view} step ${authRetries} times and re-rendered it with its own error: `
+          + `"${pageErr.slice(0, 200)}". This is Oracle's server talking, not a credential problem — an `
+          + `IRC_ACCESS_TOKENS lock is usually a previous run's session still holding the row, so wait a `
+          + `minute and re-run rather than changing anything.`);
+      }
+      const wait = 5000 * authRetries;
+      LOG(`Oracle re-rendered the ${view} step with an error — it REJECTED that submission `
+        + `("${pageErr.slice(0, 140)}"). Waiting ${wait}ms before retrying (${authRetries}/${ORC_AUTH_RETRY_MAX}) `
+        + `instead of re-submitting immediately; a transient lock needs time, not another request.`);
+      await cdpDelay(wait);
+      continue;
     }
 
     if (view === "posting") {

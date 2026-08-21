@@ -1934,82 +1934,123 @@ an idle machine.
 only lever measured to work against worker starvation (the entry-open fix: 28 starved SW awaits → 1
 page-side wait). A different clock cannot help while the worker owns the resumption.
 
-## Round 16 — ORC: the gate→fill window was FIVE settles and NONE of them said what it cost (2026-08-21)
+## Round 16 — ORC: the gate→fill pause is SW STARVATION, and BOTH pre-measurement theories were wrong (2026-08-21)
 
 **The report (operator).** *"After the sign in it seems to take the form a long time before it actually
 starts to fill out the page. After it puts the code in and presses enter, the page renders quite
 quickly, but it waits a long time before actually filling."*
 
-**⚠ NO MEASUREMENT IN THIS ROUND — instrumentation only.** It is recorded because deriving the phase
-inventory below was the work, and because the standing ORC rule earned four broken fills: a speed fix
-can remove the settling its slowness was providing, so nothing here was cut on the strength of looking
-suspicious.
+### The window, and why it had never been attributed
 
-### The window, phase by phase — everything between "Verify pressed" and the first value written
+Between "Verify pressed" and the first value written there are five sequential settles, and four of
+them could spend their whole budget while printing NOTHING: `waitForChange` after Verify (20s),
+the `view=none` settle (20s), `waitAtsFormReady` (25s), `orcAwaitBlocksPopulated` (15s) and
+`atsCaptureOrcOptions` (8s per picker). **A settle whose duration is invisible can be neither ruled in
+nor out**, which is why "a long time" had never been pinned on any of them. All five are timed now.
 
-| # | phase | where | budget | logged BEFORE this round? |
-|---|---|---|---|---|
-| A | `waitForChange` after Verify | `runOrcPreForm` (code branch) | 0.7–**20s** | yes — `verify pressed → page changed after Xms` |
-| B | `view=none` settle (half-rendered SPA) | `runOrcPreForm` | 0.7–**20s** | yes |
-| C | `waitAtsFormReady` — **3 consecutive equal** non-zero field counts *and* ≥2.5s | `background.js` | 2.5–**25s** | **only on failure** |
-| D | `orcAwaitBlocksPopulated` — scroll probe at budget/3 | `background.js` | 0–**15s** | **only on failure** |
-| E | `atsCaptureOrcOptions` — opens every non-geo picker | `ats.js` | N × 0.25–**8s** | counts only, **no time** |
-| F | `atsInjScan` + geo plan | `driveAtsPageFill` | 1 read | no |
+### ⚠⚠ MEASURED, AND IT KILLED BOTH THEORIES I HELD BEFORE MEASURING
 
-Worst case ≈ 100s, and four of the six phases could pay their whole budget while printing nothing —
-which is why "a long time" had never been attributed to any of them. **A settle whose duration is
-invisible can be neither ruled in nor out.**
+Four live runs on `eeho.fa.us2.oraclecloud.com` (Oracle's own careers site), tab VISIBLE, page clock ON:
 
-### The two structural findings worth keeping
+| | run 1 unattended | run 2 **operator present** | run 4 unattended |
+|---|---|---|---|
+| gate → first field | **34.4s** | **7.8s** | **45.1s** |
+| form settle | 27.1s / 3 polls | 6.4s / 4 polls | 8.5s / 6 polls |
+| press Verify | ~14.5s | 0.8s | — |
+| page change after Verify | 13.0s | 0.7s | 0.7s |
+| option capture (`title`) | 7.2s (6.6s) | 1.3s | 1.3s |
+| `atsInjScan` in pre-fill prep | **0.0s** | 0.0s | **13.6s** |
 
-**1. C and D settle the SAME underlying event with different predicates, sequentially, with
-independent budgets.** ORC fetches a requisition's questions separately, so while a block is still
-arriving the field COUNT is moving — which is exactly what defeats C's "three consecutive equal
-reads" bar. C can therefore burn 25s and log only `form did not settle`, and D then waits up to 15s
-more for the same arrival. **~40s for one cause.** D's predicate is the better one for ORC (it knows
-*which* block is empty and distinguishes a legitimately-empty block with an Add button from a
-suspicious one); C's is generic across every ATS.
+**Theory 1, REFUTED: "the block settle pays its 15s budget."** Measured **0.0s** — all visible blocks
+populated, every run. The 2026-08-19 observation of a block empty at its full budget was step 3, not
+the step this complaint is about.
 
-**2. On ORC, C's *stabilization* looks redundant — but its FORM IDENTIFICATION is not.** The
-authoritative field read happens after D, inside `driveAtsPageFill`, followed by two cascade rescans —
-so a field that mounts late is picked up regardless of whether C ever saw the count hold still. What C
-uniquely provides is `atsLooksLikeApplicationForm`, and that runs on the timeout path too.
-**⇒ The recommended cut is a shorter CEILING for oracle (~8s), not a weaker predicate.** Deliberately
-NOT shipped in this round: it would be the first reading of the very phase it changes.
+**Theory 2, REFUTED: "the field count churns, so the 3-equal-reads bar never trips and the 25s ceiling
+is paid."** It never timed out — it settled on 3 clean reads. The recommended cut (an 8s ceiling for
+oracle) **would have severed a legitimate settle**, and not shipping it unmeasured is the only reason
+it did not.
 
-### Most likely culprit for STEP 1 specifically, and why
+**Theory 3, ALSO REFUTED (mine, mid-diagnosis): "ORC's renderer is jammed for ~25s after the route
+transition."** Killed by the same `atsInjScan` costing **0.0s** in one run and **13.6s** in another,
+and by run 2 being uniformly fast across phases with nothing in common.
 
-The operator's report is about the first step, and A/B are before the render they describe as prompt —
-so the suspicion falls on C and E. Step 1's address block is suggestion-driven and `region1`/`region2`
-mount conditionally, with `country` arriving **prefilled "United States"**, so the dependent fields
-materialise as a reaction *while C is polling*. A field count that keeps moving is precisely C's
-whole-budget failure mode. D is more likely to bite on **step 3** ("Application Questions" — already
-measured empty at its full 15.4s budget in the 2026-08-19 round).
+### The actual cause — and the codebase already had the instrument
 
-### What was added (behaviour unchanged — logging only)
+`cdpDelay`'s always-on verdict, on the unattended runs:
 
-- `waitAtsFormReady` returns `waitedMs` / `polls` / `timedOut`, and the call site prints
-  `[ATS-TIME] form settled — N field(s) after Xs over P poll(s)`. The timeout path now separates two
-  states with different remedies: the count **never held still** (still mounting ⇒ D's job) vs it held
-  but never for three consecutive reads (⇒ budget).
-- `orcAwaitBlocksPopulated` prints `[ATS-TIME] block settle Xs` on **both** paths — the case that
-  matters most for this diagnosis, a full 15s spent on a block that was never going to populate, used
-  to print exactly as much as an instant pass: nothing.
-- `atsCaptureOrcOptions` prints `[ATS-TIME] ORC option capture Xs over N picker(s)` and names any
-  picker ≥1.5s, flagging one that **paid the full budget and captured nothing** — its per-picker cost
-  is wildly non-uniform (8s for an unreadable list, ~0.25s for a healthy one), so two bad pickers can
-  outweigh the entire rest of the pass.
-- `driveAtsPageFill` prints `[ATS-TIME] pre-fill prep Xs — scan Ys, then Zs of option capture / entry
-  growth / planning`. Every ATS gets it; it exists for ORC.
-- One total, once, before step 1: `[ATS-TIME] gate cleared → step 1 fill begins: Xs`. Printed
-  **alongside** the per-phase lines, not instead of them — the total is the complaint, the phases are
-  the diagnosis.
+```
+[PACE] a  450ms pace took  3898ms (sw-starved) — OUR OWN abandon ceiling was 1948ms late
+[PACE] a  700ms pace took  9221ms (sw-starved) — OUR OWN abandon ceiling was 7021ms late
+[PACE] a  700ms pace took 10161ms (sw-starved) — OUR OWN abandon ceiling was 7961ms late
+```
 
-### Next round: read these four lines off one run, in this order
+**MV3 service-worker timer starvation — our own watchdog 7–9s late.** Not ORC, not the renderer, not
+the scan. Same cause as round 15's 630s fill, in a phase nobody had timed. The operator's own
+workaround (*"click the page once and it goes back to filling fast"*) is run 2: **their presence is
+what un-starves the worker**, and it is worth ~5× per round-trip.
 
-1. `gate cleared → step 1 fill begins` — the operator's complaint, as a number.
-2. `form settled … after Xs` + whether it says **TIMED OUT** — confirms or kills finding 1.
-3. `block settle Xs` — whether D is paying twice for the same arrival.
-4. `ORC option capture Xs` + the slowest picker — whether any list is paying 8s to capture nothing.
+### ⚠ THE GAP IS A MULTIPLIER ON AWAIT COUNT, NOT A CONSTANT
 
-Then cut ONE of them, and re-verify what is downstream of it (the standing ORC rule).
+Per-await cost: run 1 ≈ 27.1s / ~7 awaits ≈ **3.9s**; run 2 ≈ 6.4s / ~9 awaits ≈ **0.7s**. Total =
+awaits × penalty, so **cutting awaits shrinks the attended/unattended GAP linearly**, not just the
+absolute time. That is why round 15's "reduce the number of awaits" is the lever, and it is the answer
+to the operator's goal (*"eventually attended and unattended should fill in the same amount of time"*).
+
+⛔ **Not on the table: synthesizing user gestures** to win Chrome's power-management heuristic. Fewer
+awaits reaches the same place without fighting the platform.
+
+### ⚠⚠ AND THE NOISE EXCEEDS THE SIGNAL — n=1 CANNOT VALIDATE A FIX HERE
+
+Two UNATTENDED runs of the same phase measured **27.1s and 8.5s**. So the scan-reuse fix below (one
+fewer round-trip per settle) is **NOT claimed as a speed win**: run 4's total was *worse* than run 1's
+while its settle was better, and 21.7s of run 4 landed between the settle and the block check — about
+two evals. **Any future ORC pacing claim needs several runs per arm, all unattended.** A single
+before/after pair here is indistinguishable from luck.
+
+### Changes this round
+
+- **Five phases now timed** (behaviour unchanged): `waitAtsFormReady` reports `waitedMs`/`polls` and
+  whether the count ever held still; `orcAwaitBlocksPopulated` reports its cost on BOTH paths;
+  `atsCaptureOrcOptions` reports per-picker ms and flags one that paid its full budget capturing
+  nothing; `driveAtsPageFill` reports `pre-fill prep`; and one total, `gate cleared → step 1 fill
+  begins`.
+- **`waitAtsFormReady` reuses the scan it already has** instead of re-fetching it on the settle path
+  (and on the timeout path). One fewer await per settle, on every ATS. Also **more correct**: the
+  re-fetch identified the page from a different read than the one whose count was just proven stable.
+- **A rejected ORC auth step now BACKS OFF** — see below.
+
+### ⚠ A SECOND BUG THIS TESTING EXPOSED: a 7× auth resubmit storm
+
+Run 3 halted `auth-rounds-exhausted`, and the page's own words were in the log:
+
+```
+Failed to lock the record in table IRC_ACCESS_TOKENS with key
+oracle.jbo.Key[302968642375867], another user holds the lock.
+```
+
+An Oracle row lock on the candidate's token record — the previous run's session still holding it.
+**We re-submitted the email step SEVEN times in five seconds.** Why it went unnoticed: each rejection
+re-renders the field under a new volatile id (`#primary-email-1` → `-2` → `-4` → `-6`, ORC's
+render-assignment counter), so `atsSignatureChanged` sees fresh ids and reports "the page changed",
+which the loop read as PROGRESS. **A changed page is not an advanced page**, and nothing was checking
+the VIEW.
+
+⚠ **The error is TRANSIENT** (operator) — it shows briefly and clears. So halting on first sight would
+fail a flow that recovers on its own; the fault was re-submitting at 0.7s intervals, because a lock
+needs TIME, and hammering someone else's auth endpoint is not ours to do regardless. Now: growing
+backoff (5s/10s/15s), then a halt quoting Oracle's own message instead of the generic "the flow is
+looping". Deliberately narrow — it engages only when the SAME auth view repeats AND the page carries
+an error, so every previously-working path is byte-identical.
+
+**Testing note:** three applications on one candidate account inside twenty minutes is what produced
+the lock. Space ORC runs out, or use a different account.
+
+### Next
+
+The lever is **fewer awaits**, and the biggest one in this window is `waitAtsFormReady`'s poll loop:
+3 stability reads + 2 SW sleeps + a submit-state read = ~6 worker awaits, replaceable by ONE
+page-side poll (round 15's entry-open fix: 28 starved awaits → 1). Viable on ORC because
+`cdpInstallPageOverrides` gives the page worker-backed timers — which is why
+`atsInjOrcCaptureOptions` already does page-side `await setTimeout` successfully; the recon's "page
+timers were not firing" 45s failures were raw recon WITHOUT those overrides. **Verify that assumption
+explicitly before relying on it**, and measure with several runs per arm.
