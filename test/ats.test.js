@@ -4504,3 +4504,54 @@ test("atsInjOrcResumeReset reports what it found instead of assuming markup", ()
   assert.ok(!/document\.querySelectorAll\("button/.test(fn),
     "controls are searched within the résumé area, never document-wide");
 });
+
+// ── READ THE ENTRY OFF THE TILE; OPEN ONLY IF SOMETHING DISAGREES (operator, 2026-08-21) ─────
+test("atsYearMonthKey: the same month in three vocabularies is one key", () => {
+  const K = ats.atsYearMonthKey;
+  assert.strictEqual(K("May 2025"), "2025-05");
+  assert.strictEqual(K("05/2025"), "2025-05");
+  assert.strictEqual(K("5/2025"), "2025-05");
+  assert.strictEqual(K("2025-05"), "2025-05");
+  assert.strictEqual(K("may 2025"), "2025-05");
+  assert.strictEqual(K("Sep 2025"), "2025-09", "an abbreviated month still resolves");
+  // and nothing that is not a month+year
+  assert.strictEqual(K("Rivian"), null);
+  assert.strictEqual(K(""), null);
+  assert.strictEqual(K("2025"), null, "a bare year is not a month");
+});
+
+test("atsOrcTileHoldsValue: the tile is the cheap check, and dates are tolerated", () => {
+  const H = ats.atsOrcTileHoldsValue;
+  const tile = "Rivian and Volkswagen Technologies Characterization and Test Automation Intern 05/2026 - 08/2026";
+
+  assert.strictEqual(H(tile, "Rivian and Volkswagen Technologies"), true);
+  assert.strictEqual(H(tile, "Characterization and Test Automation Intern"), true);
+  // ⚠ THE DATE VOCABULARY DIFFERS BY DESIGN: the tile renders 05/2026, the record stores "May 2026".
+  // Without this tolerance every date would read as wrong and every entry would be opened — which is
+  // exactly the work this check exists to avoid.
+  assert.strictEqual(H(tile, "May 2026"), true);
+  assert.strictEqual(H(tile, "August 2026"), true);
+
+  // …and a genuinely different value must still disagree, or the check is worthless
+  assert.strictEqual(H(tile, "June 2026"), false);
+  assert.strictEqual(H(tile, "Acme Corp"), false);
+  // nothing approved ⇒ nothing to disagree with
+  assert.strictEqual(H(tile, ""), true);
+  assert.strictEqual(H("", "May 2026"), false, "an empty tile cannot vouch for anything");
+});
+
+test("the replay checks the tile BEFORE opening an entry", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("const missing = expected.filter");
+  assert.ok(i > 0, "the tile check must exist");
+  const seg = stripJsComments(src.slice(i - 900, i + 1600));
+
+  assert.ok(seg.indexOf("atsOrcTileHoldsValue") < seg.indexOf("atsInjOrcOpenTileAndWait"),
+    "the tile is read FIRST; opening is the exception, not the default");
+  assert.ok(/verified from the DOM, not opened/.test(seg),
+    "a tile that already shows every approved value must be recorded without being opened");
+  assert.ok(/opening it to check field by field/.test(seg),
+    "…and a discrepancy must still fall through to the precise per-field check");
+  // one record per FIELD, so the keys line up with the fill's
+  assert.ok(/fieldName: e\.fieldName/.test(seg), "records are per-field, matching the fill's keys");
+});

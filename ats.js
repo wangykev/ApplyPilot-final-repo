@@ -5415,6 +5415,33 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — opening each to check it against your approved values (nothing is rewritten)`);
 
       for (let k = 0; k < tiles.length; k++) {
+        // ── THE CHEAP CHECK FIRST: is everything the human approved already visible in the tile? ──
+        // The map tells us which fields this section has, so the expected values can be looked up
+        // without opening anything. All present ⇒ verified from the DOM, nothing touched.
+        const expected = [];
+        for (const key of Object.keys(emap)) {
+          const fieldName = `${spec.source}[${k}].${key}`;
+          const want = typeof o.valueFor === "function"
+            ? o.valueFor({ fieldName, entrySection: spec.source, entryIndex: k, widgetType: "text" })
+            : undefined;
+          if (want === undefined || String(want).trim() === "") continue;
+          expected.push({ key, fieldName, want: String(want) });
+        }
+        const missing = expected.filter((e) => !atsOrcTileHoldsValue(tiles[k].text, e.want));
+        if (expected.length && !missing.length) {
+          log(`  ${spec.label} entry ${k + 1}: all ${expected.length} approved value(s) are visible on the tile — verified from the DOM, not opened`);
+          for (const e of expected) {
+            records.push({
+              fieldName: e.fieldName, label: `${spec.label} ${e.key}`, widgetType: "text",
+              isRequired: false, entrySection: spec.source, entryIndex: k,
+              status: "filled", verified: true, after: e.want, elapsedMs: 0,
+              detail: "read from the entry's own summary on the form — it matches what you approved, so the entry was not opened",
+            });
+          }
+          continue;
+        }
+        // ── something disagrees (or the tile does not display it) ⇒ open THIS entry and look ──
+        log(`  ${spec.label} entry ${k + 1}: ${missing.length ? `the tile does not show ${JSON.stringify(missing.map((m) => m.key))}` : "nothing approved to compare"} — opening it to check field by field`);
         let opened = await act.eval(atsInjOrcOpenTileAndWait, spec.pattern, k, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
         // ⚠ SELF-HEAL A STUCK-OPEN FORM. A close that did not take is a local failure; letting it
         // block every REMAINING tile turns one lost entry into a whole lost section — measured, one
@@ -5901,6 +5928,50 @@ function atsOrcEntryIdentity(source, entry) {
 
 // True when the tiles on the form already are the entries we would write — same count, and each
 // wanted entry matched by a DISTINCT tile (order-independent, because the form may sort them).
+// ── DOES THIS TILE ALREADY SHOW THIS VALUE? (operator, 2026-08-21) ───────────────────────────
+// "for the experience section, no need to go in and edit each one, you can read the information and
+// parse it directly from the dom and you only change it if something is wrong. Same for education."
+//
+// The tile summary carries the entry's content, so the cheap check is whether every value the human
+// approved is visible in it. Opening an entry is then the EXCEPTION — which matters for more than
+// speed: opening is the риskiest thing this pass does (it is what produced the second-close failure
+// that cascaded through a whole section), so not doing it is strictly safer.
+//
+// ⚠ DATES ARE THE ONE THING THAT NEEDS TOLERANCE. The tile renders "05/2025" while the record stores
+// "May 2025" — the same fact in two vocabularies, and a raw containment test would call every date
+// wrong and open every entry, which is exactly the work this avoids. So a month+year on either side
+// is reduced to a canonical key before comparing.
+// ⚠ ATS_MONTHS already exists at the top of this file (capitalised). The service worker evaluates
+// this whole file into ONE scope, so a second declaration is a SyntaxError that kills the worker —
+// the documented "never re-declare an imported name" trap, caught here by node --check.
+function atsYearMonthKey(v) {
+  const t = String(v == null ? "" : v).trim().toLowerCase();
+  if (!t) return null;
+  let m = /^(\d{4})[-/](\d{1,2})$/.exec(t);                       // 2025-05
+  if (m) return m[1] + "-" + String(Number(m[2])).padStart(2, "0");
+  m = /^(\d{1,2})[-/](\d{4})$/.exec(t);                            // 05/2025
+  if (m) return m[2] + "-" + String(Number(m[1])).padStart(2, "0");
+  m = /^([a-z]+)\s+(\d{4})$/.exec(t);                              // May 2025
+  if (m) {
+    const i = ATS_MONTHS.findIndex((n) => { const l = n.toLowerCase(); return l === m[1] || l.slice(0, 3) === m[1].slice(0, 3); });
+    if (i >= 0) return m[2] + "-" + String(i + 1).padStart(2, "0");
+  }
+  return null;
+}
+function atsOrcTileHoldsValue(tileText, value) {
+  const tile = String(tileText == null ? "" : tileText);
+  const v = String(value == null ? "" : value).trim();
+  if (!v) return true;                          // nothing approved ⇒ nothing to disagree with
+  if (!tile) return false;
+  if (atsLib.normalize(tile).indexOf(atsLib.normalize(v)) !== -1) return true;
+  // the date case: compare canonical month+year keys, both directions
+  const want = atsYearMonthKey(v);
+  if (!want) return false;
+  const seen = (tile.match(/\b(?:[A-Za-z]+\s+\d{4}|\d{1,2}[-/]\d{4}|\d{4}[-/]\d{1,2})\b/g) || [])
+    .map(atsYearMonthKey).filter(Boolean);
+  return seen.indexOf(want) !== -1;
+}
+
 function atsOrcTilesAlreadyMatch(source, entries, want, tiles) {
   if (!Array.isArray(tiles) || !Array.isArray(entries)) return false;
   if (!want || tiles.length !== want) return false;
@@ -9671,7 +9742,8 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsOrcDurableName, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsOrcDurableName,
+    atsOrcTileHoldsValue, atsYearMonthKey, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
