@@ -7154,7 +7154,15 @@ async function atsGrowIcimsEntries(act, ats, scan, profile, wantBySection) {
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
+  // ⚠ EVERYTHING BETWEEN HERE AND THE atsFillFields CALL BELOW IS DEAD AIR ON THE PAGE — the form is
+  // rendered and nothing is being written to it yet. That is the second half of the pause the operator
+  // reported on ORC (2026-08-21), and it was entirely untimed: the scan, the option capture and the
+  // geo plan all ran with no wall clock on them, so the only way to bound this phase was to subtract
+  // guesses. `prepT0` is what lets the run state its own answer.
+  const prepT0 = Date.now();
+  const scanT0 = Date.now();
   let scan = await act.eval(atsInjScan, ats);
+  const scanMs = Date.now() - scanT0;
   // Stamp which ENTRY of a repeating section each field belongs to, before anything routes it.
   if (scan && scan.fields) atsAssignEntryIndexes(ats, scan.fields);
   // ⚠ GROW REPEATING SECTIONS TO FIT THE PROFILE, BEFORE FILLING. The form renders ONE entry and
@@ -7229,6 +7237,14 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // be given a second, contradicting one.
   const fillOpts = Object.assign({}, o, { aiCache: (o && o.aiCache) || new Map() });
 
+  // The last thing before the first write: how much of this step's clock went on preparation the page
+  // shows no sign of. Printed for every ATS (it is three numbers and it costs nothing), but it exists
+  // for ORC, where the capture pass and a 39-field scan both sit in this window.
+  try {
+    console.log(`[ApplyPilot][ATS-TIME] pre-fill prep ${((Date.now() - prepT0) / 1000).toFixed(1)}s`
+      + ` — scan ${(scanMs / 1000).toFixed(1)}s, then ${((Date.now() - prepT0 - scanMs) / 1000).toFixed(1)}s`
+      + ` of option capture / entry growth / planning, over ${((scan && scan.fields) || []).length} field(s)`);
+  } catch (e) { /* diagnostic only */ }
   await atsFillFields(act, ats, scan, scan.fields, results, profile, defaults, jc, bucketIndex, fillOpts);
 
   // CASCADE RE-SCAN (the Workday M1 pattern, earned again 2026-07-31 on Ramp): these SPAs
@@ -7621,9 +7637,19 @@ async function atsCaptureOrcOptions(act, scan, LOG) {
     return { captured: 0, skipped: skipped.length };
   }
   let captured = 0, failed = 0;
+  // ⚠ THIS PASS RUNS BEFORE A SINGLE FIELD IS WRITTEN, so every second it spends is a second of the
+  // pause the operator sees between the form rendering and the fill starting (ORC, 2026-08-21). It
+  // reported COUNTS and never TIME, and its per-picker cost is not uniform: a picker whose rows never
+  // arrive pays the FULL ATS_ORC_PICK_MS budget (8s) while a healthy one exits on its first 250ms
+  // read. Two unreadable pickers therefore cost more than the whole rest of the pass, and nothing in
+  // the log could say so. Per-picker ms, and the slow ones named.
+  const capT0 = Date.now();
+  const perMs = [];
   for (const f of eligible) {
     let r = null;
+    const fT0 = Date.now();
     try { r = await act.eval(atsInjOrcCaptureOptions, f.inputSel, ATS_ORC_PICK_MS); } catch (e) { r = null; }
+    perMs.push({ name: f.fieldName, ms: Date.now() - fT0, got: !!(r && r.ok && r.count) });
     if (r && r.ok && r.count) {
       // Complete by construction: an empty open returns ORC's WHOLE vocabulary (measured — country
       // 251 rows, dial 247, title 17; there is no pager to defeat us the way iCIMS' 25 did).
@@ -7636,7 +7662,12 @@ async function atsCaptureOrcOptions(act, scan, LOG) {
     }
   }
   log(`[ATS-OPTIONS] ORC scan-time capture — ${captured} complete list(s), ${failed} unreadable, ${skipped.length} skipped as search-driven`);
-  return { captured, failed, skipped: skipped.length };
+  const capMs = Date.now() - capT0;
+  const slow = perMs.filter((x) => x.ms >= 1500).sort((a, b) => b.ms - a.ms).slice(0, 5)
+    .map((x) => `${x.name} ${(x.ms / 1000).toFixed(1)}s${x.got ? "" : " (NOTHING CAPTURED — paid the full budget)"}`);
+  log(`[ATS-TIME] ORC option capture ${(capMs / 1000).toFixed(1)}s over ${eligible.length} picker(s)`
+    + `${slow.length ? " | slowest: " + slow.join(", ") : ""}`);
+  return { captured, failed, skipped: skipped.length, capMs };
 }
 
 async function atsFillFields(act, ats, scan, fields, results, profile, defaults, jc, bucketIndex, o) {

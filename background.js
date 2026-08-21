@@ -4538,6 +4538,15 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
   const start = Date.now();
   const deadline = start + (ceilingMs || 25000);
   let prev = -1, stable = 0;
+  // ⚠ HOW LONG THIS TOOK IS EVIDENCE, NOT NOISE (ORC, 2026-08-21). The operator reported the form
+  // rendering promptly and then a long pause before anything filled, and this settle is one of the
+  // three that sit in that window — but it only ever announced itself on FAILURE, so a run that
+  // burned 25s here and a run that settled in 2.6s printed the same "form settled — N field(s)".
+  // A settle whose duration is invisible cannot be ruled in or out, which is how the pause stayed
+  // unattributed. `polls` is carried too: the field COUNT churning (ORC fetches a requisition's
+  // questions separately, so blocks arrive late) is the specific way this pays its whole budget,
+  // and it is distinguishable only by seeing that the count never held still for three reads.
+  let polls = 0, everStable = false;
   while (Date.now() < deadline) {
     await cdpWakePage();
     // ⚠ iCIMS SERVES ITS WHOLE FORM INSIDE A SAME-ORIGIN IFRAME — the top document holds ZERO
@@ -4556,7 +4565,9 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
     // accepted Ashby's form at 9 fields while its survey/consent entries (4 more) were
     // still mounting (live 2026-07-31). Sections mount in bursts; a stable count between
     // bursts is not a settled form.
+    polls++;
     stable = n > 0 && n === prev ? stable + 1 : 0;
+    if (stable > 0) everStable = true;
     if (stable >= 2 && Date.now() - start >= 2500) {
       // Settled — but settled on WHAT? Identify the page positively before calling it a form.
       const scan = await cdpEval(atsInjScan, ats).catch(() => null);
@@ -4564,22 +4575,27 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
       const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
       if (!id.ok) {
         LOG(`${n} field(s) settled here, but this is NOT an application form — ${id.why}. Not filling it.`);
-        return { ready: false, fields: n, notAForm: true, why: id.why };
+        return { ready: false, fields: n, notAForm: true, why: id.why, waitedMs: Date.now() - start, polls };
       }
-      return { ready: true, fields: n };
+      return { ready: true, fields: n, waitedMs: Date.now() - start, polls };
     }
     prev = n;
     await cdpDelay(450);
   }
-  LOG(`form did not settle within ${ceilingMs || 25000}ms (last field count ${prev})`);
+  // ⚠ SAY WHICH FAILURE THIS WAS. "Did not settle" covers two states with different remedies: a
+  // count that NEVER held still even once (the form is still mounting — ORC's late-arriving question
+  // blocks) versus one that held but never for the three consecutive reads the bar asks for. The
+  // first wants the block settle below; the second wants a longer budget.
+  LOG(`form did not settle within ${ceilingMs || 25000}ms (last field count ${prev}, ${polls} poll(s), `
+    + `the count ${everStable ? "held still but never for 3 consecutive reads" : "NEVER held still — the form was still mounting"})`);
   // Same rule on the timeout path: fields we never identified as a form are not a form.
   if (prev > 0) {
     const scan = await cdpEval(atsInjScan, ats).catch(() => null);
     const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
     const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
-    if (!id.ok) { LOG(`the ${prev} field(s) here are not an application form — ${id.why}`); return { ready: false, fields: prev, notAForm: true, why: id.why }; }
+    if (!id.ok) { LOG(`the ${prev} field(s) here are not an application form — ${id.why}`); return { ready: false, fields: prev, notAForm: true, why: id.why, waitedMs: Date.now() - start, polls, timedOut: true }; }
   }
-  return { ready: prev > 0, fields: Math.max(prev, 0) };
+  return { ready: prev > 0, fields: Math.max(prev, 0), waitedMs: Date.now() - start, polls, timedOut: true };
 }
 
 // The actuation for the ATS driver: page-side eval + SW wall-clock pacing + the same
@@ -5334,6 +5350,13 @@ async function orcAwaitBlocksPopulated(LOG) {
     // be SAID, because the alternative is a step that looks complete in the log.
     LOG(`⚠ after ${((Date.now() - blkT0) / 1000).toFixed(1)}s these block(s) still have no controls and no Add button: ${JSON.stringify(pending)} — anything inside them was NOT filled`);
   }
+  // ⚠ AND SAY WHAT IT COST EITHER WAY (ORC, 2026-08-21). This settle is one of the phases inside the
+  // pause the operator reported between the gate clearing and the first field being written, and it
+  // announced itself ONLY when it gave up — so the case that matters most for that diagnosis, a full
+  // 15s budget spent on a block that was never going to populate, printed exactly as much as an
+  // instant pass: nothing. A phase that can cost a fifth of a minute must state its own cost.
+  LOG(`[ATS-TIME] block settle ${((Date.now() - blkT0) / 1000).toFixed(1)}s`
+    + `${(pending && pending.length) ? ` — WHOLE BUDGET spent, ${pending.length} block(s) never populated` : " — all visible blocks populated"}`);
   return pending || [];
 }
 
@@ -5469,6 +5492,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // steps can never read as a finished application. It used to be set unconditionally, because the
   // path filled exactly one step and stopped.
   let orcSinglePageOnly = false;
+  // Stamped when the ORC gate is cleared, consumed once by the walk below — see the comment at the
+  // assignment for why this window needed a name. `null` on every other ATS (no gate to clear).
+  let orcGateClearedAt = null;
   // ⚠ ORACLE IS DETECTED BUT NOT YET DRIVEABLE — REFUSE LOUDLY RATHER THAN FALL THROUGH (2026-08-19).
   // `detectAts` learned Oracle Recruiting Cloud one increment ahead of its scan branch, and the two
   // must not be allowed to disagree quietly. `atsInjScan` has no `oracle` branch, so an ORC page would
@@ -5667,6 +5693,15 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       // plausible-but-incomplete failure this codebase refuses. The walk is the next increment; until
       // it exists the run result carries `pages_filled: 1` and the caller must not read it as done.
       LOG(`✔ pre-form complete — walking the wizard (${pre.sections} section(s) mounted; ORC mounts every step at once, so that count is NOT the step count)`);
+      // ⚠ THE GATE→FILL WINDOW IS A PHASE IN ITS OWN RIGHT, AND IT WAS NOBODY'S (operator, 2026-08-21):
+      // "after it puts the code in and presses enter, the page renders quite quickly, but it waits a
+      // long time before actually filling." Between this line and the first value written there are
+      // FOUR sequential settles — the form-set settle (25s budget), the block-population settle (15s),
+      // the option capture (8s per picker) and the scan — each of which logged only its own failure or
+      // nothing at all. Stamping the start here is what turns "a long time" into an attributable
+      // number, so the next round cuts the phase that is actually paying and not the one that looks
+      // suspicious. Same habit as the [CDP-TIME]/[ATS-TIME] lines the rest of the pipeline carries.
+      orcGateClearedAt = Date.now();
     }
     if (ats === "icims") {
       emitRunProgress("Signing in to the careers portal", "iCIMS");
@@ -5787,7 +5822,8 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       return { ok: true, needs_operator: true, stopped: "form-not-rendered",
         detail: "No " + ats + " application form rendered at " + (hereX || startUrl) + " and no apply link could be followed — open the tab and check, then re-run.", jd };
     }
-    LOG(`form settled — ${ready.fields} field(s).`);
+    LOG(`[ATS-TIME] form settled — ${ready.fields} field(s) after ${((ready.waitedMs || 0) / 1000).toFixed(1)}s`
+      + `${ready.polls ? ` over ${ready.polls} poll(s)` : ""}${ready.timedOut ? " (TIMED OUT — the field count never held still, so this paid its whole budget)" : ""}.`);
 
     const jobContext = { ...(store.jobContext || {}) };
     // WHICH COMPANY IS THIS? The string anchors the safety-critical "have you worked for us
@@ -5919,6 +5955,15 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         emitRunProgress(`Filling step ${st.step != null ? st.step : iter}${st.total ? " of " + st.total : ""}`, "Oracle wizard (never submits)");
       }
 
+      // What the operator actually asked about: everything from the code being accepted to the fill
+      // beginning. Printed ONCE, before the first step, and deliberately as a TOTAL alongside the
+      // per-phase lines above rather than instead of them — the total is the complaint, the phases are
+      // the diagnosis, and a total on its own would just restate the problem.
+      if (orcGateClearedAt && iter === 1) {
+        LOG(`[ATS-TIME] gate cleared → step 1 fill begins: ${((Date.now() - orcGateClearedAt) / 1000).toFixed(1)}s`
+          + ` (the form settle + block settle + step read above account for this; the option capture and`
+          + ` scan that follow are counted in "pre-fill prep")`);
+      }
       out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], credentials: store.credentials || null, resumePreattached: resumePre });
       allResults = allResults.concat(out.results || []);
       stepsFilled++;
