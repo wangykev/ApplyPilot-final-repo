@@ -2102,3 +2102,57 @@ page-side poll (round 15's entry-open fix: 28 starved awaits → 1). Viable on O
 `atsInjOrcCaptureOptions` already does page-side `await setTimeout` successfully; the recon's "page
 timers were not firing" 45s failures were raw recon WITHOUT those overrides. **Verify that assumption
 explicitly before relying on it**, and measure with several runs per arm.
+
+
+## Round 17 — the timed settle, live x3 unattended: NO REGRESSION, but the fix is NOT DEMONSTRATED (2026-08-21)
+
+Three unattended ORC runs on `eeho`, build `orc-timedsettle-1`, fresh requisitions, operator away.
+
+| run | req | form settle | polls | `gate → step 1` | `sw-starved` paces |
+|---|---|---|---|---|---|
+| 1 | 333297 | 2.8s | 5 | **2.8s** | 0 |
+| 2 | 343709 | 4.1s | 5 | **6.9s** | 0 |
+| 3 (deliberate CPU load) | 340692 | 2.8s | 7 | **2.8s** | **5** |
+
+All three walked 3/3 steps to `reached-final-step` with NOTHING pressed.
+
+### ⚠⚠ WHAT THIS DOES NOT SHOW — the fix's mechanism never engaged
+
+Against the round-16 baseline (same tenant, unattended, old build) of **34.4s** and **45.1s**, these
+look like a 5-15x win. **Do not record it as one.** The fix makes a STARVED settle finish in 2 reads
+instead of 3+; every run here took **5-7 reads at ~400-800ms each**, i.e. the worker was HEALTHY during
+the settle and the count floor was never the binding constraint. The improvement is therefore
+attributable to READ LATENCY, which my change does not touch, and not to the predicate.
+
+Round 3 is the sharpest evidence for that reading: it logged **5 `sw-starved` paces** — the worker
+genuinely was starved during that run — and still settled in 2.8s over 7 polls, because **starvation is
+BURSTY and simply did not land on the settle window.**
+
+### ⚠ THE REVISED HEADLINE: 27s IS A BURST, NOT THE TYPICAL CASE
+
+Round 16 reported 27.1s / 34.4s and framed it as what an unattended run costs. Three attempts could not
+reproduce a starved settle: **typical unattended `gate → first field` is ~3-7s.** The operator's
+instinct on being shown the 27.1s figure — *"it definitely did not take 27 secs to settle"* — was right
+about the typical case, and round 16's framing over-generalised from two unlucky runs. Both readings
+are true and they answer different questions: the tail is real and awful, the median is fine.
+
+Plausible reason the baseline runs were so much worse: the machine was under repeated `npm test` /
+`eslint` / Next-dev compilation between those runs, and starvation tracks machine pressure as well as
+Chrome's foreground state. Stated as a confound, not a conclusion — it was not controlled.
+
+### What IS established
+
+- **No regression from the timed predicate.** 3/3 complete walks; settle 2.8-4.1s, governed by the
+  unchanged ≥2500ms floor exactly as designed on a healthy worker.
+- **Starvation is bursty and phase-agnostic** — it hits whatever happens to be running (round 3 had 5
+  starved paces and a fast settle; round 16 run 4 had a 13.6s `atsInjScan` and a fast settle).
+- **The tail, not the median, is the problem.** Which is an argument FOR the fewer-awaits direction and
+  AGAINST tuning any single phase: you cannot predict which phase the burst will land on.
+
+### To actually validate the predicate change
+
+It needs a settle that occurs DURING a burst, and three attempts did not produce one. Either many more
+runs, or a way to force starvation on demand that does not change the regime (a hidden tab is NOT it —
+that is the worker-timer-polyfill path, a different mechanism). Until then the change stands on the
+structural argument (it removes an attempts floor the repo's own 59-loop audit forbids, and matches
+Workday's starvation-tolerant predicate) plus a no-regression result — **not on a measured win.**
