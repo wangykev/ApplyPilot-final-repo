@@ -4873,6 +4873,71 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
   return { ok: true, pressed: t(add), fields, count: fields.length };
 }
 
+// ── THE RÉSUMÉ IS ALWAYS REMOVED AND REPLACED ON A REPLAY (operator, 2026-08-21) ─────────────
+// "A rehearsal should only remove and replace the resume since there is no way to tell which is
+// actually uploaded." That is the exact reason it is the ONE exception to read-before-write: every
+// other field can be verified by LOOKING at the page, but a file field shows only a NAME, and a
+// filename says nothing about which bytes the server is holding. Re-uploading is the only way to
+// know, so the résumé is re-uploaded unconditionally.
+//
+// This also fixes the failure that exposed it: on the re-visit ORC renders the ATTACHED state
+// instead of the upload control, so `resume-upload` was absent from the scan entirely and the strict
+// verify reported the approved résumé as "no matching field on the live form". Removing it first
+// brings the file input back, after which the ORDINARY field loop attaches it — no second attach
+// path, and the route that maps exactly one field to the résumé still decides which slot gets it.
+//
+// ⚠ IT REPORTS WHAT IT FOUND RATHER THAN ASSUMING. I have not seen ORC's attached-résumé markup, and
+// inventing a selector for it is what the trace-first rule exists to prevent — so the remove control
+// is discovered the same way the tile controls are (aria-label / title / text), and when there is no
+// such control this returns the controls it DID see. That way a miss is a diagnosable report instead
+// of a silent no-op, and the next run has the DOM evidence.
+async function atsInjOrcResumeReset(budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const FILE_RE = /\.(pdf|docx?|rtf|txt|odt)\b/i;
+  const findWrap = () => {
+    const own = [...document.querySelectorAll("resume-upload-button")].filter(vis)[0];
+    if (own) return own;
+    // Fall back to the row/block whose own label names a résumé — never a document-wide sweep, so a
+    // cover-letter or attachment slot can never be mistaken for it.
+    return [...document.querySelectorAll("div.input-row, apply-flow-block")].filter(vis)
+      .find((d) => /r[ée]sum[ée]/i.test(t(d.querySelector("label")) || "")
+                || /r[ée]sum[ée]/i.test(t(d.querySelector("apply-flow-block-title")) || "")) || null;
+  };
+  const wrap0 = findWrap();
+  if (!wrap0) return { ok: true, present: false };
+  const controlsOf = (w) => [...w.querySelectorAll("button, a[role=button]")].filter(vis);
+  const nameIn = (w) => {
+    const el = [...w.querySelectorAll("*")].find((e) => FILE_RE.test(t(e)) && t(e).length < 120);
+    return el ? t(el) : null;
+  };
+  const attachedName = nameIn(wrap0);
+  const offered = controlsOf(wrap0)
+    .map((b) => (b.getAttribute("aria-label") || b.getAttribute("title") || t(b) || "").slice(0, 40))
+    .filter(Boolean);
+  if (!attachedName) {
+    return { ok: true, present: true, attached: false, offered,
+      hasFileInput: !!wrap0.querySelector('input[type="file"]') };
+  }
+  const rm = controlsOf(wrap0).find((b) => /remove|delete|clear|discard|trash|replace/i
+    .test(String(b.getAttribute("aria-label") || b.getAttribute("title") || t(b))));
+  if (!rm) return { ok: true, present: true, attached: true, attachedName, removed: false,
+    error: "no-remove-control", offered };
+  rm.click();
+  const deadline = Date.now() + (budgetMs || 6000);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    const w = findWrap();
+    if (!w) return { ok: true, present: true, attached: true, attachedName, removed: true, hasFileInput: false };
+    if (nameIn(w) !== attachedName) {
+      return { ok: true, present: true, attached: true, attachedName, removed: true,
+        hasFileInput: !!w.querySelector('input[type="file"]') };
+    }
+  }
+  return { ok: true, present: true, attached: true, attachedName, removed: false,
+    error: "still-attached", offered };
+}
+
 // OPEN AN EXISTING TILE FOR EDIT — the read side of the replay's verify (2026-08-20).
 // Same shape as the open above and the same evidence rule: a form is open when INPUTS APPEARED, not
 // when a button says Cancel. The tile is addressed by INDEX in the same order atsInjOrcTiles returns
@@ -7374,6 +7439,41 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       if (o.valueFor && !atsCredentialKind(ats, f)) {
         const v = o.valueFor(f);
         if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(fin()); continue; }
+        // ⚠⚠ A REHEARSAL READS BEFORE IT WRITES (operator, 2026-08-21): "the rehearsal run should not
+        // refill if it is correct. you can get all the information by looking at the page."
+        //
+        // The replay used to re-actuate every approved field unconditionally. That is a lot of
+        // avoidable page contact on a form that is already right, and every write is a chance to
+        // disturb something that was fine — a stray commit landing in a neighbouring widget is a
+        // failure mode this codebase has paid for more than once (the Workday lingering-listbox
+        // rule). The scan ALREADY carries each field's live value, so the check is free: no extra
+        // read, no extra round-trip.
+        //
+        // Equal ⇒ record it verified and move on. Different ⇒ fall through and actuate exactly as
+        // before, which is the operator's other half: "if something is filled wrong, change it."
+        //
+        // ⚠ THE COMPARISON IS DELIBERATELY CONSERVATIVE. A format difference between what the scan
+        // reads and what the fill recorded (a date read "5/2026" but stored "May 2026") simply falls
+        // through and re-writes the same value — costly, never wrong. The asymmetry matters: a false
+        // "already correct" would skip a field that needed fixing and report it verified, so anything
+        // uncertain must actuate.
+        // ⚠ FILE FIELDS ARE EXEMPT — see the résumé note below. Their "value" is a filename, which
+        // says nothing about which bytes are on the server.
+        if (f.widgetType !== "file_upload") {
+          const liveRaw = f.value;
+          const live = liveRaw == null ? "" : (typeof liveRaw === "boolean" ? (liveRaw ? "true" : "") : String(liveRaw));
+          if (live && atsLib.normalize(live) === atsLib.normalize(String(v))) {
+            rec.after = live;
+            rec.verified = true;
+            rec.status = "filled";
+            rec.tier = "already-correct";
+            // `resolved` marks this as a field we HAD a value for, which is what keeps
+            // atsSurfacePrefilled from re-reading it and re-reporting it as pre-populated.
+            rec.resolved = [String(v)];
+            rec.detail = "the form already holds the value you approved — checked, not rewritten";
+            results.push(fin()); continue;
+          }
+        }
         if (f.widgetType === "file_upload") {
           // ⚠ NOT EVERY FILE FIELD IS THE RÉSUMÉ. Greenhouse renders the COVER LETTER as a file
           // dropzone too, so attaching to every file field put the résumé in the cover-letter slot
@@ -9563,7 +9663,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
     atsOrcEntryIdentity, atsOrcTilesAlreadyMatch, atsInjOrcOpenEntryAndWait, atsInjOrcCommitEntryAndWait,
-    atsInjOrcOpenTileAndWait, atsInjOrcCloseEntry,
+    atsInjOrcOpenTileAndWait, atsInjOrcCloseEntry, atsInjOrcResumeReset,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,

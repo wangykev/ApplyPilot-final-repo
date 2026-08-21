@@ -4452,3 +4452,55 @@ test("atsSubmitKey(oracle): the volatile self-ID counter is stripped, meaningful
                      "US-STANDARD-X-STANDARD-12");
   assert.strictEqual(ats.atsSubmitKey("lever", "anything-9"), "anything-9");
 });
+
+// ── A REHEARSAL READS BEFORE IT WRITES (operator, 2026-08-21) ────────────────────────────────
+test("the replay skips actuation when the form already holds the approved value", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf('if (o.valueFor && !atsCredentialKind(ats, f))');
+  assert.ok(i > 0, "the replay branch must exist");
+  const branch = stripJsComments(src.slice(i, i + 4200));   // wide enough to include the fall-through
+
+  assert.ok(/tier = "already-correct"/.test(branch),
+    "a field the form already holds must be recorded verified rather than rewritten");
+  assert.ok(/atsLib\.normalize\(live\) === atsLib\.normalize\(String\(v\)\)/.test(branch),
+    "the comparison is on the live value the SCAN already carries — no extra page contact");
+  assert.ok(/rec\.resolved = \[String\(v\)\]/.test(branch),
+    "it must mark the field as one we HAD a value for, or atsSurfacePrefilled re-reports it as pre-populated");
+
+  // ⚠⚠ FILE FIELDS ARE EXEMPT. A file field shows only a NAME, which says nothing about which bytes
+  // the server holds — so a rehearsal always re-uploads rather than trusting a filename.
+  assert.ok(/f\.widgetType !== "file_upload"/.test(branch),
+    "the read-before-write shortcut must NOT apply to file fields");
+
+  // …and the fall-through must still actuate, which is the operator's other half
+  assert.ok(branch.indexOf('tier = "already-correct"') < branch.indexOf('route = { value: v, source: "replay" }'),
+    "a value that does NOT match must fall through and be written, exactly as before");
+});
+
+test("the résumé is removed and re-uploaded BEFORE the step's scan", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("atsInjOrcResumeReset");
+  assert.ok(i > 0, "the replay walk must reset the résumé");
+  const walk = stripJsComments(src.slice(i - 400, i + 1400));
+
+  // BEFORE the fill: until the file is removed, ORC renders the attached state and `resume-upload`
+  // is not in the scan at all — which is how the approved résumé came to report "no matching field".
+  assert.ok(walk.indexOf("atsInjOrcResumeReset") < walk.indexOf("driveAtsPageFill"),
+    "the reset must run BEFORE the step's fill, or the upload control is not in the scan");
+});
+
+test("atsInjOrcResumeReset reports what it found instead of assuming markup", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsInjOrcResumeReset");
+  assert.ok(i > 0);
+  const fn = stripJsComments(src.slice(i, src.indexOf("\n}", src.indexOf('error: "still-attached"', i))));
+
+  assert.ok(/no-remove-control/.test(fn) && /offered/.test(fn),
+    "a missing remove control must come back as a diagnosable report carrying the controls it DID " +
+    "see — ORC's attached-résumé markup has not been observed, and a silent no-op would hide that");
+  // ⚠ scoped to the résumé's own row/wrapper, never a document sweep: a cover-letter or attachment
+  // slot must never be mistaken for the résumé (the Greenhouse wrong-slot lesson).
+  assert.ok(/resume-upload-button/.test(fn), "it prefers ORC's own wrapper");
+  assert.ok(!/document\.querySelectorAll\("button/.test(fn),
+    "controls are searched within the résumé area, never document-wide");
+});

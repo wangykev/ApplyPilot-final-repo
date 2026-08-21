@@ -6299,6 +6299,20 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         LOG(`replaying step ${stepNo}${st.total ? " of " + st.total : ""} — next=${st.hasNext ? JSON.stringify(st.nextCaption) : "none"} · submit=${st.hasSubmit ? JSON.stringify(st.submitCaption) : "none"}`);
         emitRunProgress(`${arm ? "Submitting" : "Rehearsing"} — step ${stepNo}${st.total ? " of " + st.total : ""}`, "Oracle wizard");
         await orcAwaitBlocksPopulated(LOG);
+        // ⚠ THE RÉSUMÉ IS REMOVED AND RE-UPLOADED, EVERY REPLAY (operator, 2026-08-21). Every other
+        // field is verified by READING the page; a file field shows only a name, which says nothing
+        // about which bytes the server holds — so this is the one thing a rehearsal always redoes.
+        // It runs BEFORE the step's scan on purpose: ORC renders the ATTACHED state instead of the
+        // upload control, so until the file is removed `resume-upload` is not in the scan at all and
+        // the approved résumé reported "no matching field on the live form". Removing it first brings
+        // the input back and the ordinary field loop does the attaching.
+        const rr = await cdpEval(atsInjOrcResumeReset, 8000).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        if (rr && rr.present) {
+          if (rr.removed) LOG(`résumé: removed ${JSON.stringify(rr.attachedName)} so it can be re-uploaded (a filename cannot tell us which file is really attached)`);
+          else if (rr.attached) LOG(`⚠ résumé: ${JSON.stringify(rr.attachedName)} is attached and could NOT be removed (${rr.error || "unknown"})`
+            + (rr.offered ? `; the area offered ${JSON.stringify(rr.offered)}` : "") + " — it will be verified as-is instead of replaced");
+          else LOG(`résumé: nothing attached yet${rr.hasFileInput ? " (upload control present)" : ""} — the fill pass will attach it`);
+        }
         const step = await driveAtsPageFill(act, ats, {}, {}, { company: bundle.tenant }, replayOpts);
         lastUrl = step.url || lastUrl;
         for (const r of step.results || []) union.set(durable(r), r);
