@@ -6040,6 +6040,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
       .map((r) => `${r.fieldName} ${(r.elapsedMs / 1000).toFixed(1)}s`).join(", ");
     LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${allResults.length} field(s)${MULTI ? ` across ${stepsFilled} step(s)` : ""} — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`);
+    // ⚠ AND THE RUN'S OWN PACING VERDICT, every time. A 630s ORC fill had to be diagnosed by hand from
+    // the [PACE] lines; this makes any run say whether its clock was healthy, and names the culprit
+    // when it was not (see cdpPaceSummary — "sw-starved" means the WORKER, not the page).
+    try { LOG(`[ATS-TIME] ${cdpPaceSummary()}`); } catch (e) { /* log only */ }
     // Say what ACTUALLY happened to the report. reportApplication used to return nothing, so this
     // line claimed "Reported to the website." even when the line directly above it was the ⛔ saying
     // the tracker had rejected it.

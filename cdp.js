@@ -123,6 +123,10 @@ function cdpPageClockEnabled() { return _pageClockOn; } // so a caller can SAVE/
 
 const PAGE_SLEEP_SLACK_MS = 1500;   // race ceiling above the requested pace (guard 2)
 const PACE_OVERRUN_LOG_MS = 1000;   // log a pace this far over budget (permanent — no flag needed)
+// How late our OWN abandon ceiling may be before the worker, not the page, is the culprit. Small on
+// purpose: a healthy worker fires a setTimeout within a few ms, and the starved case overshoots by
+// SECONDS — there is no ambiguous middle to tune for.
+const SW_STARVED_MS = 250;
 
 const cdpSwSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -137,12 +141,49 @@ function cdpPageSleep(ms) {
 
 // Drift is now REPORTED, not merely survived: a pace that still overruns badly prints once, with no flag
 // required, so the next occurrence is visible in any run's log instead of needing debugLagTrace on.
-function cdpPaceNote(want, took, via) {
-  if (took - want < PACE_OVERRUN_LOG_MS) return;
+// ── EVERY RUN REPORTS ITS OWN PACING LOSS (2026-08-20) ──────────────────────────────────────
+// A 630s ORC fill was diagnosed by hand: grep the [PACE] lines, notice they are all one `via`, work
+// out that the abandon ceiling is due at want+SLACK and fired 9.3s late, conclude the WORKER was
+// starved. That is three steps too many for something that shows up on ordinary runs, so the numbers
+// are accumulated here and printed with the run's timing summary. Reset per attach.
+let _paceStats = { n: 0, over: 0, lostMs: 0, worstMs: 0, worstWant: 0, byVia: {} };
+function cdpPaceStatsReset() { _paceStats = { n: 0, over: 0, lostMs: 0, worstMs: 0, worstWant: 0, byVia: {} }; }
+function cdpPaceStats() { return { ..._paceStats, byVia: { ..._paceStats.byVia } }; }
+// One line, safe to print unconditionally — a healthy run says so in a few words.
+function cdpPaceSummary() {
+  const p = _paceStats;
+  if (!p.n) return "pacing: no paces recorded";
+  const pct = Math.round((p.over / p.n) * 100);
+  const vias = Object.keys(p.byVia).sort((a, b) => p.byVia[b] - p.byVia[a])
+    .map((k) => `${k}×${p.byVia[k]}`).join(" ");
+  return `pacing: ${p.n} pace(s), ${p.over} overran (${pct}%), ${(p.lostMs / 1000).toFixed(1)}s lost, `
+    + `worst ${p.worstMs}ms on a ${p.worstWant}ms wait · ${vias}`
+    + (p.byVia["sw-starved"] ? " — ⚠ SW-STARVED paces mean the SERVICE WORKER's own timers were late; "
+        + "the page clock CANNOT help there (its abandon ceiling is an SW timer too). The lever is "
+        + "FEWER AWAITS, not a different clock. docs/fill-speed-log.md" : "");
+}
+
+function cdpPaceNote(want, took, via, watchdogLateBy) {
+  const p = _paceStats;
+  p.n++;
+  p.byVia[via] = (p.byVia[via] || 0) + 1;
+  const over = took - want;
+  if (over > 0) { p.lostMs += over; }
+  if (over >= PACE_OVERRUN_LOG_MS) {
+    p.over++;
+    if (over > p.worstMs) { p.worstMs = over; p.worstWant = want; }
+  }
+  if (over < PACE_OVERRUN_LOG_MS) return;
   try {
     console.log(`[ApplyPilot][PACE] ⚠ a ${want}ms pace took ${took}ms (${via}) — the clock overran by `
-      + `${took - want}ms. SW-side starvation is the known cause (docs/fill-speed-log.md); `
-      + `"page" means even the page clock was late, which is new.`);
+      + `${over}ms.`
+      + (via === "sw-starved"
+        ? ` OUR OWN abandon ceiling was ${watchdogLateBy}ms late, so this is SERVICE-WORKER starvation`
+          + ` and says NOTHING about the page — the page clock cannot help, because that ceiling is an`
+          + ` SW timer too. Fewer awaits is the lever (docs/fill-speed-log.md).`
+        : via === "page-abandoned"
+        ? ` The abandon ceiling fired roughly on time, so the PAGE genuinely did not answer.`
+        : ` SW-side starvation is the known cause (docs/fill-speed-log.md).`));
   } catch (e) { /* log only */ }
 }
 
@@ -150,12 +191,26 @@ async function cdpDelay(ms) {
   const want = Math.max(0, Math.round(Number(ms) || 0));
   const t0 = Date.now();
   let via = "sw";
+  let watchdogLateBy = 0;
   if (want > 0 && _pageClockOn && cdpTabId !== null && _workerTimersActive) {
     via = "page";
     let timer = null;
     try {
       await new Promise((resolve, reject) => {
-        timer = setTimeout(() => { via = "page-abandoned"; resolve(); }, want + PAGE_SLEEP_SLACK_MS);
+        // ⚠⚠ WHEN THE CEILING WINS, MEASURE HOW LATE THE CEILING ITSELF WAS (2026-08-20).
+        // Losing this race was reported as `page-abandoned`, which reads as "the page did not
+        // answer" — and on a 630s ORC fill all 16 logged overruns carried that label, which sent the
+        // diagnosis at the renderer. It was the opposite: the ceiling is due at want+SLACK and fired
+        // up to 11.5s late, i.e. the SERVICE WORKER's timer was starved. Both arms of this race are
+        // worker-scheduled (this setTimeout, and resuming the await when the CDP reply lands), so a
+        // starved worker loses it every time and the page is never implicated by the evidence.
+        // Comparing the ceiling against its OWN due time separates the two for free.
+        const dueAt = t0 + want + PAGE_SLEEP_SLACK_MS;
+        timer = setTimeout(() => {
+          watchdogLateBy = Date.now() - dueAt;
+          via = watchdogLateBy > SW_STARVED_MS ? "sw-starved" : "page-abandoned";
+          resolve();
+        }, want + PAGE_SLEEP_SLACK_MS);
         cdpPageSleep(want).then(resolve, reject);
       });
     } catch (e) {
@@ -168,7 +223,7 @@ async function cdpDelay(ms) {
   } else {
     await cdpSwSleep(want);
   }
-  cdpPaceNote(want, Date.now() - t0, via);
+  cdpPaceNote(want, Date.now() - t0, via, watchdogLateBy);
 }
 // ── PACING CLOCK END ──
 
@@ -278,6 +333,7 @@ function cdpAttach(tabId) {
       _frameCtxId = null;                      // frame-scoped eval is per-run opt-in (iCIMS only) — everything else evaluates in the top frame
       _frameCtxUrl = null;
       _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
+      cdpPaceStatsReset();                     // pacing stats are PER RUN — the summary is printed with the run's timing
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});

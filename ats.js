@@ -6149,6 +6149,37 @@ function atsAssertionLead(candidate, texts) {
   return hits.length === 1 ? hits[0] : null;   // ambiguous ⇒ refuse
 }
 
+// ── A LONE ASSERTION CHECKBOX ANSWERS "NO" BY STAYING UNTICKED (operator, 2026-08-20) ──────
+// The twin of atsAssertionLead above. That one finds the option a STATED assertion matches; this one
+// recognises that for a form offering exactly ONE tickable assertion, the negative answer is not an
+// option at all — it is the ABSENCE of a tick, and the box already holds it.
+//
+// Seen first on Oracle's ethnicity question (label "Ethnicity", one option, "I am Hispanic or
+// Latino.", profile "No, I am not Hispanic"), but written for the shape rather than the question:
+// veteran status, disability, and most single-box self-ID questions are put the same way, and every
+// tenant words both halves differently. Nothing here knows what the question is ABOUT — relevance was
+// already established by whatever routed the profile value to this field.
+//
+// ⚠ THE OPTION MUST READ AFFIRMATIVELY. A negatively-worded box ("I do NOT consent…", "I decline…")
+// makes "no" a DOUBLE NEGATIVE, and which way that resolves is exactly the kind of thing this
+// codebase refuses to guess — those fall through and get flagged for a human, as before.
+//
+// ⚠ AND IT ONLY EVER RECOGNISES A NO. A yes-polarity answer is left to the tiers above (assertion-lead
+// ticks it), because a YES we fail to express must still be surfaced: the difference matters, since
+// "leave it unticked" is indistinguishable from "we never got to it" on the page itself.
+const ATS_OPTION_NEGATIVE_RE = /\b(not|never|no longer|decline|declines?|opt[- ]?out|unwilling)\b/i;
+function atsAssertionDeclined(candidate, optionText) {
+  const c = String(candidate == null ? "" : candidate).trim();
+  const o = String(optionText == null ? "" : optionText).trim();
+  if (!c || !o) return false;
+  if (ATS_NEG_LEAD_RE.test(o) || ATS_OPTION_NEGATIVE_RE.test(o)) return false;  // double negative ⇒ refuse
+  if (/^(false|no)$/i.test(c)) return true;                 // a coerced boolean, or a bare "No"
+  if (/^\s*(no|false)\b/i.test(c)) return true;             // "No, I am not Hispanic"
+  if (ATS_NEG_LEAD_RE.test(c)) return true;                 // "I am not a protected veteran"
+  if (/^\s*not\b/i.test(c)) return true;                    // "Not Hispanic or Latino"
+  return false;
+}
+
 // DEGREE LEVEL is a small closed vocabulary, and forms model it at a different granularity than a
 // person states it: the profile says "Bachelor of Science" (and its ladder "Bachelors",
 // "Bachelor of Science (BS)"), while Discord's list offers "Bachelor's Degree". The apostrophe and the
@@ -9116,7 +9147,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // The box is READ BACK and unticked if the form arrived with it set, because "leave it alone" is
     // only the right action when it is already in the answer's state.
     if (!pick && wt === "checkbox_group" && texts.length === 1
-        && /^\s*(no|false)\b/i.test(String(candidates[0] || ""))) {
+        && atsAssertionDeclined(candidates[0], texts[0])) {
       const cur = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
       const held = cur && cur.ok ? String(cur.value == null ? "" : cur.value).trim() : "";
       if (held) {
@@ -9433,7 +9464,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,

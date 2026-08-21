@@ -4351,3 +4351,42 @@ test("the replay flag is threaded EXPLICITLY into atsFinishFill", () => {
     "…which become the entry pass's reportOnly and its approved-value lookup — without the lookup " +
     "the replay can only SEE the entries, not check them against what the human approved");
 });
+
+// ── A LONE ASSERTION CHECKBOX ANSWERS "NO" BY STAYING UNTICKED (operator, 2026-08-20) ────────
+test("atsAssertionDeclined: a negative answer to a single affirmative assertion", () => {
+  const D = ats.atsAssertionDeclined;
+  // the case it was found on — Oracle's ethnicity question
+  assert.strictEqual(D("No, I am not Hispanic", "I am Hispanic or Latino."), true);
+  // …and the shapes other tenants use, since nothing here knows the question's SUBJECT
+  assert.strictEqual(D("No", "I am Hispanic or Latino."), true);
+  assert.strictEqual(D("false", "I certify the above"), true);
+  assert.strictEqual(D("I am not a protected veteran", "I identify as a protected veteran"), true);
+  assert.strictEqual(D("Not Hispanic or Latino", "I am Hispanic or Latino."), true);
+
+  // ⚠ ONLY A NO. A yes must fall through to assertion-lead, because a YES we failed to express has
+  // to be surfaced — on the page, "left unticked" and "never got to it" look identical.
+  assert.strictEqual(D("Yes, I am Hispanic or Latino", "I am Hispanic or Latino."), false);
+  assert.strictEqual(D("I am Hispanic or Latino", "I am Hispanic or Latino."), false);
+
+  // ⚠ A NEGATIVELY-WORDED OPTION IS A DOUBLE NEGATIVE — refuse and let a human decide.
+  assert.strictEqual(D("No", "I do not consent to marketing email"), false);
+  assert.strictEqual(D("No", "I decline to self-identify"), false);
+  assert.strictEqual(D("No", "I am not a protected veteran"), false);
+
+  // and nothing unrelated
+  assert.strictEqual(D("Asian", "I am Hispanic or Latino."), false);
+  assert.strictEqual(D("November", "I am Hispanic or Latino."), false, "word-anchored: 'no' must not match 'November'");
+  assert.strictEqual(D("", "I am Hispanic or Latino."), false);
+  assert.strictEqual(D("No", ""), false);
+});
+
+test("the commit branch applies it ONLY to a one-option checkbox group", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("atsAssertionDeclined(candidates[0], texts[0])");
+  assert.ok(i > 0, "the commit branch must use the shared helper, not its own regex");
+  const guard = stripJsComments(src.slice(i - 220, i + 60));
+  assert.ok(/wt === "checkbox_group"/.test(guard),
+    "checkbox groups only — an untouched RADIO group means unanswered, not 'no'");
+  assert.ok(/texts\.length === 1/.test(guard),
+    "exactly one option — a multi-option group has no single assertion for a bare 'no' to deny");
+});
