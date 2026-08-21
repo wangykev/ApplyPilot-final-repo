@@ -5115,6 +5115,21 @@ function atsInjOrcEntryAction(blockTitlePattern, action) {
 // ⚠ `Skills` and the résumé arrive PREFILLED from a returning candidate's account (measured: skills
 // already populated, `Kevin_s_Resume (6).pdf` already attached), so an entry pass here must reconcile
 // UP only and never assume a block starts empty.
+// ── PICKER READ-BACK: FRONT-LOADED, SAME BUDGET (operator reported slow skills, 2026-08-21) ──
+// Every ORC picker commit polls its read-back eight times. A flat 250ms wait meant even a value that
+// landed instantly cost 250ms before the first LOOK — and a fill crosses ~30 pickers (both halves of
+// every date pair, the dial code, the degree, and one per skill), so the floor alone was seconds.
+//
+// This schedule sums to the SAME 2000ms over the SAME eight awaits, so nothing is traded away: the
+// worst case is unchanged and the number of chances to be descheduled is unchanged — which matters,
+// because on this codebase the cost of a poll is the NUMBER of awaits, not their length. All that
+// changes is that the early looks happen sooner, so the common case (the widget already settled)
+// returns in 60ms instead of 250ms.
+//
+// ⚠ Do NOT "improve" this by adding more polls. A stability predicate gets WEAKER with denser
+// sampling, and every extra await is another starvation exposure (docs/fill-speed-log.md round 15).
+const ATS_ORC_READBACK_MS = [60, 100, 140, 200, 260, 320, 420, 500];
+
 var ATS_ORC_ENTRY_BLOCKS = [
   { pattern: "^Experience", source: "work_experience", label: "Experience" },
   { pattern: "^Education", source: "education", label: "Education" },
@@ -8690,8 +8705,8 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         const r = await act.eval(atsInjOrcPick, ref.inputSel, want, [want], ATS_ORC_PICK_MS, false);
         if (r && r.ok) {
           let back = null;
-          for (let i = 0; i < 8; i++) {
-            await act.delayFull(250);
+          for (let i = 0; i < ATS_ORC_READBACK_MS.length; i++) {
+            await act.delayFull(ATS_ORC_READBACK_MS[i]);
             back = await act.eval(atsInjOrcReadPicker, ref.inputSel);
             if (back && back.ok && String(back.value || "").trim()) break;
           }
@@ -8751,8 +8766,8 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // PREVIOUS value (measured — `country` read "United" straight after committing "United
         // States", and correctly a round-trip later).
         let back = null;
-        for (let i = 0; i < 8; i++) {
-          await act.delayFull(250);
+        for (let i = 0; i < ATS_ORC_READBACK_MS.length; i++) {
+          await act.delayFull(ATS_ORC_READBACK_MS[i]);
           back = await act.eval(atsInjOrcReadPicker, ref.inputSel);
           if (back && back.ok && String(back.value || "").trim()) break;
         }
