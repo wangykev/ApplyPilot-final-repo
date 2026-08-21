@@ -4620,8 +4620,38 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
     if (rows.length) break;
     // ⚠ AN OPEN THAT DID NOT TAKE IS RE-CLICKED, not waited out. Two extra clicks at ~700ms and
     // ~1400ms cost almost nothing and replace an 8-second stall.
+    //
+    // ⚠⚠ BUT GUARD IT ON THE LISTBOX NOT EXISTING, NOT ON "NO ROWS YET" (operator, 2026-08-21: the
+    // end date "still took 2 tries"). `el.click()` TOGGLES this picker, so re-clicking one that is
+    // already open CLOSES it — and "zero rows" is true both when the open never happened AND when the
+    // widget is open and still populating. Re-clicking in the second case shuts a dropdown that was
+    // on its way up, and the extra second or two is it being reopened.
+    //
+    // MEASURED, this run: startDate 796/786/787ms with no re-open; endDate 1579ms **(1 re-open)**,
+    // 2950ms, 2854ms — systematically the SECOND half of the pair, never the first.
+    //
+    // ⚠ THE "IT RE-RENDERS THE WIDGET" EXPLANATION IS WRONG — retire it (operator, 2026-08-21).
+    // An older comment in this file said committing the first half re-renders the widget, and I
+    // repeated it; the operator pushed back that nothing like that is visible on screen, and the
+    // evidence already in hand agrees with them. ORC ids carry a render-ASSIGNMENT counter
+    // (`month-endDate-53`), and this picker is addressed as `#month-endDate-<n>` resolved AFTER
+    // startDate has been committed. A re-render would mint a new counter and that selector would come
+    // back `not-found` — which never happens; endDate fills every time. So the nodes survive and
+    // there is no re-render.
+    //
+    // What DOES make the second half's open slower is still unestablished. The likeliest candidate is
+    // a lingering teardown of the first picker's listbox (the Workday lingering-options pattern), but
+    // nobody has instrumented it, so it stays a hypothesis. THE GUARD DOES NOT REST ON THE ANSWER: it
+    // rests on two directly measured facts — the click toggles, and the listbox is absent when closed
+    // but present-and-empty while populating.
+    //
+    // The listbox element does not exist at all while the widget is closed (measured: absent, then 12
+    // rows at 122ms), so its PRESENCE is exactly the signal that separates the two cases. Absent ⇒ the
+    // open genuinely did not take, and a re-click is the right recovery. Present-but-empty ⇒ leave it
+    // alone and keep polling.
+    const listboxUp = !!(lbId && document.getElementById(lbId));
     const waited = Date.now() - (deadline - (budgetMs || 6000));
-    if (reopens < 2 && waited > (reopens + 1) * 700) { reopens++; el.click(); }
+    if (!listboxUp && reopens < 2 && waited > (reopens + 1) * 700) { reopens++; el.click(); }
   }
   if (!rows.length) return { ok: false, error: "no-rows", reopens };
 
@@ -5831,12 +5861,18 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           let halfIdx = -1;
           for (const g of group.slice(0, 2)) {
             halfIdx++;
-            // ⚠ PACE BETWEEN THE HALVES. Committing the first half re-renders the widget, and the
-            // second half's open lands mid-render — measured as a retry firing on EVERY startDate
-            // (4108/4181/4168ms) while endDate, whose widget family is already warm, took
-            // 809/834/795ms with no retry at all. That is systematic, not flaky, so it is cheaper to
-            // wait 250ms once than to spend a failed attempt plus a 400ms recovery pace rediscovering
-            // it on every entry.
+            // ⚠ PACE BETWEEN THE HALVES. Committing one half makes the NEXT half's open slower —
+            // measured as a retry firing on EVERY startDate (4108/4181/4168ms) while endDate took
+            // 809/834/795ms with no retry at all. Systematic, not flaky, so it is cheaper to wait once
+            // than to spend a failed attempt plus a 400ms recovery pace rediscovering it every entry.
+            //
+            // ⚠ THIS COMMENT USED TO SAY THE COMMIT "RE-RENDERS THE WIDGET". That is WRONG and was the
+            // source of a wrong diagnosis later (operator, 2026-08-21). ORC ids carry a render
+            // -assignment counter, and the next half is addressed by id AFTER the previous commit — a
+            // re-render would mint a new counter and that lookup would fail `not-found`, which never
+            // happens. The nodes survive. The slowdown is real but its cause is UNESTABLISHED (a
+            // lingering teardown of the previous picker's listbox is the likeliest candidate). Keep the
+            // pace, which is justified by the measurement; do not repeat the mechanism as fact.
             if (halfIdx) await act.delayFull(150);
             if (!g.id) { failed.push("a half with no id"); continue; }
             const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
