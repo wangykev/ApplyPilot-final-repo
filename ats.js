@@ -3902,13 +3902,6 @@ function icimsAuthView(s) {
 // is not a confident answer and returns `ambiguous` with the rows, never a guess.
 // Returns the rows it saw either way, so a miss is diagnosable without a second page contact.
 async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear, segmentMatch) {
-  // ⚠ `InputEvent` exists in every browser this runs in, but NOT in the Node stub the unit tests
-  // evaluate this source under — so it is constructed defensively. The events themselves are the
-  // load-bearing part (see the keystroke note below); the fallback only keeps the tests runnable.
-  const mkInputEvt = (type, data) => {
-    try { return new InputEvent(type, { bubbles: true, cancelable: type === "beforeinput", inputType: "insertText", data }); }
-    catch (e) { return new Event(type, { bubbles: true, cancelable: type === "beforeinput" }); }
-  };
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
   // ⚠ ORC's GEO ROWS ARE COMPOSITES and no profile value will ever equal one: a postal code offers
@@ -3954,20 +3947,10 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear, segm
     el.dispatchEvent(new Event("input", { bubbles: true }));
   }
   for (const ch of String(query == null ? "" : query)) {
-    // ⚠⚠ THE FULL KEYSTROKE SHAPE, AND EVERY PART OF IT EARNS ITS PLACE (measured live 2026-08-21).
-    // With only `keydown` + `input` this widget's filter NEVER reacts: the list stayed at all 12
-    // months, so Enter had no filtered row to take and Oracle's model never received the value — the
-    // input DISPLAYED "May" while the entry kept reporting "The Start Date field is required." Adding
-    // `beforeinput` and a `keypress` carrying charCode filtered 12 rows -> 1 and Enter then committed
-    // it, clearing the error. Verified end to end by hand: month and year both filtered to a single
-    // row and the entry's required-date errors went empty.
-    const cc = ch.charCodeAt(0);
-    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: cc, which: cc, bubbles: true, cancelable: true }));
-    el.dispatchEvent(mkInputEvt("beforeinput", ch));
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
     setter.call(el, el.value + ch);
-    el.dispatchEvent(mkInputEvt("input", ch));
-    el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: cc, which: cc, charCode: cc, bubbles: true, cancelable: true }));
-    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: cc, which: cc, bubbles: true }));
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
   }
 
   // ⚠ INLINED, not a call to the top-level twin: this function is stringified and evaluated in the
@@ -4035,14 +4018,10 @@ async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear, segm
         setter.call(el, "");
         el.dispatchEvent(new Event("input", { bubbles: true }));
         for (const ch of want) {
-          // Same verified keystroke shape as atsInjOrcPickFromOwnList — see the note there.
-          const cc2 = ch.charCodeAt(0);
-          el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: cc2, which: cc2, bubbles: true, cancelable: true }));
-          el.dispatchEvent(mkInputEvt("beforeinput", ch));
+          el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
           setter.call(el, el.value + ch);
-          el.dispatchEvent(mkInputEvt("input", ch));
-          el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: cc2, which: cc2, charCode: cc2, bubbles: true, cancelable: true }));
-          el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: cc2, which: cc2, bubbles: true }));
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
         }
         // re-resolve the row: retyping re-renders the list
         await new Promise((r) => setTimeout(r, 400));
@@ -4616,13 +4595,6 @@ function atsInjOrcScrollBlocks(titles) {
 // matching one. Classification stays evidence-based — each half is still judged by its OWN options, so
 // a tenant that renders year-then-month is still handled — it just no longer costs a second visit.
 async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetMs) {
-  // ⚠ `InputEvent` exists in every browser this runs in, but NOT in the Node stub the unit tests
-  // evaluate this source under — so it is constructed defensively. The events themselves are the
-  // load-bearing part (see the keystroke note below); the fallback only keeps the tests runnable.
-  const mkInputEvt = (type, data) => {
-    try { return new InputEvent(type, { bubbles: true, cancelable: type === "beforeinput", inputType: "insertText", data }); }
-    catch (e) { return new Event(type, { bubbles: true, cancelable: type === "beforeinput" }); }
-  };
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const norm = (v) => String(v == null ? "" : v).toLowerCase().replace(/\s+/g, " ").trim();
   const el = document.querySelector(inputSel);
@@ -4693,59 +4665,26 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   setter.call(el, "");
   el.dispatchEvent(new Event("input", { bubbles: true }));
   for (const ch of String(want)) {
-    // ⚠⚠ THE FULL KEYSTROKE SHAPE, AND EVERY PART OF IT EARNS ITS PLACE (measured live 2026-08-21).
-    // With only `keydown` + `input` this widget's filter NEVER reacts: the list stayed at all 12
-    // months, so Enter had no filtered row to take and Oracle's model never received the value — the
-    // input DISPLAYED "May" while the entry kept reporting "The Start Date field is required." Adding
-    // `beforeinput` and a `keypress` carrying charCode filtered 12 rows -> 1 and Enter then committed
-    // it, clearing the error. Verified end to end by hand: month and year both filtered to a single
-    // row and the entry's required-date errors went empty.
-    const cc = ch.charCodeAt(0);
-    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: cc, which: cc, bubbles: true, cancelable: true }));
-    el.dispatchEvent(mkInputEvt("beforeinput", ch));
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
     setter.call(el, el.value + ch);
-    el.dispatchEvent(mkInputEvt("input", ch));
-    el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: cc, which: cc, charCode: cc, bubbles: true, cancelable: true }));
-    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: cc, which: cc, bubbles: true }));
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
   }
   // Let the filtered list settle before Enter — polled on the rows, not a flat sleep, and looking
   // BEFORE the first sleep for the same reason as the open above: typing re-filters a list that is
   // already in the DOM, so the wanted row is often there immediately and a 100ms sleep first was pure
   // floor. Same total budget (~1.4s), finer grain.
-  // ⚠⚠ ENTER TAKES THE LIST'S OWN CHOICE, SO THE LIST MUST BE NARROWED TO OURS FIRST (operator,
-  // 2026-08-21: "you will need to make sure what you type is actually a part of the dropdown though.
-  // these are similar to the workday typeaheads.").
-  //
-  // Two halves to that, and only one was already covered. `want` is taken from the rows the widget
-  // itself showed, so we can never type a value the form does not offer — that half has always held.
-  // The half that did not: Enter commits whatever the widget considers current, which is the FIRST
-  // row. Measured, an unfiltered list left "January" first while the input read "May", so an Enter
-  // there would have committed a month nobody asked for. Waiting for our value to merely be PRESENT
-  // is not enough; it has to be the one Enter will take.
-  //
-  // So this waits for the wanted row to be FIRST (a single-row list is the usual outcome), and if the
-  // filter never narrows that far it does NOT press Enter — it reports, and the caller turns that into
-  // needs_review. Refusing to commit beats committing the wrong month on a work-history date.
   const fDeadline = Date.now() + 1400;
-  let firstF = true, narrowed = false, shown = [];
+  let firstF = true;
   while (Date.now() < fDeadline) {
     if (!firstF) await new Promise((r) => setTimeout(r, 25));
     firstF = false;
-    shown = readRows().map(t);
-    if (shown.length && norm(shown[0]) === norm(want)) { narrowed = true; break; }
-  }
-  if (!narrowed) {
-    return { ok: false, error: "filter-did-not-narrow", kind, want,
-             rows: shown.slice(0, 6), reopens };
+    if (readRows().map(t).some((x) => norm(x) === norm(want))) break;
   }
   el.focus();
   for (const type of ["keydown", "keypress", "keyup"]) {
     el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
   }
-  // ⚠ NO `change`, NO BLUR HERE — deliberately. I added both while guessing at this bug and they were
-  // not the fix; the verified sequence is type-with-real-keystrokes then Enter, and Enter is what
-  // registers the selection. An extra blur on a widget that has already cost several runs is an
-  // untested variable, so it is gone rather than left in "just in case".
 
   // ⚠⚠ THE READ-BACK SETTLES **HERE**, PAGE-SIDE, AND THAT IS THE WHOLE POINT (speed round,
   // 2026-08-20). Shortening the SW-side poll from 150ms to 80ms bought nothing, because the MV3
@@ -4940,19 +4879,7 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
   let fields = [];
   const before = [...block0.querySelectorAll("input, textarea, select")]
     .filter((e) => e.type !== "hidden" && vis(e)).length;
-  // ⚠⚠ "APPEARED" IS NOT "FINISHED" (live 2026-08-21, and this is the THIRD time this shape has bitten
-  // in one day). Removing the 80ms sleep that used to precede the first look was right for latency and
-  // wrong on its own: the sleep had been accidentally providing a SETTLE, and without it this returned
-  // the instant the first input existed. The fill then wrote into a half-rendered entry form and
-  // pressed the commit roughly five seconds earlier than before — Oracle refused the entry, the block
-  // gave up, and experience entries 2 and 3 were never filled at all. The tell was in the timings:
-  // `employerName … 2406ms` on a write that costs 18ms on a settled form.
-  //
-  // So the wait is now on the form having STOPPED GROWING — inputs present AND the count unchanged
-  // across two consecutive reads — which is the same stability predicate the rest of this codebase
-  // uses, and unlike a sleep it adapts to however long ORC actually takes. Page-side, so the extra
-  // reads are free.
-  let first = true, lastCount = -1, stable = 0;
+  let first = true;
   while (Date.now() < deadline) {
     if (!first) await new Promise((r) => setTimeout(r, 25));
     first = false;
@@ -4969,10 +4896,6 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
     const live = [...block.querySelectorAll("input, textarea, select")]
       .filter((e) => e.type !== "hidden" && vis(e));
     if (live.length > before) {
-      // stability: the same non-zero count twice running before we hand the form over
-      if (live.length === lastCount) stable++; else stable = 0;
-      lastCount = live.length;
-      if (stable < 1) continue;
       fields = live.map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
         role: e.getAttribute("role") || null,
         label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
@@ -4980,7 +4903,7 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
       break;
     }
   }
-  return { ok: true, pressed: t(add), fields, count: fields.length, settledAt: lastCount };
+  return { ok: true, pressed: t(add), fields, count: fields.length };
 }
 
 // ── THE RÉSUMÉ IS ALWAYS REMOVED AND REPLACED ON A REPLAY (operator, 2026-08-21) ─────────────
@@ -5233,18 +5156,6 @@ async function atsInjOrcCommitEntryAndWait(blockTitlePattern, budgetMs) {
   };
   const add0 = pickCommit();
   if (!add0) return { ok: false, error: "no-add-control" };
-  // ⚠ DO NOT PRESS INTO A FORM THAT IS STILL CHANGING — the other half of the same lesson. The commit
-  // is the act Oracle validates, so pressing mid-render is what produces "the entry form stayed open".
-  // Same stability predicate as the open, bounded, page-side.
-  const stDeadline = Date.now() + 1500;
-  let lastN = -1, steady = 0;
-  while (Date.now() < stDeadline) {
-    const n = openNow();
-    if (n === 0) break;                       // already closed — nothing to settle
-    if (n === lastN) { steady++; if (steady >= 2) break; } else steady = 0;
-    lastN = n;
-    await new Promise((r) => setTimeout(r, 25));
-  }
   const perRound = Math.max(500, Math.round((budgetMs || 6000) / 3));
   let closed = false, presses = 0, pressed = t(add0) || "?";
   for (let round = 0; round < 3 && !closed; round++) {
