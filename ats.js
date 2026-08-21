@@ -4610,9 +4610,26 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
     const lb = lbId ? document.getElementById(lbId) : null;
     return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
   };
+  // ⚠⚠ DO NOT CLICK A PICKER THAT IS ALREADY OPEN — the click TOGGLES (operator saw it, 2026-08-21:
+  // "I did see it physically open, but it closes right after it opens, no options even render").
+  //
+  // That observation is what identifies this. After the previous half's Enter, ORC moves focus to the
+  // next date input and opens its list on focus — so by the time this runs, the list is ALREADY UP.
+  // `el.focus()` is then a no-op and `el.click()` SHUTS it. The re-click at ~700ms opens it again,
+  // which is the "2 tries" and the extra second or two.
+  //
+  // It explains the asymmetry that no other theory did: startDate is the first picker touched in the
+  // entry, so nothing has focused it and the click is what opens it (773/797/798ms, no re-open).
+  // endDate follows a commit, so it arrives already open and the click closes it (1580/1710ms, with a
+  // logged re-open).
+  //
+  // ⚠ Two earlier explanations of this same symptom were WRONG and are recorded in the commit: the
+  // widget re-rendering (refuted — the ids survive), and the first click being spent dismissing the
+  // PREVIOUS list (refuted by the operator seeing this one open). The discriminator is the same one
+  // the re-click guard below uses: the listbox exists only when the widget is open.
+  const listUp = () => !!(lbId && document.getElementById(lbId));
   const deadline = Date.now() + (budgetMs || 6000);
-  el.focus();
-  el.click();
+  if (!listUp()) { el.focus(); el.click(); }
   let rows = [], reopens = 0;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 120));
