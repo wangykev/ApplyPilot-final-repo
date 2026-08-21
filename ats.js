@@ -4595,6 +4595,12 @@ function atsInjOrcScrollBlocks(titles) {
 // matching one. Classification stays evidence-based — each half is still judged by its OWN options, so
 // a tenant that renders year-then-month is still handled — it just no longer costs a second visit.
 async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetMs) {
+  // `InputEvent` exists in every browser this runs in but NOT in the Node stub the tests evaluate
+  // this source under, so it is built defensively. The events are the load-bearing part — see below.
+  const mkInputEvt = (type, data) => {
+    try { return new InputEvent(type, { bubbles: true, cancelable: type === "beforeinput", inputType: "insertText", data }); }
+    catch (e) { return new Event(type, { bubbles: true, cancelable: type === "beforeinput" }); }
+  };
   const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
   const norm = (v) => String(v == null ? "" : v).toLowerCase().replace(/\s+/g, " ").trim();
   const el = document.querySelector(inputSel);
@@ -4649,17 +4655,40 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   setter.call(el, "");
   el.dispatchEvent(new Event("input", { bubbles: true }));
   for (const ch of String(want)) {
-    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
+    // ⚠⚠ THE FULL KEYSTROKE SHAPE — THIS IS WHAT MAKES ONE OPEN ENOUGH (measured live 2026-08-21).
+    // With only `keydown` + `input` this widget's filter never reacts: measured by hand, the month
+    // list stayed at all 12 rows with "January" first while the input displayed "May". Enter then had
+    // no narrowed row to take, so nothing reached Oracle's model — which is why the pick appeared to
+    // fail, the outer retry fired, and the operator saw the dropdown open TWICE.
+    //
+    // Adding `beforeinput` and a `keypress` carrying charCode filtered 12 rows -> 1, and Enter
+    // committed it: verified end to end by hand, both halves narrowing to a single row and the
+    // entry's required-date errors going empty. So the double open is not fixed by making the OPEN
+    // cleverer (that was tried, and it broke the fill) — it is fixed by making the first attempt
+    // actually work.
+    const cc = ch.charCodeAt(0);
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: cc, which: cc, bubbles: true, cancelable: true }));
+    el.dispatchEvent(mkInputEvt("beforeinput", ch));
     setter.call(el, el.value + ch);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
-    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
+    el.dispatchEvent(mkInputEvt("input", ch));
+    el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: cc, which: cc, charCode: cc, bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: cc, which: cc, bubbles: true }));
   }
-  // Let the filtered list settle before Enter — polled on the rows, not a flat sleep.
+  // ⚠⚠ ENTER TAKES THE LIST'S OWN CHOICE, SO WAIT FOR THE LIST TO BE OURS (operator: "make sure what
+  // you type is actually a part of the dropdown — these are similar to the workday typeaheads").
+  // Half of that always held: `want` is taken from the rows the widget itself showed, so we can never
+  // type a value this form does not offer. The half that did not: Enter commits the FIRST row, and on
+  // an unfiltered list that was "January" while the input read "May". Being merely PRESENT is not
+  // enough — it has to be the row Enter will take.
+  let narrowed = false, shown = [];
   for (let i = 0; i < 14; i++) {
     await new Promise((r) => setTimeout(r, 100));
-    const now = readRows().map(t);
-    if (now.some((x) => norm(x) === norm(want))) break;
+    shown = readRows().map(t);
+    if (shown.length && norm(shown[0]) === norm(want)) { narrowed = true; break; }
   }
+  // ⚠ AND IF IT NEVER NARROWS, DO NOT PRESS. Reporting beats committing a month nobody asked for onto
+  // a work-history date; the caller turns this into needs_review.
+  if (!narrowed) return { ok: false, error: "filter-did-not-narrow", kind, want, rows: shown.slice(0, 6), reopens };
   el.focus();
   for (const type of ["keydown", "keypress", "keyup"]) {
     el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
