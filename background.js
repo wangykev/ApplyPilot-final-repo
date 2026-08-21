@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-gatetime-3";
+const AP_BUILD_MARKER = "orc-timedsettle-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4532,12 +4532,35 @@ async function pullApprovedBundle(LOG, opts) {
 // discovery relies on), so NO host permissions are needed for these sites.
 // ============================================================================
 
-// Poll the form until its field count is stable non-zero twice (the standing
-// "never scan a progressively-rendered page without settling it" rule — 5th site).
+// Poll the form until its field count has been non-zero and UNCHANGED for a QUIET WINDOW (the
+// standing "never scan a progressively-rendered page without settling it" rule — 5th site).
+// ⚠ Timed, not counted — see the NO_CHANGE_MS note inside for why a count floor is the wrong shape
+// here and why Workday's equivalent settle never showed the same symptom.
 async function waitAtsFormReady(ats, LOG, ceilingMs) {
   const start = Date.now();
   const deadline = start + (ceilingMs || 25000);
-  let prev = -1, stable = 0;
+  // ⚠⚠ A STABILITY PREDICATE MUST BE TIMED, NOT COUNTED (2026-08-21). This settle used to require
+  // THREE consecutive equal reads — an ATTEMPTS FLOOR, which is the one shape CLAUDE.md's audit of all
+  // 59 wall-clock poll loops explicitly forbids: "a wait that timed out wants a bigger BUDGET; never
+  // add an attempts floor", because for a stability predicate SPARSE READS ARE STRONGER EVIDENCE.
+  //
+  // It matters here because of WHERE this runs. Measured on ORC: a starved MV3 worker makes each
+  // round-trip cost ~8s (`[PACE] a 700ms pace took 10161ms (sw-starved)`), so a count floor MULTIPLIES
+  // the starvation — 3 reads × 8s = 24s — while the operator watching the same code paid 0.7s a read.
+  //
+  // ⚠ AND THIS IS WHY THE OPERATOR NEVER SAW IT ON WORKDAY. awaitFieldSetSettled settles on
+  // `now - lastChangeAt >= 1200ms` — a TIME predicate — and wall-clock passes whether or not the worker
+  // is scheduled, so starvation makes IT settle in FEWER polls. Self-limiting. Same bug, opposite
+  // exposure, and the difference was the predicate rather than the tenant.
+  //
+  // The Ashby lesson that earned the old floor is PRESERVED, and by the thing that was actually load
+  // bearing: two reads 450ms apart accepted a form whose survey entries were still mounting, so what
+  // was needed was a longer QUIET WINDOW, not more samples. 1200ms of no change (Workday's number)
+  // is stricter in time than the old 2×450ms, and the ≥2500ms floor below is untouched — so on a
+  // healthy worker this settles at ~2.5s exactly as before, and on a starved one it settles in TWO
+  // reads instead of three-plus.
+  const NO_CHANGE_MS = 1200;
+  let prev = -1, agree = 0, lastChangeAt = 0;
   // ⚠ FUNCTION SCOPE, NOT LOOP SCOPE: the TIMEOUT path below reads this after the loop has exited.
   // Declared inside the `while` it would be a ReferenceError there — the exact shape eslint's
   // no-undef pretest exists to catch on this file (five live ORC failures were scope, not logic).
@@ -4576,14 +4599,17 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
     // was judged on a count nothing had validated.
     let n = 0;
     try { const s = await cdpEval(atsInjScan, ats); lastScan = s; n = (s && s.fields && s.fields.length) || 0; } catch (e) { n = 0; lastScan = null; }
-    // THREE consecutive equal non-zero reads AND ≥2.5s elapsed — two reads 450ms apart
-    // accepted Ashby's form at 9 fields while its survey/consent entries (4 more) were
-    // still mounting (live 2026-07-31). Sections mount in bursts; a stable count between
-    // bursts is not a settled form.
+    // The quiet window exists because sections mount in BURSTS: two reads 450ms apart accepted
+    // Ashby's form at 9 fields while its survey/consent entries (4 more) were still mounting (live
+    // 2026-07-31), and a count that is briefly equal between bursts is not a settled form. What that
+    // failure asked for was a longer GAP between agreeing samples, which is what NO_CHANGE_MS is.
     polls++;
-    stable = n > 0 && n === prev ? stable + 1 : 0;
-    if (stable > 0) everStable = true;
-    if (stable >= 2 && Date.now() - start >= 2500) {
+    const now = Date.now();
+    if (n > 0 && n === prev) { agree++; } else { agree = 0; lastChangeAt = now; }
+    if (agree > 0) everStable = true;
+    // At least two reads must AGREE (never settle on a single sample), the count must have been
+    // unchanged for NO_CHANGE_MS, and the original ≥2500ms floor still applies.
+    if (n > 0 && agree >= 1 && now - lastChangeAt >= NO_CHANGE_MS && now - start >= 2500) {
       // Settled — but settled on WHAT? Identify the page positively before calling it a form.
       // The scan is the one that just produced the stable `n` — see the note above.
       const scan = lastScan;
@@ -4603,7 +4629,7 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
   // blocks) versus one that held but never for the three consecutive reads the bar asks for. The
   // first wants the block settle below; the second wants a longer budget.
   LOG(`form did not settle within ${ceilingMs || 25000}ms (last field count ${prev}, ${polls} poll(s), `
-    + `the count ${everStable ? "held still but never for 3 consecutive reads" : "NEVER held still — the form was still mounting"})`);
+    + `the count ${everStable ? `held still but never for ${NO_CHANGE_MS}ms` : "NEVER held still — the form was still mounting"})`);
   // Same rule on the timeout path: fields we never identified as a form are not a form.
   if (prev > 0) {
     // Same reuse as the settle path: `lastScan` is the read that produced `prev`.

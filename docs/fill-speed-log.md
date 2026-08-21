@@ -2045,6 +2045,54 @@ an error, so every previously-working path is byte-identical.
 **Testing note:** three applications on one candidate account inside twenty minutes is what produced
 the lock. Space ORC runs out, or use a different account.
 
+### ⚠⚠ WHY IT NEVER SHOWED ON WORKDAY — the PREDICATE, not the tenant (answered 2026-08-21)
+
+The operator asked: *"is there any way to prevent this starvation, I don't recall it happening on
+workday."* It DOES happen there — it is their own 2026-08-20 report, quoted in background.js: *"the
+fill including the onboarding will just lag at seemingly random times and to fix it I need to click the
+page once."* That is what `cdpSetPageClock` was built for. But there is also a real structural reason
+ORC showed it and Workday hid it:
+
+| | predicate | under starvation |
+|---|---|---|
+| Workday `awaitFieldSetSettled` | `now - lastChangeAt >= 1200ms` — **TIME** | wall-clock elapses anyway ⇒ settles in FEWER polls. **Self-limiting.** |
+| ats.js `waitAtsFormReady` | `stable >= 2` — **THREE EQUAL READS** | must still pay 3 round-trips × ~8s = 24s. **Amplifies linearly.** |
+
+**A count floor is the one shape this repo already forbids.** From the audit of all 59 wall-clock poll
+loops: *"a wait that timed out wants a bigger BUDGET; never add an attempts floor"*, because for a
+STABILITY predicate **sparse reads are STRONGER evidence** — two reads 8s apart prove more than three
+450ms apart. `stable >= 2` was exactly that floor.
+
+**Fixed:** `waitAtsFormReady` now settles on a QUIET WINDOW (`NO_CHANGE_MS = 1200`, Workday's number)
+plus ≥2 agreeing reads plus the original ≥2500ms floor. Healthy worker: unchanged ~2.5s (the 2500ms
+floor governs). Starved: **2 reads instead of 3+**. The Ashby lesson that earned the old floor is
+preserved by the half that was load-bearing — two reads *450ms apart* accepted a form still mounting,
+so what was needed was a longer GAP, not more samples, and 1200ms of quiet is stricter than 2×450ms.
+
+### Can the starvation itself be PREVENTED? Not reliably — and here is why the page clock cannot
+
+`cdpDelay` races an SW `setTimeout(want+1500)` against `cdpPageSleep(want)`. Measured, the ceiling
+fired **7961ms late and STILL WON**, so the page arm's reply was later still. Both arms need the worker
+SCHEDULED to resume — the page arm is an I/O completion rather than a timer, but it is the same starved
+thread. The worker was not running at all for ~8-10s. That is Chrome deprioritising the whole extension
+service worker while Chrome is not the foreground OS window, which is exactly why a click cures it.
+
+Ruled out, with reasons:
+- **`chrome.windows.update({focused:true})`** — works, and steals the operator's OS focus mid-run.
+- **A keep-alive `setInterval` in the worker** — the interval IS the thing being starved.
+- **Synthesized user gestures** to fake presence — fighting the platform; breaks unpredictably.
+- **`chrome.alarms`** — 30s minimum, far too coarse for a 450ms pace.
+
+**Unexplored candidate, NOT a recommendation:** an offscreen document with silent audio
+(`chrome.offscreen`, `reasons:["AUDIO_PLAYBACK"]`) — Chrome exempts audible contexts from throttling,
+so moving the pacing there MIGHT keep it scheduled. Needs the `offscreen` permission (absent from the
+manifest today), may only address worker TERMINATION rather than SCHEDULING, and adds an audio
+indicator. Untested; do not cite it as a fix.
+
+**So the realistic answer is round 15's: you do not prevent it, you stop paying it repeatedly.** Cut
+worker round-trips, and prefer TIMED predicates over COUNTED ones so the remaining waits degrade
+gracefully instead of multiplying.
+
 ### Next
 
 The lever is **fewer awaits**, and the biggest one in this window is `waitAtsFormReady`'s poll loop:
