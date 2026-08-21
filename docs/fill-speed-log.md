@@ -1891,3 +1891,45 @@ There is now one `atsCommitYesNo` for all three sites, and a test that counts di
 plain text write at 13.1s. Page-clock pacing turns every pace into a `Runtime.evaluate`, so a very
 busy renderer could hand its own slowness to the paces — indistinguishable from machine load on a
 machine that costs 13s for a text write. One run each way on an idle machine settles it.
+
+## Round 15 — ORC 630s fill: the page clock cannot beat a starved worker (2026-08-20)
+
+**Measurement.** ORC fill, tab VISIBLE, `worker-timers ON`, page clock ON (default):
+630.7s for 45 fields across 3 steps = 14016ms/field. Step 3 alone 224.3s for 10 fields. Slowest:
+an unmapped question 39.4s, then `work_experience[0].employerName` **15.6s — a plain text write**.
+
+**The decisive datum is the pace `via`, not the duration.** All 16 logged overruns were
+`page-abandoned`; zero `page`, zero `sw`. That label had always read as "the page did not answer",
+and it sent the first pass of this diagnosis at the renderer.
+
+It is the opposite. The abandon ceiling is `setTimeout(want + PAGE_SLEEP_SLACK_MS)` — for a 120ms
+pace it is due at **1620ms** and it fired at **10883ms**. Our own watchdog was **9.3s late** (worst
+observed ~11.5s). The worker was starved; the page is not implicated by any of this evidence.
+
+**Why the page clock cannot fix it, structurally.** Both arms of the race are worker-scheduled — the
+ceiling `setTimeout`, *and* resuming the `await` when the CDP reply lands. A starved worker therefore
+loses the race every time, and the pace costs whatever the starvation cost, whichever arm "wins".
+cdp.js already said this for ONBOARDING ("the abandon ceiling is itself an SW timer") as a reason to
+keep the page clock OFF during navigation; this round shows the same failure on the **FILL** path,
+which is exactly where the page clock was supposed to be the answer. **The page clock only helps when
+the worker is healthy and the PAGE's timers are throttled — the hidden-tab case. It does nothing for
+a starved worker on a visible tab.**
+
+**16 overruns cannot account for 630s.** Only overruns >1000ms are logged, so the bulk is many
+sub-second overruns: starvation here is *pervasive*, not spiky.
+
+**Confound, stated rather than hidden:** the run was polled continuously from automation (screenshots
++ JS in sibling tabs) for its whole duration, which plausibly contributed to starving the worker. A
+clean re-run with nothing polling is needed to quantify. The `atsPageClock` A/B still has never run on
+an idle machine.
+
+**Changes made (this round):**
+- `cdpDelay` compares the ceiling against its OWN due time: >250ms late ⇒ `sw-starved`, and the log
+  says the page clock cannot help and that fewer awaits is the lever. No ambiguous middle to tune —
+  a healthy worker fires within a few ms, the starved case overshoots by seconds.
+- Per-run pace stats (`cdpPaceStats` / `cdpPaceSummary`) print with the `[ATS-TIME]` summary, so any
+  run states its own pacing health instead of needing a hand diagnosis from `[PACE]` lines.
+
+**Direction, unchanged by this round and reinforced by it: REDUCE THE NUMBER OF AWAITS.** That is the
+only lever measured to work against worker starvation (the entry-open fix: 28 starved SW awaits → 1
+page-side wait). A different clock cannot help while the worker owns the resumption.
