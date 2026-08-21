@@ -4841,6 +4841,92 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
   return { ok: true, pressed: t(add), fields, count: fields.length };
 }
 
+// OPEN AN EXISTING TILE FOR EDIT — the read side of the replay's verify (2026-08-20).
+// Same shape as the open above and the same evidence rule: a form is open when INPUTS APPEARED, not
+// when a button says Cancel. The tile is addressed by INDEX in the same order atsInjOrcTiles returns
+// them (both walk the block's Delete controls), so a caller that read tiles can act on tile k.
+async function atsInjOrcOpenTileAndWait(blockTitlePattern, tileIndex, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const findBlock = () => [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  const block0 = findBlock();
+  if (!block0) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+  const btns0 = [...block0.querySelectorAll("button")].filter(vis);
+  if (btns0.some((b) => /^cancel$/i.test(t(b)))) return { ok: false, error: "entry-already-open" };
+
+  // ⚠ THE TILE CONTROLS ARE ICON-ONLY — no textContent — so they are found by aria-label/title, the
+  // same way the delete pass finds its own. Ordered by the DELETE controls so the index agrees with
+  // atsInjOrcTiles; the Edit control is the one nearest that tile.
+  const dels = [...block0.querySelectorAll("button, a[role=button]")].filter(vis)
+    .filter((b) => /delete|remove/i.test(String(b.getAttribute("aria-label") || b.getAttribute("title") || "")));
+  if (!dels.length) return { ok: false, error: "no-tiles" };
+  if (tileIndex < 0 || tileIndex >= dels.length) return { ok: false, error: "tile-index-out-of-range:" + tileIndex + "/" + dels.length };
+  const del = dels[tileIndex];
+  let edit = null, scope = del.parentElement;
+  for (let i = 0; i < 5 && scope && !edit; i++) {
+    edit = [...scope.querySelectorAll("button, a[role=button]")].filter(vis)
+      .find((b) => /edit|change|update/i.test(String(b.getAttribute("aria-label") || b.getAttribute("title") || "")));
+    if (!edit) scope = scope.parentElement;
+  }
+  if (!edit) return { ok: false, error: "no-edit-control" };
+
+  const before = [...block0.querySelectorAll("input, textarea, select")]
+    .filter((e) => e.type !== "hidden" && vis(e)).length;
+  edit.click();
+
+  const deadline = Date.now() + (budgetMs || 6000);
+  let fields = [];
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 80));
+    const block = findBlock();
+    if (!block) continue;
+    const live = [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e));
+    if (live.length > before) {
+      fields = live.map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
+        role: e.getAttribute("role") || null,
+        label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
+        value: e.value || null }));
+      break;
+    }
+  }
+  if (!fields.length) return { ok: false, error: "entry-form-never-rendered" };
+  return { ok: true, fields, count: fields.length };
+}
+
+// CLOSE AN OPEN ENTRY WITHOUT SAVING. Cancel is preferred because it asserts nothing; a tenant that
+// renders no Cancel falls back to the commit control, which is equivalent HERE and only here —
+// this is called on a path that has written nothing, so committing re-saves the entry unchanged.
+// ⚠ It must never be reused after a write unless a save is what you mean.
+async function atsInjOrcCloseEntry(blockTitlePattern, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const findBlock = () => [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  const block0 = findBlock();
+  if (!block0) return { ok: false, error: "block-not-found" };
+  const btns0 = [...block0.querySelectorAll("button")].filter(vis);
+  const cancel = btns0.find((b) => /^cancel$/i.test(t(b)));
+  const ctl = cancel || btns0.find((b) => /^(add|save|update)\b/i.test(t(b)));
+  if (!ctl) return { ok: false, error: "no-close-control" };
+  ctl.click();
+  const deadline = Date.now() + (budgetMs || 6000);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 80));
+    const block = findBlock();
+    if (!block) continue;
+    const open = [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e)).length;
+    if (!open) return { ok: true, via: cancel ? "cancel" : t(ctl) };
+  }
+  return { ok: false, error: "entry-still-open", via: cancel ? "cancel" : t(ctl) };
+}
+
 // COMMIT-AND-WAIT, same reasoning: press the (homonymous) Add and wait page-side for the form to be
 // GONE. `closed` is the evidence; a form still open means Oracle refused the entry.
 async function atsInjOrcCommitEntryAndWait(blockTitlePattern, budgetMs) {
@@ -5192,20 +5278,83 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
   // means what it should — "the entries you approved are still on the form" — and a tile that changed
   // or vanished between the fill and the submit FAILS the gate instead of passing unnoticed.
   if (o.reportOnly) {
+    // ⚠⚠ PER-FIELD, NOT PER-ENTRY. The fill records one row per entry FIELD
+    // (`work_experience[0].employerName`), and for Oracle atsSubmitKey is just the durable field
+    // name — so the replay's rows must carry the SAME names or the strict verify reports every
+    // approved entry field as "no matching field on the live form". An earlier version of this
+    // branch emitted one summary row per entry, which lined up only because the fill was emitting
+    // summaries too; both are gone.
+    //
+    // The operator's rule for this visit: "see if nothing is wrong, then don't change it, but if
+    // something is filled wrong, change it." This half does the seeing. Each tile is opened, its
+    // fields are read, and each is compared with the value the human approved:
+    //   • equal  ⇒ `filled`, verified, nothing written and nothing to review;
+    //   • differs ⇒ `needs_review` + `entry-mismatch`, which BLOCKS the gate and names the field.
+    // ⚠ The repair itself is deliberately NOT done here yet — writing into an entry form means
+    // driving the date-pair and tiered-degree resolvers from a committed DISPLAY value ("May 2026",
+    // the degree wording the form chose), and a repair that mis-parses one would damage an entry
+    // that was merely reported wrong. Blocking is the safe half and is correct on its own: a
+    // mismatch stops the submit instead of passing unnoticed.
     for (const spec of ATS_ORC_ENTRY_BLOCKS) {
       const re = new RegExp(spec.pattern, "i");
       if (!blocks.some((b) => re.test(String(b.title || "")))) continue;
-      const t = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
-      const tiles = (t && t.ok && t.tiles) || [];
-      log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — reported, NOT re-entered (this is a replay)`);
+      const t0 = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+      const tiles = (t0 && t0.ok && t0.tiles) || [];
+      if (!tiles.length) { log(`${spec.label}: no entries on the form`); continue; }
+      const emap = ATS_ORC_ENTRY_MAPS[spec.source] || {};
+      log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — opening each to check it against your approved values (nothing is rewritten)`);
+
       for (let k = 0; k < tiles.length; k++) {
-        records.push({
-          fieldName: `${spec.source}[${k}]`, label: `${spec.label} entry ${k + 1}`,
-          widgetType: "text", isRequired: false,
-          entrySection: spec.source, entryIndex: k,
-          status: "filled", verified: true, after: tiles[k].text, elapsedMs: 0,
-          detail: "already on the form — read back on the replay visit, not re-entered",
-        });
+        const opened = await act.eval(atsInjOrcOpenTileAndWait, spec.pattern, k, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        if (!opened || !opened.ok) {
+          // A tile we could not open is NOT a tile we can vouch for.
+          log(`⛔ ${spec.label} entry ${k + 1}: could not open it to check — ${(opened && opened.error) || "unknown"}`);
+          records.push({
+            fieldName: `${spec.source}[${k}]`, label: `${spec.label} entry ${k + 1}`,
+            widgetType: "text", isRequired: false, entrySection: spec.source, entryIndex: k,
+            status: "needs_review", flag: "entry-unverifiable", after: tiles[k].text, elapsedMs: 0,
+            detail: "this entry is on the form but could not be opened to check its fields — "
+              + ((opened && opened.error) || "unknown") + ". Check it by hand.",
+          });
+          continue;
+        }
+        const byName = new Map();
+        for (const f of opened.fields || []) {
+          const key = f.name || f.id || "";
+          if (!key) continue;
+          if (!byName.has(key)) byName.set(key, []);
+          byName.get(key).push(f);
+        }
+        let same = 0, diff = 0;
+        for (const [key, group] of byName) {
+          if (!emap[key]) continue;                       // unmapped on the fill side too
+          const fieldName = `${spec.source}[${k}].${key}`;
+          const want = typeof o.valueFor === "function"
+            ? o.valueFor({ fieldName, entrySection: spec.source, entryIndex: k, widgetType: group[0].role === "combobox" ? "dropdown" : "text" })
+            : undefined;
+          if (want === undefined) continue;               // not in the bundle ⇒ nothing was approved
+          const live = group.map((g) => String(g.value == null ? "" : g.value).trim()).filter(Boolean).join(" ");
+          const agrees = atsLib.normalize(live) === atsLib.normalize(want)
+            || (live && atsLib.normalize(live).indexOf(atsLib.normalize(want)) !== -1)
+            || (want && atsLib.normalize(want).indexOf(atsLib.normalize(live)) !== -1 && live.length > 0);
+          records.push({
+            fieldName, label: group[0].label || key, widgetType: "text", isRequired: false,
+            entrySection: spec.source, entryIndex: k,
+            status: agrees ? "filled" : "needs_review",
+            flag: agrees ? null : "entry-mismatch",
+            verified: !!agrees, after: live || null, elapsedMs: 0,
+            detail: agrees
+              ? "already on the form and it matches what you approved — checked, not rewritten"
+              : `the form holds ${JSON.stringify(live)} but you approved ${JSON.stringify(want)} — fix it on the form, then re-run`,
+          });
+          if (agrees) same++; else diff++;
+        }
+        const closed = await act.eval(atsInjOrcCloseEntry, spec.pattern, ATS_ORC_PICK_MS).catch(() => null);
+        if (!closed || !closed.ok) {
+          notes.push(`${spec.label} entry ${k + 1}: its form was left OPEN (${(closed && closed.error) || "unknown"}) — check the page by hand`);
+          log(`⛔ ${spec.label} entry ${k + 1}: could not close the entry form — ${(closed && closed.error) || "unknown"}`);
+        }
+        log(`  ${spec.label} entry ${k + 1}: ${same} field(s) match${diff ? `, ${diff} DIFFER` : ""}${closed && closed.ok ? ` (closed via ${closed.via})` : ""}`);
       }
     }
     return { records, notes };
@@ -6701,7 +6850,7 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // atsFinishFill does not receive `o`, and the entry pass inside it already cost one live run by
   // being written against driveAtsPageFill's scope — `profile is not defined`, thrown into a silent
   // catch. `o.valueFor` is this file's established "this is a replay" signal (see the match opts).
-  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext, !!o.valueFor);
+  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext, !!o.valueFor, o.valueFor);
 }
 
 // ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
@@ -7733,7 +7882,7 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile) {
   return surfaced;
 }
 
-async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext, replay) {
+async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
   await act.delayFull(600);
@@ -7851,7 +8000,7 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
       console.log("[ApplyPilot][ORC-LINK] ⛔ the links pass threw:", String((e && e.message) || e));
     }
     try {
-      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m), reportOnly: !!replay });
+      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m), reportOnly: !!replay, valueFor });
       if (ep && ep.records && ep.records.length) results.push(...ep.records);
       // ⚠ CONCAT, never assign: the LINKS pass above writes into the same list, and an assignment
       // here silently discarded its notes — the one channel that reports a link we could not add.
@@ -9222,6 +9371,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
     atsOrcEntryIdentity, atsOrcTilesAlreadyMatch, atsInjOrcOpenEntryAndWait, atsInjOrcCommitEntryAndWait,
+    atsInjOrcOpenTileAndWait, atsInjOrcCloseEntry,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
