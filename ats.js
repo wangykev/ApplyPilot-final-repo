@@ -5007,9 +5007,35 @@ async function atsInjOrcCloseEntry(blockTitlePattern, budgetMs) {
     .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
   const block0 = findBlock();
   if (!block0) return { ok: false, error: "block-not-found" };
-  const btns0 = [...block0.querySelectorAll("button")].filter(vis);
-  const cancel = btns0.find((b) => /^cancel$/i.test(t(b)));
-  const commit = btns0.find((b) => /^(add|save|update)\b/i.test(t(b)));
+  // ⚠⚠ THE CANCEL CLICK IS IGNORED IF IT ARRIVES TOO EARLY — MEASURED, not inferred (2026-08-21).
+  // Diagnosed by hand on the operator's own live form, which settled two wrong theories of mine:
+  //
+  //   • NOT stale nodes. After pressing Edit, every previously-held button reported
+  //     `isConnected: true` and the block node was identical — nothing is detached, and the tiles
+  //     stay in the DOM alongside the open form.
+  //   • NOT a mis-targeted control. Resolving Cancel and clicking it by hand took the block from
+  //     6 visible inputs to 0 in under 200ms, and it stayed 0.
+  //
+  // And it explained the diagnostic that misled me: `offered: ["","","","","",""]` was not six
+  // orphaned nodes, it was the three Edit/Delete tile pairs — ORC's tile controls are ICON-ONLY, so
+  // their textContent is empty, and the report sliced the first six of the block's buttons.
+  //
+  // What is left is TIMING. The verify pass opens an entry, reads its fields page-side (fast), and
+  // clicks Cancel almost immediately; ORC does not have the handler wired that early, so the press
+  // is a no-op. Entry 1 escapes it because the first open is slower (component bootstrap), and the
+  // SELF-HEAL close succeeds because by then the form has been open for a while — which is exactly
+  // why the failure looked like "every entry after the first".
+  //
+  // ⚠ THE FIX IS A RE-PRESS, NOT A SLEEP. There is no readable "the form is ready" signal to poll,
+  // and the standing rule refuses fixed delays — but the predicate here ("the form is closed") is
+  // MONOTONE, so pressing again is free: if the first press worked we have already returned. Cancel
+  // twice, then the commit control as a last resort, each round re-resolved and each round polling
+  // its own share of the budget.
+  const pick = (rx) => {
+    const block = findBlock();
+    if (!block) return null;
+    return [...block.querySelectorAll("button")].filter(vis).find((b) => rx.test(t(b))) || null;
+  };
   const openCount = () => {
     const block = findBlock();
     return block ? [...block.querySelectorAll("input, textarea, select")]
@@ -5023,18 +5049,31 @@ async function atsInjOrcCloseEntry(blockTitlePattern, budgetMs) {
   // is a cheap way out, and it is safe HERE for the same reason the fallback already was: this path
   // writes nothing, so committing re-saves the entry unchanged.
   const attempts = [];
-  for (const ctl of [cancel, commit].filter(Boolean)) {
+  // Cancel, Cancel again, then the commit control — which is equivalent HERE and only here, because
+  // this path writes nothing, so committing re-saves the entry unchanged.
+  const rounds = [/^cancel$/i, /^cancel$/i, /^(add|save|update)\b/i];
+  const perRound = Math.max(600, Math.round((budgetMs || 6000) / rounds.length));
+  for (const rx of rounds) {
+    if (openCount() === 0) return { ok: true, via: attempts[attempts.length - 1] || "already-closed", attempts };
+    const ctl = pick(rx);                       // resolved NOW, not once at the top
+    if (!ctl) continue;
+    const label = t(ctl) || "?";
     ctl.click();
-    attempts.push(t(ctl) || "?");
-    const deadline = Date.now() + (budgetMs || 6000);
+    attempts.push(label);
+    const deadline = Date.now() + perRound;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 80));
-      if (openCount() === 0) return { ok: true, via: t(ctl), attempts };
+      if (openCount() === 0) return { ok: true, via: label, attempts };
     }
   }
-  if (!attempts.length) return { ok: false, error: "no-close-control", offered: btns0.map((b) => t(b)).slice(0, 6) };
-  return { ok: false, error: "entry-still-open", attempts, stillOpen: openCount(),
-    offered: btns0.map((b) => t(b)).slice(0, 6) };
+  // Read the controls LIVE for the report as well — the stale-node version of this line is what made
+  // the Experience failure look like a block with six nameless buttons.
+  const offeredNow = (() => {
+    const block = findBlock();
+    return block ? [...block.querySelectorAll("button")].filter(vis).map((b) => t(b)).slice(0, 6) : [];
+  })();
+  if (!attempts.length) return { ok: false, error: "no-close-control", offered: offeredNow };
+  return { ok: false, error: "entry-still-open", attempts, stillOpen: openCount(), offered: offeredNow };
 }
 
 // COMMIT-AND-WAIT, same reasoning: press the (homonymous) Add and wait page-side for the form to be
