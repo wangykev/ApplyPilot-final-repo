@@ -1151,6 +1151,44 @@ ORC is the first that is not, and the `oracle-not-implemented` guard is now dele
   background.js's own `importScripts` call and each page's from its HTML, so the "one shared global
   scope" model can never drift from reality; `no-undef` is the ONLY rule on, deliberately.
 
+### ORC widgets: the read-back LIES, and one control is a toggle (measured 2026-08-21)
+
+Full evidence in `docs/dom-patterns.md` `2026-08-21`. The standing rules:
+
+- **⚠⚠ THE DATE PICKER ONLY LISTENS TO COMPLETE KEYSTROKES.** `keydown` + `input` alone does NOT drive
+  its filter (measured: the month list stayed at all 12 rows with "January" first while the input
+  displayed "May"). It needs **`beforeinput`** and a **`keypress` carrying `charCode`** — then the list
+  filters 12 → 1 and Enter commits. Without that, Enter has no narrowed row and nothing reaches
+  Oracle's model.
+- **⚠⚠ AND `el.value` CANNOT DETECT THAT FAILURE.** The input read back the right text, with no
+  `cx-select-input--invalid`, while the entry kept reporting *"The Start Date field is required."*
+  **On this widget the authority is the form's own validation, not the input.** A read-back that
+  inspects what we wrote can only ever confirm we wrote it.
+- **⚠ ENTER TAKES THE LIST'S FIRST ROW.** So narrow to the wanted row and require it to BE first; if
+  the filter never narrows, **refuse rather than press** (`filter-did-not-narrow` → needs_review) —
+  pressing on an unfiltered list commits a month nobody asked for. A **row CLICK is silently
+  swallowed** (display changes, model does not), and **ArrowDown is RELATIVE**, so index arithmetic
+  is wrong.
+- **⚠⚠ THE YES/NO PILL IS A TOGGLE — READ BEFORE WRITING (operator, 2026-08-21).** Clicking the pill
+  that already holds the answer CLEARS it. Committing unconditionally therefore wiped a correct
+  answer, and the re-press then restored it — two clicks, seconds of latency, and a run ending between
+  them left the answer GONE with no record saying so, because the final read-back came after the
+  restoring click. A correct pill is left alone; a WRONG one is a different button, so selecting it is
+  not a toggle. Same rule as the rehearsal's read-before-write, on the FILL path — which needs it
+  just as much, because ORC saves each step and a re-run meets its own previous answers.
+- **⚠ REQUIRED-NESS IS ON THE COMPOSITE, NOT THE INPUT.** Both halves of a date carry no
+  `aria-required` and the date is still required. Do not conclude a field is optional from its inputs;
+  the form's own error text is the authority.
+- **⚠⚠ A SPEED FIX CAN REMOVE THE SETTLING ITS SLOWNESS PROVIDED — three times in one day here.** The
+  date bug above was INVISIBLE while each pick took ~5.6s, because the outer retry's second pass
+  re-typed and landed the value by accident; removing an unrelated 120ms open race removed the retry
+  and the latent defect surfaced as "experience didn't fill". After making anything on this tenant
+  faster, re-verify the thing downstream of it.
+- **⚠ AND CHANGE ONE VARIABLE AT A TIME ON THIS PICKER.** The keystroke fix was first shipped ON TOP
+  of an open-race change, so when the fill broke there was no way to attribute it; it took a revert to
+  a known-good commit and a single-variable re-apply to land. Four broken fills came out of not doing
+  that.
+
 **Open (submit):** the ex-Oracle screening question fails the replay `read null` after 2 presses over
 8s (34.7s on the field) — ORC renders an option group **two ways** (radios sharing a `name`, and
 `type=checkbox` with `name: null`), so the yes/no reader likely handles only the first. Needs a live

@@ -41,6 +41,9 @@ during 2026-08, so a later date can appear above an earlier one.
 | **Oracle Recruiting Cloud (JET SPA, Knockout, honeypot)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON`, `2026-08-19 (j)`, `2026-08-19 (k)`, `2026-08-19 (l)`, `2026-08-20 (a) — ORC: the whole wizard walked` |
 | **ORC repeating entries (`Add` is a homonym) + `"<CODE> - <Name>"` options** | `2026-08-19 (l) — ORC repeating blocks`, `2026-08-20 (a) — ORC: the whole wizard walked` |
 | **A control that is not a control (button-pair yes/no)** | `2026-08-20 (b) — ORC: a yes/no question is a pair of BUTTONS` — three sweeps blind at once; row class same as a combobox; required on the LABEL class |
+| **A widget that IGNORES a synthetic click / a value the model never receives** | `2026-08-21 — ORC: the date picker only listens to real keystrokes` — the read-back lies; row clicks are swallowed; what actually drives the filter |
+| **A control whose click TOGGLES (re-answering clears the answer)** | `2026-08-21 — ORC: the yes/no pill is a toggle` — read before writing, or a correct answer is wiped |
+| **Required-ness that is NOT on the input** | `2026-08-21 — ORC: the date requirement lives on the COMPOSITE` — both halves carry no `aria-required` and the field is still required |
 | **The two US EEO demographics must not answer each other** | `2026-08-20 (b)` — label "Ethnicity" + option "I am Hispanic or Latino."; why "an option mentions hispanic" is the wrong test |
 | **A zero-row option read is ABSENCE OF EVIDENCE** | `2026-08-20 (a) — ORC: the whole wizard walked` (date halves + a server-backed degree search, two widgets, same lesson) |
 | **Bot-detection honeypots (a visible field you must NEVER fill)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON` |
@@ -6058,3 +6061,81 @@ Live after the fix:
 group:ethnicity                          → skipped · your profile answers this ("No"), so the box stays unchecked
 group:select-the-races-you-identify-with → filled  · "Asian"
 ```
+
+## 2026-08-21 — ORC: the date picker only listens to real keystrokes, and the yes/no pill is a TOGGLE
+
+Measured by hand on a live Oracle form (the operator put the tab in reach), after three wrong theories
+cost four broken fills. Every claim here is an observation, and the refutations are kept because each
+one was plausible enough to be re-tried.
+
+### The date picker (`div.datepicker-row` → two `input[role=combobox]`)
+
+```html
+<div class="datepicker-row">
+  <input id="month-startDate-52" name="startDate" role="combobox" class="cx-select-input"
+         aria-controls="month-startDate-52-listbox">
+  <input id="year-startDate-52"  name="startDate" role="combobox" class="cx-select-input" …>
+```
+
+- **The listbox does not exist while closed.** `aria-controls` names an id that resolves to nothing
+  until the widget opens. Measured after the click: **0 rows at 98ms, 12 rows at 122ms.**
+- **⚠⚠ TYPING ONLY FILTERS IF THE KEYSTROKES ARE COMPLETE.** With `keydown` + `input` alone the filter
+  **never reacts** — the month list stayed at all 12 rows with "January" first while the input
+  displayed "May". Adding **`beforeinput`** and a **`keypress` carrying `charCode`** filtered
+  **12 rows → 1**. This is the whole ball game: without it Enter has no narrowed row to take.
+- **⚠⚠ THE READ-BACK CANNOT DETECT THE FAILURE.** `el.value` showed "May" and
+  `cx-select-input--invalid` was absent, so every check we own reported the field FILLED — while the
+  entry kept reporting *"The Start Date field is required."* The input was never the problem; Oracle's
+  viewmodel was. **On this widget, verify against the form's own validation, not the input.**
+- **⚠ A ROW CLICK IS SILENTLY SWALLOWED.** A full pointer sequence
+  (`pointerdown/mousedown/pointerup/mouseup/click`) on the matching `[role=row]` sets the displayed
+  value and closes the list — and the required-field error REMAINS. `ArrowDown`+`Enter` cleared it.
+  So the model only accepts the widget's own keyboard selection.
+- **⚠ `ArrowDown` IS RELATIVE, NOT INDEXED.** Wanting `2026`, finding it at row index 0 and pressing
+  ArrowDown once landed on **2025**. Do not compute "index + 1" presses; either narrow the list to one
+  row and press Enter (preferred), or walk and re-read.
+- **⚠ ENTER TAKES THE LIST'S FIRST ROW.** On an unfiltered list that was "January" while the input read
+  "May" — i.e. pressing Enter without narrowing commits a month nobody asked for. Requiring the wanted
+  row to BE first is what makes the commit safe; if it never narrows, refuse rather than press.
+- The year list is **lazy**: 127 rows on one read, 177 on a later one. Never assume a row is absent
+  because it is not loaded yet.
+
+**Refuted here, so they are not re-tried:** it is NOT a re-render orphaning held nodes (after opening
+an entry, every previously-held button reported `isConnected: true` and the block node was identical);
+it is NOT a mistimed open (a hand-resolved click took the block 6 inputs → 0 in under 200ms); and it
+is NOT a missing `change`/blur (both were added on the strength of the Knockout note in the first
+recon and changed nothing). A misleading diagnostic sent me at the first of those:
+`offered: ["","","","","",""]` was not six orphaned nodes — ORC's tile controls are **icon-only**, so
+`textContent` is empty and the report had sliced the block's first six buttons.
+
+**How it hid for so long:** at ~5.6s per date the outer retry was firing, and its second pass
+re-clicked and re-typed — churning the widget enough to land the value BY ACCIDENT. Removing an
+unrelated 120ms open race removed the retry, and the latent defect surfaced as "experience didn't
+fill". *A fix that makes something faster can remove the settling its slowness was providing — that
+happened three times in one day on this tenant.*
+
+### The yes/no pill is a TOGGLE (`ul.cx-select-pills-container`)
+
+Clicking the pill that **already holds the answer CLEARS it**. Committing unconditionally therefore
+cleared a correct answer, the read-back saw an empty widget, the re-press fired ~1800ms later, and the
+second click restored what the first removed: two pointless clicks, seconds of latency, and — if a run
+ended between them — the answer left **WIPED** with no record saying so, because the final read-back
+was taken after the restoring click. **Read before writing; leave a correct pill alone.** A pill
+holding the WRONG answer is a different button, so selecting it is not a toggle.
+
+### Required-ness is on the composite, not the input
+
+An Experience entry's six inputs: `employerName` and `jobTitle` carry `aria-required="true"`; **both
+halves of both dates carry none** — and the dates are still required. Oracle says so in its own words
+only after a refused commit: *"The Start Date field is required."* Reading `aria-required` off the
+inputs and concluding the dates were optional was wrong, and the form's own error text is the
+authority.
+
+### Entry form shape (for reference)
+
+Opening an entry leaves the TILES in the DOM alongside the form, so a block then holds both the tiles'
+icon-only `aria-label="Edit"/"Delete"` buttons and the form's `Cancel` + commit. The commit caption
+differs by mode: **"Add Experience"/"Add Skill" while adding, "Save" while editing.** Measured
+open/close cost: form renders in **36ms**, tears down in **33ms**. A skill's field is a plain
+`input[type=text][name=skills]` — not a combobox — so a skill is one text write, not a search.
+
