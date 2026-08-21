@@ -4423,3 +4423,32 @@ test("the yes/no budget extends ONLY when it ran out without looking", () => {
   // ⚠ the ordinary path is unchanged: the budget is still spent in wall clock
   assert.ok(/Date\.now\(\) < deadline/.test(fn), "the loop is still wall-clock bounded");
 });
+
+// ── ORC STAMPS A VOLATILE RENDER COUNTER ONTO A RADIO GROUP'S name (live, 2026-08-20) ────────
+test("atsSubmitKey(oracle): the volatile self-ID counter is stripped, meaningful ordinals are not", () => {
+  const k = (n) => ats.atsSubmitKey("oracle", n);
+
+  // measured across two visits to the SAME form: the fill saw -12, the rehearsal -13, and the
+  // approved answer reported "no matching field on the live form" on a question sitting right there
+  assert.strictEqual(k("US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12"),
+                     k("US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-13"),
+                     "two visits to the same field must produce the same key");
+  assert.strictEqual(k("US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12"),
+                     "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD");
+
+  // ⚠⚠ THE COLLISION THIS MUST NOT CAUSE. siteLink's trailing number is a MEANINGFUL ENTRY ORDINAL,
+  // so stripping it would key both links the same — one would shadow the other and the verify would
+  // match the wrong link or call it missing.
+  assert.strictEqual(k("siteLink-1"), "siteLink-1");
+  assert.notStrictEqual(k("siteLink-1"), k("siteLink-2"));
+
+  // digits with no hyphen are a per-tenant flexfield name, not a counter
+  assert.strictEqual(k("namInformation15"), "namInformation15");
+  // and an ordinary platform name is untouched
+  assert.strictEqual(k("lastName"), "lastName");
+
+  // ⚠ ORACLE ONLY — the other platforms must key byte-identically to before
+  assert.strictEqual(ats.atsSubmitKey("greenhouse", "US-STANDARD-X-STANDARD-12"),
+                     "US-STANDARD-X-STANDARD-12");
+  assert.strictEqual(ats.atsSubmitKey("lever", "anything-9"), "anything-9");
+});

@@ -3485,12 +3485,34 @@ function atsDurableFieldName(name) {
 // exactly, so Greenhouse / Lever / Ashby are byte-identical.
 // Accepts BOTH shapes on purpose: live scan fields (camelCase, from atsInjScan) and bundle entries /
 // result records (snake_case). One key function, or the two sides key differently and nothing matches.
+// ⚠⚠ ORC STAMPS A VOLATILE RENDER COUNTER ONTO A RADIO GROUP'S `name` (live rehearsal, 2026-08-20).
+// Measured across two visits to the SAME form: the fill saw
+// `US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12` and the rehearsal `…-STANDARD-13`, so the approved
+// answer reported `no matching field on the live form` and blocked the gate on a question that was
+// sitting right there. The recon predicted this ("id carries a volatile counter"); this is it
+// arriving on a `name`, which is supposed to be the durable half.
+//
+// ⚠ THE STRIP IS DELIBERATELY NARROW, and the reason is a collision, not caution. ORC also serves
+// `siteLink-1` / `siteLink-2`, where the trailing number is a MEANINGFUL ENTRY ORDINAL — stripping
+// that would key both links as `siteLink`, so one would shadow the other and the verify would match
+// the wrong one or call it missing. There is no syntactic way to tell a render counter from an
+// ordinal in general, so this keys on the ONE shape actually observed to be volatile: the platform
+// self-ID groups, whose names end `-STANDARD-<digits>`. `namInformation15` (digits, no hyphen) is
+// untouched for free. Widen ONLY on evidence of another family doing it — a wrong widening is
+// silent and costs a mismatched answer, which is worse than the failure it would fix.
+const ATS_ORC_VOLATILE_SUFFIX_RE = /-STANDARD-\d+$/;
+function atsOrcDurableName(name) {
+  const n = String(name == null ? "" : name);
+  return ATS_ORC_VOLATILE_SUFFIX_RE.test(n) ? n.replace(/-\d+$/, "") : n;
+}
+
 function atsSubmitKey(ats, f) {
   // A bare string is accepted so a caller that only holds a name still gets the OLD key rather than a
   // silently empty one — an empty key would match every other keyless field, which is worse than
   // missing the position.
-  if (typeof f === "string") return atsDurableFieldName(f);
+  if (typeof f === "string") return ats === "oracle" ? atsOrcDurableName(f) : atsDurableFieldName(f);
   const name = String((f && (f.fieldName != null ? f.fieldName : f.name)) || "");
+  if (ats === "oracle") return atsOrcDurableName(name);
   if (ats !== "icims" || !f) return atsDurableFieldName(name);
   const section = f.entrySection != null ? f.entrySection : f.entry_section;
   const idx = typeof f.entryIndex === "number" ? f.entryIndex
@@ -9549,7 +9571,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsOrcDurableName, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
