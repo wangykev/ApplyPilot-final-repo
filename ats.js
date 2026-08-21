@@ -9091,6 +9091,60 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         if (asrt) { pick = asrt; tier = "assertion-lead"; }
       }
     }
+    // ⚠⚠ A "NO" TO A ONE-OPTION ASSERTION CHECKBOX IS ANSWERED BY LEAVING IT UNTICKED (operator,
+    // 2026-08-20). Oracle asks the Hispanic/Latino question as a single tickable assertion — label
+    // "Ethnicity", one option, "I am Hispanic or Latino." — and the profile answers it
+    // "No, I am not Hispanic". No option can ever match that, because the form offers no "no" to
+    // pick: the negative answer IS the absence of a tick, and the box was already in exactly the
+    // right state.
+    //
+    // Without this the field fell through to the `stated-value-unmatched` rule, which exists for a
+    // real and different failure — a stated value the form genuinely cannot express (the profile
+    // says "Bachelor of Science", the form offers "Bachelor's Degree", live 2026-07-31) — and so it
+    // reached review as "ApplyPilot couldn't fill this — please fill it in yourself" on a question
+    // that was correctly and completely answered. That is review noise on a DEMOGRAPHIC, which is
+    // the worst place for it: it invites someone to "correct" a self-ID answer that was already right.
+    //
+    // Three guards, each load-bearing:
+    //   • CHECKBOX GROUPS ONLY — never a radio. Absence has to be an expressible answer, and in a
+    //     radio group it is not: leaving a radio set untouched means unanswered, not "no".
+    //   • EXACTLY ONE OPTION. A multi-option group ("Select the races you identify with") has no
+    //     single assertion for a bare "no" to deny, so this must not fire there.
+    //   • THE CANDIDATE'S POLARITY IS NO, word-anchored, so "November" or a value merely CONTAINING
+    //     "no" cannot trigger it. A yes-polarity answer is deliberately left to the tiers above —
+    //     assertion-lead already ticks it, and a yes we fail to express should still be flagged.
+    // The box is READ BACK and unticked if the form arrived with it set, because "leave it alone" is
+    // only the right action when it is already in the answer's state.
+    if (!pick && wt === "checkbox_group" && texts.length === 1
+        && /^\s*(no|false)\b/i.test(String(candidates[0] || ""))) {
+      const cur = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+      const held = cur && cur.ok ? String(cur.value == null ? "" : cur.value).trim() : "";
+      if (held) {
+        // it arrived TICKED — the answer is "no", so untick it and verify
+        await act.eval(atsInjCheckOption, ref.inputSel, texts[0], false);
+        await act.delay(150);
+        const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+        const nowHeld = back && back.ok ? String(back.value == null ? "" : back.value).trim() : "";
+        atsAttachOptions(rec, texts);
+        rec.resolved = candidates;
+        if (nowHeld) {
+          rec.status = "needs_review";
+          rec.flag = "commit-not-accepted";
+          rec.detail = "your profile says no to " + JSON.stringify(texts[0]) + " but the box stayed ticked — untick it here";
+          return true;
+        }
+        rec.after = null; rec.verified = true; rec.status = "filled"; rec.tier = "assertion-negative";
+        rec.detail = "your profile answers this " + JSON.stringify(String(candidates[0]))
+          + ", so " + JSON.stringify(texts[0]) + " was UNTICKED — the form expresses no by leaving it unticked";
+        return true;
+      }
+      atsAttachOptions(rec, texts);
+      rec.resolved = candidates;
+      rec.after = null; rec.verified = true; rec.status = "filled"; rec.tier = "assertion-negative";
+      rec.detail = "your profile answers this " + JSON.stringify(String(candidates[0]))
+        + ", and this form only offers " + JSON.stringify(texts[0]) + " to tick — leaving it unticked IS that answer";
+      return true;
+    }
     if (!pick) { rec.detail = "no candidate matched " + texts.length + " option(s)"; atsAttachOptions(rec, texts); return false; }
     const r = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
     await act.delay(150);
