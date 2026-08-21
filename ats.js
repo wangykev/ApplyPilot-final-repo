@@ -5815,9 +5815,15 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         // for a human to decide. Keyed exactly as a freshly-added skill would be, so the fill and the
         // replay agree on the name.
         records.push({
-          fieldName: `${item.source}[${added - 1 >= 0 ? added : 0}].skills`,
+          // ⚠ KEY ON THE PROFILE INDEX `i`, NOT `added`. `added` only counts skills we ADD, so on a
+          // form where every skill is already present it never increments and all 33 records collided
+          // on `skills[0].skills` — one key for thirty-three values, which the bundle cannot represent
+          // and the replay cannot verify. `i` is also exactly what a freshly-added skill is keyed by
+          // (`${item.source}[${i}].${key}`), so the two paths agree and a run that mixes added and
+          // already-present skills still produces distinct keys.
+          fieldName: `${item.source}[${i}].skills`,
           label: `${item.block} — ${entry}`, widgetType: "text", isRequired: false,
-          entrySection: item.source, entryIndex: added,
+          entrySection: item.source, entryIndex: i,
           status: "filled", verified: true, after: entry, elapsedMs: 0,
           detail: "already on the form from an earlier run — verified against your profile, not re-added",
         });
