@@ -5822,6 +5822,12 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           // (`${item.source}[${i}].${key}`), so the two paths agree and a run that mixes added and
           // already-present skills still produces distinct keys.
           fieldName: `${item.source}[${i}].skills`,
+          // ⚠ `mappedPath` IS WHAT PUTS IT IN A SECTION. The review model derives `canonical_field`
+          // from this, and groups on its `name[index]` prefix — which is why an ADDED skill lands
+          // under a "SKILLS" heading with the same Entry / Delete / + Add entry controls the form
+          // has, while these records (which set no mappedPath) were dumped into "OTHER FIELDS" as 33
+          // loose rows. Same shape as the added path so both produce one section.
+          mappedPath: `${item.source}[${i}].skills`,
           label: `${item.block} — ${entry}`, widgetType: "text", isRequired: false,
           entrySection: item.source, entryIndex: i,
           status: "filled", verified: true, after: entry, elapsedMs: 0,
