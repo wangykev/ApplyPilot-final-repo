@@ -4604,36 +4604,20 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
     const lb = lbId ? document.getElementById(lbId) : null;
     return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
   };
-  // ⚠⚠ THE OPEN WAS RACING A 122ms BOUNDARY WITH A 120ms SLEEP (measured live, 2026-08-21).
-  // The operator: "it might be a refill … it is not waiting for the dropdown to completely open and
-  // missing it the first time it tries to fill." Measured on the real widget: after the click the
-  // listbox does not exist at all, then appears with 12 rows at **122ms** (0 rows still at 98ms).
-  // This loop slept **120ms** and then read — so whether the first look caught the list was a coin
-  // flip, on every half of every date.
-  //
-  // Two changes, both page-side where polling costs nothing:
-  //   • look BEFORE sleeping and poll at 25ms, so a list that appears at ~122ms is caught at ~125ms
-  //     deterministically instead of being missed and waited out;
-  //   • ⚠ THE RE-CLICK IS GUARDED ON THE LISTBOX NOT EXISTING, not on "zero rows". `el.click()` on a
-  //     picker TOGGLES it, so re-clicking a widget that is already open CLOSES it — which is exactly
-  //     the "opens, pauses, then fills" the operator described. An empty-but-present listbox means
-  //     the widget is open and still populating; the only state a re-click can help is one where the
-  //     listbox was never created.
-  const startedAt = Date.now();
-  const deadline = startedAt + (budgetMs || 6000);
+  const deadline = Date.now() + (budgetMs || 6000);
   el.focus();
   el.click();
-  let rows = [], reopens = 0, firstOpen = true;
+  let rows = [], reopens = 0;
   while (Date.now() < deadline) {
-    if (!firstOpen) await new Promise((r) => setTimeout(r, 25));
-    firstOpen = false;
+    await new Promise((r) => setTimeout(r, 120));
     rows = readRows();
     if (rows.length) break;
-    const listboxExists = !!(lbId && document.getElementById(lbId));
-    const waited = Date.now() - startedAt;
-    if (!listboxExists && reopens < 2 && waited > (reopens + 1) * 700) { reopens++; el.click(); }
+    // ⚠ AN OPEN THAT DID NOT TAKE IS RE-CLICKED, not waited out. Two extra clicks at ~700ms and
+    // ~1400ms cost almost nothing and replace an 8-second stall.
+    const waited = Date.now() - (deadline - (budgetMs || 6000));
+    if (reopens < 2 && waited > (reopens + 1) * 700) { reopens++; el.click(); }
   }
-  if (!rows.length) return { ok: false, error: "no-rows", reopens, waitedMs: Date.now() - startedAt };
+  if (!rows.length) return { ok: false, error: "no-rows", reopens };
 
   const texts = rows.map(t);
   const yearish = texts.filter((x) => /^\s*(19|20)\d{2}\s*$/.test(x)).length;
@@ -4670,16 +4654,11 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
   }
-  // Let the filtered list settle before Enter — polled on the rows, not a flat sleep, and looking
-  // BEFORE the first sleep for the same reason as the open above: typing re-filters a list that is
-  // already in the DOM, so the wanted row is often there immediately and a 100ms sleep first was pure
-  // floor. Same total budget (~1.4s), finer grain.
-  const fDeadline = Date.now() + 1400;
-  let firstF = true;
-  while (Date.now() < fDeadline) {
-    if (!firstF) await new Promise((r) => setTimeout(r, 25));
-    firstF = false;
-    if (readRows().map(t).some((x) => norm(x) === norm(want))) break;
+  // Let the filtered list settle before Enter — polled on the rows, not a flat sleep.
+  for (let i = 0; i < 14; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const now = readRows().map(t);
+    if (now.some((x) => norm(x) === norm(want))) break;
   }
   el.focus();
   for (const type of ["keydown", "keypress", "keyup"]) {
@@ -4703,10 +4682,8 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   // exactly as before. Nothing is assumed from a timer that did not fire.
   let value = null, invalid = false;
   const vDeadline = Date.now() + 2500;
-  let firstV = true;
   while (Date.now() < vDeadline) {
-    if (!firstV) await new Promise((r) => setTimeout(r, 25));   // look first; see the open above
-    firstV = false;
+    await new Promise((r) => setTimeout(r, 60));
     const v = String(el.value || "").trim();
     invalid = /cx-select-input--invalid/.test(String(el.className || ""));
     if (v && !invalid) { value = v; break; }
