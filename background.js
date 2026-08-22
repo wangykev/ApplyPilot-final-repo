@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-sibling-wait-1";
+const AP_BUILD_MARKER = "orc-resend-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4806,6 +4806,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
   const consentsAccepted = [];
   let codeTries = 0;
   let decoysSeen = 0;
+  let resendAt = 0;   // when we last pressed "Send New Code" — see the code branch's sinceMs guard
   // ⚠⚠ A REJECTED AUTH STEP MUST BACK OFF, NOT HAMMER (live 2026-08-21). Observed: Oracle answered the
   // email step with its OWN server error — "Failed to lock the record in table IRC_ACCESS_TOKENS …
   // another user holds the lock", a row lock left by the PREVIOUS run's candidate session — and this
@@ -5042,15 +5043,57 @@ async function runOrcPreForm(tabId, credentials, opts) {
       let tok = await gmailGetToken(true);
       if (!tok.ok) return halt("gmail-auth-failed", `Gmail auto-verify could not get a token: ${tok.error}`);
       LOG(`waiting for Oracle's verification code by email (attempt ${codeTries}/${MAX_CODE_TRIES})…`);
-      const found = await gmailFindVerificationCode({ token: tok.token, length: s.pinInputs || 6 });
-      if (!found.ok && (found.status === 401 || found.status === 403)) {
-        await gmailRemoveCachedToken(tok.token);
-        tok = await gmailGetToken(true);
-        if (!tok.ok) return halt("gmail-auth-failed", `Gmail token refresh failed: ${tok.error}`);
-      }
-      const got = found.ok ? found : await gmailFindVerificationCode({ token: tok.token, length: s.pinInputs || 6 });
-      if (!got.ok) {
-        return halt("verification-code-not-received", `No Oracle verification code arrived by email: ${got.error}. Check the inbox for the stored login address, or type the code yourself and re-run.`);
+      // ⚠⚠ ORACLE SOMETIMES NEVER SENDS THE MAIL — so ASK AGAIN rather than waiting it out (operator,
+      // 2026-08-22: "this fill didn't send an email, you should click send new code if nothing is
+      // received in 30 seconds").
+      //
+      // The wait used to be one 120s poll and then a halt, which is the worst of both: two minutes of
+      // nothing, and then a run the operator has to restart by hand for a mail that was never coming.
+      // The gate ships its own `<resend-pin>` / "Send New Code" control, so the right move on an empty
+      // inbox is to press it and keep waiting.
+      //
+      // ⚠ BOUNDED, and the bound is the point — this presses a button that makes the tenant send mail,
+      // so it must never become a loop. Two resends, each followed by its own wait, then a halt that
+      // says how long it waited and how many codes it asked for.
+      // ⚠ AND EACH WAIT AFTER A RESEND ONLY ACCEPTS MAIL NEWER THAN THE PRESS (`sinceMs`), so a stale
+      // code from an earlier attempt cannot be typed into a gate that has already invalidated it.
+      const CODE_WAIT_MS = 30000;      // the operator's number
+      const MAX_RESENDS = 2;
+      let got = null, resends = 0, waitedTotal = 0;
+      for (;;) {
+        const wT0 = Date.now();
+        const found = await gmailFindVerificationCode({
+          token: tok.token, length: s.pinInputs || 6, timeoutMs: CODE_WAIT_MS,
+          // After a resend, ignore anything older than that press.
+          ...(resends ? { sinceMs: Date.now() - resendAt } : {}),
+        });
+        waitedTotal += Date.now() - wT0;
+        if (!found.ok && (found.status === 401 || found.status === 403)) {
+          await gmailRemoveCachedToken(tok.token);
+          tok = await gmailGetToken(true);
+          if (!tok.ok) return halt("gmail-auth-failed", `Gmail token refresh failed: ${tok.error}`);
+          continue;   // the token was the problem, not the mail — re-poll without spending a resend
+        }
+        if (found.ok) { got = found; break; }
+        if (resends >= MAX_RESENDS) {
+          return halt("verification-code-not-received",
+            `No Oracle verification code arrived after ${(waitedTotal / 1000).toFixed(0)}s and ${resends} `
+            + `"Send New Code" press(es): ${found.error}. Check the inbox for the stored login address, or `
+            + "type the code yourself and re-run.");
+        }
+        // Press the gate's OWN resend control. Refused captions are guarded inside the primitive, and a
+        // control that is not there is reported rather than assumed.
+        const rs = await cdpEval(atsInjOrcClickButton, "^(send new code|resend|send another code|send code again)\\b", null)
+          .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        if (!rs || !rs.ok) {
+          return halt("verification-code-not-received",
+            `No code arrived in ${(waitedTotal / 1000).toFixed(0)}s and this gate offers no "Send New Code" `
+            + `control to press${rs && rs.error ? ` (${rs.error})` : ""} — type the code yourself and re-run.`);
+        }
+        resends++;
+        resendAt = Date.now();
+        LOG(`no code in ${(CODE_WAIT_MS / 1000).toFixed(0)}s — pressed ${JSON.stringify(rs.caption || "Send New Code")} `
+          + `(${resends}/${MAX_RESENDS}) and waiting again; only mail newer than this press will be accepted`);
       }
       // The code is NEVER logged — only that one was found, and how old it was.
       LOG(`got a verification code from Gmail (message ${got.messageId}, ${Math.max(0, Math.round((Date.now() - got.internalDate) / 1000))}s old) — entering it`);

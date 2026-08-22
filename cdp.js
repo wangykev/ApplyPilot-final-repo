@@ -563,6 +563,10 @@ function cdpKeepWarmStop() {
   cdpWarmTimer = null;
 }
 
+// Is the lag trace running? Lets a caller arm an extra DIAGNOSTIC probe only when tracing, so a
+// normal run pays nothing for it.
+function cdpLagActive() { return cdpLagOn; }
+
 function cdpLagStart() {
   const first = !cdpLagOn;
   cdpLagOn = true;

@@ -6363,6 +6363,16 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         if (!byName.has(k)) byName.set(k, []);
         byName.get(k).push(f);
       }
+      // ⚠ A SETTLE GAP BETWEEN TWO DATE PAIRS (operator, 2026-08-22: "add a small 100 ms delay after
+      // start fills, then fill end"). The endDate pair is intermittently slow — 677/688/673ms on one
+      // run, 2854/2991ms on another — and when it bites the cost is DISPATCH, not the widget (2128ms
+      // SW-side against 441ms page-side). Giving ORC a beat to finish reacting to the committed start
+      // date before we open the next picker is the operator's call and it is cheap either way.
+      //
+      // ⚠ Applied only BETWEEN pairs, never before the first one, so an entry with a single date pays
+      // nothing. Whether it actually helps is a measurement, not a claim — the picker trace prints the
+      // SW-vs-page split for every slow half, so the next run says so either way.
+      let datePairsDone = 0;
       for (const [key, group] of byName) {
         const spec = map[key] || null;
         if (!spec) { unmapped.push(key + (group[0].label ? " (" + group[0].label + ")" : "")); continue; }
@@ -6397,6 +6407,9 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             ? [NAMES[mNum - 1], NAMES[mNum - 1].slice(0, 3), String(mNum).padStart(2, "0"), String(mNum)]
             : [];
           const yearCands = [String(ym.year)];
+          // The settle gap declared above — only between pairs, so the first date in an entry is
+          // unaffected and a single-date entry never pays it.
+          if (datePairsDone > 0) await act.delayFull(100);
           const got_by = {}; const failed = [];
           // ⚠⚠ PER-HALF OUTCOMES, because each half becomes its OWN review record (operator,
           // 2026-08-21: "the start date and end date are two separate pickers … they should reflect
@@ -6447,12 +6460,34 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             // 722/701/723ms — with the SAME page-side work in the trace (~250ms a half). So ~2.3s of it
             // is outside the page, and "round trips" was my inference, not a measurement. `swMs` minus
             // the trace's own elapsed is that difference, per half, so the next change is aimed.
-            let swMs = 0;
+            let swMs = 0, lastProbeMs = null;
             for (let attempt = 0; attempt < 2 && got == null; attempt++) {
               if (attempt) await act.delayFull(400);
+              // ⚠⚠ THE DISCRIMINATOR (operator, 2026-08-22: "it seems like a flake, sometimes it fills
+              // fine and sometimes it doesn't so you are wrong" — they were right, and my round-24
+              // conclusion was drawn from ONE trace line).
+              //
+              // The endDate pair measures 677/688/673ms on one run and 2854/2991ms on another, so it is
+              // INTERMITTENT. When it bites, the cost is dispatch (2128ms SW-side vs 441ms page-side) —
+              // that part is solid. What is NOT settled is WHOSE dispatch: a busy renderer and a late
+              // worker look identical from one duration, and the pace summary cannot arbitrate because
+              // it only watches PACES, not evals.
+              //
+              // So: a TRIVIAL eval immediately before the real one. Same thread, same channel, no work.
+              //   probe ~2ms   + picker slow  ⇒ the delay is OURS (worker/handling), not the page
+              //   probe ~1.7s  + picker slow  ⇒ the page's main thread is genuinely busy
+              // One extra round trip per half, and only while the lag trace is on, so a normal run pays
+              // nothing for it.
+              let probeMs = null;
+              if (o && o.lagProbe) {
+                const pT0 = Date.now();
+                try { await act.eval(function () { return 1; }); } catch (e) { /* probe only */ }
+                probeMs = Date.now() - pT0;
+              }
               const evT0 = Date.now();
               r = await act.eval(atsInjOrcPickFromOwnList, sel, monthCands, yearCands, ATS_ORC_PICK_MS).catch(() => null);
               swMs += Date.now() - evT0;
+              if (probeMs != null) lastProbeMs = probeMs;
               reopenTotal += (r && r.reopens) || 0;
               if (!r || !r.ok) continue;
               // READ-BACK VERIFIED, but settled PAGE-SIDE inside the primitive — see the note there.
@@ -6470,6 +6505,7 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
               const q = r.trace;
               const pageMs = q.samples && q.samples.length ? q.samples[q.samples.length - 1].t : (q.enterAt || 0);
               log(`  ↳ ${key} ${idHalf || r.kind || "?"}: eval ${swMs}ms SW-side vs ${pageMs}ms page-side`
+                + (lastProbeMs != null ? ` [no-op probe just before: ${lastProbeMs}ms ⇒ ${lastProbeMs > 400 ? "the PAGE thread was busy" : "the page was FREE, so the delay is OURS"}]` : "")
                 + ` (⇒ ${Math.max(0, swMs - pageMs)}ms of transport/scheduling) ·`
                 + ` sibling-list wait ${q.waitedForSibling}ms${q.siblingStillUp ? " (STILL UP!)" : ""} ·`
                 + ` openedByUs=${q.openedByUs} rows=${q.rowsN}@${q.rowsAt}ms`
@@ -6506,6 +6542,7 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           // field in the bundle, and the strict verify would demand a live control for a `startDate`
           // that no longer has one — the shape that fails a submit whose values are all present.
           // The replay reads these halves back and re-assembles them; see atsOrcTileMatch.
+          datePairsDone++;
           const wanted = { month: monthCands[0] || null, year: yearCands[0] || null };
           for (const hk of ["month", "year"]) {
             const h = half_by[hk] || {};
@@ -9132,7 +9169,7 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
       console.log("[ApplyPilot][ORC-LINK] ⛔ the links pass threw:", String((e && e.message) || e));
     }
     try {
-      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m), reportOnly: !!replay, valueFor, entryCounts });
+      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m), reportOnly: !!replay, valueFor, entryCounts, lagProbe: (typeof cdpLagActive === "function" && cdpLagActive()) });
       if (ep && ep.records && ep.records.length) results.push(...ep.records);
       // ⚠ CONCAT, never assign: the LINKS pass above writes into the same list, and an assignment
       // here silently discarded its notes — the one channel that reports a link we could not add.
