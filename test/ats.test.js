@@ -3906,12 +3906,20 @@ test("atsInjOrcTiles: a committed entry is a TILE whose controls are ICON-ONLY",
 // ── what reaches the review page is the APPLICATION'S ANSWER, not a log line ──────────────
 test("the ORC date pair reaches review as a readable value, not a debug string", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
-  const i = src.indexOf('spec.kind === "date_pair" && group.length >= 2');
+  // ⚠ ANCHOR WITH THE `if (` PREFIX. Bare `spec.kind === "date_pair"` also matches INSIDE a longer
+  // identifier (a `kspec`/`fspec` in another function ends with "spec.kind"), and this test silently
+  // began examining a different function when one appeared earlier in the file.
+  const i = src.indexOf('if (spec.kind === "date_pair" && group.length >= 2)');
   assert.ok(i > 0, "the date-pair branch must exist");
   const stripComments = (t) => String(t)
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
-  const branch = stripComments(src.slice(i, i + 9000));   // the branch is ~85 lines long
+  // ⚠ BOUND BY THE BRANCH'S OWN END, not a byte count. A fixed +9000 slice stopped reaching the
+  // per-half record block when this branch grew, and the assertion then failed for a reason that had
+  // nothing to do with what it checks. `const f = group[0];` is the first statement after it.
+  const branchEnd = src.indexOf("const f = group[0];", i);
+  assert.ok(branchEnd > i, "the statement after the date-pair branch must be findable");
+  const branch = stripComments(src.slice(i, branchEnd));
 
   // ⚠ it used to write `month="May" year="2026"` — my own debug string — which the review editor
   // rendered as a TEXT BOX of raw markup and a submit replay would have typed at the form verbatim.
@@ -3920,8 +3928,14 @@ test("the ORC date pair reaches review as a readable value, not a debug string",
   assert.ok(!/\$\{half\.kind\}=/.test(branch),
     'the record must not carry `month="…" year="…"` — that is a log format, and it lands in ' +
     "current_value and then in the replay");
-  assert.ok(/\[got_by\.month, got_by\.year\]/.test(branch),
-    'the value must be the human-readable pair ("May 2026")');
+  // ⚠ THE MERGED PAIR IS GONE BY DESIGN (operator, 2026-08-21): each half is its own review row so
+  // it can be corrected on its own. The property this test exists to protect is UNCHANGED — what
+  // lands in `after` (and therefore in current_value, and therefore in the replay) must be the
+  // option text the picker itself committed, never a string formatted for a log.
+  assert.ok(/after: h\.value \|\| null/.test(branch),
+    "each half's recorded value must be the option text the picker committed");
+  assert.ok(/status: h\.value \? "filled" : "needs_review"/.test(branch),
+    "…and a half that did not commit is needs_review, never a silent pass");
   // and the label must not be the raw platform name: these halves carry no label at all
   assert.ok(/replace\(\/\(\[a-z\]\)\(\[A-Z\]\)\//.test(branch),
     'the label must split camelCase so review shows "Start Date", not "startDate"');
@@ -4322,7 +4336,7 @@ test("SAFETY: an ORC replay that did not reach the final step REFUSES the gate",
     "the incomplete-walk refusal must precede both the verify and the submit gate");
 });
 
-test("SAFETY: a replay REPORTS the repeating entries and never rebuilds or deletes them", () => {
+test("SAFETY: a replay never DELETES a repeating entry, and restores only from the BUNDLE", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
   const i = src.indexOf("if (o.reportOnly) {");
   assert.ok(i > 0, "the report-only branch must exist");
@@ -4332,11 +4346,72 @@ test("SAFETY: a replay REPORTS the repeating entries and never rebuilds or delet
   assert.ok(/records\.push\(/.test(branch), "…and report them, or the strict verify flags every entry as missing");
   assert.ok(/entrySection: spec\.source/.test(branch) && /entryIndex: k/.test(branch),
     "the records must carry section+index so atsSubmitKey lines them up with the bundle's");
-  // ⚠⚠ NOTHING may be actuated here. A replay passes profile:{}, so a reconcile would see
-  // "profile wants 0, the form has 3" and DELETE the work history.
-  assert.ok(!/atsInjOrcDeleteTile|atsInjOrcOpenEntryAndWait|atsInjOrcCommitEntryAndWait/.test(branch),
-    "a report-only pass must not open, commit or DELETE an entry — profile:{} would read as 'wants 0'");
+  // ⚠⚠ DELETION STAYS FORBIDDEN, FOR THE ORIGINAL REASON. A replay passes profile:{}, so any
+  // profile-derived reconcile reads "wants 0, the form has 3" and DELETES the work history.
+  assert.ok(!/atsInjOrcDeleteTile/.test(branch),
+    "a report-only pass must NEVER delete an entry — profile:{} would read as 'wants 0'");
+  // ⚠ RESTORING A MISSING ENTRY IS NOW ALLOWED AND REQUIRED (operator, 2026-08-21: "it must add them
+  // and get the page to match what is approved"), because Oracle refuses an entry with an incomplete
+  // required date and a refused entry never persists — so the form can hold fewer tiles than the
+  // bundle has entries. The safety property is no longer "never actuate", it is:
+  //   (a) ADD-ONLY — the restore opens a FRESH form and never touches a tile that is present, and
+  //   (b) BUNDLE-DRIVEN — every value comes from o.valueFor / o.entryCounts, never from the profile.
+  assert.ok(/atsOrcAddApprovedEntry\(act, spec, a\.idx, emap, o\.valueFor, log\)/.test(branch),
+    "the restore must be driven by the APPROVED BUNDLE's valueFor, not the profile");
+  assert.ok(/o\.entryCounts/.test(branch), "…and sized by the bundle's entry count");
+  assert.ok(!/\bprofile\b/.test(branch),
+    "the report-only branch must never read the profile — it is {} on a replay");
   assert.ok(/return \{ records, notes \};/.test(branch), "and it must return before the filling plan runs");
+});
+
+// The restore itself: additive by construction, and it must never reach for a delete.
+test("SAFETY: atsOrcAddApprovedEntry only ADDS — it opens a fresh form and never deletes a tile", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsOrcAddApprovedEntry(");
+  assert.ok(i > 0, "the restore helper must exist");
+  const fn = stripJsComments(src.slice(i, src.indexOf("\nasync function atsOrcFillEntries(", i)));
+  assert.ok(/atsInjOrcOpenEntryAndWait/.test(fn), "it presses Add and waits for a FRESH entry form");
+  assert.ok(/atsInjOrcCommitEntryAndWait/.test(fn), "…and commits it, or the entry is not really there");
+  assert.ok(!/atsInjOrcDeleteTile|atsInjOrcOpenTileAndWait/.test(fn),
+    "it must never delete a tile or open an EXISTING one — that is what makes it non-destructive");
+  // A refusal must leave the block clean: a form left open blocks Next for everything after it.
+  assert.ok(/atsInjOrcEntryAction, spec\.pattern, "cancel"/.test(fn),
+    "a refused entry must be CANCELLED so it cannot block the step");
+  // Values come from the bundle, never the profile.
+  assert.ok(!/\bprofile\b/.test(fn), "it must not read the profile — every value comes from valueFor");
+});
+
+// Which entries are missing is decided by EVIDENCE. Assuming the tail duplicates a present entry
+// whenever the one Oracle refused was not the last.
+test("the replay finds the ABSENT approved entries by identity, not by assuming the tail", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("if (o.reportOnly) {");
+  const branch = stripJsComments(src.slice(i, src.indexOf("\n  if (!plan.length) {", i)));
+  assert.ok(/ATS_ORC_ENTRY_IDENTITY_KEYS/.test(branch), "it must look each approved entry up by its identifying values");
+  assert.ok(/atsOrcTileHoldsValue/.test(branch), "…against the tiles actually on the form");
+  // ⚠ PIN THE POSITIVE FORM. A negative "does not contain the tail range" assertion passed a mutation
+  // that rewrote the decision as `if (bi >= tiles.length)` — the same wrong behaviour in different
+  // bytes. What must be true is that membership is decided by the identity LOOKUP.
+  assert.ok(/const present = tiles\.some\(/.test(branch),
+    "presence must be decided by looking each approved entry up among the tiles");
+  assert.ok(/if \(!present\) absent\.push\(/.test(branch),
+    "…and only the ones NOT found are restored — never a positional range");
+  assert.ok(!/bi >= tiles\.length/.test(branch) && !/tiles\.length; bi < approvedCount/.test(branch),
+    "it must NOT take the tail range — the refused entry may have been the second of three");
+});
+
+// A date is TWO pickers, so it is TWO review rows sharing one question.
+test("an ORC date is recorded as two per-half rows sharing a question_key, each with its own options", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const stripped = stripJsComments(src);
+  assert.ok(/fieldName: `\$\{item\.source\}\[\$\{i\}\]\.\$\{key\}\.\$\{hk\}`/.test(stripped),
+    "the fill must key each half separately so each is editable on its own");
+  assert.ok(/question_key: `\$\{item\.source\}\[\$\{i\}\]\.\$\{key\}`/.test(stripped),
+    "…and share a question_key so review shows ONE date row with its parts inside");
+  assert.ok(/part_label: partName/.test(stripped), "…each labelled Month / Year");
+  // The scanned vocabulary must come from the UNFILTERED list, not the one-row filtered list.
+  assert.ok(/return \{ ok: true, kind, committed: want, reopens, value, invalid, options: texts \};/.test(stripped),
+    "the picker must return the vocabulary it read at OPEN (texts), never the filtered `shown`");
 });
 
 test("the replay flag is threaded EXPLICITLY into atsFinishFill", () => {
@@ -4545,9 +4620,16 @@ test("the replay checks the tile BEFORE opening an entry", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
   const i = src.indexOf("const missing = expected.filter");
   assert.ok(i > 0, "the tile check must exist");
-  const seg = stripJsComments(src.slice(i - 900, i + 1600));
-
-  assert.ok(seg.indexOf("atsOrcTileHoldsValue") < seg.indexOf("atsInjOrcOpenTileAndWait"),
+  // ⚠ WINDOW OVER THE WHOLE report-only BRANCH, not a byte count. A fixed +1600 slice silently
+  // stopped covering `atsInjOrcOpenTileAndWait` once the per-half date records were added between
+  // them, and `indexOf` then returned -1 — which made the ordering assertion pass/fail for a reason
+  // that had nothing to do with ordering.
+  const branchStart = src.lastIndexOf("if (o.reportOnly) {", i);
+  const seg = stripJsComments(src.slice(branchStart, src.indexOf("\n  if (!plan.length) {", i)));
+  const atHolds = seg.indexOf("const missing = expected.filter");
+  const atOpen = seg.indexOf("atsInjOrcOpenTileAndWait");
+  assert.ok(atHolds > 0 && atOpen > 0, "both the tile check and the per-field open must be present");
+  assert.ok(atHolds < atOpen,
     "the tile is read FIRST; opening is the exception, not the default");
   assert.ok(/verified from the DOM, not opened/.test(seg),
     "a tile that already shows every approved value must be recorded without being opened");

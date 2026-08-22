@@ -4686,7 +4686,10 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
     const row = rows.find((r) => norm(t(r)) === norm(c));
     if (row) { want = t(row); break; }
   }
-  if (!want) return { ok: false, error: "no-match", kind, rows: texts.slice(0, 6), reopens };
+  // Even a no-match hands back the vocabulary: the operator then gets a real picker to choose from,
+  // which is the whole point of scanning it — a half we could not fill is exactly the one they need
+  // to set by hand.
+  if (!want) return { ok: false, error: "no-match", kind, rows: texts.slice(0, 6), reopens, options: texts };
 
   // ⚠⚠ THE COMMIT IS TYPE-THEN-**ENTER**, NOT A CLICK ON THE ROW. Measured 2026-08-20: the first
   // version of this clicked the matching row with the full pointer sequence and ORC ignored it —
@@ -4735,7 +4738,7 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   }
   // ⚠ AND IF IT NEVER NARROWS, DO NOT PRESS. Reporting beats committing a month nobody asked for onto
   // a work-history date; the caller turns this into needs_review.
-  if (!narrowed) return { ok: false, error: "filter-did-not-narrow", kind, want, rows: shown.slice(0, 6), reopens };
+  if (!narrowed) return { ok: false, error: "filter-did-not-narrow", kind, want, rows: shown.slice(0, 6), reopens, options: texts };
   el.focus();
   for (const type of ["keydown", "keypress", "keyup"]) {
     el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
@@ -4764,7 +4767,13 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
     invalid = /cx-select-input--invalid/.test(String(el.className || ""));
     if (v && !invalid) { value = v; break; }
   }
-  return { ok: true, kind, committed: want, reopens, value, invalid };
+  // ⚠ `options` IS THE UNFILTERED VOCABULARY, captured at OPEN before a keystroke narrowed it
+  // (operator, 2026-08-21: "each one is a dropdown, those should be scanned"). It is what lets the
+  // review page render each half as a real picker instead of a text box — and it is free, because
+  // classifying month-vs-year already had to read every row. Taken from `texts`, NOT from `shown`:
+  // `shown` is the list AFTER typing filtered it to one row, which would make the review editor offer
+  // a one-option dropdown containing only the value we already chose.
+  return { ok: true, kind, committed: want, reopens, value, invalid, options: texts };
 }
 
 function atsInjOrcLinks() {
@@ -5309,6 +5318,16 @@ var ATS_ORC_ENTRY_BLOCKS = [
 // ⚠ AND EXPERIENCE HAS NO CITY, COUNTRY OR RESPONSIBILITIES ON THIS TENANT. The earlier map carried
 // all three from the iCIMS shape; they never existed here. Left OUT rather than kept "just in case",
 // because a map entry that matches nothing is indistinguishable from one that is broken.
+// Which of an entry's fields IDENTIFY it, for deciding whether an approved entry is already on the
+// form. Deliberately the human-readable ones and never a DATE: two jobs can share a start month, and
+// a date is also the field most likely to be the reason the entry went missing in the first place.
+// Mirrors atsOrcEntryIdentity, but keyed by the FORM's field names because a replay reads the bundle.
+var ATS_ORC_ENTRY_IDENTITY_KEYS = {
+  work_experience: ["employerName", "jobTitle"],
+  education: ["educationalEstablishment"],
+  skills: ["skills"],
+};
+
 var ATS_ORC_ENTRY_MAPS = {
   work_experience: {
     "employerName": { path: "company" },
@@ -5531,6 +5550,133 @@ async function atsOrcFillLinks(act, profile, opts) {
 // ⚠ AND `Add` IS A HOMONYM. The same button opens a blank entry and commits the open one, so both
 // actions are gated on whether a Cancel is present (atsInjOrcEntryAction refuses the wrong one).
 // Pressing it twice in a row on a misread state would silently create an empty entry.
+// -- RESTORE AN APPROVED ENTRY THAT THE FORM NO LONGER HAS (operator, 2026-08-21) ---------
+// "there were 3 experience fields approved. the reherse run only saw 1 repeating section and did not
+// add the other 2 that were approved. it must add them and get the page to match what is approved."
+//
+// WHY AN ENTRY GOES MISSING: Oracle REFUSES an entry whose required date is incomplete, and a refused
+// entry never persists. So a fill can end with fewer tiles than the bundle has entries -- which
+// invalidated the old premise that "ORC saves entries server-side, so the tiles the fill created are
+// still there". The strict verify then reported every field of the absent entries as "approved value
+// has NO matching field on the live form": true, but it says neither which entry nor why.
+//
+// STRICTLY ADDITIVE, AND THAT IS THE SAFETY PROPERTY. It only ever presses Add and fills a FRESH
+// form. It never opens, edits or deletes an entry that is present, so it cannot damage data already
+// on the application -- the reason the surrounding pass refuses to actuate at all is that a
+// profile-derived reconcile reads `profile:{}` as "wants 0" and DELETES the work history. Nothing
+// here reads the profile; every value comes from the approved bundle via `valueFor`.
+//
+// Values come back in the form's OWN vocabulary because that is what the fill recorded: a date half
+// is stored as the option text the picker committed ("September" / "2024"), so it is handed straight
+// back as the sole candidate. No display-string parsing, and nothing is re-derived.
+async function atsOrcAddApprovedEntry(act, spec, idx, emap, valueFor, log) {
+  const records = [];
+  const get = (fieldName, wt) => {
+    try { return valueFor({ fieldName, entrySection: spec.source, entryIndex: idx, widgetType: wt || "text" }); }
+    catch (e) { return undefined; }
+  };
+  const tag = spec.label + " entry " + (idx + 1);
+  const opened = await act.eval(atsInjOrcOpenEntryAndWait, spec.pattern, ATS_ORC_PICK_MS)
+    .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (!opened || !opened.ok || !(opened.fields || []).length) {
+    const why = (opened && opened.error) || "the entry form never rendered";
+    log("⛔ " + tag + ": could not open a form to restore it — " + why);
+    return { ok: false, error: why, records };
+  }
+  const byName = new Map();
+  for (const f of opened.fields) {
+    const k = f.name || f.id || "";
+    if (!k) continue;
+    if (!byName.has(k)) byName.set(k, []);
+    byName.get(k).push(f);
+  }
+  const esc = (id) => "#" + String(id).replace(/([^\w-])/g, "\\$1");
+  let wrote = 0, failed = 0;
+  for (const [key, group] of byName) {
+    const mapSpec = emap[key];
+    if (!mapSpec || mapSpec.kind === "skip") continue;
+
+    if (mapSpec.kind === "date_pair" && group.length >= 2) {
+      for (const g of group.slice(0, 2)) {
+        const h = /^month-/.test(String(g.id || "")) ? "month"
+          : (/^year-/.test(String(g.id || "")) ? "year" : null);
+        if (!h || !g.id) continue;
+        const want = get(spec.source + "[" + idx + "]." + key + "." + h, "dropdown");
+        if (want === undefined || !String(want).trim()) continue;   // not approved => nothing to restore
+        const cands = [String(want).trim()];
+        let r = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt) await act.delayFull(400);
+          r = await act.eval(atsInjOrcPickFromOwnList, esc(g.id),
+            h === "month" ? cands : [], h === "year" ? cands : [], ATS_ORC_PICK_MS).catch(() => null);
+          if (r && r.ok && r.value && !r.invalid) break;
+        }
+        const ok = !!(r && r.ok && r.value && !r.invalid);
+        if (ok) wrote++; else failed++;
+        records.push({
+          fieldName: spec.source + "[" + idx + "]." + key + "." + h,
+          label: (group[0].label || key) + " (" + h + ")",
+          widgetType: "dropdown", isRequired: false,
+          entrySection: spec.source, entryIndex: idx,
+          question_key: spec.source + "[" + idx + "]." + key,
+          part_label: h === "year" ? "Year" : "Month",
+          options: (r && Array.isArray(r.options) && r.options.length) ? r.options : null,
+          status: ok ? "filled" : "needs_review", verified: !!ok,
+          after: ok ? r.value : null, elapsedMs: 0,
+          flag: ok ? null : "commit-not-accepted",
+          detail: ok
+            ? "restored onto the form from your approved review (" + JSON.stringify(r.value) + ")"
+            : "could not restore " + JSON.stringify(cands[0]) + (r && r.error ? " (" + r.error + ")" : ""),
+        });
+      }
+      continue;
+    }
+
+    const f = group[0];
+    if (!f.id) continue;
+    const want = get(spec.source + "[" + idx + "]." + key, f.role === "combobox" ? "dropdown" : "text");
+    if (want === undefined || !String(want).trim()) continue;
+    const flat = String(Array.isArray(want) ? want[0] : want).trim();
+    let after = null;
+    if (f.role === "combobox") {
+      const r = await act.eval(atsInjOrcPick, esc(f.id), flat, [flat], ATS_ORC_PICK_MS, false, true).catch(() => null);
+      const back = await act.eval(atsInjOrcReadPicker, esc(f.id)).catch(() => null);
+      if (r && r.ok && back && back.ok && String(back.value || "").trim() && !back.invalid) after = back.value;
+    } else {
+      const w = await act.eval(atsInjSetText, esc(f.id), flat).catch(() => null);
+      const back = await act.eval(atsInjReadValue, "oracle", esc(f.id), "text").catch(() => null);
+      if (w && w.ok && back && back.ok && String(back.value || "").trim()) after = back.value;
+    }
+    if (after) wrote++; else failed++;
+    records.push({
+      fieldName: spec.source + "[" + idx + "]." + key, label: f.label || key,
+      widgetType: f.role === "combobox" ? "dropdown" : "text", isRequired: false,
+      entrySection: spec.source, entryIndex: idx,
+      status: after ? "filled" : "needs_review", verified: !!after,
+      after: after || null, elapsedMs: 0,
+      flag: after ? null : "commit-not-accepted",
+      detail: after
+        ? "restored onto the form from your approved review"
+        : "wrote " + JSON.stringify(flat) + " from your approved review but the field did not keep it",
+    });
+  }
+
+  // THE COMMIT IS THE ONLY THING THAT MAKES IT REAL, and Oracle refuses an incomplete entry -- the
+  // very failure that lost this entry at fill time. A form left open would block Next, so a refusal
+  // is CANCELLED to leave the block clean, and reported.
+  const done = await act.eval(atsInjOrcCommitEntryAndWait, spec.pattern, ATS_ORC_PICK_MS)
+    .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (!done || !done.ok || !done.closed) {
+    const why = (done && done.error) || "Oracle refused the entry (a required field in it is unanswered)";
+    log("⛔ " + tag + ": filled " + wrote + " field(s) from your approved review but the entry would NOT commit — " + why);
+    await act.eval(atsInjOrcEntryAction, spec.pattern, "cancel").catch(() => null);
+    return { ok: false, error: why, records, wrote, failed };
+  }
+  log("✔ " + tag + ": RESTORED from your approved review — " + wrote + " field(s) written"
+    + (failed ? ", " + failed + " could not be set" : ""));
+  return { ok: true, records, wrote, failed };
+}
+
 async function atsOrcFillEntries(act, profile, jc, opts) {
   const o = opts || {};
   const log = o.log || (() => {});
@@ -5600,15 +5746,61 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       // values on the SUBMIT path, and it must never delete or duplicate an entry that IS present.
       // `entryCounts` is now in scope for exactly that work. Reporting is strictly better than the
       // status quo and cannot damage an entry that is merely absent.
+      // ⚠⚠ RESTORE ANY APPROVED ENTRY THE FORM NO LONGER HAS (operator, 2026-08-21): "it must add
+      // them and get the page to match what is approved." Oracle refuses an entry whose required date
+      // is incomplete and a refused entry never persists, so a fill can leave FEWER tiles than the
+      // bundle has entries — which is exactly what happened live (3 approved, 1 on the form).
+      //
+      // ⚠ WHICH entries are missing is DECIDED BY EVIDENCE, not by assuming the tail. Taking
+      // "indices tiles.length…approvedCount-1" would be wrong whenever the entry Oracle refused was
+      // the SECOND of three — it would re-add the third (already present, now duplicated) and still
+      // leave the second absent. So each approved index is looked for among the tiles by its own
+      // identifying values, and only the genuinely absent ones are added.
       const approvedCount = Number((o.entryCounts || {})[spec.source] || 0);
       if (approvedCount > tiles.length) {
-        const missing = approvedCount - tiles.length;
-        const why = `${spec.label}: the form has ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} but you approved `
-          + `${approvedCount} — Oracle did not keep ${missing} of them (an entry it refused at fill time never persisted). `
-          + `The ${missing} missing entr${missing === 1 ? "y" : "ies"} cannot be verified and will FAIL the submit gate; `
-          + `re-run the fill for this job so every entry commits, then approve and rehearse again.`;
-        log(`⚠ ${why}`);
-        notes.push(why);
+        const idKeys = ATS_ORC_ENTRY_IDENTITY_KEYS[spec.source] || [];
+        const absent = [];
+        for (let bi = 0; bi < approvedCount; bi++) {
+          const idVals = idKeys.map((kk) => {
+            const v = typeof o.valueFor === "function"
+              ? o.valueFor({ fieldName: `${spec.source}[${bi}].${kk}`, entrySection: spec.source, entryIndex: bi, widgetType: "text" })
+              : undefined;
+            return v === undefined ? null : String(v).trim();
+          }).filter(Boolean);
+          // No identifying value ⇒ we cannot tell whether it is present, and adding it might
+          // duplicate a real entry. Refusing to guess is the safe direction here.
+          if (!idVals.length) continue;
+          const present = tiles.some((t) => idVals.every((v) => atsOrcTileHoldsValue(t && t.text, v)));
+          if (!present) absent.push({ idx: bi, idVals });
+        }
+        if (absent.length) {
+          log(`⚠ ${spec.label}: the form has ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} but you approved `
+            + `${approvedCount} — RESTORING ${absent.length} that Oracle did not keep: `
+            + absent.map((a) => JSON.stringify(a.idVals.join(" · "))).join(", "));
+          for (const a of absent) {
+            const res = await atsOrcAddApprovedEntry(act, spec, a.idx, emap, o.valueFor, log);
+            for (const r of res.records || []) records.push(r);
+            if (!res.ok) {
+              notes.push(`${spec.label} entry ${a.idx + 1}: approved but MISSING from the form, and it could not be restored `
+                + `(${res.error || "unknown"}) — the submit gate will refuse until this is fixed by hand or the fill is re-run`);
+            } else {
+              notes.push(`${spec.label} entry ${a.idx + 1}: was missing from the form and has been RESTORED from your approved review`);
+            }
+          }
+          // Re-read the tiles: the ones we just added are part of what has to be verified below, and
+          // their positions shift whatever the form's own ordering is.
+          const t1 = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+          const after = (t1 && t1.ok && t1.tiles) || [];
+          log(`${spec.label}: ${after.length} entr${after.length === 1 ? "y" : "ies"} on the form after restoring`);
+          tiles.length = 0;
+          for (const t of after) tiles.push(t);
+        } else {
+          const why = `${spec.label}: you approved ${approvedCount} entr${approvedCount === 1 ? "y" : "ies"} and the form shows `
+            + `${tiles.length}, but every approved entry was found on the form — nothing was added (the count differs for a `
+            + `reason this pass cannot see; check the page by hand).`;
+          log(`⚠ ${why}`);
+          notes.push(why);
+        }
       }
       if (!tiles.length) { log(`${spec.label}: no entries on the form`); continue; }
       log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — opening each to check it against your approved values (nothing is rewritten)`);
@@ -5617,12 +5809,33 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         // ── THE CHEAP CHECK FIRST: is everything the human approved already visible in the tile? ──
         // The map tells us which fields this section has, so the expected values can be looked up
         // without opening anything. All present ⇒ verified from the DOM, nothing touched.
+        const lookup = (fieldName, widgetType) => (typeof o.valueFor === "function"
+          ? o.valueFor({ fieldName, entrySection: spec.source, entryIndex: k, widgetType: widgetType || "text" })
+          : undefined);
         const expected = [];
         for (const key of Object.keys(emap)) {
+          // ⚠⚠ A DATE IS TWO BUNDLE ROWS NOW, AND THE TILE SHOWS ONE STRING (operator, 2026-08-21:
+          // "you can just read from the dom and put the answer together since the actual fields don't
+          // show, and only correct something if there is any wrong info"). The fill records the month
+          // and the year separately so each is editable, so the replay must RE-ASSEMBLE them before
+          // comparing — the tile renders "05/2026", and testing "May" against that on its own would
+          // call every date wrong and open every entry.
+          if (emap[key] && emap[key].kind === "date_pair") {
+            const parts = ["month", "year"].map((h) => ({
+              half: h, fieldName: `${spec.source}[${k}].${key}.${h}`,
+              want: lookup(`${spec.source}[${k}].${key}.${h}`, "dropdown"),
+            })).filter((pp) => pp.want !== undefined && String(pp.want).trim() !== "");
+            if (!parts.length) continue;
+            const byHalf = {};
+            for (const pp of parts) byHalf[pp.half] = String(pp.want).trim();
+            // Assembled in the vocabulary atsYearMonthKey understands ("May 2026"). A half the human
+            // never approved is simply absent — "if certain info are not shown, that is fine".
+            const asm = [byHalf.month, byHalf.year].filter(Boolean).join(" ");
+            expected.push({ key, fieldName: `${spec.source}[${k}].${key}`, want: asm, parts });
+            continue;
+          }
           const fieldName = `${spec.source}[${k}].${key}`;
-          const want = typeof o.valueFor === "function"
-            ? o.valueFor({ fieldName, entrySection: spec.source, entryIndex: k, widgetType: "text" })
-            : undefined;
+          const want = lookup(fieldName);
           if (want === undefined || String(want).trim() === "") continue;
           expected.push({ key, fieldName, want: String(want) });
         }
@@ -5642,12 +5855,24 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         if (!missing.length) {
           log(`  ${spec.label} entry ${k + 1}: all ${expected.length} approved value(s) are visible on the tile — verified from the DOM, not opened`);
           for (const e of expected) {
-            records.push({
-              fieldName: e.fieldName, label: `${spec.label} ${e.key}`, widgetType: "text",
-              isRequired: false, entrySection: spec.source, entryIndex: k,
-              status: "filled", verified: true, after: e.want, elapsedMs: 0,
-              detail: "read from the entry's own summary on the form — it matches what you approved, so the entry was not opened",
-            });
+            // ⚠ ONE RECORD PER BUNDLE ROW. A date verified as a whole still has to report its two
+            // halves under the keys the bundle actually carries, or the strict verify's set-difference
+            // reports both as "approved value has NO matching field on the live form" — the shape that
+            // refuses a submit whose values are all present and correct.
+            const rows = e.parts
+              ? e.parts.map((pp) => ({ fieldName: pp.fieldName, after: String(pp.want),
+                                       label: `${spec.label} ${e.key} (${pp.half})` }))
+              : [{ fieldName: e.fieldName, after: e.want, label: `${spec.label} ${e.key}` }];
+            for (const row of rows) {
+              records.push({
+                fieldName: row.fieldName, label: row.label, widgetType: "text",
+                isRequired: false, entrySection: spec.source, entryIndex: k,
+                status: "filled", verified: true, after: row.after, elapsedMs: 0,
+                detail: e.parts
+                  ? "assembled from the entry's own summary on the form — the date matches what you approved, so the entry was not opened"
+                  : "read from the entry's own summary on the form — it matches what you approved, so the entry was not opened",
+              });
+            }
           }
           continue;
         }
@@ -5685,6 +5910,37 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
         let same = 0, diff = 0;
         for (const [key, group] of byName) {
           if (!emap[key]) continue;                       // unmapped on the fill side too
+
+          // ⚠⚠ A DATE PAIR IS READ PER HALF FROM THE OPEN FORM, and each half is reported under its
+          // own bundle key. The two controls share one `name`, so `group` holds BOTH — joining their
+          // values into one string (what this did before the split) produced "May 2026" and compared
+          // it against a single merged approval that no longer exists.
+          if (emap[key].kind === "date_pair") {
+            for (const g of group.slice(0, 2)) {
+              const h = /^month-/.test(String(g.id || "")) ? "month" : (/^year-/.test(String(g.id || "")) ? "year" : null);
+              if (!h) continue;                           // an unidentifiable half is not one we can vouch for
+              const hName = `${spec.source}[${k}].${key}.${h}`;
+              const hWant = typeof o.valueFor === "function"
+                ? o.valueFor({ fieldName: hName, entrySection: spec.source, entryIndex: k, widgetType: "dropdown" })
+                : undefined;
+              if (hWant === undefined) continue;
+              const hLive = String(g.value == null ? "" : g.value).trim();
+              const hAgrees = atsLib.normalize(hLive) === atsLib.normalize(String(hWant));
+              records.push({
+                fieldName: hName, label: `${group[0].label || key} (${h})`, widgetType: "dropdown",
+                isRequired: false, entrySection: spec.source, entryIndex: k,
+                status: hAgrees ? "filled" : "needs_review",
+                flag: hAgrees ? null : "entry-mismatch",
+                verified: !!hAgrees, after: hLive || null, elapsedMs: 0,
+                detail: hAgrees
+                  ? "already on the form and it matches what you approved — checked, not rewritten"
+                  : `the form holds ${JSON.stringify(hLive)} but you approved ${JSON.stringify(String(hWant))} — fix it on the form, then re-run`,
+              });
+              if (hAgrees) same++; else diff++;
+            }
+            continue;
+          }
+
           const fieldName = `${spec.source}[${k}].${key}`;
           const want = typeof o.valueFor === "function"
             ? o.valueFor({ fieldName, entrySection: spec.source, entryIndex: k, widgetType: group[0].role === "combobox" ? "dropdown" : "text" })
@@ -5941,6 +6197,21 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             : [];
           const yearCands = [String(ym.year)];
           const got_by = {}; const failed = [];
+          // ⚠⚠ PER-HALF OUTCOMES, because each half becomes its OWN review record (operator,
+          // 2026-08-21: "the start date and end date are two separate pickers … they should reflect
+          // that on the review page so we can change each one manually"). A single merged record
+          // (`after: "May 2026"`) could only be edited as one string, so an operator who wanted to fix
+          // just the month had to retype both — and the review editor rendered it as a TEXT BOX
+          // because a merged record cannot carry two different option lists.
+          //
+          // Keyed by HALF, and the half is decided by two independent signals: the picker's own
+          // evidence (`r.kind`, read from the rows it showed — never assumed) when the visit
+          // succeeded, and the `month-`/`year-` id prefix when it FAILED and there is no kind to read.
+          // The prefix is the documented discriminator (a date's two controls share one `name`), and
+          // it is only ever a fallback so the evidence-based rule still governs every success.
+          const half_by = {};
+          const halfOf = (g, r) => (r && r.kind) || (/^month-/.test(String(g.id || "")) ? "month"
+            : (/^year-/.test(String(g.id || "")) ? "year" : null));
           let reopenTotal = 0;
           let halfIdx = -1;
           for (const g of group.slice(0, 2)) {
@@ -5959,6 +6230,7 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             // pace, which is justified by the measurement; do not repeat the mechanism as fact.
             if (halfIdx) await act.delayFull(150);
             if (!g.id) { failed.push("a half with no id"); continue; }
+            const idHalf = /^month-/.test(String(g.id)) ? "month" : (/^year-/.test(String(g.id)) ? "year" : null);
             const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
             // ⚠ ONE RETRY PER HALF, and only on failure. Committing the first half re-renders the
             // widget, so the second half's open can land mid-render — measured as
@@ -5978,28 +6250,74 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
               // comes back null and still fails the pair.
               if (r.value && !r.invalid) got = r.value;
             }
-            if (!r || !r.ok) { failed.push((r && r.error) || "unknown"); continue; }
-            if (got == null) { failed.push(r.kind + " not retained"); continue; }
+            // Record the half's OUTCOME whichever way it went — the review records are built from
+            // this, so a half that failed must still produce a row (with its option list, so the
+            // operator can simply pick the right value).
+            const hk = halfOf(g, r) || idHalf;
+            if (hk) half_by[hk] = { sel: g.id, error: (r && !r.ok) ? (r.error || "unknown") : null,
+                                    options: (r && r.options) || null, value: null };
+            if (!r || !r.ok) { failed.push(((r && r.error) || "unknown") + (idHalf ? ` (${idHalf})` : "")); continue; }
+            if (got == null) { failed.push(r.kind + " not retained"); if (hk) half_by[hk].error = "not-retained"; continue; }
             got_by[r.kind] = got;
+            if (hk) half_by[hk].value = got;
           }
-          rec0.elapsedMs = Date.now() - t0;
+          // (rec0 above only ever serves the "no date in this entry" case; a date we ATTEMPTED is
+          // reported as its two halves below, so nothing further is written to it.)
           // ⚠⚠ THIS VALUE GOES ON THE REVIEW PAGE AND INTO THE SUBMIT REPLAY — it is not a log line.
           // It used to be `month="May" year="2026"`, my own debug string, which the review editor then
           // rendered as a TEXT BOX for the operator to edit as raw markup, and which a replay would
           // have typed at the form verbatim. `current_value` is copied straight from `rec.after`, so
           // anything convenient for a log becomes the application's answer.
-          rec0.after = [got_by.month, got_by.year].filter(Boolean).join(" ") || null;
           const okAll = !failed.length && got_by.month != null && got_by.year != null;
-          rec0.status = okAll ? "filled" : "needs_review";
-          if (!okAll) {
-            rec0.flag = failed.some((x) => /unclassified/.test(String(x))) ? "date-halves-unidentified" : "commit-not-accepted";
-            rec0.detail = `Oracle did not accept ${ym.month}/${ym.year} — got ${rec0.after || "nothing"}` +
-              (failed.length ? ` (${failed.join("; ")})` : "");
-          } else {
-            rec0.detail = `month+year pair set from ${JSON.stringify(String(ym.month) + "/" + ym.year)}` +
-              ` in one visit per half${reopenTotal ? ` (${reopenTotal} re-open(s) — the first click did not register)` : ""}`;
+
+          // ⚠⚠ TWO RECORDS, ONE QUESTION (operator, 2026-08-21). Each half is a separate ORC combobox,
+          // so each gets its own row carrying its own SCANNED option list — that is what makes it
+          // editable as a picker on the review page. They share `question_key`, which is the existing
+          // mechanism for "one form question rendered as several controls" (salary currency/amount,
+          // Workday's month/day/year), so review shows ONE "Start Date" row with its parts inside
+          // rather than two orphans labelled "Month" and "Year" that say nothing about which date.
+          //
+          // ⚠ THE MERGED RECORD IS GONE, NOT KEPT ALONGSIDE. Emitting both would double-count the
+          // field in the bundle, and the strict verify would demand a live control for a `startDate`
+          // that no longer has one — the shape that fails a submit whose values are all present.
+          // The replay reads these halves back and re-assembles them; see atsOrcTileMatch.
+          const wanted = { month: monthCands[0] || null, year: yearCands[0] || null };
+          for (const hk of ["month", "year"]) {
+            const h = half_by[hk] || {};
+            const partName = hk === "year" ? "Year" : "Month";
+            const rec = {
+              fieldName: `${item.source}[${i}].${key}.${hk}`,
+              label: `${prettyDate} — ${partName}`,
+              widgetType: "dropdown", isRequired: false,
+              entrySection: item.source, entryIndex: i,
+              mappedPath: `${item.source}[${i}].${spec.path}.${hk}`,
+              // The shared question this half belongs to, so review groups them.
+              question_key: `${item.source}[${i}].${key}`,
+              question_label_full: prettyDate,
+              part_label: partName,
+              // Scanned at open, before typing narrowed it — see atsInjOrcPickFromOwnList.
+              options: Array.isArray(h.options) && h.options.length ? h.options : null,
+              after: h.value || null,
+              elapsedMs: Date.now() - t0,
+              status: h.value ? "filled" : "needs_review",
+              verified: h.value ? true : null,
+            };
+            if (h.value) {
+              rec.detail = `picked ${JSON.stringify(h.value)} from the form's own ${partName.toLowerCase()} list`
+                + `${reopenTotal ? ` (${reopenTotal} re-open(s) on the pair — the first click did not register)` : ""}`;
+            } else {
+              rec.flag = /unclassified/.test(String(h.error || "")) ? "date-halves-unidentified" : "commit-not-accepted";
+              rec.detail = `Oracle did not accept ${JSON.stringify(wanted[hk] || "")} for the ${partName.toLowerCase()}`
+                + `${h.error ? ` (${h.error})` : (half_by[hk] ? "" : " (this half was never reached)")}`
+                + `${Array.isArray(h.options) && h.options.length ? ` — pick from the ${h.options.length} option(s) offered` : ""}`;
+            }
+            records.push(rec);
           }
-          records.push(rec0); continue;
+          if (!okAll) {
+            notes.push(`${tag}: ${prettyDate} is INCOMPLETE (${failed.join("; ") || "a half did not commit"})`
+              + " — Oracle refuses an entry whose required date is incomplete, so this can cost the whole entry");
+          }
+          continue;
         }
 
         const f = group[0];
@@ -10029,6 +10347,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
     atsOrcEntryIdentity, atsOrcTilesAlreadyMatch, atsInjOrcOpenEntryAndWait, atsInjOrcCommitEntryAndWait,
+    atsOrcAddApprovedEntry, ATS_ORC_ENTRY_IDENTITY_KEYS, atsOrcTileHoldsValue,
     atsInjOrcOpenTileAndWait, atsInjOrcCloseEntry, atsInjOrcResumeReset,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
