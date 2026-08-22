@@ -5550,6 +5550,41 @@ async function atsOrcFillLinks(act, profile, opts) {
 // ⚠ AND `Add` IS A HOMONYM. The same button opens a blank entry and commits the open one, so both
 // actions are gated on whether a Cancel is present (atsInjOrcEntryAction refuses the wrong one).
 // Pressing it twice in a row on a misread state would silently create an empty entry.
+// -- REMOVE ONE TILE THE APPROVED BUNDLE DOES NOT WANT (operator, 2026-08-21) -------------
+// "for 4 you say purely additive however I need it to subtract if in any case the current experience
+// block is wrong."
+//
+// WHY THIS IS NOW SAFE WHEN IT WAS FORBIDDEN BEFORE, and the distinction is the whole point. The rule
+// was "a replay must never delete", and its reason was SPECIFIC: the reconcile was driven by the
+// PROFILE, which a replay passes as `{}`, so it read "wants 0, the form has 3" and would have deleted
+// a whole work history. That hazard is about the SOURCE of the count, not about deletion itself.
+// Every decision here is driven by the APPROVED BUNDLE, which carries real counts and real values, so
+// "wants 0" can only be true when the human genuinely approved nothing — and that case is refused
+// outright by the caller's `approvedCount > 0` guard.
+//
+// Deletes ONE tile BY INDEX, and re-reads afterwards, because tile indexes shift under a deletion.
+// A confirmation dialog is REPORTED by the primitive and answered here — the same split the fill path
+// uses, so the decision to confirm a destructive press stays in the driver.
+async function atsOrcDeleteTileAt(act, spec, index, log) {
+  const before = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+  const n = before && before.ok ? before.count : 0;
+  if (!n) return { ok: false, error: "no-tiles" };
+  const del = await act.eval(atsInjOrcDeleteTile, spec.pattern, index).catch(() => null);
+  if (!del || !del.ok) return { ok: false, error: (del && del.error) || "delete-not-pressable" };
+  if (del.dialog && del.dialog.present) {
+    log("  " + spec.label + ": a confirmation appeared — " + JSON.stringify(del.dialog.text));
+    const okd = await act.eval(atsInjOrcDialogPress, "^(yes|delete|remove|confirm|ok)\\b").catch(() => null);
+    if (!okd || !okd.ok) return { ok: false, error: "confirmation-unanswered" };
+  }
+  // Gated on the count actually DROPPING. A delete that did not take must be reported, never assumed.
+  for (let w = 0; w < 24; w++) {
+    await act.delayFull(150);
+    const after = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+    if (after && after.ok && after.count < n) return { ok: true, remaining: after.count };
+  }
+  return { ok: false, error: "count-did-not-drop" };
+}
+
 // -- RESTORE AN APPROVED ENTRY THAT THE FORM NO LONGER HAS (operator, 2026-08-21) ---------
 // "there were 3 experience fields approved. the reherse run only saw 1 repeating section and did not
 // add the other 2 that were approved. it must add them and get the page to match what is approved."
@@ -5807,8 +5842,52 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           notes.push(why);
         }
       }
+      // ⚠⚠ AND SUBTRACT A TILE THE APPROVED REVIEW DOES NOT WANT AT ALL (operator, 2026-08-21).
+      // The form can hold MORE than was approved — a previous run's entry, or one Oracle kept from a
+      // draft — and "the page matches what is approved" is not true while a stray entry is on it. An
+      // entry matching no approved identity is not a near-miss to repair, it is one to remove.
+      //
+      // ⚠ GUARDED ON THE BUNDLE WANTING SOMETHING HERE (`approvedCount > 0`). That single condition is
+      // what separates this from the failure the never-delete rule was written for: a replay passes
+      // profile:{}, so anything profile-derived reads "wants 0, the form has 3" and deletes a whole
+      // work history. With nothing approved for a section this does not run at all.
+      // ⚠ And identity must be KNOWABLE for the tile to be condemned — a tile we cannot evaluate is
+      // left alone, because absence of evidence is not evidence it is stray.
+      const approvedNow = Number((o.entryCounts || {})[spec.source] || 0);
+      if (approvedNow > 0 && tiles.length > approvedNow) {
+        const idKeys2 = ATS_ORC_ENTRY_IDENTITY_KEYS[spec.source] || [];
+        const approvedIds = [];
+        for (let bi = 0; bi < approvedNow; bi++) {
+          const vals = idKeys2.map((kk) => {
+            const v = typeof o.valueFor === "function"
+              ? o.valueFor({ fieldName: `${spec.source}[${bi}].${kk}`, entrySection: spec.source, entryIndex: bi, widgetType: "text" })
+              : undefined;
+            return v === undefined ? null : String(v).trim();
+          }).filter(Boolean);
+          if (vals.length) approvedIds.push(vals);
+        }
+        if (approvedIds.length) {
+          // LAST-FIRST, so the earlier indexes this loop still has to consider stay valid.
+          for (let ti = tiles.length - 1; ti >= 0; ti--) {
+            const txt = tiles[ti] && tiles[ti].text;
+            const wanted = approvedIds.some((vals) => vals.every((v) => atsOrcTileHoldsValue(txt, v)));
+            if (wanted) continue;
+            log(`⚠ ${spec.label} entry ${ti + 1}: on the form but NOT in your approved review `
+              + `(${JSON.stringify(String(txt || "").slice(0, 60))}) — removing it so the page matches what you approved`);
+            const gone = await atsOrcDeleteTileAt(act, spec, ti, log);
+            if (gone.ok) {
+              notes.push(`${spec.label} entry ${ti + 1}: was on the form but not in your approved review — REMOVED`);
+              tiles.splice(ti, 1);
+            } else {
+              notes.push(`${spec.label} entry ${ti + 1}: is on the form but not in your approved review, and could NOT be removed `
+                + `(${gone.error}) — remove it by hand`);
+              log(`⛔ ${spec.label} entry ${ti + 1}: could not remove the unapproved entry (${gone.error})`);
+            }
+          }
+        }
+      }
       if (!tiles.length) { log(`${spec.label}: no entries on the form`); continue; }
-      log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — opening each to check it against your approved values (nothing is rewritten)`);
+      log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — opening each to check it against your approved values (nothing is rewritten unless it disagrees)`);
 
       for (let k = 0; k < tiles.length; k++) {
         // ── THE CHEAP CHECK FIRST: is everything the human approved already visible in the tile? ──
@@ -5991,6 +6070,65 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             + (closed && closed.offered ? `; the block offered ${JSON.stringify(closed.offered)}` : ""));
         }
         log(`  ${spec.label} entry ${k + 1}: ${same} field(s) match${diff ? `, ${diff} DIFFER` : ""}${closed && closed.ok ? ` (closed via ${closed.via})` : ""}`);
+
+        // ⚠⚠ A WRONG ENTRY IS REPLACED, NOT JUST REPORTED (operator, 2026-08-21: "I need it to
+        // subtract if in any case the current experience block is wrong"). Blocking the gate was the
+        // safe half and it is no longer enough: the page has to END UP matching what was approved.
+        //
+        // Delete-and-re-add rather than repair-in-place, because re-adding is the path that is already
+        // proven (atsOrcAddApprovedEntry, live + unit) and because writing INTO a wrong entry has to
+        // negotiate whichever fields are wrong one at a time. The cost is a window in which the entry
+        // does not exist, which is why the guards below are not optional.
+        if (diff > 0 && closed && closed.ok) {
+          // GUARD 1 — the bundle must actually want entries here. This is the original "wants 0" trap:
+          // a replay passes profile:{}, so anything profile-derived would read "delete everything".
+          const wantN = Number((o.entryCounts || {})[spec.source] || 0);
+          // GUARD 2 — we must be able to REBUILD it. Deleting something we cannot put back is the one
+          // outcome worse than leaving it wrong, so the entry's identifying values must be approved.
+          const idKeys = ATS_ORC_ENTRY_IDENTITY_KEYS[spec.source] || [];
+          const haveId = idKeys.length && idKeys.every((kk) => {
+            const v = typeof o.valueFor === "function"
+              ? o.valueFor({ fieldName: `${spec.source}[${k}].${kk}`, entrySection: spec.source, entryIndex: k, widgetType: "text" })
+              : undefined;
+            return v !== undefined && String(v).trim() !== "";
+          });
+          if (!wantN || !haveId) {
+            notes.push(`${spec.label} entry ${k + 1}: ${diff} field(s) disagree with what you approved and it was LEFT ALONE `
+              + `(${!wantN ? "the approved review lists no entries for this section" : "the approved review does not carry enough of it to rebuild"}) `
+              + "— the submit gate will refuse; fix it on the form by hand");
+            log(`  ${spec.label} entry ${k + 1}: DISAGREES but was left alone — ${!wantN ? "nothing approved for this section" : "not enough approved data to rebuild it"}`);
+          } else {
+            log(`  ${spec.label} entry ${k + 1}: ${diff} field(s) DISAGREE with your approved review — removing it and re-adding it from the approved values`);
+            const gone = await atsOrcDeleteTileAt(act, spec, k, log);
+            if (!gone.ok) {
+              notes.push(`${spec.label} entry ${k + 1}: disagrees with your approved review and could NOT be removed (${gone.error}) — fix it on the form by hand`);
+              log(`⛔ ${spec.label} entry ${k + 1}: could not remove it (${gone.error})`);
+            } else {
+              const re = await atsOrcAddApprovedEntry(act, spec, k, emap, o.valueFor, log);
+              // ⚠ THE REPLACEMENT'S RECORDS SUPERSEDE THE MISMATCH ROWS. Without this the bundle
+              // carries both the "DIFFER" verdict and the corrected one for the same field, and the
+              // gate would refuse an entry it had just fixed.
+              for (let z = records.length - 1; z >= 0; z--) {
+                const rn = String(records[z].fieldName || "");
+                if (records[z].entrySection === spec.source && records[z].entryIndex === k
+                    && records[z].flag === "entry-mismatch" && rn.indexOf(`${spec.source}[${k}].`) === 0) {
+                  records.splice(z, 1);
+                }
+              }
+              for (const rr of re.records || []) records.push(rr);
+              if (re.ok) {
+                notes.push(`${spec.label} entry ${k + 1}: disagreed with your approved review and was REPLACED from it`);
+              } else {
+                notes.push(`${spec.label} entry ${k + 1}: disagreed with your approved review, was removed, and could NOT be re-added `
+                  + `(${re.error || "unknown"}) — the submit gate will refuse until this is fixed by hand`);
+              }
+              const t2 = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+              const now = (t2 && t2.ok && t2.tiles) || [];
+              tiles.length = 0;
+              for (const t of now) tiles.push(t);
+            }
+          }
+        }
       }
     }
     return { records, notes };
@@ -10401,7 +10539,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
     atsOrcEntryIdentity, atsOrcTilesAlreadyMatch, atsInjOrcOpenEntryAndWait, atsInjOrcCommitEntryAndWait,
-    atsOrcAddApprovedEntry, ATS_ORC_ENTRY_IDENTITY_KEYS, atsOrcTileHoldsValue, atsOrcLegacyDateHalf,
+    atsOrcAddApprovedEntry, atsOrcDeleteTileAt, ATS_ORC_ENTRY_IDENTITY_KEYS, atsOrcTileHoldsValue, atsOrcLegacyDateHalf,
     atsInjOrcOpenTileAndWait, atsInjOrcCloseEntry, atsInjOrcResumeReset,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,

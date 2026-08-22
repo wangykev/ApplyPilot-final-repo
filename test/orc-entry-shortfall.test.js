@@ -48,7 +48,11 @@ test("SAFETY: the report-only pass compares the form's tiles against the APPROVE
   // exactly the reading that would DELETE a work history.
   assert.ok(/o\.entryCounts/.test(branch), "it must read the BUNDLE's entry count, not the profile's");
   assert.ok(/approvedCount > tiles\.length/.test(branch),
-    "…and act on a SHORTFALL only: more approved than present. The other direction must never delete.");
+    "…and RESTORE only on a shortfall: more approved than present");
   assert.ok(/notes\.push\(/.test(branch), "the shortfall must reach the run's notes, not only the log ring");
-  assert.ok(!/atsInjOrcDeleteTile/.test(branch), "a report-only pass must never delete an entry");
+  // ⚠ DELETION IS ALLOWED NOW, BUT ONLY BUNDLE-GATED. See the note in ats.test.js: the original rule
+  // was aimed at a PROFILE-driven count reading as "wants 0" on a replay, not at deletion itself.
+  assert.ok(/approvedNow > 0 && tiles\.length > approvedNow/.test(branch),
+    "an unapproved tile is removed only when the bundle wants entries here and there is an excess");
+  assert.ok(!/\bprofile\b/.test(branch), "and never from the profile, which is {} on a replay");
 });

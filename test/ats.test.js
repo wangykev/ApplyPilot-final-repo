@@ -4336,7 +4336,7 @@ test("SAFETY: an ORC replay that did not reach the final step REFUSES the gate",
     "the incomplete-walk refusal must precede both the verify and the submit gate");
 });
 
-test("SAFETY: a replay never DELETES a repeating entry, and restores only from the BUNDLE", () => {
+test("SAFETY: a replay only mutates entries the APPROVED BUNDLE justifies", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
   const i = src.indexOf("if (o.reportOnly) {");
   assert.ok(i > 0, "the report-only branch must exist");
@@ -4346,10 +4346,20 @@ test("SAFETY: a replay never DELETES a repeating entry, and restores only from t
   assert.ok(/records\.push\(/.test(branch), "…and report them, or the strict verify flags every entry as missing");
   assert.ok(/entrySection: spec\.source/.test(branch) && /entryIndex: k/.test(branch),
     "the records must carry section+index so atsSubmitKey lines them up with the bundle's");
-  // ⚠⚠ DELETION STAYS FORBIDDEN, FOR THE ORIGINAL REASON. A replay passes profile:{}, so any
-  // profile-derived reconcile reads "wants 0, the form has 3" and DELETES the work history.
-  assert.ok(!/atsInjOrcDeleteTile/.test(branch),
-    "a report-only pass must NEVER delete an entry — profile:{} would read as 'wants 0'");
+  // ⚠⚠ DELETION IS NOW ALLOWED, AND THE GUARD MOVED (operator, 2026-08-21: "I need it to subtract if
+  // in any case the current experience block is wrong"). The never-delete rule existed for a SPECIFIC
+  // reason — the reconcile was PROFILE-driven, and a replay passes profile:{}, so it read "wants 0,
+  // the form has 3" and would have deleted a whole work history. That hazard is about the SOURCE of
+  // the count, not about deletion. So what must hold now is that every destructive decision is gated
+  // on the BUNDLE wanting entries in this section.
+  assert.ok(/const wantN = Number\(\(o\.entryCounts \|\| \{\}\)\[spec\.source\] \|\| 0\)/.test(branch),
+    "a repair must be gated on the BUNDLE's approved count, never the profile's");
+  assert.ok(/if \(!wantN \|\| !haveId\)/.test(branch),
+    "…and must refuse when nothing is approved here, or when there is not enough approved data to rebuild");
+  assert.ok(/approvedNow > 0 && tiles\.length > approvedNow/.test(branch),
+    "removing an unapproved tile must require the bundle to want entries here AND an excess to exist");
+  assert.ok(!/\bprofile\b/.test(branch),
+    "nothing in this branch may read the profile — it is {} on a replay, which is the whole hazard");
   // ⚠ RESTORING A MISSING ENTRY IS NOW ALLOWED AND REQUIRED (operator, 2026-08-21: "it must add them
   // and get the page to match what is approved"), because Oracle refuses an entry with an incomplete
   // required date and a refused entry never persists — so the form can hold fewer tiles than the
