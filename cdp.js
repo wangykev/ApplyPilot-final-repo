@@ -375,6 +375,7 @@ function cdpDetach() {
       cdpTabId = null;
       cdpAttachedAt = 0;
       cdpLagStop();   // the heartbeat probes over the attach — it must never outlive it
+      cdpKeepWarmStop();   // same rule for the keep-warm beat
       resolve();
     });
   });
@@ -495,6 +496,52 @@ function cdpLagNote(method, ms, err) {
     const base = cdpLagBaseline();
     console.log(`[ApplyPilot][LAG] ⏳ ${method} ${ms}ms — ${cdpLagBlame(ms, base)}${err ? " (errored)" : ""}`);
   }
+}
+
+// ── KEEP THE WORKER WARM (2026-08-21) ────────────────────────────────────────────────────────────
+// ⚠⚠ THE DIAGNOSTIC WAS CURING THE DISEASE, which is why this exists as a FEATURE and not a probe.
+//
+// Measured, same tenant, same build, back to back: a run with `debugLagTrace` OFF produced 5
+// `sw-starved` paces and a worst pace of 12180ms (a 150ms pace taking 6193ms). The next two runs with
+// the trace ON produced ZERO pace warnings and SW drift of p95 21ms / max 375ms and p95 12ms / max
+// 75ms. The only thing the trace adds to the worker is the 500ms heartbeat in cdpLagStart.
+//
+// ⚠ AND IT REFUTES MY OWN EARLIER ARGUMENT, which was: "a keep-alive interval cannot help, because the
+// interval is the thing being starved." That is wrong in the way that matters — a late timer still
+// FIRES, and each firing runs the worker's event loop. What appears to be starved is a worker with
+// NOTHING scheduled at all; giving it a standing reason to be scheduled is a different state.
+//
+// Two mechanisms are plausible and this deliberately keeps BOTH, because the measurement cannot yet
+// separate them and the cheap-but-wrong version would be indistinguishable from a no-op:
+//   * the periodic TIMER keeps the worker's loop from going fully idle, and
+//   * the periodic trivial CDP command keeps inbound I/O flowing to it.
+// Narrowing to one is a later optimisation, and it needs its own A/B.
+//
+// ⚠ Cost is real and bounded: ~2 commands/second of `Runtime.evaluate "1"`, measured at ~2ms each
+// (the lag trace's own probe p50 across three runs). Over a 4-minute fill that is ~480 round trips and
+// under a second of CDP time, against multi-second stalls. `cdpSendRaw`, so it never enters the pace
+// or command statistics it exists to improve.
+//
+// ⚠ It must NEVER outlive the attach — same rule as the lag heartbeat, and for the same reason: a
+// timer probing a detached tab throws on every beat.
+// Kill-switch for the A/B: `chrome.storage.local.atsKeepWarm = false`.
+let cdpWarmTimer = null;
+const CDP_WARM_BEAT_MS = 500;
+
+function cdpKeepWarmStart() {
+  if (cdpWarmTimer) return false;
+  cdpWarmTimer = setInterval(async () => {
+    if (cdpTabId === null) return;
+    try { await cdpSendRaw("Runtime.evaluate", { expression: "1", returnByValue: true }); }
+    catch (e) { /* detached or navigating — the next beat re-checks */ }
+  }, CDP_WARM_BEAT_MS);
+  return true;
+}
+
+function cdpKeepWarmStop() {
+  if (!cdpWarmTimer) return;
+  clearInterval(cdpWarmTimer);
+  cdpWarmTimer = null;
 }
 
 function cdpLagStart() {

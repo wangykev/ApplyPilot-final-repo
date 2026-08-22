@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-subtract-1";
+const AP_BUILD_MARKER = "orc-keepwarm-2";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -707,7 +707,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     // parse re-renders the form, so "is this widget's option list empty because the tenant has none, or
     // because the PARSE left it that way?" is only answerable by filling the same form with the attach
     // OFF. Diagnostic only — a real run always attaches (the operator's résumé belongs on the form).
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume",
+      // The keep-warm beat's kill-switch — cdpKeepWarmStart documents it as the A/B lever, and it was
+      // unreachable through AP_DEV_FLAG, so the "off" arm silently ran as another "on" arm.
+      "atsKeepWarm", "atsPageClock"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -5672,6 +5675,37 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // ACTIVATES it — so `background:false` at the call site is an INTENTION, not an observation. Any
     // hidden-vs-visible timing claim about this path needs the measured label, not the flag.
     try { LOG(`[ATS-PACING] ${await cdpPacingLabel()}`); } catch (e) { /* label only */ }
+    // ⚠⚠ THE LAG TRACE WAS UNREACHABLE ON THIS PATH (operator, 2026-08-21: "the lag happens even when
+    // I click on the page and focus on it, it still happens. This is weird.").
+    //
+    // That report kills the explanation I had been using — Chrome deprioritising a BACKGROUND worker —
+    // because a worker suspended for being idle would wake on a real interaction. A worker whose EVENT
+    // LOOP IS SATURATED does not: it is busy whether or not Chrome is foreground. cdp.js has carried
+    // the leading suspect for that since 2026-08-09, in its own words: we `Runtime.enable` +
+    // `DOM.enable` at attach while registering NO onEvent listener, so Chrome streams
+    // console / executionContext / DOM-mutation events at a worker that never reads them — and it built
+    // the event counter to settle it "aimed at a measured cause rather than a plausible story".
+    //
+    // The counter was only ever STARTED from the Workday fill (drivePageFill), so on Greenhouse, Lever,
+    // Ashby, iCIMS and Oracle the flag could be set and nothing happened — exactly what I observed:
+    // debugLagTrace ON, zero [LAG] lines. Wiring it here is the prerequisite for fixing the cause
+    // instead of guessing at it.
+    const _atsLag = await new Promise((r) => chrome.storage.local.get("debugLagTrace", (v) => r(!!(v && v.debugLagTrace))));
+    if (_atsLag) {
+      cdpLagStart();
+      LOG("debugLagTrace ON — timing every CDP command, a 500ms no-op page probe, the SW's own scheduling "
+        + "drift, AND the inbound CDP event firehose by method (which domain is saturating the worker).");
+    }
+    // ⚠ KEEP THE WORKER WARM — see cdpKeepWarmStart. This is the diagnostic's own heartbeat promoted to
+    // a feature, because turning the diagnostic ON is what made the operator's lag disappear. Skipped
+    // when the lag trace is already running, since that installs an equivalent beat of its own — two
+    // would just double the traffic and confound the very A/B this is here to allow.
+    const _keepWarm = await new Promise((r) => chrome.storage.local.get("atsKeepWarm", (v) => r(v ? v.atsKeepWarm : undefined)));
+    if (_keepWarm !== false && !_atsLag) {
+      if (cdpKeepWarmStart()) LOG("[ATS-PACING] keep-warm beat ON (500ms) — a standing reason for the MV3 worker to stay scheduled; set atsKeepWarm=false to A/B it off");
+    } else if (_keepWarm === false) {
+      LOG("[ATS-PACING] keep-warm beat OFF by atsKeepWarm=false — expect the intermittent multi-second sw-starved paces");
+    }
 
     // …and NOW open the posting, so its document runs with the overrides from its first byte. Defensive
     // about the starting URL: a caller that hands over an already-loaded tab (the redirect chase below
@@ -6173,6 +6207,8 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // the [PACE] lines; this makes any run say whether its clock was healthy, and names the culprit
     // when it was not (see cdpPaceSummary — "sw-starved" means the WORKER, not the page).
     try { LOG(`[ATS-TIME] ${cdpPaceSummary()}`); } catch (e) { /* log only */ }
+    // The lag trace's own verdict, next to the pacing summary it explains.
+    try { const lag = cdpLagReport("ats run"); if (lag) LOG(lag); } catch (e) { /* log-only */ }
     // Say what ACTUALLY happened to the report. reportApplication used to return nothing, so this
     // line claimed "Reported to the website." even when the line directly above it was the ⛔ saying
     // the tracker had rejected it.
@@ -6220,6 +6256,37 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // hide or alt-tab a tab mid-run, and an occluded tab still reports active), so a hidden-vs-visible
     // claim about a REHEARSAL had no ground truth to cite. Noticed while live-verifying both arms.
     try { LOG(`[ATS-PACING] ${await cdpPacingLabel()}`); } catch (e) { /* label only */ }
+    // ⚠⚠ THE LAG TRACE WAS UNREACHABLE ON THIS PATH (operator, 2026-08-21: "the lag happens even when
+    // I click on the page and focus on it, it still happens. This is weird.").
+    //
+    // That report kills the explanation I had been using — Chrome deprioritising a BACKGROUND worker —
+    // because a worker suspended for being idle would wake on a real interaction. A worker whose EVENT
+    // LOOP IS SATURATED does not: it is busy whether or not Chrome is foreground. cdp.js has carried
+    // the leading suspect for that since 2026-08-09, in its own words: we `Runtime.enable` +
+    // `DOM.enable` at attach while registering NO onEvent listener, so Chrome streams
+    // console / executionContext / DOM-mutation events at a worker that never reads them — and it built
+    // the event counter to settle it "aimed at a measured cause rather than a plausible story".
+    //
+    // The counter was only ever STARTED from the Workday fill (drivePageFill), so on Greenhouse, Lever,
+    // Ashby, iCIMS and Oracle the flag could be set and nothing happened — exactly what I observed:
+    // debugLagTrace ON, zero [LAG] lines. Wiring it here is the prerequisite for fixing the cause
+    // instead of guessing at it.
+    const _atsLag = await new Promise((r) => chrome.storage.local.get("debugLagTrace", (v) => r(!!(v && v.debugLagTrace))));
+    if (_atsLag) {
+      cdpLagStart();
+      LOG("debugLagTrace ON — timing every CDP command, a 500ms no-op page probe, the SW's own scheduling "
+        + "drift, AND the inbound CDP event firehose by method (which domain is saturating the worker).");
+    }
+    // ⚠ KEEP THE WORKER WARM — see cdpKeepWarmStart. This is the diagnostic's own heartbeat promoted to
+    // a feature, because turning the diagnostic ON is what made the operator's lag disappear. Skipped
+    // when the lag trace is already running, since that installs an equivalent beat of its own — two
+    // would just double the traffic and confound the very A/B this is here to allow.
+    const _keepWarm = await new Promise((r) => chrome.storage.local.get("atsKeepWarm", (v) => r(v ? v.atsKeepWarm : undefined)));
+    if (_keepWarm !== false && !_atsLag) {
+      if (cdpKeepWarmStart()) LOG("[ATS-PACING] keep-warm beat ON (500ms) — a standing reason for the MV3 worker to stay scheduled; set atsKeepWarm=false to A/B it off");
+    } else if (_keepWarm === false) {
+      LOG("[ATS-PACING] keep-warm beat OFF by atsKeepWarm=false — expect the intermittent multi-second sw-starved paces");
+    }
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real
     // form from an embedded frame, and the fill followed it there. Starting from the caller's

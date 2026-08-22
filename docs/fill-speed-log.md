@@ -2408,3 +2408,86 @@ records the same test's sensitivity in its own words — *"inline pre-type seam 
 keptLowerTier recommit strays to Economics"* — so it is a timing-sensitive assertion on a fake
 actuation, not a regression. **Re-run before believing a single red suite here, and do not run two
 `npm test` processes at once** (CPU contention makes it far likelier, which is how it first appeared).
+
+## Round 21 — ⚠⚠ THE LAG IS FIXED: a 500ms keep-warm beat, and the DIAGNOSTIC was curing it (2026-08-21)
+
+**Operator:** *"the form still lags sometimes, this run is very bad. I need to click the page to get it
+to lock back in"* … then, decisively: *"the lag happens even when I click on the page and focus on it,
+it still happens. This is weird."*
+
+That second report is what cracked it, by killing the explanation rounds 16-18 were built on.
+
+### Three hypotheses eliminated by measurement, including two of mine
+
+1. **Chrome deprioritising a BACKGROUND worker** (rounds 16-18) — ⛔ refuted by the operator: a worker
+   suspended for being idle would wake on a real interaction. It lagged while focused.
+2. **A CDP EVENT FIREHOSE saturating the worker's loop** — cdp.js's own leading suspect since
+   2026-08-09 (*"we `Runtime.enable` + `DOM.enable` at attach while registering NO onEvent listener…
+   thousands of dispatches"*). ⛔ Refuted: **221 unread events over 82s**
+   (`consoleAPICalled ×113, executionContextCreated ×19, frameStartedLoading ×13`). That is not a
+   firehose.
+3. **The channel or the renderer** — ⛔ refuted: page-thread probe **p50 2ms**, p95 44ms.
+
+⚠ And the reason no data existed for any of this: **`cdpLagStart()` was only ever called from the
+WORKDAY fill** (`drivePageFill`). On Greenhouse / Lever / Ashby / iCIMS / Oracle the flag could be set
+and nothing happened — `debugLagTrace ON`, zero `[LAG]` lines. The instrument built in 2026-08-09 to
+answer exactly this question was unreachable on the path that needed it. Now wired into both ATS runs.
+
+### ⚠⚠ THE FINDING: turning the diagnostic ON made the lag disappear
+
+Two instrumented runs came back healthy — SW drift p95 21ms / max 375ms, then p95 12ms / max 75ms, zero
+pace warnings — right after an uninstrumented run with 5 `sw-starved` paces and a worst of 12180ms. The
+only thing the trace adds to the worker is `cdpLagStart`'s **500ms heartbeat**.
+
+So it was promoted from probe to feature (`cdpKeepWarmStart`, a 500ms `setInterval` issuing a trivial
+`Runtime.evaluate "1"`), and A/B'd on the same tenant, same build, back to back:
+
+| arm | paces | overran | time lost | worst pace |
+|---|---|---|---|---|
+| keep-warm **ON** #1 | 77 | **0 (0%)** | 1.5s | 0ms |
+| keep-warm **ON** #2 | 78 | **0 (0%)** | 2.0s | 0ms |
+| lag-trace ON (equivalent beat) ×2 | — | **0** | — | drift ≤ 375ms |
+| keep-warm **OFF** (control) | 82 | 1 (1%) | **16.7s** | **13461ms on a 600ms wait** |
+
+Four runs with a heartbeat: **zero overruns**. Two without: 16.7s lost, and the operator's 12180ms.
+
+### ⚠ AND IT REFUTES MY OWN ARGUMENT FROM ROUND 16
+
+I wrote: *"a keep-alive `setInterval` in the worker — the interval **is** the thing being starved"*, and
+ruled it out. That is wrong in the way that matters: **a late timer still FIRES**, and each firing runs
+the worker's event loop. The starved state is a worker with NOTHING scheduled; a standing timer is a
+different state entirely. It also explains why clicking helped only sometimes — a click is ONE wake, not
+a standing reason to stay scheduled.
+
+Both mechanisms are deliberately kept for now (the timer, and the periodic inbound CDP reply), because
+the measurement cannot separate them and the cheap-but-wrong version would look like a no-op. Narrowing
+to one needs its own A/B.
+
+**Cost:** ~2 commands/second at ~2ms each — ~480 round trips and under a second of CDP time over a
+4-minute fill, against multi-second stalls. `cdpSendRaw`, so it never enters the statistics it exists to
+improve. Stopped wherever the lag heartbeat is stopped, so it can never outlive the attach.
+
+### Honest bounds
+
+n=4 treatment vs n=2 control on an INTERMITTENT phenomenon, so the *rate* is not established — but the
+effect size is large, consistent, and mechanistically coherent. Kill-switch `atsKeepWarm=false`
+(⚠ which had to be added to `AP_DEV_FLAG`'s allow-list — the first "off" arm silently ran as another
+"on" arm because the flag was rejected as "not a debug flag", and the run's own `[ATS-PACING]` line is
+what caught it). **Workday is untouched**: this is wired into the ats.js runs only. Wiring it there is
+the obvious next step, since the original 2026-08-20 report — *"the fill including the onboarding will
+just lag at seemingly random times"* — was about Workday.
+
+### Also measured, as the baseline for the fewer-awaits work
+
+A healthy ORC fill is **~280-320 `Runtime.evaluate` calls totalling 23-32s** (p95 ~576ms, max 8182ms —
+the max being our own page-side polling budgets doing their job). Plus `Page.setWebLifecycleState ×35`
+from `cdpWakePage`. That command count is the surface area any per-round-trip stall multiplies against.
+
+### ⚠ A SECOND load-sensitive test, same class as the first
+
+`test/clock-probe.test.js:84` — *"a HANGING page arm is abandoned at want+ceiling and never blocks"* —
+failed once in a full-suite run and passed **14/14 twice** in isolation immediately after. Like
+`fill-driver.test.js:7818` ("inline AI"), it asserts on REAL timers, so CPU contention (a second
+`npm test`, a live run, a dev-server compile) is enough to trip it. The cdp.js change that run was
+purely additive — 47 insertions, 0 deletions, and `cdpWarmTimer` is referenced nowhere near the clock
+probe. **Two known load-sensitive tests now: re-run in isolation before believing either.**
