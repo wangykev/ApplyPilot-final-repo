@@ -2156,3 +2156,88 @@ runs, or a way to force starvation on demand that does not change the regime (a 
 that is the worker-timer-polyfill path, a different mechanism). Until then the change stands on the
 structural argument (it removes an attempts floor the repo's own 59-loop audit forbids, and matches
 Workday's starvation-tolerant predicate) plus a no-regression result — **not on a measured win.**
+
+
+## Round 18 — ⚠⚠ STARVATION COSTS **COVERAGE**, NOT ONLY LATENCY (live, 2026-08-21)
+
+**This overturns a standing claim.** CLAUDE.md and round 15 both say drift costs *"LATENCY, not
+coverage"*, on the strength of an audit of all 59 wall-clock poll loops: every run-path one watches a
+MONOTONE predicate (noticeable late, never missed) or a STABILITY one (sparse reads are stronger
+evidence). **The ORC date picker is a counterexample and the audit's reasoning does not cover it.**
+
+### The measurement — three unattended runs, one variable
+
+| run | req | `sw-starved` paces | step 2 outcome |
+|---|---|---|---|
+| 1 | 333297 | 0 | 29 fields, **0 to review** — both Experience entries committed |
+| 2 | 343709 | 0 | 29 fields, **0 to review** — both committed |
+| 3 | 340692 | **5** (deliberate CPU load) | 25 fields, 1 to review — **date failed, entry 2 LOST** |
+
+Run 3's chain, from its own log:
+
+```
+work_experience[1].endDate → needs_review · commit-not-accepted · after "2026" · 7065ms
+    · Oracle did not accept 5/2026 — got 2026 (filter-did-not-narrow)
+⛔ Experience entry 2: pressed "Add Experience" but the entry form stayed open — Oracle is
+   refusing it, usually a required entry field we could not answer
+```
+
+`5/2026` is the SAME value entry 1 committed successfully in 794ms on the same run. Under load the
+month half spent its whole 7s budget and never saw the list narrow.
+
+### Why the audit's reasoning does not apply here
+
+A monotone predicate can only be noticed LATE. A stability predicate is only STRENGTHENED by sparse
+reads. **This widget's filter is neither:** it must narrow *in response to a keystroke sequence WE
+pace*, so if our pacing stretches, the widget never receives a coherent sequence and the condition
+never becomes true at all. There is no later read that would have caught it — the event we were
+waiting for was one our own lateness prevented.
+
+### The cascade — one root cause, three symptoms
+
+1. month filter does not narrow ⇒ the picker correctly **REFUSES to press** (the documented guard:
+   pressing an unfiltered list commits a month nobody asked for);
+2. so `endDate` is year-only ⇒ **Oracle rejects the whole entry commit** (it wants a complete date);
+3. so Experience entry 2 never persists ⇒ the rehearsal's `reportOnly` pass finds **1 tile for a
+   2-entry bundle** ⇒ 4 × *"approved value has NO matching field on the live form"* ⇒ `verify-failed`.
+
+**Every layer reported honestly** — the date flagged `needs_review`, the entry refusal logged loudly,
+review showed "End Date", the gate refused the submit. Nothing wrong reached the form. But the operator
+saw it as *"the rehearsal did not add experience"*, three steps downstream of the cause.
+
+### ⚠ AND IT INVALIDATES `reportOnly`'s PREMISE
+
+That branch does nothing on purpose, justified as: *"ORC saves entries to the candidate profile
+server-side, so the tiles the fill created are still on the form."* **Measured false** — a fill can
+leave FEWER tiles than the bundle has entries, because an entry Oracle refused never persisted. So the
+replay needs to either grow the missing entries from the bundle (growth-only, never delete — the fix
+iCIMS already carries, and the ORC log line *already claims* "the form will be grown to fit") or fail
+with that specific diagnosis instead of a generic per-field "no matching field".
+
+### Consequence for priorities
+
+Fewer awaits is no longer only a speed lever on this tenant — it is a **correctness** lever. And the
+audit line in CLAUDE.md needs qualifying: it holds for monotone and stability predicates, and NOT for a
+poll whose condition depends on pacing the page's own input handling.
+
+### ✔ AND THE END-TO-END PASSES ON AN UNSTARVED FILL (same session)
+
+Rehearsal on run 1's application (req 333297), `arm:false`:
+
+```
+Experience: 3 entries on the form — all 3 verified from the DOM
+Education entry 1: 4 field(s) match (closed via Cancel)
+Skills: 8 entries
+verify: 54 field(s) replayed, 0 failure(s)  bundle blockers: 0
+        submit button: true (disabled false)  captcha challenge visible: false
+▶▶ WOULD CLICK SUBMIT ◀◀ (dry rehearsal — every gate passed)
+```
+
+So the pipeline is sound: **fill → review → approve → rehearse → gate passed**, ORC's first full loop.
+The failed rehearsal on run 3 was NOT a replay bug — it was the starved fill upstream of it. Which is
+the cleanest possible statement of round 18: on this tenant, starvation does not make a run slow, it
+makes a run WRONG, and the wrongness surfaces three steps later in a component that is behaving
+correctly.
+
+⚠ Still not demonstrated: the timed-settle predicate's starved path (round 17). Five runs now, and no
+burst has landed on the settle window. It remains structurally argued + no-regression, not measured.
