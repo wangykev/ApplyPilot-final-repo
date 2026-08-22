@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-picker-trace-2";
+const AP_BUILD_MARKER = "orc-sibling-wait-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6207,6 +6207,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const repT0 = Date.now();
     const reported = await reportApplication(bundle, jobContext);
     const repMs = Date.now() - repT0;
+    try { const ws = cdpWakeSkipped(); if (ws) LOG(`[ATS-TIME] skipped ${ws} no-op page-wake round trip(s) (tab was visible)`); } catch (e) { /* log only */ }
     LOG(`[ATS-TIME] tail after the last field: detach ${(detMs / 1000).toFixed(1)}s`
       + ` — then storage ${(storeMs / 1000).toFixed(1)}s + report ${(repMs / 1000).toFixed(1)}s`
       + " with the tab ALREADY RELEASED (the page plays no part in either)");

@@ -2616,3 +2616,62 @@ three assert on REAL timers, so they degrade under in-process load (700+ tests i
 as machine load. **The rule for this repo: a single red result on a timer-based test is not evidence —
 re-run it alone before believing it.** Ironically the same lesson the pacing work itself keeps
 teaching: a timed assertion measures the machine as much as the code.
+
+## Round 24 — the end-date wait is ORC'S RENDERER, not us (2026-08-22)
+
+Operator: *"that past run did not lag, but when filling experience, after start date, it waits before
+completely filling the end date"* … then a hypothesis worth its weight: *"did you make sure the start
+date dropdown is closed before end date begins to fill?"*
+
+### First: the "page shouldn't be starved when focused" premise, corrected
+
+It is not the PAGE that is starved — it is our extension's **service worker**, a different context
+entirely. Visibility and focus govern the RENDERER's throttling; the MV3 worker's scheduling is
+independent of both, which is exactly why focusing the tab never fixed it. The evidence: while paces
+overran by seconds, the page-thread probe was **p50 2ms, p95 44ms**. The page was answering instantly;
+we were late to ask.
+
+### The operator's hypothesis — tested, and RULED OUT with a number
+
+It was a good one, and it is this repo's own Workday rule applied somewhere it never had been: *"a close
+is confirmed by the options being GONE, not by aria-expanded — options linger a beat while unmounting
+and STAY CLICKABLE, and a lingering option strays the next field's open-click."* `atsInjOrcPickFromOwnList`
+only ever asked about ITS OWN listbox, so a still-mounted sibling was invisible to it. And the asymmetry
+fit perfectly: startDate is the first picker in an entry (722/701/723ms), endDate follows two commits
+(3000/2774/2729ms), same page-side work either way.
+
+A page-side, bounded wait for any OTHER `.cx-select__listbox` to unmount was added — zero extra round
+trips — and it reports what it saw:
+
+```
+sibling-list wait 1ms · sibling-list wait 0ms · sibling-list wait 0ms
+```
+
+**The previous list is already gone.** Not the cause. The guard is KEPT anyway: it costs ~1ms, it is the
+documented rule, and it converts an untested assumption into a measured one.
+
+### The actual cause: a 1.7s DISPATCH wait on one specific eval
+
+Splitting each half into SW-side vs page-side wall clock is what found it:
+
+```
+↳ endDate month: eval 2128ms SW-side vs 441ms page-side  ⇒ 1687ms of transport/scheduling
+↳ endDate year:  eval  291ms SW-side vs 286ms page-side  ⇒    5ms
+```
+
+The first eval **after the start date commits** waits ~1.7s for a slot on the page's main thread, then
+runs in 441ms. The next eval pays 5ms. So this is **ORC's own post-commit work** (validation /
+re-render after a date is accepted), and `Runtime.evaluate` must be scheduled on that same thread.
+Our worker was healthy for the whole run: `73 pace(s), 0 overran (0%), 2.1s lost, worst 0ms`.
+
+⚠ **This bounds what is left to win here.** Once we get a slot we cost 5ms. The 1.7s is the tenant's,
+and no amount of pacing, batching or keep-warm on our side removes work the page has to do. It can only
+be OVERLAPPED (do something useful elsewhere while ORC settles) or ABSORBED (wait for it page-side
+inside an eval we were going to make anyway) — neither of which makes it shorter.
+
+### And one round trip per wake, removed
+
+`cdpWakePage` sent `Page.setWebLifecycleState` unconditionally, but freezing only happens to
+BACKGROUNDED tabs — on a visible tab it is a guaranteed no-op costing a full round trip. Gated on the
+(cached, chrome.tabs-based, free) visibility check, failing CLOSED so any error still wakes. Measured:
+**22 no-op round trips skipped** on one fill.

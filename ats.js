@@ -4611,7 +4611,7 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   // A value present for ~4ms is invisible to a 60ms read-back poll, so the caller would record "not
   // retained" for a commit that DID happen — and then retry it, which is the double-fill observed.
   const T0 = Date.now();
-  const tr = { openedByUs: false, rowsAt: null, rowsN: 0, typedAt: null, narrowedAt: null,
+  const tr = { openedByUs: false, waitedForSibling: null, siblingStillUp: null, rowsAt: null, rowsN: 0, typedAt: null, narrowedAt: null,
                firstRow: null, enterAt: null, samples: [], reopens: 0 };
   const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
   const readRows = () => {
@@ -4637,6 +4637,30 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   // the re-click guard below uses: the listbox exists only when the widget is open.
   const listUp = () => !!(lbId && document.getElementById(lbId));
   const deadline = Date.now() + (budgetMs || 6000);
+  // ⚠⚠ WAIT FOR THE **PREVIOUS** PICKER'S LIST TO UNMOUNT FIRST (operator, 2026-08-21: "did you make
+  // sure the start date dropdown is closed before end date begins to fill?").
+  //
+  // This is the WORKDAY LINGERING-LISTBOX RULE, which this repo learned the hard way and never applied
+  // to ORC: "a close is confirmed by the options being GONE, not by aria-expanded — options linger a
+  // beat while unmounting and STAY CLICKABLE, and a lingering option strays the next field's
+  // open-click." `listUp()` only ever asked about OUR OWN listbox, so a still-mounted sibling was
+  // invisible to it.
+  //
+  // The measurement is what makes this the leading suspect: startDate is the FIRST picker touched in an
+  // entry and costs 722/701/723ms; endDate follows two commits and costs 3000/2774/2729ms — with the
+  // SAME ~250ms of page-side work per half. A predecessor's list still being up is the difference
+  // between those two situations.
+  //
+  // Page-side and bounded, so it costs ZERO extra round trips and cannot hang: if the sibling never
+  // goes away we proceed exactly as before and the trace says we waited.
+  const otherListUp = () => [...document.querySelectorAll(".cx-select__listbox")]
+    .some((lb) => lb.id !== lbId && lb.querySelectorAll('[role="row"]').length > 0);
+  const sibT0 = Date.now();
+  while (otherListUp() && Date.now() - sibT0 < 600) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  tr.waitedForSibling = Date.now() - sibT0;
+  tr.siblingStillUp = otherListUp();
   if (!listUp()) { el.focus(); el.click(); tr.openedByUs = true; }
   let rows = [], reopens = 0;
   while (Date.now() < deadline) {
@@ -6417,9 +6441,18 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             // does not — Oracle refuses an entry whose required date is incomplete, so this one flake
             // was costing the other two work-history entries as well.
             let r = null, got = null;
+            // ⚠ SPLIT THE HALF'S WALL CLOCK INTO PAGE-SIDE AND SW-SIDE (2026-08-21). The operator:
+            // "when filling experience, after start date, it waits before completely filling the end
+            // date." Measured, the endDate PAIR costs 3000/2774/2729ms while startDate costs
+            // 722/701/723ms — with the SAME page-side work in the trace (~250ms a half). So ~2.3s of it
+            // is outside the page, and "round trips" was my inference, not a measurement. `swMs` minus
+            // the trace's own elapsed is that difference, per half, so the next change is aimed.
+            let swMs = 0;
             for (let attempt = 0; attempt < 2 && got == null; attempt++) {
               if (attempt) await act.delayFull(400);
+              const evT0 = Date.now();
               r = await act.eval(atsInjOrcPickFromOwnList, sel, monthCands, yearCands, ATS_ORC_PICK_MS).catch(() => null);
+              swMs += Date.now() - evT0;
               reopenTotal += (r && r.reopens) || 0;
               if (!r || !r.ok) continue;
               // READ-BACK VERIFIED, but settled PAGE-SIDE inside the primitive — see the note there.
@@ -6435,7 +6468,11 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             // distinguish "never committed" from "committed, flashed, and our poll missed it".
             if (r && r.trace && (!r.ok || !r.value || (Date.now() - t0) > 1200)) {
               const q = r.trace;
-              log(`  ↳ ${key} ${idHalf || r.kind || "?"}: openedByUs=${q.openedByUs} rows=${q.rowsN}@${q.rowsAt}ms`
+              const pageMs = q.samples && q.samples.length ? q.samples[q.samples.length - 1].t : (q.enterAt || 0);
+              log(`  ↳ ${key} ${idHalf || r.kind || "?"}: eval ${swMs}ms SW-side vs ${pageMs}ms page-side`
+                + ` (⇒ ${Math.max(0, swMs - pageMs)}ms of transport/scheduling) ·`
+                + ` sibling-list wait ${q.waitedForSibling}ms${q.siblingStillUp ? " (STILL UP!)" : ""} ·`
+                + ` openedByUs=${q.openedByUs} rows=${q.rowsN}@${q.rowsAt}ms`
                 + ` typed@${q.typedAt}ms narrowed@${q.narrowedAt == null ? "NEVER" : q.narrowedAt + "ms"}`
                 + ` firstRow=${JSON.stringify(q.firstRow)} enter@${q.enterAt}ms reopens=${q.reopens}`
                 + ` value=${JSON.stringify((r && r.value) || null)}`

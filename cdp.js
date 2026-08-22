@@ -334,6 +334,7 @@ function cdpAttach(tabId) {
       _frameCtxUrl = null;
       _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
       cdpPaceStatsReset();                     // pacing stats are PER RUN — the summary is printed with the run's timing
+      _wakeSkipped = 0;                        // …and so is the count of no-op wakes we skipped
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
@@ -640,7 +641,19 @@ function cdpLagReport(label) {
 // It does NOT spoof document.visibilityState (that would corrupt the adaptive-pacing sampler and
 // race the next page's fill) — only the freeze lifecycle. If this proves insufficient the cause is
 // pure rAF-pause, which only true tab visibility resumes.
+// ⚠ SKIP IT ENTIRELY ON A VISIBLE TAB (2026-08-21). Freezing is something Chrome does to BACKGROUNDED
+// tabs, so on a tab that is active and not minimized this command cannot do anything — it is a
+// guaranteed no-op that still costs a full round trip, and the lag trace counted
+// `Page.setWebLifecycleState ×35` on one fill. Round trips are the thing that multiplies when the
+// worker is late (see CLAUDE.md "Don't write laggy code"), so 35 of them for a no-op is worth removing.
+//
+// `cdpVisible()` is CACHED with a TTL and uses chrome.tabs, not CDP, so the check itself is free. It
+// fails CLOSED: any error reports not-visible and the wake still happens, which is the safe direction —
+// a needless wake costs one round trip, a skipped one on a frozen tab costs the fill.
+let _wakeSkipped = 0;
+function cdpWakeSkipped() { return _wakeSkipped; }
 async function cdpWakePage() {
+  try { if (await cdpVisible()) { _wakeSkipped++; return; } } catch (e) { /* fall through and wake */ }
   try { await cdpSend("Page.setWebLifecycleState", { state: "active" }); } catch (e) { /* best-effort — no-op if unsupported/not frozen */ }
 }
 
