@@ -4343,11 +4343,11 @@ test("the replay flag is threaded EXPLICITLY into atsFinishFill", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
   // atsFinishFill does not receive `o`; the entry pass inside it already cost one live run by being
   // written against a scope it did not have.
-  assert.ok(/async function atsFinishFill\(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor\)/.test(src),
-    "atsFinishFill must take the replay flag AND the approved-value lookup as parameters");
-  assert.ok(/atsFinishFill\(act, ats, scan, results, o\.credentials, profile, jobContext, !!o\.valueFor, o\.valueFor\)/.test(src),
+  assert.ok(/async function atsFinishFill\(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor, entryCounts\)/.test(src),
+    "atsFinishFill must take the replay flag, the approved-value lookup AND the bundle's entry counts");
+  assert.ok(/atsFinishFill\(act, ats, scan, results, o\.credentials, profile, jobContext, !!o\.valueFor, o\.valueFor, o\.entryCounts\)/.test(src),
     "…and the caller must pass them from o.valueFor, this file's established replay signal");
-  assert.ok(/reportOnly: !!replay, valueFor/.test(src),
+  assert.ok(/reportOnly: !!replay, valueFor, entryCounts/.test(src),
     "…which become the entry pass's reportOnly and its approved-value lookup — without the lookup " +
     "the replay can only SEE the entries, not check them against what the human approved");
 });

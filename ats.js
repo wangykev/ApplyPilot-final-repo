@@ -5582,8 +5582,35 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       if (!blocks.some((b) => re.test(String(b.title || "")))) continue;
       const t0 = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
       const tiles = (t0 && t0.ok && t0.tiles) || [];
-      if (!tiles.length) { log(`${spec.label}: no entries on the form`); continue; }
       const emap = ATS_ORC_ENTRY_MAPS[spec.source] || {};
+      // ⚠⚠ DID ORACLE KEEP EVERY ENTRY THE HUMAN APPROVED? (live 2026-08-21) This branch's premise was
+      // "ORC saves entries server-side, so the tiles the fill created are still on the form", and that
+      // is MEASURED FALSE: a fill whose entry Oracle REFUSED (an incomplete required date is enough —
+      // see the date-picker note) never persisted it, so the form can serve FEWER tiles than the
+      // bundle has entries. Live, a 2-entry bundle met a 1-tile form and the operator saw "the
+      // rehearsal did not add experience".
+      //
+      // It already blocked the gate — the strict verify reported each absent field as "approved value
+      // has NO matching field on the live form" — but four per-field failures do not say WHICH entry
+      // is missing or WHY, and the cause was three steps upstream. So the shortfall is named here, at
+      // the one place that can see both numbers.
+      //
+      // ⚠ THIS IS THE DIAGNOSIS HALF ONLY. Re-ADDING the missing entry is the operator's actual
+      // request and is NOT done here: it means writing into a fresh entry form from committed DISPLAY
+      // values on the SUBMIT path, and it must never delete or duplicate an entry that IS present.
+      // `entryCounts` is now in scope for exactly that work. Reporting is strictly better than the
+      // status quo and cannot damage an entry that is merely absent.
+      const approvedCount = Number((o.entryCounts || {})[spec.source] || 0);
+      if (approvedCount > tiles.length) {
+        const missing = approvedCount - tiles.length;
+        const why = `${spec.label}: the form has ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} but you approved `
+          + `${approvedCount} — Oracle did not keep ${missing} of them (an entry it refused at fill time never persisted). `
+          + `The ${missing} missing entr${missing === 1 ? "y" : "ies"} cannot be verified and will FAIL the submit gate; `
+          + `re-run the fill for this job so every entry commits, then approve and rehearse again.`;
+        log(`⚠ ${why}`);
+        notes.push(why);
+      }
+      if (!tiles.length) { log(`${spec.label}: no entries on the form`); continue; }
       log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — opening each to check it against your approved values (nothing is rewritten)`);
 
       for (let k = 0; k < tiles.length; k++) {
@@ -7308,7 +7335,7 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // atsFinishFill does not receive `o`, and the entry pass inside it already cost one live run by
   // being written against driveAtsPageFill's scope — `profile is not defined`, thrown into a silent
   // catch. `o.valueFor` is this file's established "this is a replay" signal (see the match opts).
-  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext, !!o.valueFor, o.valueFor);
+  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext, !!o.valueFor, o.valueFor, o.entryCounts);
 }
 
 // ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
@@ -8410,7 +8437,7 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile, valueFor) {
   return surfaced;
 }
 
-async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor) {
+async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor, entryCounts) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
   await act.delayFull(600);
@@ -8528,7 +8555,7 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
       console.log("[ApplyPilot][ORC-LINK] ⛔ the links pass threw:", String((e && e.message) || e));
     }
     try {
-      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m), reportOnly: !!replay, valueFor });
+      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m), reportOnly: !!replay, valueFor, entryCounts });
       if (ep && ep.records && ep.records.length) results.push(...ep.records);
       // ⚠ CONCAT, never assign: the LINKS pass above writes into the same list, and an assignment
       // here silently discarded its notes — the one channel that reports a link we could not add.
