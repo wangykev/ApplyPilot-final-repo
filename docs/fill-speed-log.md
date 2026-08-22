@@ -2332,3 +2332,79 @@ On the second 340692 rehearsal, `education[0].contentItemId` and `educationalEst
 `""` from the opened tile and failed the verify, where the previous run reported *"4 field(s) match"*.
 It follows a CANCELLED restore attempt on the Experience block, so a page-state side effect of the
 cancel is the first suspect. One observation, not a diagnosis.
+
+## Round 20 — the replay SUBTRACTS: a wrong entry is replaced, a stray one removed (2026-08-21)
+
+Operator: *"for 4 you say purely additive however I need it to subtract if in any case the current
+experience block is wrong."*
+
+### ⚠⚠ WHY DELETION IS SAFE NOW WHEN IT WAS FORBIDDEN — the guard MOVED, it did not disappear
+
+The rule was "a replay never deletes a repeating entry", and its reason was SPECIFIC: the reconcile was
+**PROFILE**-driven, and a replay passes `profile:{}`, so it read *"wants 0, the form has 3"* and would
+have deleted an entire work history. **That hazard is about the SOURCE OF THE COUNT, not about
+deletion.** Every destructive decision is now driven by the APPROVED BUNDLE, which carries real counts
+and real values, so "wants 0" can only be true when the human genuinely approved nothing — and that
+case is refused outright.
+
+### Two kinds of wrong, two responses
+
+**A tile whose FIELDS disagree is REPLACED** (delete + re-add from the bundle) rather than merely
+reported. Blocking the gate was the safe half and it is not enough: the page has to END UP matching
+what was approved. Delete-and-re-add rather than repair-in-place, because re-adding is already proven
+(live + unit) and repairing has to negotiate each wrong field individually. Two guards, and neither is
+optional:
+- **the bundle must want entries in this section** (`o.entryCounts`) — the "wants 0" trap, restated;
+- **the entry's identifying values must be approved**, so we can put back what we remove. *Deleting
+  something we cannot rebuild is the one outcome worse than leaving it wrong.*
+Failing either, the entry is LEFT ALONE, the gate still refuses, and the note says which guard stopped
+it.
+
+**A tile matching NO approved entry is REMOVED.** The form can hold more than was approved (a previous
+run's entry, one Oracle kept from a draft), and the page does not match what was approved while a stray
+entry sits on it. Gated on the bundle wanting entries here, and on identity being KNOWABLE — a tile we
+cannot evaluate is left alone, because absence of evidence is not evidence it is stray. Deletes
+last-first so the indexes still to be considered stay valid, gates on the tile count actually DROPPING,
+and answers Oracle's confirmation dialog through the same report-then-decide split the fill path uses.
+
+**The replacement's records SUPERSEDE the mismatch rows** for that entry. Without that the bundle
+carries both the "DIFFER" verdict and the corrected value for one field, and the gate refuses an entry
+it has just fixed.
+
+### ✔ LIVE: the no-regression case, which is the one that matters for a destructive change
+
+Rehearsal on req 343628 (3 approved entries, 3 on the form, all matching), subtract enabled:
+
+```
+Experience: 3 entries on the form — opening each to check it (nothing is rewritten unless it disagrees)
+  Experience entry 1/2/3: all 4 approved value(s) are visible on the tile — verified from the DOM, not opened
+verify: 60 field(s) replayed, 0 failure(s)  bundle blockers: 0
+▶▶ WOULD CLICK SUBMIT ◀◀
+```
+**Zero deletions, zero re-adds, gate passed.** A form that already matches is not touched.
+
+### ⚠ THE HONEST GAP: the subtract FIRING is unit-verified, not live-observed
+
+No live application currently presents either condition — every form matches its bundle, and the one
+short form (340692) is a *shortfall*, which the restore handles. So the firing paths are proven by
+`test/orc-entry-subtract.test.js`, which drives `atsOrcFillEntries` end to end against a fake
+actuation: a stray tile removed; a disagreeing tile deleted and rebuilt with the APPROVED value; and
+the two refusals — **nothing deleted when the bundle approves nothing**, and **nothing deleted when it
+cannot be rebuilt**. Mutation-checked: replacing the repair gate with `if (false)` fails the safety
+test.
+
+The safety tests were re-pinned deliberately rather than left to pass by accident. `never delete` is
+gone as an assertion because it is no longer the invariant; what is asserted is that every mutation is
+gated on the bundle's approved count, that a repair refuses without enough data to rebuild, that
+removal requires a genuine excess, and that **nothing in the branch reads the profile at all**.
+
+### ⚠ A PRE-EXISTING FLAKE, NAMED (so the next person does not chase it)
+
+`test/fill-driver.test.js:7818` — *"inline AI (repeating): a FoS no-match in Education is rescued
+INLINE…"* — fails roughly 1 run in 3 and passes on a re-run. It is **not** related to the ORC work:
+across rounds 16-20 the only non-test files touched were `ats.js` and `background.js`, and this test
+exercises `driveRepeatingSectionCdp` in **fill-driver.js**, which was never edited. The stash on `main`
+records the same test's sensitivity in its own words — *"inline pre-type seam shifts fill timing →
+keptLowerTier recommit strays to Economics"* — so it is a timing-sensitive assertion on a fake
+actuation, not a regression. **Re-run before believing a single red suite here, and do not run two
+`npm test` processes at once** (CPU contention makes it far likelier, which is how it first appeared).
