@@ -2526,3 +2526,93 @@ rather than an oversight — if it ever needs cutting, the lever is a cheaper pr
 
 The standing rules are now in **CLAUDE.md → "Don't write laggy code"**, so they are read before a wait is
 written rather than after a run is slow.
+
+## Round 23 — three operator reports, and a CORRECTION to round 21's claim (2026-08-21)
+
+### ⚠⚠ FIRST, THE CORRECTION: the keep-warm beat REDUCES starvation, it does not eliminate it
+
+Round 21 said *"four runs with a heartbeat: zero overruns."* That was an overclaim on n=2 of real
+treatment data. With the beat **verified** on (see the flag bug below — two "on" arms were not), five
+runs now say:
+
+| beat | paces | overran | lost | worst pace | sw-starved |
+|---|---|---|---|---|---|
+| ON | 77 | 0 | 1.5s | 0ms | 0 |
+| ON | 78 | 0 | 2.0s | 0ms | 0 |
+| ON (verified) | 82 | 1 | 5.2s | 1857ms | 0 |
+| ON (verified) | 69 | 1 | 7.4s | **4675ms** | 1 |
+| ON (verified) | 108 | 3 | 9.6s | 1453ms | 0 |
+| **OFF** | 82 | 1 | **16.7s** | **13461ms** | 1 |
+| **OFF** (accidental) | 75 | 2 | 8.7s | 3260ms | 3 |
+
+**What holds:** worst-case pace fell from **13461ms to ≤4675ms**, and `sw-starved` paces from several
+per run to **one across five runs**. **What does not:** "zero overruns". Total time lost still varies
+(an ON run lost 9.6s — though across 108 paces, and with a worst pace of 1453ms rather than 13s).
+The right claim is *the tail severity is cut several-fold*, not *the problem is gone*.
+
+### ⚠⚠ AND THE FLAG THAT MADE THAT MEASUREMENT WRONG: `null` did not clear a flag, it stored `false`
+
+`AP_DEV_FLAG` did `const value = !!message.value`, so the live-testing skill's standing instruction —
+*"clear every flag when you're done… a forgotten flag silently invalidates every later measurement"* —
+**wrote `false` instead of removing the key.** For an opt-IN flag (`debugLagTrace`) false and absent are
+identical, so it hid for a long time. For an opt-OUT KILL-SWITCH they are opposites: a "cleared"
+`keepWarmBeat` became a permanent *beat OFF*, and a run fired as the treatment arm ran as a control and
+lost 8.7s. **A flag you cannot clear is worse than no flag, because the docs tell you to clear it.**
+`value: null` now REMOVES the key and answers `{removed: true}`.
+
+### The date picker is HEALTHY — the slowness was never in the widget
+
+The operator, at 240fps: *"I see it click open the end month dropdown, I see it fill the month for 1
+frame, and then somehow it doesn't commit, then after a wait, it refills and then fills the year."*
+
+`atsInjOrcPickFromOwnList` now returns a step trace, and the read-back's first ~240ms is sampled at
+**8ms** rather than 60ms (a ~4ms appearance is invisible to a 60ms poll, so the caller could record
+"not retained" for a commit that HAPPENED and then retry it — which would look exactly like the
+observed refill). Measured:
+
+```
+↳ endDate month: openedByUs true rows 12@137ms typed@138ms narrowed@247ms
+                 firstRow "August" enter@249ms reopens 0 value "August" | after Enter: 261ms:"August"
+```
+
+**~261ms, first try, no flash, no retry** — and 261ms is ~62 frames at 240fps, so the one-frame
+appearance was not this instance. Meanwhile the *pair* was being reported at **2834ms**, i.e. ~2.3s of
+it was SW round-trip and pacing overhead OUTSIDE the picker. With the beat on and no starvation, the
+three pairs in one run came in at **677 / 688 / 673ms** where an earlier run had 716 / 718 / **2854**.
+
+⚠ **Not reproduced under trace:** no failing pick has been captured yet. The trace prints on failure, so
+the next occurrence will say which step broke. Do not treat the widget as exonerated — treat it as
+"healthy in five runs, instrumented for the next".
+
+### The slow detach — measured, then fixed
+
+Operator: *"at the very end it seems to detach very slowly — after filling out the last page, it stays
+attached for a decent amount of time."* Measured tail: `storage 0.0s + report 3.0s` (and 4.5s on
+another run) — essentially all of it a **network POST to our own website**, with the debugger still
+attached, purely because the detach lived in the bottom `finally`.
+
+The two remaining CDP reads (visibility, paint) are taken first, then `cdpDetach()`, then the storage
+write and the report. `cdpDetach` guards on `cdpTabId === null`, so it is idempotent and the `finally`
+remains a backstop. After: `detach 0.0s — then storage 0.0s + report 1.3s with the tab ALREADY
+RELEASED`. More than cosmetic — the attach is exclusive (one debugger client per tab), it shows a
+"being debugged" banner, and holding it blocks both the operator and the next run.
+
+### Should the beat go to the other tenants? YES — it already did
+
+It is started by `cdpAttach`, so every ats.js tenant, both Workday walks, onboarding, discovery and the
+recon probes get it. Round 22 records the audit. Workday's own numbers are still unmeasured — its
+`awaitFieldSetSettled` is already timed, so it should benefit less, but the original 2026-08-20 lag
+report was about Workday and that is where a measurement is still owed.
+
+### ⚠ A THIRD load-sensitive test — the pattern, not the test, is the finding
+
+`fill-driver.test.js:4250` — *"awaitSourceListStable: a tenant that opens straight to LEAVES"* — failed
+once in a full run, failed again running its own 704-test file, and **passed when run alone**
+(`--test-name-pattern`). `fill-driver.js` and `lib.js` were untouched (git diff empty), and the full
+suite then went green again at 1726/0.
+
+That makes three: `fill-driver.test.js:7818` ("inline AI"), `clock-probe.test.js:84`, and this one. All
+three assert on REAL timers, so they degrade under in-process load (700+ tests in one process) as well
+as machine load. **The rule for this repo: a single red result on a timer-based test is not evidence —
+re-run it alone before believing it.** Ironically the same lesson the pacing work itself keeps
+teaching: a timed assertion measures the machine as much as the code.

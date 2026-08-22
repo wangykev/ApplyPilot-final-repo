@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-picker-trace-1";
+const AP_BUILD_MARKER = "orc-picker-trace-2";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -722,6 +722,19 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       if (message.value === undefined) {
         const got = await new Promise((r) => chrome.storage.local.get(key, r));
         sendResponse({ ok: true, key, value: got[key] ?? null });
+        return;
+      }
+      // ⚠⚠ `null` REMOVES THE FLAG — it does not store `false` (2026-08-21). This was `!!message.value`,
+      // so every "clear the flag when you're done" call in the live-testing skill silently wrote FALSE.
+      // For an opt-IN flag (debugLagTrace) false and absent are the same thing and it went unnoticed for
+      // a long time. For an opt-OUT kill-switch they are OPPOSITES: `keepWarmBeat` cleared this way
+      // became a permanent "beat OFF", which then contaminated the very A/B it was the lever for — a
+      // run intended as the treatment arm ran as a control and lost 8.7s to starvation. A flag you
+      // cannot actually clear is worse than no flag, because the docs tell you to clear it.
+      if (message.value === null) {
+        await new Promise((r) => chrome.storage.local.remove(key, r));
+        console.log(`[ApplyPilot][DEV] flag ${key} REMOVED (back to its default)`);
+        sendResponse({ ok: true, key, value: null, removed: true });
         return;
       }
       const value = !!message.value;
@@ -6166,19 +6179,37 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // (live 2026-08-01). The fill already KNOWS the answer, so it writes it down.
     bundle.ats = ats;
     bundle.jobKeyUrl = originUrl; // stable identity across landing hops (see the top of this fn)
-    // ⚠ TIME THE TAIL. The operator: "at the very end, it seems to detach very slowly — after filling
-    // out the last page, it stays attached for a decent amount of time." Everything from here to the
-    // detach is work the PAGE is no longer involved in (a storage write, then a network POST to the
-    // website), so if the tail is the report then the debugger is being held open across it for no
-    // reason. Measured before changing the order, so the fix is aimed rather than guessed.
+    // ⚠⚠ DETACH BEFORE REPORTING (operator, 2026-08-21: "at the very end, it seems to detach very
+    // slowly — after filling out the last page, it stays attached for a decent amount of time").
+    // MEASURED: the tail is `storage 0.0s + report 3.0s`, i.e. essentially all of it is a network POST
+    // to our own website — work the PAGE plays no part in. The debugger was being held open across it
+    // only because the detach lived in the `finally` at the very bottom.
+    //
+    // The two remaining CDP reads (visibility and paint, for the timing line) are taken FIRST, so
+    // nothing after the detach needs the attach. `cdpDetach` is idempotent and the `finally` still
+    // calls it, so an early return or a throw between here and there is unchanged.
+    //
+    // ⚠ WHY THIS IS MORE THAN COSMETIC: the attach is exclusive — one debugger client per tab — and it
+    // shows the operator a "being debugged" banner. Holding it across a network round trip blocks them
+    // from touching the tab for seconds after the work is visibly finished, and blocks the next run
+    // from attaching.
+    let visNow = null; try { visNow = await cdpVisible(); } catch (e) {}
+    let paint = "?"; try { paint = await cdpPaintLabel(); } catch (e) {}
+    // …and the pacing/lag verdicts, which read SW-side counters but are cheapest to print with the
+    // rest of the timing block below. Nothing here touches the page.
+    const detT0 = Date.now();
+    try { await cdpDetach(); } catch (e) { /* the finally is the backstop */ }
+    const detMs = Date.now() - detT0;
+
     const tailT0 = Date.now();
     await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
     const storeMs = Date.now() - tailT0;
     const repT0 = Date.now();
     const reported = await reportApplication(bundle, jobContext);
     const repMs = Date.now() - repT0;
-    LOG(`[ATS-TIME] tail after the last field: storage ${(storeMs / 1000).toFixed(1)}s + report ${(repMs / 1000).toFixed(1)}s`
-      + " — the tab is still ATTACHED for all of this, and the page plays no part in it");
+    LOG(`[ATS-TIME] tail after the last field: detach ${(detMs / 1000).toFixed(1)}s`
+      + ` — then storage ${(storeMs / 1000).toFixed(1)}s + report ${(repMs / 1000).toFixed(1)}s`
+      + " with the tab ALREADY RELEASED (the page plays no part in either)");
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
     // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
     const fillMs = Date.now() - fillT0;
@@ -6186,11 +6217,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // would divide a four-step wall clock by one step's field count and report a per-field cost
     // several times the truth.
     const perField = allResults.length ? Math.round(fillMs / allResults.length) : 0;
-    let visNow = null; try { visNow = await cdpVisible(); } catch (e) {}
-    // MEASURED paint state next to Chrome's visibility (the Workday branch's rule): "visible but
-    // not painting" is the state that used to be invisible in the logs, and it is exactly when a
-    // widget's own renders crawl — which this pipeline reads as an empty menu.
-    let paint = "?"; try { paint = await cdpPaintLabel(); } catch (e) {}
+    // (visNow / paint were read ABOVE, before the detach — see the note there. Reading them here would
+    // now hit a detached tab and report "?" for both, which is exactly the diagnostic the Workday
+    // branch's rule exists to preserve: "visible but not painting" is the state that used to be
+    // invisible in the logs, and it is when a widget's own renders crawl.)
     // …and NAME the slowest fields. "1540ms/field" cannot tell you whether the cost is spread or
     // sitting in two widgets waiting out a ceiling — which is the only thing worth retuning.
     // The résumé is ALWAYS named, whatever it cost: it is the field whose time varies most between a
