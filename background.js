@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "keepwarm-universal-1";
+const AP_BUILD_MARKER = "orc-picker-trace-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6166,8 +6166,19 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // (live 2026-08-01). The fill already KNOWS the answer, so it writes it down.
     bundle.ats = ats;
     bundle.jobKeyUrl = originUrl; // stable identity across landing hops (see the top of this fn)
+    // ⚠ TIME THE TAIL. The operator: "at the very end, it seems to detach very slowly — after filling
+    // out the last page, it stays attached for a decent amount of time." Everything from here to the
+    // detach is work the PAGE is no longer involved in (a storage write, then a network POST to the
+    // website), so if the tail is the report then the debugger is being held open across it for no
+    // reason. Measured before changing the order, so the fix is aimed rather than guessed.
+    const tailT0 = Date.now();
     await new Promise((r) => chrome.storage.local.set({ reviewSummary: bundle, reviewAudit: null }, r));
+    const storeMs = Date.now() - tailT0;
+    const repT0 = Date.now();
     const reported = await reportApplication(bundle, jobContext);
+    const repMs = Date.now() - repT0;
+    LOG(`[ATS-TIME] tail after the last field: storage ${(storeMs / 1000).toFixed(1)}s + report ${(repMs / 1000).toFixed(1)}s`
+      + " — the tab is still ATTACHED for all of this, and the page plays no part in it");
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
     // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
     const fillMs = Date.now() - fillT0;

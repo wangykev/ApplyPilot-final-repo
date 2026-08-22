@@ -4420,8 +4420,12 @@ test("an ORC date is recorded as two per-half rows sharing a question_key, each 
     "…and share a question_key so review shows ONE date row with its parts inside");
   assert.ok(/part_label: partName/.test(stripped), "…each labelled Month / Year");
   // The scanned vocabulary must come from the UNFILTERED list, not the one-row filtered list.
-  assert.ok(/return \{ ok: true, kind, committed: want, reopens, value, invalid, options: texts \};/.test(stripped),
+  // ⚠ PIN THE INTENT, NOT THE WHOLE RETURN LITERAL. The first version matched the return byte for byte
+  // and broke the moment a `trace` field was added for an unrelated diagnosis — a test that fails on
+  // any edit to a line teaches nothing about the property it is guarding.
+  assert.ok(/return \{ ok: true, kind, committed: want, reopens, value, invalid, options: texts[,}]/.test(stripped),
     "the picker must return the vocabulary it read at OPEN (texts), never the filtered `shown`");
+  assert.ok(!/options: shown/.test(stripped), "…and never the post-typing filtered list");
 });
 
 test("the replay flag is threaded EXPLICITLY into atsFinishFill", () => {

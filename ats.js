@@ -4605,6 +4605,14 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   const norm = (v) => String(v == null ? "" : v).toLowerCase().replace(/\s+/g, " ").trim();
   const el = document.querySelector(inputSel);
   if (!el) return { ok: false, error: "not-found:" + inputSel };
+  // ⚠ A STEP-BY-STEP TRACE, because the operator watched this at 240fps and saw something no duration
+  // could have told us: "I see it click open the end month dropdown, I see it fill the month for 1
+  // frame, and then somehow it doesn't commit, then after a wait, it refills and then fills the year."
+  // A value present for ~4ms is invisible to a 60ms read-back poll, so the caller would record "not
+  // retained" for a commit that DID happen — and then retry it, which is the double-fill observed.
+  const T0 = Date.now();
+  const tr = { openedByUs: false, rowsAt: null, rowsN: 0, typedAt: null, narrowedAt: null,
+               firstRow: null, enterAt: null, samples: [], reopens: 0 };
   const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
   const readRows = () => {
     const lb = lbId ? document.getElementById(lbId) : null;
@@ -4629,12 +4637,12 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   // the re-click guard below uses: the listbox exists only when the widget is open.
   const listUp = () => !!(lbId && document.getElementById(lbId));
   const deadline = Date.now() + (budgetMs || 6000);
-  if (!listUp()) { el.focus(); el.click(); }
+  if (!listUp()) { el.focus(); el.click(); tr.openedByUs = true; }
   let rows = [], reopens = 0;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 120));
     rows = readRows();
-    if (rows.length) break;
+    if (rows.length) { tr.rowsAt = Date.now() - T0; tr.rowsN = rows.length; break; }
     // ⚠ AN OPEN THAT DID NOT TAKE IS RE-CLICKED, not waited out. Two extra clicks at ~700ms and
     // ~1400ms cost almost nothing and replace an 8-second stall.
     //
@@ -4724,6 +4732,7 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
     el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: cc, which: cc, charCode: cc, bubbles: true, cancelable: true }));
     el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: cc, which: cc, bubbles: true }));
   }
+  tr.typedAt = Date.now() - T0;
   // ⚠⚠ ENTER TAKES THE LIST'S OWN CHOICE, SO WAIT FOR THE LIST TO BE OURS (operator: "make sure what
   // you type is actually a part of the dropdown — these are similar to the workday typeaheads").
   // Half of that always held: `want` is taken from the rows the widget itself showed, so we can never
@@ -4734,11 +4743,12 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   for (let i = 0; i < 14; i++) {
     await new Promise((r) => setTimeout(r, 100));
     shown = readRows().map(t);
-    if (shown.length && norm(shown[0]) === norm(want)) { narrowed = true; break; }
+    if (shown.length && norm(shown[0]) === norm(want)) { narrowed = true; tr.narrowedAt = Date.now() - T0; break; }
   }
+  tr.firstRow = shown.length ? shown[0] : null;
   // ⚠ AND IF IT NEVER NARROWS, DO NOT PRESS. Reporting beats committing a month nobody asked for onto
   // a work-history date; the caller turns this into needs_review.
-  if (!narrowed) return { ok: false, error: "filter-did-not-narrow", kind, want, rows: shown.slice(0, 6), reopens, options: texts };
+  if (!narrowed) { tr.reopens = reopens; return { ok: false, error: "filter-did-not-narrow", kind, want, rows: shown.slice(0, 6), reopens, options: texts, trace: tr }; }
   el.focus();
   for (const type of ["keydown", "keypress", "keyup"]) {
     el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
@@ -4760,20 +4770,29 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   // and if the page never settles it simply returns `value: null` and the caller reports the failure
   // exactly as before. Nothing is assumed from a timer that did not fire.
   let value = null, invalid = false;
+  tr.enterAt = Date.now() - T0;
   const vDeadline = Date.now() + 2500;
+  // ⚠⚠ THE FIRST STRETCH IS SAMPLED AT 8ms, NOT 60ms (operator at 240fps: the month was present for ONE
+  // FRAME). A 60ms poll can step straight over a ~4ms appearance, and the caller then treats a commit
+  // that HAPPENED as "not retained" and RETRIES it — which is exactly the refill that was observed.
+  // Fine sampling for the first ~240ms costs 30 in-page iterations and nothing over the wire.
+  let tick = 0;
   while (Date.now() < vDeadline) {
-    await new Promise((r) => setTimeout(r, 60));
+    await new Promise((r) => setTimeout(r, tick < 30 ? 8 : 60));
+    tick++;
     const v = String(el.value || "").trim();
     invalid = /cx-select-input--invalid/.test(String(el.className || ""));
+    if (tr.samples.length < 24) tr.samples.push({ t: Date.now() - T0, v: v.slice(0, 14), i: invalid ? 1 : 0 });
     if (v && !invalid) { value = v; break; }
   }
+  tr.reopens = reopens;
   // ⚠ `options` IS THE UNFILTERED VOCABULARY, captured at OPEN before a keystroke narrowed it
   // (operator, 2026-08-21: "each one is a dropdown, those should be scanned"). It is what lets the
   // review page render each half as a real picker instead of a text box — and it is free, because
   // classifying month-vs-year already had to read every row. Taken from `texts`, NOT from `shown`:
   // `shown` is the list AFTER typing filtered it to one row, which would make the review editor offer
   // a one-option dropdown containing only the value we already chose.
-  return { ok: true, kind, committed: want, reopens, value, invalid, options: texts };
+  return { ok: true, kind, committed: want, reopens, value, invalid, options: texts, trace: tr };
 }
 
 function atsInjOrcLinks() {
@@ -6411,6 +6430,17 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             // Record the half's OUTCOME whichever way it went — the review records are built from
             // this, so a half that failed must still produce a row (with its option list, so the
             // operator can simply pick the right value).
+            // ⚠ SAY WHAT THE PICKER SAW when a half was slow or failed. The operator diagnosed the
+            // double-fill from a 240fps recording because the log could not: a duration cannot
+            // distinguish "never committed" from "committed, flashed, and our poll missed it".
+            if (r && r.trace && (!r.ok || !r.value || (Date.now() - t0) > 1200)) {
+              const q = r.trace;
+              log(`  ↳ ${key} ${idHalf || r.kind || "?"}: openedByUs=${q.openedByUs} rows=${q.rowsN}@${q.rowsAt}ms`
+                + ` typed@${q.typedAt}ms narrowed@${q.narrowedAt == null ? "NEVER" : q.narrowedAt + "ms"}`
+                + ` firstRow=${JSON.stringify(q.firstRow)} enter@${q.enterAt}ms reopens=${q.reopens}`
+                + ` value=${JSON.stringify((r && r.value) || null)}`
+                + (q.samples && q.samples.length ? ` | after Enter: ${q.samples.map((x) => x.t + "ms:" + JSON.stringify(x.v) + (x.i ? "!" : "")).join(" ")}` : ""));
+            }
             const hk = halfOf(g, r) || idHalf;
             if (hk) half_by[hk] = { sel: g.id, error: (r && !r.ok) ? (r.error || "unknown") : null,
                                     options: (r && r.options) || null, value: null };
