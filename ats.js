@@ -5601,8 +5601,13 @@ async function atsOrcAddApprovedEntry(act, spec, idx, emap, valueFor, log) {
         const h = /^month-/.test(String(g.id || "")) ? "month"
           : (/^year-/.test(String(g.id || "")) ? "year" : null);
         if (!h || !g.id) continue;
-        const want = get(spec.source + "[" + idx + "]." + key + "." + h, "dropdown");
-        if (want === undefined || !String(want).trim()) continue;   // not approved => nothing to restore
+        let want = get(spec.source + "[" + idx + "]." + key + "." + h, "dropdown");
+        if (want === undefined || !String(want).trim()) {
+          // A pre-split approval keys the whole date as one row — take this half out of it.
+          const merged = get(spec.source + "[" + idx + "]." + key, "dropdown");
+          want = merged === undefined ? undefined : atsOrcLegacyDateHalf(merged, h);
+        }
+        if (want === undefined || want === null || !String(want).trim()) continue;   // not approved => nothing to restore
         const cands = [String(want).trim()];
         let r = null;
         for (let attempt = 0; attempt < 2; attempt++) {
@@ -5821,11 +5826,20 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
           // comparing — the tile renders "05/2026", and testing "May" against that on its own would
           // call every date wrong and open every entry.
           if (emap[key] && emap[key].kind === "date_pair") {
-            const parts = ["month", "year"].map((h) => ({
+            let parts = ["month", "year"].map((h) => ({
               half: h, fieldName: `${spec.source}[${k}].${key}.${h}`,
               want: lookup(`${spec.source}[${k}].${key}.${h}`, "dropdown"),
             })).filter((pp) => pp.want !== undefined && String(pp.want).trim() !== "");
-            if (!parts.length) continue;
+            if (!parts.length) {
+              // ⚠ A PRE-SPLIT APPROVAL: the date is ONE bundle row. Verify it as one, and report it
+              // under ITS OWN key — emitting the halves instead would leave the legacy row unmatched,
+              // which the strict verify reports as "approved value has NO matching field on the live
+              // form" and which refuses a submit whose values are all present. Measured live.
+              const legacy = lookup(`${spec.source}[${k}].${key}`, "dropdown");
+              if (legacy === undefined || !String(legacy).trim()) continue;
+              expected.push({ key, fieldName: `${spec.source}[${k}].${key}`, want: String(legacy) });
+              continue;
+            }
             const byHalf = {};
             for (const pp of parts) byHalf[pp.half] = String(pp.want).trim();
             // Assembled in the vocabulary atsYearMonthKey understands ("May 2026"). A half the human
@@ -5920,10 +5934,16 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
               const h = /^month-/.test(String(g.id || "")) ? "month" : (/^year-/.test(String(g.id || "")) ? "year" : null);
               if (!h) continue;                           // an unidentifiable half is not one we can vouch for
               const hName = `${spec.source}[${k}].${key}.${h}`;
-              const hWant = typeof o.valueFor === "function"
+              let hWant = typeof o.valueFor === "function"
                 ? o.valueFor({ fieldName: hName, entrySection: spec.source, entryIndex: k, widgetType: "dropdown" })
                 : undefined;
-              if (hWant === undefined) continue;
+              if (hWant === undefined) {
+                const merged = typeof o.valueFor === "function"
+                  ? o.valueFor({ fieldName: `${spec.source}[${k}].${key}`, entrySection: spec.source, entryIndex: k, widgetType: "dropdown" })
+                  : undefined;
+                hWant = merged === undefined ? undefined : atsOrcLegacyDateHalf(merged, h);
+              }
+              if (hWant === undefined || hWant === null) continue;
               const hLive = String(g.value == null ? "" : g.value).trim();
               const hAgrees = atsLib.normalize(hLive) === atsLib.normalize(String(hWant));
               records.push({
@@ -6521,6 +6541,40 @@ function atsYearMonthKey(v) {
   }
   return null;
 }
+// ⚠⚠ A BUNDLE APPROVED BEFORE THE DATE SPLIT KEYS A DATE AS ONE ROW (2026-08-21). The fill now
+// records `startDate.month` / `startDate.year` so each half is separately editable, but an approved
+// bundle already in Supabase carries the merged `startDate` = "May 2026". Live, that cost four verify
+// failures on an application that had passed its rehearsal the day before: the replay looked for the
+// halves, found nothing, wrote an entry with no dates, and Oracle refused it.
+//
+// So a missing half FALLS BACK to the merged row and takes its share of it. Same discipline
+// atsSubmitKey already applies to entry keys — "the two sides keying differently IS the bug" — and it
+// is why an old approval keeps working instead of silently failing with "no matching field".
+//
+// Deliberately narrow: it only ever splits a "<Month> <YYYY>" / "<MM>/<YYYY>" shape it can parse, and
+// returns null otherwise rather than guessing at half of a string it does not understand.
+function atsOrcLegacyDateHalf(merged, half) {
+  const t = String(merged == null ? "" : merged).trim();
+  if (!t) return null;
+  let m = /^([A-Za-z]+)\s+((?:19|20)\d{2})$/.exec(t);              // "May 2026"
+  if (m) return half === "year" ? m[2] : m[1];
+  m = /^(\d{1,2})[-/]((?:19|20)\d{2})$/.exec(t);                   // "05/2026"
+  if (m) {
+    if (half === "year") return m[2];
+    const i = Number(m[1]);
+    return i >= 1 && i <= 12 ? ATS_MONTHS[i - 1] : null;
+  }
+  m = /^((?:19|20)\d{2})[-/](\d{1,2})$/.exec(t);                   // "2026-05"
+  if (m) {
+    if (half === "year") return m[1];
+    const i = Number(m[2]);
+    return i >= 1 && i <= 12 ? ATS_MONTHS[i - 1] : null;
+  }
+  // A bare year is a real shape the fill can produce when only that half committed.
+  if (/^(?:19|20)\d{2}$/.test(t)) return half === "year" ? t : null;
+  return null;
+}
+
 function atsOrcTileHoldsValue(tileText, value) {
   const tile = String(tileText == null ? "" : tileText);
   const v = String(value == null ? "" : value).trim();
@@ -10347,7 +10401,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
     atsOrcEntryIdentity, atsOrcTilesAlreadyMatch, atsInjOrcOpenEntryAndWait, atsInjOrcCommitEntryAndWait,
-    atsOrcAddApprovedEntry, ATS_ORC_ENTRY_IDENTITY_KEYS, atsOrcTileHoldsValue,
+    atsOrcAddApprovedEntry, ATS_ORC_ENTRY_IDENTITY_KEYS, atsOrcTileHoldsValue, atsOrcLegacyDateHalf,
     atsInjOrcOpenTileAndWait, atsInjOrcCloseEntry, atsInjOrcResumeReset,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,

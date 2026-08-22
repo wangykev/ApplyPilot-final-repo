@@ -2241,3 +2241,94 @@ correctly.
 
 ⚠ Still not demonstrated: the timed-settle predicate's starved path (round 17). Five runs now, and no
 burst has landed on the settle window. It remains structurally argued + no-regression, not measured.
+
+## Round 19 — ORC dates split into two editable pickers, and a replay that RESTORES entries (2026-08-21)
+
+Four operator requirements, all implemented; three fully live-verified, one live-verified except its
+successful commit (see the honest gap at the end).
+
+### 1 + 2. A date is TWO pickers, so it is TWO review rows — each with its SCANNED options ✔ LIVE
+
+The fill recorded one merged row (`after: "May 2026"`), so review could only offer it as a single text
+box: an operator wanting to fix just the month had to retype both, and a merged row cannot carry two
+different option lists. Now each half is its own record, sharing a `question_key` — the existing
+"one question, several controls" mechanism (salary currency/amount, Workday's month/day/year).
+
+`atsInjOrcPickFromOwnList` already read every row to classify month-vs-year, so the vocabulary was
+free; it just was not returned. ⚠ It returns `texts` (read at OPEN) and never `shown` (the list AFTER
+typing filtered it to one row) — the latter would hand review a one-option dropdown containing only
+the value already chosen.
+
+Live (`eeho`, req 343628):
+```
+work_experience[0].startDate.month → filled · after "May"  · picked from the form's own month list
+work_experience[0].startDate.year  → filled · after "2026" · picked from the form's own year list
+```
+and the review page renders **one "Start Date" row with two `<select>` pickers**, 12 scanned months.
+Step 2 went 29 → 35 fields (each date is now two rows). All 3 entries committed, all 3 steps walked.
+
+### 3. The replay ASSEMBLES the halves from the tile DOM ✔ LIVE
+
+The tile shows `"05/2026"`; testing `"May"` against that alone would call every date wrong and open
+every entry. So the two approved halves are re-assembled into `"May 2026"` and compared once, through
+the existing `atsYearMonthKey` tolerance. Rehearsal on 343628: **60 field(s) replayed, 0 failure(s)**,
+all three Experience entries *"verified from the DOM, not opened"* → `WOULD CLICK SUBMIT`.
+
+### 4. A replay RESTORES an approved entry the form no longer has ✔ LIVE (commit: unit-proven)
+
+`atsOrcAddApprovedEntry` — strictly additive: it presses Add, fills a FRESH form from the bundle, and
+commits. It never opens, edits or deletes a tile that is present, which is what makes it safe next to
+the standing rule that a `profile:{}` reconcile reads "wants 0" and DELETES the work history. Nothing
+in it reads the profile.
+
+⚠ **WHICH entries are missing is decided by EVIDENCE, not by assuming the tail.** Taking indices
+`tiles.length…approvedCount-1` is wrong whenever the entry Oracle refused was the SECOND of three — it
+would duplicate the third and still leave the second absent. Each approved index is looked up among
+the tiles by its own identifying values (`ATS_ORC_ENTRY_IDENTITY_KEYS`, never a date). A mutation test
+proved this: rewriting the decision as `if (bi >= tiles.length)` passed the first version of the
+guard, so the guard now pins the positive form.
+
+Live on 340692 (bundle 2 entries, form 1):
+```
+⚠ Experience: the form has 1 entry but you approved 2 — RESTORING 1 that Oracle did not keep:
+  "Carnegie Mellon Racing · Firmware Team Member"
+```
+Detection, open, field writes, refusal-cancel and reporting all confirmed live.
+
+### ⚠⚠ AND THE SPLIT BROKE EVERY BUNDLE ALREADY APPROVED — found live, fixed
+
+The first restore run wrote only **2** of 6 fields and Oracle refused the entry. Cause: that bundle
+predates the split, so its dates are the merged `startDate` row; the replay looked for `.month`/`.year`,
+found nothing, and built an entry with no dates. The verify said
+`✗ work_experience[0].startDate: approved value has NO matching field on the live form` — four failures
+on an application that had passed its rehearsal the day before.
+
+`atsOrcLegacyDateHalf` takes a half out of a merged row (`"May 2026"` / `"05/2026"` / `"2026-05"`), and
+the report-only path verifies a legacy date **under its own merged key** — emitting the halves instead
+would leave the legacy row unmatched, which is exactly the "no matching field" refusal. Same discipline
+`atsSubmitKey` already applies: accept BOTH shapes, because *the two sides keying differently IS the
+bug*. Re-run: 2 → **5 fields written**.
+
+### ⚠ THE HONEST GAP: the restore's successful COMMIT is not live-observed
+
+It stopped at 5 of 6 because that legacy bundle's end date is the bare `"2026"` the ORIGINAL failed
+fill recorded — the month **is not in the bundle**, and `atsOrcLegacyDateHalf("2026","month")` returns
+null by design rather than inventing one. Oracle then refuses the incomplete entry, which is correct.
+
+Manufacturing the missing condition (short form + COMPLETE data) was not possible this session: the
+only real instance has genuinely incomplete data, the run's Oracle tab is outside the MCP tab group so
+a tile cannot be deleted by hand, and editing the month into the bundle through the review editor
+failed the documented way — box showed the new value, chip stayed `Edited 0`, i.e. React never saw it
+(the isolated-world limitation; it needs a real click by screenshot coordinates).
+
+So the happy path — all six fields written and the entry COMMITTED — is proven by
+`test/orc-entry-restore.test.js` against a fake actuation, not by a live run. **Do not record it as
+live-verified.** The next live run that meets a genuinely short form with a complete new-shape bundle
+closes this.
+
+### Also seen, unexplained
+
+On the second 340692 rehearsal, `education[0].contentItemId` and `educationalEstablishment` read back
+`""` from the opened tile and failed the verify, where the previous run reported *"4 field(s) match"*.
+It follows a CANCELLED restore attempt on the Experience block, so a page-state side effect of the
+cancel is the first suspect. One observation, not a diagnosis.
