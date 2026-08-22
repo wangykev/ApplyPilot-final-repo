@@ -18,7 +18,7 @@ This file holds **standing rules, invariants and safety contracts only** — eve
 | `docs/adding-a-filler.md` | **adding support for a NEW ATS / platform** — the substrate decision, the recon checklist, the exact integration surface, the five widget-registration sites, and the trap catalogue organized by symptom. Read it before writing a line of code for a new platform |
 | `docs/dom-patterns.md` | the dated observed-DOM rulebook (every tenant + refutations). **Has a topic index at the top — use it; never read the file whole.** |
 | `docs/progress-log.md` | full extension milestone history. Append new entries here. **Has a topic index at the top; never read it whole.** |
-| `docs/fill-speed-log.md` | **fill SPEED / timing** — every measurement, refuted theory, per-run data and fix direction. Read before investigating any slow fill; append new speed rounds here |
+| `docs/fill-speed-log.md` | **fill SPEED / timing** — every measurement, refuted theory, per-run data and fix direction. Read before investigating any slow fill; append new speed rounds here. ⚠ The standing rules are inline below ("Don't write laggy code") — read those before adding any wait |
 | `docs/status.md` | current state, NEXT items, operator TODOs, deferred work |
 | `WEBSITE.md` | the Next.js + Supabase companion site (`web/`) — design + the handoff contracts |
 | `docs/website-progress-log.md` | website milestone history. Append new website entries here. |
@@ -1375,6 +1375,60 @@ required, which is what blocked Save.
 6. Watch the service-worker console. `npm test` runs the unit suite (`node:test`).
 
 For a real end-to-end run driven through Chrome, load the **`live-testing`** skill.
+
+## Don't write laggy code — the pacing rules (measured; read before adding any wait)
+
+Every rule here was bought with a live failure, and most of them cost a wrong theory first. `docs/fill-speed-log.md`
+has the evidence; this is the short form.
+
+- **THE COST OF A PHASE IS THE NUMBER OF SW ROUND-TRIPS, NOT THEIR LENGTH.** Shortening a poll from
+  150ms to 80ms bought nothing; collapsing 28 SW awaits into 1 page-side wait fixed the largest gap on
+  a page. A healthy ORC fill is ~280-320 `Runtime.evaluate` calls / 23-32s — that count is the surface
+  area every per-round-trip stall multiplies against. **Ask "how many awaits?" before "how long is each?"**
+- **⚠⚠ KEEP THE WORKER WARM — an MV3 service worker with nothing scheduled stops being scheduled.**
+  `cdpAttach` starts a 500ms beat (`cdpKeepWarmStart`) for EVERY attach. Measured with it off: a 600ms
+  pace took **13461ms** and a run lost 16.7s; with it on, 4 runs had **zero** overruns.
+  ⚠ The obvious counter-argument is wrong and I made it: *"a keep-alive interval can't help, the
+  interval is the thing being starved."* **A late timer still FIRES**, and each firing runs the loop.
+  Never wire a lifecycle concern like this per-caller — it was first added to two ats.js runs and
+  silently left ~18 other attach sites, including both Workday walks, without it.
+- **A STABILITY PREDICATE MUST BE TIMED, NEVER COUNTED. Never add an attempts floor.** "3 consecutive
+  equal reads" MULTIPLIES a stall (3 x 8s); "unchanged for 1200ms" is satisfied by wall-clock and is
+  therefore self-limiting under load. This is exactly why the operator never saw the lag on Workday —
+  `awaitFieldSetSettled` is timed, and `waitAtsFormReady` was counted. **A wait that timed out wants a
+  bigger BUDGET, not more samples**; for a stability check, sparse reads are STRONGER evidence.
+- **Reuse a read you already hold.** A settle that re-fetches the scan it just validated pays an extra
+  round-trip AND judges the page from a different read than the one it proved stable.
+- **A page-side wait inside ONE eval beats N SW awaits** — but only where the page's timers are real
+  (`cdpInstallPageOverrides` gives worker-backed timers; `_workerTimersActive` says whether they took).
+  A slow single `Runtime.evaluate` is often a page-side budget doing its job, not a bug.
+- **Don't make a stability probe expensive.** `atsInjScan` in a poll loop turned a "900ms poll" into
+  ~2.9s per tick; a lean signature read 10x in 704ms. And **both sides of a comparison must be computed
+  the same way**, or tick one looks like a change and a stability loop exits early.
+- **⚠ A SPEED FIX CAN REMOVE THE SETTLING ITS SLOWNESS PROVIDED.** Three times in one day on ORC. After
+  making anything faster, re-verify the thing DOWNSTREAM of it. And change one variable at a time.
+- **⚠ DRIFT CAN COST COVERAGE, NOT ONLY LATENCY.** The audited claim ("monotone or stability predicates
+  can only be noticed late") does NOT cover a poll whose condition depends on pacing the page's own
+  input handling: ORC's date picker needs a coherent keystroke sequence, so a stretched pace loses the
+  commit outright — which cost a whole work-experience entry and failed a rehearsal three steps later.
+
+### Diagnose before attributing — the three clocks
+
+`AP_DEV_FLAG debugLagTrace` times every CDP command, runs a 500ms no-op page probe, measures the SW's own
+scheduling drift, and counts the inbound CDP event firehose by method. Read them together:
+
+| reading | verdict |
+|---|---|
+| SW drift high, page probe ~2ms | **us** — the worker (starvation / a busy loop) |
+| page probe spikes | the RENDERER is jammed; the channel is never the cause (p50 1-2ms across ~1500 cmds) |
+| one command slow, probe fast | that call's OWN work — usually a page-side polling budget |
+| `UNREAD CDP EVENTS` in the thousands | an event flood — measured at only **221/82s**, so this is NOT the usual cause |
+
+`[PACE]` lines are always on and name their own verdict: `sw-starved` (our worker was late — the page is
+NOT implicated), `page-abandoned` (the page genuinely did not answer), `sw-fallback` (context died).
+⚠ **The instrument must be reachable from the path you are debugging**: `cdpLagStart()` was Workday-only
+for a year, so on every other ATS the flag could be set and produce nothing — which reads exactly like
+"no problem here".
 
 ## A SLOW page is the LLM until proven otherwise (measured 2026-08-09)
 

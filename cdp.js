@@ -344,6 +344,24 @@ function cdpAttach(tabId) {
         // trusted Input.* path (slow-but-battle-tested) — the escape hatch if a tenant's widgets
         // ignore synthetic events (they'd surface as needs_review, never a wrong fill).
         try { const { forceTrustedInput } = await new Promise((r) => chrome.storage.local.get("forceTrustedInput", r)); _forceTrustedInput = !!forceTrustedInput; } catch (e) { _forceTrustedInput = false; }
+        // ⚠⚠ THE KEEP-WARM BEAT BELONGS TO THE ATTACH, NOT TO EACH CALLER (2026-08-21). It was first
+        // wired into the two ats.js runs, which left ~18 other attach sites without it — including the
+        // WORKDAY fill and replay walks, which is where the operator originally reported this lag
+        // ("the fill including the onboarding will just lag at seemingly random times and to fix it I
+        // need to click the page once"). Starting it here is the one place it cannot be forgotten, and
+        // cdpKeepWarmStop() already runs on the detach path, so its lifetime matches the attach's by
+        // construction. See cdpKeepWarmStart for the A/B that justifies it.
+        // Kill-switch: `keepWarmBeat = false` (or the original `atsKeepWarm = false`).
+        try {
+          const kw = await new Promise((r) => chrome.storage.local.get(["keepWarmBeat", "atsKeepWarm"], r));
+          const off = kw && (kw.keepWarmBeat === false || kw.atsKeepWarm === false);
+          if (!off && cdpKeepWarmStart()) {
+            console.log("[ApplyPilot][CDP] keep-warm beat ON (500ms) — a standing reason for the MV3 worker to stay scheduled; "
+              + "without it a 600ms pace was measured taking 13461ms. Set keepWarmBeat=false to A/B it off.");
+          } else if (off) {
+            console.log("[ApplyPilot][CDP] keep-warm beat OFF by flag — expect intermittent multi-second sw-starved paces");
+          }
+        } catch (e) { if (cdpKeepWarmStart()) console.log("[ApplyPilot][CDP] keep-warm beat ON (500ms)"); }
         cdpInvalidatePaint(); // a fresh attach says nothing about the previous tab's paint state
         _synthInputEnabled = false; // per-run opt-in — only the FILL entry points enable it (auth/onboarding/recon stay trusted)
         console.log(`[ApplyPilot][CDP] input mode: trusted${_forceTrustedInput ? " ALWAYS (forceTrustedInput)" : " (synthetic-when-hidden armed — the fill walk enables it)"}`);

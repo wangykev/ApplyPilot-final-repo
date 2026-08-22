@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-keepwarm-2";
+const AP_BUILD_MARKER = "keepwarm-universal-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -707,7 +707,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     // parse re-renders the form, so "is this widget's option list empty because the tenant has none, or
     // because the PARSE left it that way?" is only answerable by filling the same form with the attach
     // OFF. Diagnostic only — a real run always attaches (the operator's résumé belongs on the form).
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume",
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "keepWarmBeat",
       // The keep-warm beat's kill-switch — cdpKeepWarmStart documents it as the A/B lever, and it was
       // unreachable through AP_DEV_FLAG, so the "off" arm silently ran as another "on" arm.
       "atsKeepWarm", "atsPageClock"];
@@ -5696,16 +5696,8 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       LOG("debugLagTrace ON — timing every CDP command, a 500ms no-op page probe, the SW's own scheduling "
         + "drift, AND the inbound CDP event firehose by method (which domain is saturating the worker).");
     }
-    // ⚠ KEEP THE WORKER WARM — see cdpKeepWarmStart. This is the diagnostic's own heartbeat promoted to
-    // a feature, because turning the diagnostic ON is what made the operator's lag disappear. Skipped
-    // when the lag trace is already running, since that installs an equivalent beat of its own — two
-    // would just double the traffic and confound the very A/B this is here to allow.
-    const _keepWarm = await new Promise((r) => chrome.storage.local.get("atsKeepWarm", (v) => r(v ? v.atsKeepWarm : undefined)));
-    if (_keepWarm !== false && !_atsLag) {
-      if (cdpKeepWarmStart()) LOG("[ATS-PACING] keep-warm beat ON (500ms) — a standing reason for the MV3 worker to stay scheduled; set atsKeepWarm=false to A/B it off");
-    } else if (_keepWarm === false) {
-      LOG("[ATS-PACING] keep-warm beat OFF by atsKeepWarm=false — expect the intermittent multi-second sw-starved paces");
-    }
+    // (The keep-warm beat is started by cdpAttach for EVERY attach — see the note there. It used to be
+    // started here, which silently left the Workday walks and the discovery sweep without it.)
 
     // …and NOW open the posting, so its document runs with the overrides from its first byte. Defensive
     // about the starting URL: a caller that hands over an already-loaded tab (the redirect chase below
@@ -6277,16 +6269,8 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       LOG("debugLagTrace ON — timing every CDP command, a 500ms no-op page probe, the SW's own scheduling "
         + "drift, AND the inbound CDP event firehose by method (which domain is saturating the worker).");
     }
-    // ⚠ KEEP THE WORKER WARM — see cdpKeepWarmStart. This is the diagnostic's own heartbeat promoted to
-    // a feature, because turning the diagnostic ON is what made the operator's lag disappear. Skipped
-    // when the lag trace is already running, since that installs an equivalent beat of its own — two
-    // would just double the traffic and confound the very A/B this is here to allow.
-    const _keepWarm = await new Promise((r) => chrome.storage.local.get("atsKeepWarm", (v) => r(v ? v.atsKeepWarm : undefined)));
-    if (_keepWarm !== false && !_atsLag) {
-      if (cdpKeepWarmStart()) LOG("[ATS-PACING] keep-warm beat ON (500ms) — a standing reason for the MV3 worker to stay scheduled; set atsKeepWarm=false to A/B it off");
-    } else if (_keepWarm === false) {
-      LOG("[ATS-PACING] keep-warm beat OFF by atsKeepWarm=false — expect the intermittent multi-second sw-starved paces");
-    }
+    // (The keep-warm beat is started by cdpAttach for EVERY attach — see the note there. It used to be
+    // started here, which silently left the Workday walks and the discovery sweep without it.)
     // GO WHERE THE FILL WENT. bundle.url is the URL the fill ACTUALLY filled, which is not
     // always the posting link the caller holds: an employer careers page can serve the real
     // form from an embedded frame, and the fill followed it there. Starting from the caller's

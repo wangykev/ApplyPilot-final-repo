@@ -2491,3 +2491,38 @@ failed once in a full-suite run and passed **14/14 twice** in isolation immediat
 `npm test`, a live run, a dev-server compile) is enough to trip it. The cdp.js change that run was
 purely additive — 47 insertions, 0 deletions, and `cdpWarmTimer` is referenced nowhere near the clock
 probe. **Two known load-sensitive tests now: re-run in isolation before believing either.**
+
+## Round 22 — the fix made universal, and an audit of the OTHER paths (2026-08-21)
+
+Operator: *"go through not just oracle but other ats code and see if they have the same issue or not."*
+
+### ⚠ The keep-warm beat now starts in `cdpAttach`, not per caller
+
+It was first wired into the two `ats.js` runs — which left **~18 other attach sites without it**,
+including both **Workday** walks, onboarding, the discovery sweep and every recon probe. That is
+precisely where the operator's ORIGINAL 2026-08-20 report came from (*"the fill including the onboarding
+will just lag at seemingly random times"*). Moved into `cdpAttach`, where it cannot be forgotten and
+where its lifetime matches the attach's by construction (`cdpKeepWarmStop` already runs on detach).
+Kill-switch `keepWarmBeat = false` (the older `atsKeepWarm = false` still works).
+
+**The general lesson, worth more than the fix:** a lifecycle concern wired per-caller is a fix that
+silently covers whichever callers you happened to think of.
+
+### The audit — counted-vs-timed stability predicates, per path
+
+| site | shape | verdict |
+|---|---|---|
+| `waitAtsFormReady` — **GH / Lever / Ashby / iCIMS / Oracle** | was `stable >= 2` (3 reads) | ⚠ **the same bug, and it was never Oracle-only** — every ats.js tenant paid it. Fixed round 19: timed quiet window (1200ms) + the original ≥2500ms floor. |
+| `awaitFieldSetSettled` — **Workday** | `now - lastChangeAt >= 1200ms` | ✔ already timed. This is the model the others should follow, and the reason the operator never saw the lag here. |
+| `atsIcimsAwaitParse` — **iCIMS résumé parse** | `stableReads: 3` **AND** `idle >= 2500ms` | ⚠ carries the same 3-round-trip amplification — but **left alone deliberately**. Its own comment is the argument: being slow costs latency, being early costs the ENTIRE fill, and "polling faster makes a STABILITY predicate weaker". Changing it is the documented *"a speed fix removes the settling its slowness provided"* trap. Recorded, not touched. |
+| iCIMS form-ready settle (`background.js` ~5187) | `stable >= 1` (2 reads) | ✔ fine — you cannot claim stability from ONE sample, so two is the minimum, not a floor. |
+| `atsInjOrcPickFromOwnList`, entry open/commit | page-side polling inside ONE eval | ✔ correct by design — a slow single `Runtime.evaluate` here is a budget doing its job. |
+
+### What this leaves
+
+The lag fix is now global. The remaining amplifier is iCIMS' parse settle, and it is a *conscious* trade
+rather than an oversight — if it ever needs cutting, the lever is a cheaper probe (round 13's
+`atsInjLeanSignature` already did that once) rather than fewer samples.
+
+The standing rules are now in **CLAUDE.md → "Don't write laggy code"**, so they are read before a wait is
+written rather than after a run is slow.
