@@ -2675,3 +2675,51 @@ inside an eval we were going to make anyway) — neither of which makes it short
 BACKGROUNDED tabs — on a visible tab it is a guaranteed no-op costing a full round trip. Gated on the
 (cached, chrome.tabs-based, free) visibility check, failing CLOSED so any error still wakes. Measured:
 **22 no-op round trips skipped** on one fill.
+
+## Round 25 — the end-date gap: the operator's 100ms wins, and BOTH "detect it" attempts lose (2026-08-22)
+
+Operator: *"it seems like a flake, sometimes it fills fine and sometimes it doesn't so you are wrong"* —
+correct, and my round-24 conclusion was drawn from one trace line. Then: *"add a small 100 ms delay
+after start fills, then fill end"*, and *"instead of hardcoding it, find a way to detect it and answer
+still as fast as possible."*
+
+### endDate pair timings, by implementation
+
+| implementation | endDate pairs (3 entries) |
+|---|---|
+| no gap | 3000 / 2774 / 2729 · and 1555 / 2785 / 1546 |
+| **unconditional 100ms (operator's)** | **882 / 848 / 1639 · and 832 / 1671 / 839** |
+| conditional on the previous half's stall | 1554 / 1527 / 1502 |
+| page-side auto-open detection | never engaged — a no-op |
+
+startDate, for scale, is 703-804ms throughout. So the operator's fix brings 2 of 3 endDate pairs level
+with startDate; the remaining one still loses the race.
+
+### WHY it works — and it is NOT what I assumed
+
+The trace, with the discriminating no-op probe:
+
+```
+↳ endDate month: eval 1948ms SW-side vs 291ms page-side [no-op probe just before: 2ms ⇒ page FREE]
+                 sibling-list wait 0ms · not focused, clicked straight away · rows 12@150ms
+```
+
+The page is free (2ms), the picker is fast (291ms page-side, rows at 150ms). The ~1.65s sits **between
+our probe returning and our eval returning** — the WORKER stalling, not the page. Which is why a *pace*
+helps: a scheduled timer gives the MV3 worker a reason to stay scheduled, the same mechanism as the
+keep-warm beat. ⚠ **Round 24's "it's ORC's renderer" is refuted by that 2ms probe.**
+
+### Both attempts to replace the constant, and why each failed
+
+1. **Page-side detection of ORC auto-opening the picker** (the toggle-race theory this file already
+   suspected). Its own instrument reported **"not focused, clicked straight away"** on every endDate
+   half — ORC does not auto-open on focus — so it never engaged, and the pairs regressed to
+   1555/2785/1546.
+2. **Conditioning the pace on the previous half's measured stall** (`lastStallMs > 250`). Worse still:
+   1554/1527/1502, every pair carrying a re-open. **The stall is not autocorrelated**, so a past stall
+   does not predict the next one and the gate skips exactly when it is needed.
+
+⚠ **So "as fast as possible" is satisfied by PAYING the 100ms, not by trying to skip it.** It buys the
+avoidance of a ~700ms re-open, and no observable predicts which pair will need it. A constant is the
+right shape here — the thing to avoid is a constant nobody measured, and this one now has four runs
+behind it.

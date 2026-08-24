@@ -4611,7 +4611,7 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   // A value present for ~4ms is invisible to a 60ms read-back poll, so the caller would record "not
   // retained" for a commit that DID happen — and then retry it, which is the double-fill observed.
   const T0 = Date.now();
-  const tr = { openedByUs: false, waitedForSibling: null, siblingStillUp: null, rowsAt: null, rowsN: 0, typedAt: null, narrowedAt: null,
+  const tr = { openedByUs: false, autoOpenWait: null, autoOpened: null, waitedForSibling: null, siblingStillUp: null, rowsAt: null, rowsN: 0, typedAt: null, narrowedAt: null,
                firstRow: null, enterAt: null, samples: [], reopens: 0 };
   const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
   const readRows = () => {
@@ -4661,7 +4661,42 @@ async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetM
   }
   tr.waitedForSibling = Date.now() - sibT0;
   tr.siblingStillUp = otherListUp();
-  if (!listUp()) { el.focus(); el.click(); tr.openedByUs = true; }
+
+  // -- DETECT WHETHER ORC IS ALREADY OPENING THIS PICKER, rather than delaying blindly ------------
+  // Operator, 2026-08-22: "instead of hardcoding it, find a way to detect it and answer still as fast
+  // as possible."
+  //
+  // WHY A FIXED DELAY WORKED AT ALL, measured: the slow endDate half traced as `rows 12@946ms,
+  // reopens 1` with a no-op probe of **2ms** taken immediately before it. The page was FREE, so those
+  // 946ms were entirely OUR OWN doing: the picker clicked, saw nothing, waited its 700ms, re-clicked.
+  // That is the TOGGLE RACE this file already suspected -- ORC moves focus to the next date input and
+  // opens its list ON FOCUS, so a click arriving mid-open SHUTS it. A fixed 100ms only helped by
+  // letting the auto-open finish first, which is a guess at someone else's timing; 1 of 3 pairs still
+  // lost the race (1639ms, one re-open).
+  //
+  // The detectable version, from signals this file has already measured:
+  //   * rows already up      => nothing to do. Fastest path, zero clicks.
+  //   * the input is FOCUSED => ORC is opening it. WAIT for the listbox instead of clicking, because
+  //                             the click is exactly what would close it. "The listbox element does
+  //                             not exist at all while the widget is closed", so its APPEARANCE is the
+  //                             confirmation -- evidence, not a timer.
+  //   * not focused          => nothing is opening it. Click IMMEDIATELY and pay nothing. This is the
+  //                             first picker in an entry (startDate), which never needed a wait.
+  // Both waits are bounded, so a tenant that focuses without auto-opening falls through to the click
+  // quickly rather than stalling.
+  const lbExists = () => !!(lbId && document.getElementById(lbId));
+  if (!listUp()) {
+    if (document.activeElement === el) {
+      const aT0 = Date.now();
+      while (!lbExists() && Date.now() - aT0 < 300) await new Promise((r) => setTimeout(r, 15));
+      if (lbExists()) {
+        while (!listUp() && Date.now() - aT0 < 700) await new Promise((r) => setTimeout(r, 15));
+      }
+      tr.autoOpenWait = Date.now() - aT0;
+      tr.autoOpened = listUp();
+    }
+    if (!listUp()) { el.focus(); el.click(); tr.openedByUs = true; }
+  }
   let rows = [], reopens = 0;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 120));
@@ -6373,6 +6408,9 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
       // nothing. Whether it actually helps is a measurement, not a claim — the picker trace prints the
       // SW-vs-page split for every slow half, so the next run says so either way.
       let datePairsDone = 0;
+      // The SW-vs-page gap the last date half observed. Drives the conditional pace above: a stall is
+      // the only evidence that the worker is in the regime where a scheduled timer helps.
+      let lastStallMs = 0;
       for (const [key, group] of byName) {
         const spec = map[key] || null;
         if (!spec) { unmapped.push(key + (group[0].label ? " (" + group[0].label + ")" : "")); continue; }
@@ -6407,8 +6445,36 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
             ? [NAMES[mNum - 1], NAMES[mNum - 1].slice(0, 3), String(mNum).padStart(2, "0"), String(mNum)]
             : [];
           const yearCands = [String(ym.year)];
-          // The settle gap declared above — only between pairs, so the first date in an entry is
-          // unaffected and a single-date entry never pays it.
+          // ⚠⚠ THE GAP IS BACK, AND ITS MECHANISM IS THE OPPOSITE OF WHAT I ASSUMED (measured 2026-08-22).
+          //
+          // I removed this in favour of page-side "detect whether ORC is auto-opening the picker", on
+          // the theory that a click arriving mid-open toggles it shut. The detector reported
+          // **"not focused, clicked straight away"** on every single endDate half -- ORC is NOT
+          // auto-opening on focus -- so it was a no-op, and the pairs regressed from
+          // 882/848/1639ms back to 1555/2785/1546ms. The hypothesis is refuted by its own instrument.
+          //
+          // WHERE THE TIME ACTUALLY IS, from the same trace: `eval 1948ms SW-side vs 291ms page-side`,
+          // `rows 12@150ms`, and a no-op probe of **2ms** immediately before. The page is free, the
+          // picker is fast; the ~1.65s sits between OUR probe returning and OUR eval returning. It is
+          // the worker stalling, not the page -- which is why a PACE fixes it: a scheduled timer gives
+          // the MV3 worker a reason to stay scheduled, exactly like the keep-warm beat. That also means
+          // no page-side detector can ever replace it, because the condition is not on the page.
+          //
+          // ⚠ CONDITIONAL, so "as fast as possible" still holds (operator's requirement): the gap is
+          // only spent when the PREVIOUS half actually showed a dispatch stall. A healthy pair pays
+          // nothing. `lastStallMs` is the SW-vs-page difference the trace already computes, so this is
+          // detection on the axis that is genuinely observable -- our own dispatch health -- rather
+          // than on the page state, which measured innocent.
+          // ⚠⚠ UNCONDITIONAL, AND THAT IS THE MEASURED ANSWER — both attempts to make it conditional
+          // are refuted (2026-08-22):
+          //   1. PAGE-SIDE DETECTION of ORC auto-opening the picker. Its own instrument reported
+          //      "not focused, clicked straight away" on every endDate half, so it never engaged, and
+          //      the pairs regressed 882/848/1639ms -> 1555/2785/1546ms.
+          //   2. CONDITIONING ON THE PREVIOUS HALF'S STALL (`lastStallMs > 250`). Also worse:
+          //      1554/1527/1502ms, every pair carrying a re-open. The stall is not autocorrelated, so a
+          //      past stall does not predict the next one — the gate skips exactly when it is needed.
+          // The unconditional pace measures 882/848/1639ms. It is 100ms spent to avoid a ~700ms re-open,
+          // so "as fast as possible" is SATISFIED BY PAYING IT, not by trying to skip it.
           if (datePairsDone > 0) await act.delayFull(100);
           const got_by = {}; const failed = [];
           // ⚠⚠ PER-HALF OUTCOMES, because each half becomes its OWN review record (operator,
@@ -6488,6 +6554,13 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
               r = await act.eval(atsInjOrcPickFromOwnList, sel, monthCands, yearCands, ATS_ORC_PICK_MS).catch(() => null);
               swMs += Date.now() - evT0;
               if (probeMs != null) lastProbeMs = probeMs;
+              // Record the dispatch stall for the NEXT pair's decision, whether or not the trace is on:
+              // page-side elapsed comes back in the trace, so the difference needs no extra probe.
+              if (r && r.trace) {
+                const pm = (r.trace.samples && r.trace.samples.length)
+                  ? r.trace.samples[r.trace.samples.length - 1].t : (r.trace.enterAt || 0);
+                lastStallMs = Math.max(0, (Date.now() - evT0) - pm);
+              }
               reopenTotal += (r && r.reopens) || 0;
               if (!r || !r.ok) continue;
               // READ-BACK VERIFIED, but settled PAGE-SIDE inside the primitive — see the note there.
@@ -6508,6 +6581,9 @@ async function atsOrcFillEntries(act, profile, jc, opts) {
                 + (lastProbeMs != null ? ` [no-op probe just before: ${lastProbeMs}ms ⇒ ${lastProbeMs > 400 ? "the PAGE thread was busy" : "the page was FREE, so the delay is OURS"}]` : "")
                 + ` (⇒ ${Math.max(0, swMs - pageMs)}ms of transport/scheduling) ·`
                 + ` sibling-list wait ${q.waitedForSibling}ms${q.siblingStillUp ? " (STILL UP!)" : ""} ·`
+                + (q.autoOpenWait != null
+                    ? ` ORC auto-open ${q.autoOpened ? "CAUGHT" : "missed"} after ${q.autoOpenWait}ms ·`
+                    : " not focused, clicked straight away ·")
                 + ` openedByUs=${q.openedByUs} rows=${q.rowsN}@${q.rowsAt}ms`
                 + ` typed@${q.typedAt}ms narrowed@${q.narrowedAt == null ? "NEVER" : q.narrowedAt + "ms"}`
                 + ` firstRow=${JSON.stringify(q.firstRow)} enter@${q.enterAt}ms reopens=${q.reopens}`
