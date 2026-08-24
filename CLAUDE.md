@@ -913,7 +913,9 @@ The standing rules:
 - **`runAtsSubmitRun` gates** (all must pass before the one trusted click): bundle blockers + STRICT live
   verify + **no VISIBLE captcha challenge** + `arm===true` (absent ⇒ full dry rehearsal logging "WOULD CLICK
   SUBMIT"). **AI is OFF for submit runs regardless of the toggle.** A VISIBLE challenge halts
-  `needs_operator` — **the bot never solves or bypasses a captcha.**
+  `needs_operator` — **the bot never solves or bypasses a captcha.** ⚠ The one trusted click can become
+  **two**, when the form answers Submit by emailing a verification code — see the email-verification section
+  above; that is a possession factor, NOT a relaxation of the captcha rule.
 - **A CLOSED POSTING IS NOT A BROKEN PIPELINE** — `atsPostingGone` reads Lever's `Not found` title and
   Greenhouse's redirect-to-board-index, and halts `posting-gone` rather than sending the operator to debug a
   fill on a job that no longer exists.
@@ -944,6 +946,54 @@ The standing rules:
   to the operator's yes/no model while the "Fill — essays and long answers" slot sat unused; the Workday
   twin (`aiFillText`) had always routed correctly. Live-verified: `AI batch [text → "essay" route]` next to
   `[LLM] … for "essay"`.
+
+## AN EMAILED VERIFICATION CODE IS ANSWERED FROM THE INBOX — SUBMIT IS TWO CLICKS (operator, 2026-08-24)
+
+Observed DOM (the eight `#security-input-N` boxes, the disabled button, why shape-matching an 8-char run
+fails): `docs/dom-patterns.md` `2026-08-24 — Greenhouse: SUBMIT IS TWO CLICKS`. The standing rules:
+
+- **Greenhouse can answer "Submit application" by MAILING AN 8-CHARACTER CODE** and holding the submit
+  disabled until it is typed into `div.email-verification__wrapper`. So an armed submit is **one authorized
+  ACTION that can take two clicks** — the arm gate authorizes submitting *this application*, not a number of
+  clicks — and `atsAnswerEmailVerify` (background.js) sits between them.
+- **⚠ THIS IS NOT CAPTCHA HANDLING, and the distinction is the entire licence for it.** A captcha is a
+  challenge designed to be unsolvable by a machine; the standing rule that the bot never solves or bypasses
+  one is UNTOUCHED — `captchaChallenge` still halts `needs_operator`, and nothing here solves, forges or
+  hides a challenge. This is a **possession factor**: a code mailed to an address the operator owns and has
+  already granted `gmail.readonly` on, for an application a human approved field-by-field at the review gate.
+  Operator's reasoning: everything submitted is human-approved, so proving control of the mailbox is the one
+  step in the flow carrying no judgement. **Do not generalise it to any other kind of challenge.**
+- **Why it needed code rather than a halt:** the gate is invisible to the outcome loop — not a confirmation,
+  not a visible captcha, and `#email-verification-error` does not exist until a code is REJECTED. An armed run
+  therefore ended `no-confirmation` after 30s with the application **unsent** and no log line explaining it.
+  A gate we cannot NAME is worse than either a pass or a halt.
+- **A CODE IS RECOGNISED BY THE WORDS AROUND IT, NEVER BY ITS SHAPE.** `gmailExtractVerificationCode`
+  (gmail.js — a SIBLING of `gmailExtractVerificationUrl`, never a widening of it, so Workday's live
+  auto-verify is untouched) strips the body to prose first, then requires a **cue**. Cue words are excluded
+  **positionally** (`"security"` is 8 chars and sits beside every cue; testing the cue regex against a lone
+  token fails because the pattern needs the whole phrase), and a **shape tie-break** prefers a digit-carrying
+  or all-caps candidate over ordinary English of the same length (`"continue"`). ⚠ The tie-break only CHOOSES
+  BETWEEN candidates already next to a cue — **two code-shaped candidates still REFUSE.**
+- **The LENGTH is the form's own box count**, cross-checked against its own prose. A length mismatch is
+  REFUSED and writes nothing: `maxlength="1"` would silently truncate the difference, which then looks like a
+  wrong code rather than a wrong write.
+- **⚠ THE FRESHNESS FLOOR IS THE MOMENT WE CLICKED**, absolute, not a relative window. A code from an earlier
+  attempt is still in the inbox and still matches every test; typing it **burns the operator's real one** and
+  reports a rejection that looks exactly like a bad extractor.
+- **ONE ATTEMPT. A rejected code HALTS, never retries** — the code is single-use, so re-typing the one we
+  already used cannot succeed, and guessing again spends the operator's attempts. Same for every other
+  uncertainty: a gate ALREADY on screen before we click (a prior attempt mid-flight — `verification-in-flight`,
+  checked before the click so a rehearsal reports it too), boxes already holding characters
+  (`verification-partly-entered`), Gmail off or `chrome.storage.local.skipEmailVerify`
+  (`verification-code-required`), a form that keeps Submit disabled (`verification-code-not-accepted`).
+- **The code never reaches a log line, a record or a run result.** `atsInjFillEmailCode` returns a LENGTH, a
+  MATCH BOOLEAN and per-box occupancy — never a value — exactly like `atsInjSetCredential`, and the stage logs
+  the character count and the sender, never the code.
+- **The form's own acceptance signal is the gate we trust**: the button is disabled until every box is filled,
+  so `submitDisabled:false` is the PAGE agreeing the code is complete — stronger than our string compare
+  because it is the widget's judgement rather than ours.
+- **The confirmation budget is EXTENDED, not shared.** Answering the gate can spend 120s waiting for mail,
+  which would consume the 30s outcome budget and make a SUCCESSFUL submit report `no-confirmation`.
 
 ## Onboarding walk (pre-form: JD → apply → login → verify)
 

@@ -2416,6 +2416,138 @@ function atsInjSubmitState(ats) {
     disabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null, captchaChallenge: challenge, confirmed, url: location.href };
 }
 
+// ── THE EMAIL-VERIFICATION GATE: SUBMIT IS TWO CLICKS, NOT ONE (traced live 2026-08-24) ──
+// On a Zipline Greenhouse posting, pressing "Submit application" does NOT submit. It mails an
+// 8-character code to the applicant's own address and re-renders the footer as
+// `div.email-verification__wrapper`: eight `<input id="security-input-N" type="text"
+// maxlength="1" aria-required="true" aria-errormessage="email-verification-error">` boxes, and
+// the SAME submit button — now `disabled` / `aria-disabled="true"` — inside the SAME <form>.
+//
+// ⚠ WHY THIS NEEDED CODE RATHER THAN A HALT. Nothing in the post-click loop could see it: it is
+// not a confirmation, not a visible captcha, and `#email-verification-error` does not exist until
+// a code is REJECTED. So an armed run clicked Submit, waited its 30s, and ended
+// `no-confirmation` — the application NOT submitted, and the log unable to say why. A gate we
+// cannot name is the worst of the three outcomes.
+//
+// ⚠ AND IT IS NOT A CAPTCHA, WHICH IS WHY IT MAY BE ANSWERED AT ALL. The rule this repo holds —
+// "the bot never solves or bypasses a captcha" — is about a challenge designed to be unsolvable
+// by a machine. This is a POSSESSION factor: a code mailed to an address the operator owns and
+// has already granted this extension readonly OAuth on, for an application a human approved
+// field by field at the review gate. The page's reCAPTCHA is untouched, and `captchaChallenge`
+// still halts `needs_operator` exactly as before. Nothing here solves, forges or hides a
+// challenge.
+//
+// READ-ONLY. Returns everything the stage needs to decide, and NOTHING it could actuate on blind.
+function atsInjEmailVerifyState() {
+  const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  // ORDER BY THE ID'S OWN INDEX, never by document order. The boxes are the code's characters, so
+  // a re-render that appends out of order would type a correct code in the wrong sequence and
+  // report a rejection that looks like a bad extraction.
+  const numbered = [...document.querySelectorAll('input[id^="security-input-"]')]
+    .map((el) => ({ el, n: Number(String(el.id).replace(/^security-input-/, "")) }))
+    .filter((x) => Number.isFinite(x.n))
+    .sort((a, b) => a.n - b.n);
+  const wrapper = document.querySelector(".email-verification__wrapper");
+  // Fallback for a tenant that renames the ids but keeps the shape: single-character boxes inside
+  // the verification wrapper. Deliberately requires the wrapper — a bare `[maxlength="1"]` sweep
+  // over a whole application form would collect unrelated inputs.
+  const boxes = numbered.length ? numbered.map((x) => x.el)
+    : (wrapper ? [...wrapper.querySelectorAll('input[maxlength="1"]')] : []);
+  const shown = boxes.filter(vis);
+
+  // The submit control. ⚠ A DELIBERATE IN-FUNCTION DUP of atsInjSubmitState's finder: each
+  // injected function is stringified on its own and cannot call a sibling, and CLAUDE.md's rule is
+  // that a lockstep dup lives INSIDE a function so it never touches the shared global scope.
+  const btn = [...document.querySelectorAll('button[type="submit"], button')]
+    .find((b) => /submit application|submit$/i.test(clean(b.textContent)) && vis(b)) || null;
+  const r = btn ? btn.getBoundingClientRect() : null;
+  const err = document.getElementById("email-verification-error");
+  // The notice names the DESTINATION address. Worth returning: "the code went to X but we are
+  // connected to Y" is a diagnosis, where a bare poll timeout is a mystery.
+  const notice = clean((wrapper && wrapper.innerText) || "")
+    || clean([...document.querySelectorAll("div, p, span")]
+      .filter((e) => e.children.length < 3 && /verification code was sent|enter the \d+-character code/i.test(e.textContent || ""))
+      .map((e) => e.textContent).pop() || "");
+  const to = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/.exec(notice);
+  const nchar = /\b(\d+)-character\b/.exec(clean(document.body.innerText || "").slice(0, 20000));
+
+  return {
+    ok: true,
+    present: shown.length > 0,
+    boxCount: shown.length,
+    // How many boxes already hold a character — a re-entry guard, so a stage that already ran
+    // (or an operator who typed it by hand) is visible rather than overwritten blind.
+    filledCount: shown.filter((b) => String(b.value || "").length > 0).length,
+    // The form's OWN statement of the code length. Used to cross-check the box count, because two
+    // independent statements agreeing is what makes the length a fact rather than an assumption.
+    statedLength: nchar ? Number(nchar[1]) : null,
+    emailedTo: to ? to[1] : null,
+    notice: notice.slice(0, 240),
+    errorText: err && vis(err) ? clean(err.textContent).slice(0, 200) : null,
+    hasSubmit: !!btn,
+    submitDisabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null,
+    rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
+  };
+}
+
+// Type the code into the per-character boxes. Separate from atsInjSetText for the same two
+// reasons atsInjSetCredential is separate, both of which bite here:
+//
+// 1. ⚠ IT NEVER RETURNS THE CODE. atsInjSetText answers `{after: el.value}`, and this path's
+//    result object is logged and carried on a run result. A single-use code is not an account
+//    password, but it is the one secret in the submit run, so it leaves as a MATCH BOOLEAN.
+// 2. ⚠ IT CLEARS FIRST and does not blur between boxes. The setter SETS rather than replaces, so
+//    a re-entry over a half-typed code would concatenate — and `maxlength="1"` then silently
+//    TRUNCATES the result, which is the failure mode that looks like a wrong code rather than a
+//    wrong write. Blur per box would fire the widget's own validation eight times mid-write.
+function atsInjFillEmailCode(code) {
+  const chars = String(code == null ? "" : code).split("");
+  const numbered = [...document.querySelectorAll('input[id^="security-input-"]')]
+    .map((el) => ({ el, n: Number(String(el.id).replace(/^security-input-/, "")) }))
+    .filter((x) => Number.isFinite(x.n))
+    .sort((a, b) => a.n - b.n);
+  const wrapper = document.querySelector(".email-verification__wrapper");
+  const boxes = (numbered.length ? numbered.map((x) => x.el)
+    : (wrapper ? [...wrapper.querySelectorAll('input[maxlength="1"]')] : []))
+    .filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+  if (!boxes.length) return { ok: false, error: "no-code-boxes" };
+  // A 6-box widget must never be handed an 8-character code (nor the reverse): the extra
+  // characters would vanish into maxlength and the run would report a rejected code.
+  if (boxes.length !== chars.length) return { ok: false, error: "length-mismatch", boxCount: boxes.length, codeLength: chars.length };
+
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  for (let i = 0; i < boxes.length; i++) {
+    const el = boxes[i];
+    try {
+      el.focus();
+      setter.call(el, "");
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      setter.call(el, chars[i]);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (e) { return { ok: false, error: "write-failed@" + i + ":" + String((e && e.message) || e) }; }
+  }
+  const last = boxes[boxes.length - 1];
+  try { last.blur(); last.dispatchEvent(new Event("focusout", { bubbles: true })); } catch (e) { /* the write is what matters */ }
+
+  const readBack = boxes.map((b) => String(b.value || "")).join("");
+  const btn = [...document.querySelectorAll('button[type="submit"], button')]
+    .find((b) => /submit application|submit$/i.test(String(b.textContent || "").replace(/\s+/g, " ").trim())) || null;
+  return {
+    ok: readBack === chars.join(""),
+    matches: readBack === chars.join(""),
+    len: readBack.length,
+    // Per-box occupancy, so a partial write says WHERE it stopped without ever naming a character.
+    perBox: boxes.map((b) => String(b.value || "").length),
+    // ⚠ THE WIDGET'S OWN ACCEPTANCE SIGNAL. The button is disabled until every box holds a
+    // character, so `submitDisabled:false` is the page agreeing the code is complete — a free
+    // read-back gate of exactly the kind the safety contract asks for, and stronger than our own
+    // string compare because it is the form's judgement rather than ours.
+    submitDisabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null,
+  };
+}
+
 // Validation errors after a refused submit — per-ATS error nodes + a generic fallback.
 function atsInjErrors(ats) {
   const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
@@ -6150,5 +6282,6 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
+    atsInjEmailVerifyState, atsInjFillEmailCode,
   };
 }

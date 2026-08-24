@@ -37,6 +37,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
+| **Email-verification gate (emailed code)** | `2026-08-24 — Greenhouse: SUBMIT IS TWO CLICKS` |
 | **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out`, `2026-08-18 — four more tenants: the Apply widget, the bare "Type", and the settle probe` |
 | **Employer-hosted portals + sign-in gates + captcha** | `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage` |
 | **Option lists: paging, completeness, what review can offer** | `2026-08-16 (d) — Astrion iCIMS: the dropdown PAGE SIZE` |
@@ -4501,3 +4502,70 @@ per nominal-900ms tick — ~2.9s per tick in practice. A lean read of name + has
 ⚠ Both sides of that comparison must be computed the same way. A full-scan baseline against lean ticks
 differs on tick ONE, which the loop reads as "the parse changed the form" — and a false `changed` lets the
 wait finish on the first brief quiet, potentially **before the parse has started**.
+
+## 2026-08-24 — Greenhouse: SUBMIT IS TWO CLICKS — an emailed 8-character code stands between them
+
+Traced read-only on a live Zipline posting (`job-boards.greenhouse.io/embed/job_app?for=flyzipline`), on a
+form the operator had filled and reached the end of by hand. **Pressing "Submit application" does not submit
+the application.** It mails an 8-character code to the applicant's own address and re-renders the footer:
+
+```html
+<div class="email-verification__wrapper">
+  A verification code was sent to <em>…@gmail.com</em>. To submit your application, enter the
+  8-character code to confirm you're a human.
+  <label for="security-input-0">Security code</label>
+  <input id="security-input-0" type="text" aria-invalid="false"
+         aria-errormessage="email-verification-error" aria-required="true" maxlength="1" value="">
+  … security-input-1 … security-input-7
+</div>
+<button type="submit" class="btn btn--pill btn__disabled" aria-disabled="true">Submit application</button>
+```
+
+Measured facts, all read off the page itself:
+
+| | |
+|---|---|
+| boxes | **8**, `#security-input-0` … `-7`, each `maxlength="1"`, `aria-required="true"` |
+| container | `div.email-verification__wrapper`, ONE shared parent for all eight |
+| framework | React-controlled (`__reactFiber$*` / `__reactProps$*` on each box) ⇒ native-setter + `input` event |
+| form | the boxes are **inside the SAME `<form>`** as the application, and the SAME submit button is reused |
+| button | `disabled` + `aria-disabled="true"` + `btn__disabled` until every box holds a character |
+| error node | `#email-verification-error` — **does not exist** until a code is REJECTED |
+| captcha | a dormant invisible reCAPTCHA badge, present before and after; unrelated to this gate |
+
+### ⚠ Why the run could not see it, and ended `no-confirmation`
+
+The armed submit's outcome loop watches for exactly three things: a confirmation, a VISIBLE captcha, and
+validation errors. This gate is **none of them** — it is not a confirmation, the reCAPTCHA stays invisible,
+and the error node is absent until a code is rejected. So an armed run clicked Submit, polled its 30s, and
+returned `stopped:"no-confirmation"` with the application **unsent** and nothing in the log to explain why.
+*A gate we cannot name is worse than either a pass or a halt*, because the operator cannot tell a broken
+pipeline from a form that is simply waiting.
+
+### The 8-character run is NOT findable by shape — two refutations paid for by tests
+
+1. **A real HTML email is full of 8-character runs that are not the code.** Class hashes (`shell_44ff9911`),
+   hex colours, a tracking path segment (`/f/a/PXQ99KLM/x/BB771A2C`) — all match `[A-Za-z0-9]{8}` as well as
+   the code does. So the body is stripped to PROSE first (script/style bodies, tags **and their attributes**,
+   URLs, entities) and a code is only ever recognised **by the words around it**.
+2. **The cue's own words are candidates, and so is ordinary English.** At length 8 `"security"` sits
+   immediately beside every cue, and `"continue"` sits in the sentence after it. Two fixes, both load-bearing:
+   cue words are excluded **POSITIONALLY** (by span overlap — testing the cue regex against a lone token
+   fails, because the pattern needs the whole phrase `"security code"`), and a **shape tie-break** prefers a
+   candidate carrying a digit or written in caps. The tie-break only ever CHOOSES BETWEEN candidates already
+   next to a cue, never finds one: two code-shaped candidates still refuse.
+
+### The freshness floor is the guard that matters
+
+A code from an EARLIER attempt is still in the inbox, still 8 characters, still next to the same cue. The
+poll's floor is therefore the **absolute moment we clicked Submit** (minus 60s of clock skew), not a relative
+window — typing a stale code burns the operator's real one and reports a rejection that looks exactly like a
+bad extractor. A message older than that floor is counted and named in the failure text (`N older message(s)
+skipped as predating the submit click`) rather than silently ignored.
+
+### What is NOT being done here
+
+This is a **possession factor**, not a captcha: a code mailed to an address the operator owns and has already
+granted this extension `gmail.readonly` on, for an application a human approved field-by-field. The page's
+reCAPTCHA is untouched and `captchaChallenge` still halts `needs_operator` — nothing solves, forges or hides
+a challenge. One attempt only: the code is single-use, so a rejected one is a HALT, never a retry.

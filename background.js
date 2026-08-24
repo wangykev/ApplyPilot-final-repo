@@ -1221,7 +1221,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             const tab = await new Promise((res) => chrome.tabs.create({ url: "about:blank", active: !background }, res));
             if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
             await waitTabComplete(tab.id, 20000);
-            const res = await runAtsSubmitRun(tab.id, atsKind, pull.bundle, { arm, startUrl });
+            // gmailEnabled reaches the ATS submit run for ONE purpose: a form that answers Submit
+            // with an emailed verification code (Greenhouse, live 2026-08-24). OFF ⇒ that gate halts
+            // for the operator instead of being answered — see atsAnswerEmailVerify.
+            const res = await runAtsSubmitRun(tab.id, atsKind, pull.bundle, { arm, startUrl, gmailEnabled });
             sendResponse({ ...res, job_key: jobKey, application_id: pull.application_id || null, tabId: tab.id, startUrl });
             return;
           }
@@ -5417,11 +5420,122 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   }
 }
 
+// ── THE EMAIL-VERIFICATION GATE: ANSWER IT FROM THE INBOX WE ALREADY READ ─────────────────
+// Live 2026-08-24 (Zipline, Greenhouse): "Submit application" does not submit. It mails an
+// 8-character code to the applicant's own address and re-renders the footer as eight
+// single-character boxes with the submit button DISABLED until they are all filled. So an armed
+// submit is TWO clicks, and the run could not see the thing between them: not a confirmation,
+// not a visible captcha, and the error node does not exist until a code is REJECTED — it ended
+// `no-confirmation` after 30s with the application unsent and nothing in the log to explain it.
+//
+// ⚠ THIS IS NOT CAPTCHA HANDLING, AND THE DISTINCTION IS THE WHOLE LICENCE FOR IT. A captcha is
+// a challenge designed to be unsolvable by a machine, and the standing rule — the bot never
+// solves or bypasses one — is untouched: `captchaChallenge` still halts `needs_operator`, and
+// nothing here solves, forges or hides a challenge. This is a POSSESSION factor: a code mailed
+// to an address the operator owns and has already granted this extension gmail.readonly OAuth
+// on, for an application a human approved field-by-field at the review gate. The operator's
+// reasoning (2026-08-24): everything that gets submitted is human-approved, so proving control
+// of the mailbox is the one step in the flow that carries no judgement.
+//
+// SAFETY, in layers — every one of these is a REFUSAL, not a retry:
+//   • it runs ONLY after an armed submit click. A rehearsal never clicks, so it never gets here;
+//     a gate found BEFORE the click is a prior attempt mid-flight and halts for the operator.
+//   • `notBeforeMs` is the moment WE clicked. A code from an earlier attempt is still in the
+//     inbox and still matches every shape test — typing it would burn the real one.
+//   • the code LENGTH comes from the form's own box count, cross-checked against its own prose.
+//   • the extractor REFUSES on two candidates rather than picking (gmail.js).
+//   • ONE attempt. A rejected code is a halt, because the code is single-use and re-typing the
+//     same one cannot succeed — see the note at the rejection branch.
+//   • Gmail OFF, or the kill-switch `chrome.storage.local.skipEmailVerify`, halts with the
+//     manual instructions instead.
+//
+// Returns { done:true } when the gate is answered and the caller should keep polling for a
+// confirmation, { absent:true } when there is no gate, or a HALT object to return as-is.
+async function atsAnswerEmailVerify(o) {
+  const LOG = o.log || (() => {});
+  const state = await cdpEval(atsInjEmailVerifyState).catch(() => null);
+  if (!state || !state.present) return { absent: true };
+
+  const boxes = Number(state.boxCount || 0);
+  LOG(`EMAIL VERIFICATION GATE — the form mailed a ${boxes}-character code${state.emailedTo ? " to " + state.emailedTo : ""} and is holding the submit until it is entered.`);
+  if (state.statedLength && state.statedLength !== boxes) {
+    // Two independent statements of the length disagreeing is exactly the condition under which
+    // we must not assume: the widget is what we type into, so it wins, but say so out loud.
+    LOG(`⚠ the page SAYS ${state.statedLength} characters but renders ${boxes} boxes — filling ${boxes} (the widget is what accepts the code).`);
+  }
+  if (state.filledCount) {
+    // Already-typed boxes mean someone (or a previous stage) got here first. Overwriting blind
+    // could mix two codes; the fill clears per box, but the SOURCE of the existing characters is
+    // unknown and a wrong submit is not undoable.
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-partly-entered",
+      detail: `${state.filledCount} of ${boxes} code boxes already hold a character — this run did not type them. Finish the code yourself in the tab and press Submit, or clear the boxes and re-run.` };
+  }
+
+  const kill = await new Promise((r) => chrome.storage.local.get(["skipEmailVerify"], (v) => r(!!(v && v.skipEmailVerify))));
+  const manual = `The form emailed a ${boxes}-character verification code${state.emailedTo ? " to " + state.emailedTo : ""}. Enter it in the tab and press Submit — the application is filled and waiting on that code alone.`;
+  if (kill) {
+    LOG("skipEmailVerify is SET — not fetching the code; stopping for the operator.");
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-required", detail: manual };
+  }
+  if (!o.gmailEnabled) {
+    LOG("Gmail auto-verify is OFF — stopping for the operator.");
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-required",
+      detail: manual + " (Or enable Gmail auto-verify and Connect Gmail, and this step runs itself.)" };
+  }
+
+  emitRunProgress("Verifying your email", `reading the ${boxes}-character code from Gmail`);
+  LOG(`polling Gmail (readonly) for a ${boxes}-character code mailed after ${new Date(o.clickedAtMs).toISOString()} (up to 120s)…`);
+  let tok = await gmailGetToken(true);
+  if (!tok.ok) {
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "gmail-auth-failed",
+      detail: tok.error + " — " + manual };
+  }
+  // The sender is the WEAK half of the identification (see gmailFindVerificationCode): the cue,
+  // the exact length and the freshness floor are what actually gate it, and a sender miss widens
+  // once rather than stranding the run.
+  const args = { token: tok.token, senderContains: "greenhouse.io", length: boxes,
+    notBeforeMs: o.clickedAtMs, timeoutMs: 120000, pollMs: 5000, log: (m) => LOG("gmail: " + m) };
+  let find = await gmailFindVerificationCode(args);
+  if (!find.ok && (find.status === 401 || find.status === 403)) {
+    LOG("Gmail token 401/403 — refreshing once and retrying.");
+    await gmailRemoveCachedToken(tok.token);
+    tok = await gmailGetToken(true);
+    if (tok.ok) find = await gmailFindVerificationCode({ ...args, token: tok.token });
+  }
+  if (!find.ok) {
+    LOG("could not read a code from Gmail — " + find.error);
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-not-found",
+      detail: find.error + " — " + manual };
+  }
+  // ⚠ NEVER LOG THE CODE. It is single-use and this log is the operator's own console, but the
+  // run RESULT travels (it is returned to the website), and the habit is what keeps a value out
+  // of a place nobody audited. Length + provenance is everything needed to diagnose.
+  LOG(`✓ code found (${find.code.length} chars) in a message from ${String(find.from || "?").slice(0, 60)}` +
+    `${find.widened ? " [sender filter was widened]" : ""} — subject ${JSON.stringify(String(find.subject || "").slice(0, 60))}. Typing it into the form.`);
+
+  const w = await cdpEval(atsInjFillEmailCode, find.code).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (!w || !w.ok) {
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-not-entered",
+      detail: `Read the code from Gmail but could not type it into the form (${(w && (w.error || "read-back mismatch")) || "no result"}). ` + manual };
+  }
+  // The form's OWN acceptance signal: the button is disabled until every box holds a character,
+  // so this is the page agreeing the code is complete — stronger evidence than our string compare
+  // because it is the widget's judgement rather than ours.
+  if (w.submitDisabled === true) {
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-not-accepted",
+      detail: "Typed all " + boxes + " characters and the form still holds the submit button disabled. " + manual };
+  }
+  LOG(`code entered (${w.len}/${boxes} boxes filled, submit button ${w.submitDisabled === false ? "now ENABLED" : "state unknown"}).`);
+  return { done: true, emailedTo: state.emailedTo || null };
+}
+
 // SUBMIT run: approved bundle → blank form → re-fill → verify → gate → (armed) submit.
 // The submit click is TRUSTED input (the one irreversible action; captcha vendors also
 // score event trust) and happens ONLY when: no bundle blockers, no live verify failures,
 // no visible captcha challenge, arm===true. A visible captcha challenge is a
 // needs_operator halt — NEVER solved or bypassed by the bot.
+// ⚠ That click can become TWO, on a form that answers Submit by emailing a verification code —
+// one authorized ACTION, two clicks, with atsAnswerEmailVerify (above) between them.
 async function runAtsSubmitRun(tabId, ats, bundle, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][ATS-SUBMIT]", ...a);
   const arm = !!(opts && opts.arm);
@@ -5635,24 +5749,88 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (!state || !state.hasSubmit) return { ok: true, submitted: false, replayed: true, stopped: "no-submit-button", ats };
     if (state.captchaChallenge) return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "captcha-challenge", detail: "A captcha challenge is visible — solve it yourself in the tab, then submit manually or re-run.", ats };
 
+    // ⚠ A VERIFICATION GATE ALREADY ON SCREEN BEFORE WE CLICK is a PRIOR attempt mid-flight, and it
+    // must not be answered: the code sitting in the inbox belongs to a submit WE did not make, so
+    // there is nothing to tie it to this bundle, and the submit button is disabled anyway. Checked
+    // here rather than only after the click so a rehearsal reports it too — this is the one shape
+    // that can be present without an armed run having done anything.
+    {
+      const pre = await cdpEval(atsInjEmailVerifyState).catch(() => null);
+      if (pre && pre.present) {
+        LOG(`an email-verification gate is ALREADY on this form (${pre.boxCount} boxes, ${pre.filledCount} filled) — a previous submit attempt is mid-flight. Not clicking.`);
+        return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-in-flight", ats,
+          detail: `This form is already waiting on a verification code${pre.emailedTo ? " mailed to " + pre.emailedTo : ""} from an earlier submit attempt. Finish it in the tab, or reload the form and re-run.` };
+      }
+    }
+
     if (!arm) {
       LOG("▶▶ WOULD CLICK SUBMIT ◀◀ (dry rehearsal — every gate passed; arm the run to actually submit)");
       return { ok: true, submitted: false, replayed: true, would_submit: true, stopped: "simulate", ats };
     }
 
     // ── the ONE irreversible click — trusted input, forced. ──
+    // ⚠ "ONE" IS NOW "ONE AUTHORIZED ACTION", WHICH CAN TAKE TWO CLICKS. A form behind an
+    // email-verification gate answers the first click by mailing a code and disabling the button;
+    // the second click is the one that actually submits. Both are inside the SAME arm
+    // authorization — the operator authorized submitting this application, not a number of clicks
+    // — and the gate is answered from the operator's own mailbox (atsAnswerEmailVerify).
     LOG("⚠ ARMED — clicking Submit (trusted input).");
     cdpSetSyntheticInput(false);
+    const clickedAtMs = Date.now();
     await cdpClickAt(state.rect.cx, state.rect.cy);
-    // Outcome: confirmation, validation errors, or a captcha challenge that popped on submit.
-    const deadline = Date.now() + 30000;
+    // Outcome: confirmation, validation errors, a captcha challenge that popped on submit, or the
+    // email-verification gate. Errors are checked LAST on each tick: the gate renders its own
+    // `[role="alert"]`-ish furniture, and reading that as a validation failure would report a
+    // refused submit for a form that is simply waiting on a code.
+    // ⚠ THE DEADLINE IS EXTENDED, NOT SHARED. Answering the gate can spend up to 120s waiting for
+    // an email, which would consume the whole confirmation budget and make a SUCCESSFUL submit
+    // report `no-confirmation` — the outcome-reporting failure this loop exists to prevent. So the
+    // budget is reset for the second click: 30s to see the result of the click that was actually
+    // made, in both cases.
+    let verifiedVia = null;
+    let deadline = Date.now() + 30000;
     while (Date.now() < deadline) {
       await cdpDelay(1000);
       const s2 = await cdpEval(atsInjSubmitState, ats).catch(() => null);
-      if (s2 && s2.confirmed) { LOG("✅ SUBMITTED — confirmation detected:", s2.url); return { ok: true, submitted: true, replayed: true, confirmed: true, ats, confirmUrl: s2.url }; }
+      if (s2 && s2.confirmed) { LOG("✅ SUBMITTED — confirmation detected:", s2.url); return { ok: true, submitted: true, replayed: true, confirmed: true, ats, confirmUrl: s2.url, email_verified: verifiedVia }; }
       if (s2 && s2.captchaChallenge) { LOG("captcha challenge appeared on submit — operator must solve it in the tab."); return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "captcha-challenge", ats }; }
+      // The gate, if this form has one. Answered ONCE per run: `verifiedVia` set means the code is
+      // already in and the second click has been made, so a gate still on screen after that is a
+      // REJECTION, handled below rather than re-fetched.
+      if (!verifiedVia) {
+        const ev = await atsAnswerEmailVerify({ log: LOG, gmailEnabled: !!(opts && opts.gmailEnabled), clickedAtMs });
+        if (ev && ev.stopped) return { ...ev, ats };
+        if (ev && ev.done) {
+          verifiedVia = ev.emailedTo || true;
+          // ── the SECOND half of the same authorized submit ──
+          const s3 = await cdpEval(atsInjSubmitState, ats).catch(() => null);
+          if (!s3 || !s3.hasSubmit || !s3.rect) {
+            return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-submit-missing", ats,
+              detail: "The code is entered but the submit button could not be located to press it. Press Submit yourself in the tab." };
+          }
+          if (s3.disabled) {
+            return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-not-accepted", ats,
+              detail: "The code is entered but the form still has Submit disabled. Check the code in the tab and submit there." };
+          }
+          LOG("⚠ code accepted by the form — clicking Submit again to complete the submission (trusted input).");
+          await cdpClickAt(s3.rect.cx, s3.rect.cy);
+          deadline = Date.now() + 30000; // a fresh budget to observe THIS click's outcome (see above)
+          continue;
+        }
+      }
       const errs = await cdpEval(atsInjErrors, ats).catch(() => null);
-      if (errs && errs.errors && errs.errors.length) { LOG("submit refused — validation errors:"); errs.errors.forEach((x) => LOG("  · " + x)); return { ok: true, submitted: false, replayed: true, stopped: "validation-errors", errors: errs.errors, ats }; }
+      if (errs && errs.errors && errs.errors.length) {
+        // ⚠ A REJECTED CODE IS A HALT, NOT A RETRY. The code is single-use, so re-typing the one we
+        // already used cannot succeed, and Greenhouse does not re-mail without a resend the
+        // operator presses. Guessing again would burn attempts against the operator's application.
+        if (verifiedVia && errs.errors.some((x) => /code/i.test(String(x)))) {
+          LOG("the form REJECTED the verification code:"); errs.errors.forEach((x) => LOG("  · " + x));
+          return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-rejected", errors: errs.errors, ats,
+            detail: "The form rejected the code read from Gmail. Enter the code from your inbox yourself in the tab and press Submit — everything else is filled and approved." };
+        }
+        LOG("submit refused — validation errors:"); errs.errors.forEach((x) => LOG("  · " + x));
+        return { ok: true, submitted: false, replayed: true, stopped: "validation-errors", errors: errs.errors, ats };
+      }
     }
     LOG("no confirmation within 30s — VERIFY IN THE TAB before assuming either outcome.");
     return { ok: true, submitted: false, replayed: true, stopped: "no-confirmation", detail: "Submit was clicked but no confirmation rendered within 30s — check the tab.", ats };

@@ -173,6 +173,32 @@ delete.
 
 ## Built, live-verify pending
 
+### Greenhouse's emailed verification code — BUILT 2026-08-24, branch `greenhouse-email-verify`
+
+A Greenhouse Submit can answer with *"enter the 8-character code"* instead of submitting, so an armed submit
+is **two clicks** with a Gmail read between them. See CLAUDE.md's email-verification section (standing rules),
+`docs/dom-patterns.md` `2026-08-24` (the widget), and the progress-log entry (the two refutations).
+
+**1631 tests green** (44 new). Nothing is live-verified yet.
+
+**Remaining, in order:**
+1. Load the unpacked extension in the new browser + connect Gmail (the code path needs the same
+   `gmail.readonly` grant Workday's auto-verify uses — `docs/gmail-setup.md`).
+2. **Rehearse first.** On a Greenhouse job with an approved bundle, expect `WOULD CLICK SUBMIT` and NOTHING
+   submitted — the gate cannot appear on a rehearsal, so this only proves no regression.
+3. Then ONE armed run on a **disposable** application, eyes-on. Watch for, in order:
+   `EMAIL VERIFICATION GATE — the form mailed an 8-character code to …` → `✓ code found (8 chars) in a message
+   from …` → `code entered (8/8 boxes filled, submit button now ENABLED)` → `⚠ code accepted by the form —
+   clicking Submit again` → `✅ SUBMITTED`.
+4. **The one unproven guess is the SENDER.** `greenhouse.io` is assumed; if the mail comes from elsewhere the
+   log will say `no fresh mail matched from:greenhouse.io — widening…` and still succeed. If it widens, pin
+   the real sender in `atsAnswerEmailVerify`.
+5. Note the real email's wording in `docs/dom-patterns.md` — the cue set was written against a plausible
+   shape, not an observed one, and `ambiguous`/`no-cue` in the log is the tell that it needs the real text.
+
+**Kill-switch if any of this misbehaves:** `chrome.storage.local.skipEmailVerify = true` restores a clean
+`verification-code-required` halt for the operator.
+
 ### Website SUBMIT button + per-application LOGIN tracking — BUILT 2026-07-26
 
 This branch; see progress-log and the `workday-walk` / `review-and-submit` skills. `/app/run` gains
