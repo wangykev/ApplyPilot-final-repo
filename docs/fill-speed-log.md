@@ -3004,10 +3004,40 @@ fixed by clicking the page". So the page clock has NOT fully closed it on this m
 the uncertainty main's `atsPageClock` A/B was added to settle, and this round is more evidence for running
 it rather than an answer to it.
 
-⚠ **The visible row is CONTAMINATED and must not be read as a visible baseline.** Polling the dev tab from
-automation ACTIVATES it, which hides the run tab and adds load — the documented trap — and this round's
-reads were frequent. It is kept only because its `typed 75ms` is the cleanest input-path number obtained,
-and that measurement does not depend on visibility.
+⚠ **That visible row was CONTAMINATED** — polling the dev tab from automation ACTIVATES it, which hides the
+run tab and adds load. Re-run properly below.
+
+### Round 18b — three CLEAN visible runs (nothing touched Chrome while they ran)
+
+| run | fill | `candidate-location` | `school--0` | slowest field |
+|---|---|---|---|---|
+| V1 | 32.7s | open 683 · typed **56** · lookup 408 → **1147ms** | 777ms | country 8.7s |
+| V2 | **14.2s** | open 424 · typed **50** · lookup 414 → **888ms** | 1694ms | degree 3.2s |
+| V3 | 50.9s | open 415 · typed **188** · lookup 407 → **1010ms** | **14393ms** | a question 15.1s |
+
+**No regression, and the location work is the most stable thing on the form: 888–1147ms across all three**,
+against 2.0s pre-merge and 7.9–25.5s before any of it. `typed` is 50–188ms. School correctly stays
+per-char, and its 777ms → 14393ms spread is Greenhouse's own endpoint (documented 390ms–12s), not us.
+
+### ⚠ "IT'S VISIBLE, SO WHY DOES IT STILL LAG?" — because the lag is not in the TAB
+
+The operator asked exactly this, and it is the right question with a non-obvious answer. A foreground tab is
+NOT throttled — but the stalls are in the **MV3 service worker**, a separate context whose timers Chrome
+deprioritises on its own heuristics, tab visibility included or not. Measured across these runs: **3
+`sw-starved` paces, 1 `page-abandoned`, 1 `page`** — and the worst were a 150ms pace taking 5624ms and a
+450ms pace taking 10658ms, on a VISIBLE tab.
+
+Main's diagnostic already states the consequence, and it is the load-bearing sentence for anyone tempted to
+reach for the page clock again:
+
+> *the page clock cannot help, because that ceiling is an SW timer too. **Fewer awaits is the lever.***
+
+`cdpDelay` races a page sleep against an SW-timer abandon ceiling; when the worker is starved, the ceiling
+itself fires late, so moving WHERE a pace sleeps cannot rescue it. That makes rounds 14–17 the right shape
+of fix by accident as much as design — every one of them REMOVED awaits (a 4.8s dead poll, a 2.1s clear of
+an empty box, 11 keystrokes down to 1) rather than shortening them, and each removed await is one fewer
+chance to land on a starved timer. The remaining fill-total variance is what is left to attack the same
+way, plus the widgets' own servers.
 
 **Conclusion, stated narrowly:** the round 14–17 work still does what it claimed — per-field input cost is
 down and stayed down. It does NOT follow that a fill is reliably fast, because the dominant remaining term
