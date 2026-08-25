@@ -15,9 +15,10 @@ This file holds **standing rules, invariants and safety contracts only** — eve
 | `workday-onboarding` skill | pre-form: JD → Apply → sign-in → Gmail verify → the form |
 | `job-discovery` skill | the Simplify / @zero2sudo / LinkedIn / Handshake sweep (`discover.js`) + the queue's per-source tabs |
 | `live-testing` skill | driving a real end-to-end run through Chrome |
+| `docs/adding-a-filler.md` | **adding support for a NEW ATS / platform** — the substrate decision, the recon checklist, the exact integration surface, the five widget-registration sites, and the trap catalogue organized by symptom. Read it before writing a line of code for a new platform |
 | `docs/dom-patterns.md` | the dated observed-DOM rulebook (every tenant + refutations). **Has a topic index at the top — use it; never read the file whole.** |
 | `docs/progress-log.md` | full extension milestone history. Append new entries here. **Has a topic index at the top; never read it whole.** |
-| `docs/fill-speed-log.md` | **fill SPEED / timing** — every measurement, refuted theory, per-run data and fix direction. Read before investigating any slow fill; append new speed rounds here |
+| `docs/fill-speed-log.md` | **fill SPEED / timing** — every measurement, refuted theory, per-run data and fix direction. Read before investigating any slow fill; append new speed rounds here. ⚠ The standing rules are inline below ("Don't write laggy code") — read those before adding any wait |
 | `docs/status.md` | current state, NEXT items, operator TODOs, deferred work |
 | `WEBSITE.md` | the Next.js + Supabase companion site (`web/`) — design + the handoff contracts |
 | `docs/website-progress-log.md` | website milestone history. Append new website entries here. |
@@ -641,8 +642,8 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   matches `textContent`, which an `<input>` lacks. Measured: without it `hasSubmit:false` and
   `atsLooksLikeApplicationForm` REFUSES a perfectly good form.
 - **A RUN STARTS FROM AN EMPLOYER-HOSTED PORTAL, AND ITS LOGIN PAGE LOOKS LIKE A FORM (2026-08-16).**
-  `careers.astrion.us` is an iCIMS portal on the EMPLOYER's domain, so `detectAts` (host-based, and it
-  must stay that way) returns null. Detection is by PAGE EVIDENCE — `atsPortalAts` reads the hosts the
+  `careers.astrion.us` is an iCIMS portal on the EMPLOYER's domain, so `detectAts` (**URL-only** — see
+  the Oracle note below for why that is the real rule, not "host-only") returns null. Detection is by PAGE EVIDENCE — `atsPortalAts` reads the hosts the
   page itself references and refuses when two ATSs are named. ⚠ Then the Apply link lands on
   `/jobs/<id>/login`, whose email box + submit control **PASS `atsLooksLikeApplicationForm`** — so
   `runIcimsPreForm` runs BEFORE the form wait, never as a fallback after it. Reaching the gate and calling
@@ -891,6 +892,314 @@ Observed DOM (ids, required markers, section shape, the résumé postback): `doc
   label ladder. A leading `-1_` is a repeating-entry ordinal whose ids recur inside work history, where
   an "address" is the EMPLOYER's — mapping those by bare id files your home address under a past job.
 
+## Oracle Recruiting Cloud (ORC) — RECON DONE, FILL NOT BUILT (2026-08-19)
+
+Observed DOM, URL shapes and every measurement: `docs/dom-patterns.md` `2026-08-19 — Oracle Recruiting
+Cloud (ORC) / Candidate Experience: FIRST RECON`. **Read `docs/adding-a-filler.md` before building the
+rest.** What is settled, and what must not be re-litigated:
+
+- **DETECTED, AND DELIBERATELY REFUSED UNTIL THE SCAN EXISTS.** `detectAts` returns `"oracle"` (host +
+  path — see the URL-only amendment above), and BOTH `runAtsApplicationRun` and `runAtsSubmitRun` halt
+  `oracle-not-implemented` **before the attach**. That guard is not caution for its own sake:
+  `atsInjScan` has no `oracle` branch, so an ORC page would reach the GENERIC tail, and because ORC's
+  controls are plain `<input>`s that tail would classify them — including the honeypot below. A
+  plausible-but-wrong bundle is worse than no bundle. **Delete both guards in the commit that adds the
+  scan**, not before.
+- **⚠⚠ THERE IS A BOT-DETECTION HONEYPOT AND EVERY VISIBILITY TEST WE OWN PASSES IT.** `#honey-pot-1`
+  sits beside the real email box with rect **179×38**, closest-`div` **179×19**, `offsetParent` non-null,
+  `display:inline-block`, `visibility:visible`, `opacity:1`. The Greenhouse/Lever predicate
+  (`rect.width > 0 && rect.height > 0`) admits it. It is OPTIONAL, so the AI tier never fills it and the
+  fill *looks* clean — but it still reaches the **review editor as a fillable box**, and a value typed
+  there is replayed on submit and marks the application as a bot. **No read-back catches this: the write
+  SUCCEEDS.** Invisible from inside the pipeline, and it lands on the employer's side.
+  - `atsDecoyKind` (ats.js, pure, unit-pinned both directions) is the recognizer. The primary signal is
+    **generic, not an Oracle name match**: `aria-hidden="true"` **AND** `tabindex="-1"` — a control the
+    page hides from assistive tech *and* removes from tab order is not one a human is asked to fill, on
+    any platform. **Neither marker alone is enough** (a decorative wrapper legitimately carries
+    `aria-hidden`; custom widgets routinely park a focused input out of tab order). The `honey[-_ ]?pot`
+    name match is a word-anchored belt.
+  - ⛔ **DO NOT "fix" this by tightening the visibility test** — the Workday dropdown-chip dead end
+    (tried twice, confirmed): the element is genuinely visible by every computed-style measure.
+    Exclusion must key on **declared intent**, never on geometry.
+  - **The scan REPORTS the markers; the judgement stays SW-side**, like `atsInjAuthScan` /
+    `atsConsentKind` — one copy of a rule this consequential, not an injected dup that can drift.
+  - **Polarity trap, same page:** the terms checkbox is **0×0**, `opacity:0`, clipped — and it MUST be
+    ticked (click its `<label>`, the Workday radio rule verbatim). Non-zero rect ⇒ never touch;
+    zero rect ⇒ click the label. **Geometry answers neither question.**
+- **PAGE-SIDE SYNTHETIC, and that is MEASURED not assumed.** The form path is not JET components but
+  native `<input>`s carrying a Knockout `data-bind`. A native-setter write with **no events** left
+  `aria-invalid` at `false` (Knockout did not notice); adding `input` + `change` flipped it to `true`.
+  Same lesson as React for a different reason — `el.value = x` alone is still not enough. ⚠ `valueUpdate`
+  is **per-element and dynamic** (`element.valueUpdateType()`), so always dispatch BOTH events rather
+  than detecting which one is bound. ⚠ JET components DO exist (`oj-text-area`, `oj-dialog`) — so far
+  only in dialogs and the AI assistant. An `oj-select-single` binds its value as an element **property**,
+  not through an inner input, so if the form uses them that is a separate widget class with its own
+  commit path and read-back.
+- **THE APPLY URL IS NOT DERIVABLE — the button is a required STAGE.** `…/job/<id>/apply` **redirects to
+  `…/sites/<site>/404`**; only pressing `button.apply-now-button` pushes `…/job/<id>/apply/email`. So
+  `atsFormUrl` returns the POSTING url unchanged for `oracle`, and that is the correct answer, not an
+  oversight — **do not append a path**. ORC therefore needs an Apply-click pre-form stage like iCIMS'.
+- **AUTH: the Workday pattern, per operator instruction (2026-08-19)** — sign in with the **stored
+  credentials** and let **Gmail auto-verify** approve the emailed code. Two shapes exist: the quick
+  `<quick-email-verification-form>` gate (email + terms → code; *"You don't need to have an account"*, so
+  **no password and no account creation**) and a full account sign-in. Either way the value comes ONLY
+  from `store.credentials` via `atsInjSetCredential` (returns a LENGTH, never a value) — never a profile
+  value, never a bucket, never an LLM — and it never enters a log line, a record or the bundle. The
+  terms box is an **ACCEPT** checkbox under the 2026-08-18 instruction ⇒ ticked, logged by name, verified.
+- **THE COMPANY ANCHOR IS EVIDENCE, NOT A URL HEURISTIC.** `atsCompanyFromUrl` returns **null** for
+  oracle on purpose: the subdomain is an opaque Fusion **pod id** (`eeho`, `fa-evmr-saasfaprod1`) and
+  path segment 0 is the literal `hcmUI` — either would hand the safety-critical employment recognizer a
+  word no employer is called, the exact failure iCIMS' `jobs` segment produced. Null is safe here *only*
+  because ORC supplies the real name structurally: JSON-LD **`hiringOrganization.name`**, plus its own CX
+  REST requisition endpoint (`recruitingCEJobRequisitionDetails`, **200 unauthenticated**). With no
+  plausible fallback, an absent company correctly makes the recognizer UNEVALUABLE (blank + review).
+- **`siteCode` IS A TENANT SETTING** — `CX_1`, `CX`, `CX_1001`, `CX_1003`, `nfcu`, `LateralHiring`.
+  Nothing may key on the literal `CX_1`. Three host shapes, and `jpmc.fa.oraclecloud.com` has **no region
+  segment**. A vanity domain CNAME'd to ORC is deliberately unmatched — that is the page-evidence case.
+- **SCOPE THE SCAN TO THE APPLY-FLOW CONTAINER.** `oj-text-area#oda-work-summary-text-area` (the Oracle
+  Digital Assistant's box) carries `required="true"` and is **not an application field** — a
+  document-wide sweep for required controls picks it up, and a required unmapped textarea is exactly the
+  shape that buys an LLM call. Same discipline as scoping a Workday dropdown scrape to its own listbox.
+- **No iframe** (JET SPA in the top document), so no `cdpUseFormFrame`. But `<session-expire>` means ORC
+  has an idle timeout, so the Workday rule holds: **session death is behavioural, not statically
+  detectable**. And the JD scrape's largest-text-block fallback is a **contest** on an SPA that is mostly
+  bundled JS — the shape that made a session token a job description on iCIMS. Prefer JSON-LD → REST →
+  rendered text, and keep `redactSecrets` on the assignment.
+
+### Through the gate — the form's shape (recon 2, 2026-08-19; Baylor + Nokia)
+
+- **⚠ ONCE THE CANDIDATE EXISTS, THE CODE IS REQUIRED ON *EVERY* RE-ENTRY — so Gmail auto-verify is on the
+  critical path for every run, fill included (operator, 2026-08-19).** This took three passes to get right
+  and the wrong versions were each load-bearing, so the whole ladder is recorded:
+  - recon 2 saw a **brand-new** email go `Next` → straight to `…/apply/section/1` and concluded "no code is
+    ever needed". Wrong, from one observation of a conditional branch.
+  - recon 4 saw a **known** email hit **"Confirm Your Identity"** and concluded "conditional on whether the
+    email is known". Closer, but it framed the code as the exception.
+  - the operator's own experience settles it: *"you need to approve each time you reopen the application."*
+    So: **no candidate account yet ⇒ no code; the account exists ⇒ a code on every entry.** Both earlier
+    observations fit that, and the common case in production is the coded one.
+  The screen: six digit boxes (`input#pin-code-1…6`, `type=number`, **no `name`**, Knockout-bound,
+  `aria-label="Enter verification code digit N of six."`), a `Verify` button, `<resend-pin>` / "Send New
+  Code". Route `…/apply/pin` on some tenants, still `…/apply/email` on others — so **recognize the view by
+  its CONTENT, never by route or message text** (Baylor names the address, Oracle's own site says only "sent
+  to you").
+- **⚠⚠ THE APPLY-FLOW SESSION IS PER-TAB, NOT A COOKIE (measured 2026-08-19).** A fresh tab in the SAME
+  Chrome profile, with `ORA_CX_USERID` / `ORA_CX_SITE_NUMBER` cookies present, still bounces
+  `…/apply/section<n>` → `…/apply/pin`. The verified flow state lives in **`sessionStorage`**, which is
+  per-tab. Two consequences, both structural: **a run must clear the gate in the SAME TAB it then fills**
+  and can never borrow a session another tab established (including the operator's own signed-in tab); and
+  **the flow is not resumable cold** — a deep link from a new tab is not an entry point.
+  ⚠ The terms checkbox is **per-tenant optional** (Nokia has one, Baylor none) — tick it when present, never
+  require it. The honeypot's WIDTH also varies by tenant (179 vs 200), so no size constant may ever enter the
+  test.
+- **⚠ TWO SCANNING HAZARDS MEASURED ON THIS PAGE.** `document.querySelector("h1,h2")` returned **"Are You
+  Still With Us?"** — the hidden `<session-expire>` dialog's heading, not the visible "Confirm Your Identity".
+  A first-match query reaches a hidden dialog, so headings need the same visibility scoping the fields do.
+  And `Runtime.evaluate` **blocked past 45s on six separate occasions**, always around a route transition —
+  so ORC needs generous CDP timeouts and its waits must never rely on page timers (they were not firing).
+- **⚠⚠ THE ACTIVE-SECTION SIGNAL IS THE EXACT INVERSE OF THE HONEYPOT SIGNAL — neither may become *the*
+  rule.** The form is a **4-step wizard** (`…/apply/section/<n>`) and **all four steps sit in the DOM at
+  once**. Measured on the inactive ones while on step 1: `hidden` = false, **`aria-hidden` = `"false"`**,
+  `display` = `block` — every declared signal says they are live — and only the **bounding rect** is 0×0.
+  > On the **GATE**, geometry lies and declared intent tells the truth (the honeypot is 179×38 yet
+  > `aria-hidden="true"`). On the **FORM**, declared intent lies and geometry tells the truth. Each signal
+  > is authoritative precisely where the other fails.
+  **So: never scan the document. Scope to the active section**, keyed primarily off the URL's section number
+  (`apply-flow-section[n]` — index 0 is an empty shell, so it lines up), with geometry as the cross-check.
+  A document-wide scan on step 1 returns all 39 fields of all four steps.
+- **⚠⚠ `name` IS THE DURABLE KEY; `id` CARRIES A VOLATILE COUNTER.** Every control is `id="<name>-<N>"` with
+  N a render-**assignment** counter (`country-19` numbers below `email-27` while appearing after it). Key
+  bundles on `name`; treat `id` as an in-visit DOM address only. Same lesson as iCIMS' per-visit entry ids
+  reached by another route, and the same consequence: an `id`-keyed bundle fails every field on the submit
+  visit. ⚠ `label[for=…]` and `aria-controls` both point at the volatile id, so resolve both **live** —
+  never reconstruct them from a remembered value.
+- **Three id families, one mappable.** Platform names (`firstName`, `lastName`, `knownAs`, `email`,
+  `country`, `addressLine1/2`, `postalCode`, `city`, `region1/2`, `title`, `fullName`) → the static map.
+  Per-tenant flexfields (`300000016979265`, `namInformation15`) → **label ladder only**. Standard self-ID
+  (`US-STANDARD-ORA_GENDER-STANDARD`, `…ORA_VETERAN_STATUS…`, `…ORA_DISABILITY_STATUS…`, radios suffixed
+  `-ORA_PER_Y`/`-ORA_PER_N`) → mappable, and must obey the EEO rules. `dq-option-<id>` are ORC's
+  **disqualification** (screening) checkboxes — ⚠ some carry a bare small integer, so a `dq-option-*` key is
+  not automatically durable.
+- **⚠⚠ `name="phoneNumber"` IS THE DIAL-CODE PICKER, NOT THE NUMBER.** The number input has **no id and no
+  name** — only `aria-label="Phone Number"` + `class="phone-row__input"` — so a name-keyed scan maps the
+  number onto the country-code combobox and leaves the real field unkeyed. Address it by class/aria-label.
+- **⚠ THREE FILE INPUTS SHARE `name="attachment-upload"`**, told apart ONLY by their wrapper
+  (`<resume-upload-button>` / `<cover-letter-upload-button>` / `<attachment-upload-button>`). So `name` is
+  **not unique** on an ORC form, and résumé-vs-cover-letter is a wrapper decision. All three report
+  `required` — a widget artifact, not the tenant's rule; do not trust it.
+- **The choice widget is `input[role="combobox"].cx-select-input` with `aria-controls="<id>-listbox"`, and
+  that aria-controls resolves to the REAL listbox** (unlike Workday's `source`) — so scope every option
+  scrape to it, never a page-wide `[role=option]` sweep. `aria-expanded` exists but the close still gates on
+  options being **GONE**. Plain text rows are `input.input-row__control` with a Knockout `data-bind`;
+  combobox inputs have none.
+- **⚠ THE WHOLE ADDRESS BLOCK IS SUGGESTION-DRIVEN.** `addressLine1` (classed `--auto-su`), `postalCode`,
+  `city`, `region1` **and** `region2` are all comboboxes; only `addressLine2` is free text. ⚠ **`region1` vs
+  `region2` is UNRESOLVED — do not guess**: both required, and which is State/Province vs County almost
+  certainly varies by country, so mapping the wrong one files a state as a county. Resolve from the live
+  label. ⚠ `country` arrived **prefilled "United States" AND classed `cx-select-input--invalid`** — a value
+  present is not a value accepted, so read-back must not treat non-empty as verified.
+- **Labels are a proper `label[for]`** (`label.input-row__label` inside `div.input-row`), so the house
+  `labelFor` helper is already correct. Required is marked **three** ways — `aria-required`, the label class
+  `input-row__label--required`, and a `<span class="input-row__label--required-star">` — detect all.
+- **`<form-builder>` is the generic renderer**, which is *why* one scan can be generic: a per-tenant question
+  and a platform field are structurally identical. Group a field by its `<apply-flow-block-title>`.
+  ⚠ `<address-form-v2>` is **versioned** — expect a v1 on older tenants.
+- **⚠ The renderer is heavy enough to break a harness:** `Runtime.evaluate` containing an in-page
+  `setTimeout` await **timed out at 45s twice** across the section-1 transition — page timers were not
+  firing. Reads must be synchronous with waits taken OUTSIDE the page, and a section transition needs real
+  pacing (measure into `fill-speed-log.md` once a fill runs).
+
+### Sections 2–4 and the timeline (recon 3, 2026-08-19)
+
+- **`div.input-row--<kind>` IS THE WIDGET CLASSIFIER** — declared by the framework, so classification is a
+  read rather than a guess: `--text` · `--textarea` · `--has-picker` (combobox) · `--radiogroup` (option
+  group) · `datepicker-row` (month+year). Sections are also **directly URL-addressable**
+  (`…/apply/section/3` loads with step 1 empty — validation does not gate navigation), and exactly one
+  `apply-flow-section` has a non-zero rect with its index equal to the URL's number, which confirms the
+  URL-keyed scoping rule. A real fill should still press `Next` so the tenant's validation and save fire.
+- **⚠⚠ AN OPTION GROUP IS RENDERED TWO WAYS AND ONE HAS NO `name` AT ALL.** Disability self-ID = 3
+  `type=radio` sharing a name; Baylor's enrollment question = 3 **`type=checkbox` with `name: null`**; EEO
+  race = 6 the same. So **grouping cannot be by `name`** the way every other platform does it — the group is
+  `div.input-row--radiogroup`. ⚠ **And the question text is not any option's label**: each box's `label[for]`
+  is its own OPTION text, so the question must be read from the group. Using a member's label as the field
+  label files every option as a separate question — the Gusto 12-phantom-field failure in a new costume.
+  ⚠ **`radiogroup` does NOT imply pick-one** — EEO race is legitimately multi-select inside one. The class
+  names the widget family, not the arity; treat arity as unresolved rather than inferring it.
+- **⚠⚠ A DATE IS TWO COMBOBOXES SHARING ONE `name`, month + year, NO DAY.** `month-startDate-34` and
+  `year-startDate-34` both carry `name="startDate"`, so the **`month-`/`year-` id prefix is the only
+  discriminator** — a name identifies the *pair*, not a control (same shape as the phone composite). **No day
+  means iCIMS' `atsDefaultDay` approximation must NOT be applied here** — the profile's month precision is
+  exactly right.
+- **⚠ EVERY TEXTAREA ROW HOLDS TWO TEXTAREAS** — the named one plus a clone with **empty id and empty name**,
+  both visible by rect. Push only the named one. Untreated this is the Greenhouse double-push again, and here
+  the phantom is a *textarea*, the shape that becomes a required free-text field and buys an LLM call.
+- **§3 is a repeating timeline**: `<beautiful-timeline>` with `button.work-and-education-timeline-add-button`
+  (`.timeline-work-add-button` / `.timeline-education-add-button`), opening `<timeline-form-inline>` →
+  `<timeline-form-builder>` (⚠ a *different* renderer from the page-level `<form-builder>`). Experience
+  fields: `employerName` (req) · `jobTitle` · `startDate` · `endDate` · `countryCode` · `employerCity` ·
+  `responsibilities` · `leavingReason`. ⚠ `countryCode` is the **EMPLOYER's** country — the iCIMS entry seal
+  applies verbatim. The date fields carry **no label**, so they are identifiable only structurally.
+- **⚠⚠ TWO TIMELINE TRAPS, EITHER OF WHICH DESTROYS AN ENTRY SILENTLY.** (1) **The commit button has the SAME
+  TEXT as the opener** (`Add Experience` both outside and inside the form) — disambiguate by container:
+  inside `timeline-form-inline` ⇒ commit, outside ⇒ open. (2) **Clicking outside the entry box DISCARDS it**,
+  and the tenant says so itself (*"Do not click outside the white box until you have submitted your
+  information"*). That collides directly with portaled combobox options — the entry form holds **four**
+  comboboxes, and if an option list mounts outside the white box then selecting an option *is* a click
+  outside. With the Workday findings that portaled lists share coordinates and linger while unmounting, the
+  failure is an entry that vanishes while every commit reports success. **Check where the option list mounts
+  relative to `timeline-form-inline` BEFORE writing the entry handler**, and re-read the whole entry after
+  each commit rather than trusting one field's read-back.
+- **§2** = per-tenant screening questions (`300000…` comboboxes + a checkbox group), three file inputs
+  (Résumé / Cover Letter / references Attachment — distinguished by **label AND wrapper**, a useful
+  redundancy), and `siteLink-1` whose label is the bare noun **"Link 1"** and whose trailing `-1` is a
+  **meaningful entry ordinal**, not a render counter.
+- **§4** = `Sex` / `Veteran Status` (comboboxes), disability (3 radios incl. "I do not want to answer"),
+  race/ethnicity checkbox groups, and **E-Signature → `fullName`** (required text — the Workday signature-name
+  rule applies; no signature date on this tenant). **Every self-ID field here is OPTIONAL**, so the standing
+  rule holds: unstated + optional ⇒ **blank, no AI**; stated ⇒ deterministic. ⚠ The disability wording is
+  **byte-identical to Workday cat.wd5's**, so `selfIdDisabilityCandidates` + POLARITY LEAD should land it
+  with no new matching code — verify rather than assume.
+- **⚠⚠ THE DURABLE KEY NEEDS NORMALIZING: A RADIO GROUP'S `name` CARRIES THE VOLATILE COUNTER.** Text and
+  combobox names are clean (`lastName`, `US-STANDARD-ORA_GENDER-STANDARD`) but the disability group's is
+  `…ORA_DISABILITY_STATUS-STANDARD-12`. So the durable name **strips a trailing `-<digits>`** — the same move
+  as iCIMS' `atsMapKey`. ⚠ The exceptions must be pinned before it ships: `siteLink-1` → `siteLink` is
+  *desirable* (family + ordinal), `dq-option-4` → `dq-option` is acceptable only because the group is the
+  field, and `namInformation15` ends in digits with **no hyphen** and must be left alone. Wrong in either
+  direction and the submit visit misses the field.
+
+### The SUBMIT stage — a REPLAY WALKS the wizard (2026-08-20, rehearsal live-verified)
+
+`runAtsSubmitRun` was single-page from the day it was written, because every ATS on this path was.
+ORC is the first that is not, and the `oracle-not-implemented` guard is now deleted from BOTH runs.
+
+- **ANY WALK STOP OTHER THAN `reached-final-step` REFUSES THE GATE** (`replay-incomplete`), before the
+  verify and before the click. The fill run marks a short walk's bundle PARTIAL; here the consequence
+  is a submitted application missing whatever the walk never reached, so it is not interpreted at all.
+- **THE ADVANCE IS ONE SHARED FUNCTION** — `orcAdvanceAfterStep` (guard 1, the disabled-Next wait,
+  guard 2, the monotone predicate, the settle), called by both walks; `orcAwaitBlocksPopulated` the
+  same. A test pins that guard 1 appears **exactly once in the file**. This is the double guard on the
+  one irreversible act in the pipeline: a near-duplicate keeps working until the day it stops agreeing
+  with the other about what "the last step" is, and the disagreement surfaces as a submitted form.
+- **RESULTS ARE UNIONED ACROSS STEPS, then verified ONCE.** The strict verify's "approved value has no
+  matching field" check is a set difference over the WHOLE bundle, so a per-step verify would flag
+  every other step's fields on every step.
+- **THE PRE-FORM RUNS BEFORE THE FORM WAIT** — ORC's gate passes `atsLooksLikeApplicationForm`, so a
+  run that waited for "a form" would find the GATE and replay approved values into a login box. And
+  because the fill created the candidate, **the emailed code is required on every submit run** —
+  Gmail auto-verify is on this path by construction, not as an edge case.
+- **A REPLAY *REPORTS* THE REPEATING ENTRIES; IT MUST NEVER REBUILD OR DELETE THEM.** `profile:{}` is
+  by design, so the entry plan is empty — correct as an ACTION (ORC saves entries server-side; live,
+  the rehearsal found Experience 3 / Education 1 still there) but not as an ANSWER, because the bundle
+  carries a record per entry and emitting none fails every one at verify. `reportOnly` reads the tiles
+  and records them, so the verify means "the entries you approved are still on the form". ⚠ It must
+  not actuate: with `profile:{}` a reconcile reads "wants 0, form has 3" and **deletes the work
+  history**. Pinned in both directions.
+- **⚠ A CHOICE RECORD MUST STORE THE OPTION THAT WAS CHOSEN, NOT THE WIDGET'S READ-BACK.** `rec.after`
+  becomes the bundle's `current_value`, which is what the replay matches against the live options. The
+  dial-code picker DISPLAYS `"+1"` while its option reads `"+1 (United States)"`, so the fill recorded
+  `"+1"` and the rehearsal correctly REFUSED it — `+1` is the United States **and** Canada, so a bare
+  code is a guess between two real countries. The fix is never to loosen the ladder (the ambiguity is
+  real) but to record a value that reproduces the decision; the read-back stays the VERIFICATION.
+  Safe because `atsSurfacePrefilled` skips any record carrying `resolved`, so nothing re-reads and
+  compares the two. *Suspect this shape on any widget whose display differs from its option text.*
+- **⚠ SCOPE BITES IN THIS FILE — AND `npm test` NOW CATCHES IT.** Five live failures were code
+  written against a scope it did not have (`profile`, `apMatch.cdpPageKey`, `preCreds`, the entry
+  pass, and `startUrl` in the submit run's Oracle branch). The unit guards scan source TEXT and
+  cannot evaluate a scope, so every one of them passed the suite and cost a live run.
+  **`eslint.config.mjs` runs `no-undef` as `pretest`** — it found the fifth in under a second, in
+  code that had already passed 1693 tests and a rehearsal. It reads the SW file list from
+  background.js's own `importScripts` call and each page's from its HTML, so the "one shared global
+  scope" model can never drift from reality; `no-undef` is the ONLY rule on, deliberately.
+
+### ORC widgets: the read-back LIES, and one control is a toggle (measured 2026-08-21)
+
+Full evidence in `docs/dom-patterns.md` `2026-08-21`. The standing rules:
+
+- **⚠⚠ THE DATE PICKER ONLY LISTENS TO COMPLETE KEYSTROKES.** `keydown` + `input` alone does NOT drive
+  its filter (measured: the month list stayed at all 12 rows with "January" first while the input
+  displayed "May"). It needs **`beforeinput`** and a **`keypress` carrying `charCode`** — then the list
+  filters 12 → 1 and Enter commits. Without that, Enter has no narrowed row and nothing reaches
+  Oracle's model.
+- **⚠⚠ AND `el.value` CANNOT DETECT THAT FAILURE.** The input read back the right text, with no
+  `cx-select-input--invalid`, while the entry kept reporting *"The Start Date field is required."*
+  **On this widget the authority is the form's own validation, not the input.** A read-back that
+  inspects what we wrote can only ever confirm we wrote it.
+- **⚠ ENTER TAKES THE LIST'S FIRST ROW.** So narrow to the wanted row and require it to BE first; if
+  the filter never narrows, **refuse rather than press** (`filter-did-not-narrow` → needs_review) —
+  pressing on an unfiltered list commits a month nobody asked for. A **row CLICK is silently
+  swallowed** (display changes, model does not), and **ArrowDown is RELATIVE**, so index arithmetic
+  is wrong.
+- **⚠⚠ THE YES/NO PILL IS A TOGGLE — READ BEFORE WRITING (operator, 2026-08-21).** Clicking the pill
+  that already holds the answer CLEARS it. Committing unconditionally therefore wiped a correct
+  answer, and the re-press then restored it — two clicks, seconds of latency, and a run ending between
+  them left the answer GONE with no record saying so, because the final read-back came after the
+  restoring click. A correct pill is left alone; a WRONG one is a different button, so selecting it is
+  not a toggle. Same rule as the rehearsal's read-before-write, on the FILL path — which needs it
+  just as much, because ORC saves each step and a re-run meets its own previous answers.
+- **⚠ REQUIRED-NESS IS ON THE COMPOSITE, NOT THE INPUT.** Both halves of a date carry no
+  `aria-required` and the date is still required. Do not conclude a field is optional from its inputs;
+  the form's own error text is the authority.
+- **⚠⚠ A SPEED FIX CAN REMOVE THE SETTLING ITS SLOWNESS PROVIDED — three times in one day here.** The
+  date bug above was INVISIBLE while each pick took ~5.6s, because the outer retry's second pass
+  re-typed and landed the value by accident; removing an unrelated 120ms open race removed the retry
+  and the latent defect surfaced as "experience didn't fill". After making anything on this tenant
+  faster, re-verify the thing downstream of it.
+- **⚠ AND CHANGE ONE VARIABLE AT A TIME ON THIS PICKER.** The keystroke fix was first shipped ON TOP
+  of an open-race change, so when the fill broke there was no way to attribute it; it took a revert to
+  a known-good commit and a single-variable re-apply to land. Four broken fills came out of not doing
+  that.
+
+**Open (submit):** the ex-Oracle screening question fails the replay `read null` after 2 presses over
+8s (34.7s on the field) — ORC renders an option group **two ways** (radios sharing a `name`, and
+`type=checkbox` with `name: null`), so the yes/no reader likely handles only the first. Needs a live
+widget recon, not a guess.
+
+**Open:** whether a combobox accepts a typed value or strictly requires a suggestion; `region1`/`region2`
+semantics per country (must not be guessed); **where a combobox's options mount relative to
+`timeline-form-inline`** (the discard hazard); whether ids renumber across a section transition; captcha on
+submit and `<apply-flow-submission-checklist>` semantics; the Education entry's field set; and a **second
+tenant's form** (the gate has two tenants, the form still has one).
+
 ## Multi-ATS — Greenhouse / Lever / Ashby (`ats.js`; fill + gated submit, live-verified 2026-07-31)
 
 Routing, the option poll, per-ATS traps, the dev loop and every measured refutation: **`ats-tenants` skill.**
@@ -903,6 +1212,14 @@ The standing rules:
 - **`detectAts(url)` routes `AP_RUN_APPLICATION` / `AP_SUBMIT_APPLICATION`.** Workday and anything
   unrecognized keep the existing onboard→walk path **byte-identical**. All through CDP — **NO new host
   permissions.**
+  ⚠ **THE RULE IS URL-ONLY, NOT HOST-ONLY (amended 2026-08-19, operator-approved).** Every family except
+  Oracle is identified by host alone, and the property that actually matters is that detection needs **no
+  PAGE EVIDENCE** — that is `atsPortalAts`' job, a separate and more expensive decision. Oracle keeps that
+  property while breaking the letter: `*.fa.*.oraclecloud.com` is the generic Oracle **Fusion
+  Applications** host, which also serves ERP / HCM back-office UIs this pipeline must never drive, and the
+  recruiting product's identity lives in the **PATH** (`/hcmUI/CandidateExperience/`). So Oracle tests
+  host **and** path — still one URL parse, no fetch, no injection. A host test widened until it matched
+  what it cannot verify would be the unsafe direction.
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
@@ -1129,6 +1446,60 @@ required, which is what blocked Save.
 6. Watch the service-worker console. `npm test` runs the unit suite (`node:test`).
 
 For a real end-to-end run driven through Chrome, load the **`live-testing`** skill.
+
+## Don't write laggy code — the pacing rules (measured; read before adding any wait)
+
+Every rule here was bought with a live failure, and most of them cost a wrong theory first. `docs/fill-speed-log.md`
+has the evidence; this is the short form.
+
+- **THE COST OF A PHASE IS THE NUMBER OF SW ROUND-TRIPS, NOT THEIR LENGTH.** Shortening a poll from
+  150ms to 80ms bought nothing; collapsing 28 SW awaits into 1 page-side wait fixed the largest gap on
+  a page. A healthy ORC fill is ~280-320 `Runtime.evaluate` calls / 23-32s — that count is the surface
+  area every per-round-trip stall multiplies against. **Ask "how many awaits?" before "how long is each?"**
+- **⚠⚠ KEEP THE WORKER WARM — an MV3 service worker with nothing scheduled stops being scheduled.**
+  `cdpAttach` starts a 500ms beat (`cdpKeepWarmStart`) for EVERY attach. Measured with it off: a 600ms
+  pace took **13461ms** and a run lost 16.7s; with it on, 4 runs had **zero** overruns.
+  ⚠ The obvious counter-argument is wrong and I made it: *"a keep-alive interval can't help, the
+  interval is the thing being starved."* **A late timer still FIRES**, and each firing runs the loop.
+  Never wire a lifecycle concern like this per-caller — it was first added to two ats.js runs and
+  silently left ~18 other attach sites, including both Workday walks, without it.
+- **A STABILITY PREDICATE MUST BE TIMED, NEVER COUNTED. Never add an attempts floor.** "3 consecutive
+  equal reads" MULTIPLIES a stall (3 x 8s); "unchanged for 1200ms" is satisfied by wall-clock and is
+  therefore self-limiting under load. This is exactly why the operator never saw the lag on Workday —
+  `awaitFieldSetSettled` is timed, and `waitAtsFormReady` was counted. **A wait that timed out wants a
+  bigger BUDGET, not more samples**; for a stability check, sparse reads are STRONGER evidence.
+- **Reuse a read you already hold.** A settle that re-fetches the scan it just validated pays an extra
+  round-trip AND judges the page from a different read than the one it proved stable.
+- **A page-side wait inside ONE eval beats N SW awaits** — but only where the page's timers are real
+  (`cdpInstallPageOverrides` gives worker-backed timers; `_workerTimersActive` says whether they took).
+  A slow single `Runtime.evaluate` is often a page-side budget doing its job, not a bug.
+- **Don't make a stability probe expensive.** `atsInjScan` in a poll loop turned a "900ms poll" into
+  ~2.9s per tick; a lean signature read 10x in 704ms. And **both sides of a comparison must be computed
+  the same way**, or tick one looks like a change and a stability loop exits early.
+- **⚠ A SPEED FIX CAN REMOVE THE SETTLING ITS SLOWNESS PROVIDED.** Three times in one day on ORC. After
+  making anything faster, re-verify the thing DOWNSTREAM of it. And change one variable at a time.
+- **⚠ DRIFT CAN COST COVERAGE, NOT ONLY LATENCY.** The audited claim ("monotone or stability predicates
+  can only be noticed late") does NOT cover a poll whose condition depends on pacing the page's own
+  input handling: ORC's date picker needs a coherent keystroke sequence, so a stretched pace loses the
+  commit outright — which cost a whole work-experience entry and failed a rehearsal three steps later.
+
+### Diagnose before attributing — the three clocks
+
+`AP_DEV_FLAG debugLagTrace` times every CDP command, runs a 500ms no-op page probe, measures the SW's own
+scheduling drift, and counts the inbound CDP event firehose by method. Read them together:
+
+| reading | verdict |
+|---|---|
+| SW drift high, page probe ~2ms | **us** — the worker (starvation / a busy loop) |
+| page probe spikes | the RENDERER is jammed; the channel is never the cause (p50 1-2ms across ~1500 cmds) |
+| one command slow, probe fast | that call's OWN work — usually a page-side polling budget |
+| `UNREAD CDP EVENTS` in the thousands | an event flood — measured at only **221/82s**, so this is NOT the usual cause |
+
+`[PACE]` lines are always on and name their own verdict: `sw-starved` (our worker was late — the page is
+NOT implicated), `page-abandoned` (the page genuinely did not answer), `sw-fallback` (context died).
+⚠ **The instrument must be reachable from the path you are debugging**: `cdpLagStart()` was Workday-only
+for a year, so on every other ATS the flag could be set and produce nothing — which reads exactly like
+"no problem here".
 
 ## A SLOW page is the LLM until proven otherwise (measured 2026-08-09)
 

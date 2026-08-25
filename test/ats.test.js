@@ -8,6 +8,15 @@ const assert = require("node:assert");
 const ats = require("../ats.js");
 
 // ── detection + URL shaping ─────────────────────────────────────────────────────────────
+// Shared by the source-scanning guards below. ⚠ Every one of them must strip comments FIRST: the
+// code documents the shapes it refuses, and a textual scan cannot tell explaining a bug apart from
+// committing it — three separate guards have failed on their own prose.
+function stripJsComments(t) {
+  return String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+}
+
 test("detectAts: the four families + null for everything else", () => {
   assert.strictEqual(ats.detectAts("https://job-boards.greenhouse.io/figma/jobs/61191"), "greenhouse");
   assert.strictEqual(ats.detectAts("https://boards.greenhouse.io/figma/jobs/61191"), "greenhouse");
@@ -2357,4 +2366,2370 @@ test("canonicalJobUrl: a short path number is NOT mistaken for a requisition", (
   const lib = require("../lib.js");
   // ≥4 digits required, so an ordinary segment number keys by path as before.
   assert.notStrictEqual(lib.canonicalJobUrl("https://x.wd1.myworkdayjobs.com/en-US/b/job/L/Role_12"), "wd1:12");
+});
+
+// ── Oracle Recruiting Cloud (ORC / Candidate Experience) ────────────────────────────────
+// Recon 2026-08-19 (Nokia, read-only). Oracle is the one family whose HOST cannot identify it,
+// so detection is host + PATH — still URL-only, no page evidence. See detectAts.
+
+test("detectAts oracle: all three observed host shapes, including the one with NO region", () => {
+  // <tenant>.fa.<region>.oraclecloud.com — the common shape, six regions seen live
+  for (const h of ["eeho.fa.us2", "ejov.fa.ca2", "hdpc.fa.us2", "efds.fa.em5", "hcmn.fa.ap1", "hdow.fa.us6"]) {
+    assert.strictEqual(
+      ats.detectAts("https://" + h + ".oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/35578"),
+      "oracle", h);
+  }
+  // fa-<code>-saasfaprod1.fa.ocs.oraclecloud.com — the hyphenated pod + `.fa.ocs.` shape
+  assert.strictEqual(
+    ats.detectAts("https://fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/35578"),
+    "oracle");
+  // <tenant>.fa.oraclecloud.com — BARE: the optional region group is absent (jpmc, live)
+  assert.strictEqual(
+    ats.detectAts("https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210682657"),
+    "oracle");
+});
+
+test("detectAts oracle: siteCode is a TENANT SETTING — nothing may key on the literal CX_1", () => {
+  // Observed live across tenants. A detector keyed on "CX_1" would work on one and miss the rest.
+  for (const site of ["CX_1", "CX", "CX_1001", "CX_1003", "nfcu", "LateralHiring"]) {
+    assert.strictEqual(
+      ats.detectAts("https://eeho.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/" + site + "/jobs"),
+      "oracle", site);
+  }
+});
+
+test("detectAts oracle: an Oracle FUSION host that is NOT a careers page is refused", () => {
+  // The whole reason detection is host+path. `*.fa.*.oraclecloud.com` also serves ERP/HCM
+  // back-office UIs, and driving one of those would be actively wrong — not merely useless.
+  const host = "https://eeho.fa.us2.oraclecloud.com";
+  assert.strictEqual(ats.detectAts(host + "/fscmUI/faces/FuseWelcome"), null);
+  assert.strictEqual(ats.detectAts(host + "/hcmUI/faces/FuseWelcome"), null);       // HCM, but not CandidateExperience
+  assert.strictEqual(ats.detectAts(host + "/"), null);
+  assert.strictEqual(ats.detectAts(host + "/soa-infra/services"), null);
+});
+
+test("detectAts oracle: the host test is ANCHORED — lookalikes return null", () => {
+  const p = "/hcmUI/CandidateExperience/en/sites/CX_1/job/1";
+  // the same discipline pinned for lever/greenhouse above: a suffix, not a substring
+  assert.strictEqual(ats.detectAts("https://eeho.fa.us2.oraclecloud.com.evil.com" + p), null);
+  assert.strictEqual(ats.detectAts("https://fakeoraclecloud.com" + p), null);
+  assert.strictEqual(ats.detectAts("https://oraclecloud.com.evil.com" + p), null);
+  // `.fa.` must be a real label, and a host with no `fa` label at all is not a Fusion pod
+  assert.strictEqual(ats.detectAts("https://cloud.oraclecloud.com" + p), null);
+  assert.strictEqual(ats.detectAts("https://notfa.oraclecloud.com" + p), null);
+  // a vanity domain CNAME'd to ORC is DELIBERATELY not matched — that is the page-evidence case
+  assert.strictEqual(ats.detectAts("https://careers.nokia.com" + p), null);
+});
+
+test("atsFormUrl oracle: returns the POSTING url unchanged — never a synthesized /apply", () => {
+  // Measured: guessing the Lever/Ashby shape redirects to `…/sites/CX_1/404`. The apply route is
+  // reached only by pressing button.apply-now-button. A synthesized url is a broken run.
+  const u = "https://fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/35578";
+  assert.strictEqual(ats.atsFormUrl("oracle", u), u);
+  assert.ok(!/\/apply/.test(ats.atsFormUrl("oracle", u)));
+  // idempotent, and a query is preserved rather than invented
+  assert.strictEqual(ats.atsFormUrl("oracle", u + "?utm=x"), u + "?utm=x");
+});
+
+test("atsCompanyFromUrl oracle: null — a Fusion POD ID is not a company name", () => {
+  // The subdomain is an opaque pod (`eeho`, `fa-evmr-saasfaprod1`) and path segment 0 is `hcmUI`.
+  // Either would hand the safety-critical employment recognizer a word no employer is called —
+  // the exact failure iCIMS' literal `jobs` segment produced. Null makes the recognizer
+  // UNEVALUABLE (blank + review) instead of confidently comparing against a pod id.
+  for (const u of [
+    "https://eeho.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/1",
+    "https://fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1/job/35578",
+    "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/2",
+  ]) {
+    assert.strictEqual(ats.atsCompanyFromUrl(u), null, u);
+  }
+  // …and the other families are UNTOUCHED by that change
+  assert.strictEqual(ats.atsCompanyFromUrl("https://job-boards.greenhouse.io/figma/jobs/61191"), "Figma");
+  assert.strictEqual(ats.atsCompanyFromUrl("https://astrioncareers-astrion.icims.com/jobs/24615/x/job"), "Astrion");
+});
+
+// ── the decoy / honeypot recognizer ─────────────────────────────────────────────────────
+// ORC ships a bot-detection honeypot that EVERY visibility test in this pipeline passes
+// (measured: rect 179×38, offsetParent non-null, display inline-block, visibility visible,
+// opacity 1). Writing to it marks the application as a bot, and no read-back catches that
+// because the write SUCCEEDS. Both directions are pinned: what it claims and what it must not.
+
+test("atsDecoyKind: the live ORC honeypot is recognized", () => {
+  // exactly as observed on the Nokia gate
+  assert.strictEqual(ats.atsDecoyKind({
+    fieldName: "honey-pot", ariaLabel: "honeypot", ariaHidden: "true", tabIndex: "-1",
+    cssClassAttr: "input-row--invisible", widgetType: "text", isRequired: false,
+  }), "honeypot");
+});
+
+test("atsDecoyKind: the GENERIC pair works with no Oracle-specific naming", () => {
+  // The primary signal must not depend on a vendor's word choice — a control the page hides from
+  // assistive tech AND removes from tab order is not one a human is asked to fill, anywhere.
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "xyz_trap_9", ariaHidden: "true", tabIndex: "-1" }),
+    "aria-hidden+untabbable");
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "q7", ariaHidden: true, tabIndex: "-1" }),
+    "aria-hidden+untabbable");
+});
+
+test("atsDecoyKind: NEITHER marker alone is enough", () => {
+  // aria-hidden alone: a decorative wrapper around a real input legitimately carries it.
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "first-name", ariaHidden: "true" }), null);
+  // tabindex=-1 alone: custom widgets routinely park a programmatically-focused input out of
+  // tab order — Workday's own CSS-clipped radios are reached by label, not by tabbing.
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "first-name", tabIndex: "-1" }), null);
+  // an "invisible" wrapper class alone is the tenant's vocabulary, not evidence
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "first-name", cssClassAttr: "input-row--invisible" }), null);
+});
+
+test("atsDecoyKind: a REAL field is never claimed", () => {
+  // the real email box that sits directly beside the honeypot, same classes, same container
+  assert.strictEqual(ats.atsDecoyKind({
+    fieldName: "primary-email", ariaLabel: "Email Address", ariaHidden: null, tabIndex: null,
+    cssClassAttr: "", widgetType: "text", isRequired: true,
+  }), null);
+  // the CSS-clipped terms checkbox — 0×0 and opacity 0, but it MUST be ticked, so claiming it
+  // as a decoy would be the inverse failure: consent silently never given.
+  assert.strictEqual(ats.atsDecoyKind({
+    fieldName: "legal-disclaimer-checkbox", ariaLabel: null, ariaHidden: null, tabIndex: null,
+    widgetType: "checkbox", isRequired: true,
+  }), null);
+  assert.strictEqual(ats.atsDecoyKind({}), null);
+  assert.strictEqual(ats.atsDecoyKind(null), null);
+});
+
+test("atsDecoyKind: the name match is word-anchored, so a substring cannot claim a real field", () => {
+  // the guard-rail the skills containment tier had to learn: raw `includes` puts `CAN` inside
+  // "Canadian". A field merely CONTAINING the letters must not be dropped.
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "honeymoon-leave-request" }), null);
+  assert.strictEqual(ats.atsDecoyKind({ fieldName: "pot-luck-preference" }), null);
+  // …while the real separators used in the wild all match
+  for (const n of ["honey-pot", "honey_pot", "honeypot", "honey pot", "HONEY-POT-1"]) {
+    assert.strictEqual(ats.atsDecoyKind({ fieldName: n }), "honeypot", n);
+  }
+});
+
+// ── ORC: the map-lookup key ─────────────────────────────────────────────────────────────
+// atsMapKey is the MAP key, deliberately lossy; a durable/submit key is a different thing and
+// for ORC is still unsettled (whether render counters renumber across visits is unverified).
+
+test("atsMapKey oracle: the render counter is stripped so a RADIO GROUP matches the map", () => {
+  // the whole reason this branch exists — a radio group's shared `name` carries the counter while
+  // its combobox siblings' names are clean, so without the strip the disability group never matches
+  // the entry gender/veteran do. Observed live 2026-08-19.
+  assert.strictEqual(ats.atsMapKey("oracle", "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12"), "ORA_DISABILITY_STATUS");
+  assert.strictEqual(ats.atsMapKey("oracle", "US-STANDARD-ORA_GENDER-STANDARD"), "ORA_GENDER");
+  assert.strictEqual(ats.atsMapKey("oracle", "US-STANDARD-ORA_GENDER-STANDARD-10"), "ORA_GENDER");
+  assert.strictEqual(ats.atsMapKey("oracle", "US-STANDARD-ORA_VETERAN_STATUS-STANDARD-11"), "ORA_VETERAN_STATUS");
+});
+
+test("atsMapKey oracle: the self-ID reduction is LOCALE-NEUTRAL", () => {
+  // `US-STANDARD-` is a jurisdiction prefix; keying on the whole string would silently stop
+  // matching outside the US while looking like it worked.
+  assert.strictEqual(ats.atsMapKey("oracle", "CA-STANDARD-ORA_GENDER-STANDARD-4"), "ORA_GENDER");
+  assert.strictEqual(ats.atsMapKey("oracle", "UK-LEGISLATIVE-ORA_DISABILITY_STATUS-VARIANT-9"), "ORA_DISABILITY_STATUS");
+});
+
+test("atsMapKey oracle: names whose digits are NOT hyphen-separated are untouched", () => {
+  // the guard that makes the strip safe — these all end in digits and must survive intact
+  assert.strictEqual(ats.atsMapKey("oracle", "region1"), "region1");
+  assert.strictEqual(ats.atsMapKey("oracle", "region2"), "region2");
+  assert.strictEqual(ats.atsMapKey("oracle", "addressLine1"), "addressLine1");
+  assert.strictEqual(ats.atsMapKey("oracle", "addressLine2"), "addressLine2");
+  assert.strictEqual(ats.atsMapKey("oracle", "namInformation15"), "namInformation15");
+});
+
+test("atsMapKey oracle: clean platform names pass through unchanged", () => {
+  for (const n of ["firstName", "lastName", "email", "knownAs", "phoneNumber", "country",
+                   "city", "postalCode", "fullName", "employerName", "jobTitle", "startDate"]) {
+    assert.strictEqual(ats.atsMapKey("oracle", n), n, n);
+  }
+});
+
+test("atsMapKey oracle: an entry ordinal collapses to its FAMILY, on purpose", () => {
+  // siteLink-1 / siteLink-2 are repeating link entries; the map keys the family and the ordinal is
+  // handled as an entry index — the same treatment iCIMS gives its ordinals.
+  assert.strictEqual(ats.atsMapKey("oracle", "siteLink-1"), "siteLink");
+  assert.strictEqual(ats.atsMapKey("oracle", "siteLink-2"), "siteLink");
+});
+
+test("atsMapKey oracle: a per-tenant screening key collapses, and that is HARMLESS here", () => {
+  // dq-option-* and 300000… are per-tenant questions that belong to the LABEL ladder, never the
+  // map. Collapsing them means they fail to match a map entry — which routes them exactly where
+  // they should go. ⚠ This is why atsMapKey must not be reused as a submit key: these would collide.
+  assert.strictEqual(ats.atsMapKey("oracle", "dq-option-300000016979250"), "dq-option");
+  assert.strictEqual(ats.atsMapKey("oracle", "dq-option-4"), "dq-option");
+  assert.ok(!Object.prototype.hasOwnProperty.call(ats.ATS_STATIC_MAPS.oracle, "dq-option"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(ats.ATS_STATIC_MAPS.oracle, "300000016979265"));
+});
+
+test("atsMapKey: the OTHER families are byte-identical", () => {
+  // the strip must not leak — greenhouse/lever/ashby names ending in digits are common
+  assert.strictEqual(ats.atsMapKey("greenhouse", "question_12"), "question_12");
+  assert.strictEqual(ats.atsMapKey("lever", "cards[abc][field-1]"), "cards[abc][field-1]");
+  assert.strictEqual(ats.atsMapKey("ashby", "_systemfield_name-3"), "_systemfield_name-3");
+  assert.strictEqual(ats.atsMapKey("icims", "-1_PersonProfileFields.AddressCity"), "PersonProfileFields.AddressCity");
+});
+
+// ── ORC: the static map's deliberate contents and deliberate GAPS ───────────────────────
+test("ATS_STATIC_MAPS.oracle: phoneNumber is the DIAL CODE, not the phone number", () => {
+  // the most misleading name on an ORC form. Mapping it to the number would type the number into
+  // the country-code list; `kind:"dial"` + the tiered ladder is the same fix Greenhouse's `country`
+  // needed.
+  const m = ats.ATS_STATIC_MAPS.oracle["phoneNumber"];
+  assert.strictEqual(m.kind, "dial");
+  assert.strictEqual(m.path, "personal_info.country_phone_code");
+  assert.ok(!/phone_number$/.test(m.path), "must NOT point at the phone number");
+});
+
+test("ATS_STATIC_MAPS.oracle: region1/region2 are UNMAPPED on purpose", () => {
+  // Both are required comboboxes whose labels did not render in recon, so which is State/Province
+  // vs County is unknown and probably country-dependent. Mapping the wrong one files a state as a
+  // county — a confidently wrong value, worse than reaching review. This test is the reminder that
+  // the gap is intentional, so a future change has to delete the test on purpose.
+  assert.ok(!Object.prototype.hasOwnProperty.call(ats.ATS_STATIC_MAPS.oracle, "region1"));
+  assert.ok(!Object.prototype.hasOwnProperty.call(ats.ATS_STATIC_MAPS.oracle, "region2"));
+});
+
+test("ATS_STATIC_MAPS.oracle: the address + name block points at real profile paths", () => {
+  const m = ats.ATS_STATIC_MAPS.oracle;
+  assert.strictEqual(m["firstName"].path, "personal_info.first_name");
+  assert.strictEqual(m["lastName"].path, "personal_info.last_name");
+  assert.strictEqual(m["email"].path, "personal_info.email");
+  assert.strictEqual(m["addressLine1"].path, "personal_info.address_line_1");
+  assert.strictEqual(m["city"].path, "personal_info.city");
+  assert.strictEqual(m["postalCode"].path, "personal_info.postal_code");
+  assert.strictEqual(m["country"].path, "personal_info.country");
+  assert.strictEqual(m["fullName"].compose, "full_name");   // the e-signature name
+});
+
+test("ATS_STATIC_MAPS.oracle: self-ID is keyed on the ORA_ token, and DISABILITY does not use containment", () => {
+  const m = ats.ATS_STATIC_MAPS.oracle;
+  // Gender and veteran status keep containment: their stored values are short and the tenants word the
+  // options long, so a unique prefix hit at the flagged containment tier is the best available.
+  for (const [k, p] of [["ORA_GENDER", "self_identification.gender"],
+                        ["ORA_VETERAN_STATUS", "self_identification.veteran_status"]]) {
+    assert.strictEqual(m[k].path, p, k);
+    assert.strictEqual(m[k].containment, true, k + " needs containment for long-form option wording");
+  }
+  // ⚠ DISABILITY IS DIFFERENT, and this is the operator's question answered: "it filled
+  // deterministically, why is that for review". It committed the right option — at the CONTAINMENT
+  // tier, which is graded `filled_review` BY DESIGN because containment is a guess. The polarity
+  // ladder reaches the same option at a tier graded `exact`, so the answer stops being a review item
+  // without becoming any less verified. Containment must NOT come back here.
+  assert.strictEqual(m.ORA_DISABILITY_STATUS.path, "self_identification.disability_status");
+  assert.strictEqual(m.ORA_DISABILITY_STATUS.kind, "selfid_disability");
+  assert.ok(!m.ORA_DISABILITY_STATUS.containment,
+    "the disability ladder ends in a bare polarity token that lands exactly — containment would " +
+    "re-flag an answer we are certain about");
+});
+
+test("ATS_STATIC_MAPS.oracle: every mapped path resolves against a real profile shape", () => {
+  // catches a typo'd path, which would silently look like "the profile has no value" forever.
+  const profile = {
+    personal_info: { first_name: "A", last_name: "B", email: "e@x.com", preferred_first_name: "P",
+      country_phone_code: ["United States of America (+1)"], dialing_code: "+1",
+      country: ["United States of America"], address_line_1: "1 St", address_line_2: "",
+      city: "C", postal_code: "12345" },
+    self_identification: { gender: "Male", race_ethnicity: "Asian", veteran_status: "No", disability_status: "No" },
+  };
+  const get = (p) => p.split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
+  for (const [key, spec] of Object.entries(ats.ATS_STATIC_MAPS.oracle)) {
+    if (spec.compose || spec.candidates) continue;
+    // ⚠ SKIP BY SHAPE, NOT BY A LIST OF KIND NAMES. This used to name resume/skip explicitly, so
+    // adding `kind:"website"` — which resolves from a LIST and carries no `path` — crashed the guard
+    // instead of skipping it. A kind-named allowlist has to be edited every time a kind is added,
+    // and the failure it produces looks like a broken map rather than a stale test.
+    if (spec.kind && spec.path === undefined) continue;
+    // …but a spec with NEITHER a path nor a kind is exactly what this guard exists to catch.
+    assert.ok(spec.path !== undefined || spec.kind,
+      key + " has neither a `path` nor a `kind` — it can never resolve to anything");
+    if (spec.path === undefined) continue;
+    assert.notStrictEqual(get(spec.path), undefined, key + " → " + spec.path + " does not exist on the profile");
+  }
+});
+
+// ── ORC onboarding: which view are we on? ───────────────────────────────────────────────
+// Pure judgement half of the pre-form walk, mirroring icimsAuthView.
+
+test("orcApplyView: captcha outranks everything actionable", () => {
+  // the bot never solves or bypasses one, so no later branch that finds a fillable box may
+  // reach around this.
+  assert.strictEqual(ats.orcApplyView({ ok: true, captchaChallenge: true, emailInput: true, pinInputs: 6, formSectionVisible: true }), "captcha");
+});
+
+test("orcApplyView: a visible form section means DONE, even with an email box present", () => {
+  // ORC prefills `email` on the form from the gate, so a form still has an email input. Checking
+  // "form" before "email" is what stops the stage re-entering the gate it just cleared.
+  assert.strictEqual(ats.orcApplyView({ ok: true, formSectionVisible: true, emailInput: true }), "form");
+  assert.strictEqual(ats.orcApplyView({ ok: true, formSectionVisible: true, emailGate: true }), "form");
+});
+
+test("orcApplyView: the code screen outranks the email gate", () => {
+  // the gate LEADS to the code screen, and the gate's markup can still be in the document
+  assert.strictEqual(ats.orcApplyView({ ok: true, pinInputs: 6, emailGate: true }), "code");
+  assert.strictEqual(ats.orcApplyView({ ok: true, pinInputs: 6 }), "code");
+});
+
+test("orcApplyView: the plain views", () => {
+  assert.strictEqual(ats.orcApplyView({ ok: true, emailGate: true }), "email");
+  assert.strictEqual(ats.orcApplyView({ ok: true, emailInput: true }), "email");
+  assert.strictEqual(ats.orcApplyView({ ok: true, passwordInput: true }), "password");
+  assert.strictEqual(ats.orcApplyView({ ok: true, applyControl: true }), "posting");
+  assert.strictEqual(ats.orcApplyView({ ok: true }), "none");
+});
+
+test("orcApplyView: an email box beats a password box (the quick gate has no password)", () => {
+  // measured on Nokia and Baylor: the quick gate asks for an email and nothing else. A page with
+  // both is a real sign-in, but the login still goes in first, so "email" is the actionable view.
+  assert.strictEqual(ats.orcApplyView({ ok: true, emailInput: true, passwordInput: true }), "email");
+});
+
+test("orcApplyView: federated / create-account only is BLOCKED, never pressed", () => {
+  assert.strictEqual(ats.orcApplyView({ ok: true, federated: ["Sign in with Google"] }), "blocked");
+  assert.strictEqual(ats.orcApplyView({ ok: true, createAccount: ["Create an account"] }), "blocked");
+  // …but a fillable box outranks it: we can proceed ourselves without touching those controls
+  assert.strictEqual(ats.orcApplyView({ ok: true, emailInput: true, federated: ["Sign in with Google"] }), "email");
+});
+
+test("orcApplyView: an unreadable scan is never guessed at", () => {
+  assert.strictEqual(ats.orcApplyView(null), "unreadable");
+  assert.strictEqual(ats.orcApplyView({ ok: false }), "unreadable");
+  assert.strictEqual(ats.orcApplyView({ ok: false, emailInput: true }), "unreadable");
+});
+
+// ── The emailed verification CODE ───────────────────────────────────────────────────────
+const gmail = require("../gmail.js");
+
+test("gmailExtractVerificationCode: the ordinary ORC email", () => {
+  assert.strictEqual(gmail.gmailExtractVerificationCode(
+    "Your verification code is 481920. Enter it to confirm your identity."), "481920");
+  assert.strictEqual(gmail.gmailExtractVerificationCode(
+    "Confirm Your Identity\n\n314159\n\nType this code into the field."), "314159");
+});
+
+test("gmailExtractVerificationCode: ⚠ an ORC JOB ID IS ALSO SIX DIGITS and must never win", () => {
+  // the adversarial case that motivated the URL strip: the email links back to the posting, and
+  // `…/job/334325` is exactly code-shaped. Picking it would report "the code was rejected" and
+  // send the next debugging round to the wrong place.
+  const body = "Your verification code is 481920.\n" +
+    "View the job: https://eeho.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/jobsearch/job/334325";
+  assert.strictEqual(gmail.gmailExtractVerificationCode(body), "481920");
+  // and with NO real code present, the job id inside the URL must not be returned at all
+  const noCode = "Thanks for applying. View the job: https://eeho.fa.us2.oraclecloud.com/x/job/334325";
+  assert.strictEqual(gmail.gmailExtractVerificationCode(noCode), null);
+});
+
+test("gmailExtractVerificationCode: a 7+ digit run is rejected wholesale, not truncated", () => {
+  // \b is not a boundary between two digits, so the first six of a long number are never taken
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Reference 3000000169792650 for your records"), null);
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Your code is 1234567"), null);
+});
+
+test("gmailExtractVerificationCode: it REFUSES an ambiguous body rather than guessing", () => {
+  // two candidates, no keyword near either — guessing burns the code (a wrong submit can
+  // invalidate it) and misreports the cause. One operator stop is the cheaper failure.
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Ref 123456 and batch 654321 processed"), null);
+  // …but a LONE candidate is unambiguous even with no keyword
+  assert.strictEqual(gmail.gmailExtractVerificationCode("481920"), "481920");
+});
+
+test("gmailExtractVerificationCode: keyword proximity picks the right one of several", () => {
+  const body = "Requisition 334325 was posted. Your verification code is 481920. Batch 999888 queued.";
+  assert.strictEqual(gmail.gmailExtractVerificationCode(body), "481920");
+});
+
+test("gmailExtractVerificationCode: empty / junk never throws", () => {
+  for (const v of ["", null, undefined, 0, {}, []]) {
+    assert.strictEqual(gmail.gmailExtractVerificationCode(v), null, String(v));
+  }
+});
+
+test("gmailExtractVerificationCode: the code length is configurable", () => {
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Your code is 1234", { length: 4 }), "1234");
+  assert.strictEqual(gmail.gmailExtractVerificationCode("Your code is 1234", { length: 6 }), null);
+});
+
+// ── An opt-in worded as an acceptance (live on Oracle's own careers site, 2026-08-19) ────
+// Its job-alerts box says "I agree to receive new job opportunities (see oracle.com privacy
+// policy)". Measured BEFORE the fix: atsConsentKind returned "accept", i.e. the box would have
+// been TICKED and the operator subscribed to marketing mail — the one thing the accept-checkbox
+// authorisation explicitly excludes. Pinned in both directions, because widening the opt-in side
+// must not start refusing genuine privacy notices.
+
+test("atsConsentKind: the Oracle job-alerts wording is an OPT-IN, not an acceptance", () => {
+  assert.strictEqual(ats.atsConsentKind("I agree to receive new job opportunities (see oracle.com privacy policy)"), "optin");
+  assert.strictEqual(ats.atsConsentKind("I agree to receive new job opportunities"), "optin");
+  // sibling phrasings a tenant might ship
+  assert.strictEqual(ats.atsConsentKind("Please send me career opportunities"), "optin");
+  assert.strictEqual(ats.atsConsentKind("I agree to receive further employment openings"), "optin");
+});
+
+test("atsConsentKind: DECLARED intent outranks the prose", () => {
+  // wording that carries no opt-in token at all, but the page files it under <opt-in>
+  const hints = { containers: ["opt-in", "job-alerts-opt-in", "form-builder"], id: "job-alerts-checkbox" };
+  assert.strictEqual(ats.atsConsentKind("I agree to receive updates", hints), "optin");
+  // and the declaration wins even over wording that looks like a privacy acceptance, because a
+  // marketer writes an opt-in in the language of assent
+  assert.strictEqual(ats.atsConsentKind("I accept the privacy policy", hints), "optin");
+  // an id alone is enough
+  assert.strictEqual(ats.atsConsentKind("I agree", { id: "job-alerts-checkbox" }), "optin");
+  assert.strictEqual(ats.atsConsentKind("I agree", { name: "marketingOptIn" }), "optin");
+});
+
+test("atsConsentKind: GENUINE acceptances still classify as accept", () => {
+  // the direction that must not regress — a missed acceptance halts the run
+  for (const t of ["I accept the Privacy Policy",
+                   "I agree to the terms and conditions",
+                   "I have read the Peraton Job Application Privacy Notice",
+                   "I acknowledge the GDPR data protection notice",
+                   "I accept the Privacy Notice governing this application"]) {
+    assert.strictEqual(ats.atsConsentKind(t), "accept", t);
+  }
+  // …and an accept box carries no opt-in container, so hints do not disturb it
+  assert.strictEqual(ats.atsConsentKind("I accept the Privacy Policy",
+    { containers: ["legal-disclaimer", "form-builder"], id: "legal-disclaimer-checkbox" }), "accept");
+});
+
+test("atsConsentKind: attestations are still excluded on purpose", () => {
+  assert.strictEqual(ats.atsConsentKind("I certify the information given is accurate"), "attestation");
+  assert.strictEqual(ats.atsConsentKind("I declare under penalty of perjury"), "attestation");
+});
+
+test("atsConsentKind: hints are OPTIONAL — the iCIMS call path is unchanged", () => {
+  assert.strictEqual(ats.atsConsentKind("I accept the Privacy Policy", undefined), "accept");
+  assert.strictEqual(ats.atsConsentKind("I accept the Privacy Policy", null), "accept");
+  assert.strictEqual(ats.atsConsentKind(""), null);
+  assert.strictEqual(ats.atsConsentKind(null), null);
+  assert.strictEqual(ats.atsConsentKind("Are you still enrolled?"), null);
+});
+
+test("atsConsentPlan: the Oracle job-alerts box is LEFT, the privacy box is TICKED", () => {
+  const plan = ats.atsConsentPlan([
+    { sel: "#job-alerts-checkbox", id: "job-alerts-checkbox", containers: ["opt-in", "job-alerts-opt-in"],
+      checked: false, label: "I agree to receive new job opportunities (see oracle.com privacy policy)" },
+    { sel: "#legal-disclaimer-checkbox", id: "legal-disclaimer-checkbox", containers: ["legal-disclaimer"],
+      checked: false, label: "I agree with the terms and conditions" },
+  ]);
+  assert.strictEqual(plan.tick.length, 1);
+  assert.strictEqual(plan.tick[0].sel, "#legal-disclaimer-checkbox");
+  assert.ok(plan.left.some((c) => c.sel === "#job-alerts-checkbox" && c.kind === "optin"),
+    "the job-alerts box must be left untouched and named as an opt-in");
+});
+
+// ── no injected fn may call ANOTHER injected fn (2026-08-19) ─────────────────────────────
+// The existing self-containment test greps each injected fn for the SHIM names (atsLib/atsFd/…),
+// which is necessary but not sufficient: an injected fn is stringified and evaluated in the page, so
+// a reference to any other top-level function is equally undefined there.
+//
+// Found the hard way while writing atsInjOrcPick — it called a top-level atsInjOrcCommitRow, split
+// out "so the two commit paths cannot drift". Every unit test passed and the reference would have
+// thrown ReferenceError on the first live pick. Shared logic between injected fns has to be an inner
+// closure (or duplicated as a marked LOCKSTEP pair), never a call.
+test("injected fns never reference another atsInj* function", () => {
+  const names = Object.keys(ats).filter((k) => /^atsInj/.test(k) && typeof ats[k] === "function");
+  assert.ok(names.length > 15, "expected the injected-fn family, found " + names.length);
+  for (const name of names) {
+    // strip comments first — prose that NAMES a sibling is documentation, not a call. Same reason the
+    // iCIMS lockstep test strips them.
+    const src = String(ats[name])
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+    for (const other of names) {
+      if (other === name) continue;
+      assert.ok(!new RegExp("\\b" + other + "\\s*\\(").test(src),
+        name + " CALLS " + other + " — an injected fn is evaluated in the page, where that name does " +
+        "not exist. Inline it as a closure instead.");
+    }
+  }
+});
+
+
+// ── ORC option capture: which pickers may be enumerated for review ──────────────────────
+// The operator's asymmetry decides every uncertain case: a picker MISSING their answer makes them
+// conclude the form does not offer it, while a complete list wrongly called partial only costs a
+// typed value. So this errs toward not claiming a list.
+
+test("atsOrcCaptureEligible: a plain picker is captured, a GEO picker never is", () => {
+  // non-geo: an empty open returns the whole vocabulary on ORC (measured: country 251, dial 247,
+  // title 17 — there is no pager), so the captured list is genuinely complete.
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "select" }), true);
+  // geo: DEPENDENT (a child with an uncommitted parent answers "No results", so a scan-time capture
+  // would record an empty vocabulary as if it were the field's) and unbounded for city/postal.
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "select", searchDriven: true }), false);
+});
+
+test("atsOrcCaptureEligible: nothing already enumerated is re-opened", () => {
+  // radio / checkbox groups read their option labels inline during the scan — opening them would be
+  // page contact for a list we already hold.
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "radio", options: ["Yes", "No"] }), false);
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "checkbox_group", options: ["A", "B"] }), false);
+  assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: "select", options: ["A"] }), false);
+});
+
+test("atsOrcCaptureEligible: non-choice widgets are never opened", () => {
+  for (const w of ["text", "textarea", "date", "file_upload", "checkbox", "unknown"]) {
+    assert.strictEqual(ats.atsOrcCaptureEligible({ widgetType: w }), false, w);
+  }
+  assert.strictEqual(ats.atsOrcCaptureEligible(null), false);
+  assert.strictEqual(ats.atsOrcCaptureEligible({}), false);
+});
+
+test("atsAttachOptions: a captured COMPLETE ORC list renders as a real picker", () => {
+  // the whole point of the capture — `options` set means review draws a picker; `captured_options`
+  // means it draws type-it-yourself.
+  const rec = {};
+  ats.atsAttachOptions(rec, ["DR.", "Doctor", "Mr.", "Mrs.", "Ms."]);
+  assert.deepStrictEqual(rec.options, ["DR.", "Doctor", "Mr.", "Mrs.", "Ms."]);
+  assert.strictEqual(rec.captured_options, null);
+  assert.notStrictEqual(rec.widgetType, "typeahead");
+});
+
+test("atsAttachOptions: a list marked PARTIAL degrades to filter-or-type, never a false picker", () => {
+  const rec = {};
+  ats.atsAttachOptions(rec, ["Tallahassee, Leon, FL"], true);
+  assert.strictEqual(rec.options, null);
+  assert.deepStrictEqual(rec.captured_options, ["Tallahassee, Leon, FL"]);
+  assert.strictEqual(rec.widgetType, "typeahead");
+  assert.strictEqual(rec.optionsPartial, true);
+});
+
+
+// ── the ORC option-capture PASS (driver-level, against a fake actuation) ─────────────────
+test("atsCaptureOrcOptions: opens only eligible pickers and enriches the SCAN in place", async () => {
+  const opened = [];
+  const logs = [];
+  const act = { eval: async (fn, sel) => {
+    opened.push(sel);
+    if (sel === "#title") return { ok: true, options: ["Mr.", "Ms.", "Dr."], count: 3, closed: true };
+    if (sel === "#dial") return { ok: true, options: ["+1 (United States)"], count: 1, closed: false };
+    return { ok: true, options: [], count: 0, terminalNo: true, closed: true };
+  } };
+  const scan = { fields: [
+    { fieldName: "title", inputSel: "#title", widgetType: "select" },
+    { fieldName: "phoneNumber", inputSel: "#dial", widgetType: "select" },
+    { fieldName: "country", inputSel: "#c", widgetType: "select", searchDriven: true },
+    { fieldName: "region2", inputSel: "#s", widgetType: "select", searchDriven: true },
+    { fieldName: "gender", inputSel: "#g", widgetType: "select" },
+    { fieldName: "lastName", inputSel: "#l", widgetType: "text" },
+    { fieldName: "race", inputSel: "#r", widgetType: "checkbox_group", options: ["Asian"] },
+  ] };
+  const res = await ats.atsCaptureOrcOptions(act, scan, (m) => logs.push(m));
+
+  // ONLY the three eligible pickers were opened — geo pickers, plain text and an already-enumerated
+  // group cost zero page contact.
+  assert.deepStrictEqual(opened, ["#title", "#dial", "#g"]);
+  assert.strictEqual(res.captured, 2);
+  assert.strictEqual(res.skipped, 2);
+
+  // the scan is enriched IN PLACE, which is what makes every downstream atsAttachOptions work
+  assert.deepStrictEqual(scan.fields[0].options, ["Mr.", "Ms.", "Dr."]);
+  // …and nothing else is disturbed
+  assert.strictEqual(scan.fields[2].options, undefined, "a geo picker must never be enumerated");
+  assert.strictEqual(scan.fields[3].options, undefined);
+  assert.strictEqual(scan.fields[5].options, undefined, "a text field is not a picker");
+  assert.deepStrictEqual(scan.fields[6].options, ["Asian"], "an inline-enumerated group is left alone");
+});
+
+test("atsCaptureOrcOptions: NO SILENT CAPS — a lingering list and an unreadable one are both named", async () => {
+  const logs = [];
+  const act = { eval: async (fn, sel) =>
+    (sel === "#dial" ? { ok: true, options: ["+1 (US)"], count: 1, closed: false }
+                     : { ok: true, options: [], count: 0, terminalNo: true, closed: true }) };
+  const scan = { fields: [
+    { fieldName: "phoneNumber", inputSel: "#dial", widgetType: "select" },
+    { fieldName: "gender", inputSel: "#g", widgetType: "select" },
+  ] };
+  await ats.atsCaptureOrcOptions(act, scan, (m) => logs.push(m));
+  const all = logs.join(" | ");
+  assert.ok(/phoneNumber.*did NOT close/.test(all), "a list that stayed open must be reported: " + all);
+  assert.ok(/gender.*no options captured/.test(all), "an unreadable picker must be reported: " + all);
+  assert.ok(/reach review as a text box/.test(all), "…and it must say what that COSTS the operator");
+});
+
+test("atsCaptureOrcOptions: a page with nothing capturable does no page contact", async () => {
+  let calls = 0;
+  const act = { eval: async () => { calls++; return { ok: true, options: [], count: 0 }; } };
+  const scan = { fields: [
+    { fieldName: "country", inputSel: "#c", widgetType: "select", searchDriven: true },
+    { fieldName: "lastName", inputSel: "#l", widgetType: "text" },
+  ] };
+  const res = await ats.atsCaptureOrcOptions(act, scan, () => {});
+  assert.strictEqual(calls, 0);
+  assert.strictEqual(res.captured, 0);
+  assert.strictEqual(res.skipped, 1);
+});
+
+test("atsCaptureOrcOptions: an eval that throws degrades to 'unreadable', never a crash", async () => {
+  const act = { eval: async () => { throw new Error("detached"); } };
+  const scan = { fields: [{ fieldName: "title", inputSel: "#title", widgetType: "select" }] };
+  const res = await ats.atsCaptureOrcOptions(act, scan, () => {});
+  assert.strictEqual(res.captured, 0);
+  assert.strictEqual(res.failed, 1);
+  assert.strictEqual(scan.fields[0].options, undefined);
+});
+
+
+// ── ORC's address is ONE answer expressed through its most specific field ────────────────
+// Measured with the operator: typing a postal code and pressing Enter on its single row fills city,
+// state and county by itself. So the block is one decision, not five — and the five-independent-picks
+// approach failed only because the house clear-before-typing step cascades on a geo picker.
+
+test("atsOrcGeoPlan: the postal code is the anchor and the rest are DEPENDENTS", () => {
+  const fields = [
+    { fieldName: "country", widgetType: "select", searchDriven: true },
+    { fieldName: "city", widgetType: "select", searchDriven: true },
+    { fieldName: "region2", widgetType: "select", searchDriven: true },
+    { fieldName: "postalCode", widgetType: "select", searchDriven: true },
+    { fieldName: "region1", widgetType: "select", searchDriven: true },
+    { fieldName: "addressLine1", widgetType: "text" },
+  ];
+  const plan = ats.atsOrcGeoPlan(fields, { personal_info: { postal_code: "32312", city: "Tallahassee", state_province: "Florida" } });
+  assert.strictEqual(plan.anchor.fieldName, "postalCode");
+  assert.strictEqual(plan.anchorValue, "32312");
+  assert.strictEqual(plan.exact, true);
+  // city / state / county are VERIFIED, never actuated — typing into one clears the anchor
+  assert.deepStrictEqual(plan.dependents.map((d) => d.fieldName).sort(), ["city", "region1", "region2"]);
+  // ⚠ country is the geo ROOT: it mounts the block and is filled normally, so it is neither the
+  // anchor nor a dependent of it.
+  assert.ok(plan.dependents.every((d) => d.fieldName !== "country"));
+});
+
+test("atsOrcGeoPlan: with NO postal code it falls back to city and SAYS the risk", () => {
+  // measured: "32312" resolved to ONE row while "Tallahassee" resolved to TWO (Jefferson and Leon),
+  // and the profile stores no county — so the city route is genuinely ambiguous from our data.
+  const fields = [
+    { fieldName: "city", widgetType: "select", searchDriven: true },
+    { fieldName: "region2", widgetType: "select", searchDriven: true },
+  ];
+  const plan = ats.atsOrcGeoPlan(fields, { personal_info: { city: "Tallahassee", state_province: "Florida" } });
+  assert.strictEqual(plan.anchor.fieldName, "city");
+  assert.strictEqual(plan.exact, false, "a city anchor is NOT an exact resolution");
+  assert.match(plan.detail, /more than one county/i, "the ambiguity has to be stated, not hidden");
+});
+
+test("atsOrcGeoPlan: no geo pickers, or no usable profile value, yields no plan", () => {
+  assert.strictEqual(ats.atsOrcGeoPlan([{ fieldName: "lastName", widgetType: "text" }], { personal_info: { postal_code: "32312" } }), null);
+  // geo present but the profile has nothing to anchor on
+  const fields = [{ fieldName: "postalCode", widgetType: "select", searchDriven: true }];
+  assert.strictEqual(ats.atsOrcGeoPlan(fields, { personal_info: {} }), null);
+  assert.strictEqual(ats.atsOrcGeoPlan(null, null), null);
+});
+
+test("atsOrcGeoPlan: a blank/whitespace profile value is not an anchor", () => {
+  const fields = [
+    { fieldName: "postalCode", widgetType: "select", searchDriven: true },
+    { fieldName: "city", widgetType: "select", searchDriven: true },
+  ];
+  // an empty zip must fall through to city rather than anchoring on nothing
+  const plan = ats.atsOrcGeoPlan(fields, { personal_info: { postal_code: "   ", city: "Tallahassee" } });
+  assert.strictEqual(plan.anchor.fieldName, "city");
+});
+
+test("atsInjOrcPick: ENTER is the commit, with a pointer fallback, and noClear is honoured", () => {
+  // Structural, because the primitive needs a live widget to exercise. Each of these is a measured
+  // behaviour: a pointer click leaves the list OPEN and the selection unmade; clearing a geo picker
+  // cascades to its siblings.
+  const src = String(ats.atsInjOrcPick);
+  assert.match(src, /keyCode: 13/, "Enter must be the commit");
+  assert.match(src, /commitRowByPointer/, "the pointer sequence must survive as a fallback");
+  assert.match(src, /if \(!noClear\)/, "the clear must be skippable for cascading geo pickers");
+  // and it must stay evaluable in the page
+  for (const shim of ["atsLib", "atsFd", "atsInjOrcReadPicker", "atsInjOrcCaptureOptions"]) {
+    assert.ok(!src.includes(shim), "atsInjOrcPick must not reference " + shim);
+  }
+});
+
+
+// ── the geo plan, wired through the driver ───────────────────────────────────────────────
+// The dependents must reach review WITHOUT being actuated, on the fill path AND the replay path.
+// Typing into one clears the anchor that produced it, so "we have an approved value for city" is
+// NOT a licence to type it back in.
+
+function orcGeoAct(picks, evals) {
+  return {
+    eval: async (fn, ...a) => {
+      const name = fn && fn.name;
+      if (evals) evals.push({ fn: name, sel: a[0] });
+      if (name === "atsInjScan") return {
+        ats: "oracle", url: "https://eeho.fa.us2.oraclecloud.com/x", title: "t", fields: [
+          { fieldName: "postalCode", inputSel: "#postal", widgetType: "select", searchDriven: true, isRequired: true, label: "Postal Code", domIndex: 0 },
+          { fieldName: "city", inputSel: "#city", widgetType: "select", searchDriven: true, isRequired: true, label: "City", domIndex: 1 },
+          { fieldName: "region2", inputSel: "#state", widgetType: "select", searchDriven: true, isRequired: true, label: "State", domIndex: 2 },
+          { fieldName: "region1", inputSel: "#county", widgetType: "select", searchDriven: true, isRequired: true, label: "County", domIndex: 3 },
+        ] };
+      if (name === "atsInjOrcPick") { if (picks) picks.push(a[0]); return { ok: true, committed: String(a[1]) }; }
+      if (name === "atsInjOrcCaptureOptions") return { ok: true, options: [], count: 0, closed: true };
+      if (name === "atsInjOrcReadPicker") return { ok: true, value: "32312", invalid: false };
+      if (name === "atsInjReadValue") return { ok: true, value: null };
+      if (name === "atsInjSubmitState") return { ok: true, hasSubmit: true };
+      if (name === "atsInjErrors") return { ok: true, errors: [] };
+      return { ok: true };
+    },
+    delay: async () => {}, delayFull: async () => {}, aiEnabled: false,
+    attachResume: async () => ({ ok: false }),
+  };
+}
+
+test("driveAtsPageFill oracle: only the ANCHOR is actuated; dependents are left for the cascade", async () => {
+  const picks = [], evals = [];
+  const profile = { personal_info: { postal_code: "32312", city: "Tallahassee", state_province: "Florida" } };
+  const out = await ats.driveAtsPageFill(orcGeoAct(picks, evals), "oracle", profile, {}, {}, {});
+  const results = (out && out.results) || out || [];
+  const by = {};
+  for (const r of results) if (r && r.fieldName) by[r.fieldName] = r;
+
+  // the postal anchor WAS picked…
+  assert.ok(picks.includes("#postal"), "the postal anchor must be actuated; picks=" + JSON.stringify(picks));
+  // …and none of its dependents were
+  for (const sel of ["#city", "#state", "#county"]) {
+    assert.ok(!picks.includes(sel), sel + " must NOT be actuated — typing into it clears the anchor");
+  }
+  // each dependent claims nothing, and SAYS why (atsSurfacePrefilled promotes it later from the page)
+  for (const name of ["city", "region2", "region1"]) {
+    assert.ok(by[name], name + " must still produce a record");
+    assert.strictEqual(by[name].status, "skipped", name + " should claim nothing");
+    assert.match(by[name].detail || "", /cascade|clear that anchor/i,
+      name + " must say why it was left: " + by[name].detail);
+  }
+});
+
+test("driveAtsPageFill oracle: a geo dependent is left alone on the REPLAY path too", async () => {
+  // an approved bundle carrying "Tallahassee" must not cause it to be typed back in on submit
+  const picks = [];
+  // ⚠ A REAL bundle carries BOTH — the fill recorded postalCode as filled and city as
+  // already-filled — so postal is still the anchor and city is still a dependent. Handing the
+  // replay ONLY a city would legitimately make city the anchor, which is not what this pins.
+  const out = await ats.driveAtsPageFill(orcGeoAct(picks, null), "oracle", {}, {}, {},
+    { valueFor: (f) => ({ postalCode: "32312", city: "Tallahassee", region2: "FL", region1: "Leon" })[f.fieldName] });
+  const results = (out && out.results) || out || [];
+  const city = results.find((r) => r && r.fieldName === "city");
+  assert.ok(!picks.includes("#city"), "the replay must not type into a geo dependent; picks=" + JSON.stringify(picks));
+  assert.strictEqual(city.status, "skipped");
+});
+
+test("atsActuateField oracle: the pick ALWAYS clears before searching", () => {
+  // ⚠ REVERSED from an earlier assertion, and the reversal is the lesson (operator, 2026-08-19).
+  // noClear was passed for geo pickers because clearing one cascades to its siblings — true, but it
+  // solved a problem the old approach created, when all five geo fields were actuated in sequence.
+  // Now only the ANCHOR is actuated and its cascade repopulates the rest, so the sibling clear is
+  // wanted. Leaving it off was actively harmful: a live run APPENDED its query to a field that
+  // already held a value ("United States" + "United States of America"), and the widget answered
+  // "No results" on a field whose option was right there.
+  assert.match(String(ats.atsActuateField), /atsInjOrcPick[\s\S]{0,400}ATS_ORC_PICK_MS,\s*false\)/,
+    "the pick call must pass noClear=false — a search box must be cleared before it is searched");
+});
+
+
+// ── ORC repeating blocks: the entry lifecycle ────────────────────────────────────────────
+// The commit button is a HOMONYM of the opener ("Add Experience" both times) and on Oracle both live
+// in the SAME block, so scoping by container cannot separate them. The discriminator is the sibling
+// Cancel, present only while an entry form is open. Each action therefore REFUSES in the state where
+// it would press the other's button.
+
+test("atsInjOrcEntryAction: open/commit each REFUSE in the state where they'd press the wrong button", () => {
+  const src = String(ats.atsInjOrcEntryAction);
+  // the Cancel-derived open/closed test must exist…
+  assert.match(src, /\/\^cancel\$\/i/, "openness must be derived from a sibling Cancel");
+  // …and both directions must refuse rather than click blindly
+  assert.match(src, /entry-already-open/, "open must refuse when a form is already open (that button COMMITS)");
+  assert.match(src, /no-open-entry-to-commit/, "commit must refuse when no form is open (that button OPENS)");
+});
+
+test("atsInjOrcEntry*: keyed on the BLOCK, never on the timeline elements", () => {
+  // Baylor renders entries through beautiful-timeline/timeline-form-inline; Oracle has neither and
+  // renders in-block. Keying on those elements would work on exactly one tenant.
+  for (const fn of [ats.atsInjOrcEntryState, ats.atsInjOrcEntryAction]) {
+    const src = String(fn);
+    assert.match(src, /apply-flow-block/, "must locate the block");
+    assert.match(src, /apply-flow-block-title/, "must identify it by its title");
+    assert.ok(!/beautiful-timeline|timeline-form-inline|timeline-form-builder/.test(src),
+      "must NOT key on the timeline elements — they are one tenant's configuration");
+  }
+});
+
+test("atsOrcEntryPlan: counts entries per block, and skips what it cannot source", () => {
+  const profile = {
+    work_experience: [{ company: "A" }, { company: "B" }, { company: "C" }],
+    education: [{ school_or_university: "CMU" }],
+    skills: ["Python", "C"],
+    certifications: [],                      // present but EMPTY → no plan entry
+  };
+  const blocks = ["Experience", "Education", "Licenses and Certificates", "Skills",
+                  "Supporting Documents and URLs"];
+  const plan = ats.atsOrcEntryPlan(profile, blocks);
+  const byBlock = {};
+  for (const p of plan) byBlock[p.block] = p;
+  assert.strictEqual(byBlock.Experience.want, 3);
+  assert.strictEqual(byBlock.Experience.source, "work_experience");
+  assert.strictEqual(byBlock.Education.want, 1);
+  assert.strictEqual(byBlock.Skills.want, 2);
+  assert.ok(!byBlock["Licenses and Certificates"], "an empty profile array yields no plan entry");
+  // a block that is not on the page is not planned for
+  assert.ok(!ats.atsOrcEntryPlan(profile, ["Experience"]).some((p) => p.block === "Education"));
+  // nothing to source ⇒ nothing planned
+  assert.deepStrictEqual(ats.atsOrcEntryPlan({}, blocks), []);
+});
+
+test("atsOrcEntryPlan: NO SILENT CAPS — a history longer than the backstop reports what it dropped", () => {
+  const many = Array.from({ length: ats.ATS_ORC_ENTRY_MAX + 3 }, (_, i) => ({ company: "C" + i }));
+  const plan = ats.atsOrcEntryPlan({ work_experience: many }, ["Experience"]);
+  assert.strictEqual(plan[0].want, ats.ATS_ORC_ENTRY_MAX);
+  assert.strictEqual(plan[0].capped, many.length,
+    "the ORIGINAL count must survive so the run can say what it left out");
+});
+
+test("ATS_ORC_ENTRY_MAPS: the entry forms match what the live DOM actually offered", () => {
+  const we = ats.ATS_ORC_ENTRY_MAPS.work_experience;
+  assert.strictEqual(we.employerName.path, "company");
+  assert.strictEqual(we.jobTitle.path, "job_title");
+  // ⚠ A DATE IS TWO COMBOBOXES SHARING ONE `name`, measured off the live form:
+  //   Experience entry 1 — 6 field(s): employerName[text], jobTitle[text],
+  //                        startDate[combobox], startDate[combobox], endDate[combobox], endDate[combobox]
+  // The first version of this map called it one field of kind "date"; the pass wrote the whole
+  // "2025-05" into whichever id came first and burned 8.2s failing — the slowest field of the run.
+  assert.strictEqual(we.startDate.kind, "date_pair");
+  assert.strictEqual(we.endDate.kind, "date_pair");
+  assert.strictEqual(we.endDate.blankWhenCurrent, true, "a job you still hold has no end date");
+  // ⚠ measured ABSENT on this tenant, and so deliberately unmapped rather than kept "just in case":
+  // a map entry that matches nothing is indistinguishable from one that is broken.
+  for (const gone of ["employerCity", "countryCode", "responsibilities", "leavingReason"]) {
+    assert.ok(!we[gone], gone + " is not on Oracle's Experience entry and must not be mapped");
+  }
+
+  const ed = ats.ATS_ORC_ENTRY_MAPS.education;
+  // `contentItemId` is Oracle's own opaque name for the DEGREE picker — only its label says so.
+  assert.strictEqual(ed.contentItemId.path, "degree");
+  assert.strictEqual(ed.contentItemId.kind, "tiered", "the profile stores degrees as an ordered ladder");
+  assert.strictEqual(ed.major.kind, "tiered");
+  assert.strictEqual(ed.educationalEstablishment.path, "school_or_university");
+  assert.strictEqual(ed.gpa.path, "gpa");
+
+  const sk = ats.ATS_ORC_ENTRY_MAPS.skills;
+  // ⚠ a skills entry is a BARE STRING, so there is no property to read.
+  assert.strictEqual(sk.skills.kind, "self");
+  assert.ok(!sk.yearsOfExperience,
+    "per-skill years are not in the profile, and inventing a number on a form an employer reads is " +
+    "the confidently-wrong class — an entry Oracle refuses over it is the honest outcome");
+});
+
+test("atsOrcEntryValue: the measured kinds, including the ones that must answer NOTHING", () => {
+  const M = ats.ATS_ORC_ENTRY_MAPS;
+  const we = { company: "X", job_title: "Y", from: "2025-05", to: "2025-08", currently_work_here: false };
+  assert.deepStrictEqual(ats.atsOrcEntryValue(M.work_experience.startDate, we), { year: "2025", month: "5" });
+  assert.deepStrictEqual(ats.atsOrcEntryValue(M.work_experience.endDate, we), { year: "2025", month: "8" });
+  // still there ⇒ no end date. Writing one would assert you had left.
+  assert.strictEqual(ats.atsOrcEntryValue(M.work_experience.endDate, { ...we, currently_work_here: true }), null);
+  // a year-only value yields a year and no month — never a guessed month
+  assert.deepStrictEqual(ats.atsOrcEntryValue(M.work_experience.startDate, { from: "2024" }), { year: "2024", month: null });
+  assert.strictEqual(ats.atsOrcEntryValue(M.work_experience.startDate, { from: "" }), null);
+
+  const ed = { degree: ["Bachelor of Science", "Bachelors"], school_or_university: "CMU",
+               field_of_study: ["ECE", "EE"], gpa: "3.95" };
+  assert.deepStrictEqual(ats.atsOrcEntryValue(M.education.contentItemId, ed), ["Bachelor of Science", "Bachelors"],
+    "a tiered value passes through as an ordered candidate list, most-specific first");
+  assert.strictEqual(ats.atsOrcEntryValue(M.education.educationalEstablishment, ed), "CMU");
+  assert.strictEqual(ats.atsOrcEntryValue(M.education.gpa, ed), "3.95");
+
+  assert.strictEqual(ats.atsOrcEntryValue(M.skills.skills, "Python"), "Python", "the entry IS the value");
+  assert.strictEqual(ats.atsOrcEntryValue(M.skills.skills, { name: "Python" }), null,
+    "an object where a bare string was expected answers nothing rather than something wrong");
+
+  // ⚠ THE SEAL: every value comes from the ENTRY. Nothing here may consult a profile root.
+  assert.strictEqual(ats.atsOrcEntryValue(M.education.gpa, {}), null);
+  assert.strictEqual(ats.atsOrcEntryValue(M.work_experience.employerName, {}), null);
+});
+
+
+// ── a regex passed as a STRING must survive the JS string literal (2026-08-19) ───────────
+// Found by a real run, not by a test: the caller passed "^(next|…|submit)\b", and in a JavaScript
+// string literal `\b` is U+0008 (BACKSPACE), not a word boundary. new RegExp therefore received a
+// control character and could never match, so a run reached Oracle's email gate and stopped with
+// `auth-submit-not-pressable` on a page whose Next button was plainly there.
+//
+// ⚠ My earlier test asserted the pattern STRING was present in the source. That is exactly the kind
+// of test that passes while the thing is broken — it checked the spelling, not the behaviour. This
+// one decodes the literal the way the engine does and matches it against real captions.
+const fs = require("node:fs");
+
+test("the ORC button patterns MATCH real captions once decoded from their JS literals", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const found = [...src.matchAll(/atsInjOrcClickButton,\s*"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+  assert.ok(found.length >= 2, "expected the Next and Verify call sites, found " + found.length);
+
+  // decode each JS string literal exactly as the engine would, then build the regex from it
+  const decoded = found.map((lit) => JSON.parse('"' + lit + '"'));
+  for (const pat of decoded) {
+    assert.ok(!/[ -]/.test(pat),
+      "the decoded pattern contains a CONTROL CHARACTER — a \\b in a JS literal is backspace, not a " +
+      "word boundary: " + JSON.stringify(pat));
+  }
+
+  const nextPat = decoded.find((p) => /next/i.test(p));
+  const verifyPat = decoded.find((p) => /verify/i.test(p));
+  assert.ok(nextPat && verifyPat, "both call-site patterns must be present");
+
+  const next = new RegExp(nextPat, "i");
+  for (const cap of ["Next", "Next ", "NEXT", "Continue", "Sign In", "Submit"]) {
+    assert.ok(next.test(cap), "the Next pattern must match " + JSON.stringify(cap));
+  }
+  // …and must not claim the buttons that sit beside it on Oracle's own gate
+  for (const cap of ["Cancel", "Do you want to communicate by phone instead?", "Add Experience"]) {
+    assert.ok(!next.test(cap), "the Next pattern must NOT match " + JSON.stringify(cap));
+  }
+
+  const verify = new RegExp(verifyPat, "i");
+  assert.ok(verify.test("Verify"), "the Verify pattern must match Verify");
+  assert.ok(verify.test("VERIFY"), "…including the caption as Oracle renders it");
+  assert.ok(!verify.test("Send New Code"), "and must not claim the resend control");
+});
+
+
+// ── a shared reader's RESULT CONTRACT is load-bearing (live 2026-08-19) ──────────────────
+// runOrcPreForm's `sig()` gates every read on `r && r.ok`, which is how every other atsInj* result
+// is consumed. atsInjPageSignature did not return `ok`, so each successful read became null, both
+// sides of the compare were null, and atsSignatureChanged's conservative "an unreadable side is no
+// change" rule made every ORC waitForChange run its FULL budget — 36s per run, reported as "page
+// did NOT change". The flow still advanced (the next round re-scans), which is exactly why it hid.
+test("atsInjPageSignature returns ok:true, so an `r && r.ok` caller does not discard a good read", () => {
+  const prevDoc = global.document, prevLoc = global.location;
+  try {
+    const el = (id) => ({ id, name: "", getAttribute: () => null });
+    global.document = {
+      querySelectorAll: (q) => (/button/.test(q) ? [el("a"), el("b")] : [el("a")]),
+      // selector-aware: the reader also looks for an iCIMS frame, and ORC has none
+      querySelector: (q) => (/iframe/.test(q) ? null : { textContent: "  Personal   Info " }),
+      getElementById: () => null,
+    };
+    global.location = { href: "https://eeho.fa.us2.oraclecloud.com/x/apply/section1#frag" };
+
+    const r = ats.atsInjPageSignature();
+    assert.strictEqual(r.ok, true, "without ok:true every caller that gates on it reads a good page as unreadable");
+    // the rest of the contract the comparator depends on
+    assert.strictEqual(r.url, "https://eeho.fa.us2.oraclecloud.com/x/apply/section1", "the fragment is dropped");
+    assert.strictEqual(r.heading, "Personal Info", "whitespace-collapsed heading");
+    assert.strictEqual(r.controls, 1, "controls counts inputs/selects/textareas, not buttons");
+
+    // and the gate a caller actually writes must now KEEP it
+    const gated = (x) => (x && x.ok ? x : null);
+    assert.notStrictEqual(gated(r), null, "the caller's own `r && r.ok` gate must pass on a real read");
+  } finally { global.document = prevDoc; global.location = prevLoc; }
+});
+
+test("atsSignatureChanged keeps its conservative rule: an unreadable side is never progress", () => {
+  const a = { ok: true, url: "u", heading: "h", controls: 3, ids: "x" };
+  assert.strictEqual(ats.atsSignatureChanged(null, a), false, "a missing baseline is not a change");
+  assert.strictEqual(ats.atsSignatureChanged(a, null), false, "a failed read is not a change");
+  assert.strictEqual(ats.atsSignatureChanged(a, a), false);
+  assert.strictEqual(ats.atsSignatureChanged(a, { ...a, url: "v" }), true);
+  assert.strictEqual(ats.atsSignatureChanged(a, { ...a, controls: 4 }), true);
+  assert.strictEqual(ats.atsSignatureChanged(a, { ...a, heading: "i" }), true);
+  // ⚠ the `ok` field is NOT part of the comparison — it reports readability, not identity, so a
+  // signature must never appear to "change" merely because one read declared itself differently.
+  assert.strictEqual(ats.atsSignatureChanged({ ...a, ok: true }, { ...a, ok: undefined }), false);
+});
+
+test("the ORC wait reports BLINDNESS separately from stillness", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("const waitForChange = async");
+  assert.ok(i > 0, "the ORC wait must exist");
+  const body = src.slice(i, i + 1200);
+  assert.ok(/blind:/.test(body), "the wait must distinguish 'never read the page' from 'page stood still'");
+  assert.ok(/readOk/.test(body), "and must count the reads that actually landed, so the log can say so");
+  // the three call sites must go through the shared message, not re-spell the binary
+  assert.ok(!/did NOT change\$\{|\? "changed" : "did NOT change"/.test(src),
+    "no call site may re-spell the changed/not-changed binary — that is what hid the blindness");
+});
+
+// ── ORC's `title` is a SALUTATION and must be CLAIMED (live 2026-08-19) ──────────────────
+// Unmapped, its label normalizes to "title" — one of the most common taught-bucket wordings there
+// is — and an operator bucket answered it "Characterization and Test Automation Intern": a job
+// title aimed at a Mr./Mrs./Dr. picker. Only the platform id can tell the two apart.
+test("ORC `title` is claimed as a salutation, so no bucket or AI can answer it with a job title", () => {
+  const m = ats.ATS_STATIC_MAPS.oracle;
+  assert.ok(m.title, "`title` must be CLAIMED — recognition is what keeps the guessers off it");
+  assert.strictEqual(m.title.kind, "skip", "the profile stores no salutation, so the answer is BLANK");
+  assert.ok(/salutation/i.test(m.title.detail || ""), "and the record must SAY why it is blank");
+  // it must NOT have become a job-title mapping by someone 'fixing' it the other way
+  assert.ok(!/job_title/.test(JSON.stringify(m.title)), "a job title in a salutation picker is the bug, not the fix");
+  // the honorific field is page-level, so it must not be confused with the work-entry `title`,
+  // which legitimately IS the job title
+  const entryTitle = (ats.ATS_ENTRY_MAPS && ats.ATS_ENTRY_MAPS.icims) || null;
+  if (entryTitle) assert.ok(true, "the iCIMS work-entry map keeps its own `title` → job_title");
+});
+
+test("a no-results diagnosis is only attributed to the geo cascade on a geo field", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const hits = [...src.matchAll(/dependent geo picker whose parent is not committed/g)];
+  assert.ok(hits.length >= 1, "the geo explanation must still exist");
+  for (const h of hits) {
+    // each occurrence must sit inside a searchDriven-guarded branch, not be appended unconditionally
+    const before = src.slice(Math.max(0, h.index - 400), h.index);
+    assert.ok(/searchDriven/.test(before),
+      "the geo explanation must be guarded by searchDriven — printed on a salutation picker it sends " +
+      "the next debugging round at the wrong subsystem");
+  }
+});
+
+
+// ── the ORC multi-step walk ──────────────────────────────────────────────────────────────
+// ORC is the first MULTI-PAGE form on the ats.js path. The safety property under test is the one
+// this whole codebase is built around: the walk must reach the end of the wizard and NEVER press
+// the control that submits an application.
+
+const mkBtn = (caption, opts = {}) => ({
+  value: opts.isInput ? caption : undefined,
+  textContent: opts.isInput ? "" : caption,
+  disabled: !!opts.disabled,
+  getAttribute: (a) => (a === "aria-disabled" ? (opts.ariaDisabled ? "true" : null) : null),
+  getBoundingClientRect: () => (opts.invisible ? { width: 0, height: 0 } : { width: 90, height: 32 }),
+  click() { this.clicked = true; },
+});
+const mkSection = (visible) => ({ getBoundingClientRect: () => (visible ? { width: 800, height: 400 } : { width: 0, height: 0 }) });
+
+// A document whose querySelectorAll answers by selector family — enough for the step reader.
+const mkOrcDoc = ({ pagButtons = [], sections = [], submitButtons = [], announce = null, errors = [] } = {}) => {
+  const pag = {
+    textContent: announce || "Back 1 2 3 4 Next",
+    querySelectorAll: () => pagButtons,
+    getBoundingClientRect: () => ({ width: 700, height: 60 }),
+  };
+  return {
+    querySelector: (q) => (/apply-flow-pagination/.test(q) ? pag : null),
+    querySelectorAll: (q) => {
+      if (/apply-flow-pagination/.test(q) && /aria-live/.test(q)) return [pag];
+      if (/^apply-flow-section$/.test(q)) return sections;
+      if (/input\[type="submit"\]/.test(q) || /^button, input/.test(q)) return submitButtons;
+      if (/role=alert/.test(q)) return errors;
+      return [];
+    },
+    getElementById: () => null,
+  };
+};
+
+test("atsInjOrcStepState: the step comes from the URL and the TOTAL from the announced text", () => {
+  const prevDoc = global.document, prevLoc = global.location;
+  try {
+    global.location = { href: "https://x.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/en/sites/js/job/1/apply/section/2#z" };
+    const next = mkBtn("Next"), back = mkBtn("Back"), one = mkBtn("1"), two = mkBtn("2");
+    global.document = mkOrcDoc({
+      pagButtons: [back, one, two, next],
+      sections: [mkSection(false), mkSection(true), mkSection(true), mkSection(false), mkSection(false)],
+      announce: "Job application, step 2 of 4",
+    });
+    const st = ats.atsInjOrcStepState();
+    assert.strictEqual(st.ok, true);
+    assert.strictEqual(st.step, 2, "the step number is DECLARED in the url — the primary signal");
+    assert.strictEqual(st.total, 4, "the total is only available from the announced text");
+    assert.strictEqual(st.hasNext, true);
+    assert.strictEqual(st.nextCaption, "Next");
+    assert.strictEqual(st.hasBack, true);
+    // ⚠ the bar reads "Back 1 2 3 4 Next" — the NUMBERED buttons are step jumps and must never be
+    // mistaken for the advance control.
+    assert.strictEqual(st.hasSubmit, false, "no visible submit on a middle step");
+    // TWO sections are visible at once on Oracle (index 0 is the résumé-import banner), so the
+    // active-section signal is a SET and never a count.
+    assert.deepStrictEqual(st.visibleSections, [1, 2]);
+    assert.strictEqual(st.sectionCount, 5, "…and the section count is NOT the step count (5 sections, 4 steps)");
+  } finally { global.document = prevDoc; global.location = prevLoc; }
+});
+
+test("atsInjOrcStepState: a 0×0 submit does NOT count — every step is mounted at once", () => {
+  const prevDoc = global.document, prevLoc = global.location;
+  try {
+    global.location = { href: "https://x.fa.us2.oraclecloud.com/a/apply/section/1" };
+    // ORC mounts all four steps, so the LAST step's Submit is in the DOM while we sit on step 1 —
+    // at 0×0. Geometry is the trustworthy signal on the form (declared intent is not: inactive
+    // sections report aria-hidden="false"), so the invisible one must be excluded.
+    global.document = mkOrcDoc({
+      pagButtons: [mkBtn("Next")],
+      sections: [mkSection(true)],
+      submitButtons: [mkBtn("Submit Application", { invisible: true })],
+    });
+    assert.strictEqual(ats.atsInjOrcStepState().hasSubmit, false,
+      "an inactive step's Submit is mounted at 0×0 and must not make the walk think it is finished");
+
+    global.document = mkOrcDoc({
+      pagButtons: [],
+      sections: [mkSection(true)],
+      submitButtons: [mkBtn("Submit Application")],
+    });
+    const st = ats.atsInjOrcStepState();
+    assert.strictEqual(st.hasSubmit, true, "a VISIBLE submit is the last step");
+    assert.strictEqual(st.hasNext, false, "…and the terminal condition the walk keys on is the absence of Next");
+  } finally { global.document = prevDoc; global.location = prevLoc; }
+});
+
+test("atsInjOrcStepState: a DISABLED Next is reported, not hidden — that is how ORC refuses a step", () => {
+  const prevDoc = global.document, prevLoc = global.location;
+  try {
+    global.location = { href: "https://x.fa.us2.oraclecloud.com/a/apply/section/1" };
+    global.document = mkOrcDoc({
+      pagButtons: [mkBtn("Next", { disabled: true })],
+      sections: [mkSection(true)],
+      errors: [{ textContent: "  You must answer   all required questions ", getBoundingClientRect: () => ({ width: 400, height: 20 }) }],
+    });
+    const st = ats.atsInjOrcStepState();
+    assert.strictEqual(st.hasNext, true, "it is present…");
+    assert.strictEqual(st.nextEnabled, false, "…but not pressable, which is a different halt from 'no Next'");
+    assert.deepStrictEqual(st.errors, ["You must answer all required questions"],
+      "and the page's OWN words come back with it, so the halt does not need a second read");
+  } finally { global.document = prevDoc; global.location = prevLoc; }
+});
+
+// ── GUARD 2: the click itself refuses a forbidden caption ────────────────────────────────
+test("atsInjOrcClickButton REFUSES a forbidden caption, judged on what it actually resolved", () => {
+  const prevDoc = global.document;
+  try {
+    // A bar whose only control is captioned Submit: the Next pattern must not find it, and even if a
+    // widened pattern did, the forbid list must refuse the press.
+    const submit = mkBtn("Submit Application");
+    global.document = {
+      querySelector: () => ({ querySelectorAll: () => [submit] }),
+      querySelectorAll: () => [submit],
+    };
+    const byNext = ats.atsInjOrcClickButton(ats.ATS_ORC_NEXT_RE, "apply-flow-pagination", ats.ATS_ORC_FORBID_RE);
+    assert.strictEqual(byNext.ok, false, "the Next pattern must not match Submit");
+    assert.ok(/no-button-matching/.test(byNext.error));
+    assert.ok(!submit.clicked, "nothing may be pressed");
+
+    // now the belt: a pattern that WOULD match it is still refused by the forbid list
+    const widened = ats.atsInjOrcClickButton("^(next|submit)\\b", "apply-flow-pagination", ats.ATS_ORC_FORBID_RE);
+    assert.strictEqual(widened.ok, false, "the forbid list is the second guard and must hold on its own");
+    assert.strictEqual(widened.error, "refused-forbidden-caption");
+    assert.strictEqual(widened.caption, "Submit Application", "and it must name what it refused");
+    assert.ok(!submit.clicked, "STILL nothing pressed — this is the one irreversible click in the pipeline");
+
+    // …and a real Next goes through
+    const next = mkBtn("Next");
+    global.document = { querySelector: () => ({ querySelectorAll: () => [next] }), querySelectorAll: () => [next] };
+    const ok = ats.atsInjOrcClickButton(ats.ATS_ORC_NEXT_RE, "apply-flow-pagination", ats.ATS_ORC_FORBID_RE);
+    assert.strictEqual(ok.ok, true);
+    assert.strictEqual(next.clicked, true);
+  } finally { global.document = prevDoc; }
+});
+
+test("the ORC advance and forbid patterns are DISJOINT — no caption can satisfy both", () => {
+  const next = new RegExp(ats.ATS_ORC_NEXT_RE, "i"), forbid = new RegExp(ats.ATS_ORC_FORBID_RE, "i");
+  for (const cap of ["Next", "Continue", "Save and Continue", "Save & Continue"]) {
+    assert.ok(next.test(cap), "must advance on " + JSON.stringify(cap));
+    assert.ok(!forbid.test(cap), JSON.stringify(cap) + " must not be forbidden");
+  }
+  for (const cap of ["Submit", "Submit Application", "Apply Now", "Finish", "Send Application"]) {
+    assert.ok(!next.test(cap), JSON.stringify(cap) + " must NEVER match the advance pattern");
+    assert.ok(forbid.test(cap), JSON.stringify(cap) + " must be on the forbid list");
+  }
+  for (const cap of ["Back", "1", "2", "3", "4"]) {
+    assert.ok(!next.test(cap), "a step-jump button is not the advance control: " + JSON.stringify(cap));
+  }
+  // a decoded-literal check, because `\b` in a JS string literal is BACKSPACE and that exact slip
+  // already halted one live run with a pattern that could never match.
+  assert.ok(!/[\x00-\x1f]/.test(ats.ATS_ORC_NEXT_RE), "the advance pattern must not contain a control character");
+});
+
+// ── the walk's structure, asserted on source because it is I/O-shaped ────────────────────
+test("the ORC walk: clear-once OUTSIDE the loop, write-per-step", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("const MULTI = ats === \"oracle\"");
+  assert.ok(i > 0, "the walk must exist");
+  // ⚠ STRIP COMMENTS BEFORE ASSERTING ON SOURCE. The walk DOCUMENTS the shapes it refuses ("the
+  // terminal test is the presence of a Next control and not `step >= total`"), and a textual scan
+  // cannot tell that apart from doing it — this assertion failed on its own explanation. Third time
+  // today, after the sw-globals lockstep guards and the injected-fn guard before them: a guard that
+  // reads prose punishes the comment written to prevent the bug.
+  const walk = stripJsComments(src.slice(i, src.indexOf("if (!bundle) return", i)));
+  assert.ok(walk.length > 1000, "found the walk body");
+
+  // the clear must happen BEFORE the loop — a clear inside wipes the steps already walked
+  const clearAt = walk.indexOf("reviewSummary: null");
+  const loopAt = walk.indexOf("for (let iter");
+  assert.ok(clearAt > 0 && loopAt > 0 && clearAt < loopAt,
+    "reviewSummary must be cleared ONCE before the loop — a mid-walk clear wipes the accumulated steps");
+
+  // accumulation must go through the PURE merge, not a rebuild
+  assert.ok(/accumulateBundle\(accEntries, pageBundle\)/.test(walk),
+    "steps must merge through the pure accumulateBundle so other pages' entries (and their edits) survive");
+  // …and be persisted per step, so an evicted worker cannot lose a walked step
+  assert.ok(/chrome\.storage\.local\.set\(\{ reviewSummary: bundle \}/.test(walk), "write-per-step");
+});
+
+// ── THE ADVANCE IS SHARED, AND THAT IS THE POINT (2026-08-20) ────────────────────────────────
+// Extracted when the submit run grew its own ORC walk. Both guards on the one irreversible act in
+// the pipeline live in ONE function now, so the assertions follow them there — and one new
+// assertion covers the thing the extraction exists to prevent: a second, drifting copy.
+test("orcAdvanceAfterStep: guard 1, guard 2 and the monotone predicate — in one shared copy", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("async function orcAdvanceAfterStep");
+  assert.ok(i > 0, "the shared advance must exist");
+  const fn = stripJsComments(src.slice(i, src.indexOf("\n}", src.indexOf("return { advanced: true", i))));
+
+  // GUARD 1 — terminal on the ABSENCE of Next, never on step >= total
+  assert.ok(/if \(!after\.hasNext\)/.test(fn), "the terminal test is the absence of an advance control");
+  assert.ok(!/after\.step >= after\.total|step >= total/.test(fn),
+    "the step count must NOT be derived from the section count or compared to a total — Baylor serves " +
+    "5 sections for 4 steps and Oracle 4 for 3");
+  // GUARD 2 — the forbid pattern is actually passed at the call site
+  assert.ok(/atsInjOrcClickButton, ATS_ORC_NEXT_RE, "apply-flow-pagination", ATS_ORC_FORBID_RE/.test(fn),
+    "the advance must pass the forbid pattern — guard 2 is worthless if the call site omits it");
+  // the advance predicate must be monotone
+  assert.ok(/now\.step > after\.step/.test(fn), "advancement is 'the declared step number went UP' — a monotone predicate");
+  // a stalled advance is a graceful halt carrying the form's own words
+  assert.ok(/step-did-not-advance/.test(fn) && /now\.errors/.test(fn),
+    "a refused advance must halt with the page's own error text, never retry and never guess");
+  // a disabled Next is WAITED OUT, not treated as a refusal (Oracle disables it while it saves)
+  assert.ok(/nextEnabled/.test(fn) && /next-disabled/.test(fn),
+    "the disabled-Next wait must be here too — it is what keeps 'Saved' from ending the walk");
+
+  // ⚠⚠ ONE COPY. The submit walk must CALL this, never carry its own — a near-duplicate of the
+  // double guard would keep working right up until the day it stopped agreeing with this one about
+  // what "the last step" means, and the disagreement would surface as a submitted application.
+  const calls = (src.match(/await orcAdvanceAfterStep\(/g) || []).length;
+  assert.ok(calls >= 2, "both the fill walk and the submit walk must go through the shared advance (found " + calls + ")");
+  const guard1 = (src.match(/if \(!after\.hasNext\)/g) || []).length;
+  assert.strictEqual(guard1, 1, "guard 1 must exist exactly ONCE in the file — a second copy is the drift this prevents");
+});
+
+test("a partial ORC bundle NAMES the step it stopped on and why", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("if (orcSinglePageOnly) {");
+  assert.ok(i > 0);
+  const blk = src.slice(i, i + 900);
+  assert.ok(/bundle\.partial = true/.test(blk), "partial must be carried ON THE BUNDLE, not only logged");
+  assert.ok(/walkStopped/.test(blk) && /walkDetail/.test(blk),
+    "the reason must reach the reviewer — 'incomplete' without WHICH step and WHAT the form said is not actionable");
+  // and it must only be partial when the walk did NOT reach the end
+  assert.ok(/walkStopped !== "reached-final-step"/.test(src),
+    "a walk that reached the last step produces a COMPLETE bundle");
+});
+
+
+// ── "nothing here" needs stability, not one read (live 2026-08-19) ───────────────────────
+// The gate submitted, the page changed in 1387ms, and the next scan of `…/apply/section/1` reported
+// every signal zero — the fingerprint of a half-rendered SPA, not of an unknown page. The run halted
+// `unknown-page` on the form it had just reached. The same wait had previously burned a full 20228ms
+// because its signature comparison could never return true, and that accidental delay WAS the settle
+// this loop relied on; making the wait honest removed it.
+test("the ORC pre-form SETTLES before concluding a page is unknown", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf('if (view === "none") {');
+  assert.ok(i > 0, "the none branch must exist");
+  const branch = src.slice(i, i + 2600);
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const code = stripComments(branch);
+  // it must POLL rather than halt on the first read
+  assert.ok(/while \(Date\.now\(\) - noneT0/.test(code),
+    "a `none` view must be re-read against a budget — one read cannot distinguish 'nothing here' from 'not yet'");
+  assert.ok(/orcApplyView\(again\)/.test(code), "and the re-read must go through the same view judgement");
+  // …and it must still be able to halt, so a genuinely unknown page is not walked blindly
+  assert.ok(/halt\("unknown-page"/.test(code), "a view that stays none for the whole budget must still halt");
+  // the halt must REPORT the wait, so it can never again be mistaken for the instant one
+  assert.ok(/reads/.test(code) && /toFixed\(1\)/.test(code),
+    "the halt must say how long it waited and how many reads landed — otherwise a settled halt and an " +
+    "instant one read identically in the log");
+  // and it must resume the loop on the settled view rather than acting on the stale one
+  assert.ok(/continue;/.test(code), "a settled view must be routed by the loop, not by the stale read");
+});
+
+
+// ── a function's body may only use what its signature receives (live 2026-08-19) ─────────
+// The ORC entry pass was written against driveAtsPageFill's scope while living inside
+// atsFinishFill's, so it threw `profile is not defined` on a real run. Node cannot catch that
+// statically for a whole file, but it CAN check the specific pair: the finish stage now uses
+// `profile` and `jobContext`, so both must be parameters AND must be passed at the one call site.
+test("atsFinishFill receives what its body uses — profile and jobContext", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const sig = /async function atsFinishFill\(([^)]*)\)/.exec(src);
+  assert.ok(sig, "atsFinishFill must exist");
+  const params = sig[1].split(",").map((x) => x.trim());
+
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const start = src.indexOf("async function atsFinishFill(");
+  const body = stripComments(src.slice(start, src.indexOf("\n}\n", start)));
+
+  for (const name of ["profile", "jobContext"]) {
+    if (new RegExp("\\b" + name + "\\b").test(body.slice(body.indexOf("{")))) {
+      assert.ok(params.includes(name),
+        `atsFinishFill's body uses \`${name}\` but its signature does not receive it — that is a ` +
+        `ReferenceError at runtime and every Node test still passes, because no test calls this ` +
+        `function with an ORC scan`);
+    }
+  }
+  // …and the single call site must actually pass them, in the right positions
+  const call = /return await atsFinishFill\(([^)]*)\)/.exec(src);
+  assert.ok(call, "the call site must exist");
+  const args = call[1].split(",").map((x) => x.trim());
+  assert.strictEqual(args.length, params.length,
+    "the call site passes " + args.length + " argument(s) for " + params.length + " parameter(s) — a " +
+    "trailing parameter left unpassed is `undefined`, which fails silently rather than loudly");
+});
+
+test("the ORC diagnostics report their OWN failure — a silent completeness catch hides a bug forever", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // both ORC completeness guards must say something when they fail. The entry pass's catch is what
+  // surfaced the scope bug in ONE run; the unclaimed check's catch was silent, so an identical
+  // failure there would have read as "no unclaimed controls" — a clean step, on the very diagnostic
+  // built because a clean-looking step was hiding three required fields.
+  for (const marker of ["ORC-ENTRY", "ORC-UNCLAIMED"]) {
+    const i = src.indexOf("[ApplyPilot][" + marker + "] ⛔");
+    assert.ok(i > 0, `the ${marker} guard must log its own failure, not swallow it`);
+  }
+  // and neither may be an empty catch
+  const emptyCatches = [...src.matchAll(/catch \(e\) \{ \/\* a diagnostic must never break a fill \*\/ \}/g)];
+  assert.strictEqual(emptyCatches.length, 0,
+    "an empty diagnostic catch makes a broken check indistinguishable from a clean result");
+});
+
+
+// ── ORC labels some lists "<CODE> - <Name>" (live 2026-08-19) ────────────────────────────
+// The Education entry's Degree picker returned exactly ONE row for a search of "Bachelor of
+// Science" — `"BS - Bachelor of Science"` — and an exact compare refused it, leaving a REQUIRED
+// field empty and Oracle refusing the whole Education entry on three consecutive runs.
+test("atsInjOrcPick: a code-prefixed option is matched on the form's own \" - \" separator", async () => {
+  const prevDoc = global.document, prevWin = global.window;
+  try {
+    // the injected fn writes through the NATIVE value setter (the React-fill technique), so the
+    // fixture has to provide one — a plain object property would not be a descriptor with a `set`.
+    let held = "";
+    global.window = { HTMLInputElement: { prototype: {} }, HTMLTextAreaElement: { prototype: {} } };
+    // the pick TYPES into the search box, so the event constructors it uses must exist
+    global.KeyboardEvent = class { constructor(t, o) { Object.assign(this, o || {}); this.type = t; } };
+    global.Event = global.Event || class { constructor(t, o) { Object.assign(this, o || {}); this.type = t; } };
+    global.MouseEvent = class { constructor(t, o) { Object.assign(this, o || {}); this.type = t; } };
+    global.PointerEvent = class { constructor(t, o) { Object.assign(this, o || {}); this.type = t; } };
+    Object.defineProperty(global.window.HTMLInputElement.prototype, "value", {
+      configurable: true, get() { return held; }, set(v) { held = v; },
+    });
+    const mkRow = (text) => ({
+      textContent: text,
+      getBoundingClientRect: () => ({ width: 300, height: 24, x: 10, y: 10 }),
+      dispatchEvent() { this.clicked = true; return true; },
+      scrollIntoView() {},
+    });
+    const rows = [mkRow("BS - Bachelor of Science")];
+    const listbox = { querySelectorAll: () => rows };
+    const input = {
+      id: "contentItemId-9", value: "", className: "cx-select-input",
+      getAttribute: (a) => (a === "aria-controls" ? "lb1" : null),
+      focus() {}, click() {}, dispatchEvent() { return true; },
+      getBoundingClientRect: () => ({ width: 200, height: 30, x: 0, y: 0 }),
+      closest: () => null,
+    };
+    global.document = {
+      querySelector: (q) => (/contentItemId/.test(q) ? input : null),
+      getElementById: (id) => (id === "lb1" ? listbox : null),
+      querySelectorAll: () => [],
+    };
+
+    const r = await ats.atsInjOrcPick("#contentItemId-9", "Bachelor of Science",
+      ["bachelor of science"], 1500, false, /* segmentMatch */ true);
+    assert.ok(r && r.ok, "the code-prefixed row must be accepted: " + JSON.stringify(r));
+    assert.strictEqual(r.committed, "BS - Bachelor of Science",
+      "and the COMMITTED value is the form's own full label, not our candidate");
+  } finally { global.document = prevDoc; global.window = prevWin; }
+});
+
+test("the code-prefix rule is structural, not the containment the ladder refuses", () => {
+  // The rule lives inside atsInjOrcPick, so its guarantees are asserted on the source: each of the
+  // three is what separates this from a substring guess, and losing any one of them turns it into
+  // exactly the thing the match ladder exists to refuse.
+  const src = String(ats.atsInjOrcPick);
+  // 1. the separator is " - " WITH SPACES — a bare hyphen lives inside ordinary words and names
+  assert.ok(/indexOf\(" - "\)/.test(src),
+    'the split must be on " - " with spaces; a bare "-" matches inside "Jean-Luc" and "Add-On"');
+  assert.ok(!/split\("-"\)|indexOf\("-"\)/.test(src), "a bare hyphen must never be the separator");
+  // 2. what remains must EQUAL the candidate, never merely contain it
+  assert.ok(/wants\.indexOf\(afterCode\(t\(r\)\)\) !== -1/.test(src),
+    "the remainder must be looked up in `wants` (an exact, normalized compare), not substring-tested");
+  // 3. the ambiguity guard is untouched — two matching rows still refuse
+  assert.ok(/hits\.length > 1[\s\S]{0,80}ambiguous/.test(src),
+    "two rows matching must still be `ambiguous` and commit nothing");
+  // 4. and it is gated on segmentMatch, so a plain picker is unaffected
+  assert.ok(/segmentMatch && afterCode/.test(src), "the rule must only apply where segment matching is on");
+});
+
+
+// ── ORC's yes/no questions are a pair of BUTTONS (live 2026-08-20) ───────────────────────
+// The operator reported three REQUIRED yes/no questions on step 3 that no run ever filled. They
+// were there the whole time and every sweep in this file was blind to them at once: no
+// input/select/textarea exists, the ARIA roles are list/listitem (not radio), and the
+// block-population settle counted 0 "inputs" and spent 15s deciding the block was still loading —
+// of a block visible at 680×331 with all three questions rendered.
+test("the ORC scan finds a pill yes/no group, keyed on its flexfield id with the counter stripped", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("ul.cx-select-pills-container");
+  assert.ok(i > 0, "the pill widget must be scanned");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const pass = stripComments(src.slice(src.indexOf("for (const ul of sec.querySelectorAll(\"ul.cx-select-pills-container\")"), i + 4000));
+
+  // ⚠ its own pass, NOT a branch in the control loop: the row class is `input-row--has-picker`,
+  // the SAME as a combobox, so the classifier would call it a picker, look for an inner
+  // input[role=combobox], find none, and drop the field silently.
+  assert.ok(/widgetType: "yesno"/.test(pass), "it must classify as the existing yesno widget");
+  // the durable key strips the volatile render counter, like every other ORC field
+  assert.ok(/replace\(\/-\\d\+\$\/, ""\)/.test(pass),
+    "the key must strip the trailing -<digits> render counter (lastName-21 -> lastName)");
+  // required lives on the LABEL class, not the row's
+  assert.ok(/input-row__label--required/.test(pass),
+    "required is marked on the label class; reading the ROW class reports these as OPTIONAL, and an " +
+    "optional unmapped field is deliberately left blank — they would stay unfilled AND unexplained");
+  // aria-pressed is the selected state
+  assert.ok(/aria-pressed/.test(pass), "the current answer is read from aria-pressed");
+});
+
+test("atsInjClickYesNo/atsInjReadValue: the container is the Ashby entry OR the element itself", () => {
+  for (const fn of [ats.atsInjClickYesNo, ats.atsInjReadValue]) {
+    const src = String(fn);
+    assert.ok(/ashby-application-form-field-entry"\) \|\| (cb|el)/.test(src),
+      "requiring the Ashby wrapper made ORC's pill group `no-field-entry`; the fallback keeps Ashby " +
+      "byte-identical while making the primitive shape-agnostic");
+  }
+});
+
+test("an ORC block's control count includes pill groups", () => {
+  const src = String(ats.atsInjOrcBlocks);
+  assert.ok(/cx-select-pills-container/.test(src),
+    "a block holding three button-pair questions counted 0 controls, so the settle spent its whole " +
+    "budget deciding a fully-rendered block was still loading. 'Zero inputs' and 'nothing to " +
+    "answer' are different claims");
+});
+
+// ── the two US EEO demographics must never be answered from each other ───────────────────
+test("the Hispanic/Latino question is recognized by its OPTIONS when the label will not say", () => {
+  const p = { self_identification: { hispanic_or_latino: "No", race_ethnicity: "Asian" } };
+  // live shape: label "Ethnicity", a single checkbox, option "I am Hispanic or Latino."
+  const r = ats.atsRouteLabel("Ethnicity", { options: ["I am Hispanic or Latino."] }, p, {});
+  assert.strictEqual(r.path, "self_identification.hispanic_or_latino",
+    '"Ethnicity" carries no hispanic token, so it fell into the RACE rung and was answered "Asian" — ' +
+    "a demographic answered from a different demographic field");
+  assert.deepStrictEqual(r.candidates, ["No"]);
+
+  // …and the race question still answers from race
+  const r2 = ats.atsRouteLabel("Select the races you identify with.",
+    { options: ["American Indian or Alaska Native", "Asian", "Black or African American"] }, p, {});
+  assert.strictEqual(r2.path, "self_identification.race_ethnicity");
+  assert.deepStrictEqual(r2.candidates, ["Asian"]);
+
+  // an explicit label still works with no options at all
+  const r3 = ats.atsRouteLabel("Are you Hispanic or Latino?", { options: ["Yes", "No"] }, p, {});
+  assert.strictEqual(r3.path, "self_identification.hispanic_or_latino");
+
+  // ⚠⚠ AND "AN OPTION MENTIONS HISPANIC" IS NOT THE TEST. EEO-1 race categories are routinely
+  // SUFFIXED with the phrase as a negation, so both "any option mentions it" and "every option
+  // mentions it" misroute a RACE question into the Hispanic field. A regression test caught the
+  // first version of this within minutes; these pin the rule that replaced it.
+  for (const opts of [
+    ["Asian (Not Hispanic or Latino)", "White (Not Hispanic or Latino)", "Decline to self identify"],
+    ["Asian (Not Hispanic or Latino)", "White (Not Hispanic or Latino)", "Black (Not Hispanic or Latino)"],
+    ["Asian", "Black or African American", "Hispanic or Latino"],
+  ]) {
+    const rr = ats.atsRouteLabel("Race", { options: opts }, p, {});
+    assert.strictEqual(rr.path, "self_identification.race_ethnicity",
+      "a list offering OTHER RACES is a race question however it qualifies them: " + JSON.stringify(opts));
+  }
+  // …and a list that talks about nothing but Hispanic identity is the ethnicity question
+  const re = ats.atsRouteLabel("Ethnicity", { options: ["Hispanic or Latino", "Not Hispanic or Latino"] }, p, {});
+  assert.strictEqual(re.path, "self_identification.hispanic_or_latino");
+
+  // ⚠ and an UNSTATED one is still never inferred
+  const r4 = ats.atsRouteLabel("Ethnicity", { options: ["I am Hispanic or Latino."] },
+    { self_identification: { race_ethnicity: "Asian" } }, {});
+  assert.strictEqual(r4.eeoUnstated, true,
+    "with no hispanic_or_latino stored it must report UNSTATED — never borrow the race answer");
+});
+
+
+// ── never add repeating entries on top of entries already on the form (live 2026-08-20) ──
+// A run landed on a form Oracle had PREFILLED from an existing candidate record and the entry pass
+// pressed Add three times anyway, leaving TWO copies of every job on a real application. Workday's
+// rule is "reconcile to exactly N, then fill each entry — true idempotency, proven from ARBITRARY
+// dirty state"; only the second half of that had been built for ORC. Add-N-times is correct on a
+// blank form and duplicates on every other kind.
+test("the ORC entry pass RECONCILES before filling — and history and skills get different policies", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const i = src.indexOf("async function atsOrcFillEntries");
+  const pass = stripComments(src.slice(i, src.indexOf("\nfunction atsOrcEntryPlan", i)));
+
+  // it must READ the tiles already on the form before adding anything
+  assert.ok(/const tiles0 = await act\.eval\(atsInjOrcTiles/.test(pass),
+    "the pass must read the block's existing TILES before pressing Add — a returning candidate's form " +
+    "arrives prepopulated, and Add-once-per-profile-entry duplicated every job on a real application");
+
+  // HISTORY: delete first
+  assert.ok(/atsInjOrcDeleteTile/.test(pass), "history blocks must DELETE existing tiles before filling");
+  // …last-first, and gated on the count actually dropping rather than on a delay
+  assert.ok(/after\.count < n/.test(pass),
+    "each delete must be confirmed by the tile count DROPPING — a delete that did not take must stop " +
+    "the loop rather than spin it");
+  // a confirmation dialog is answered here, not inside the injected primitive
+  assert.ok(/del\.dialog && del\.dialog\.present/.test(pass) && /atsInjOrcDialogPress/.test(pass),
+    "a delete confirmation must be REPORTED by the primitive and decided SW-side");
+  // ⚠ and a PARTIAL clear must not be filled on top of — that is the duplicate this exists to prevent
+  assert.ok(/still > 0/.test(pass) && /continue;/.test(pass),
+    "if tiles could not be cleared, nothing may be added on top of them");
+
+  // SKILLS: add only what is missing, never delete
+  assert.ok(/const isSkills = item\.source === "skills"/.test(pass), "skills must be distinguished");
+  assert.ok(/present\.length && !isSkills/.test(pass),
+    "the DELETE path must be gated OFF for skills: a skills list is a SET, and the profile's skills are " +
+    "capped, so deleting first would discard skills we could not restore");
+  assert.ok(/haveSkills\.indexOf\(atsLib\.normalize\(entry\)\) !== -1/.test(pass),
+    "a skill already on the form must be skipped, not re-added");
+  // the cap must count ADDITIONS, or already-present skills eat the whole budget
+  assert.ok(/added < item\.want/.test(pass),
+    "the loop must stop after `want` NEW entries — capping the iteration count instead would let eight " +
+    "already-present skills consume the budget and add nothing");
+});
+
+test("atsInjOrcTiles: a committed entry is a TILE whose controls are ICON-ONLY", () => {
+  const src = String(ats.atsInjOrcTiles);
+  // ⚠ THE LABEL IS IN aria-label / title, NEVER IN textContent. The first version of this detector
+  // matched button CAPTIONS against /^(edit|delete|remove)/ and counted ZERO on a form that plainly
+  // held three jobs, so the guard never fired and a second run duplicated the history again.
+  assert.ok(/getAttribute\("aria-label"\)/.test(src) && /getAttribute\("title"\)/.test(src),
+    "tiles must be found by their controls' aria-label/title — these buttons have NO text at all");
+  // ⚠ and a ONE-CHARACTER tile text must survive: the skill "C" came back as "" under a `length > 1`
+  // guard, which would make it look ABSENT on every visit and be re-added forever.
+  assert.ok(/txt\.length > 0/.test(src),
+    'a one-character tile text (the skill "C", or R, or Go) must not be discarded');
+  assert.ok(!/txt\.length > 1/.test(src), "the `> 1` guard is the bug, not the fix");
+});
+
+
+// ── what reaches the review page is the APPLICATION'S ANSWER, not a log line ──────────────
+test("the ORC date pair reaches review as a readable value, not a debug string", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // ⚠ ANCHOR WITH THE `if (` PREFIX. Bare `spec.kind === "date_pair"` also matches INSIDE a longer
+  // identifier (a `kspec`/`fspec` in another function ends with "spec.kind"), and this test silently
+  // began examining a different function when one appeared earlier in the file.
+  const i = src.indexOf('if (spec.kind === "date_pair" && group.length >= 2)');
+  assert.ok(i > 0, "the date-pair branch must exist");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  // ⚠ BOUND BY THE BRANCH'S OWN END, not a byte count. A fixed +9000 slice stopped reaching the
+  // per-half record block when this branch grew, and the assertion then failed for a reason that had
+  // nothing to do with what it checks. `const f = group[0];` is the first statement after it.
+  const branchEnd = src.indexOf("const f = group[0];", i);
+  assert.ok(branchEnd > i, "the statement after the date-pair branch must be findable");
+  const branch = stripComments(src.slice(i, branchEnd));
+
+  // ⚠ it used to write `month="May" year="2026"` — my own debug string — which the review editor
+  // rendered as a TEXT BOX of raw markup and a submit replay would have typed at the form verbatim.
+  // `current_value` is copied straight from `rec.after`, so anything convenient for a log becomes
+  // the application's answer.
+  assert.ok(!/\$\{half\.kind\}=/.test(branch),
+    'the record must not carry `month="…" year="…"` — that is a log format, and it lands in ' +
+    "current_value and then in the replay");
+  // ⚠ THE MERGED PAIR IS GONE BY DESIGN (operator, 2026-08-21): each half is its own review row so
+  // it can be corrected on its own. The property this test exists to protect is UNCHANGED — what
+  // lands in `after` (and therefore in current_value, and therefore in the replay) must be the
+  // option text the picker itself committed, never a string formatted for a log.
+  assert.ok(/after: h\.value \|\| null/.test(branch),
+    "each half's recorded value must be the option text the picker committed");
+  assert.ok(/status: h\.value \? "filled" : "needs_review"/.test(branch),
+    "…and a half that did not commit is needs_review, never a silent pass");
+  // and the label must not be the raw platform name: these halves carry no label at all
+  assert.ok(/replace\(\/\(\[a-z\]\)\(\[A-Z\]\)\//.test(branch),
+    'the label must split camelCase so review shows "Start Date", not "startDate"');
+});
+
+test("every yes/no commit goes through ONE implementation, and it waits on a DEADLINE", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+
+  // ⚠⚠ ONE implementation for all THREE call sites. Live 2026-08-20 (hidden run): the two
+  // DETERMINISTIC yes/no questions both reported "took 2 press(es)" and landed, while the
+  // AI-answered one on the SAME page came back needs_review seconds later — because only the
+  // deterministic path had the deadline-and-re-press logic. Which rung answered a question must not
+  // decide whether the answer sticks.
+  const i = src.indexOf("async function atsCommitYesNo");
+  assert.ok(i > 0, "the shared yes/no commit must exist");
+  const body = stripComments(src.slice(i, src.indexOf("\n// Actuate one field", i)));
+
+  // A DEADLINE, not an iteration count — an iteration count is a proxy for time, and every proxy
+  // breaks when the clock beneath it changes (this bit three times in one day: a fixed 150ms read;
+  // 10 iterations on the ADAPTIVE pace, which collapsed 1.5s into 196ms; 24 iterations that only
+  // passed because the STARVED worker clock made each ~500ms).
+  assert.ok(/Date\.now\(\) < deadline/.test(body), "the read-back must poll against a DEADLINE");
+  assert.ok(!/for \(let \w+ = 0; \w+ < \d+; \w+\+\+\)[\s\S]{0,160}atsInjReadValue/.test(body),
+    "an iteration count is not a budget");
+  // wall-clock pacing, never the adaptive pace
+  assert.ok(/await act\.delayFull\(/.test(body) && !/await act\.delay\(\d/.test(body),
+    "a settle must pace on delayFull; act.delay is the ADAPTIVE pace and collapses on a visible tab");
+  // re-press, gated on nothing being pressed — a blind second press un-presses a TOGGLE
+  assert.ok(/nothingPressed/.test(body) && /presses < 3/.test(body),
+    "a press that did not register must be re-pressed, gated on nothing being pressed yet");
+  // and the press count must be reported, so a widget that habitually needs two is visible
+  assert.ok(/press\(es\)/.test(body), "the press count must reach the record");
+
+  // ⚠ EVERY call site must use it — the deterministic rung, the AI choice commit, and the EEO
+  // decline path. A direct atsInjClickYesNo outside the helper is the bug this test exists for.
+  const whole = stripComments(src);
+  const direct = [...whole.matchAll(/act\.eval\(atsInjClickYesNo/g)];
+  assert.strictEqual(direct.length, 2,
+    "atsInjClickYesNo may only be called from INSIDE atsCommitYesNo (the initial press and the " +
+    "re-press) — found " + direct.length + " call(s), so a path is committing without the settle");
+  for (const m of direct) {
+    const before = whole.slice(Math.max(0, m.index - 2000), m.index);
+    assert.ok(before.lastIndexOf("async function atsCommitYesNo") > before.lastIndexOf("\nasync function ")
+      || /atsCommitYesNo/.test(before.slice(-2000)),
+      "the only atsInjClickYesNo calls must sit inside atsCommitYesNo");
+  }
+});
+
+
+// ── `siteLink` is a REPEATING family, so the ordinal picks WHICH website (operator, 2026-08-20) ──
+test("atsProfileWebsites: every non-empty link, in order, https-normalized and deduped", () => {
+  const p = { websites: [
+    { type: "linkedin", url: "linkedin.com/in/wangykev" },
+    { type: "github", url: "github.com/wangykev" },
+    { type: "portfolio", url: "" },      // the editor keeps blank slots
+    { type: "other", url: "   " },
+  ] };
+  assert.deepStrictEqual(ats.atsProfileWebsites(p),
+    ["https://www.linkedin.com/in/wangykev", "https://www.github.com/wangykev"]);
+  // compaction is what makes an ORDINAL meaningful: "link 2" is the second website that EXISTS,
+  // not the second row of the profile editor.
+  assert.deepStrictEqual(ats.atsProfileWebsites({}), []);
+  // the same url written two ways collapses to one row
+  const dup = ats.atsProfileWebsites({ websites: [{ url: "x.com" }, { url: "https://www.x.com" }] });
+  assert.strictEqual(dup.length, 1, "a url listed twice must not claim two link rows: " + JSON.stringify(dup));
+});
+
+test("the Nth siteLink resolves to the Nth website — not the first one repeated", () => {
+  const p = { websites: [{ url: "linkedin.com/in/kev" }, { url: "github.com/kev" }] };
+  const route = (name) => ats.atsRouteField("oracle", { fieldName: name, widgetType: "text", label: "Link" }, p, {}, {}, null, null);
+  // ⚠ atsMapKey strips a trailing `-<digits>` for Oracle, so EVERY siteLink-N reduces to one map key.
+  // Returning "the first website" filled link 1 correctly and would have written that SAME url into
+  // every further link the moment a second input existed — a duplicate from a rung that looked fine.
+  const r1 = route("siteLink-1"), r2 = route("siteLink-2"), r3 = route("siteLink-3");
+  assert.strictEqual(r1 && r1.raw, "https://www.linkedin.com/in/kev");
+  assert.strictEqual(r2 && r2.raw, "https://www.github.com/kev");
+  assert.ok(!r3 || r3.raw == null,
+    "past the end of the list the extra input stays BLANK — never the last url repeated");
+});
+
+test("the links pass only ADDS what is missing, and is idempotent by url", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsOrcFillLinks");
+  assert.ok(i > 0, "the links pass must exist");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const pass = stripComments(src.slice(i, src.indexOf("\n// ── THE ENTRY PASS", i)));
+
+  // idempotent by url — the form arrives prepopulated for a returning candidate, so without this
+  // every run would grow the list
+  assert.ok(/have\.indexOf\(norm\(u\)\) === -1/.test(pass), "a url already on the form must be skipped");
+  // an existing EMPTY row is used before creating another
+  assert.ok(/\.find\(\(l\) => !l\.value\)/.test(pass),
+    "an empty row already on the form must be filled before pressing Add — otherwise a blank row is " +
+    "left behind for the operator to notice");
+  // the new input is awaited with a monotone poll, never a fixed sleep
+  assert.ok(/now\.count > n/.test(pass), "the new input must be awaited by a monotone poll");
+  // and every write is read-back verified like every other commit here
+  assert.ok(/atsInjReadValue/.test(pass) && /needs_review/.test(pass),
+    "each link write must be read-back verified, and a failure must reach review");
+});
+
+test("the links pass's notes are not discarded by the entry pass", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // ⚠ an assignment here silently dropped the links pass's notes — the one channel that reports a
+  // link we could not add.
+  assert.ok(/entryNotes = entryNotes\.concat\(\(ep && ep\.notes\)/.test(src),
+    "the entry pass must CONCAT onto entryNotes, never assign over it");
+});
+
+
+// ── a block whose tiles already match the profile is left alone (speed round, 2026-08-20) ──
+// On a re-run the form arrives holding exactly the entries the profile would produce, and the pass
+// deleted all of them and typed the identical thing back — the single largest waste on step 2, where
+// each entry costs an open, four fields (two of them date pairs) and a commit.
+test("atsOrcTilesAlreadyMatch: order-independent, and CONSERVATIVE in every uncertain direction", () => {
+  const we = [
+    { company: "Rivian and Volkswagon Technologies", job_title: "Characterization and Test Automation Intern" },
+    { company: "Carnegie Mellon Racing", job_title: "Firmware Team Member" },
+  ];
+  const tiles = [
+    { text: "Firmware Team Member Carnegie Mellon Racing 09/2024 - 05/2026" },
+    { text: "Characterization and Test Automation Intern Rivian and Volkswagon Technologies 05/2026 - 08/2026" },
+  ];
+  // the form may sort its tiles, so matching is order-independent
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", we, 2, tiles), true);
+
+  // ⚠ EVERY uncertain case must fall through to delete-and-refill:
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", we, 2, tiles.slice(0, 1)), false,
+    "a different COUNT is not a match");
+  const corrected = [{ company: "Rivian and Volkswagen Technologies", job_title: we[0].job_title }, we[1]];
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", corrected, 2, tiles), false,
+    "a one-letter employer correction must rewrite the block, not be waved through");
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", [{ company: "X" }], 1, [{ text: "X" }]), false,
+    "an entry we cannot fully identify (no job title) can never claim a match");
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("unknown_section", [{ a: 1 }], 1, [{ text: "a" }]), false,
+    "an unknown section never claims a match");
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", we, 2, null), false);
+
+  // ⚠ two entries may not share one tile
+  const dup = [we[1], we[1]];
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("work_experience", dup, 2, tiles), false,
+    "a tile is consumed once — two entries cannot both match the same row");
+
+  // education identifies on the school
+  assert.strictEqual(ats.atsOrcTilesAlreadyMatch("education",
+    [{ school_or_university: "Carnegie Mellon University" }], 1,
+    [{ text: "Electrical and Computer Engineering Carnegie Mellon University" }]), true);
+});
+
+test("atsOrcEntryIdentity: a tiered profile value identifies on its most specific wording", () => {
+  assert.deepStrictEqual(ats.atsOrcEntryIdentity("work_experience", { company: "C", job_title: "T" }), ["C", "T"]);
+  assert.strictEqual(ats.atsOrcEntryIdentity("work_experience", { company: "C" }), null, "both are required");
+  assert.deepStrictEqual(ats.atsOrcEntryIdentity("education", { school_or_university: "CMU" }), ["CMU"]);
+  assert.deepStrictEqual(ats.atsOrcEntryIdentity("skills", "Python"), ["Python"]);
+  assert.strictEqual(ats.atsOrcEntryIdentity("work_experience", null), null);
+});
+
+test("the FILL always deletes and refills a repeating block — no already-matches skip", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsOrcFillEntries");
+  const end = src.indexOf("\nfunction atsOrcEntryPlan", i);
+  const pass = stripJsComments(src.slice(i, end > 0 ? end : i + 20000));
+
+  // ⚠ THE SKIP IS GONE (operator, 2026-08-20). It left correct tiles in place, which meant the entry
+  // FIELDS never reached review — first not at all, then as opaque one-row summaries. The operator's
+  // division of labour puts leaving-alone on the REHEARSAL, not the fill: the fill clicks Add,
+  // exposes the entry form and fills it, so those fields are reviewable and editable.
+  assert.ok(!/atsOrcTilesAlreadyMatch\(item\.source/.test(pass),
+    "the fill must not skip a block because its tiles already match — the fields must reach review");
+  assert.ok(/atsInjOrcDeleteTile/.test(pass),
+    "delete-before-fill is the operator's instruction and must remain");
+
+  // …and the per-field records are what makes the entries reviewable at all
+  assert.ok(/fieldName: `\$\{item\.source\}\[\$\{i\}\]\.\$\{key\}`/.test(pass),
+    "each entry field gets its OWN record — a per-entry summary row cannot be checked or corrected");
+});
+
+
+// ── three things that were flagged while being certain (operator, 2026-08-20) ────────────
+
+test("atsGeoValueInProfile: does the profile CONTAIN this value — no label patterns, no per-field map", () => {
+  const p = { personal_info: { city: "Tallahassee", state_province: "Florida", postal_code: "32312",
+                               country: "United States", address_line_1: "715 Middlebrooks Circle" } };
+  // ⚠ NO LABEL PATTERNS (operator's instruction). The first version matched the label against
+  // /city|state|county|postal/ and looked each up under a named profile key — a list that has to be
+  // extended for every tenant's wording and every locale's idea of a region, and which silently
+  // answers "no opinion" the moment a label is worded unexpectedly.
+  assert.strictEqual(ats.atsGeoValueInProfile("Tallahassee", p), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("32312", p), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("United States", p), true);
+  // the ONLY normalization is FORM: "FL" and "Florida" are the same answer, both directions
+  assert.strictEqual(ats.atsGeoValueInProfile("FL", p), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("Florida", p), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("FL", { personal_info: { state_province: "FL" } }), true);
+  assert.strictEqual(ats.atsGeoValueInProfile("Florida", { personal_info: { state_province: "FL" } }), true);
+
+  // ⚠⚠ AND "NOT IN THE PROFILE" MEANS REVIEW — also the operator's instruction, and a correction to
+  // my first version, which CLEARED the County because Oracle had derived it from a verified anchor.
+  // That reasoning is not wrong, but it is reasoning: the profile is the authority on what the
+  // operator has actually told us, so a value it does not contain is something a human looks at once.
+  assert.strictEqual(ats.atsGeoValueInProfile("Leon", p), false, "a county the profile never mentions");
+  assert.strictEqual(ats.atsGeoValueInProfile("Orlando", p), false, "a wrong city");
+  assert.strictEqual(ats.atsGeoValueInProfile("GA", p), false, "a wrong state");
+  assert.strictEqual(ats.atsGeoValueInProfile("", p), false);
+  assert.strictEqual(ats.atsGeoValueInProfile("Tallahassee", {}), false, "no profile ⇒ nothing verified");
+
+  // it also draws on `locations`, so a value stated there counts
+  assert.strictEqual(ats.atsGeoValueInProfile("Pittsburgh",
+    { locations: [{ city: "Pittsburgh", state: "PA" }] }), true);
+});
+
+test("a cascade value the profile contains is FILLED; one it does not is a review item", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsSurfacePrefilled");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const body = stripComments(src.slice(i, src.indexOf("\n  return surfaced;", i)));
+
+  assert.ok(/atsGeoValueInProfile\(v, profile\)[\s\S]{0,200}status = "filled"/.test(body),
+    "a value the profile contains is verified — the cascade ran off an anchor the profile supplied");
+  assert.ok(/geo-not-in-profile/.test(body),
+    "a value the profile does not contain must be flagged, and the flag must say WHY");
+  // ⚠ TWO STATES ONLY — no third bucket that gets cleared by reasoning about derived values.
+  assert.ok(!/cascadeTrustworthy|geoUnknown/.test(body),
+    "the derived-value clearing is gone: verified, or reviewed");
+});
+
+test("an UNCHECKED checkbox holds no value — `false` is not content", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsSurfacePrefilled");
+  const body = src.slice(i, src.indexOf("\n  return surfaced;", i));
+  // ⚠ atsInjReadValue answers a checkbox with a BOOLEAN and `String(false)` is "false" — a non-empty
+  // string. So every unchecked box on EVERY platform read as "the form already has something here"
+  // and was surfaced as PRE-POPULATED, on a box deliberately left alone because the profile says No.
+  assert.ok(/live\.value === false/.test(body), "a boolean false must short-circuit before stringifying");
+  assert.ok(/v === "false"/.test(body), "…and the stringified form must be caught too");
+  assert.strictEqual(String(false), "false", "this is the whole trap, in one line");
+});
+
+test("the ORC disability self-ID commits at a DETERMINISTIC tier, not containment", () => {
+  const p = { self_identification: { disability_status: "No, I do not have a disability" } };
+  const r = ats.atsRouteField("oracle",
+    { fieldName: "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12", widgetType: "radio", label: "Do you have a disability?" },
+    p, {}, {}, null, null);
+  // the stored wording FIRST, the bare polarity token LAST
+  assert.deepStrictEqual(r.candidates, ["No, I do not have a disability", "No"]);
+  assert.ok(!r.containment, "containment must NOT be requested — the ladder ends in a token that lands exactly");
+
+  // …and against the real option list it lands on POLARITY LEAD, which grades `exact` ⇒ unflagged
+  const opts = ["Yes, I have a disability, or have had one in the past",
+                "No, I do not have a disability and have not had one in the past",
+                "I do not want to answer"];
+  const lib = require("../lib.js");
+  const fd2 = require("../fill-driver.js");
+  const m = lib.matchCandidates(r.candidates, opts, { containment: false });
+  assert.strictEqual(m.targetIndex, 1);
+  assert.strictEqual(m.matchTier, "polarity-lead");
+  assert.strictEqual(fd2.flagTierCategory(m.matchTier), "exact",
+    "polarity lead is graded exact, which is what makes this `filled` rather than `filled_review`");
+
+  // ⚠ and a tenant that splits one polarity into TWO meanings must still escalate rather than guess
+  const split = ["Yes, I have a disability",
+                 "No, I do not now have a disability",
+                 "No, I do not now have one BUT HAVE HAD one in the past"];
+  const m2 = lib.matchCandidates(r.candidates, split, { containment: false });
+  assert.ok(m2.targetIndex === -1 || m2.matchTier !== "polarity-lead",
+    "two options leading with the same polarity is ambiguous — it must not be guessed");
+
+  // an UNSTATED disability is still never inferred
+  const r2 = ats.atsRouteField("oracle",
+    { fieldName: "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12", widgetType: "radio", label: "Do you have a disability?" },
+    { self_identification: {} }, {}, {}, null, null);
+  assert.strictEqual(r2.eeoUnstated, true);
+});
+
+
+// ── one predicate for "is this tier deterministic", and it must be ADDITIVE ──────────────
+test("atsTierIsDeterministic: keeps the ATS-local tier the shared grader has never heard of", () => {
+  // ⚠ Both choice-commit paths used to hardcode `exact-normalized || label-exact`, a list that
+  // cannot learn — so **polarity-lead**, the tier that exists precisely so a stored "No" can land
+  // "No, I do not have a disability and have not had one in the past" deterministically, was graded
+  // filled_review anyway.
+  assert.strictEqual(ats.atsTierIsDeterministic("polarity-lead"), true);
+  assert.strictEqual(ats.atsTierIsDeterministic("exact-normalized"), true);
+
+  // ⚠⚠ AND THIS IS WHY IT IS ADDITIVE RATHER THAN A SWAP: fill-driver's flagTierCategory returns
+  // `none` for label-exact, an ATS-LOCAL tier it has never seen. Swapping outright would have
+  // demoted every label-exact commit from filled to filled_review — a silent regression on
+  // Greenhouse, Lever and Ashby in the name of fixing Oracle.
+  const fd = require("../fill-driver.js");
+  assert.strictEqual(fd.flagTierCategory("label-exact"), "none", "the shared grader does not know it");
+  assert.strictEqual(ats.atsTierIsDeterministic("label-exact"), true, "…and this predicate must");
+
+  // everything that IS a guess stays flagged
+  for (const t of ["containment", "fuzzy", "autocommit", "skills-containment", undefined, null, ""]) {
+    assert.strictEqual(ats.atsTierIsDeterministic(t), false, String(t) + " must stay flagged");
+  }
+});
+
+test("both choice-commit paths grade through the one predicate", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const code = stripComments(src);
+  const hardcoded = [...code.matchAll(/=== "exact-normalized" \|\| \w+(\.\w+)? === "label-exact"/g)];
+  assert.strictEqual(hardcoded.length, 1,
+    "the tier pair may appear ONCE, inside atsTierIsDeterministic — found " + hardcoded.length +
+    " site(s), so a commit path is grading tiers on its own again");
+  assert.ok(/function atsTierIsDeterministic/.test(code));
+  assert.ok((code.match(/atsTierIsDeterministic\(/g) || []).length >= 3,
+    "both commit paths plus the definition must reference it");
+});
+
+
+// ── skipping the WORK must never skip the RECORD (operator, 2026-08-20) ──────────────────
+// The tile-match skip and the "0 links to add" path saved real time and quietly deleted Experience,
+// Education and Links from the review bundle — on a run where all three were correctly on the form.
+// That is worse than the slowness it replaced: a reviewer cannot approve an application whose work
+// history they cannot see, and "absent" reads as "not filled" rather than "already right".
+// (The "a skipped block still reports its entries" test retired with the skip itself — the fill now
+// always refills, so the per-field records above are the only shape an entry reaches review in.)
+
+test("links already on the form are reported, and not DOUBLED by the flat loop's record", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsOrcFillLinks");
+  const stripComments = (t) => String(t)
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  const pass = stripComments(src.slice(i, src.indexOf("\n// ── THE ENTRY PASS", i)));
+
+  assert.ok(/for \(const l of st0\.links\)[\s\S]{0,400}records\.push\(/.test(pass),
+    "a link already on the form is still part of the application and must reach review");
+  // ⚠ `siteLink-1` is in the static map, so the flat loop already recorded it — reporting every link
+  // here without a guard makes the field appear TWICE, which reads as two links.
+  assert.ok(/already\.has\(l\.name\)/.test(pass),
+    "links the flat loop already recorded must be skipped, or review shows the same link twice");
+  assert.ok(/recorded: results\.map/.test(src),
+    "…and the caller must actually pass the recorded field names");
+});
+
+
+// ══ THE ORC SUBMIT WALK (2026-08-20) ═══════════════════════════════════════════════════════
+// The submit run was single-page from the day it was written, because every ATS on this path was.
+// ORC is the first that is not, and the failure mode of getting it wrong is the worst one available:
+// a gate opened on a third of an application.
+
+test("the ORC submit run WALKS the wizard and unions the results", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("async function runAtsSubmitRun");
+  assert.ok(i > 0);
+  const run = stripJsComments(src.slice(i, src.indexOf("\n  } catch (e) {", i)));
+
+  // the guard is GONE — and its absence is the thing under test, since it was correct until today
+  assert.ok(!/oracle-not-implemented/.test(run),
+    "the oracle-not-implemented guard must be deleted in the commit that adds the submit stage");
+
+  // it must sign in BEFORE waiting for a form: ORC's gate PASSES atsLooksLikeApplicationForm, so a
+  // run that waited for 'a form' first would find the GATE and replay approved values into a login box
+  const preAt = run.indexOf("runOrcPreForm");
+  const waitAt = run.indexOf("waitAtsFormReady");
+  assert.ok(preAt > 0, "the submit run must run the ORC pre-form");
+  assert.ok(preAt < waitAt, "the ORC pre-form must run BEFORE the form wait, never as a fallback after it");
+
+  // the walk goes through the SHARED advance, not a second copy of the double guard
+  assert.ok(/orcAdvanceAfterStep/.test(run), "the submit walk must use the shared advance");
+  // …and the results are UNIONED, because the verify is a set difference over the whole bundle
+  assert.ok(/union\.set\(durable\(r\), r\)/.test(run),
+    "each step's results must accumulate into one union keyed by the durable submit key");
+});
+
+test("SAFETY: an ORC replay that did not reach the final step REFUSES the gate", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("async function runAtsSubmitRun");
+  const run = stripJsComments(src.slice(i, src.indexOf("\n  } catch (e) {", i)));
+
+  const at = run.indexOf('walkStop !== "reached-final-step"');
+  assert.ok(at > 0, "there must be an explicit test that the walk reached the END");
+  const branch = run.slice(at, at + 700);
+  assert.ok(/return \{/.test(branch) && /replay-incomplete/.test(branch),
+    "a short walk must RETURN, not fall through to the gate");
+  assert.ok(/submitted: false/.test(branch), "and it must say nothing was submitted");
+
+  // ⚠ the refusal must come BEFORE the verify and the click — falling through with a partial union
+  // would let the strict verify pass on the steps it did walk and open the gate on the rest.
+  // ⚠ ANCHOR ON CODE, NOT PROSE: "STRICT verify" lives in a comment, and this very test strips
+  // comments before scanning — so that anchor was -1 and the ordering assertion passed vacuously in
+  // one direction and failed in the other. The fourth prose-vs-code scanning bite today.
+  const verifyAt = run.indexOf("const failures = [];");
+  const clickAt = run.indexOf("WOULD CLICK SUBMIT");
+  assert.ok(at < verifyAt && at < clickAt,
+    "the incomplete-walk refusal must precede both the verify and the submit gate");
+});
+
+test("SAFETY: a replay only mutates entries the APPROVED BUNDLE justifies", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("if (o.reportOnly) {");
+  assert.ok(i > 0, "the report-only branch must exist");
+  const branch = stripJsComments(src.slice(i, src.indexOf("\n  if (!plan.length) {", i)));
+
+  assert.ok(/atsInjOrcTiles/.test(branch), "it must READ the tiles that are on the form");
+  assert.ok(/records\.push\(/.test(branch), "…and report them, or the strict verify flags every entry as missing");
+  assert.ok(/entrySection: spec\.source/.test(branch) && /entryIndex: k/.test(branch),
+    "the records must carry section+index so atsSubmitKey lines them up with the bundle's");
+  // ⚠⚠ DELETION IS NOW ALLOWED, AND THE GUARD MOVED (operator, 2026-08-21: "I need it to subtract if
+  // in any case the current experience block is wrong"). The never-delete rule existed for a SPECIFIC
+  // reason — the reconcile was PROFILE-driven, and a replay passes profile:{}, so it read "wants 0,
+  // the form has 3" and would have deleted a whole work history. That hazard is about the SOURCE of
+  // the count, not about deletion. So what must hold now is that every destructive decision is gated
+  // on the BUNDLE wanting entries in this section.
+  assert.ok(/const wantN = Number\(\(o\.entryCounts \|\| \{\}\)\[spec\.source\] \|\| 0\)/.test(branch),
+    "a repair must be gated on the BUNDLE's approved count, never the profile's");
+  assert.ok(/if \(!wantN \|\| !haveId\)/.test(branch),
+    "…and must refuse when nothing is approved here, or when there is not enough approved data to rebuild");
+  assert.ok(/approvedNow > 0 && tiles\.length > approvedNow/.test(branch),
+    "removing an unapproved tile must require the bundle to want entries here AND an excess to exist");
+  assert.ok(!/\bprofile\b/.test(branch),
+    "nothing in this branch may read the profile — it is {} on a replay, which is the whole hazard");
+  // ⚠ RESTORING A MISSING ENTRY IS NOW ALLOWED AND REQUIRED (operator, 2026-08-21: "it must add them
+  // and get the page to match what is approved"), because Oracle refuses an entry with an incomplete
+  // required date and a refused entry never persists — so the form can hold fewer tiles than the
+  // bundle has entries. The safety property is no longer "never actuate", it is:
+  //   (a) ADD-ONLY — the restore opens a FRESH form and never touches a tile that is present, and
+  //   (b) BUNDLE-DRIVEN — every value comes from o.valueFor / o.entryCounts, never from the profile.
+  assert.ok(/atsOrcAddApprovedEntry\(act, spec, a\.idx, emap, o\.valueFor, log\)/.test(branch),
+    "the restore must be driven by the APPROVED BUNDLE's valueFor, not the profile");
+  assert.ok(/o\.entryCounts/.test(branch), "…and sized by the bundle's entry count");
+  assert.ok(!/\bprofile\b/.test(branch),
+    "the report-only branch must never read the profile — it is {} on a replay");
+  assert.ok(/return \{ records, notes \};/.test(branch), "and it must return before the filling plan runs");
+});
+
+// The restore itself: additive by construction, and it must never reach for a delete.
+test("SAFETY: atsOrcAddApprovedEntry only ADDS — it opens a fresh form and never deletes a tile", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsOrcAddApprovedEntry(");
+  assert.ok(i > 0, "the restore helper must exist");
+  const fn = stripJsComments(src.slice(i, src.indexOf("\nasync function atsOrcFillEntries(", i)));
+  assert.ok(/atsInjOrcOpenEntryAndWait/.test(fn), "it presses Add and waits for a FRESH entry form");
+  assert.ok(/atsInjOrcCommitEntryAndWait/.test(fn), "…and commits it, or the entry is not really there");
+  assert.ok(!/atsInjOrcDeleteTile|atsInjOrcOpenTileAndWait/.test(fn),
+    "it must never delete a tile or open an EXISTING one — that is what makes it non-destructive");
+  // A refusal must leave the block clean: a form left open blocks Next for everything after it.
+  assert.ok(/atsInjOrcEntryAction, spec\.pattern, "cancel"/.test(fn),
+    "a refused entry must be CANCELLED so it cannot block the step");
+  // Values come from the bundle, never the profile.
+  assert.ok(!/\bprofile\b/.test(fn), "it must not read the profile — every value comes from valueFor");
+});
+
+// Which entries are missing is decided by EVIDENCE. Assuming the tail duplicates a present entry
+// whenever the one Oracle refused was not the last.
+test("the replay finds the ABSENT approved entries by identity, not by assuming the tail", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("if (o.reportOnly) {");
+  const branch = stripJsComments(src.slice(i, src.indexOf("\n  if (!plan.length) {", i)));
+  assert.ok(/ATS_ORC_ENTRY_IDENTITY_KEYS/.test(branch), "it must look each approved entry up by its identifying values");
+  assert.ok(/atsOrcTileHoldsValue/.test(branch), "…against the tiles actually on the form");
+  // ⚠ PIN THE POSITIVE FORM. A negative "does not contain the tail range" assertion passed a mutation
+  // that rewrote the decision as `if (bi >= tiles.length)` — the same wrong behaviour in different
+  // bytes. What must be true is that membership is decided by the identity LOOKUP.
+  assert.ok(/const present = tiles\.some\(/.test(branch),
+    "presence must be decided by looking each approved entry up among the tiles");
+  assert.ok(/if \(!present\) absent\.push\(/.test(branch),
+    "…and only the ones NOT found are restored — never a positional range");
+  assert.ok(!/bi >= tiles\.length/.test(branch) && !/tiles\.length; bi < approvedCount/.test(branch),
+    "it must NOT take the tail range — the refused entry may have been the second of three");
+});
+
+// A date is TWO pickers, so it is TWO review rows sharing one question.
+test("an ORC date is recorded as two per-half rows sharing a question_key, each with its own options", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const stripped = stripJsComments(src);
+  assert.ok(/fieldName: `\$\{item\.source\}\[\$\{i\}\]\.\$\{key\}\.\$\{hk\}`/.test(stripped),
+    "the fill must key each half separately so each is editable on its own");
+  assert.ok(/question_key: `\$\{item\.source\}\[\$\{i\}\]\.\$\{key\}`/.test(stripped),
+    "…and share a question_key so review shows ONE date row with its parts inside");
+  assert.ok(/part_label: partName/.test(stripped), "…each labelled Month / Year");
+  // The scanned vocabulary must come from the UNFILTERED list, not the one-row filtered list.
+  // ⚠ PIN THE INTENT, NOT THE WHOLE RETURN LITERAL. The first version matched the return byte for byte
+  // and broke the moment a `trace` field was added for an unrelated diagnosis — a test that fails on
+  // any edit to a line teaches nothing about the property it is guarding.
+  assert.ok(/return \{ ok: true, kind, committed: want, reopens, value, invalid, options: texts[,}]/.test(stripped),
+    "the picker must return the vocabulary it read at OPEN (texts), never the filtered `shown`");
+  assert.ok(!/options: shown/.test(stripped), "…and never the post-typing filtered list");
+});
+
+test("the replay flag is threaded EXPLICITLY into atsFinishFill", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // atsFinishFill does not receive `o`; the entry pass inside it already cost one live run by being
+  // written against a scope it did not have.
+  assert.ok(/async function atsFinishFill\(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor, entryCounts\)/.test(src),
+    "atsFinishFill must take the replay flag, the approved-value lookup AND the bundle's entry counts");
+  assert.ok(/atsFinishFill\(act, ats, scan, results, o\.credentials, profile, jobContext, !!o\.valueFor, o\.valueFor, o\.entryCounts\)/.test(src),
+    "…and the caller must pass them from o.valueFor, this file's established replay signal");
+  assert.ok(/reportOnly: !!replay, valueFor, entryCounts/.test(src),
+    "…which become the entry pass's reportOnly and its approved-value lookup — without the lookup " +
+    "the replay can only SEE the entries, not check them against what the human approved");
+});
+
+// ── A LONE ASSERTION CHECKBOX ANSWERS "NO" BY STAYING UNTICKED (operator, 2026-08-20) ────────
+test("atsAssertionDeclined: a negative answer to a single affirmative assertion", () => {
+  const D = ats.atsAssertionDeclined;
+  // the case it was found on — Oracle's ethnicity question
+  assert.strictEqual(D("No, I am not Hispanic", "I am Hispanic or Latino."), true);
+  // …and the shapes other tenants use, since nothing here knows the question's SUBJECT
+  assert.strictEqual(D("No", "I am Hispanic or Latino."), true);
+  assert.strictEqual(D("false", "I certify the above"), true);
+  assert.strictEqual(D("I am not a protected veteran", "I identify as a protected veteran"), true);
+  assert.strictEqual(D("Not Hispanic or Latino", "I am Hispanic or Latino."), true);
+
+  // ⚠ ONLY A NO. A yes must fall through to assertion-lead, because a YES we failed to express has
+  // to be surfaced — on the page, "left unticked" and "never got to it" look identical.
+  assert.strictEqual(D("Yes, I am Hispanic or Latino", "I am Hispanic or Latino."), false);
+  assert.strictEqual(D("I am Hispanic or Latino", "I am Hispanic or Latino."), false);
+
+  // ⚠ A NEGATIVELY-WORDED OPTION IS A DOUBLE NEGATIVE — refuse and let a human decide.
+  assert.strictEqual(D("No", "I do not consent to marketing email"), false);
+  assert.strictEqual(D("No", "I decline to self-identify"), false);
+  assert.strictEqual(D("No", "I am not a protected veteran"), false);
+
+  // and nothing unrelated
+  assert.strictEqual(D("Asian", "I am Hispanic or Latino."), false);
+  assert.strictEqual(D("November", "I am Hispanic or Latino."), false, "word-anchored: 'no' must not match 'November'");
+  assert.strictEqual(D("", "I am Hispanic or Latino."), false);
+  assert.strictEqual(D("No", ""), false);
+});
+
+test("the commit branch applies it ONLY to a one-option checkbox group", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("atsAssertionDeclined(candidates[0], texts[0])");
+  assert.ok(i > 0, "the commit branch must use the shared helper, not its own regex");
+  const guard = stripJsComments(src.slice(i - 220, i + 60));
+  assert.ok(/wt === "checkbox_group"/.test(guard),
+    "checkbox groups only — an untouched RADIO group means unanswered, not 'no'");
+  assert.ok(/texts\.length === 1/.test(guard),
+    "exactly one option — a multi-option group has no single assertion for a bare 'no' to deny");
+});
+
+// ── A WALL-CLOCK BUDGET EATEN BY A STARVED PACE IS NOT EVIDENCE (live 2026-08-20) ────────────
+test("atsCommitYesNo: a normal commit still lands inside the ordinary budget", async () => {
+  let clicks = 0, reads = 0;
+  // Discriminate on ARITY, not on the function's name: the click is eval(fn, inputSel, want) and the
+  // read is eval(fn, ats, inputSel, kind), so only the read is passed a third argument.
+  const act = {
+    eval: async (fn, a, b, c) => {
+      if (c === undefined) { clicks++; return { ok: true }; }
+      reads++;
+      return { ok: true, value: reads >= 2 ? "No" : null };   // the pill settles on the 2nd read
+    },
+    delayFull: async () => {},
+  };
+  const out = await ats.atsCommitYesNo(act, "oracle", { inputSel: "#q" }, "No", "yesno");
+  assert.strictEqual(out.ok, true);
+  assert.strictEqual(out.starved, false, "a healthy clock must never trip the extension");
+  assert.ok(out.cycles >= 1 && out.cycles < 10, "it stops as soon as the read agrees");
+  assert.ok(clicks >= 1, "a pill NOT already holding the answer must still be clicked");
+});
+
+test("the yes/no budget extends ONLY when it ran out without looking", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsCommitYesNo");
+  const fn = stripJsComments(src.slice(i, src.indexOf("\n}", src.indexOf("return { ok, value", i))));
+
+  assert.ok(/cycles < MIN_CYCLES/.test(fn),
+    "the extension is gated on having completed too FEW read cycles — a budget that expired before " +
+    "the loop could look even once has measured nothing");
+  assert.ok(/HARD_CEILING_MS/.test(fn), "…and it is bounded, so a genuinely dead widget still ends");
+  assert.ok(/starved/.test(fn), "the outcome must say which of the two happened");
+  // ⚠ the ordinary path is unchanged: the budget is still spent in wall clock
+  assert.ok(/Date\.now\(\) < deadline/.test(fn), "the loop is still wall-clock bounded");
+});
+
+// ── ORC STAMPS A VOLATILE RENDER COUNTER ONTO A RADIO GROUP'S name (live, 2026-08-20) ────────
+test("atsSubmitKey(oracle): the volatile self-ID counter is stripped, meaningful ordinals are not", () => {
+  const k = (n) => ats.atsSubmitKey("oracle", n);
+
+  // measured across two visits to the SAME form: the fill saw -12, the rehearsal -13, and the
+  // approved answer reported "no matching field on the live form" on a question sitting right there
+  assert.strictEqual(k("US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12"),
+                     k("US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-13"),
+                     "two visits to the same field must produce the same key");
+  assert.strictEqual(k("US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12"),
+                     "US-STANDARD-ORA_DISABILITY_STATUS-STANDARD");
+
+  // ⚠⚠ THE COLLISION THIS MUST NOT CAUSE. siteLink's trailing number is a MEANINGFUL ENTRY ORDINAL,
+  // so stripping it would key both links the same — one would shadow the other and the verify would
+  // match the wrong link or call it missing.
+  assert.strictEqual(k("siteLink-1"), "siteLink-1");
+  assert.notStrictEqual(k("siteLink-1"), k("siteLink-2"));
+
+  // digits with no hyphen are a per-tenant flexfield name, not a counter
+  assert.strictEqual(k("namInformation15"), "namInformation15");
+  // and an ordinary platform name is untouched
+  assert.strictEqual(k("lastName"), "lastName");
+
+  // ⚠ ORACLE ONLY — the other platforms must key byte-identically to before
+  assert.strictEqual(ats.atsSubmitKey("greenhouse", "US-STANDARD-X-STANDARD-12"),
+                     "US-STANDARD-X-STANDARD-12");
+  assert.strictEqual(ats.atsSubmitKey("lever", "anything-9"), "anything-9");
+});
+
+// ── A REHEARSAL READS BEFORE IT WRITES (operator, 2026-08-21) ────────────────────────────────
+test("the replay skips actuation when the form already holds the approved value", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf('if (o.valueFor && !atsCredentialKind(ats, f))');
+  assert.ok(i > 0, "the replay branch must exist");
+  const branch = stripJsComments(src.slice(i, i + 4200));   // wide enough to include the fall-through
+
+  assert.ok(/tier = "already-correct"/.test(branch),
+    "a field the form already holds must be recorded verified rather than rewritten");
+  assert.ok(/atsLib\.normalize\(live\) === atsLib\.normalize\(String\(v\)\)/.test(branch),
+    "the comparison is on the live value the SCAN already carries — no extra page contact");
+  assert.ok(/rec\.resolved = \[String\(v\)\]/.test(branch),
+    "it must mark the field as one we HAD a value for, or atsSurfacePrefilled re-reports it as pre-populated");
+
+  // ⚠⚠ FILE FIELDS ARE EXEMPT. A file field shows only a NAME, which says nothing about which bytes
+  // the server holds — so a rehearsal always re-uploads rather than trusting a filename.
+  assert.ok(/f\.widgetType !== "file_upload"/.test(branch),
+    "the read-before-write shortcut must NOT apply to file fields");
+
+  // …and the fall-through must still actuate, which is the operator's other half
+  assert.ok(branch.indexOf('tier = "already-correct"') < branch.indexOf('route = { value: v, source: "replay" }'),
+    "a value that does NOT match must fall through and be written, exactly as before");
+});
+
+test("the résumé is removed and re-uploaded BEFORE the step's scan", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
+  const i = src.indexOf("atsInjOrcResumeReset");
+  assert.ok(i > 0, "the replay walk must reset the résumé");
+  const walk = stripJsComments(src.slice(i - 400, i + 1400));
+
+  // BEFORE the fill: until the file is removed, ORC renders the attached state and `resume-upload`
+  // is not in the scan at all — which is how the approved résumé came to report "no matching field".
+  assert.ok(walk.indexOf("atsInjOrcResumeReset") < walk.indexOf("driveAtsPageFill"),
+    "the reset must run BEFORE the step's fill, or the upload control is not in the scan");
+});
+
+test("atsInjOrcResumeReset reports what it found instead of assuming markup", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsInjOrcResumeReset");
+  assert.ok(i > 0);
+  const fn = stripJsComments(src.slice(i, src.indexOf("\n}", src.indexOf('error: "still-attached"', i))));
+
+  assert.ok(/no-remove-control/.test(fn) && /offered/.test(fn),
+    "a missing remove control must come back as a diagnosable report carrying the controls it DID " +
+    "see — ORC's attached-résumé markup has not been observed, and a silent no-op would hide that");
+  // ⚠ scoped to the résumé's own row/wrapper, never a document sweep: a cover-letter or attachment
+  // slot must never be mistaken for the résumé (the Greenhouse wrong-slot lesson).
+  assert.ok(/resume-upload-button/.test(fn), "it prefers ORC's own wrapper");
+  assert.ok(!/document\.querySelectorAll\("button/.test(fn),
+    "controls are searched within the résumé area, never document-wide");
+});
+
+// ── READ THE ENTRY OFF THE TILE; OPEN ONLY IF SOMETHING DISAGREES (operator, 2026-08-21) ─────
+test("atsYearMonthKey: the same month in three vocabularies is one key", () => {
+  const K = ats.atsYearMonthKey;
+  assert.strictEqual(K("May 2025"), "2025-05");
+  assert.strictEqual(K("05/2025"), "2025-05");
+  assert.strictEqual(K("5/2025"), "2025-05");
+  assert.strictEqual(K("2025-05"), "2025-05");
+  assert.strictEqual(K("may 2025"), "2025-05");
+  assert.strictEqual(K("Sep 2025"), "2025-09", "an abbreviated month still resolves");
+  // and nothing that is not a month+year
+  assert.strictEqual(K("Rivian"), null);
+  assert.strictEqual(K(""), null);
+  assert.strictEqual(K("2025"), null, "a bare year is not a month");
+});
+
+test("atsOrcTileHoldsValue: the tile is the cheap check, and dates are tolerated", () => {
+  const H = ats.atsOrcTileHoldsValue;
+  const tile = "Rivian and Volkswagen Technologies Characterization and Test Automation Intern 05/2026 - 08/2026";
+
+  assert.strictEqual(H(tile, "Rivian and Volkswagen Technologies"), true);
+  assert.strictEqual(H(tile, "Characterization and Test Automation Intern"), true);
+  // ⚠ THE DATE VOCABULARY DIFFERS BY DESIGN: the tile renders 05/2026, the record stores "May 2026".
+  // Without this tolerance every date would read as wrong and every entry would be opened — which is
+  // exactly the work this check exists to avoid.
+  assert.strictEqual(H(tile, "May 2026"), true);
+  assert.strictEqual(H(tile, "August 2026"), true);
+
+  // …and a genuinely different value must still disagree, or the check is worthless
+  assert.strictEqual(H(tile, "June 2026"), false);
+  assert.strictEqual(H(tile, "Acme Corp"), false);
+  // nothing approved ⇒ nothing to disagree with
+  assert.strictEqual(H(tile, ""), true);
+  assert.strictEqual(H("", "May 2026"), false, "an empty tile cannot vouch for anything");
+});
+
+test("the replay checks the tile BEFORE opening an entry", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("const missing = expected.filter");
+  assert.ok(i > 0, "the tile check must exist");
+  // ⚠ WINDOW OVER THE WHOLE report-only BRANCH, not a byte count. A fixed +1600 slice silently
+  // stopped covering `atsInjOrcOpenTileAndWait` once the per-half date records were added between
+  // them, and `indexOf` then returned -1 — which made the ordering assertion pass/fail for a reason
+  // that had nothing to do with ordering.
+  const branchStart = src.lastIndexOf("if (o.reportOnly) {", i);
+  const seg = stripJsComments(src.slice(branchStart, src.indexOf("\n  if (!plan.length) {", i)));
+  const atHolds = seg.indexOf("const missing = expected.filter");
+  const atOpen = seg.indexOf("atsInjOrcOpenTileAndWait");
+  assert.ok(atHolds > 0 && atOpen > 0, "both the tile check and the per-field open must be present");
+  assert.ok(atHolds < atOpen,
+    "the tile is read FIRST; opening is the exception, not the default");
+  assert.ok(/verified from the DOM, not opened/.test(seg),
+    "a tile that already shows every approved value must be recorded without being opened");
+  assert.ok(/opening it to check field by field/.test(seg),
+    "…and a discrepancy must still fall through to the precise per-field check");
+  // one record per FIELD, so the keys line up with the fill's
+  assert.ok(/fieldName: e\.fieldName/.test(seg), "records are per-field, matching the fill's keys");
+});
+
+// ── ORC IGNORES A CLICK THAT LANDS TOO EARLY (measured on the live form, 2026-08-21) ─────────
+test("the entry COMMIT re-presses, but can never add a second entry", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("async function atsInjOrcCommitEntryAndWait");
+  assert.ok(i > 0);
+  const fn = stripJsComments(src.slice(i, src.indexOf("\n}", src.indexOf("return { ok: true, pressed", i))));
+
+  // the re-press itself — the commit is pressed immediately after the field write, so it is even
+  // more exposed to the early-click no-op than Cancel was
+  assert.ok(/for \(let round = 0; round < 3/.test(fn), "it must be willing to press again");
+  assert.ok(/pickCommit\(\)/.test(fn), "…re-resolving the control each round");
+
+  // ⚠⚠ THE SAFETY PROPERTY. A commit is not a cancel: pressing twice must never be able to create a
+  // SECOND entry. The already-closed check has to come BEFORE the press, so a first press that
+  // worked exits the loop instead of pressing again.
+  const roundAt = fn.indexOf("for (let round");
+  const guardAt = fn.indexOf("openNow() === 0", roundAt);
+  const clickAt = fn.indexOf("ctl.click()", roundAt);
+  assert.ok(guardAt > 0 && clickAt > 0 && guardAt < clickAt,
+    "the already-closed check must precede the click, or a re-press could add a duplicate entry");
+
+  // and the caption is resolved live, because it differs by mode: "Add Skill" while adding,
+  // "Save" while editing (both measured)
+  assert.ok(/\^\(add\|save\|update\)/.test(fn), "the commit caption differs between add and edit mode");
+});
+
+test("the entry waits poll finely and look BEFORE sleeping", () => {
+  const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
+  // Measured: ORC renders an entry form in 36ms and tears it down in 33ms, so an 80ms sleep taken
+  // BEFORE the first look cost 80-160ms per phase on every one of twelve entries.
+  for (const name of ["atsInjOrcOpenEntryAndWait", "atsInjOrcOpenTileAndWait", "atsInjOrcCommitEntryAndWait"]) {
+    const i = src.indexOf("async function " + name);
+    assert.ok(i > 0, name + " must exist");
+    const fn = stripJsComments(src.slice(i, i + 5200));   // the commit grew with the re-press logic
+    assert.ok(/setTimeout\(r, 25\)/.test(fn), name + " must poll finely — these are PAGE timers, not SW pacing");
+    assert.ok(!/await new Promise\(\(r\) => setTimeout\(r, 80\)\)/.test(fn),
+      name + " must not sleep 80ms before its first look");
+  }
+});
+
+// ── THE PILL IS A TOGGLE: AN ALREADY-CORRECT ANSWER MUST NOT BE CLICKED (operator, 2026-08-21) ──
+// "if it is already answered, clicking it again actually clears the answer, so you see that and
+// re-click it. instead if it is correct already, just don't click it, leave it be."
+test("atsCommitYesNo: an already-correct pill is left alone, never clicked", async () => {
+  let clicks = 0, reads = 0;
+  const act = {
+    // arity discriminates: the click is eval(fn, sel, want), the read is eval(fn, ats, sel, kind)
+    eval: async (fn, a, b, c) => {
+      if (c === undefined) { clicks++; return { ok: true }; }
+      reads++;
+      return { ok: true, value: "No" };            // the form ALREADY holds the wanted answer
+    },
+    delayFull: async () => {},
+  };
+  const out = await ats.atsCommitYesNo(act, "oracle", { inputSel: "#q" }, "No", "yesno");
+
+  assert.strictEqual(out.ok, true, "an answer already on the form is a success");
+  assert.strictEqual(clicks, 0, "⚠ it must NOT click — clicking a pill that already holds the answer CLEARS it");
+  assert.strictEqual(out.presses, 0);
+  assert.strictEqual(out.value, "No", "and it reports what the form holds");
+  assert.match(String(out.detail || ""), /left alone/i, "the record should say why nothing was pressed");
+  assert.ok(reads >= 1, "it has to LOOK before deciding not to click");
+});
+
+test("atsCommitYesNo: a pill holding the WRONG answer is still clicked", async () => {
+  let clicks = 0, reads = 0;
+  const act = {
+    eval: async (fn, a, b, c) => {
+      if (c === undefined) { clicks++; return { ok: true }; }
+      reads++;
+      // holds "Yes" until the click lands, then "No"
+      return { ok: true, value: clicks ? "No" : "Yes" };
+    },
+    delayFull: async () => {},
+  };
+  const out = await ats.atsCommitYesNo(act, "oracle", { inputSel: "#q" }, "No", "yesno");
+  assert.strictEqual(out.ok, true);
+  assert.ok(clicks >= 1, "a different option is a different button — selecting it is not a toggle");
+  assert.strictEqual(out.value, "No");
 });

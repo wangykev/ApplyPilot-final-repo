@@ -89,6 +89,59 @@ function gmailExtractVerificationUrl(body, urlMustContain) {
   return needle ? (hostUrls[0] || null) : null;
 }
 
+// ── A NUMERIC VERIFICATION CODE, NOT A LINK (Oracle Recruiting Cloud, 2026-08-19) ──────────
+// Workday emails a clickable activation URL; ORC emails a SIX-DIGIT CODE to type into six boxes
+// ("Confirm Your Identity"). Same auto-verify purpose, a different payload, so this sits beside
+// gmailExtractVerificationUrl rather than inside it.
+//
+// ⚠ THE ADVERSARIAL CASE IS REAL, NOT HYPOTHETICAL: an ORC requisition id is itself six digits
+// (`…/job/334325`), and the verification email carries links back to the posting. A naive
+// `\d{6}` would happily return the JOB ID and then report "the code was rejected", sending the
+// next debugging round at the typing code rather than at the extraction. Two guards:
+//
+//   1. URLs are stripped FIRST, so a job id, a tracking parameter or a message id inside a link
+//      cannot be a candidate at all.
+//   2. A candidate must sit near a code-ish word. Only if the body contains EXACTLY ONE candidate
+//      overall is proximity waived — and otherwise it REFUSES. Refusing costs one operator stop;
+//      guessing burns the code (each wrong submit may invalidate it) and lies about why.
+//
+// `\b\d{6}\b` is deliberate: `\b` is not a boundary between two digits, so a 7+ digit run is
+// rejected wholesale rather than having its first six taken.
+var GMAIL_CODE_KEYWORD_RE = /(verification|verify|confirm|identity|security|access|one[\s-]?time|passcode|\bpin\b|\bcode\b|\botp\b)/gi;
+
+function gmailExtractVerificationCode(body, opts) {
+  const o = opts || {};
+  const len = Number(o.length) > 0 ? Number(o.length) : 6;
+  const windowChars = o.windowChars != null ? Number(o.windowChars) : 200;
+  const text = String(body == null ? "" : body);
+  if (!text) return null;
+
+  const noUrls = text.replace(/https?:\/\/[^\s"'<>]+/g, " ");
+
+  const cands = [];
+  const digitRe = new RegExp("\\b\\d{" + len + "}\\b", "g");
+  for (let m = digitRe.exec(noUrls); m; m = digitRe.exec(noUrls)) cands.push({ code: m[0], at: m.index });
+  if (!cands.length) return null;
+
+  const keys = [];
+  GMAIL_CODE_KEYWORD_RE.lastIndex = 0;
+  for (let m = GMAIL_CODE_KEYWORD_RE.exec(noUrls); m; m = GMAIL_CODE_KEYWORD_RE.exec(noUrls)) keys.push(m.index);
+
+  if (keys.length) {
+    let best = null;
+    for (const c of cands) {
+      for (const k of keys) {
+        const d = Math.abs(c.at - k);
+        if (d <= windowChars && (!best || d < best.d)) best = { code: c.code, d };
+      }
+    }
+    if (best) return best.code;
+  }
+  // No keyword anywhere near a candidate. A LONE candidate is still unambiguous; two or more is a
+  // guess, and this refuses to make it.
+  return cands.length === 1 ? cands[0].code : null;
+}
+
 // The Gmail search `q`. Mirrors the reference: sender + a 1h recency floor (the
 // hard freshness guard is the internalDate cutoff below; newer_than:1h just keeps
 // the result set small). Optional subject narrows further (unused by the caller).
@@ -204,6 +257,65 @@ async function gmailFindVerificationEmail(opts) {
 // Get a gmail.readonly access token. interactive:true shows Chrome's native
 // account-picker/consent (first connect); interactive:false is silent (cached/
 // refreshed by Chrome) and fails fast if consent was never granted.
+// ── POLL FOR AN EMAILED *CODE* (Oracle Recruiting Cloud, 2026-08-19) ───────────────────────
+// A deliberate SIBLING of gmailFindVerificationEmail rather than a new mode inside it. That
+// function is live on the Workday path and extracts a URL; threading a second payload type through
+// it would put the one auto-verify path that already works at risk for no benefit. This shares the
+// pieces that matter (gmailApiGet, gmailExtractBodyText, the freshness cutoff) and nothing else.
+//
+// ⚠ THE FRESHNESS CUTOFF IS THE LOAD-BEARING PART. A code is one-time and short-lived, and an ORC
+// inbox accumulates them — one per apply attempt per tenant. Returning a STALE code fails
+// verification and, worse, may consume an attempt, so the internalDate floor is not an
+// optimisation: a message older than `sinceMs` is not a candidate at all. Default 300s.
+// Returns { ok, code } | { ok:false, error } and NEVER throws. The code is returned to the caller
+// (which must not log it) and appears nowhere else.
+async function gmailFindVerificationCode(opts) {
+  const o = opts || {};
+  const fetchFn = o.fetchImpl || (typeof fetch !== "undefined" ? fetch : null);
+  const sleep = o.sleepImpl || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const now = o.nowImpl || (() => Date.now());
+  if (!fetchFn) return { ok: false, error: "no fetch available in this context" };
+  if (!o.token) return { ok: false, error: "no Gmail token" };
+
+  const timeoutMs = o.timeoutMs != null ? o.timeoutMs : 120000;
+  const pollMs = o.pollMs != null ? o.pollMs : 5000;
+  const sinceMs = o.sinceMs != null ? o.sinceMs : 300000;
+  const maxResults = o.maxResults || 10;
+  // Oracle's candidate mail comes from the tenant's Fusion pod, so the SENDER is as unreliable as
+  // Workday's was. Key on tokens the body/subject carry instead, and let the code extractor's own
+  // guards be the decisive filter.
+  const q = o.query || ("newer_than:1h (oraclecloud OR oracle OR \"verification code\" OR \"Confirm Your Identity\")");
+
+  const start = now();
+  const cutoffMs = start - sinceMs;
+  let lastErr = null;
+
+  while (now() - start < timeoutMs) {
+    const list = await gmailApiGet(o.token, "/messages?q=" + encodeURIComponent(q) + "&maxResults=" + maxResults, fetchFn);
+    if (!list.ok) {
+      if (list.status === 401 || list.status === 403) return list; // auth — polling cannot fix it
+      lastErr = list;
+    } else {
+      const stubs = (list.data && list.data.messages) || [];
+      const msgs = [];
+      for (const stub of stubs) {
+        const full = await gmailApiGet(o.token, "/messages/" + stub.id + "?format=full", fetchFn);
+        if (full.ok && full.data) msgs.push(full.data);
+        else if (full.status === 401 || full.status === 403) return full;
+      }
+      msgs.sort((a, b) => Number(b.internalDate || 0) - Number(a.internalDate || 0)); // newest first
+      for (const m of msgs) {
+        if (Number(m.internalDate || 0) < cutoffMs) continue; // stale — see the note above
+        const code = gmailExtractVerificationCode(gmailExtractBodyText(m.payload), o);
+        if (code) return { ok: true, code, messageId: m.id, internalDate: Number(m.internalDate || 0) };
+      }
+    }
+    if (now() - start + pollMs >= timeoutMs) break;
+    await sleep(pollMs);
+  }
+  return { ok: false, error: lastErr ? ("Gmail lookup failed: " + (lastErr.error || lastErr.status)) : "no verification code found within " + Math.round(timeoutMs / 1000) + "s" };
+}
+
 function gmailGetToken(interactive) {
   return new Promise((resolve) => {
     try {
@@ -241,6 +353,7 @@ function gmailRemoveCachedToken(token) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     gmailB64UrlDecode, gmailExtractBodyText, gmailExtractVerificationUrl,
+    gmailExtractVerificationCode, gmailFindVerificationCode,
     gmailBuildQuery, gmailApiGet, gmailFindVerificationEmail,
     gmailGetToken, gmailRemoveCachedToken
   };
