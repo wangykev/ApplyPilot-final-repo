@@ -21,9 +21,36 @@ const STATUS: Record<QueueItem["status"], { dot: string; text: string }> = {
 // Matches the Discover panel's badge colours so a source reads the same on both pages.
 const SOURCE_BADGE: Record<string, string> = {
   simplify: "border-verified/40 text-verified",
+  zero2sudo: "border-iris/40 text-iris",
   linkedin: "border-amber/40 text-amber",
   handshake: "border-ink-dim/40 text-ink-dim",
 };
+
+/** Tab order = the sweep order, so the queue reads the same way Discover ran. */
+const SOURCE_TABS: string[] = ["simplify", "zero2sudo", "linkedin", "handshake"];
+
+const SOURCE_TAB_LABEL: Record<string, string> = {
+  simplify: "Simplify",
+  zero2sudo: "@zero2sudo",
+  linkedin: "LinkedIn",
+  handshake: "Handshake",
+};
+
+/** The sentinel for rows the operator PASTED — they have no source at all. */
+const PASTED = "__pasted__";
+
+/**
+ * Every source that found this row.
+ *
+ * `details.found_on` is written only when MORE THAN ONE source found the posting, so
+ * the common single-source row falls back to `source`. That fallback is the whole
+ * contract: absent means "just `source`", never "unknown".
+ */
+function sourcesOf(item: QueueItem): string[] {
+  const many = item.details?.found_on;
+  if (Array.isArray(many) && many.length) return many;
+  return item.source ? [item.source] : [PASTED];
+}
 
 function host(url: string): string {
   try {
@@ -55,8 +82,35 @@ export function QueuePanel({ items }: { items: QueueItem[] }) {
   const [text, setText] = useState("");
   const [pending, startTransition] = useTransition();
   const [msg, setMsg] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [tab, setTab] = useState<string>("all");
 
   const detected = parseUrls(text).length;
+
+  // ── SOURCE TABS ───────────────────────────────────────────────────────────
+  // One tab per source that actually has rows, plus "All". The per-source tabs
+  // deliberately OVERLAP — a posting found on both LinkedIn and Simplify is listed
+  // under both, because "what did LinkedIn find for me?" is the question a source tab
+  // answers. "All" is the deduped union and is the ONLY count that sums to the queue.
+  //
+  // Pure client-side: the page already loaded every row, so switching is instant and
+  // no tab can be stale relative to another (the same reasoning as the Fill/Submit
+  // toggle one level up).
+  const counts = new Map<string, number>();
+  for (const it of items) {
+    for (const s of sourcesOf(it)) counts.set(s, (counts.get(s) ?? 0) + 1);
+  }
+  // Known sources in sweep order, then anything unrecognised (a source added to the
+  // extension before this list), then pasted rows last.
+  const present = [
+    ...SOURCE_TABS.filter((s) => counts.has(s)),
+    ...[...counts.keys()].filter((s) => s !== PASTED && !SOURCE_TABS.includes(s)).sort(),
+    ...(counts.has(PASTED) ? [PASTED] : []),
+  ];
+  // A tab whose rows all got removed must not strand the view on an empty list.
+  const activeTab = tab !== "all" && !counts.has(tab) ? "all" : tab;
+  const shown = activeTab === "all" ? items : items.filter((it) => sourcesOf(it).includes(activeTab));
+  // How many rows more than one source found — the number the "All" tab is collapsing.
+  const overlapping = items.filter((it) => sourcesOf(it).length > 1).length;
 
   const add = () =>
     startTransition(async () => {
@@ -137,20 +191,90 @@ export function QueuePanel({ items }: { items: QueueItem[] }) {
             Nothing queued yet. Paste some Workday links above.
           </p>
         ) : (
-          <ol className="space-y-2">
-            {items.map((it, i) => (
-              <QueueRow
-                key={it.id}
-                item={it}
-                index={i}
-                pending={pending}
-                onRemove={() => remove(it.id)}
-              />
-            ))}
-          </ol>
+          <>
+            {/* Only worth showing once there is more than one source to switch between. */}
+            {present.length > 1 && (
+              <div className="mb-4 flex flex-wrap items-center gap-2 border-b border-hairline pb-3">
+                <SourceTab
+                  id="all"
+                  label="All"
+                  n={items.length}
+                  active={activeTab === "all"}
+                  onClick={setTab}
+                />
+                {present.map((s) => (
+                  <SourceTab
+                    key={s}
+                    id={s}
+                    label={s === PASTED ? "Pasted" : SOURCE_TAB_LABEL[s] || s}
+                    n={counts.get(s) ?? 0}
+                    active={activeTab === s}
+                    tone={SOURCE_BADGE[s]}
+                    onClick={setTab}
+                  />
+                ))}
+                <span className="ml-auto font-mono text-[10px] text-ink-faint">
+                  {activeTab === "all"
+                    ? overlapping > 0
+                      ? `deduped — ${overlapping} found by more than one source`
+                      : "deduped union"
+                    : "everything this source found"}
+                </span>
+              </div>
+            )}
+            <ol className="space-y-2">
+              {shown.map((it, i) => (
+                <QueueRow
+                  key={it.id}
+                  item={it}
+                  index={i}
+                  pending={pending}
+                  onRemove={() => remove(it.id)}
+                />
+              ))}
+            </ol>
+          </>
         )}
       </SectionCard>
     </div>
+  );
+}
+
+/**
+ * One source tab. Deliberately smaller and squarer than the Fill/Submit toggle above
+ * it — these are a filter WITHIN that view, not a peer of it, and reusing the same pill
+ * would read as two equal rows of tabs.
+ */
+function SourceTab({
+  id,
+  label,
+  n,
+  active,
+  tone,
+  onClick,
+}: {
+  id: string;
+  label: string;
+  n: number;
+  active: boolean;
+  tone?: string;
+  onClick: (id: string) => void;
+}) {
+  return (
+    <button
+      onClick={() => onClick(id)}
+      aria-pressed={active}
+      className={clsx(
+        "rounded border px-2.5 py-1 font-mono text-[10px] uppercase tracking-label transition-colors",
+        active
+          ? tone
+            ? clsx(tone, "bg-panel-raised")
+            : "border-ink-dim bg-panel-raised text-ink"
+          : "border-hairline text-ink-dim hover:border-ink-dim"
+      )}
+    >
+      {label} <span className={active ? "" : "text-ink-faint"}>{n}</span>
+    </button>
   );
 }
 
@@ -187,16 +311,22 @@ function QueueRow({
           {String(index + 1).padStart(2, "0")}
         </span>
         <span className={clsx("h-2 w-2 shrink-0 rounded-full", st.dot)} />
-        {item.source && (
-          <span
-            className={clsx(
-              "shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-label",
-              SOURCE_BADGE[item.source] || "border-ink-faint/40 text-ink-faint"
-            )}
-          >
-            {item.source}
-          </span>
-        )}
+        {/* EVERY source that found this posting, not just the one that found it first.
+            On the "All" tab that is the only place the overlap is visible — the row
+            appears once, so the badges are what say it was corroborated. */}
+        {sourcesOf(item)
+          .filter((s) => s !== PASTED)
+          .map((s) => (
+            <span
+              key={s}
+              className={clsx(
+                "shrink-0 rounded border px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-label",
+                SOURCE_BADGE[s] || "border-ink-faint/40 text-ink-faint"
+              )}
+            >
+              {s}
+            </span>
+          ))}
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm text-ink">{headline}</div>
           {discovered ? (

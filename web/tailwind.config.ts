@@ -34,6 +34,15 @@ const config: Config = {
           DEFAULT: "#FF5C5C",
           dim: "#7a3636",
         },
+        // A FOURTH accent, added only when a fourth discovery source arrived
+        // (@zero2sudo, 2026-08-19). The other three were already spoken for —
+        // verified=Simplify, amber=LinkedIn, ink-dim=Handshake — and reusing one
+        // would make two sources read as the same thing in the queue's badges.
+        // Deliberately the only addition: this palette stays small.
+        iris: {
+          DEFAULT: "#B07CFF",
+          dim: "#5b3f85",
+        },
       },
       fontFamily: {
         display: ["var(--font-display)", "ui-sans-serif", "system-ui", "sans-serif"],

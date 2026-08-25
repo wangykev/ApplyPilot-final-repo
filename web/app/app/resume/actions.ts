@@ -1,7 +1,7 @@
 "use server";
 
 import { createClient } from "@/lib/supabase/server";
-import { isSupabaseConfigured } from "@/lib/env";
+import { isSupabaseConfigured, IS_HOSTED } from "@/lib/env";
 import {
   profileSchema,
   coerceProfile,
@@ -260,7 +260,9 @@ export async function convertDocxToPdf(): Promise<{ ok: true; pdfBase64: string 
   if (!soffice) {
     return {
       ok: false,
-      error: "Converting .docx to PDF needs LibreOffice — install it and set SOFFICE_PATH in web/.env.local, or upload a .tex instead.",
+      error: IS_HOSTED
+        ? "Converting .docx to PDF isn't available on the hosted site — upload a PDF résumé instead."
+        : "Converting .docx to PDF needs LibreOffice — install it and set SOFFICE_PATH in web/.env.local, or upload a .tex instead.",
     };
   }
   try {

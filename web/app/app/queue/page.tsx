@@ -75,7 +75,7 @@ export default async function QueuePage() {
       <PageHeader
         eyebrow="Apply in batches"
         title="Job queue"
-        description="Two stages of the same pipeline: jobs lined up to be FILLED, and applications you've approved that are waiting to be SENT. Paste links below, or let Discover on the Run page fill this from LinkedIn, Handshake and the Simplify board."
+        description="Two stages of the same pipeline: jobs lined up to be FILLED, and applications you've approved that are waiting to be SENT. Paste links below, or let Discover on the Run page fill this from the Simplify board, @zero2sudo's stories, LinkedIn and Handshake — each gets its own tab, and All is the deduplicated union."
       />
       <QueueTabs items={items} ready={ready} />
     </div>

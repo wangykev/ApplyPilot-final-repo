@@ -40,6 +40,16 @@ export type DiscoveredJob = {
   applyKind?: string;
   applyResolved?: boolean;
   /**
+   * EVERY source that found this posting, including `source` itself.
+   *
+   * Dedup runs at sweep time and keeps the first source's copy, so `source` alone
+   * answers "who found it FIRST", not "who found it". The queue's per-source tabs need
+   * the second question — otherwise a job LinkedIn genuinely surfaced disappears from
+   * the LinkedIn tab just because Simplify happened to run earlier. This is what lets
+   * the per-source tabs legitimately overlap while "All" stays the deduped union.
+   */
+  foundOn?: string[];
+  /**
    * Ranking (2026-07-30, "scrape wide, queue narrow"). Both boards report how many
    * people have already applied, which is the strongest available signal; `score`
    * orders the queue and `scoreReasons` explains it, so the ranking is auditable
@@ -123,16 +133,26 @@ export type DiscoverSearch = {
   minMatchPercent?: number;
 };
 
-export type DiscoverSourceKey = "simplify" | "linkedin" | "handshake";
+export type DiscoverSourceKey = "simplify" | "zero2sudo" | "linkedin" | "handshake";
+
+/** Sweep order — the same order the extension runs them in, which is what makes
+ *  cross-source dedup deterministic (the first source to find a job keeps the row). */
+export const DISCOVER_SOURCES: DiscoverSourceKey[] = ["simplify", "zero2sudo", "linkedin", "handshake"];
 
 export const DISCOVER_SOURCE_LABEL: Record<DiscoverSourceKey, string> = {
   simplify: "Simplify 2026 internships",
+  zero2sudo: "@zero2sudo stories",
   linkedin: "LinkedIn",
   handshake: "Handshake",
 };
 
 export const DISCOVER_SOURCE_HINT: Record<DiscoverSourceKey, string> = {
   simplify: "The public GitHub board — no sign-in needed.",
+  // Two things the operator needs to know before ticking this, both measured live:
+  // stories expire after 24h (so this is a daily-sweep source, and a gap is a real
+  // gap), and reading them marks them seen — you appear in his viewer list.
+  zero2sudo:
+    "Read from your signed-in Instagram session. Only the last 24h of stories exist, so sweep daily. Reading them marks them seen — you'll show in his viewer list.",
   linkedin: "Read from your signed-in LinkedIn session in this browser.",
   handshake: "Read from your signed-in Handshake session in this browser.",
 };
@@ -161,6 +181,14 @@ export const DISCOVER_DEFAULTS = {
   maxRecords: 25,
   /** Real page loads in the reused reader tab, for anything with no board record. */
   maxJdOpens: 10,
+  /**
+   * zero2sudo's OWN description budget, spent inside its driver. Separate from
+   * maxJdOpens on purpose: a story link is a bare url with no company, title or JD,
+   * and the global ranking runs BEFORE the reader pass — so an unenriched story job
+   * would score ~0 on relevance and be dropped below the match threshold before
+   * anything ever opened it. The source would look empty rather than filtered.
+   */
+  maxStoryReads: 16,
   /** How many result PAGES to sweep per board (scrape wide…). */
   maxPages: 3,
   /**
@@ -419,6 +447,12 @@ export type QueueItemDetails = {
   reposted?: boolean;
   original_posted_at?: string;
   apply_note?: string;
+  /**
+   * TODO(dup): lockstep with web/app/app/queue/shared.ts QueueItemDetails.
+   * Every source that found this posting. Present ONLY when more than one did, so an
+   * ordinary row is unchanged. The queue's per-source tabs read it — see DiscoveredJob.foundOn.
+   */
+  found_on?: string[];
 };
 
 /** Drop empty/blank keys so a row never stores `{pay: ""}` and render code can just truthy-check. */
@@ -492,6 +526,16 @@ export function toQueueRow(job: Partial<DiscoveredJob> | null | undefined): {
           ? new Date(job.originalPostedAt).toISOString()
           : undefined,
       apply_note: str(job?.applyNote, 300) ?? undefined,
+      // EVERY source that found this posting (see DiscoveredJob.foundOn). Lives in
+      // `details` rather than its own column deliberately — the queue page already
+      // loads every row and filters client-side, so this needs no new query and no
+      // migration, which is exactly the case migration 0012's jsonb was added for.
+      // Omitted when it says nothing beyond `source` (the overwhelmingly common case),
+      // so an ordinary single-source row is byte-identical to before.
+      found_on:
+        Array.isArray(job?.foundOn) && job.foundOn.length > 1
+          ? job.foundOn.map((s) => String(s).slice(0, 40)).slice(0, 8)
+          : undefined,
     }),
   };
 }

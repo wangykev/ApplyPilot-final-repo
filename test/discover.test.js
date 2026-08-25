@@ -1009,3 +1009,120 @@ test("normalizeDiscoveredJob: carries the apply-resolution fields from the start
   assert.equal(job.applyKind, "");
   assert.equal(job.applyResolved, false);
 });
+
+// ── SOURCE 4 — zero2sudo story links ────────────────────────────────────────
+//
+// The driver needs chrome.tabs, so what is pinned here is every INTERPRETATION it
+// makes: unwrapping the shim, and the foundOn bookkeeping the queue's per-source tabs
+// read. Both were built off a live trace on 2026-08-19.
+
+const { unwrapStoryLink, noteFoundOn, dedupeCrossSource } = discoverMod;
+
+test("unwrapStoryLink: decodes Instagram's l.instagram.com shim to the real destination", () => {
+  const real = "https://job-boards.greenhouse.io/acme/jobs/4567";
+  const shim = "https://l.instagram.com/?u=" + encodeURIComponent(real) + "&e=AT1abcTOKEN";
+  assert.equal(unwrapStoryLink(shim), real);
+});
+
+test("unwrapStoryLink: DROPS the shim's tracking token — it must never reach the queue", () => {
+  // `e=` is a per-view token. A discovered url is written to Supabase and echoed into
+  // logs, so carrying it there is the leak class redactSecrets exists for.
+  const real = "https://boards.greenhouse.io/acme/jobs/1";
+  const shim = "https://l.instagram.com/?u=" + encodeURIComponent(real) + "&e=AT3SECRET99";
+  const out = unwrapStoryLink(shim);
+  assert.ok(!/AT3SECRET99/.test(out), "the tracking token survived into the unwrapped url");
+  assert.ok(!/l\.instagram\.com/.test(out), "the shim host survived");
+});
+
+test("unwrapStoryLink: strips Meta's fbclid from the DESTINATION, not just the shim (live 2026-08-19)", () => {
+  // Observed on the first real sweep: unwrapping the shim still left `?fbclid=<~90 chars>` on
+  // every url, which then reaches Supabase, the logs and the Run pipeline's navigation.
+  const real = "https://careers.truist.com/us/en/job/12345?fbclid=PAcGRvZgRleHRuA2FlbQIxMQBzcnRj";
+  const out = unwrapStoryLink("https://l.instagram.com/?u=" + encodeURIComponent(real));
+  assert.ok(!/fbclid/i.test(out), "fbclid survived: " + out);
+  assert.ok(out.startsWith("https://careers.truist.com/us/en/job/12345"));
+});
+
+test("unwrapStoryLink: strips igshid / igsh too, and leaves a clean url with no stray '?'", () => {
+  const real = "https://job-boards.greenhouse.io/acme/jobs/9?igshid=abc&igsh=def";
+  const out = unwrapStoryLink("https://l.instagram.com/?u=" + encodeURIComponent(real));
+  assert.equal(out, "https://job-boards.greenhouse.io/acme/jobs/9");
+});
+
+test("unwrapStoryLink: a DENYLIST, not 'drop the query' — real params survive alongside a tracker", () => {
+  // The whole reason this is a denylist: an ATS posting id lives in the query on some tenants,
+  // so blanket-stripping would break the link it is meant to clean.
+  const real = "https://x.example/job?jobId=129661&fbclid=PAcGRvZg&source=WEB";
+  const out = unwrapStoryLink("https://l.instagram.com/?u=" + encodeURIComponent(real));
+  assert.ok(out.includes("jobId=129661"), out);
+  assert.ok(out.includes("source=WEB"), out);
+  assert.ok(!/fbclid/i.test(out), out);
+});
+
+test("unwrapStoryLink: keeps the destination's OWN query — an ATS posting id can live there", () => {
+  const real = "https://egug.fa.us2.oraclecloud.com/hcmUI/CandidateExperience/job/26011698?mode=location";
+  const shim = "https://l.instagram.com/?u=" + encodeURIComponent(real);
+  assert.ok(unwrapStoryLink(shim).includes("mode=location"));
+});
+
+test("unwrapStoryLink: a bare (unshimmed) url passes through unchanged", () => {
+  const real = "https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/job/x";
+  assert.equal(unwrapStoryLink(real), real);
+});
+
+test("unwrapStoryLink: refuses anything that isn't a usable http(s) url", () => {
+  assert.equal(unwrapStoryLink(""), "");
+  assert.equal(unwrapStoryLink(null), "");
+  assert.equal(unwrapStoryLink("not a url"), "");
+  assert.equal(unwrapStoryLink("javascript:alert(1)"), "");
+  // A shim with no `u` param is a dead sticker, not a destination.
+  assert.equal(unwrapStoryLink("https://l.instagram.com/?e=AT1"), "");
+});
+
+test("noteFoundOn: seeds from the job's own source, then appends without duplicating", () => {
+  const job = { source: "simplify" };
+  noteFoundOn(job, "simplify");
+  assert.deepEqual(job.foundOn, ["simplify"]);
+  noteFoundOn(job, "linkedin");
+  noteFoundOn(job, "linkedin");
+  assert.deepEqual(job.foundOn, ["simplify", "linkedin"], "order-stable and unique");
+});
+
+test("dedupeDiscovered: a LATER source's duplicate is recorded on the survivor, not lost", () => {
+  // THE reason foundOn exists. Dedup keeps the first copy, so without this LinkedIn's
+  // tab would under-report — it really did find this job, it just wasn't first.
+  const url = "https://job-boards.greenhouse.io/acme/jobs/9";
+  const { jobs, skippedDupe } = dedupeDiscovered([
+    { source: "zero2sudo", url },
+    { source: "linkedin", url },
+  ], []);
+  assert.equal(jobs.length, 1, "All shows it ONCE");
+  assert.equal(skippedDupe, 1);
+  assert.deepEqual(jobs[0].foundOn, ["zero2sudo", "linkedin"], "both tabs can show it");
+  assert.equal(jobs[0].source, "zero2sudo", "the first source still owns the row");
+});
+
+test("dedupeCrossSource: the dropped copy's FULL foundOn list is carried over", () => {
+  // A three-source overlap: the dropped copy had already absorbed a third source in the
+  // key pass, and losing that would silently empty one tab.
+  const a = { source: "zero2sudo", url: "https://x.example/a", company: "Acme", title: "SWE Intern", foundOn: ["zero2sudo"] };
+  const b = { source: "linkedin", url: "https://grnh.se/short", company: "Acme", title: "SWE Intern", foundOn: ["linkedin", "handshake"] };
+  const { kept, dropped } = dedupeCrossSource([a, b]);
+  assert.equal(kept.length, 1);
+  assert.equal(dropped.length, 1);
+  assert.deepEqual(kept[0].foundOn, ["zero2sudo", "linkedin", "handshake"]);
+});
+
+test("dedupeCrossSource: a SAME-source repeat is left alone (two real postings)", () => {
+  const a = { source: "linkedin", url: "https://x.example/a", company: "Neuralink", title: "Embedded Intern", foundOn: ["linkedin"] };
+  const b = { source: "linkedin", url: "https://x.example/b", company: "Neuralink", title: "Embedded Intern", foundOn: ["linkedin"] };
+  const { kept } = dedupeCrossSource([a, b]);
+  assert.equal(kept.length, 2, "same-source duplicates are distinct postings, not overlap");
+});
+
+test("DISCOVER_DEFAULTS: zero2sudo gets its OWN description budget", () => {
+  // Separate from maxJdOpens on purpose — ranking runs before the global reader pass,
+  // so unenriched story jobs would score ~0 and be dropped before being opened.
+  assert.ok(DISCOVER_DEFAULTS.maxStoryReads > 0);
+  assert.equal(discoverMod.DISCOVER_Z2S_USERNAME, "zero2sudo");
+});

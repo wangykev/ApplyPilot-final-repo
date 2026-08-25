@@ -19,7 +19,7 @@ For current state and open work, see **`docs/status.md`**.
 | Topic | Grep for |
 |---|---|
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — MULTI-ATS: Greenhouse / Lever / Ashby end-to-end` (the landing milestone), then `2026-07-31 (b)`…`(f)`, `2026-08-04 — the async combobox`, `2026-08-05 — multi-ATS end to end`, `2026-08-07 — the dead first fill` |
-| **Job discovery** | `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
+| **Job discovery** | `2026-08-19 — SOURCE 4: @zero2sudo's stories`, `2026-07-30 — Discovery rebuilt from a live trace`, `2026-07-26 — Job DISCOVERY: a Discover button` |
 | **iCIMS pre-form (employer portal → gate → form)** | `2026-08-16 (c) — iCIMS PRE-FORM` |
 | **Résumé attach (iCIMS: attach-then-wait)** | `2026-08-17 (b) — the résumé goes on FIRST, which makes iCIMS' parse harmless` |
 | **Option lists reaching review (pickers vs free text)** | `2026-08-16 (d) — an OPTIONAL dropdown reaches review as a real picker` |
@@ -5566,6 +5566,130 @@ the trap that both sides of the comparison must be computed the same way — a m
 
 **1574 unit tests** (112 iCIMS). The baseline-vocabulary test was confirmed to FAIL on a reverted probe.
 
+## 2026-08-19 — SOURCE 4: @zero2sudo's stories, and per-source tabs on the queue
+
+Operator: *"currently it discovers from simplify, linkedin, handshake — add a zero2sudo. Make tabs so each
+time I press run I get jobs from all 4 and can see the different tabs on the queue page. Another tab with
+all, this one looks for overlap and removes them."*
+
+### The trace came first, and it changed the design twice
+
+Before writing a driver, the live endpoints were read through the operator's own signed-in session. Two
+assumptions died there, which is the whole argument for tracing first:
+
+1. **"He always uses link stickers" — actually 16 of 32.** But the half WITHOUT stickers carry no tappable
+   link at all: they are his commentary. So **the sticker IS the job filter** — every one of the 16 linked
+   stories was a genuine posting. That killed the entire vision/OCR branch of the design: `llm.js` needs no
+   image support, there is no per-story model spend, and this source ends up as cheap as the Simplify feed.
+   `story_cta` (the pre-2021 swipe-up) was 0/32, so one field is read rather than two.
+2. **Highlights DO NOT solve the 24h window.** The hopeful theory — job stories get archived into a
+   Highlight, which never expires, so a sweep could catch up at leisure — was tested and **refuted**:
+   "Insider Info 4" held 65 items spanning the same dates, only 3 carried a sticker, and cross-referencing
+   by media id gave **ZERO overlap** with the 16 live linked ones. He archives evergreen commentary, not the
+   job drops. So the window is real, a missed day is genuinely lost, and the driver **says so in a note**
+   rather than implying the list is complete. Only an unattended collector closes that gap; this source
+   cannot, and pretending otherwise would be the silent-narrowing failure.
+
+### The bug that would have made the source look empty
+
+Ranking (`pickByThreshold`) runs **before** `fillMissingDescriptions`. A story link is a bare url — no
+company, no title, no JD — so it scores ~0 on relevance, lands under the 60% threshold, and is dropped
+**before anything ever opens it**. The source would have returned nothing on a page full of real jobs, and
+the log would have called it a threshold filter. Fixed by giving the driver its **own** `maxStoryReads`
+budget and enriching inside it, so these reach the global ranking with the same fields a board record
+supplies. Deliberately not "simplified" into the global reader pass — the ordering is the fix.
+
+`unwrapStoryLink` is pure and unit-pinned: it decodes `l.instagram.com/?u=` to the destination and **drops
+the `e=` tracking token**. A discovered url reaches Supabase and the logs, so carrying that token is exactly
+the leak class `redactSecrets` exists for.
+
+### Per-source tabs, and why `source` alone couldn't drive them
+
+`source` answers *"who found it FIRST"*, not *"who found it"* — dedup keeps the first source's copy, so a
+job LinkedIn genuinely surfaced would vanish from the LinkedIn tab merely because Simplify ran earlier, and
+that tab would quietly under-report. `foundOn` (→ `details.found_on`) records **every** source; both dedup
+passes merge onto the survivor, and `dedupeCrossSource` carries the dropped copy's *whole* list because it
+may already have absorbed a third source. Per-source tabs therefore overlap on purpose; **All** is the
+deduped union and the only count that sums to the queue. Written only when >1 source found the row, so an
+ordinary row is unchanged — and it lives in migration 0012's `details` jsonb, so **no migration and no new
+query**: the queue page already loads every row and filters client-side.
+
+One new palette token (`iris`) — the other three accents were already spoken for, and a fourth source
+sharing a colour would make two sources read as the same thing.
+
+### Coverage is the real constraint, and it is worth stating plainly
+
+Of the 16 links found live, only **3** are on an ATS ApplyPilot can fill (2 Greenhouse + 1 Workday). The
+rest were Oracle Recruiting Cloud, Phenom-fronted employer career sites, SmartRecruiters and SAP — and
+checked directly, **none redirect to a vanity-domain Workday**, so `atsPortalAts` does not recover them
+either. Ingestion was the easy 20% of this feature. Oracle Recruiting Cloud is the highest-value next
+adapter (3 of 16, and ubiquitous in the defense/industrials postings he favours).
+
+### Follow-up the same day: the tab was doing far more than it needed to
+
+Operator: *"does it need to physically open the tab, or just request to open it — the least invasive, the
+better."* Asking that exposed real waste. The tab exists for exactly ONE reason: to give the `fetch` an
+instagram.com ORIGIN so the session cookie rides along. Nothing in the DOM is ever read. But the first cut
+navigated to the HOME PAGE, which boots Instagram's entire web app, and then sat through
+`withDiscoverTab`'s 2s React-hydration beat — several seconds spent acquiring a property that *any*
+document on the origin already has.
+
+Now `robots.txt` with `settleMs: 0`. Verified live rather than assumed, because "a non-HTML document still
+behaves like a page" is exactly the kind of thing that is usually true and occasionally isn't:
+`contentType "text/plain"`, `origin https://www.instagram.com`, **`document.cookie` readable** (the
+signed-in check depends on it), and both authenticated endpoints returning **200**. Roughly 5-8s → under a
+second.
+
+That surfaced a latent bug in `withDiscoverTab`: it read `o.settleMs || 2000`, so an explicit **`0` silently
+became the full 2s**. Now `!= null`. No existing caller passes 0, so this only grants a request that used to
+be ignored.
+
+The genuinely tab-free alternative — a bare service-worker `fetch`, the Simplify pattern — was considered
+and **declined as the MORE invasive option**: it needs `instagram.com` in `host_permissions`, and adding a
+host permission to an already-installed extension makes Chrome **disable it until the user re-approves**.
+Whether MV3's SW `credentials:"include"` attaches IG's cookies is also version-sensitive enough that it
+would need proving first. A sub-second tab is the cheaper trade.
+
+### LIVE-VERIFIED the same day — and the live run corrected the headline claim
+
+Driven end to end in a second Chrome profile with the worktree loaded (`AP_PING` build marker
+`icims-leansig-1` → `zero2sudo-3` across reloads, which is what proved the loaded directory was this
+worktree and not another).
+
+**What passed.** Signed-out path: clean skip, actionable note, **no login attempted** — hit for real,
+because that profile was signed out. Happy path: `zero2sudo: 35 live stories, 13 carrying a link sticker`
+→ 13 jobs with correct keys (`greenhouse:gardacp:6146213004`, `wd5:jr2023495`), real companies and JDs
+(Nvidia, Gardacp, Honeywell, Humana). The `robots.txt` origin trick worked under a real sweep. All four
+source toggles render. And the queue tabs: **`ALL 40 · @ZERO2SUDO 13 · LINKEDIN 27`**, clicking
+@zero2sudo filtered to exactly 13 rows all badged `zero2sudo`, caption switching *"deduped union"* →
+*"everything this source found"*. With one source present the bar correctly stays hidden.
+
+**⚠ THE HEADLINE CLAIM WAS WRONG, and one sample is why.** "Every stickered story is a real posting" came
+off a single trace and was written into CLAUDE.md as fact. This sweep: of 13 stickered stories, ~7 were
+real individual postings; the rest were an event RSVP (`rsvp.withgoogle.com`), a Zoom **webinar**
+(`micron.zoom.us`), a "TikTok Interest Form", a careers **index** (`verition.com`), and a **dead** posting
+(Intuit → "Job Not Found"). The sticker is a cheap pre-filter, not a classifier. Corrected in CLAUDE.md and
+the skill. *A property claimed off one observation is a hypothesis.*
+
+**Three defects the live run found, all fixed:**
+- **`fbclid` on the DESTINATION.** Unwrapping the shim was not enough — 13/13 urls came back carrying
+  `?fbclid=<~90 chars>`, straight into Supabase and every log line. Now a denylist (`fbclid`/`igshid`/
+  `igsh`), deliberately not "drop the query": one of his links carries `utm_source=zero2sudo` and some
+  tenants put the posting id there (`?jobId=`, `?gh_jid=`). 3 tests.
+- **Signed-out was invisible in the SW log** — the note existed only on the RESULT, so the console showed a
+  bare `scanned {"zero2sudo":0}`, identical to "he posted nothing". Now `dlog`s `NOT SIGNED IN` and returns
+  `signedOut: true` like the boards. *This was the operator's own ask, and the live run is what showed the
+  note was reaching the wrong surface.*
+- **`maxStoryReads` was not forwardable** through either message handler, unlike every sibling budget.
+
+**One operational finding, left as the operator's call.** A sweep with profile-derived keywords found 13
+links and queued **0** — every one scored 39–57% against the 60% default. Nothing broken, nothing silent
+(*"13 scored lower — lower the threshold to take more"*), but filtering a **human-curated** feed by your own
+keyword match works against the reason the source exists. Also noted: `scrapeJobPosting` returns page
+artifacts as titles on these employer SPAs (`"Job title"`, `"Single Position"`, `"CAREERS AT NVIDIA"`).
+
+**1592 unit tests**, all green (14 new). Website typecheck clean, `next build` clean, 315 web tests green
+including the `discover.js` ↔ `web/lib/discover.ts` lockstep cross-load.
 
 ## 2026-08-20 — Oracle Recruiting Cloud: the wizard walks end to end
 

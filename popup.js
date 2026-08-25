@@ -1,6 +1,22 @@
 const statusEl = document.getElementById("status");
 const setStatus = (msg) => { statusEl.textContent = msg; };
 
+// [data-dev-only] — hide the controls that read gitignored files out of data/.
+//
+// Those files are deliberately NOT packaged (scripts/build-store-zip.mjs ships an
+// allowlist so the operator's real profile.json / credentials.json can never reach a
+// public build), so on a store install the fetch 404s and the handler reports "copy
+// data/profile.example.json and fill it in" — a dev instruction shown to whoever opened
+// the popup, including a Web Store reviewer, on a build where the button cannot work.
+//
+// Store-installed extensions carry an `update_url` that Chrome injects into the manifest;
+// an unpacked load has none. That is the whole test — it needs no extra permission, and
+// it keeps ONE popup rather than a production twin that would drift. HIDDEN, not removed,
+// so the listeners below still bind against real elements.
+if (chrome.runtime.getManifest().update_url) {
+  for (const el of document.querySelectorAll("[data-dev-only]")) el.hidden = true;
+}
+
 // "Load default profile" — temporary stand-in for the future website→extension
 // handoff. Today it reads the bundled data/profile.json and writes it into
 // chrome.storage.local; later an external website (resume upload + profile UI)
@@ -518,6 +534,7 @@ document.getElementById("gmail-connect").addEventListener("click", () => {
 // only LOGS. It's the debugging / first-look path — the real flow is /app/run → Discover.
 const discoverSources = () => ({
   simplify: document.getElementById("discover-simplify").checked,
+  zero2sudo: document.getElementById("discover-zero2sudo").checked,
   linkedin: document.getElementById("discover-linkedin").checked,
   handshake: document.getElementById("discover-handshake").checked,
 });
