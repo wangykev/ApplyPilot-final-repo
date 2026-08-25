@@ -2621,15 +2621,17 @@ const ATS_POLL = {
   // dead-form state, and the remedy is the page refresh the run now performs — so waiting longer only
   // delays the fix. Was 20000, which cost ~20s per silent widget before the reload could help.
   search: 2000, searchCeil: 6000,
-  // ⚠ A PLACES BOX HAS NO LIST UNTIL SOMETHING IS TYPED, so the ordinary `open` deadline is spent
-  // waiting for something that cannot arrive. Measured 2026-08-25, and spotted by the operator
-  // watching a run: the field sat FOCUSED AND IDLE for ~5s before a character was typed — 1800ms
-  // of `open` plus two forced-toggle retries at 1500ms each.
-  // This is a SOFT deadline only. `pollFor`'s ceiling is a LOADING allowance and still applies, so
-  // a pick-one whose list is genuinely still fetching keeps its full budget — what shrinks is only
-  // the wait on an idle, empty menu. That is what preserves the GitLab pick-one detection this read
-  // exists for (a static list is already in the DOM on open, and answers the first read).
-  locOpen: 500,
+  // ⚠ A MENU THAT HAS SETTLED ON SHOWING NOTHING IS AN ANSWER, AND IT ARRIVES EARLY (2026-08-25).
+  // Many of these widgets render no list until a query is typed — a places box, an async
+  // school/degree search — so the ordinary `open` deadline is spent waiting for something that
+  // cannot arrive. Spotted by the operator watching a run: the field sat FOCUSED AND IDLE for ~5s
+  // before a character was typed (1800ms of `open` plus two forced-toggle retries at 1500ms each).
+  // This is how long the widget's own subtree must have been STILL before an empty, mounted,
+  // not-loading menu is believed early. Deliberately a quiescence threshold rather than a shorter
+  // clock: a widget that is ABOUT to paint its options is still mutating, so a slow-painting list
+  // (the GitLab 3-option pick-one, misread as empty at 1.8s) keeps its full budget. The loading
+  // ceiling is untouched, and where the quiet watch is unavailable the rule simply never fires.
+  emptyQuietMs: 350,
   restore: 1200, restoreCeil: 3000, // clearing the query to report real options
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
   loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
@@ -5557,6 +5559,18 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         //     is only believed once the SAME empty read repeats with the menu present.
         const emptyNow = !!(r && Array.isArray(r.options) && !r.options.length);
         const settledEmpty = emptyNow && !!(r && r.open) && sawEmptyMounted;
+        // Is this a menu that has SETTLED on showing nothing? Only asked when the cheap signals
+        // already agree (mounted + not loading + a repeated empty read), so a healthy widget never
+        // pays for the extra probe — and only BEFORE the deadline, since after it the ordinary
+        // rules below already reach the same verdict.
+        let earlyEmptyStop = false;
+        if (settledEmpty && !loading && now < deadline && act.quietRead) {
+          try {
+            const q = await act.quietRead(ref.inputSel);
+            const idle = q && q.ok ? q.idleMs : null;
+            if (idle != null && idle >= ATS_POLL.emptyQuietMs) { earlyEmptyStop = true; quietIdleMs = idle; }
+          } catch (e) { /* watch unavailable ⇒ fall through to the deadline, unchanged */ }
+        }
         if (emptyNow && r && r.open) { sawEmptyMounted = true; sawMounted = true; }
         else if (r && r.open) sawMounted = true;
         // Not every kind of "nothing yet" is progress, and the difference is worth ms:
@@ -5568,6 +5582,27 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         //     A brief grace, then stop: an absent menu is not evidence of anything to come.
         let why = "soft";
         const stop = (() => {
+          // ⚠ AN ANSWER IS AN ANSWER BEFORE THE DEADLINE TOO (generic, 2026-08-25).
+          // Everything below already knows how to recognise "mounted, not loading, confirmed
+          // empty" — but it could never SAY so early, because the soft deadline short-circuited
+          // first. So every widget whose menu legitimately renders nothing until a query is typed
+          // paid the full `open` beat (1800ms) plus two forced-toggle retries, waiting for a list
+          // that cannot exist. That was first patched per-field for the location box; this is the
+          // same finding stated once, for every widget, which is where it belonged.
+          //
+          // The evidence required is deliberately stronger than "it looks empty":
+          //   • the menu is MOUNTED (r.open) — we are looking at a real widget, not a missed click;
+          //   • it is NOT loading — the widget is not telling us a fetch is in flight;
+          //   • the SAME empty-mounted read has repeated (settledEmpty) — a react-select paints its
+          //     list a beat after the open click, and one empty frame is not an answer;
+          //   • and the page's own QUIESCENCE WATCH says the subtree has stopped mutating.
+          // That last one is what makes this safe rather than merely fast, and it is why this asks
+          // the PAGE instead of shortening a clock: a widget that is ABOUT to paint its options is
+          // still mutating, and a slow-painting list (the GitLab 3-option pick-one, misread as
+          // empty at 1.8s on 2026-08-05) keeps its full budget because it is either loading or not
+          // yet quiet. When the watch is unavailable this rule simply never fires and the old
+          // deadline behaviour stands.
+          if (earlyEmptyStop) { why = "empty-mounted-quiet"; return true; }
           if (now < deadline) return false;
           if (loading) { why = "loading-ceiling"; return now >= hardDeadline; }
           if (emptyNow && r && r.open) { why = "empty-mounted"; return settledEmpty || now >= hardDeadline; }
@@ -5633,19 +5668,25 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     if (act.quietInstall) { try { await act.quietInstall(ref.inputSel); } catch (e) { /* fallback */ } }
     const openPhaseT0 = Date.now();
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
-    // A LOCATION box gets a SHORT soft deadline here (see ATS_POLL.locOpen): this read exists only
-    // to ask "did a list render on open?", and for a places box the answer is permanently no.
-    let read = await pollFor(wt === "location" ? ATS_POLL.locOpen : ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
+    // No per-widget deadline here any more: `pollFor` now returns as soon as the PAGE says the menu
+    // has settled on showing nothing (mounted + not loading + repeated empty + quiet), which covers
+    // a places box, an async school/degree search and any tenant widget of the same shape without
+    // naming any of them. See the early-stop note in pollFor.
+    let read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
     // menu), so one forced click closes it and the next opens for real. Each attempt flips the
     // state, so two cover both "the click missed" and "it lied about being open".
-    // ⚠ SKIPPED FOR A LOCATION BOX, on two counts. An empty menu there is the NORMAL state rather
-    // than evidence of a missed click, so the toggles cost ~3s to re-confirm what we already know;
-    // and each attempt FLIPS the menu, so the loser of an odd number of clicks is a CLOSED widget —
-    // which is precisely the state the search path below has a documented recovery for ("a query
-    // only filters a menu that is OPEN"). Not spending the clicks is better than recovering from
-    // them. The typed search immediately after is the real test of whether this widget answers.
-    const forceToggles = wt === "location" ? 0 : 2;
+    // ⚠ TOGGLE ONLY WHEN THE MENU NEVER APPEARED — evidence, not a field name (generic, 2026-08-25).
+    // These toggles exist for a click that MISSED or an `aria-expanded` that lied. A menu we watched
+    // MOUNT and settle on empty is neither: it is a widget that legitimately has nothing to show
+    // until a query is typed, so the toggles cost ~3s to re-confirm what we already know. Worse,
+    // each attempt FLIPS the menu, so an odd number of clicks leaves it CLOSED — precisely the state
+    // the search path below carries a documented recovery for ("a query only filters a menu that is
+    // OPEN"). Not spending the clicks beats recovering from them.
+    // `read.open` is the positive evidence the widget mounted; the typed search immediately after is
+    // the real test of whether it answers.
+    const menuMounted = !!(read && read.open);
+    const forceToggles = menuMounted ? 0 : 2;
     for (let attempt = 0; attempt < forceToggles && !optsOf(read).length; attempt++) {
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
       read = await pollFor(ATS_POLL.retry, (t) => t.length > 0, ATS_POLL.retryCeil);
@@ -5709,7 +5750,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         try { console.log(`[ApplyPilot][ATS-LOC] SYNTHETIC-TYPE arm (REFUTED — see the note above): woke with a trusted ${how || "FAILED"}, typing synthetically`); } catch (e) { /* log only */ }
         await typeInto(city);
         locArm = "synthetic";
-      } else if (act.locInsertText && (await typeInsert(city))) {
+      } else if (act.fastComboType && (await typeInsert(city))) {
         // ONE trusted command for the whole string. Falls through to the per-char path on ANY
         // failure (no read-back match, no focus, missing capability) — the proven path stays the
         // safety net, because a REQUIRED field going unanswered costs far more than the keystrokes.
@@ -5797,9 +5838,47 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // resolving — when everything they have seen is synthetic: live 2026-08-06 the school box sat
         // `loading` for 19.2s and the location box showed nothing for 21.6s, while by hand each
         // answered in about a second. Once woken, ordinary synthetic typing drives them.
-        const typed = (await typeTrusted(query)) || (await typeInto(query)); didSearch = true; optionsFiltered = true;
+        // ⚠ SAME HEAD+1-KEYSTROKE WRITE AS THE LOCATION BOX (2026-08-25). School / degree /
+        // discipline are the SAME class of widget — Greenhouse's async comboboxes — and after the
+        // location work `school--0` became the slowest field on these forms, typing 15 chars
+        // ("Carnegie Mellon") at ~95ms/char visible and ~197ms/char hidden. The interaction shape is
+        // unchanged: `typeTrusted` already issued a trusted focus CLICK before typing, so this
+        // swaps only HOW the characters arrive, not whether the widget is woken.
+        const searchT0 = Date.now();
+        let searchArm = "trusted-perchar";
+        let typed = null;
+        // ⚠ THE FAST WRITE IS USED ONLY WHERE ITS SUCCESS IS CHEAPLY VERIFIABLE — and the widget
+        // tells us which kind it is, so no field is named here (generic, 2026-08-25).
+        //
+        // A menu that showed NOTHING on open is a query-only widget (a places box). There, "options
+        // appeared" is an unambiguous success signal, so a failed fast write is detected in one
+        // settled-empty read and costs almost nothing.
+        //
+        // A menu that ALREADY LISTS options on open is a different animal — measured live:
+        // `school--0: open 2454ms (100 opt on open)`. We cannot cheaply tell "the search fired and
+        // filtered the list" from "nothing happened and these are the stale defaults", so a failed
+        // fast write is only discovered after a full search budget. Live, that turned school from
+        // ~3.4s into 8.4s: the fast path is a REGRESSION on exactly the widget that has the most to
+        // lose. So a widget that arrives with a list keeps the per-char typing it was proven with.
+        const fastWriteVerifiable = preOpts.length === 0;
+        if (act.fastComboType && fastWriteVerifiable) { typed = await typeInsert(query); if (typed) searchArm = "insertText"; }
+        if (!typed) typed = (await typeTrusted(query)) || (await typeInto(query));
+        didSearch = true; optionsFiltered = true;
         const wantHit = (t) => t.length > 0 && hasHit(t);
         let found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
+        // ⚠ OPTIONS-BASED FALLBACK, NOT VALUE-BASED — the lesson the location box paid for. A
+        // read-back match only proves the TEXT landed; a widget that never SEARCHED reports exactly
+        // the same thing, and the field then reaches review unanswered. An empty menu re-runs the
+        // proven per-char path before anything is believed.
+        if (searchArm === "insertText" && !optsOf(found).length) {
+          try { console.log(`[ApplyPilot][ATS-SEARCH] ${f.fieldName}: insertText produced NO options — falling back to per-char typing`); } catch (e) { /* log only */ }
+          if (!(await typeTrusted(query))) await typeInto(query);
+          searchArm = "insertText→trusted";
+          found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
+        }
+        try {
+          console.log(`[ApplyPilot][ATS-SEARCH] ${f.fieldName} [${searchArm}]: open ${openPhaseMs}ms (${preOpts.length} opt on open) · query ${JSON.stringify(query)} (${query.length} chars) → ${optsOf(found).length} option(s) in ${Date.now() - searchT0}ms`);
+        } catch (e) { /* log only */ }
         // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave
         // it CLOSED (two clicks = shut), and then the text lands in the input while the widget
         // shows nothing — live 2026-07-31 this read as "the value isn't in the list" with

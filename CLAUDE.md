@@ -906,20 +906,32 @@ The standing rules:
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
-- **A PLACES BOX HAS NO LIST UNTIL SOMETHING IS TYPED — so do not poll for one (2026-08-25).** The generic
-  open-and-read-options step ran before the location branch and spent ~4.8s (`ATS_POLL.open` 1800 + two
-  forced toggles at 1500) waiting for options that cannot exist; the operator saw it as the field sitting
-  *focused and idle* for 5s before a character was typed. `ATS_POLL.locOpen` (500) is the soft deadline for
-  a location box and the forced toggles are SKIPPED for it — they flip the menu, so an odd number leaves it
-  CLOSED. ⚠ The **ceiling is untouched**: it is a LOADING allowance, which is what still lets a genuinely
-  fetching pick-one (the GitLab three-option case this read exists for) finish.
-- **TYPE THE HEAD, THEN ONE REAL KEYSTROKE.** `Input.insertText` puts the whole word in at 218ms vs 8373ms
-  of per-char typing — and **alone it does NOT work**: the widget returns 0 options, because it watches for
-  a KEY event, not a trusted INPUT event (measured; this refutes "it just needs trusted input"). One
-  keystroke for the last character fires the search with the full query already in the box. ⚠ Its read-back
-  PASSES on failure (the text really is there), so the fallback must be **options-based, not value-based** —
-  an empty menu re-runs the per-char path before anything is believed. Default ON; `atsLocInsertText:false`
-  is the kill-switch.
+- **A MENU THAT SETTLED ON SHOWING NOTHING IS AN ANSWER — AND IT ARRIVES EARLY (2026-08-25).** Many of these
+  widgets render no list until a query is typed (a places box, an async school/degree search), so the
+  open-and-read step spent ~4.8s (`ATS_POLL.open` 1800 + two forced toggles at 1500) waiting for options
+  that cannot exist — the operator saw it as the field sitting *focused and idle* for 5s before a character
+  was typed. `pollFor` ALREADY recognised "mounted + not loading + repeated empty", but the verdict sat
+  behind `if (now < deadline) return false`, so it could never fire early. It now stops as soon as the
+  page's own **quiescence watch** says the subtree has been still for `ATS_POLL.emptyQuietMs` (350ms).
+  ⚠ Quiescence, not a shorter clock: a widget ABOUT to paint its list is still mutating, so a slow-painting
+  pick-one (the GitLab 3-option case, misread as empty at 1.8s) keeps its full budget, and the LOADING
+  ceiling is untouched. Where the watch is unavailable the rule never fires. **Forced toggles now require
+  the menu to have NEVER MOUNTED** (`read.open` is the evidence) — they exist for a missed click, and each
+  flips the menu, so an odd number leaves it CLOSED.
+- **TYPE THE HEAD, THEN ONE REAL KEYSTROKE — BUT ONLY WHERE SUCCESS IS CHEAPLY VERIFIABLE.**
+  `Input.insertText` puts the whole word in at 218ms vs 8373ms of per-char typing, and **alone it does NOT
+  work**: the widget returns 0 options, because it watches for a KEY event, not a trusted INPUT event
+  (measured — this refutes "it just needs trusted input"). One keystroke for the last character fires the
+  search with the full query already in the box.
+  ⚠ **The gate is what the widget showed ON OPEN, never a field name.** A menu EMPTY on open is query-only,
+  so "options appeared" is an unambiguous success signal and a failed fast write is caught in one settled
+  read. A menu that ALREADY LISTS options on open cannot cheaply distinguish "searched and filtered" from
+  "nothing happened, these are stale defaults" — live, `school--0` (100 opt on open) went 3.4s → **8.4s**
+  before this gate existed, so a widget that arrives with a list keeps the per-char typing it was proven
+  with. ⚠ And the fallback must be **options-based, not value-based**: the read-back PASSES on failure
+  (the text really is there). Default ON; `atsComboPerChar` forces per-char everywhere.
+  ⚠ The kill-switch is named for the OLD behaviour because `AP_DEV_FLAG` cannot delete a key — "clearing"
+  writes FALSE, so a `…InsertText:false` switch would make every cleared profile permanently slow.
 - **`cdpSetFastWhenHidden(true)` APPLIES TO GH/LEVER/ASHBY, for a different reason than iCIMS.** iCIMS needs
   it because it DECLINED the timer polyfill; these three KEEP it, so the page's clock was already fast while
   **our** pacing still charged full hidden beats — independent axes, and only one was set. Live: a 500ms

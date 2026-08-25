@@ -1918,6 +1918,58 @@ Net: `candidate-location` **7.9s → 2.0s visible, 9.3s → 3.4s hidden**; whole
 38.8s → 19.3s hidden**. It is no longer the slowest field on the form — `school--0` is, and it still types
 per-char.
 
+### Round 17 (2026-08-25) — the same finding, stated ONCE, for every widget
+
+Operator: *"can you detect when you need to do this and make it more generic instead of hardcoding school
+picker and location picker."* Correct, and the generic form was already half-written.
+
+**`pollFor` could already recognise the condition and could never say so.** `stop()` opens with
+`if (now < deadline) return false`, so the `empty-mounted` verdict below it — mounted, not loading, empty
+confirmed by a repeat read — was unreachable before the soft deadline. Every query-only widget therefore
+paid the full `open` beat for a list that cannot exist. The `ATS_POLL.locOpen` hardcode from round 16 was
+that finding applied to one field.
+
+Now the poll stops early when the page's own **quiescence watch** reports the widget's subtree still for
+`emptyQuietMs` (350ms). ⚠ Quiescence rather than a shorter clock is the whole safety argument: a widget
+about to paint its options is still MUTATING, so the slow-painting pick-one keeps its budget, and the
+LOADING ceiling is untouched. Where the watch is unavailable the rule never fires and behaviour is
+byte-identical. Forced toggles likewise now key on evidence — `read.open` — instead of a field name.
+
+Live, hardcode REMOVED: `candidate-location open 395ms` (vs 1800ms before round 16, 588–717ms with the
+hardcode). The generic rule reproduces the win.
+
+### ⚠ …and applying the fast WRITE everywhere was a REGRESSION, caught by the fallback
+
+Extending `insertText`+1-keystroke to the by-name search path (school / degree / discipline) looked
+obviously right and was wrong:
+
+```
+[ATS-SEARCH] school--0: insertText produced NO options — falling back to per-char typing
+[ATS-SEARCH] school--0 [insertText→trusted]: open 2454ms (100 opt on open) · query "Carnegie Mellon" → 1 option(s) in 4790ms
+slowest: school--0 8.4s     ← was ~3.4s
+```
+
+The options-based fallback did its job (the field still filled), but the wasted attempt cost school ~2s
+and it became the slowest field on the form.
+
+**Why it works on one and not the other, in the widget's own terms:** `candidate-location` shows NOTHING on
+open, so "options appeared" is an unambiguous success signal and a failed write is caught in one settled
+read. `school--0` shows **100 options on open**, so a fast write that did nothing is indistinguishable from
+one that searched and filtered — the failure is only discovered after a full search budget.
+
+So the gate is `preOpts.length === 0`: **use the fast write only where its success is cheaply verifiable.**
+Evidence the widget itself supplies, no field names. Verified — location keeps `[insertText]`, school is
+back to `[trusted-perchar]` with no wasted attempt, 5 need review unchanged (nothing lost):
+
+```
+candidate-location [insertText]  open 612ms · typed 853ms · lookup 1261ms → 2.8s
+school--0 [trusted-perchar]      open 693ms (100 opt on open) · query 15 chars → 1 option in 3054ms
+[ATS-TIME] fill 18.7s / 26 fields — 719ms/field (HIDDEN)
+```
+
+School's residue is its OWN server (3054ms against a documented 390ms–12s spread), not our input path.
+The next honest lever there is the query, not the keystrokes.
+
 ### The process note worth keeping
 
 Three rounds of instrumentation attributed the cost to typing, and typing was never the largest term. The

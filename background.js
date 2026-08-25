@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "ats-loc-default-9";
+const AP_BUILD_MARKER = "ats-generic-12";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -709,7 +709,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     // parse re-renders the form, so "is this widget's option list empty because the tenant has none, or
     // because the PARSE left it that way?" is only answerable by filling the same form with the attach
     // OFF. Diagnostic only — a real run always attaches (the operator's résumé belongs on the form).
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "atsLocSyntheticType", "atsLocPerChar"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "atsLocSyntheticType", "atsComboPerChar"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -4673,8 +4673,8 @@ function makeAtsActuation(llmConfig) {
     // can see it (the run overrides it per-run from the flag store). Default false = the trusted path,
     // which is the only one that actually wakes the widget — see the REFUTED note at its call site.
     locSyntheticType: false,
-    locInsertText: true,
-    locPerCharType: false,
+    fastComboType: true,
+    comboPerCharType: false,
     painting: workday.painting,
     paintLabel: workday.paintLabel,
     quietInstall: workday.quietInstall,
@@ -5404,7 +5404,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // Diagnostic A/B for the location combobox's typing path — see the note at its call site in
     // ats.js. Read per run from the flag store, so the arm can be switched without a reload.
     {
-      const armFlags = await new Promise((r) => chrome.storage.local.get(["atsLocSyntheticType", "atsLocPerChar"], r));
+      const armFlags = await new Promise((r) => chrome.storage.local.get(["atsLocSyntheticType", "atsComboPerChar"], r));
       act.locSyntheticType = !!(armFlags && armFlags.atsLocSyntheticType);
       // DEFAULT ON as of 2026-08-25. Promoted on 3 clean runs across 2 tenants (Discord visible 2.0s
       // / hidden 3.4s, Cloudflare hidden 3.7s), every one `filled · exact-normalized`, against a
@@ -5416,10 +5416,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       // `atsLocInsertText:false` would therefore turn every previously-cleared profile into a
       // permanently slow one, silently. Naming the flag for the OLD behaviour keeps absent == false
       // == the default, which is the only polarity that survives a clear.
-      act.locPerCharType = !!(armFlags && armFlags.atsLocPerChar);
-      act.locInsertText = !act.locPerCharType;
+      // NOT location-specific any more: the same head+1-keystroke write drives EVERY searched
+      // combobox on these forms (school / degree / discipline / location), which is why the flag
+      // and the act property are named for the mechanism rather than the field.
+      act.comboPerCharType = !!(armFlags && armFlags.atsComboPerChar);
+      act.fastComboType = !act.comboPerCharType;
       if (act.locSyntheticType) LOG("⚠ atsLocSyntheticType is SET — the location box will be woken with a trusted click and then typed SYNTHETICALLY (diagnostic arm; REFUTED live 2026-08-25).");
-      if (act.locPerCharType) LOG("⚠ atsLocPerChar is SET — the location box falls back to per-char trusted typing (the slow pre-2026-08-25 path).");
+      if (act.comboPerCharType) LOG("⚠ atsComboPerChar is SET — every searched combobox falls back to per-char trusted typing (the slow pre-2026-08-25 path).");
     }
     const prepared = prepareProfile(store.profile);
     // ⚠ `credentials` reaches the ATS driver ONLY here, and only the credential tier can consume it
