@@ -1,0 +1,29 @@
+# ⚠ KEEP LF IN THE WORKING TREE (2026-08-21)
+#
+# `core.autocrlf=true` is set globally on this machine, so a checkout was rewriting every source file
+# to CRLF. That is harmless to Chrome and to Node at runtime — but SEVERAL UNIT TESTS SCAN SOURCE TEXT
+# and anchor on "\n" (e.g. `src.indexOf("\n}")`, and the shared comment-stripper's line split). Under
+# CRLF those patterns stop matching, so the suite reports failures that have nothing to do with the
+# code.
+#
+# It cost real confusion twice in one day: both times a `git revert` / `git checkout` restored a
+# known-good tree, the suite went red, and the red looked like a regression in the thing being
+# reverted. The tree was byte-identical to the good commit both times — only the line endings differed.
+#
+# Pinning LF here fixes it once for every test and every future checkout, with no test churn and no
+# dependence on a contributor's local git config. It also silences the constant
+# "LF will be replaced by CRLF" warnings that made real warnings easy to miss.
+#
+# ⚠ If a test ever needs to assert on line endings, it must read bytes deliberately rather than rely
+# on whatever the checkout produced.
+* text=auto eol=lf
+
+# Binary-ish assets: never touched, never normalized.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary

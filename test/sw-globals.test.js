@@ -89,12 +89,22 @@ test("SW GLOBAL SCOPE: every importScripts file exists and parses", () => {
 // NOT scanned, so it had exactly the hole this test exists to close. A signature-date fix called
 // `apMatch.parseErrorFieldName` from background.js; the suite passed 1185/1185 and the live replay
 // aborted with `apMatch.parseErrorFieldName is not a function`. Both callers are checked now.
+// ⚠ THESE GUARDS SCAN SOURCE, SO THEY MUST NOT SCAN PROSE (2026-08-19). Every one of them looks for
+// `<ns>.<name>` textually, and a comment EXPLAINING the trap — "apMatch.dateOrderOf would throw in the
+// browser" — reads identically to a call. That is not hypothetical: documenting the lockstep trap next
+// to a bare `cdpPageKey(...)` call failed this file, i.e. the guard punished the comment that exists to
+// stop the bug. Stripping comments is the same remedy the injected-fn guard and the iCIMS lockstep test
+// already use, and it makes these tests check CODE rather than spelling.
+const stripComments = (text) => String(text)
+  .replace(/\/\*[\s\S]*?\*\//g, " ")
+  .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+
 test("apMatch: every apMatch.X used in fill-driver.js AND background.js is present in the SW object literal", () => {
   const src = fs.readFileSync(path.join(ROOT, "fill-driver.js"), "utf8");
   const callers = ["fill-driver.js", "background.js"];
   const used = new Map(); // name → the file that calls it (for a message that names the culprit)
   for (const f of callers) {
-    const text = fs.readFileSync(path.join(ROOT, f), "utf8");
+    const text = stripComments(fs.readFileSync(path.join(ROOT, f), "utf8"));
     for (const m of text.matchAll(/\bapMatch\.([A-Za-z_$][\w$]*)/g)) if (!used.has(m[1])) used.set(m[1], f);
   }
   assert.ok(used.size > 3, `expected several apMatch.* uses, found ${used.size}`);
@@ -125,7 +135,7 @@ test("apMatch: everything the SW literal lists is actually exported by lib.js", 
 // found while wiring the signature-date recognizer, which lives in lib.js and was NOT in the literal.
 for (const [ns, from] of [["atsLib", "lib.js"], ["atsFd", "fill-driver.js"]]) {
   test(`${ns}: every ${ns}.X used in ats.js is present in the SW object literal`, () => {
-    const src = fs.readFileSync(path.join(ROOT, "ats.js"), "utf8");
+    const src = stripComments(fs.readFileSync(path.join(ROOT, "ats.js"), "utf8"));
     const used = new Set([...src.matchAll(new RegExp("\\b" + ns + "\\.([A-Za-z_$][\\w$]*)", "g"))].map((m) => m[1]));
     assert.ok(used.size > 2, `expected several ${ns}.* uses, found ${used.size}`);
     const decl = new RegExp("const " + ns + " = [\\s\\S]*?\\n\\s*: (\\{[\\s\\S]*?\\});").exec(src);

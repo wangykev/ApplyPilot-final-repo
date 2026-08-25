@@ -36,16 +36,16 @@ test("strip: null/empty are '' and never throw", () => {
   assert.strictEqual(gmail.gmailStripNonProse(""), "");
 });
 
-// ── gmailExtractVerificationCode ────────────────────────────────────────────────────────
+// ── gmailExtractAlnumCode ────────────────────────────────────────────────────────
 test("extract: the 8-char code next to the cue, at the exact length the form asked for", () => {
   const body = "Hi Kevin, your verification code is TQ7F2M9B. Enter it to submit your application.";
-  const r = gmail.gmailExtractVerificationCode(body, { length: 8 });
+  const r = gmail.gmailExtractAlnumCode(body, { length: 8 });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.code, "TQ7F2M9B");
 });
 
 test("extract: a code in the SUBJECT is found (the caller prepends it)", () => {
-  const r = gmail.gmailExtractVerificationCode("Your security code: 4KD9WQ2X\nOpen the application to continue.", { length: 8 });
+  const r = gmail.gmailExtractAlnumCode("Your security code: 4KD9WQ2X\nOpen the application to continue.", { length: 8 });
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.code, "4KD9WQ2X");
 });
@@ -57,51 +57,51 @@ test("extract: an HTML mail full of 8-char junk still yields exactly the code", 
     "<h2>WQ4T7YB2</h2>" +
     '<p><a href="https://click.greenhouse.io/f/a/PXQ99KLM/x/BB771A2C">View your application</a></p>' +
     "</td></tr></table></body></html>";
-  const r = gmail.gmailExtractVerificationCode(body, { length: 8 });
+  const r = gmail.gmailExtractAlnumCode(body, { length: 8 });
   assert.strictEqual(r.ok, true, JSON.stringify(r));
   assert.strictEqual(r.code, "WQ4T7YB2");
 });
 
 test("extract: REFUSES when two candidates sit at the same radius (never picks one)", () => {
   const body = "Your verification code is AAAA1111 or maybe BBBB2222, we are not sure.";
-  const r = gmail.gmailExtractVerificationCode(body, { length: 8 });
+  const r = gmail.gmailExtractAlnumCode(body, { length: 8 });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.reason, "ambiguous");
   assert.ok(r.candidates.length >= 2, JSON.stringify(r));
 });
 
 test("extract: no cue at all ⇒ no-cue, even when a perfectly-shaped token is present", () => {
-  const r = gmail.gmailExtractVerificationCode("Thanks for applying! Reference ABCD1234 for your records.", { length: 8 });
+  const r = gmail.gmailExtractAlnumCode("Thanks for applying! Reference ABCD1234 for your records.", { length: 8 });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.reason, "no-cue");
 });
 
 test("extract: a YYYYMMDD date stamp beside the cue is rejected by shape", () => {
   const body = "Your verification code was sent 20260824 and expires soon.";
-  const r = gmail.gmailExtractVerificationCode(body, { length: 8 });
+  const r = gmail.gmailExtractAlnumCode(body, { length: 8 });
   assert.strictEqual(r.ok, false, "a date stamp must never be returned as a code: " + JSON.stringify(r));
 });
 
 test("extract: an all-digit code IS accepted (only date-SHAPED runs are junk)", () => {
-  const r = gmail.gmailExtractVerificationCode("Your verification code is 90210417.", { length: 8 });
+  const r = gmail.gmailExtractAlnumCode("Your verification code is 90210417.", { length: 8 });
   assert.strictEqual(r.ok, true, JSON.stringify(r));
   assert.strictEqual(r.code, "90210417");
 });
 
 test("extract: a repeated-character run is styling filler, not a code", () => {
-  const r = gmail.gmailExtractVerificationCode("Your verification code is XXXXXXXX below.", { length: 8 });
+  const r = gmail.gmailExtractAlnumCode("Your verification code is XXXXXXXX below.", { length: 8 });
   assert.strictEqual(r.ok, false, JSON.stringify(r));
 });
 
 test("extract: the cue's OWN words are never offered as the code", () => {
   // "security" is exactly 8 characters and sits immediately beside every cue.
-  const r = gmail.gmailExtractVerificationCode("Enter your security code: 7HJ4KP2Q", { length: 8 });
+  const r = gmail.gmailExtractAlnumCode("Enter your security code: 7HJ4KP2Q", { length: 8 });
   assert.strictEqual(r.ok, true, JSON.stringify(r));
   assert.strictEqual(r.code, "7HJ4KP2Q");
 });
 
 test("extract: shape is a TIE-BREAK, not a matcher — two code-shaped candidates still refuse", () => {
-  const r = gmail.gmailExtractVerificationCode("Your verification code is AAAA1111, previously BBBB2222.", { length: 8 });
+  const r = gmail.gmailExtractAlnumCode("Your verification code is AAAA1111, previously BBBB2222.", { length: 8 });
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.reason, "ambiguous");
 });
@@ -109,7 +109,7 @@ test("extract: shape is a TIE-BREAK, not a matcher — two code-shaped candidate
 test("extract: two WORD-shaped candidates and nothing code-shaped also refuse", () => {
   // Two 8-character lower-case words, no digits and no caps anywhere ⇒ nothing to prefer, so it
   // escalates instead of guessing.
-  const r = gmail.gmailExtractVerificationCode("your verification code is elephant, continue reading", { length: 8 });
+  const r = gmail.gmailExtractAlnumCode("your verification code is elephant, continue reading", { length: 8 });
   assert.strictEqual(r.ok, false, JSON.stringify(r));
   assert.strictEqual(r.reason, "ambiguous");
 });
@@ -117,7 +117,7 @@ test("extract: two WORD-shaped candidates and nothing code-shaped also refuse", 
 test("extract: an English word of the code's length loses to the code beside it", () => {
   // "continue" is exactly 8 characters and sits right next to the cue. Before the shape tie-break
   // this refused a perfectly clear email as ambiguous.
-  const r = gmail.gmailExtractVerificationCode("Your verification code is 4KD9WQ2X, continue to submit.", { length: 8 });
+  const r = gmail.gmailExtractAlnumCode("Your verification code is 4KD9WQ2X, continue to submit.", { length: 8 });
   assert.strictEqual(r.ok, true, JSON.stringify(r));
   assert.strictEqual(r.code, "4KD9WQ2X");
   assert.strictEqual(r.shaped, true);
@@ -125,14 +125,14 @@ test("extract: an English word of the code's length loses to the code beside it"
 
 test("extract: LENGTH IS EXACT — an 8-box form does not accept a 6-char code", () => {
   const body = "Your verification code is AB12CD.";
-  assert.strictEqual(gmail.gmailExtractVerificationCode(body, { length: 8 }).ok, false);
-  const six = gmail.gmailExtractVerificationCode(body, { length: 6 });
+  assert.strictEqual(gmail.gmailExtractAlnumCode(body, { length: 8 }).ok, false);
+  const six = gmail.gmailExtractAlnumCode(body, { length: 6 });
   assert.strictEqual(six.ok, true);
   assert.strictEqual(six.code, "AB12CD");
 });
 
 test("extract: with no length given, 4-10 chars are accepted (the probe path)", () => {
-  const r = gmail.gmailExtractVerificationCode("Your verification code is AB12CD.");
+  const r = gmail.gmailExtractAlnumCode("Your verification code is AB12CD.");
   assert.strictEqual(r.ok, true);
   assert.strictEqual(r.code, "AB12CD");
 });
@@ -140,15 +140,15 @@ test("extract: with no length given, 4-10 chars are accepted (the probe path)", 
 test("extract: the module-level cue regex keeps no lastIndex between calls", () => {
   // A `g`-flagged module constant would make the SECOND call in a poll loop start mid-string.
   const body = "Your verification code is TQ7F2M9B. Enter it to submit.";
-  const a = gmail.gmailExtractVerificationCode(body, { length: 8 });
-  const b = gmail.gmailExtractVerificationCode(body, { length: 8 });
-  const c = gmail.gmailExtractVerificationCode(body, { length: 8 });
+  const a = gmail.gmailExtractAlnumCode(body, { length: 8 });
+  const b = gmail.gmailExtractAlnumCode(body, { length: 8 });
+  const c = gmail.gmailExtractAlnumCode(body, { length: 8 });
   assert.deepStrictEqual([a.code, b.code, c.code], ["TQ7F2M9B", "TQ7F2M9B", "TQ7F2M9B"]);
 });
 
 test("extract: empty body ⇒ a reason, never a throw", () => {
-  assert.strictEqual(gmail.gmailExtractVerificationCode("", { length: 8 }).reason, "empty-body");
-  assert.strictEqual(gmail.gmailExtractVerificationCode(null, { length: 8 }).reason, "empty-body");
+  assert.strictEqual(gmail.gmailExtractAlnumCode("", { length: 8 }).reason, "empty-body");
+  assert.strictEqual(gmail.gmailExtractAlnumCode(null, { length: 8 }).reason, "empty-body");
 });
 
 // ── gmailBuildCodeQuery ─────────────────────────────────────────────────────────────────
@@ -164,7 +164,7 @@ test("code query is SEPARATE from the Workday one (widening it must not touch Wo
   assert.ok(!gmail.gmailBuildCodeQuery("greenhouse.io").includes("myworkdayjobs"));
 });
 
-// ── gmailFindVerificationCode (injected fetch/sleep/now) ────────────────────────────────
+// ── gmailFindAlnumCode (injected fetch/sleep/now) ────────────────────────────────
 // A tiny Gmail double: `msgs` is [{ id, internalDate, subject, body }].
 function fakeGmail(msgs, opts) {
   const o = opts || {};
@@ -201,7 +201,7 @@ function fakeGmail(msgs, opts) {
 test("find: returns the code from a message newer than the submit click", async () => {
   const NOW = 1_700_000_000_000;
   const g = fakeGmail([{ id: "m1", internalDate: NOW + 2000, subject: "Verify", body: "Your verification code is TQ7F2M9B." }]);
-  const r = await gmail.gmailFindVerificationCode({
+  const r = await gmail.gmailFindAlnumCode({
     token: "t", length: 8, notBeforeMs: NOW, timeoutMs: 30000, pollMs: 100,
     fetchImpl: g.fetchImpl, nowImpl: () => NOW, sleepImpl: async () => {},
   });
@@ -215,7 +215,7 @@ test("find: A CODE PREDATING OUR OWN CLICK IS SKIPPED — the guard that stops u
   // A perfectly good code, but mailed for an EARLIER attempt (10 minutes before we clicked).
   const g = fakeGmail([{ id: "old", internalDate: NOW - 600_000, subject: "Verify", body: "Your verification code is OLDCODE1." }]);
   let slept = 0;
-  const r = await gmail.gmailFindVerificationCode({
+  const r = await gmail.gmailFindAlnumCode({
     token: "t", length: 8, notBeforeMs: NOW, timeoutMs: 400, pollMs: 100,
     fetchImpl: g.fetchImpl, nowImpl: () => NOW + slept, sleepImpl: async (ms) => { slept += ms; },
   });
@@ -230,7 +230,7 @@ test("find: the skew window accepts a code marginally 'older' than our click", a
   const NOW = 1_700_000_000_000;
   // 20s before our click — inside the default 60s clock-skew allowance.
   const g = fakeGmail([{ id: "m1", internalDate: NOW - 20_000, subject: "Verify", body: "Your verification code is TQ7F2M9B." }]);
-  const r = await gmail.gmailFindVerificationCode({
+  const r = await gmail.gmailFindAlnumCode({
     token: "t", length: 8, notBeforeMs: NOW, timeoutMs: 5000, pollMs: 100,
     fetchImpl: g.fetchImpl, nowImpl: () => NOW, sleepImpl: async () => {},
   });
@@ -246,7 +246,7 @@ test("find: a sender filter that matches nothing WIDENS once, loudly, and then s
   );
   let slept = 0;
   const logs = [];
-  const r = await gmail.gmailFindVerificationCode({
+  const r = await gmail.gmailFindAlnumCode({
     token: "t", length: 8, senderContains: "greenhouse.io", notBeforeMs: NOW,
     timeoutMs: 1000, pollMs: 100, log: (m) => logs.push(m),
     fetchImpl: g.fetchImpl, nowImpl: () => NOW + slept, sleepImpl: async (ms) => { slept += ms; },
@@ -261,7 +261,7 @@ test("find: a sender filter that matches nothing WIDENS once, loudly, and then s
 test("find: a 401 bubbles up immediately for a token refresh (polling cannot fix auth)", async () => {
   const NOW = 1_700_000_000_000;
   const g = fakeGmail([], { status: 401 });
-  const r = await gmail.gmailFindVerificationCode({
+  const r = await gmail.gmailFindAlnumCode({
     token: "t", length: 8, notBeforeMs: NOW, timeoutMs: 30000, pollMs: 100,
     fetchImpl: g.fetchImpl, nowImpl: () => NOW, sleepImpl: async () => {},
   });
@@ -274,7 +274,7 @@ test("find: a fresh mail we cannot read a code from is reported as SUCH, not as 
   const NOW = 1_700_000_000_000;
   const g = fakeGmail([{ id: "m1", internalDate: NOW + 1000, subject: "Thanks", body: "Thanks for applying. Nothing code-shaped here." }]);
   let slept = 0;
-  const r = await gmail.gmailFindVerificationCode({
+  const r = await gmail.gmailFindAlnumCode({
     token: "t", length: 8, notBeforeMs: NOW, timeoutMs: 400, pollMs: 100,
     fetchImpl: g.fetchImpl, nowImpl: () => NOW + slept, sleepImpl: async (ms) => { slept += ms; },
   });
@@ -284,8 +284,8 @@ test("find: a fresh mail we cannot read a code from is reported as SUCH, not as 
 });
 
 test("find: no token / no fetch ⇒ a normalized error, never a throw", async () => {
-  assert.strictEqual((await gmail.gmailFindVerificationCode({ fetchImpl: async () => ({}) })).ok, false);
-  assert.strictEqual((await gmail.gmailFindVerificationCode({ token: "t", fetchImpl: null, nowImpl: () => 0 })).ok, false);
+  assert.strictEqual((await gmail.gmailFindAlnumCode({ fetchImpl: async () => ({}) })).ok, false);
+  assert.strictEqual((await gmail.gmailFindAlnumCode({ token: "t", fetchImpl: null, nowImpl: () => 0 })).ok, false);
 });
 
 // ── the injected widget fns ─────────────────────────────────────────────────────────────
@@ -484,7 +484,7 @@ test("both new injected fns are self-contained (stringify → new Function parse
     // explanation rather than a real reference — the same trap CLAUDE.md records for the iCIMS
     // select readers.
     const code = src.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:])\/\/[^\n]*/g, "$1 ");
-    for (const other of ["atsLib", "atsFd", "ATS_STATIC_MAPS", "atsRouteField", "atsRouteLabel", "atsInjSubmitState", "gmailFindVerificationCode"]) {
+    for (const other of ["atsLib", "atsFd", "ATS_STATIC_MAPS", "atsRouteField", "atsRouteLabel", "atsInjSubmitState", "gmailFindAlnumCode"]) {
       assert.ok(!code.includes(other), name + " references " + other + " (not self-contained in the page)");
     }
   }

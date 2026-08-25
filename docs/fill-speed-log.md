@@ -1721,6 +1721,1009 @@ one, the fill-loop number is provider variance.
 `[N signature read(s) costing Xms; Y s of this wait was OURS, proving quiet]`. Reading a total as the
 server's time is how an 8.6s probe cost went unnoticed for a day.
 
+
+## Round 13 — Oracle Recruiting Cloud: 100s → 38.5s (2026-08-20)
+
+Operator target: the whole form in ~30s, each page ~6s, "page 2 maybe taking longer". Same tenant
+and posting throughout (`eeho.fa.us2.oraclecloud.com` job 334325), each run on a fresh account.
+
+| | before | after |
+|---|---|---|
+| step 1 (Personal Info) | ~10s | **5.9s** |
+| step 2 (Experience) | ~40–96s | **19.1s** |
+| step 3 (More About You) | ~13s | **5.3s** |
+| **page fill total** | | **30.3s** |
+| **run total** | **~100s** | **38.5s** (45 fields, 856ms/field) |
+| `work_experience[N].startDate` | ~11s ×3 | **~1.09s ×3** |
+| `work_experience[N].endDate` | ~2s ×3 | **~1.07s ×3** |
+| `education[0].educationalEstablishment` | ~17s | **1.3s** |
+
+### ⚠ FIRST: THROW AWAY THE CONTAMINATED RUN
+
+One run took 641.5s at 13.9s/field with `employerName` at 12908ms and `fullName` at 11325ms —
+plain text writes that cost ~30ms when the browser is healthy. Chrome's renderer was wedging
+(screenshots timing out while `Runtime.evaluate` still answered). Optimising from those numbers
+would have sent the whole round at the wrong fields. **A per-field table is only usable once the
+cheapest fields in it look cheap.**
+
+### The finding: `startDate` cost ~11s and `endDate` ~2s — same widget, same code
+
+The only difference is that `startDate` is the first picker touched in a freshly-created entry
+form. Three causes, one insight — **an open that did not register must be RE-CLICKED, not waited
+out**:
+
+1. **Two opens per half.** The date pair CAPTURED each half's options (open → poll → Escape) and
+   then PICKED it (open → type → Enter). The operator spotted it unprompted: *"it opens the
+   dropdown before going back and filling it when it could definitely fill it just once."*
+   `atsInjOrcPickFromOwnList` opens once, classifies from the rows in front of it, and commits.
+   Classification is still per-half and still evidence-based — a tenant rendering year-then-month
+   is still handled — it just no longer costs a second visit.
+2. **A dead open was waited out for the full 8s budget.** ORC's combobox is sometimes not wired
+   when the first click lands; the capture then polled 8s for rows that were never coming, and only
+   a retry's second click worked. Both the fused primitive and `atsInjOrcPick` now re-click at
+   ~700ms and ~1400ms. This is also the operator's *"sometimes it lags and I need to click the page
+   to get it to keep going"* — without the re-click the run sits in a poll on a picker that never
+   opened, and the human's click is what finally wires it. **The School picker's 17s → 1.3s is
+   entirely this.**
+3. **Poll granularity, not widget speed.** The yes/no read-back at 10 × 200ms plus a CDP round-trip
+   each meant a late flip paid the WHOLE loop — 5227ms and 3378ms on commits that had already
+   succeeded. 24 × 120ms exits at the first agreeing read.
+
+### ⚠ Two mistakes worth keeping
+
+- **Fusing the visits was right; changing the commit with it was not.** The first fused version
+  clicked the matching row with a full pointer sequence and ORC ignored it — every date came back
+  `commit-not-accepted … got nothing`. This widget commits by TYPING the value and pressing ENTER
+  on the input, which `atsInjOrcPick` had always done. Two changes rode in on one commit and only a
+  live run could separate them.
+- **`act.delay` is not a settle.** The yes/no poll was first written with `act.delay`, the ADAPTIVE
+  pace, which collapses to ~15ms on a visible tab: a loop written as "10 × 150ms" finished in 196ms
+  and reported both required fields unfilled. `act.delayFull` is wall clock. Same trap this file
+  already records for Workday's settles, and the test that passed alongside the bug only checked
+  that a loop existed.
+
+### And a retry that fired every time is a missing pace
+
+After the fusion, `startDate` still cost ~4.1s on every entry (4108/4181/4168ms) against
+`endDate`'s ~0.8s (809/834/795ms) — the retry firing *systematically*, not occasionally.
+Committing the first half re-renders the widget and the second half's open lands mid-render.
+Waiting 250ms between halves is cheaper than spending a failed attempt plus a 400ms recovery pace
+to rediscover it on every entry. Result: all six halves at ~1.07s, retry idle.
+
+### What is left
+
+Page fill is 30.3s and the run is 38.5s, so ~8.2s sits in the three step transitions (Next click +
+advance poll + `waitAtsFormReady` + the block-population settle). Step 3's AI call is ~8s of
+provider latency inside its 5.3s–13.2s spread — one call, and the standing rule applies: **a slow
+page is the LLM until proven otherwise.** The block settle can spend up to 15s, but only when a
+block genuinely never populates; it did not fire on this run.
+
+
+## Round 14 — ORC hidden vs visible, and the lag's actual cause (2026-08-20)
+
+### The lag was the SERVICE WORKER'S CLOCK, and the operator's workaround proved it
+
+Reported as: *"the fill including the onboarding will just lag at seemingly random times and to fix
+it I need to click the page once and it goes back to filling fast."* Measured on a **freshly
+restarted** Chrome, so not a tired browser:
+
+```
+⚠ a 700ms pace took 3322ms (sw) — overran by 2622ms
+⚠ a 150ms pace took 2436ms (sw) — overran by 2286ms
+⚠ an  80ms pace took 1226ms (sw) — overran by 1146ms
+```
+
+MV3 deprioritises a background worker's timers, and a real click restores focus, which un-throttles
+them. That is *why the lag looked random*: it tracked window focus, not the form.
+
+⚠ **`cdpSetPageClock` already existed for this and the `ats.js` path never called it.** The Workday
+fill and replay walks turn it on; Greenhouse, Lever, Ashby, iCIMS and Oracle had been pacing on the
+starved clock since that path was written. The fix is one unconditional line in the shared entry
+point (plus the submit run), not a new mechanism.
+
+**Scope:** GH / Lever / Ashby / Oracle get it. **iCIMS is inert by design** — it passes
+`noWorkerTimers: true` so its invisible hCaptcha can initialise, so `_workerTimersActive` is false
+and `cdpDelay` takes the SW branch itself. iCIMS keeps its own `cdpSetFastWhenHidden` compensation.
+
+**Why it cannot be worse than before:** `cdpDelay` races the page sleep against an SW timeout
+(`page-abandoned`, costing `want + slack`) and finishes the remainder on the SW clock if the context
+is destroyed (`sw-fallback`).
+
+### Hidden vs visible, back-to-back on the same form state
+
+| | hidden | visible |
+|---|---|---|
+| pacing label | `hidden-fast (worker timers)` | `visible-fast` |
+| step 1 · 2 · 3 | 6.3s · 2.3s · 11.2s | 5.9s · 1.6s · 9.1s |
+| total | **28.3s** (30 fields, 944ms/f) | **25.0s** (29 fields, 860ms/f) |
+| walk | `reached-final-step`, nothing pressed | same |
+
+**Hidden is within 13% of visible** — the first measurement showing the page clock and the
+worker-timer polyfill compose. A hidden tab's own page timers quantize to ~1Hz; blob-worker timers
+do not, which is precisely what the polyfill exists for.
+
+⚠ Contrast with iCIMS round 11–12, where hidden was 2.24× visible and the gap was per-field page
+contact. Do not carry that conclusion here: ORC pays its cost in picker round-trips, not in throttled
+page reactions.
+
+### ⚠ The cost of a poll is the NUMBER of SW awaits, not their length
+
+Shortening the polls (300→150ms, 150→80ms) bought **nothing**, because on a starved clock an 80ms
+request costs ~1.2s regardless. The timestamp deltas inside step 2 showed the real shape: gaps of
+**5067ms, 3200ms and 1701ms** between an entry form's discovery read and its first *20ms* text write
+— entirely inside "has the form appeared yet". So the long settles moved INTO injected functions
+(entry open, entry commit, date read-back): one `cdpEval` with a real page-side loop instead of ~28
+starved worker awaits.
+
+### ⚠⚠ AN ITERATION COUNT IS NOT A BUDGET — this bit three times in one day
+
+The yes/no read-back, in order:
+
+1. one read after a fixed 150ms → too early, both required fields unfilled;
+2. 10 × 150ms on `act.delay` → the **adaptive** pace collapses to ~15ms on a visible tab, so the
+   "1.5s" poll finished in **196ms**;
+3. 24 × 120ms on `delayFull` → each pace really cost ~500ms on the **starved** clock, so it
+   accidentally waited ~5s and PASSED. Turning the page clock on made the paces honest, the same 24
+   iterations became ~2.9s, and both fields went blank again.
+
+**A deadline does not care which clock is underneath it.** Every proxy for time breaks when the clock
+beneath it changes.
+
+### ⚠ ORC's pill IGNORES THE FIRST PRESS, reliably
+
+Both deterministic yes/no questions reported `took 2 press(es) — the first did not register` on
+**every** run once the press count was recorded, hidden and visible. So the re-press is load-bearing,
+not a rare safety net. It is gated on the read-back still showing NOTHING pressed — on a toggle a
+blind second press would un-press what the first one set.
+
+### ⚠ And the hidden run caught a bug the press count made obvious
+
+Both deterministic questions landed with 2 presses while the AI-answered one on the SAME page came
+back `needs_review` seconds later. Not the widget and not the answer: only the deterministic rung had
+the deadline-and-re-press logic, while the AI choice commit and the EEO decline path still did one
+click plus a short read. **Which rung answers a question must not decide whether the answer sticks.**
+There is now one `atsCommitYesNo` for all three sites, and a test that counts direct
+`atsInjClickYesNo` calls — exactly two are allowed, both inside the helper.
+
+### Still open
+
+`atsPageClock` is a flag (default ON) because one run showed step 2 at 8.2s and a later one showed a
+plain text write at 13.1s. Page-clock pacing turns every pace into a `Runtime.evaluate`, so a very
+busy renderer could hand its own slowness to the paces — indistinguishable from machine load on a
+machine that costs 13s for a text write. One run each way on an idle machine settles it.
+
+## Round 15 — ORC 630s fill: the page clock cannot beat a starved worker (2026-08-20)
+
+**Measurement.** ORC fill, tab VISIBLE, `worker-timers ON`, page clock ON (default):
+630.7s for 45 fields across 3 steps = 14016ms/field. Step 3 alone 224.3s for 10 fields. Slowest:
+an unmapped question 39.4s, then `work_experience[0].employerName` **15.6s — a plain text write**.
+
+**The decisive datum is the pace `via`, not the duration.** All 16 logged overruns were
+`page-abandoned`; zero `page`, zero `sw`. That label had always read as "the page did not answer",
+and it sent the first pass of this diagnosis at the renderer.
+
+It is the opposite. The abandon ceiling is `setTimeout(want + PAGE_SLEEP_SLACK_MS)` — for a 120ms
+pace it is due at **1620ms** and it fired at **10883ms**. Our own watchdog was **9.3s late** (worst
+observed ~11.5s). The worker was starved; the page is not implicated by any of this evidence.
+
+**Why the page clock cannot fix it, structurally.** Both arms of the race are worker-scheduled — the
+ceiling `setTimeout`, *and* resuming the `await` when the CDP reply lands. A starved worker therefore
+loses the race every time, and the pace costs whatever the starvation cost, whichever arm "wins".
+cdp.js already said this for ONBOARDING ("the abandon ceiling is itself an SW timer") as a reason to
+keep the page clock OFF during navigation; this round shows the same failure on the **FILL** path,
+which is exactly where the page clock was supposed to be the answer. **The page clock only helps when
+the worker is healthy and the PAGE's timers are throttled — the hidden-tab case. It does nothing for
+a starved worker on a visible tab.**
+
+**16 overruns cannot account for 630s.** Only overruns >1000ms are logged, so the bulk is many
+sub-second overruns: starvation here is *pervasive*, not spiky.
+
+**Confound, stated rather than hidden:** the run was polled continuously from automation (screenshots
++ JS in sibling tabs) for its whole duration, which plausibly contributed to starving the worker. A
+clean re-run with nothing polling is needed to quantify. The `atsPageClock` A/B still has never run on
+an idle machine.
+
+**Changes made (this round):**
+- `cdpDelay` compares the ceiling against its OWN due time: >250ms late ⇒ `sw-starved`, and the log
+  says the page clock cannot help and that fewer awaits is the lever. No ambiguous middle to tune —
+  a healthy worker fires within a few ms, the starved case overshoots by seconds.
+- Per-run pace stats (`cdpPaceStats` / `cdpPaceSummary`) print with the `[ATS-TIME]` summary, so any
+  run states its own pacing health instead of needing a hand diagnosis from `[PACE]` lines.
+
+**Direction, unchanged by this round and reinforced by it: REDUCE THE NUMBER OF AWAITS.** That is the
+only lever measured to work against worker starvation (the entry-open fix: 28 starved SW awaits → 1
+page-side wait). A different clock cannot help while the worker owns the resumption.
+
+## Round 16 — ORC: the gate→fill pause is SW STARVATION, and BOTH pre-measurement theories were wrong (2026-08-21)
+
+**The report (operator).** *"After the sign in it seems to take the form a long time before it actually
+starts to fill out the page. After it puts the code in and presses enter, the page renders quite
+quickly, but it waits a long time before actually filling."*
+
+### The window, and why it had never been attributed
+
+Between "Verify pressed" and the first value written there are five sequential settles, and four of
+them could spend their whole budget while printing NOTHING: `waitForChange` after Verify (20s),
+the `view=none` settle (20s), `waitAtsFormReady` (25s), `orcAwaitBlocksPopulated` (15s) and
+`atsCaptureOrcOptions` (8s per picker). **A settle whose duration is invisible can be neither ruled in
+nor out**, which is why "a long time" had never been pinned on any of them. All five are timed now.
+
+### ⚠⚠ MEASURED, AND IT KILLED BOTH THEORIES I HELD BEFORE MEASURING
+
+Four live runs on `eeho.fa.us2.oraclecloud.com` (Oracle's own careers site), tab VISIBLE, page clock ON:
+
+| | run 1 unattended | run 2 **operator present** | run 4 unattended |
+|---|---|---|---|
+| gate → first field | **34.4s** | **7.8s** | **45.1s** |
+| form settle | 27.1s / 3 polls | 6.4s / 4 polls | 8.5s / 6 polls |
+| press Verify | ~14.5s | 0.8s | — |
+| page change after Verify | 13.0s | 0.7s | 0.7s |
+| option capture (`title`) | 7.2s (6.6s) | 1.3s | 1.3s |
+| `atsInjScan` in pre-fill prep | **0.0s** | 0.0s | **13.6s** |
+
+**Theory 1, REFUTED: "the block settle pays its 15s budget."** Measured **0.0s** — all visible blocks
+populated, every run. The 2026-08-19 observation of a block empty at its full budget was step 3, not
+the step this complaint is about.
+
+**Theory 2, REFUTED: "the field count churns, so the 3-equal-reads bar never trips and the 25s ceiling
+is paid."** It never timed out — it settled on 3 clean reads. The recommended cut (an 8s ceiling for
+oracle) **would have severed a legitimate settle**, and not shipping it unmeasured is the only reason
+it did not.
+
+**Theory 3, ALSO REFUTED (mine, mid-diagnosis): "ORC's renderer is jammed for ~25s after the route
+transition."** Killed by the same `atsInjScan` costing **0.0s** in one run and **13.6s** in another,
+and by run 2 being uniformly fast across phases with nothing in common.
+
+### The actual cause — and the codebase already had the instrument
+
+`cdpDelay`'s always-on verdict, on the unattended runs:
+
+```
+[PACE] a  450ms pace took  3898ms (sw-starved) — OUR OWN abandon ceiling was 1948ms late
+[PACE] a  700ms pace took  9221ms (sw-starved) — OUR OWN abandon ceiling was 7021ms late
+[PACE] a  700ms pace took 10161ms (sw-starved) — OUR OWN abandon ceiling was 7961ms late
+```
+
+**MV3 service-worker timer starvation — our own watchdog 7–9s late.** Not ORC, not the renderer, not
+the scan. Same cause as round 15's 630s fill, in a phase nobody had timed. The operator's own
+workaround (*"click the page once and it goes back to filling fast"*) is run 2: **their presence is
+what un-starves the worker**, and it is worth ~5× per round-trip.
+
+### ⚠ THE GAP IS A MULTIPLIER ON AWAIT COUNT, NOT A CONSTANT
+
+Per-await cost: run 1 ≈ 27.1s / ~7 awaits ≈ **3.9s**; run 2 ≈ 6.4s / ~9 awaits ≈ **0.7s**. Total =
+awaits × penalty, so **cutting awaits shrinks the attended/unattended GAP linearly**, not just the
+absolute time. That is why round 15's "reduce the number of awaits" is the lever, and it is the answer
+to the operator's goal (*"eventually attended and unattended should fill in the same amount of time"*).
+
+⛔ **Not on the table: synthesizing user gestures** to win Chrome's power-management heuristic. Fewer
+awaits reaches the same place without fighting the platform.
+
+### ⚠⚠ AND THE NOISE EXCEEDS THE SIGNAL — n=1 CANNOT VALIDATE A FIX HERE
+
+Two UNATTENDED runs of the same phase measured **27.1s and 8.5s**. So the scan-reuse fix below (one
+fewer round-trip per settle) is **NOT claimed as a speed win**: run 4's total was *worse* than run 1's
+while its settle was better, and 21.7s of run 4 landed between the settle and the block check — about
+two evals. **Any future ORC pacing claim needs several runs per arm, all unattended.** A single
+before/after pair here is indistinguishable from luck.
+
+### Changes this round
+
+- **Five phases now timed** (behaviour unchanged): `waitAtsFormReady` reports `waitedMs`/`polls` and
+  whether the count ever held still; `orcAwaitBlocksPopulated` reports its cost on BOTH paths;
+  `atsCaptureOrcOptions` reports per-picker ms and flags one that paid its full budget capturing
+  nothing; `driveAtsPageFill` reports `pre-fill prep`; and one total, `gate cleared → step 1 fill
+  begins`.
+- **`waitAtsFormReady` reuses the scan it already has** instead of re-fetching it on the settle path
+  (and on the timeout path). One fewer await per settle, on every ATS. Also **more correct**: the
+  re-fetch identified the page from a different read than the one whose count was just proven stable.
+- **A rejected ORC auth step now BACKS OFF** — see below.
+
+### ⚠ A SECOND BUG THIS TESTING EXPOSED: a 7× auth resubmit storm
+
+Run 3 halted `auth-rounds-exhausted`, and the page's own words were in the log:
+
+```
+Failed to lock the record in table IRC_ACCESS_TOKENS with key
+oracle.jbo.Key[302968642375867], another user holds the lock.
+```
+
+An Oracle row lock on the candidate's token record — the previous run's session still holding it.
+**We re-submitted the email step SEVEN times in five seconds.** Why it went unnoticed: each rejection
+re-renders the field under a new volatile id (`#primary-email-1` → `-2` → `-4` → `-6`, ORC's
+render-assignment counter), so `atsSignatureChanged` sees fresh ids and reports "the page changed",
+which the loop read as PROGRESS. **A changed page is not an advanced page**, and nothing was checking
+the VIEW.
+
+⚠ **The error is TRANSIENT** (operator) — it shows briefly and clears. So halting on first sight would
+fail a flow that recovers on its own; the fault was re-submitting at 0.7s intervals, because a lock
+needs TIME, and hammering someone else's auth endpoint is not ours to do regardless. Now: growing
+backoff (5s/10s/15s), then a halt quoting Oracle's own message instead of the generic "the flow is
+looping". Deliberately narrow — it engages only when the SAME auth view repeats AND the page carries
+an error, so every previously-working path is byte-identical.
+
+**Testing note:** three applications on one candidate account inside twenty minutes is what produced
+the lock. Space ORC runs out, or use a different account.
+
+### ⚠⚠ WHY IT NEVER SHOWED ON WORKDAY — the PREDICATE, not the tenant (answered 2026-08-21)
+
+The operator asked: *"is there any way to prevent this starvation, I don't recall it happening on
+workday."* It DOES happen there — it is their own 2026-08-20 report, quoted in background.js: *"the
+fill including the onboarding will just lag at seemingly random times and to fix it I need to click the
+page once."* That is what `cdpSetPageClock` was built for. But there is also a real structural reason
+ORC showed it and Workday hid it:
+
+| | predicate | under starvation |
+|---|---|---|
+| Workday `awaitFieldSetSettled` | `now - lastChangeAt >= 1200ms` — **TIME** | wall-clock elapses anyway ⇒ settles in FEWER polls. **Self-limiting.** |
+| ats.js `waitAtsFormReady` | `stable >= 2` — **THREE EQUAL READS** | must still pay 3 round-trips × ~8s = 24s. **Amplifies linearly.** |
+
+**A count floor is the one shape this repo already forbids.** From the audit of all 59 wall-clock poll
+loops: *"a wait that timed out wants a bigger BUDGET; never add an attempts floor"*, because for a
+STABILITY predicate **sparse reads are STRONGER evidence** — two reads 8s apart prove more than three
+450ms apart. `stable >= 2` was exactly that floor.
+
+**Fixed:** `waitAtsFormReady` now settles on a QUIET WINDOW (`NO_CHANGE_MS = 1200`, Workday's number)
+plus ≥2 agreeing reads plus the original ≥2500ms floor. Healthy worker: unchanged ~2.5s (the 2500ms
+floor governs). Starved: **2 reads instead of 3+**. The Ashby lesson that earned the old floor is
+preserved by the half that was load-bearing — two reads *450ms apart* accepted a form still mounting,
+so what was needed was a longer GAP, not more samples, and 1200ms of quiet is stricter than 2×450ms.
+
+### Can the starvation itself be PREVENTED? Not reliably — and here is why the page clock cannot
+
+`cdpDelay` races an SW `setTimeout(want+1500)` against `cdpPageSleep(want)`. Measured, the ceiling
+fired **7961ms late and STILL WON**, so the page arm's reply was later still. Both arms need the worker
+SCHEDULED to resume — the page arm is an I/O completion rather than a timer, but it is the same starved
+thread. The worker was not running at all for ~8-10s. That is Chrome deprioritising the whole extension
+service worker while Chrome is not the foreground OS window, which is exactly why a click cures it.
+
+Ruled out, with reasons:
+- **`chrome.windows.update({focused:true})`** — works, and steals the operator's OS focus mid-run.
+- **A keep-alive `setInterval` in the worker** — the interval IS the thing being starved.
+- **Synthesized user gestures** to fake presence — fighting the platform; breaks unpredictably.
+- **`chrome.alarms`** — 30s minimum, far too coarse for a 450ms pace.
+
+**Unexplored candidate, NOT a recommendation:** an offscreen document with silent audio
+(`chrome.offscreen`, `reasons:["AUDIO_PLAYBACK"]`) — Chrome exempts audible contexts from throttling,
+so moving the pacing there MIGHT keep it scheduled. Needs the `offscreen` permission (absent from the
+manifest today), may only address worker TERMINATION rather than SCHEDULING, and adds an audio
+indicator. Untested; do not cite it as a fix.
+
+**So the realistic answer is round 15's: you do not prevent it, you stop paying it repeatedly.** Cut
+worker round-trips, and prefer TIMED predicates over COUNTED ones so the remaining waits degrade
+gracefully instead of multiplying.
+
+### Next
+
+The lever is **fewer awaits**, and the biggest one in this window is `waitAtsFormReady`'s poll loop:
+3 stability reads + 2 SW sleeps + a submit-state read = ~6 worker awaits, replaceable by ONE
+page-side poll (round 15's entry-open fix: 28 starved awaits → 1). Viable on ORC because
+`cdpInstallPageOverrides` gives the page worker-backed timers — which is why
+`atsInjOrcCaptureOptions` already does page-side `await setTimeout` successfully; the recon's "page
+timers were not firing" 45s failures were raw recon WITHOUT those overrides. **Verify that assumption
+explicitly before relying on it**, and measure with several runs per arm.
+
+
+## Round 17 — the timed settle, live x3 unattended: NO REGRESSION, but the fix is NOT DEMONSTRATED (2026-08-21)
+
+Three unattended ORC runs on `eeho`, build `orc-timedsettle-1`, fresh requisitions, operator away.
+
+| run | req | form settle | polls | `gate → step 1` | `sw-starved` paces |
+|---|---|---|---|---|---|
+| 1 | 333297 | 2.8s | 5 | **2.8s** | 0 |
+| 2 | 343709 | 4.1s | 5 | **6.9s** | 0 |
+| 3 (deliberate CPU load) | 340692 | 2.8s | 7 | **2.8s** | **5** |
+
+All three walked 3/3 steps to `reached-final-step` with NOTHING pressed.
+
+### ⚠⚠ WHAT THIS DOES NOT SHOW — the fix's mechanism never engaged
+
+Against the round-16 baseline (same tenant, unattended, old build) of **34.4s** and **45.1s**, these
+look like a 5-15x win. **Do not record it as one.** The fix makes a STARVED settle finish in 2 reads
+instead of 3+; every run here took **5-7 reads at ~400-800ms each**, i.e. the worker was HEALTHY during
+the settle and the count floor was never the binding constraint. The improvement is therefore
+attributable to READ LATENCY, which my change does not touch, and not to the predicate.
+
+Round 3 is the sharpest evidence for that reading: it logged **5 `sw-starved` paces** — the worker
+genuinely was starved during that run — and still settled in 2.8s over 7 polls, because **starvation is
+BURSTY and simply did not land on the settle window.**
+
+### ⚠ THE REVISED HEADLINE: 27s IS A BURST, NOT THE TYPICAL CASE
+
+Round 16 reported 27.1s / 34.4s and framed it as what an unattended run costs. Three attempts could not
+reproduce a starved settle: **typical unattended `gate → first field` is ~3-7s.** The operator's
+instinct on being shown the 27.1s figure — *"it definitely did not take 27 secs to settle"* — was right
+about the typical case, and round 16's framing over-generalised from two unlucky runs. Both readings
+are true and they answer different questions: the tail is real and awful, the median is fine.
+
+Plausible reason the baseline runs were so much worse: the machine was under repeated `npm test` /
+`eslint` / Next-dev compilation between those runs, and starvation tracks machine pressure as well as
+Chrome's foreground state. Stated as a confound, not a conclusion — it was not controlled.
+
+### What IS established
+
+- **No regression from the timed predicate.** 3/3 complete walks; settle 2.8-4.1s, governed by the
+  unchanged ≥2500ms floor exactly as designed on a healthy worker.
+- **Starvation is bursty and phase-agnostic** — it hits whatever happens to be running (round 3 had 5
+  starved paces and a fast settle; round 16 run 4 had a 13.6s `atsInjScan` and a fast settle).
+- **The tail, not the median, is the problem.** Which is an argument FOR the fewer-awaits direction and
+  AGAINST tuning any single phase: you cannot predict which phase the burst will land on.
+
+### To actually validate the predicate change
+
+It needs a settle that occurs DURING a burst, and three attempts did not produce one. Either many more
+runs, or a way to force starvation on demand that does not change the regime (a hidden tab is NOT it —
+that is the worker-timer-polyfill path, a different mechanism). Until then the change stands on the
+structural argument (it removes an attempts floor the repo's own 59-loop audit forbids, and matches
+Workday's starvation-tolerant predicate) plus a no-regression result — **not on a measured win.**
+
+
+## Round 18 — ⚠⚠ STARVATION COSTS **COVERAGE**, NOT ONLY LATENCY (live, 2026-08-21)
+
+**This overturns a standing claim.** CLAUDE.md and round 15 both say drift costs *"LATENCY, not
+coverage"*, on the strength of an audit of all 59 wall-clock poll loops: every run-path one watches a
+MONOTONE predicate (noticeable late, never missed) or a STABILITY one (sparse reads are stronger
+evidence). **The ORC date picker is a counterexample and the audit's reasoning does not cover it.**
+
+### The measurement — three unattended runs, one variable
+
+| run | req | `sw-starved` paces | step 2 outcome |
+|---|---|---|---|
+| 1 | 333297 | 0 | 29 fields, **0 to review** — both Experience entries committed |
+| 2 | 343709 | 0 | 29 fields, **0 to review** — both committed |
+| 3 | 340692 | **5** (deliberate CPU load) | 25 fields, 1 to review — **date failed, entry 2 LOST** |
+
+Run 3's chain, from its own log:
+
+```
+work_experience[1].endDate → needs_review · commit-not-accepted · after "2026" · 7065ms
+    · Oracle did not accept 5/2026 — got 2026 (filter-did-not-narrow)
+⛔ Experience entry 2: pressed "Add Experience" but the entry form stayed open — Oracle is
+   refusing it, usually a required entry field we could not answer
+```
+
+`5/2026` is the SAME value entry 1 committed successfully in 794ms on the same run. Under load the
+month half spent its whole 7s budget and never saw the list narrow.
+
+### Why the audit's reasoning does not apply here
+
+A monotone predicate can only be noticed LATE. A stability predicate is only STRENGTHENED by sparse
+reads. **This widget's filter is neither:** it must narrow *in response to a keystroke sequence WE
+pace*, so if our pacing stretches, the widget never receives a coherent sequence and the condition
+never becomes true at all. There is no later read that would have caught it — the event we were
+waiting for was one our own lateness prevented.
+
+### The cascade — one root cause, three symptoms
+
+1. month filter does not narrow ⇒ the picker correctly **REFUSES to press** (the documented guard:
+   pressing an unfiltered list commits a month nobody asked for);
+2. so `endDate` is year-only ⇒ **Oracle rejects the whole entry commit** (it wants a complete date);
+3. so Experience entry 2 never persists ⇒ the rehearsal's `reportOnly` pass finds **1 tile for a
+   2-entry bundle** ⇒ 4 × *"approved value has NO matching field on the live form"* ⇒ `verify-failed`.
+
+**Every layer reported honestly** — the date flagged `needs_review`, the entry refusal logged loudly,
+review showed "End Date", the gate refused the submit. Nothing wrong reached the form. But the operator
+saw it as *"the rehearsal did not add experience"*, three steps downstream of the cause.
+
+### ⚠ AND IT INVALIDATES `reportOnly`'s PREMISE
+
+That branch does nothing on purpose, justified as: *"ORC saves entries to the candidate profile
+server-side, so the tiles the fill created are still on the form."* **Measured false** — a fill can
+leave FEWER tiles than the bundle has entries, because an entry Oracle refused never persisted. So the
+replay needs to either grow the missing entries from the bundle (growth-only, never delete — the fix
+iCIMS already carries, and the ORC log line *already claims* "the form will be grown to fit") or fail
+with that specific diagnosis instead of a generic per-field "no matching field".
+
+### Consequence for priorities
+
+Fewer awaits is no longer only a speed lever on this tenant — it is a **correctness** lever. And the
+audit line in CLAUDE.md needs qualifying: it holds for monotone and stability predicates, and NOT for a
+poll whose condition depends on pacing the page's own input handling.
+
+### ✔ AND THE END-TO-END PASSES ON AN UNSTARVED FILL (same session)
+
+Rehearsal on run 1's application (req 333297), `arm:false`:
+
+```
+Experience: 3 entries on the form — all 3 verified from the DOM
+Education entry 1: 4 field(s) match (closed via Cancel)
+Skills: 8 entries
+verify: 54 field(s) replayed, 0 failure(s)  bundle blockers: 0
+        submit button: true (disabled false)  captcha challenge visible: false
+▶▶ WOULD CLICK SUBMIT ◀◀ (dry rehearsal — every gate passed)
+```
+
+So the pipeline is sound: **fill → review → approve → rehearse → gate passed**, ORC's first full loop.
+The failed rehearsal on run 3 was NOT a replay bug — it was the starved fill upstream of it. Which is
+the cleanest possible statement of round 18: on this tenant, starvation does not make a run slow, it
+makes a run WRONG, and the wrongness surfaces three steps later in a component that is behaving
+correctly.
+
+⚠ Still not demonstrated: the timed-settle predicate's starved path (round 17). Five runs now, and no
+burst has landed on the settle window. It remains structurally argued + no-regression, not measured.
+
+## Round 19 — ORC dates split into two editable pickers, and a replay that RESTORES entries (2026-08-21)
+
+Four operator requirements, all implemented; three fully live-verified, one live-verified except its
+successful commit (see the honest gap at the end).
+
+### 1 + 2. A date is TWO pickers, so it is TWO review rows — each with its SCANNED options ✔ LIVE
+
+The fill recorded one merged row (`after: "May 2026"`), so review could only offer it as a single text
+box: an operator wanting to fix just the month had to retype both, and a merged row cannot carry two
+different option lists. Now each half is its own record, sharing a `question_key` — the existing
+"one question, several controls" mechanism (salary currency/amount, Workday's month/day/year).
+
+`atsInjOrcPickFromOwnList` already read every row to classify month-vs-year, so the vocabulary was
+free; it just was not returned. ⚠ It returns `texts` (read at OPEN) and never `shown` (the list AFTER
+typing filtered it to one row) — the latter would hand review a one-option dropdown containing only
+the value already chosen.
+
+Live (`eeho`, req 343628):
+```
+work_experience[0].startDate.month → filled · after "May"  · picked from the form's own month list
+work_experience[0].startDate.year  → filled · after "2026" · picked from the form's own year list
+```
+and the review page renders **one "Start Date" row with two `<select>` pickers**, 12 scanned months.
+Step 2 went 29 → 35 fields (each date is now two rows). All 3 entries committed, all 3 steps walked.
+
+### 3. The replay ASSEMBLES the halves from the tile DOM ✔ LIVE
+
+The tile shows `"05/2026"`; testing `"May"` against that alone would call every date wrong and open
+every entry. So the two approved halves are re-assembled into `"May 2026"` and compared once, through
+the existing `atsYearMonthKey` tolerance. Rehearsal on 343628: **60 field(s) replayed, 0 failure(s)**,
+all three Experience entries *"verified from the DOM, not opened"* → `WOULD CLICK SUBMIT`.
+
+### 4. A replay RESTORES an approved entry the form no longer has ✔ LIVE (commit: unit-proven)
+
+`atsOrcAddApprovedEntry` — strictly additive: it presses Add, fills a FRESH form from the bundle, and
+commits. It never opens, edits or deletes a tile that is present, which is what makes it safe next to
+the standing rule that a `profile:{}` reconcile reads "wants 0" and DELETES the work history. Nothing
+in it reads the profile.
+
+⚠ **WHICH entries are missing is decided by EVIDENCE, not by assuming the tail.** Taking indices
+`tiles.length…approvedCount-1` is wrong whenever the entry Oracle refused was the SECOND of three — it
+would duplicate the third and still leave the second absent. Each approved index is looked up among
+the tiles by its own identifying values (`ATS_ORC_ENTRY_IDENTITY_KEYS`, never a date). A mutation test
+proved this: rewriting the decision as `if (bi >= tiles.length)` passed the first version of the
+guard, so the guard now pins the positive form.
+
+Live on 340692 (bundle 2 entries, form 1):
+```
+⚠ Experience: the form has 1 entry but you approved 2 — RESTORING 1 that Oracle did not keep:
+  "Carnegie Mellon Racing · Firmware Team Member"
+```
+Detection, open, field writes, refusal-cancel and reporting all confirmed live.
+
+### ⚠⚠ AND THE SPLIT BROKE EVERY BUNDLE ALREADY APPROVED — found live, fixed
+
+The first restore run wrote only **2** of 6 fields and Oracle refused the entry. Cause: that bundle
+predates the split, so its dates are the merged `startDate` row; the replay looked for `.month`/`.year`,
+found nothing, and built an entry with no dates. The verify said
+`✗ work_experience[0].startDate: approved value has NO matching field on the live form` — four failures
+on an application that had passed its rehearsal the day before.
+
+`atsOrcLegacyDateHalf` takes a half out of a merged row (`"May 2026"` / `"05/2026"` / `"2026-05"`), and
+the report-only path verifies a legacy date **under its own merged key** — emitting the halves instead
+would leave the legacy row unmatched, which is exactly the "no matching field" refusal. Same discipline
+`atsSubmitKey` already applies: accept BOTH shapes, because *the two sides keying differently IS the
+bug*. Re-run: 2 → **5 fields written**.
+
+### ⚠ THE HONEST GAP: the restore's successful COMMIT is not live-observed
+
+It stopped at 5 of 6 because that legacy bundle's end date is the bare `"2026"` the ORIGINAL failed
+fill recorded — the month **is not in the bundle**, and `atsOrcLegacyDateHalf("2026","month")` returns
+null by design rather than inventing one. Oracle then refuses the incomplete entry, which is correct.
+
+Manufacturing the missing condition (short form + COMPLETE data) was not possible this session: the
+only real instance has genuinely incomplete data, the run's Oracle tab is outside the MCP tab group so
+a tile cannot be deleted by hand, and editing the month into the bundle through the review editor
+failed the documented way — box showed the new value, chip stayed `Edited 0`, i.e. React never saw it
+(the isolated-world limitation; it needs a real click by screenshot coordinates).
+
+So the happy path — all six fields written and the entry COMMITTED — is proven by
+`test/orc-entry-restore.test.js` against a fake actuation, not by a live run. **Do not record it as
+live-verified.** The next live run that meets a genuinely short form with a complete new-shape bundle
+closes this.
+
+### Also seen, unexplained
+
+On the second 340692 rehearsal, `education[0].contentItemId` and `educationalEstablishment` read back
+`""` from the opened tile and failed the verify, where the previous run reported *"4 field(s) match"*.
+It follows a CANCELLED restore attempt on the Experience block, so a page-state side effect of the
+cancel is the first suspect. One observation, not a diagnosis.
+
+## Round 20 — the replay SUBTRACTS: a wrong entry is replaced, a stray one removed (2026-08-21)
+
+Operator: *"for 4 you say purely additive however I need it to subtract if in any case the current
+experience block is wrong."*
+
+### ⚠⚠ WHY DELETION IS SAFE NOW WHEN IT WAS FORBIDDEN — the guard MOVED, it did not disappear
+
+The rule was "a replay never deletes a repeating entry", and its reason was SPECIFIC: the reconcile was
+**PROFILE**-driven, and a replay passes `profile:{}`, so it read *"wants 0, the form has 3"* and would
+have deleted an entire work history. **That hazard is about the SOURCE OF THE COUNT, not about
+deletion.** Every destructive decision is now driven by the APPROVED BUNDLE, which carries real counts
+and real values, so "wants 0" can only be true when the human genuinely approved nothing — and that
+case is refused outright.
+
+### Two kinds of wrong, two responses
+
+**A tile whose FIELDS disagree is REPLACED** (delete + re-add from the bundle) rather than merely
+reported. Blocking the gate was the safe half and it is not enough: the page has to END UP matching
+what was approved. Delete-and-re-add rather than repair-in-place, because re-adding is already proven
+(live + unit) and repairing has to negotiate each wrong field individually. Two guards, and neither is
+optional:
+- **the bundle must want entries in this section** (`o.entryCounts`) — the "wants 0" trap, restated;
+- **the entry's identifying values must be approved**, so we can put back what we remove. *Deleting
+  something we cannot rebuild is the one outcome worse than leaving it wrong.*
+Failing either, the entry is LEFT ALONE, the gate still refuses, and the note says which guard stopped
+it.
+
+**A tile matching NO approved entry is REMOVED.** The form can hold more than was approved (a previous
+run's entry, one Oracle kept from a draft), and the page does not match what was approved while a stray
+entry sits on it. Gated on the bundle wanting entries here, and on identity being KNOWABLE — a tile we
+cannot evaluate is left alone, because absence of evidence is not evidence it is stray. Deletes
+last-first so the indexes still to be considered stay valid, gates on the tile count actually DROPPING,
+and answers Oracle's confirmation dialog through the same report-then-decide split the fill path uses.
+
+**The replacement's records SUPERSEDE the mismatch rows** for that entry. Without that the bundle
+carries both the "DIFFER" verdict and the corrected value for one field, and the gate refuses an entry
+it has just fixed.
+
+### ✔ LIVE: the no-regression case, which is the one that matters for a destructive change
+
+Rehearsal on req 343628 (3 approved entries, 3 on the form, all matching), subtract enabled:
+
+```
+Experience: 3 entries on the form — opening each to check it (nothing is rewritten unless it disagrees)
+  Experience entry 1/2/3: all 4 approved value(s) are visible on the tile — verified from the DOM, not opened
+verify: 60 field(s) replayed, 0 failure(s)  bundle blockers: 0
+▶▶ WOULD CLICK SUBMIT ◀◀
+```
+**Zero deletions, zero re-adds, gate passed.** A form that already matches is not touched.
+
+### ⚠ THE HONEST GAP: the subtract FIRING is unit-verified, not live-observed
+
+No live application currently presents either condition — every form matches its bundle, and the one
+short form (340692) is a *shortfall*, which the restore handles. So the firing paths are proven by
+`test/orc-entry-subtract.test.js`, which drives `atsOrcFillEntries` end to end against a fake
+actuation: a stray tile removed; a disagreeing tile deleted and rebuilt with the APPROVED value; and
+the two refusals — **nothing deleted when the bundle approves nothing**, and **nothing deleted when it
+cannot be rebuilt**. Mutation-checked: replacing the repair gate with `if (false)` fails the safety
+test.
+
+The safety tests were re-pinned deliberately rather than left to pass by accident. `never delete` is
+gone as an assertion because it is no longer the invariant; what is asserted is that every mutation is
+gated on the bundle's approved count, that a repair refuses without enough data to rebuild, that
+removal requires a genuine excess, and that **nothing in the branch reads the profile at all**.
+
+### ⚠ A PRE-EXISTING FLAKE, NAMED (so the next person does not chase it)
+
+`test/fill-driver.test.js:7818` — *"inline AI (repeating): a FoS no-match in Education is rescued
+INLINE…"* — fails roughly 1 run in 3 and passes on a re-run. It is **not** related to the ORC work:
+across rounds 16-20 the only non-test files touched were `ats.js` and `background.js`, and this test
+exercises `driveRepeatingSectionCdp` in **fill-driver.js**, which was never edited. The stash on `main`
+records the same test's sensitivity in its own words — *"inline pre-type seam shifts fill timing →
+keptLowerTier recommit strays to Economics"* — so it is a timing-sensitive assertion on a fake
+actuation, not a regression. **Re-run before believing a single red suite here, and do not run two
+`npm test` processes at once** (CPU contention makes it far likelier, which is how it first appeared).
+
+## Round 21 — ⚠⚠ THE LAG IS FIXED: a 500ms keep-warm beat, and the DIAGNOSTIC was curing it (2026-08-21)
+
+**Operator:** *"the form still lags sometimes, this run is very bad. I need to click the page to get it
+to lock back in"* … then, decisively: *"the lag happens even when I click on the page and focus on it,
+it still happens. This is weird."*
+
+That second report is what cracked it, by killing the explanation rounds 16-18 were built on.
+
+### Three hypotheses eliminated by measurement, including two of mine
+
+1. **Chrome deprioritising a BACKGROUND worker** (rounds 16-18) — ⛔ refuted by the operator: a worker
+   suspended for being idle would wake on a real interaction. It lagged while focused.
+2. **A CDP EVENT FIREHOSE saturating the worker's loop** — cdp.js's own leading suspect since
+   2026-08-09 (*"we `Runtime.enable` + `DOM.enable` at attach while registering NO onEvent listener…
+   thousands of dispatches"*). ⛔ Refuted: **221 unread events over 82s**
+   (`consoleAPICalled ×113, executionContextCreated ×19, frameStartedLoading ×13`). That is not a
+   firehose.
+3. **The channel or the renderer** — ⛔ refuted: page-thread probe **p50 2ms**, p95 44ms.
+
+⚠ And the reason no data existed for any of this: **`cdpLagStart()` was only ever called from the
+WORKDAY fill** (`drivePageFill`). On Greenhouse / Lever / Ashby / iCIMS / Oracle the flag could be set
+and nothing happened — `debugLagTrace ON`, zero `[LAG]` lines. The instrument built in 2026-08-09 to
+answer exactly this question was unreachable on the path that needed it. Now wired into both ATS runs.
+
+### ⚠⚠ THE FINDING: turning the diagnostic ON made the lag disappear
+
+Two instrumented runs came back healthy — SW drift p95 21ms / max 375ms, then p95 12ms / max 75ms, zero
+pace warnings — right after an uninstrumented run with 5 `sw-starved` paces and a worst of 12180ms. The
+only thing the trace adds to the worker is `cdpLagStart`'s **500ms heartbeat**.
+
+So it was promoted from probe to feature (`cdpKeepWarmStart`, a 500ms `setInterval` issuing a trivial
+`Runtime.evaluate "1"`), and A/B'd on the same tenant, same build, back to back:
+
+| arm | paces | overran | time lost | worst pace |
+|---|---|---|---|---|
+| keep-warm **ON** #1 | 77 | **0 (0%)** | 1.5s | 0ms |
+| keep-warm **ON** #2 | 78 | **0 (0%)** | 2.0s | 0ms |
+| lag-trace ON (equivalent beat) ×2 | — | **0** | — | drift ≤ 375ms |
+| keep-warm **OFF** (control) | 82 | 1 (1%) | **16.7s** | **13461ms on a 600ms wait** |
+
+Four runs with a heartbeat: **zero overruns**. Two without: 16.7s lost, and the operator's 12180ms.
+
+### ⚠ AND IT REFUTES MY OWN ARGUMENT FROM ROUND 16
+
+I wrote: *"a keep-alive `setInterval` in the worker — the interval **is** the thing being starved"*, and
+ruled it out. That is wrong in the way that matters: **a late timer still FIRES**, and each firing runs
+the worker's event loop. The starved state is a worker with NOTHING scheduled; a standing timer is a
+different state entirely. It also explains why clicking helped only sometimes — a click is ONE wake, not
+a standing reason to stay scheduled.
+
+Both mechanisms are deliberately kept for now (the timer, and the periodic inbound CDP reply), because
+the measurement cannot separate them and the cheap-but-wrong version would look like a no-op. Narrowing
+to one needs its own A/B.
+
+**Cost:** ~2 commands/second at ~2ms each — ~480 round trips and under a second of CDP time over a
+4-minute fill, against multi-second stalls. `cdpSendRaw`, so it never enters the statistics it exists to
+improve. Stopped wherever the lag heartbeat is stopped, so it can never outlive the attach.
+
+### Honest bounds
+
+n=4 treatment vs n=2 control on an INTERMITTENT phenomenon, so the *rate* is not established — but the
+effect size is large, consistent, and mechanistically coherent. Kill-switch `atsKeepWarm=false`
+(⚠ which had to be added to `AP_DEV_FLAG`'s allow-list — the first "off" arm silently ran as another
+"on" arm because the flag was rejected as "not a debug flag", and the run's own `[ATS-PACING]` line is
+what caught it). **Workday is untouched**: this is wired into the ats.js runs only. Wiring it there is
+the obvious next step, since the original 2026-08-20 report — *"the fill including the onboarding will
+just lag at seemingly random times"* — was about Workday.
+
+### Also measured, as the baseline for the fewer-awaits work
+
+A healthy ORC fill is **~280-320 `Runtime.evaluate` calls totalling 23-32s** (p95 ~576ms, max 8182ms —
+the max being our own page-side polling budgets doing their job). Plus `Page.setWebLifecycleState ×35`
+from `cdpWakePage`. That command count is the surface area any per-round-trip stall multiplies against.
+
+### ⚠ A SECOND load-sensitive test, same class as the first
+
+`test/clock-probe.test.js:84` — *"a HANGING page arm is abandoned at want+ceiling and never blocks"* —
+failed once in a full-suite run and passed **14/14 twice** in isolation immediately after. Like
+`fill-driver.test.js:7818` ("inline AI"), it asserts on REAL timers, so CPU contention (a second
+`npm test`, a live run, a dev-server compile) is enough to trip it. The cdp.js change that run was
+purely additive — 47 insertions, 0 deletions, and `cdpWarmTimer` is referenced nowhere near the clock
+probe. **Two known load-sensitive tests now: re-run in isolation before believing either.**
+
+## Round 22 — the fix made universal, and an audit of the OTHER paths (2026-08-21)
+
+Operator: *"go through not just oracle but other ats code and see if they have the same issue or not."*
+
+### ⚠ The keep-warm beat now starts in `cdpAttach`, not per caller
+
+It was first wired into the two `ats.js` runs — which left **~18 other attach sites without it**,
+including both **Workday** walks, onboarding, the discovery sweep and every recon probe. That is
+precisely where the operator's ORIGINAL 2026-08-20 report came from (*"the fill including the onboarding
+will just lag at seemingly random times"*). Moved into `cdpAttach`, where it cannot be forgotten and
+where its lifetime matches the attach's by construction (`cdpKeepWarmStop` already runs on detach).
+Kill-switch `keepWarmBeat = false` (the older `atsKeepWarm = false` still works).
+
+**The general lesson, worth more than the fix:** a lifecycle concern wired per-caller is a fix that
+silently covers whichever callers you happened to think of.
+
+### The audit — counted-vs-timed stability predicates, per path
+
+| site | shape | verdict |
+|---|---|---|
+| `waitAtsFormReady` — **GH / Lever / Ashby / iCIMS / Oracle** | was `stable >= 2` (3 reads) | ⚠ **the same bug, and it was never Oracle-only** — every ats.js tenant paid it. Fixed round 19: timed quiet window (1200ms) + the original ≥2500ms floor. |
+| `awaitFieldSetSettled` — **Workday** | `now - lastChangeAt >= 1200ms` | ✔ already timed. This is the model the others should follow, and the reason the operator never saw the lag here. |
+| `atsIcimsAwaitParse` — **iCIMS résumé parse** | `stableReads: 3` **AND** `idle >= 2500ms` | ⚠ carries the same 3-round-trip amplification — but **left alone deliberately**. Its own comment is the argument: being slow costs latency, being early costs the ENTIRE fill, and "polling faster makes a STABILITY predicate weaker". Changing it is the documented *"a speed fix removes the settling its slowness provided"* trap. Recorded, not touched. |
+| iCIMS form-ready settle (`background.js` ~5187) | `stable >= 1` (2 reads) | ✔ fine — you cannot claim stability from ONE sample, so two is the minimum, not a floor. |
+| `atsInjOrcPickFromOwnList`, entry open/commit | page-side polling inside ONE eval | ✔ correct by design — a slow single `Runtime.evaluate` here is a budget doing its job. |
+
+### What this leaves
+
+The lag fix is now global. The remaining amplifier is iCIMS' parse settle, and it is a *conscious* trade
+rather than an oversight — if it ever needs cutting, the lever is a cheaper probe (round 13's
+`atsInjLeanSignature` already did that once) rather than fewer samples.
+
+The standing rules are now in **CLAUDE.md → "Don't write laggy code"**, so they are read before a wait is
+written rather than after a run is slow.
+
+## Round 23 — three operator reports, and a CORRECTION to round 21's claim (2026-08-21)
+
+### ⚠⚠ FIRST, THE CORRECTION: the keep-warm beat REDUCES starvation, it does not eliminate it
+
+Round 21 said *"four runs with a heartbeat: zero overruns."* That was an overclaim on n=2 of real
+treatment data. With the beat **verified** on (see the flag bug below — two "on" arms were not), five
+runs now say:
+
+| beat | paces | overran | lost | worst pace | sw-starved |
+|---|---|---|---|---|---|
+| ON | 77 | 0 | 1.5s | 0ms | 0 |
+| ON | 78 | 0 | 2.0s | 0ms | 0 |
+| ON (verified) | 82 | 1 | 5.2s | 1857ms | 0 |
+| ON (verified) | 69 | 1 | 7.4s | **4675ms** | 1 |
+| ON (verified) | 108 | 3 | 9.6s | 1453ms | 0 |
+| **OFF** | 82 | 1 | **16.7s** | **13461ms** | 1 |
+| **OFF** (accidental) | 75 | 2 | 8.7s | 3260ms | 3 |
+
+**What holds:** worst-case pace fell from **13461ms to ≤4675ms**, and `sw-starved` paces from several
+per run to **one across five runs**. **What does not:** "zero overruns". Total time lost still varies
+(an ON run lost 9.6s — though across 108 paces, and with a worst pace of 1453ms rather than 13s).
+The right claim is *the tail severity is cut several-fold*, not *the problem is gone*.
+
+### ⚠⚠ AND THE FLAG THAT MADE THAT MEASUREMENT WRONG: `null` did not clear a flag, it stored `false`
+
+`AP_DEV_FLAG` did `const value = !!message.value`, so the live-testing skill's standing instruction —
+*"clear every flag when you're done… a forgotten flag silently invalidates every later measurement"* —
+**wrote `false` instead of removing the key.** For an opt-IN flag (`debugLagTrace`) false and absent are
+identical, so it hid for a long time. For an opt-OUT KILL-SWITCH they are opposites: a "cleared"
+`keepWarmBeat` became a permanent *beat OFF*, and a run fired as the treatment arm ran as a control and
+lost 8.7s. **A flag you cannot clear is worse than no flag, because the docs tell you to clear it.**
+`value: null` now REMOVES the key and answers `{removed: true}`.
+
+### The date picker is HEALTHY — the slowness was never in the widget
+
+The operator, at 240fps: *"I see it click open the end month dropdown, I see it fill the month for 1
+frame, and then somehow it doesn't commit, then after a wait, it refills and then fills the year."*
+
+`atsInjOrcPickFromOwnList` now returns a step trace, and the read-back's first ~240ms is sampled at
+**8ms** rather than 60ms (a ~4ms appearance is invisible to a 60ms poll, so the caller could record
+"not retained" for a commit that HAPPENED and then retry it — which would look exactly like the
+observed refill). Measured:
+
+```
+↳ endDate month: openedByUs true rows 12@137ms typed@138ms narrowed@247ms
+                 firstRow "August" enter@249ms reopens 0 value "August" | after Enter: 261ms:"August"
+```
+
+**~261ms, first try, no flash, no retry** — and 261ms is ~62 frames at 240fps, so the one-frame
+appearance was not this instance. Meanwhile the *pair* was being reported at **2834ms**, i.e. ~2.3s of
+it was SW round-trip and pacing overhead OUTSIDE the picker. With the beat on and no starvation, the
+three pairs in one run came in at **677 / 688 / 673ms** where an earlier run had 716 / 718 / **2854**.
+
+⚠ **Not reproduced under trace:** no failing pick has been captured yet. The trace prints on failure, so
+the next occurrence will say which step broke. Do not treat the widget as exonerated — treat it as
+"healthy in five runs, instrumented for the next".
+
+### The slow detach — measured, then fixed
+
+Operator: *"at the very end it seems to detach very slowly — after filling out the last page, it stays
+attached for a decent amount of time."* Measured tail: `storage 0.0s + report 3.0s` (and 4.5s on
+another run) — essentially all of it a **network POST to our own website**, with the debugger still
+attached, purely because the detach lived in the bottom `finally`.
+
+The two remaining CDP reads (visibility, paint) are taken first, then `cdpDetach()`, then the storage
+write and the report. `cdpDetach` guards on `cdpTabId === null`, so it is idempotent and the `finally`
+remains a backstop. After: `detach 0.0s — then storage 0.0s + report 1.3s with the tab ALREADY
+RELEASED`. More than cosmetic — the attach is exclusive (one debugger client per tab), it shows a
+"being debugged" banner, and holding it blocks both the operator and the next run.
+
+### Should the beat go to the other tenants? YES — it already did
+
+It is started by `cdpAttach`, so every ats.js tenant, both Workday walks, onboarding, discovery and the
+recon probes get it. Round 22 records the audit. Workday's own numbers are still unmeasured — its
+`awaitFieldSetSettled` is already timed, so it should benefit less, but the original 2026-08-20 lag
+report was about Workday and that is where a measurement is still owed.
+
+### ⚠ A THIRD load-sensitive test — the pattern, not the test, is the finding
+
+`fill-driver.test.js:4250` — *"awaitSourceListStable: a tenant that opens straight to LEAVES"* — failed
+once in a full run, failed again running its own 704-test file, and **passed when run alone**
+(`--test-name-pattern`). `fill-driver.js` and `lib.js` were untouched (git diff empty), and the full
+suite then went green again at 1726/0.
+
+That makes three: `fill-driver.test.js:7818` ("inline AI"), `clock-probe.test.js:84`, and this one. All
+three assert on REAL timers, so they degrade under in-process load (700+ tests in one process) as well
+as machine load. **The rule for this repo: a single red result on a timer-based test is not evidence —
+re-run it alone before believing it.** Ironically the same lesson the pacing work itself keeps
+teaching: a timed assertion measures the machine as much as the code.
+
+## Round 24 — the end-date wait is ORC'S RENDERER, not us (2026-08-22)
+
+Operator: *"that past run did not lag, but when filling experience, after start date, it waits before
+completely filling the end date"* … then a hypothesis worth its weight: *"did you make sure the start
+date dropdown is closed before end date begins to fill?"*
+
+### First: the "page shouldn't be starved when focused" premise, corrected
+
+It is not the PAGE that is starved — it is our extension's **service worker**, a different context
+entirely. Visibility and focus govern the RENDERER's throttling; the MV3 worker's scheduling is
+independent of both, which is exactly why focusing the tab never fixed it. The evidence: while paces
+overran by seconds, the page-thread probe was **p50 2ms, p95 44ms**. The page was answering instantly;
+we were late to ask.
+
+### The operator's hypothesis — tested, and RULED OUT with a number
+
+It was a good one, and it is this repo's own Workday rule applied somewhere it never had been: *"a close
+is confirmed by the options being GONE, not by aria-expanded — options linger a beat while unmounting
+and STAY CLICKABLE, and a lingering option strays the next field's open-click."* `atsInjOrcPickFromOwnList`
+only ever asked about ITS OWN listbox, so a still-mounted sibling was invisible to it. And the asymmetry
+fit perfectly: startDate is the first picker in an entry (722/701/723ms), endDate follows two commits
+(3000/2774/2729ms), same page-side work either way.
+
+A page-side, bounded wait for any OTHER `.cx-select__listbox` to unmount was added — zero extra round
+trips — and it reports what it saw:
+
+```
+sibling-list wait 1ms · sibling-list wait 0ms · sibling-list wait 0ms
+```
+
+**The previous list is already gone.** Not the cause. The guard is KEPT anyway: it costs ~1ms, it is the
+documented rule, and it converts an untested assumption into a measured one.
+
+### The actual cause: a 1.7s DISPATCH wait on one specific eval
+
+Splitting each half into SW-side vs page-side wall clock is what found it:
+
+```
+↳ endDate month: eval 2128ms SW-side vs 441ms page-side  ⇒ 1687ms of transport/scheduling
+↳ endDate year:  eval  291ms SW-side vs 286ms page-side  ⇒    5ms
+```
+
+The first eval **after the start date commits** waits ~1.7s for a slot on the page's main thread, then
+runs in 441ms. The next eval pays 5ms. So this is **ORC's own post-commit work** (validation /
+re-render after a date is accepted), and `Runtime.evaluate` must be scheduled on that same thread.
+Our worker was healthy for the whole run: `73 pace(s), 0 overran (0%), 2.1s lost, worst 0ms`.
+
+⚠ **This bounds what is left to win here.** Once we get a slot we cost 5ms. The 1.7s is the tenant's,
+and no amount of pacing, batching or keep-warm on our side removes work the page has to do. It can only
+be OVERLAPPED (do something useful elsewhere while ORC settles) or ABSORBED (wait for it page-side
+inside an eval we were going to make anyway) — neither of which makes it shorter.
+
+### And one round trip per wake, removed
+
+`cdpWakePage` sent `Page.setWebLifecycleState` unconditionally, but freezing only happens to
+BACKGROUNDED tabs — on a visible tab it is a guaranteed no-op costing a full round trip. Gated on the
+(cached, chrome.tabs-based, free) visibility check, failing CLOSED so any error still wakes. Measured:
+**22 no-op round trips skipped** on one fill.
+
+## Round 25 — the end-date gap: the operator's 100ms wins, and BOTH "detect it" attempts lose (2026-08-22)
+
+Operator: *"it seems like a flake, sometimes it fills fine and sometimes it doesn't so you are wrong"* —
+correct, and my round-24 conclusion was drawn from one trace line. Then: *"add a small 100 ms delay
+after start fills, then fill end"*, and *"instead of hardcoding it, find a way to detect it and answer
+still as fast as possible."*
+
+### endDate pair timings, by implementation
+
+| implementation | endDate pairs (3 entries) |
+|---|---|
+| no gap | 3000 / 2774 / 2729 · and 1555 / 2785 / 1546 |
+| **unconditional 100ms (operator's)** | **882 / 848 / 1639 · and 832 / 1671 / 839** |
+| conditional on the previous half's stall | 1554 / 1527 / 1502 |
+| page-side auto-open detection | never engaged — a no-op |
+
+startDate, for scale, is 703-804ms throughout. So the operator's fix brings 2 of 3 endDate pairs level
+with startDate; the remaining one still loses the race.
+
+### WHY it works — and it is NOT what I assumed
+
+The trace, with the discriminating no-op probe:
+
+```
+↳ endDate month: eval 1948ms SW-side vs 291ms page-side [no-op probe just before: 2ms ⇒ page FREE]
+                 sibling-list wait 0ms · not focused, clicked straight away · rows 12@150ms
+```
+
+The page is free (2ms), the picker is fast (291ms page-side, rows at 150ms). The ~1.65s sits **between
+our probe returning and our eval returning** — the WORKER stalling, not the page. Which is why a *pace*
+helps: a scheduled timer gives the MV3 worker a reason to stay scheduled, the same mechanism as the
+keep-warm beat. ⚠ **Round 24's "it's ORC's renderer" is refuted by that 2ms probe.**
+
+### Both attempts to replace the constant, and why each failed
+
+1. **Page-side detection of ORC auto-opening the picker** (the toggle-race theory this file already
+   suspected). Its own instrument reported **"not focused, clicked straight away"** on every endDate
+   half — ORC does not auto-open on focus — so it never engaged, and the pairs regressed to
+   1555/2785/1546.
+2. **Conditioning the pace on the previous half's measured stall** (`lastStallMs > 250`). Worse still:
+   1554/1527/1502, every pair carrying a re-open. **The stall is not autocorrelated**, so a past stall
+   does not predict the next one and the gate skips exactly when it is needed.
+
+⚠ **So "as fast as possible" is satisfied by PAYING the 100ms, not by trying to skip it.** It buys the
+avoidance of a ~700ms re-open, and no observable predicts which pair will need it. A constant is the
+right shape here — the thing to avoid is a constant nobody measured, and this one now has four runs
+behind it.
+
 ## Round 14 (2026-08-25) — Greenhouse `candidate-location`: the lookup is 2ms; the cost is OUR input
 
 Raised by the operator watching a fill: *"the location for greenhouse fills too slowly… it hovered in the

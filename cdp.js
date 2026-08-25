@@ -123,6 +123,10 @@ function cdpPageClockEnabled() { return _pageClockOn; } // so a caller can SAVE/
 
 const PAGE_SLEEP_SLACK_MS = 1500;   // race ceiling above the requested pace (guard 2)
 const PACE_OVERRUN_LOG_MS = 1000;   // log a pace this far over budget (permanent — no flag needed)
+// How late our OWN abandon ceiling may be before the worker, not the page, is the culprit. Small on
+// purpose: a healthy worker fires a setTimeout within a few ms, and the starved case overshoots by
+// SECONDS — there is no ambiguous middle to tune for.
+const SW_STARVED_MS = 250;
 
 const cdpSwSleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -137,12 +141,49 @@ function cdpPageSleep(ms) {
 
 // Drift is now REPORTED, not merely survived: a pace that still overruns badly prints once, with no flag
 // required, so the next occurrence is visible in any run's log instead of needing debugLagTrace on.
-function cdpPaceNote(want, took, via) {
-  if (took - want < PACE_OVERRUN_LOG_MS) return;
+// ── EVERY RUN REPORTS ITS OWN PACING LOSS (2026-08-20) ──────────────────────────────────────
+// A 630s ORC fill was diagnosed by hand: grep the [PACE] lines, notice they are all one `via`, work
+// out that the abandon ceiling is due at want+SLACK and fired 9.3s late, conclude the WORKER was
+// starved. That is three steps too many for something that shows up on ordinary runs, so the numbers
+// are accumulated here and printed with the run's timing summary. Reset per attach.
+let _paceStats = { n: 0, over: 0, lostMs: 0, worstMs: 0, worstWant: 0, byVia: {} };
+function cdpPaceStatsReset() { _paceStats = { n: 0, over: 0, lostMs: 0, worstMs: 0, worstWant: 0, byVia: {} }; }
+function cdpPaceStats() { return { ..._paceStats, byVia: { ..._paceStats.byVia } }; }
+// One line, safe to print unconditionally — a healthy run says so in a few words.
+function cdpPaceSummary() {
+  const p = _paceStats;
+  if (!p.n) return "pacing: no paces recorded";
+  const pct = Math.round((p.over / p.n) * 100);
+  const vias = Object.keys(p.byVia).sort((a, b) => p.byVia[b] - p.byVia[a])
+    .map((k) => `${k}×${p.byVia[k]}`).join(" ");
+  return `pacing: ${p.n} pace(s), ${p.over} overran (${pct}%), ${(p.lostMs / 1000).toFixed(1)}s lost, `
+    + `worst ${p.worstMs}ms on a ${p.worstWant}ms wait · ${vias}`
+    + (p.byVia["sw-starved"] ? " — ⚠ SW-STARVED paces mean the SERVICE WORKER's own timers were late; "
+        + "the page clock CANNOT help there (its abandon ceiling is an SW timer too). The lever is "
+        + "FEWER AWAITS, not a different clock. docs/fill-speed-log.md" : "");
+}
+
+function cdpPaceNote(want, took, via, watchdogLateBy) {
+  const p = _paceStats;
+  p.n++;
+  p.byVia[via] = (p.byVia[via] || 0) + 1;
+  const over = took - want;
+  if (over > 0) { p.lostMs += over; }
+  if (over >= PACE_OVERRUN_LOG_MS) {
+    p.over++;
+    if (over > p.worstMs) { p.worstMs = over; p.worstWant = want; }
+  }
+  if (over < PACE_OVERRUN_LOG_MS) return;
   try {
     console.log(`[ApplyPilot][PACE] ⚠ a ${want}ms pace took ${took}ms (${via}) — the clock overran by `
-      + `${took - want}ms. SW-side starvation is the known cause (docs/fill-speed-log.md); `
-      + `"page" means even the page clock was late, which is new.`);
+      + `${over}ms.`
+      + (via === "sw-starved"
+        ? ` OUR OWN abandon ceiling was ${watchdogLateBy}ms late, so this is SERVICE-WORKER starvation`
+          + ` and says NOTHING about the page — the page clock cannot help, because that ceiling is an`
+          + ` SW timer too. Fewer awaits is the lever (docs/fill-speed-log.md).`
+        : via === "page-abandoned"
+        ? ` The abandon ceiling fired roughly on time, so the PAGE genuinely did not answer.`
+        : ` SW-side starvation is the known cause (docs/fill-speed-log.md).`));
   } catch (e) { /* log only */ }
 }
 
@@ -150,12 +191,26 @@ async function cdpDelay(ms) {
   const want = Math.max(0, Math.round(Number(ms) || 0));
   const t0 = Date.now();
   let via = "sw";
+  let watchdogLateBy = 0;
   if (want > 0 && _pageClockOn && cdpTabId !== null && _workerTimersActive) {
     via = "page";
     let timer = null;
     try {
       await new Promise((resolve, reject) => {
-        timer = setTimeout(() => { via = "page-abandoned"; resolve(); }, want + PAGE_SLEEP_SLACK_MS);
+        // ⚠⚠ WHEN THE CEILING WINS, MEASURE HOW LATE THE CEILING ITSELF WAS (2026-08-20).
+        // Losing this race was reported as `page-abandoned`, which reads as "the page did not
+        // answer" — and on a 630s ORC fill all 16 logged overruns carried that label, which sent the
+        // diagnosis at the renderer. It was the opposite: the ceiling is due at want+SLACK and fired
+        // up to 11.5s late, i.e. the SERVICE WORKER's timer was starved. Both arms of this race are
+        // worker-scheduled (this setTimeout, and resuming the await when the CDP reply lands), so a
+        // starved worker loses it every time and the page is never implicated by the evidence.
+        // Comparing the ceiling against its OWN due time separates the two for free.
+        const dueAt = t0 + want + PAGE_SLEEP_SLACK_MS;
+        timer = setTimeout(() => {
+          watchdogLateBy = Date.now() - dueAt;
+          via = watchdogLateBy > SW_STARVED_MS ? "sw-starved" : "page-abandoned";
+          resolve();
+        }, want + PAGE_SLEEP_SLACK_MS);
         cdpPageSleep(want).then(resolve, reject);
       });
     } catch (e) {
@@ -168,7 +223,7 @@ async function cdpDelay(ms) {
   } else {
     await cdpSwSleep(want);
   }
-  cdpPaceNote(want, Date.now() - t0, via);
+  cdpPaceNote(want, Date.now() - t0, via, watchdogLateBy);
 }
 // ── PACING CLOCK END ──
 
@@ -278,6 +333,8 @@ function cdpAttach(tabId) {
       _frameCtxId = null;                      // frame-scoped eval is per-run opt-in (iCIMS only) — everything else evaluates in the top frame
       _frameCtxUrl = null;
       _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
+      cdpPaceStatsReset();                     // pacing stats are PER RUN — the summary is printed with the run's timing
+      _wakeSkipped = 0;                        // …and so is the count of no-op wakes we skipped
       try {
         await cdpSend("Runtime.enable", {});
         await cdpSend("DOM.enable", {});
@@ -288,6 +345,24 @@ function cdpAttach(tabId) {
         // trusted Input.* path (slow-but-battle-tested) — the escape hatch if a tenant's widgets
         // ignore synthetic events (they'd surface as needs_review, never a wrong fill).
         try { const { forceTrustedInput } = await new Promise((r) => chrome.storage.local.get("forceTrustedInput", r)); _forceTrustedInput = !!forceTrustedInput; } catch (e) { _forceTrustedInput = false; }
+        // ⚠⚠ THE KEEP-WARM BEAT BELONGS TO THE ATTACH, NOT TO EACH CALLER (2026-08-21). It was first
+        // wired into the two ats.js runs, which left ~18 other attach sites without it — including the
+        // WORKDAY fill and replay walks, which is where the operator originally reported this lag
+        // ("the fill including the onboarding will just lag at seemingly random times and to fix it I
+        // need to click the page once"). Starting it here is the one place it cannot be forgotten, and
+        // cdpKeepWarmStop() already runs on the detach path, so its lifetime matches the attach's by
+        // construction. See cdpKeepWarmStart for the A/B that justifies it.
+        // Kill-switch: `keepWarmBeat = false` (or the original `atsKeepWarm = false`).
+        try {
+          const kw = await new Promise((r) => chrome.storage.local.get(["keepWarmBeat", "atsKeepWarm"], r));
+          const off = kw && (kw.keepWarmBeat === false || kw.atsKeepWarm === false);
+          if (!off && cdpKeepWarmStart()) {
+            console.log("[ApplyPilot][CDP] keep-warm beat ON (500ms) — a standing reason for the MV3 worker to stay scheduled; "
+              + "without it a 600ms pace was measured taking 13461ms. Set keepWarmBeat=false to A/B it off.");
+          } else if (off) {
+            console.log("[ApplyPilot][CDP] keep-warm beat OFF by flag — expect intermittent multi-second sw-starved paces");
+          }
+        } catch (e) { if (cdpKeepWarmStart()) console.log("[ApplyPilot][CDP] keep-warm beat ON (500ms)"); }
         cdpInvalidatePaint(); // a fresh attach says nothing about the previous tab's paint state
         _synthInputEnabled = false; // per-run opt-in — only the FILL entry points enable it (auth/onboarding/recon stay trusted)
         console.log(`[ApplyPilot][CDP] input mode: trusted${_forceTrustedInput ? " ALWAYS (forceTrustedInput)" : " (synthetic-when-hidden armed — the fill walk enables it)"}`);
@@ -319,6 +394,7 @@ function cdpDetach() {
       cdpTabId = null;
       cdpAttachedAt = 0;
       cdpLagStop();   // the heartbeat probes over the attach — it must never outlive it
+      cdpKeepWarmStop();   // same rule for the keep-warm beat
       resolve();
     });
   });
@@ -441,6 +517,56 @@ function cdpLagNote(method, ms, err) {
   }
 }
 
+// ── KEEP THE WORKER WARM (2026-08-21) ────────────────────────────────────────────────────────────
+// ⚠⚠ THE DIAGNOSTIC WAS CURING THE DISEASE, which is why this exists as a FEATURE and not a probe.
+//
+// Measured, same tenant, same build, back to back: a run with `debugLagTrace` OFF produced 5
+// `sw-starved` paces and a worst pace of 12180ms (a 150ms pace taking 6193ms). The next two runs with
+// the trace ON produced ZERO pace warnings and SW drift of p95 21ms / max 375ms and p95 12ms / max
+// 75ms. The only thing the trace adds to the worker is the 500ms heartbeat in cdpLagStart.
+//
+// ⚠ AND IT REFUTES MY OWN EARLIER ARGUMENT, which was: "a keep-alive interval cannot help, because the
+// interval is the thing being starved." That is wrong in the way that matters — a late timer still
+// FIRES, and each firing runs the worker's event loop. What appears to be starved is a worker with
+// NOTHING scheduled at all; giving it a standing reason to be scheduled is a different state.
+//
+// Two mechanisms are plausible and this deliberately keeps BOTH, because the measurement cannot yet
+// separate them and the cheap-but-wrong version would be indistinguishable from a no-op:
+//   * the periodic TIMER keeps the worker's loop from going fully idle, and
+//   * the periodic trivial CDP command keeps inbound I/O flowing to it.
+// Narrowing to one is a later optimisation, and it needs its own A/B.
+//
+// ⚠ Cost is real and bounded: ~2 commands/second of `Runtime.evaluate "1"`, measured at ~2ms each
+// (the lag trace's own probe p50 across three runs). Over a 4-minute fill that is ~480 round trips and
+// under a second of CDP time, against multi-second stalls. `cdpSendRaw`, so it never enters the pace
+// or command statistics it exists to improve.
+//
+// ⚠ It must NEVER outlive the attach — same rule as the lag heartbeat, and for the same reason: a
+// timer probing a detached tab throws on every beat.
+// Kill-switch for the A/B: `chrome.storage.local.atsKeepWarm = false`.
+let cdpWarmTimer = null;
+const CDP_WARM_BEAT_MS = 500;
+
+function cdpKeepWarmStart() {
+  if (cdpWarmTimer) return false;
+  cdpWarmTimer = setInterval(async () => {
+    if (cdpTabId === null) return;
+    try { await cdpSendRaw("Runtime.evaluate", { expression: "1", returnByValue: true }); }
+    catch (e) { /* detached or navigating — the next beat re-checks */ }
+  }, CDP_WARM_BEAT_MS);
+  return true;
+}
+
+function cdpKeepWarmStop() {
+  if (!cdpWarmTimer) return;
+  clearInterval(cdpWarmTimer);
+  cdpWarmTimer = null;
+}
+
+// Is the lag trace running? Lets a caller arm an extra DIAGNOSTIC probe only when tracing, so a
+// normal run pays nothing for it.
+function cdpLagActive() { return cdpLagOn; }
+
 function cdpLagStart() {
   const first = !cdpLagOn;
   cdpLagOn = true;
@@ -519,7 +645,19 @@ function cdpLagReport(label) {
 // It does NOT spoof document.visibilityState (that would corrupt the adaptive-pacing sampler and
 // race the next page's fill) — only the freeze lifecycle. If this proves insufficient the cause is
 // pure rAF-pause, which only true tab visibility resumes.
+// ⚠ SKIP IT ENTIRELY ON A VISIBLE TAB (2026-08-21). Freezing is something Chrome does to BACKGROUNDED
+// tabs, so on a tab that is active and not minimized this command cannot do anything — it is a
+// guaranteed no-op that still costs a full round trip, and the lag trace counted
+// `Page.setWebLifecycleState ×35` on one fill. Round trips are the thing that multiplies when the
+// worker is late (see CLAUDE.md "Don't write laggy code"), so 35 of them for a no-op is worth removing.
+//
+// `cdpVisible()` is CACHED with a TTL and uses chrome.tabs, not CDP, so the check itself is free. It
+// fails CLOSED: any error reports not-visible and the wake still happens, which is the safe direction —
+// a needless wake costs one round trip, a skipped one on a frozen tab costs the fill.
+let _wakeSkipped = 0;
+function cdpWakeSkipped() { return _wakeSkipped; }
 async function cdpWakePage() {
+  try { if (await cdpVisible()) { _wakeSkipped++; return; } } catch (e) { /* fall through and wake */ }
   try { await cdpSend("Page.setWebLifecycleState", { state: "active" }); } catch (e) { /* best-effort — no-op if unsupported/not frozen */ }
 }
 

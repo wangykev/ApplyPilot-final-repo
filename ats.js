@@ -35,14 +35,21 @@ const atsLib = (typeof module !== "undefined" && module.exports)
       recognizeRelocationQuestion: recognizeRelocationQuestion, relocationCandidates: relocationCandidates,
       // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
       // join/split exactly the way groups do — see the multiselect commit path.
-      joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN };
+      joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN,
+      // Work-experience bullets → one prose block for a "Responsibilities" textarea.
+      joinBullets: joinBullets };
 const atsFd = (typeof module !== "undefined" && module.exports)
   ? require("./fill-driver.js")
   : { resolve: resolve, buildReviewBundle: buildReviewBundle, buildBucketIndex: buildBucketIndex,
       recognizeEmploymentQuestion: recognizeEmploymentQuestion, decideEmploymentStatus: decideEmploymentStatus,
       optionForPolarity: optionForPolarity, parseAiReply: parseAiReply, parseAiText: parseAiText,
       legallyLoaded: legallyLoaded, textValuesMatch: textValuesMatch, bundleSubmitBlockers: bundleSubmitBlockers,
-      boolLadderCandidates: boolLadderCandidates, appendFieldVariants: appendFieldVariants };
+      boolLadderCandidates: boolLadderCandidates, appendFieldVariants: appendFieldVariants,
+      // The disability self-ID ladder: the stored wording FIRST, the bare polarity token LAST, so
+      // POLARITY LEAD can commit it deterministically. See the ORA_DISABILITY_STATUS map entry.
+      selfIdDisabilityCandidates: selfIdDisabilityCandidates,
+      // Grades a match tier as exact / containment / fuzzy / none. See atsTierIsDeterministic.
+      flagTierCategory: flagTierCategory };
 
 // ── ATS detection + URL shaping (pure) ───────────────────────────────────────────────────
 
@@ -60,6 +67,31 @@ function detectAts(url) {
   // an exact-host allowlist cannot work. ANCHORED at a dot or start so `icims.com.evil.com` and
   // `fakeicims.com` still return null — the same discipline test/ats.test.js pins for the others.
   if (/(^|\.)icims\.com$/.test(host)) return "icims";
+  // ⚠ ORACLE RECRUITING CLOUD IS THE ONE FAMILY THE HOST ALONE CANNOT IDENTIFY (2026-08-19).
+  // Every test above is host-only, and CLAUDE.md said that must stay so — the reason being that
+  // detection must never need PAGE EVIDENCE (that is atsPortalAts' job, and it is a separate,
+  // more expensive decision). Oracle keeps that property while breaking the letter of the rule:
+  // `*.fa.*.oraclecloud.com` is the generic Oracle FUSION APPLICATIONS host, which also serves
+  // ERP and HCM back-office UIs — pages this pipeline must never drive. The recruiting product's
+  // identity is in the PATH (`/hcmUI/CandidateExperience/`), so that is what we test. Still
+  // URL-only: no fetch, no injection, no page contact. Operator-approved 2026-08-19.
+  //
+  // Three host shapes observed live, and the third has NO region segment:
+  //   eeho.fa.us2.oraclecloud.com · ejov.fa.ca2 · hdpc.fa.us2 · efds.fa.em5 · hcmn.fa.ap1 · hdow.fa.us6
+  //   fa-evmr-saasfaprod1.fa.ocs.oraclecloud.com   (the `fa-<code>-saasfaprod1` + `.fa.ocs.` shape)
+  //   jpmc.fa.oraclecloud.com                      (bare — the optional region group is absent)
+  // ANCHORED at `$` and on a label boundary, so `oraclecloud.com.evil.com` and
+  // `fakeoraclecloud.com` return null — the same discipline test/ats.test.js pins for the others.
+  //
+  // ⚠ An employer VANITY domain CNAME'd to ORC (careers.<company>.com) does not match, by design:
+  // that is the employer-hosted-portal case iCIMS already established, and it is answered by page
+  // evidence, not by widening a host test until it matches things it cannot verify.
+  if (/(^|\.)fa(\.[a-z0-9-]+)?\.oraclecloud\.com$/.test(host)) {
+    let path = "";
+    try { path = new URL(String(url)).pathname; } catch (e) { return null; }
+    if (/\/hcmUI\/CandidateExperience\//i.test(path)) return "oracle";
+    return null;
+  }
   return null;
 }
 
@@ -80,6 +112,14 @@ function atsFormUrl(ats, url) {
       u.pathname = /\/application$/i.test(path) ? path : path + "/application";
       return u.origin + u.pathname;
     }
+    // ⚠ ORACLE MUST NOT BE GIVEN A SYNTHESIZED FORM URL (measured 2026-08-19). It falls to the
+    // default below — which returns the POSTING url unchanged — and that is the correct answer, not
+    // an oversight. Guessing the Lever/Ashby shape `…/job/<id>/apply` **redirects to
+    // `…/sites/<site>/404`**: the apply route is reached only by pressing `button.apply-now-button`,
+    // which pushes `…/job/<id>/apply/email`. Landing on that route directly is also not a shortcut —
+    // it is a step of a stateful SPA flow. So the Apply click is a required STAGE for ORC, the way
+    // it is for an iCIMS portal. Do not "fix" this by appending a path.
+    if (ats === "oracle") return u.origin + u.pathname + u.search;
     // ⚠ iCIMS falls to the default below, and KEEPING THE QUERY IS LOAD-BEARING — not incidental
     // like greenhouse's gh_jid. An iCIMS apply link carries the one-time magic-link session in
     // `?eem=…&code=…`; strip it and the run lands on a sign-in page with no form at all.
@@ -108,6 +148,19 @@ function atsCompanyFromUrl(url) {
       if (!seg) return null;
       return seg[0].toUpperCase() + seg.slice(1);
     }
+    // ⚠ ORACLE'S SUBDOMAIN IS OPAQUE, SO THIS RETURNS NOTHING RATHER THAN A GUESS (2026-08-19).
+    // The tenant label is a Fusion POD id — `eeho`, `hdpc`, `ejov`, `fa-evmr-saasfaprod1` — which
+    // names no employer, and path segment 0 is the literal `hcmUI`. Both would hand the
+    // safety-critical employment recognizer ("have you worked for us before?") a word no company is
+    // called, which is the exact failure iCIMS' `jobs` segment produced.
+    //
+    // Returning null is SAFE here in a way it would not be elsewhere, and only because ORC supplies
+    // the real name in STRUCTURED form: the posting carries JSON-LD `hiringOrganization.name`
+    // ("Nokia Corporation"), and its own CX REST requisition endpoint answers 200 unauthenticated.
+    // So the anchor is evidence rather than a URL heuristic — and with no plausible fallback, an
+    // absent company correctly makes the recognizer UNEVALUABLE (blank + review) instead of
+    // confidently comparing against a pod id.
+    if (kind === "oracle") return null;
     const seg = (u.pathname.split("/").filter(Boolean)[0] || "").replace(/[-_]+/g, " ").trim();
     if (!seg || seg === "embed") return null;
     return seg.split(" ").map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
@@ -206,6 +259,100 @@ const ATS_STATIC_MAPS = {
   // map would hand it a duplicate of the first. The repeat is DETECTED from the page rather than
   // declared here — see `repeatIndex` in atsAssignEntryIndexes — so only the first entry the form
   // renders is mapped, on any tenant, whether or not its blocks happen to repeat.
+  // ── ORACLE RECRUITING CLOUD (observed 2026-08-19; Baylor + Oracle's own careers site) ──────────
+  // Keys are the control's `name` after atsMapKey (render counter stripped, self-ID reduced to its
+  // ORA_ token). ONLY platform names belong here — per-tenant flexfields (`300000016979265`,
+  // `namInformation15`) and `dq-option-*` screening questions go to the LABEL ladder, which is why
+  // they are absent rather than forgotten.
+  oracle: {
+    "firstName": { path: "personal_info.first_name" },
+    "lastName": { path: "personal_info.last_name" },
+    "email": { path: "personal_info.email" },
+    // ORC's "Known As" is the preferred/known-as name (Baylor marks it REQUIRED). Falls through to
+    // the label ladder when the operator has no preferred name, which is the right behaviour.
+    "knownAs": { path: "personal_info.preferred_first_name" },
+    // ⚠⚠ `phoneNumber` IS THE DIAL-CODE PICKER, NOT THE NUMBER — measured, and the single most
+    // misleading name on an ORC form. `id="country-codes-dropdownphoneNumber"`, `role=combobox`,
+    // label "Country code", value "+1". The control that actually wants the number has NO id and NO
+    // name at all (only `aria-label="Phone Number"` + `.phone-row__input`), so it cannot be mapped
+    // here and needs a scan-side synthetic name. Mapping this to the phone NUMBER would type the
+    // number into the dial-code list — the same class of error as Greenhouse's `country`, which is
+    // why it takes the same `kind:"dial"` + tiered ladder.
+    "phoneNumber": { kind: "dial", path: "personal_info.country_phone_code", altPath: "personal_info.dialing_code" },
+    // ⚠ `title` IS A SALUTATION (Mr./Mrs./Dr./Professor/Frau/Dipl. Ing. — 17 rows measured), NOT a
+    // job title, and it sits in the NAME block between lastName and middleNames. The profile stores
+    // no salutation, so the right value is BLANK.
+    //
+    // It is CLAIMED rather than left unmapped, and that is the whole point: unmapped, its label
+    // normalizes to "title", which collides with one of the most common taught-bucket wordings there
+    // is — live 2026-08-19 an operator bucket answered it "Characterization and Test Automation
+    // Intern", i.e. a job title typed into a salutation picker. The bucket is not even wrong in
+    // general ("Title" means job title on nearly every other form); only the PLATFORM ID can tell the
+    // two apart, which is why recognition has to happen here. Same shape as the clearance rung and
+    // `may_contact`: claiming a question we cannot answer is what keeps the guessers off it.
+    // (It committed nothing that run — the salutation list held no such row — but on a form whose
+    // picker accepts free text it would have.)
+    "title": { kind: "skip", detail: "salutation (Mr./Ms./Dr.) — the profile stores none, so it stays blank; claimed so a \"Title\" bucket cannot answer it with a JOB title" },
+    // Address. `country` is the ADDRESS country (a tiered profile array), not the phone's.
+    "country": { path: "personal_info.country" },
+    "addressLine1": { path: "personal_info.address_line_1" },
+    "addressLine2": { path: "personal_info.address_line_2" },
+    "city": { path: "personal_info.city" },
+    "postalCode": { path: "personal_info.postal_code" },
+    // ⚠ `region1` / `region2` ARE DELIBERATELY UNMAPPED. Both are required comboboxes and their
+    // labels did not render in recon, so which one is State/Province vs County is UNKNOWN — and it
+    // almost certainly varies by `country`. Mapping the wrong one files the applicant's state as a
+    // county, i.e. a confidently wrong value, which is worse than reaching review. Resolve from the
+    // live label first, then map. Left here as a named gap so it is not mistaken for an oversight.
+    // ── §2 documents. The résumé route + attach already exist (kind:"resume" → act.attachResume);
+    // ORC only ever needed the map entry, which is why a REQUIRED résumé reached review as
+    // "no profile mapping for this question" on a run that was otherwise clean.
+    //
+    // ⚠ ORDER IS THE OPPOSITE OF iCIMS, AND THAT IS DELIBERATE. iCIMS parses the upload SERVER-SIDE
+    // and re-renders the whole panel with the result, so its résumé must go on BEFORE any value is
+    // written (atsIcimsResumeStage). Oracle's résumé sits on a LATER STEP than the fields it could
+    // disturb, and Oracle's own parse offer is the section-0 résumé-import banner, which we never
+    // press — so the ordinary in-loop attach is correct here and no pre-stage is needed. Do not
+    // "unify" the two: the reason they differ is WHEN the tenant re-renders the form.
+    "resume-upload": { kind: "resume" },
+    // Operator-supplied documents. Same reasoning as iCIMS' cover_letter: a cover letter is the
+    // operator's own voice and an extra attachment is theirs to choose, so neither is invented.
+    "cover-letter-upload": { kind: "skip", detail: "cover letter — operator-supplied (not modeled)" },
+    "attachment-upload": { kind: "skip", detail: "extra attachment — the operator's to choose" },
+    // ⚠ `siteLink-<n>` IS A NUMBERED FAMILY (<candidate-links>), and atsMapKey strips the trailing
+    // `-<digits>` for Oracle, so this one key serves every rendered row.
+    "siteLink": { kind: "website" },
+    // E-signature (§4). The Workday signature rule: a signature NAME is the candidate's own name and
+    // fills deterministically. ORC showed no signature DATE on the tenants observed.
+    "fullName": { compose: "full_name" },
+    // Self-ID, reduced by atsMapKey to Oracle's own ORA_ vocabulary so the map is locale-neutral.
+    // containment:true for the same reason Greenhouse's block carries it — each tenant words the
+    // long options its own way ("No, I do not have a disability" ⊂ "… and have not had one in the
+    // past"), and a unique prefix hit commits at the flagged containment tier.
+    // ⚠ These are STATED values only; an unstated one stays blank per the EEO rule (every self-ID
+    // field on the observed tenants was OPTIONAL, so unstated ⇒ blank, no AI).
+    "ORA_GENDER": { path: "self_identification.gender", containment: true },
+    "ORA_ETHNICITY": { path: "self_identification.race_ethnicity", containment: true },
+    "ORA_VETERAN_STATUS": { path: "self_identification.veteran_status", containment: true },
+    // ⚠⚠ THE DISABILITY SELF-ID USES THE POLARITY LADDER, NOT CONTAINMENT (operator, 2026-08-20).
+    // The operator's question was exactly right: "the disability question seems like it filled
+    // deterministically, why is that for review." It committed the correct option — but at the
+    // CONTAINMENT tier, and containment is graded `filled_review` BY DESIGN because containment is a
+    // guess. The profile stores "No, I do not have a disability" and the form offers "No, I do not
+    // have a disability and have not had one in the past", so the stored value is a strict PREFIX and
+    // the ladder had nothing better to reach for.
+    //
+    // Workday has the answer already: `selfIdDisabilityCandidates` expands the stored value into the
+    // stored wording FIRST and the bare polarity token LAST, and POLARITY LEAD then commits it
+    // DETERMINISTICALLY — `filled`, unflagged — but only when EXACTLY ONE option leads with that
+    // polarity. Here that is true ("Yes, I have…", "No, I do not…", "I do not want to answer"), and a
+    // tenant that split one polarity into two meanings would still escalate to review instead of
+    // being guessed. The ORC recon predicted this would work because the wording is byte-identical to
+    // cat.wd5's; this is that prediction wired up.
+    "ORA_DISABILITY_STATUS": { path: "self_identification.disability_status", kind: "selfid_disability" },
+    // ⚠ Race/ethnicity is ALSO rendered as a checkbox GROUP whose boxes have NO `name` at all, so
+    // that shape cannot be reached by this map and needs the scan's group handling first.
+  },
   icims: {
     // ── The "Create a login" block. THIS ACCOUNT IS CREATED BY THE SUBMISSION ──────────────
     // Not a sign-in form and not a profile edit: on this class of application the account is created
@@ -346,6 +493,33 @@ function atsComposeValue(kind, profile) {
   return null;
 }
 
+// ⚠ THE FIRST NON-EMPTY WEBSITE, IN THE PROFILE'S OWN ORDER — not "the LinkedIn one". The profile
+// keeps `websites` as an ordered list WITH BLANK SLOTS (the portfolio and "other" rows are usually
+// empty strings), so a type-keyed lookup answers nothing for a generic "Website" field while a naive
+// `websites[0].url` can hand a form an empty string to type into a url input. "First that exists"
+// gives a candidate who filled only GitHub a real link, and gives nobody a blank one.
+// ONE row is filled because ORC renders one `siteLink-<n>` at a time; adding more is the operator's.
+function atsFirstWebsiteValue(profile) {
+  const list = atsProfileWebsites(profile);
+  return list.length ? list[0] : null;
+}
+
+// EVERY non-empty website, in the profile's own order, https-normalized. The profile keeps blank
+// slots (the portfolio and "other" rows are usually empty strings), so the list is compacted here —
+// which is what makes an ORDINAL meaningful: "link 2" is the second website that EXISTS, not the
+// second row of the editor.
+function atsProfileWebsites(profile) {
+  const ws = Array.isArray(profile && profile.websites) ? profile.websites : [];
+  const out = [];
+  for (const w of ws) {
+    const u = w && typeof w.url === "string" ? w.url.trim() : "";
+    if (!u) continue;
+    const full = atsLib.ensureHttps(u);
+    if (full && out.indexOf(full) === -1) out.push(full);
+  }
+  return out;
+}
+
 function atsWebsiteValue(profile, type) {
   const ws = Array.isArray(profile && profile.websites) ? profile.websites : [];
   const hit = ws.find((w) => w && String(w.type || "").toLowerCase() === type && String(w.url || "").trim());
@@ -366,8 +540,31 @@ function atsWebsiteValue(profile, type) {
 // multi-entry repeating sections are still open work (docs/status.md).
 function atsMapKey(ats, fieldName) {
   const n = String(fieldName == null ? "" : fieldName);
-  if (ats !== "icims") return n;
-  return n.replace(/^-?\d+_/, "");
+  if (ats === "icims") return n.replace(/^-?\d+_/, "");
+  // ── ORACLE: strip the render counter, then reduce a self-ID name to its ORA_ token ────────
+  // ⚠ THIS IS THE **MAP-LOOKUP** KEY ONLY, NOT A DURABLE/SUBMIT KEY. The two differ for ORC and
+  // conflating them would be a bug: this function is allowed to be LOSSY because the map contains
+  // only known platform names, so a collapsed per-tenant key simply fails to match and falls to the
+  // label ladder — which is the correct destination for it anyway. A submit key must instead stay
+  // UNIQUE per field, and for ORC that is deliberately still unsettled (see below).
+  //
+  // 1. A trailing `-<digits>` is the render-assignment counter. Text and combobox `name`s are clean
+  //    (`lastName`, `US-STANDARD-ORA_GENDER-STANDARD`) but a RADIO GROUP's shared name carries it
+  //    (`US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12`), so without this the disability group never
+  //    matches the map entry its gender/veteran siblings do. Observed 2026-08-19.
+  //    ⚠ Safe on every other observed name because the digits there are NOT hyphen-separated:
+  //    `region1`, `region2`, `addressLine1`, `namInformation15` are all untouched.
+  //    `siteLink-1` → `siteLink` is INTENDED (the digit is an entry ordinal; the family is the map
+  //    key, exactly as iCIMS treats its ordinals).
+  // 2. Self-ID names are `<JURISDICTION>-STANDARD-ORA_<THING>-STANDARD`. `ORA_<THING>` is Oracle's
+  //    stable vocabulary; the wrapper is jurisdiction + variant, so keying on the whole string would
+  //    silently stop matching outside the US. Reduce to the token and the map becomes locale-neutral.
+  if (ats === "oracle") {
+    const bare = n.replace(/-\d+$/, "");
+    const ora = /(ORA_[A-Z0-9_]+)/.exec(bare);
+    return ora ? ora[1] : bare;
+  }
+  return n;
 }
 
 // ── REPEATING SECTIONS ARE SCOPED TO THEIR OWN ENTRY (operator, 2026-08-16) ──────────────
@@ -1247,7 +1444,37 @@ function atsRouteLabel(label, f, profile, defaults) {
   // ("No, I do not have a disability" ⊂ "…, or have had one in the past") commits at the
   // CONTAINMENT tier, which the driver grades filled_review (flagged, human verifies) —
   // never silent, and the ambiguity guard still refuses a 2+-option hit.
-  if (/hispanic|latino/i.test(L)) { if (has(si.hispanic_or_latino)) return { candidates: [si.hispanic_or_latino], source: "eeo", containment: true, path: "self_identification.hispanic_or_latino" }; return { eeoUnstated: true }; }
+  // ⚠⚠ THE QUESTION CAN BE IN THE OPTIONS RATHER THAN THE LABEL, and on a US EEO form the two
+  // demographics that get confused this way are the two that must never be swapped. Live on Oracle:
+  //
+  //     label "Ethnicity"  ·  single checkbox  ·  option "I am Hispanic or Latino."
+  //
+  // "Ethnicity" carries no hispanic/latino token, so it fell past this rung into the race one and was
+  // answered from `race_ethnicity` ("Asian") — a demographic answered from a DIFFERENT demographic
+  // field. It could not commit (the form offers no such option), so it reached review rather than
+  // submitting something false; but the next tenant to word it as a yes/no dropdown would have taken
+  // the wrong value silently.
+  //
+  // The US EEO standard asks TWO questions — "are you Hispanic or Latino?" then "what race?" — and
+  // the profile models them as two fields precisely so each is answered from its own. Reading the
+  // OPTIONS is what tells them apart when the label will not: an option naming Hispanic/Latino IS the
+  // Hispanic/Latino question, whatever the heading above it says. Evidence, not inference.
+  // ⚠⚠ AND "AN OPTION MENTIONS HISPANIC" IS NOT THE TEST — a regression test caught that within
+  // minutes. EEO-1 race categories are routinely SUFFIXED with the phrase as a negation:
+  //     ["Asian (Not Hispanic or Latino)", "White (Not Hispanic or Latino)", "Decline to self identify"]
+  // so both "any option mentions it" and "every option mentions it" misroute a RACE question to the
+  // Hispanic field. The discriminator is whether the options offer OTHER RACES as alternatives: a
+  // list of races qualified by ethnicity is a race question; a list that only ever talks about
+  // Hispanic identity is the ethnicity question.
+  const opts = ((f && f.options) || []).map(String);
+  const RACE_TOKEN = /\basian\b|\bwhite\b|\bblack\b|african|american indian|alaska|hawaiian|pacific islander|two or more races|caucasian/i;
+  const optsAreOnlyHispanic = opts.length > 0
+    && opts.every((o) => /hispanic|latino/i.test(o))
+    && !opts.some((o) => RACE_TOKEN.test(o));
+  if (/hispanic|latino/i.test(L) || optsAreOnlyHispanic) {
+    if (has(si.hispanic_or_latino)) return { candidates: [si.hispanic_or_latino], source: "eeo", containment: true, path: "self_identification.hispanic_or_latino" };
+    return { eeoUnstated: true };
+  }
   if (/race|ethnicit/i.test(L)) { if (has(si.race_ethnicity)) return { candidates: [si.race_ethnicity], source: "eeo", containment: true, path: "self_identification.race_ethnicity" }; return { eeoUnstated: true }; }
   if (/veteran/i.test(L)) { if (has(si.veteran_status)) return { candidates: [si.veteran_status], source: "eeo", containment: true, path: "self_identification.veteran_status" }; return { eeoUnstated: true }; }
   if (/disabilit/i.test(L)) { if (has(si.disability_status)) return { candidates: [si.disability_status], source: "eeo", containment: true, path: "self_identification.disability_status" }; return { eeoUnstated: true }; }
@@ -1404,6 +1631,274 @@ function atsInjScan(ats) {
       push({ fieldName: nm, inputSel: el.id ? "#" + esc(el.id) : (el.tagName === "TEXTAREA" ? "textarea" : "input") + '[name="' + esc(nm) + '"]',
         widgetType: el.tagName === "TEXTAREA" ? "textarea" : (nm === "location" ? "location" : "text"),
         label, isRequired: required, value: el.value || null });
+    }
+    return out;
+  }
+
+  // ── ORACLE RECRUITING CLOUD (Oracle JET SPA + Knockout on native inputs; observed 2026-08-19) ──
+  // Structure: <apply-flow-section> → <apply-flow-block> (+ <apply-flow-block-title>) →
+  // <form-builder> → div.input-row.input-row--<kind>. The row CLASS declares the widget, so
+  // classification here is a read rather than an inference — the opposite of every earlier platform.
+  //
+  // ⚠ SCOPED TO EVERY *VISIBLE* SECTION, and each half of that is a measured correction:
+  //   • not the whole document — all sections of all steps are mounted at once, and the inactive ones
+  //     report `hidden`=false, `aria-hidden`="false", `display`=block. Only the RECT distinguishes
+  //     them, so a document-wide scan returns every step's fields as if they were one page.
+  //   • not "the single visible section" and not the URL's number either — Baylor served 5 sections
+  //     for 4 steps (index 0 an empty shell) while Oracle serves 4 for 3, and on Oracle TWO are
+  //     visible at once (index 0 is the résumé-import banner, index 1 the real step-1 content).
+  // So: every section with a non-zero rect, and no arithmetic on indexes.
+  if (ats === "oracle") {
+    const secs = [...document.querySelectorAll("apply-flow-section")].filter(vis);
+    if (!secs.length) return out;
+    const stripStar = (s) => String(s || "").replace(/\s*[*✱]\s*$/, "").trim();
+    const blockOf = (el) => {
+      const b = el.closest("apply-flow-block");
+      return b ? txt(b.querySelector("apply-flow-block-title")) : "";
+    };
+    // ⚠ A DECOY IS EXCLUDED BY DECLARED INTENT, NEVER BY GEOMETRY. ORC's gate ships a honeypot
+    // measuring 179×38 / 200×38 with visibility:visible and a non-null offsetParent, so every
+    // visibility test here passes it. Writing to one marks the application as a bot and NO read-back
+    // notices, because the write succeeds. LOCKSTEP with atsDecoyKind (an injected fn cannot import).
+    const isDecoy = (e) => {
+      const nm = ((e.name || "") + " " + (e.getAttribute("aria-label") || "")).replace(/\s+/g, " ");
+      if (/\bhoney[\s_-]?pot\b/i.test(nm)) return true;
+      return e.getAttribute("aria-hidden") === "true" && e.getAttribute("tabindex") === "-1";
+    };
+    const reqOf = (el, rawLabel) => el.required === true || el.getAttribute("aria-required") === "true"
+      || /[*✱]\s*$/.test(String(rawLabel || ""))
+      || !!(el.id && (document.querySelector('label[for="' + esc(el.id) + '"]') || {}).classList
+            && document.querySelector('label[for="' + esc(el.id) + '"]').classList.contains("input-row__label--required"));
+
+    for (const sec of secs) {
+      // 1) OPTION GROUPS first, so their member boxes are never also emitted as standalone fields.
+      //    The group is the ROW (div.input-row--radiogroup) — NOT a shared `name`, which the
+      //    checkbox-rendered variant does not even have (measured `name: null` on race + ethnicity).
+      //    ⚠ The QUESTION is the row's own label, which is the one WITHOUT a `for` attribute; each
+      //    member's `label[for=<id>]` is its OPTION text. Using a member's label as the field label
+      //    would file every option as its own required question — the Gusto 12-phantom-field failure.
+      //    ⚠ `--radiogroup` does NOT imply pick-one: this tenant's race group asks "Select the races
+      //    you identify with." So ARITY comes from the input TYPE, never from the class name.
+      for (const row of sec.querySelectorAll("div.input-row--radiogroup")) {
+        const boxes = [...row.querySelectorAll('input[type="radio"], input[type="checkbox"]')].filter((e) => !isDecoy(e));
+        if (!boxes.length) continue;
+        const qEl = row.querySelector("form-element-label") || [...row.querySelectorAll("label")].find((l) => !l.getAttribute("for"));
+        const rawQ = txt(qEl);
+        const optOf = (b) => (b.id ? txt(document.querySelector('label[for="' + esc(b.id) + '"]')) : "") || b.value || "";
+        const isRadio = String(boxes[0].type).toLowerCase() === "radio";
+        // A shared `name` exists only on the radio variant; fall back to the group's question so a
+        // nameless checkbox group still has a stable key.
+        // ⚠ The group separator "; " is inlined — a LOCKSTEP dup of lib.js's GROUP_JOIN, because an
+        // injected fn cannot import, and the replay splits a multi-answer value on exactly this
+        // vocabulary. Change one, change both.
+        // (The helper name is deliberately not written here: the self-containment test greps this
+        //  function's SOURCE for shim references, and a comment would trip it.)
+        const key = boxes[0].name || ("group:" + String(rawQ).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48));
+        if (seen.has(key)) continue; seen.add(key);
+        push({ fieldName: key, inputSel: boxes.map((b) => "#" + esc(b.id)).join(", "),
+          // ⚠⚠ A ONE-BOX GROUP IS STILL A GROUP (operator, 2026-08-20). Typing it `checkbox` made the
+          // review editor render a bare boolean and DROP the options, so the Hispanic/Latino question
+          // reached the operator as `Ethnicity — Unchecked`: the group's question with an opaque
+          // state word, and no sign of what was being declined. The distinction that matters is
+          // structural, not arity — in a `--radiogroup` row the QUESTION and the OPTION TEXT are
+          // different elements ("Ethnicity" vs "I am Hispanic or Latino"), so collapsing to a boolean
+          // always loses the half that carries the meaning. A genuine standalone checkbox (branch 3,
+          // `div.input-row--checkbox`, e.g. a terms box) keeps `checkbox`, because there the label IS
+          // the meaning and a boolean says everything.
+          widgetType: isRadio ? "radio" : "checkbox_group",
+          label: stripStar(rawQ) || key, isRequired: boxes.some((b) => reqOf(b, rawQ)),
+          value: boxes.filter((b) => b.checked).map(optOf).join("; ") || null,
+          options: boxes.map(optOf).filter(Boolean),
+          optionSels: boxes.map((b) => "#" + esc(b.id)),
+          group: isRadio ? "radio" : "checkbox", section: blockOf(boxes[0]) });
+      }
+
+      // 2) DATE COMPOSITES. Parts share ONE `name` and are told apart only by an id prefix
+      //    (`month-startDate-34` / `year-startDate-34`), so a name identifies the PAIR, not a
+      //    control. ⚠ ARITY VARIES: the timeline's dates are month+year, while this tenant's
+      //    `earliestAvailableDate` is month+DAY+year — so the parts are discovered, never assumed,
+      //    and a required day here means the profile's month precision is not always sufficient.
+      for (const row of sec.querySelectorAll("div.datepicker-row")) {
+        const parts = [...row.querySelectorAll("input")].filter((e) => !isDecoy(e));
+        if (!parts.length) continue;
+        const nm = parts[0].name || "";
+        if (!nm || seen.has("date:" + nm)) continue; seen.add("date:" + nm);
+        const order = [];
+        const bySel = {};
+        for (const p of parts) {
+          const m = /^(month|day|year)-/.exec(p.id || "");
+          if (m) { order.push(m[1]); bySel[m[1]] = "#" + esc(p.id); }
+        }
+        const rawLabel = txt(row.querySelector("form-element-label")) || txt([...row.querySelectorAll("label")].find((l) => !l.getAttribute("for")));
+        push({ fieldName: nm, inputSel: Object.values(bySel).join(", "), widgetType: "date",
+          label: stripStar(rawLabel) || nm, isRequired: parts.some((p) => reqOf(p, rawLabel)),
+          value: parts.map((p) => p.value).filter(Boolean).join("/") || null,
+          dateParts: order, datePartSels: bySel, section: blockOf(parts[0]) });
+      }
+
+      // 3) LONE CHECKBOX ROWS. ORC files a standalone checkbox in `div.input-row--checkbox` rather
+      //    than a radiogroup, so it needs its own pass — the general loop below deliberately skips
+      //    every radio and checkbox (see the note there), and without this they would be lost.
+      //    ⚠ VISIBLE ONLY: this tenant ships pre-checked, hidden communication-preference flags
+      //    (`af-checkbox-emailPreferredFlag`, `…phonePreferredFlag`). They are not questions being
+      //    asked, so surfacing them would add review noise and invite us to toggle a contact
+      //    preference nobody chose.
+      for (const row of sec.querySelectorAll("div.input-row--checkbox")) {
+        const box = [...row.querySelectorAll('input[type="checkbox"]')].filter((e) => !isDecoy(e) && vis(e))[0];
+        if (!box) continue;
+        const key = box.name || box.id;
+        if (!key || seen.has(key)) continue; seen.add(key);
+        const rawLabel = (box.id ? txt(document.querySelector('label[for="' + esc(box.id) + '"]')) : "")
+          || txt(row.querySelector("form-element-label")) || box.getAttribute("aria-label") || "";
+        push({ fieldName: key, inputSel: "#" + esc(box.id), widgetType: "checkbox",
+          label: stripStar(rawLabel) || key, isRequired: reqOf(box, rawLabel),
+          value: box.checked ? "true" : null, section: blockOf(box) });
+      }
+
+      // 3b) ⚠⚠ ORC'S YES/NO QUESTIONS ARE A PAIR OF **BUTTONS**, NOT A CONTROL (live 2026-08-20).
+      // The operator reported three REQUIRED yes/no questions on step 3 that no run ever filled. They
+      // were there the whole time, and every sweep this file owns was blind to them at once:
+      //   • `input, select, textarea` finds nothing — there is no form control of any kind;
+      //   • the ARIA sweep finds nothing — the roles are `list` / `listitem`, not radio/radiogroup;
+      //   • the block-population settle read 0 "inputs" and spent 15s deciding the block was still
+      //     loading, then said so — while the block sat there VISIBLE at 680×331 with all three
+      //     questions rendered.
+      // The widget is `ul.cx-select-pills-container` → `li` → `button.cx-select-pill-section`, with
+      // **`aria-pressed`** as the selected state. So "count the controls" was never the right
+      // question; the right one is "what can be answered here".
+      //
+      // ⚠ AND THE ROW CLASS IS `input-row--has-picker` — THE SAME AS A COMBOBOX. That is why this
+      // must be its own pass rather than a branch in the loop below: the classifier would call it a
+      // picker, look for `input[role=combobox]` inside, find none, and drop the field silently.
+      //
+      // ⚠ IDENTITY: there is no id and no name anywhere on the widget. The row's own
+      // `<label for="302960759052341-13">` points at an id that DOES NOT EXIST as an element, but it
+      // names the per-tenant flexfield — so the durable key is that id with the volatile render
+      // counter stripped, exactly the rule every other ORC field follows (`lastName-21` → lastName).
+      // The FULL id is used only for the live selector, which is what an id is for here.
+      for (const ul of sec.querySelectorAll("ul.cx-select-pills-container")) {
+        if (!vis(ul)) continue;
+        const row = ul.closest("div.input-row");
+        if (!row) continue;
+        const forId = (row.querySelector("label[for]") || {}).getAttribute
+          ? row.querySelector("label[for]").getAttribute("for") : null;
+        if (!forId) continue;
+        const key = String(forId).replace(/-\d+$/, "");
+        if (!key || seen.has(key)) continue; seen.add(key);
+        // The ul's OWN aria-label carries the whole question, untruncated and without the required
+        // star — cleaner than the label element, whose text is the same string plus decoration.
+        const rawLabel = ul.getAttribute("aria-label") || txt(row.querySelector("form-element-label")) || "";
+        const btns = [...ul.querySelectorAll("li button")];
+        if (!btns.length) continue;
+        const picked = btns.find((b) => b.getAttribute("aria-pressed") === "true");
+        // ⚠ REQUIRED IS ON THE **LABEL** CLASS, not the row's. A first probe looked at the row and
+        // concluded these were optional — which would have been the worst possible outcome, because
+        // the AI rescue is gated on `isRequired` and an optional unmapped field is deliberately left
+        // blank. They would have stayed unfilled AND unexplained.
+        const lblEl2 = row.querySelector("label.input-row__label");
+        const isReq = !!(lblEl2 && /input-row__label--required/.test(String(lblEl2.className || "")))
+          || !!row.querySelector(".input-row__label--required-star")
+          || /[*✱]\s*$/.test(String(rawLabel || ""));
+        push({ fieldName: key,
+          inputSel: 'div.input-row:has(label[for="' + esc(forId) + '"]) ul.cx-select-pills-container',
+          widgetType: "yesno", label: stripStar(rawLabel) || key, isRequired: isReq,
+          value: picked ? txt(picked) : null,
+          options: btns.map((b) => txt(b)).filter(Boolean), section: blockOf(ul) });
+      }
+
+      // 4) EVERYTHING ELSE, one control at a time.
+      // ⚠ RADIO AND CHECKBOX ARE SKIPPED HERE ON PURPOSE — the grouping passes above own them.
+      // Classifying a grouped box here would push it a SECOND time as a plain field keyed on its own
+      // id, which on Greenhouse turned one 12-option question into 12 phantom REQUIRED text fields,
+      // each buying its own LLM call. Structurally enforced by a test that reads this very line.
+      for (const el of sec.querySelectorAll("input, textarea, select")) {
+        if (el.type === "hidden" || el.type === "radio" || el.type === "checkbox" || isDecoy(el)) continue;
+        if (el.closest("div.input-row--radiogroup") || el.closest("div.datepicker-row")) continue; // handled above
+        // ⚠ EVERY TEXTAREA ROW SHIPS A CLONE with an empty id AND empty name (an autosize mirror).
+        // Pushing it creates a phantom free-text field — the shape that becomes required and buys an
+        // LLM call. The named one is the real control.
+        const isFile = el.type === "file";
+        // ⚠ THE ANONYMOUS-BUT-REAL CONTROLS MUST SURVIVE THIS GUARD. It exists to drop the textarea
+        // CLONE (empty id AND empty name — an autosize mirror), but ORC's actual phone-number input
+        // is also id-less and name-less, and it is REQUIRED. Caught by running this scan against the
+        // live form: the field silently vanished, which would leave the form uncompletable while the
+        // bundle looked clean. `type=tel` is therefore admitted here and keyed synthetically below.
+        const isAnonReal = !el.id && !el.name && el.type === "tel";
+        if (!el.id && !el.name && !isFile && !isAnonReal) continue;
+        if (!isFile && !vis(el)) continue; // file inputs are styled invisible by design
+
+        const lblEl = el.id ? document.querySelector('label[for="' + esc(el.id) + '"]') : null;
+        const rawLabel = txt(lblEl) || el.getAttribute("aria-label") || "";
+        const row = el.closest("div.input-row");
+        const rowCls = String((row && row.className) || "");
+        let widgetType, key = el.name || el.id, searchDriven = false;
+
+        if (isFile) {
+          // ⚠ THREE FILE INPUTS SHARE `name="attachment-upload"`, told apart ONLY by their wrapper
+          // (<resume-upload-button> / <cover-letter-upload-button> / <attachment-upload-button>). So
+          // `name` is NOT unique on an ORC form and the wrapper is the discriminator; the label
+          // agrees, which is a useful redundancy rather than the primary signal.
+          let wrap = null;
+          for (let p = el.parentElement; p && !wrap; p = p.parentElement) {
+            const n = p.tagName.toLowerCase();
+            if (/^(resume|cover-letter|attachment)-upload-button$/.test(n) || n === "referral-resume-block") wrap = n;
+          }
+          widgetType = "file_upload";
+          key = wrap ? wrap.replace(/-button$/, "") : (el.id || "attachment-upload");
+        } else if (el.tagName === "SELECT") {
+          widgetType = "dropdown_native";
+        } else if (el.getAttribute("role") === "combobox" || /input-row--has-picker/.test(rowCls)) {
+          // ⚠ IS THIS PICKER ENUMERABLE? Declared by the row, not inferred: a geo picker carries
+          // `geo-hierarchy-form-element` and is BOTH dependent on a parent and effectively unbounded
+          // (cities, postal codes), so an empty open cannot produce the operator's answer — the same
+          // reason Workday's option capture skips SKILLS. Everything else is a fixed vocabulary that
+          // an empty open returns WHOLE (measured: country = 251 rows, Afghanistan→Zimbabwe, so ORC
+          // does not paginate and needs no page-cap derivation the way iCIMS did).
+          searchDriven = /geo-hierarchy-form-element/.test(rowCls);
+          // ORC's own picker. Options are NOT read here: the listbox is created on demand and holds
+          // `div[role="row"]` rows inside a `div[role="grid"]` — a `[role=option]` scrape finds
+          // NOTHING — so reading them at scan time would mean opening every dropdown on the page.
+          widgetType = "select";
+        } else if (el.tagName === "TEXTAREA" || /input-row--textarea/.test(rowCls)) {
+          widgetType = "textarea";
+        } else if (el.type === "checkbox") {
+          widgetType = "checkbox";
+        } else {
+          widgetType = "text";
+        }
+
+        // The phone composite: `name="phoneNumber"` is the DIAL-CODE picker, and the control that
+        // wants the number has NO id and NO name at all. Give it a synthetic key so it is
+        // addressable and can never collide with the picker's.
+        if (!el.name && !el.id && el.type === "tel") { key = "phoneNumber--number"; widgetType = "text"; }
+
+        if (!key || seen.has(key)) continue; seen.add(key);
+        // ⚠ THE SELECTOR MUST BE THE FIELD'S OWN, and `.phone-row__input` is NOT a general fallback.
+        // Caught by running this scan through the extension: ORC's résumé-IMPORT input has no id and
+        // no name, so it inherited the phone fallback and came back as
+        // `{fieldName:"attachment-upload", inputSel:".phone-row__input"}` — an attach would have
+        // written a file into the PHONE box. A fallback that is right for one field and silently
+        // wrong for every other is worse than no fallback.
+        let sel = el.id ? "#" + esc(el.id) : (el.name ? '[name="' + esc(el.name) + '"]' : null);
+        if (!sel && key === "phoneNumber--number") sel = ".phone-row__input";
+        if (!sel && isFile) {
+          // A file input is addressable through the wrapper that identifies it, when there is one.
+          for (let p = el.parentElement; p && !sel; p = p.parentElement) {
+            const n = p.tagName.toLowerCase();
+            if (/^(resume|cover-letter|attachment)-upload-button$/.test(n)) sel = n + ' input[type="file"]';
+          }
+        }
+        // ⚠ NO SELECTOR ⇒ NOT EMITTED. An unaddressable field cannot be actuated OR verified, so
+        // emitting it would put a record in the bundle that no later pass can act on. ORC's
+        // résumé-import banner is exactly this, and skipping it is also what the operator asked for:
+        // that control is the résumé AUTOFILL, which must not run before the deterministic fill.
+        if (!sel) continue;
+        push({ fieldName: key, inputSel: sel,
+          widgetType, label: stripStar(rawLabel) || key, isRequired: reqOf(el, rawLabel),
+          value: (el.type === "checkbox" ? (el.checked ? "true" : null) : (el.value || null)),
+          searchDriven: searchDriven || undefined,
+          section: blockOf(el) });
+      }
     }
     return out;
   }
@@ -2057,7 +2552,9 @@ function atsInjReadValue(ats, inputSel, widgetType) {
   }
   if (widgetType === "checkbox") return { ok: true, value: !!el.checked };
   if (widgetType === "yesno") {
-    const entry = el.closest(".ashby-application-form-field-entry");
+    // …and the same container fallback as atsInjClickYesNo, for the same reason. `aria-pressed` was
+    // already the signal it reads, which is exactly what ORC's pills use.
+    const entry = el.closest(".ashby-application-form-field-entry") || el;
     const picked = entry && [...entry.querySelectorAll("button")].find((b) => /_selected|active/i.test(String(b.className || "")) || b.getAttribute("aria-pressed") === "true");
     return { ok: true, value: picked ? txt(picked) : (el.checked ? "Yes" : null) };
   }
@@ -2225,8 +2722,13 @@ function atsInjSetChecked(inputSel, on) {
 function atsInjClickYesNo(inputSel, want) {
   const cb = document.querySelector(inputSel);
   if (!cb) return { ok: false, error: "not-found:" + inputSel };
-  const entry = cb.closest(".ashby-application-form-field-entry");
-  if (!entry) return { ok: false, error: "no-field-entry" };
+  // ⚠ THE BUTTON CONTAINER IS THE ASHBY FIELD ENTRY **OR THE ELEMENT ITSELF**. Ashby hands this a
+  // hidden checkbox whose sibling buttons live in an ancestor wrapper; ORC's pill widget IS the
+  // container (`ul.cx-select-pills-container` holding the Yes/No buttons), so requiring the Ashby
+  // wrapper made a perfectly answerable question `no-field-entry`. Falling back to the element keeps
+  // Ashby byte-identical while making the primitive shape-agnostic — which is the whole reason ORC
+  // needed no new commit path, no new review widget and no new AI kind: `yesno` already existed.
+  const entry = cb.closest(".ashby-application-form-field-entry") || cb;
   const btn = [...entry.querySelectorAll("button")].find((b) => (b.textContent || "").trim().toLowerCase() === String(want).toLowerCase());
   if (!btn) return { ok: false, error: "button-not-found", offered: [...entry.querySelectorAll("button")].map((b) => (b.textContent || "").trim()) };
   btn.click();
@@ -2399,6 +2901,21 @@ function atsInjSubmitState(ats) {
   // clicks only behind the arm gate.
   if (ats === "icims") btn = [...document.querySelectorAll('#cp_form_submit_i, input[type="submit"], button[type="submit"]')].find((b) => vis(b)) || null;
   if (!btn) btn = [...document.querySelectorAll('button[type="submit"], button')].find((b) => /submit application|submit$/i.test((b.textContent || "").trim()) && vis(b));
+  // ⚠ ORACLE'S STEP PAGES HAVE **NEXT**, NOT SUBMIT — Submit appears only on the last step. So the
+  // generic finder returns nothing and atsLooksLikeApplicationForm rejected a perfectly good form as
+  // "not an application form" (measured: a run reached …/apply/section/1 and stopped
+  // `form-not-rendered`). Third instance of this exact lesson after Lever's #btn-submit and iCIMS'
+  // <input type=submit>.
+  //
+  // ⚠⚠ REPORTED SEPARATELY, NOT FOLDED INTO `hasSubmit`, and that separation is the safety property:
+  // `hasSubmit` is what the SUBMIT GATE clicks. Letting a "Next" satisfy it would mean a submit run
+  // pressing Next — advancing a step while believing it had submitted the application. Recognition
+  // and submission are different questions and get different fields.
+  let flowNext = null;
+  if (ats === "oracle") {
+    const pag = document.querySelector("apply-flow-pagination") || document;
+    flowNext = [...pag.querySelectorAll("button")].find((b) => /^(next|continue)\b/i.test((b.textContent || "").trim()) && vis(b)) || null;
+  }
   const r = btn ? btn.getBoundingClientRect() : null;
   // a VISIBLE captcha challenge. ⚠ Lever's DORMANT invisible-mode hCaptcha container is a
   // FULL-VIEWPORT iframe (1547×720 live) with `visibility:hidden` — a size-only test calls
@@ -2412,7 +2929,9 @@ function atsInjSubmitState(ats) {
   });
   const bodyText = (document.body.innerText || "").slice(0, 4000);
   const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText) || /\/thanks(\?|$)/.test(location.href);
-  return { ok: true, hasSubmit: !!btn, rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
+  return { ok: true, hasSubmit: !!btn, hasFlowControl: !!flowNext,
+    flowCaption: flowNext ? (flowNext.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30) : null,
+    rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
     disabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null, captchaChallenge: challenge, confirmed, url: location.href };
 }
 
@@ -2601,6 +3120,12 @@ function atsNearOptions(texts, query, limit) {
 // atsInjReadOptions). A healthy widget exits on its first read and pays neither. `search` is
 // sized from the live measurement that earned this: Discord's school list answered at 4049ms on
 // a hidden tab, so the old flat 2000ms could not have worked no matter how it retried.
+// ORC's picker search is server-backed and its own budget: the school/geo lookups answered in ~1.3-4s
+// during recon, and a give-up that is too short reports "no option matched" on a field whose list was
+// about to arrive — the exact failure iCIMS' 675ms settle produced. Separate from ATS_POLL because
+// nothing else in that table describes a grid-of-rows widget.
+var ATS_ORC_PICK_MS = 8000;
+
 const ATS_POLL = {
   // The first render after opening. The soft deadline only applies once the menu has actually
   // SETTLED (see pollFor): an empty read while the menu node isn't even mounted is not an answer,
@@ -2891,6 +3416,16 @@ function atsDialMatch(candidates, optionTexts) {
   for (const cand of candidates || []) {
     const cc = atsDialCode(cand), cn = atsDialName(cand);
     if (!cc || !cn) continue;
+    // ⚠⚠ AN EXACT NAME MATCH WINS OUTRIGHT (live rehearsal, 2026-08-20). The prefix fallback below
+    // exists so a form's shorter or longer wording still lands, but it made "United States" match
+    // BOTH "+1 (United States)" and "+1 (United States Minor Outlying Islands)" — two hits, so the
+    // ambiguity guard refused, and the replay reported `no dial-code option agreed with
+    // ["+1 (United States)"]` while the form was offering that exact string as its FIRST option.
+    // The guard was right to distrust two prefix hits; it should never have been asked, because one
+    // of them was an exact match. Exact first; ambiguity only among equally-good candidates.
+    const exact = [];
+    opts.forEach((o, i) => { if (atsDialCode(o) === cc && atsDialName(o) === cn) exact.push(i); });
+    if (exact.length === 1) return { index: exact[0], tier: "dial-code+name" };
     const hits = [];
     opts.forEach((o, i) => {
       if (atsDialCode(o) !== cc) return;
@@ -3093,12 +3628,34 @@ function atsDurableFieldName(name) {
 // exactly, so Greenhouse / Lever / Ashby are byte-identical.
 // Accepts BOTH shapes on purpose: live scan fields (camelCase, from atsInjScan) and bundle entries /
 // result records (snake_case). One key function, or the two sides key differently and nothing matches.
+// ⚠⚠ ORC STAMPS A VOLATILE RENDER COUNTER ONTO A RADIO GROUP'S `name` (live rehearsal, 2026-08-20).
+// Measured across two visits to the SAME form: the fill saw
+// `US-STANDARD-ORA_DISABILITY_STATUS-STANDARD-12` and the rehearsal `…-STANDARD-13`, so the approved
+// answer reported `no matching field on the live form` and blocked the gate on a question that was
+// sitting right there. The recon predicted this ("id carries a volatile counter"); this is it
+// arriving on a `name`, which is supposed to be the durable half.
+//
+// ⚠ THE STRIP IS DELIBERATELY NARROW, and the reason is a collision, not caution. ORC also serves
+// `siteLink-1` / `siteLink-2`, where the trailing number is a MEANINGFUL ENTRY ORDINAL — stripping
+// that would key both links as `siteLink`, so one would shadow the other and the verify would match
+// the wrong one or call it missing. There is no syntactic way to tell a render counter from an
+// ordinal in general, so this keys on the ONE shape actually observed to be volatile: the platform
+// self-ID groups, whose names end `-STANDARD-<digits>`. `namInformation15` (digits, no hyphen) is
+// untouched for free. Widen ONLY on evidence of another family doing it — a wrong widening is
+// silent and costs a mismatched answer, which is worse than the failure it would fix.
+const ATS_ORC_VOLATILE_SUFFIX_RE = /-STANDARD-\d+$/;
+function atsOrcDurableName(name) {
+  const n = String(name == null ? "" : name);
+  return ATS_ORC_VOLATILE_SUFFIX_RE.test(n) ? n.replace(/-\d+$/, "") : n;
+}
+
 function atsSubmitKey(ats, f) {
   // A bare string is accepted so a caller that only holds a name still gets the OLD key rather than a
   // silently empty one — an empty key would match every other keyless field, which is worse than
   // missing the position.
-  if (typeof f === "string") return atsDurableFieldName(f);
+  if (typeof f === "string") return ats === "oracle" ? atsOrcDurableName(f) : atsDurableFieldName(f);
   const name = String((f && (f.fieldName != null ? f.fieldName : f.name)) || "");
+  if (ats === "oracle") return atsOrcDurableName(name);
   if (ats !== "icims" || !f) return atsDurableFieldName(name);
   const section = f.entrySection != null ? f.entrySection : f.entry_section;
   const idx = typeof f.entryIndex === "number" ? f.entryIndex
@@ -3139,11 +3696,18 @@ function atsLooksLikeApplicationForm(fields, submitState) {
   const hasResume = list.some((x) => (x && x.widgetType === "file_upload") || /resume|\bcv\b/.test(txt(x)));
   const hasName = list.some((x) => /(^|[^a-z])(first|last|full|preferred|legal)?[ _-]*name([^a-z]|$)/.test(txt(x)));
   const hasSubmit = !!(submitState && submitState.hasSubmit);
+  // ⚠ A MULTI-STEP FLOW CONTROL COUNTS FOR RECOGNITION. On Oracle, step 1 of 3 has "Next" and no
+  // Submit at all, so requiring a submit control refused a form we could fill perfectly well. What
+  // this function answers is "is this a fillable application page", and a Next answers that.
+  // It does NOT make the page submittable — that stays keyed on `hasSubmit`, which the submit gate
+  // reads, so nothing here can cause a Next to be pressed in place of a Submit.
+  const hasFlow = !!(submitState && submitState.hasFlowControl);
+  const canAct = hasSubmit || hasFlow;
   return {
-    ok: hasSubmit && (hasResume || hasEmail || hasName),
-    hasSubmit, hasResume, hasEmail, hasName,
-    why: hasSubmit ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
-                   : "no submit control on the page — this isn't a form we could ever submit",
+    ok: canAct && (hasResume || hasEmail || hasName),
+    hasSubmit, hasFlowControl: hasFlow, hasResume, hasEmail, hasName,
+    why: canAct ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
+                : "no submit or next control on the page — this isn't a form we could fill or advance",
   };
 }
 
@@ -3230,6 +3794,16 @@ function atsInjPageSignature() {
   const fr = document.getElementById("icims_content_iframe") || document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
   const h = document.querySelector("h1, h2");
   return {
+    // ⚠ `ok` IS LOAD-BEARING, NOT DECORATION (live 2026-08-19). Every other atsInj* fn returns it, so
+    // a caller naturally writes `r && r.ok ? r : null` — and runOrcPreForm's did. This function did
+    // NOT return it, so that guard turned EVERY successful read into null: both sides of the compare
+    // were null, atsSignatureChanged's deliberately-conservative "an unreadable side is no change"
+    // rule then said false forever, and every ORC waitForChange ran its FULL budget every time
+    // (measured: 15697ms of a 15000ms budget, 20228ms of 20000ms — 36s per run). The flow still
+    // worked, because the loop's next round re-scans and sees the new view, which is exactly why it
+    // hid: a wait that always times out looks like a slow page, and the tempting fix is a bigger
+    // budget. Nothing was wrong with the budget.
+    ok: true,
     url: String(location.href).split("#")[0],
     frameSrc: fr ? String(fr.getAttribute("src") || fr.src || "").split("#")[0] : null,
     controls: document.querySelectorAll(q).length,
@@ -3439,6 +4013,3204 @@ function icimsAuthView(s) {
   return "none";
 }
 
+// ── ORC's TYPEAHEAD PICKER: type → poll → pointer-commit, ALL IN ONE CALL (2026-08-19) ───
+// Every clause below is a measured live finding, not a precaution. Verified on Oracle's own careers
+// site (`eeho.fa.us2`, job 334325) against country / city / state / county / postal / dial-code.
+//
+//   1. THE SEARCH FIRES ON KEY EVENTS, NOT ON `input`. A native-setter write plus an `input` event
+//      sets the value and even opens the listbox, but no search runs and the box sits EMPTY. Typing
+//      character-by-character with keydown/input/keyup returns rows. (Knockout takes the value from
+//      `input`; the SEARCH is bound to keys.)
+//   2. THE OPTIONS ARE `div[role="row"]` INSIDE `div#<id>-listbox[role="grid"]`. A `[role=option]`
+//      scrape finds NOTHING. The listbox does not exist until the widget opens, and it is NOT
+//      portaled — it lives inside the field's own `div.input-row`.
+//   3. A BARE `.click()` ON A ROW DOES NOT COMMIT. A full pointer sequence does
+//      (pointerdown→mousedown→pointerup→mouseup→click with real clientX/Y) — i.e. exactly
+//      robustClick's first strategy, arrived at independently here.
+//   4. TYPE THE FULL OPTION TEXT BEFORE COMMITTING. The widget re-syncs its input to whatever was
+//      typed, so committing after a partial query ("United" for "United States") leaves the typed
+//      fragment behind and the selection does not stick.
+//   5. READ AND COMMIT MUST HAPPEN IN ONE EVALUATION. Measured: the listbox closes between two
+//      separate CDP calls, so a read in one call and a click in the next finds zero rows.
+//   6. ⚠ ESCAPE IS THE CLOSE — and the hazard is UNCOMMITTED TEXT, not Escape (corrected by the
+//      operator, then measured). Blur, focus-move and a second toggle click ALL leave the rows
+//      mounted; Escape takes them to zero with the value untouched. What destroyed an address block
+//      during recon was DISMISSING A PICKER THAT HELD TEXT IT HAD NEVER COMMITTED (`country` was
+//      prefilled text wearing `cx-select-input--invalid`): the dismissal discarded it, and clearing
+//      a geo PARENT unmounts its whole dependent block. So: commit before closing, and if the value
+//      did not take, REPORT it — never dismiss it and hope.
+//
+// `wantTexts` is a LIST so a composite row can be matched whole ("Tallahassee, Leon, FL"), and the
+// caller supplies it — the ambiguity rules stay SW-side. Commits ONLY on exactly one match: two hits
+// is not a confident answer and returns `ambiguous` with the rows, never a guess.
+// Returns the rows it saw either way, so a miss is diagnosable without a second page contact.
+async function atsInjOrcPick(inputSel, query, wantTexts, budgetMs, noClear, segmentMatch) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const norm = (s) => String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim();
+  // ⚠ ORC's GEO ROWS ARE COMPOSITES and no profile value will ever equal one: a postal code offers
+  // "32312, Tallahassee, Leon, FL", a city "Tallahassee, Leon, FL", a county "Leon, FL". Exact
+  // matching therefore refused a REQUIRED field while the widget was showing the answer (live).
+  // `segmentMatch` compares against the row's FIRST comma-segment, which is the form's own delimiter
+  // rather than a guess — so it is structured matching, NOT the loose containment the match ladder
+  // deliberately refuses. "32312" matches "32312, …" and still cannot match "323120, …".
+  const firstSeg = (v) => norm(String(v).split(",")[0]);
+  // ⚠ AND ORC LABELS SOME LISTS WITH A LEADING CODE: `"<CODE> - <Name>"`. Measured on the Education
+  // entry's Degree picker — a search for "Bachelor of Science" returned exactly ONE row,
+  // `"BS - Bachelor of Science"`, and an exact compare refused it, so the required field stayed empty
+  // and Oracle refused the whole Education entry on three consecutive runs.
+  //
+  // ⚠ THIS IS NOT THE CONTAINMENT THE MATCH LADDER REFUSES, and the difference is structural rather
+  // than a matter of degree:
+  //   • the split is on the FORM'S OWN separator, " - " WITH SPACES — never a bare hyphen, which
+  //     lives inside ordinary words and names ("Jean-Luc", "e-mail", "Add-On");
+  //   • what remains must equal the candidate EXACTLY after normalize, not contain it. "Bachelor"
+  //     still cannot claim "BS - Bachelor of Science";
+  //   • the ambiguity guard above is untouched — two rows matching is still `ambiguous` and refuses.
+  // Same reasoning as the postal composite ("32312" → "32312, Tallahassee, Leon, FL"): a delimiter
+  // the tenant chose is structure, and reading it is not guessing.
+  const afterCode = (v) => {
+    const str = String(v);
+    const i = str.indexOf(" - ");
+    return i > 0 ? norm(str.slice(i + 3)) : null;
+  };
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  const wants = (Array.isArray(wantTexts) ? wantTexts : [wantTexts]).map(norm).filter(Boolean);
+  if (!wants.length) return { ok: false, error: "no-target-text" };
+
+  // CLEARING A GEO PICKER CASCADES (operator, 2026-08-19): emptying city/state/postal/county can
+  // empty its siblings too, so the house "clear before typing" rule -- which exists to stop residual
+  // text contaminating a re-fill -- is DESTRUCTIVE here. It is what made a sequence of picks look
+  // like the fields were deleting each other. `noClear` skips it for those fields; everything else
+  // keeps the clear, because a stale query really would poison the search.
+  el.focus();
+  if (!noClear) {
+    setter.call(el, "");
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  for (const ch of String(query == null ? "" : query)) {
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
+    setter.call(el, el.value + ch);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
+  }
+
+  // ⚠ INLINED, not a call to the top-level twin: this function is stringified and evaluated in the
+  // page, so any free identifier is undefined there. Splitting it out "so the paths cannot drift"
+  // would have thrown ReferenceError on the first live pick.
+  // ENTER IS THE COMMIT (operator, then measured 2026-08-19). A full pointer sequence on the row
+  // LOOKS like it works -- it returns cleanly and the field shows the typed query -- but the list
+  // stays OPEN and the selection is never made, which is how four required address fields sat empty
+  // with a visible option row underneath them. Pressing Enter while exactly one row is showing
+  // selects it, closes the list, AND fires the tenant's own cascade. The pointer sequence is kept
+  // only as a fallback for a widget that ignores Enter.
+  const commitRow = (row, wantText, sawRows) => {
+    el.focus();
+    for (const type of ["keydown", "keypress", "keyup"]) {
+      el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+    }
+    return { ok: true, committed: wantText, rows: sawRows, via: "enter" };
+  };
+  const commitRowByPointer = (row, wantText, sawRows) => {
+    const r = row.getBoundingClientRect();
+    const o = { bubbles: true, cancelable: true, view: window,
+      clientX: Math.round(r.left + r.width / 2), clientY: Math.round(r.top + r.height / 2) };
+    for (const ty of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      row.dispatchEvent(new MouseEvent(ty, o));
+    }
+    return { ok: true, committed: wantText, rows: sawRows, via: "pointer" };
+  };
+
+  const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
+  const readRows = () => {
+    const lb = lbId ? document.getElementById(lbId) : null;
+    return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
+  };
+  const deadline = Date.now() + (budgetMs || 8000);
+  const openedAt = Date.now();
+  let lastRows = [], reopens = 0;
+  while (Date.now() < deadline) {
+    // ⚠ AN OPEN THAT DID NOT TAKE IS RE-CLICKED, not waited out (speed round, 2026-08-20). ORC's
+    // combobox is sometimes not wired when the first click lands — measured on the Education entry's
+    // School picker at ~17s, which was one dead 8s visit followed by a retry that worked. Two extra
+    // clicks cost nothing next to that, and they also cure the "it lags until I click the page"
+    // symptom: without them the run sits in a poll on a picker that never opened.
+    if (!lastRows.length && reopens < 2 && Date.now() - openedAt > (reopens + 1) * 700) {
+      reopens++;
+      try { el.click(); } catch (e) { /* the poll below is the judge */ }
+    }
+    await new Promise((r) => setTimeout(r, 250));
+    const rows = readRows();
+    if (!rows.length) {
+      // the widget's own terminal "nothing here" — stop early rather than burning the budget
+      const box = document.querySelector(".cx-select__listbox");
+      if (box && /no results/i.test(t(box))) return { ok: false, error: "no-results", query, rows: [] };
+      continue;
+    }
+    lastRows = rows.map(t);
+    const hits = rows.filter((r) => wants.indexOf(norm(t(r))) !== -1
+      || (segmentMatch && wants.indexOf(firstSeg(t(r))) !== -1)
+      || (segmentMatch && afterCode(t(r)) !== null && wants.indexOf(afterCode(t(r))) !== -1));
+    if (hits.length > 1) return { ok: false, error: "ambiguous", query, rows: lastRows, matched: hits.length };
+    if (hits.length === 1) {
+      const row = hits[0];
+      const want = t(row);
+      // finding 4: make the typed text agree with the option before committing
+      if (!segmentMatch && !noClear && norm(el.value) !== norm(want)) {
+        setter.call(el, "");
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+        for (const ch of want) {
+          el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true }));
+          setter.call(el, el.value + ch);
+          el.dispatchEvent(new Event("input", { bubbles: true }));
+          el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true }));
+        }
+        // re-resolve the row: retyping re-renders the list
+        await new Promise((r) => setTimeout(r, 400));
+        const again = readRows().filter((r) => norm(t(r)) === norm(want));
+        if (again.length === 1) return commitRow(again[0], want, lastRows);
+        // fall through and try again on the next tick rather than clicking a stale node
+        continue;
+      }
+      return commitRow(row, want, lastRows);
+    }
+  }
+  return { ok: false, error: "no-match", query, rows: lastRows };
+}
+
+// ── CAPTURE AN ORC PICKER'S OPTIONS SO REVIEW GETS A REAL PICKER (2026-08-19) ────────────
+// The operator's rule, carried over from iCIMS: on a form where a field we never filled still has to
+// be ANSWERABLE, a picker with no usable options is just a text box. ORC's scan cannot read options
+// inline — the listbox does not exist until the widget opens — so this is a separate, read-only pass.
+//
+// ⚠ AN EMPTY OPEN RETURNS THE WHOLE VOCABULARY ON ORC, which is what makes the captured list
+// genuinely COMPLETE rather than a first page. Measured: `country` returns **251** rows,
+// Afghanistan→Zimbabwe. So ORC needs none of the page-cap derivation iCIMS required — there is no
+// pager to detect. (If a future tenant does paginate, the caller must mark the list partial; that is
+// why completeness is the CALLER's call and this function only reports what it saw.)
+//
+// ⚠ IT OPENS WITH NO QUERY, on purpose. Typing would filter, and a filtered list is not the field's
+// vocabulary — the same reason a search-filtered actuation list must not be mistaken for a complete
+// scan list.
+//
+// ⚠ CLOSED BY BLUR ONLY. NEVER Escape (it REVERTS an ORC geo picker) and never a click elsewhere:
+// that combination unmounted an entire dependent address block during recon and did not recover.
+// Verifies the rows are GONE afterwards and says so, because a lingering list is the standing hazard.
+async function atsInjOrcCaptureOptions(inputSel, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
+  const readRows = () => {
+    const lb = lbId ? document.getElementById(lbId) : null;
+    return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
+  };
+  el.focus();
+  el.click();
+  const deadline = Date.now() + (budgetMs || 6000);
+  let texts = [];
+  let terminalNo = false;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 250));
+    const rows = readRows();
+    if (rows.length) { texts = rows.map(t).filter(Boolean); break; }
+    const box = document.querySelector(".cx-select__listbox");
+    if (box && /no results/i.test(t(box))) { terminalNo = true; break; }
+  }
+  // ⚠ ESCAPE IS THE CLOSE, and it is the ONLY one that works (operator, then measured): blur,
+  // focus-move to another field, and a second toggle click ALL leave the rows mounted — captured
+  // lists were observed accumulating to 515 rows across three captures. Escape took `title` from 17
+  // rows to 0 with `aria-expanded` true→false and the value untouched.
+  //
+  // ⚠ THE REAL HAZARD IS NOT ESCAPE, IT IS CLOSING A PICKER THAT HOLDS UNCOMMITTED TEXT. A picker
+  // wearing `cx-select-input--invalid` is holding text it never accepted as a selection, and
+  // dismissing it DISCARDS that text — which for a geo PARENT (`country`) also unmounts its whole
+  // dependent block (addressLine1-3, city, region1/2, postalCode leave the DOM). This capture pass
+  // opens with NO query and writes nothing, so it has nothing to lose; a caller that has typed into
+  // a picker must commit it before closing, and report a failure rather than dismissing it.
+  el.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true }));
+  el.dispatchEvent(new KeyboardEvent("keyup", { key: "Escape", keyCode: 27, which: 27, bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 300));
+  return { ok: true, options: texts, count: texts.length, terminalNo,
+    // the standing rule: a close is confirmed by the options being GONE, never by aria-expanded
+    closed: readRows().length === 0,
+    heldUncommittedText: /cx-select-input--invalid/.test(String(el.className || "")) };
+}
+
+// Read an ORC picker back. ⚠ THE VALUE ALONE IS NOT PROOF: the widget keeps typed text that it has
+// not accepted as a selection, and marks that state with `cx-select-input--invalid` (measured — a
+// prefilled "United States" carried it from first load). So `invalid` is a NEGATIVE verify signal and
+// a commit that leaves it set must not be reported as filled.
+// ⚠ It is also LAGGY: a read in the same evaluation as the click returns the PREVIOUS value, so the
+// caller must poll this SW-side rather than reading once.
+function atsInjOrcReadPicker(inputSel) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  return { ok: true, value: el.value || null,
+    invalid: /cx-select-input--invalid/.test(String(el.className || "")),
+    expanded: el.getAttribute("aria-expanded") === "true",
+    openRows: [...document.querySelectorAll(".cx-select__listbox [role=\"row\"]")].length };
+}
+
+// ── PRESS AN ORC FLOW BUTTON BY CAPTION (injected; 2026-08-19) ───────────────────────────
+// ⚠ atsInjClickAuthSubmit is NOT reusable here, and the reason is measured: ORC's "Next" and
+// "Verify" are plain `<button>`s with **no id** and no `type="submit"`, so that helper's selector
+// would be null and its fallback query (`input[type=submit], button[type=submit]`) finds nothing —
+// it would report `no-submit-control` on a page whose button is right there.
+//
+// The caption is therefore the only handle, which brings its own hazard the timeline already
+// demonstrated: on ORC's own experience form the entry-COMMIT button carries the SAME TEXT as the
+// entry-OPENER. So this takes an optional `withinSel` and, when given, only considers buttons
+// inside it — the caller decides the scope rather than hoping the first match is the right one.
+// A pattern SOURCE string is passed rather than a RegExp because CDP serializes arguments as JSON
+// and a RegExp arrives as `{}`.
+// WHERE THE WIZARD IS, AND WHAT MAY BE PRESSED. Read as a whole rather than field by field,
+// because the walk's two decisions ("is this the last step" / "did Next actually advance") each need
+// several of these at the same instant, and reading them across separate evals lets the page move in
+// between.
+//
+// ⚠ THE STEP NUMBER COMES FROM THE URL FIRST. It is DECLARED (`…/apply/section/<n>`), where every
+// other candidate is measured — and the standing ORC rule is that on the FORM geometry tells the
+// truth while declared intent lies (inactive sections report aria-hidden="false" at 0×0), so a
+// signal that is declared *and* corroborated by geometry is the only one worth building a loop on.
+// The announced "step N of M" gives the TOTAL, which the URL cannot.
+//
+// ⚠ AND THE TOTAL IS NEVER THE SECTION COUNT. Measured: Baylor serves 5 <apply-flow-section> for 4
+// steps (index 0 an empty shell), Oracle 4 for 3, and on Oracle TWO are visible at once (index 0 is
+// the résumé-import banner). Any arithmetic on that count is wrong on one of the two tenants, which
+// is why the walk's terminal test is the PRESENCE OF A NEXT CONTROL and not `step >= total`.
+// ⚠ THE ADVANCE PATTERN AND THE REFUSAL PATTERN ARE DEFINED AS A PAIR, deliberately adjacent: the
+// safety property is that no caption can satisfy both, and that is only checkable by reading them
+// together. The pre-form's own click pattern DOES include `submit` (a sign-in step's control is
+// legitimately captioned Submit) — this pair is the WALK's, where a submit press is the one
+// irreversible act in the whole pipeline.
+// ⚠ `\\b` not `\b`: in a JS string literal `\b` is U+0008 (BACKSPACE), so the regex could never
+// match. That exact slip halted a run at Oracle's email gate with `auth-submit-not-pressable` on a
+// page whose Next button was plainly there, and a test that asserted the pattern's SPELLING passed
+// the whole time. test/ats.test.js decodes these literals and matches them against real captions.
+const ATS_ORC_NEXT_RE = "^(next|continue|save and continue|save & continue)\\b";
+const ATS_ORC_FORBID_RE = "submit|apply now|finish|send application";
+
+function atsInjOrcStepState() {
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const url = String(location.href).split("#")[0];
+  const um = /\/apply\/section\/?(\d+)/.exec(url);
+  const step = um ? Number(um[1]) : null;
+
+  // "…application, step 1 of 4" — announced for screen readers, so it is text on the page rather
+  // than an attribute. Searched over a bounded set of small nodes, never the whole body's text.
+  let total = null, announced = null;
+  const cands = [...document.querySelectorAll("apply-flow-pagination, [aria-live], [role=status], h1, h2, .progress-bar-text")];
+  for (const el of cands) {
+    const m = /step\s+(\d+)\s+of\s+(\d+)/i.exec(clean(el.textContent));
+    if (m) { announced = Number(m[1]); total = Number(m[2]); break; }
+  }
+
+  const secs = [...document.querySelectorAll("apply-flow-section")];
+  const visibleIdx = secs.map((el, i) => (vis(el) ? i : -1)).filter((i) => i >= 0);
+
+  // Pagination. The bar reads "Back 1 2 3 4 Next", so the NUMBERED buttons are step jumps and must
+  // never be mistaken for the advance control — hence an anchored caption match, not a position.
+  const pag = document.querySelector("apply-flow-pagination");
+  const btns = pag ? [...pag.querySelectorAll('button, a[role="button"], input[type="button"], input[type="submit"]')].filter(vis) : [];
+  const cap = (b) => clean(b.value || b.textContent);
+  const enabled = (b) => !(b.disabled || b.getAttribute("aria-disabled") === "true");
+  const next = btns.find((b) => /^(next|continue|save and continue|save & continue)\b/i.test(cap(b))) || null;
+  const back = btns.find((b) => /^back\b/i.test(cap(b))) || null;
+
+  // The submit control, document-wide but VISIBLE-filtered: ORC mounts every step at once, so an
+  // inactive step's submit is present in the DOM at 0×0. Geometry is what excludes it, and on this
+  // form geometry is the trustworthy signal.
+  const submit = [...document.querySelectorAll('button, input[type="submit"]')]
+    .filter(vis).find((b) => /^(submit|submit application)\b/i.test(cap(b))) || null;
+
+  return {
+    ok: true, url, step, announcedStep: announced, total,
+    sectionCount: secs.length, visibleSections: visibleIdx,
+    hasNext: !!next, nextCaption: next ? cap(next).slice(0, 40) : null, nextEnabled: !!(next && enabled(next)),
+    hasBack: !!back,
+    hasSubmit: !!submit, submitCaption: submit ? cap(submit).slice(0, 40) : null,
+    // the error channel, so a refused advance can say WHY without a second read
+    errors: [...document.querySelectorAll("cx-notifications [role=alert], .oj-messages-message, [role=alert]")]
+      .filter(vis).map((e) => clean(e.textContent).slice(0, 160)).filter(Boolean).slice(0, 6),
+  };
+}
+
+function atsInjOrcClickButton(patternSource, withinSel, forbidSource) {
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  let re;
+  try { re = new RegExp(patternSource, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const root = withinSel ? document.querySelector(withinSel) : document;
+  if (!root) return { ok: false, error: "scope-not-found:" + withinSel };
+  const btns = [...root.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]')].filter(vis);
+  const hit = btns.find((b) => re.test(clean(b.value || b.textContent)));
+  if (!hit) return { ok: false, error: "no-button-matching:" + patternSource, offered: btns.map((b) => clean(b.value || b.textContent).slice(0, 40)).slice(0, 8) };
+  if (hit.disabled || hit.getAttribute("aria-disabled") === "true") return { ok: false, error: "button-disabled", caption: clean(hit.value || hit.textContent).slice(0, 40) };
+  // ⚠⚠ SECOND GUARD ON THE ONE CLICK THAT COULD SUBMIT AN APPLICATION. The walk already refuses to
+  // advance off a step that has no Next; this refuses to PRESS a caption the caller has forbidden,
+  // inside the injected fn, using the caption actually resolved rather than the pattern that found
+  // it. Defense in depth, exactly as Workday's clickPageNext refuses `review-page` independently of
+  // the walk's own top-of-loop check — that footer button reuses Submit's automation-id, and the
+  // whole reason two guards exist there is that one of them was once enough right up until it wasn't.
+  const capHit = clean(hit.value || hit.textContent);
+  if (forbidSource) {
+    let bad = null;
+    try { bad = new RegExp(forbidSource, "i"); } catch (e) { return { ok: false, error: "bad-forbid-pattern" }; }
+    if (bad.test(capHit)) return { ok: false, error: "refused-forbidden-caption", caption: capHit.slice(0, 40) };
+  }
+  hit.click();
+  return { ok: true, caption: capHit.slice(0, 40) };
+}
+
+// ── TYPE A ONE-TIME CODE INTO ORC'S SIX BOXES (injected; 2026-08-19) ─────────────────────
+// ⚠ A VERIFICATION CODE IS TREATED WITH THE CREDENTIAL DISCIPLINE, not as ordinary field data:
+// it returns a COUNT and never the digits, so the value cannot reach a log line, a record or the
+// review bundle by way of this function's result. Same reasoning as atsInjSetCredential returning
+// a length — the callers that log results are many, and the belt belongs at the source.
+//
+// Each box is one Knockout-bound `type=number` input with NO name, so the write is the house
+// technique (native setter → `input` → `change`; a bare assignment leaves Knockout unaware — the
+// measured ORC substrate finding). Boxes are written in the order the caller resolved them.
+// ⚠ Cleared FIRST, for the same reason iCIMS' credential write is: a setter SETS rather than
+// replaces, so a retry after a wrong or expired code would otherwise append into a 2-digit box.
+function atsInjOrcFillPin(sels, code) {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  const digits = String(code == null ? "" : code).replace(/\D+/g, "");
+  const list = Array.isArray(sels) ? sels : [];
+  if (!digits.length) return { ok: false, error: "no digits to enter" };
+  if (digits.length !== list.length) return { ok: false, error: "code length " + digits.length + " does not match " + list.length + " boxes" };
+  let filled = 0;
+  for (let i = 0; i < list.length; i++) {
+    const el = document.querySelector(list[i]);
+    if (!el) return { ok: false, error: "box " + (i + 1) + " not found", filled };
+    for (const v of ["", digits[i]]) {
+      setter.call(el, v);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    // read back the LENGTH only — never the character
+    if (String(el.value || "").length !== 1) return { ok: false, error: "box " + (i + 1) + " did not accept a digit", filled };
+    filled++;
+  }
+  return { ok: true, filled };
+}
+
+// ── THE ORACLE PRE-FORM SCAN (injected; 2026-08-19) ──────────────────────────────────────
+// Reports, classifies nothing — the judgement is orcApplyView + atsConsentKind + atsDecoyKind,
+// SW-side, so there is ONE copy of each rule rather than an injected dup that can drift. Same
+// split atsInjAuthScan / icimsAuthView already uses.
+//
+// ⚠ THE ONE PLACE THIS SCAN DOES EXERCISE JUDGEMENT IS THE HONEYPOT, AND THAT IS DELIBERATE.
+// ORC's gate ships a bot-detection decoy beside the real email box that passes every visibility
+// test (measured 179×38 and 200×38 on two tenants; see atsDecoyKind). If the scan merely
+// *reported* it and left exclusion to the caller, then any caller bug puts a value in it — and
+// that value is replayed on submit and marks the application as a bot, with no read-back able to
+// notice because the write succeeds. So decoys are excluded from the candidate lists HERE, at the
+// only point where a selector for one could be produced at all, AND reported separately so the
+// run's log can say it was seen and skipped.
+// ⚠ LOCKSTEP with atsDecoyKind (an injected fn cannot import): the generic aria-hidden + tabindex
+// pair plus the honeypot name. atsDecoyKind stays the authority for judging REPORTED fields.
+function atsInjOrcAuthScan() {
+  const vis = (el) => {
+    if (!el) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  const esc = (s) => (window.CSS && CSS.escape ? CSS.escape(s) : String(s).replace(/["\\]/g, "\\$&"));
+  const selOf = (e) => (e && e.id ? "#" + esc(e.id) : (e && e.name ? '[name="' + esc(e.name) + '"]' : null));
+  const labelOf = (e) => {
+    let l = e.id ? document.querySelector('label[for="' + esc(e.id) + '"]') : null;
+    if (!l) l = e.closest("label");
+    return clean(l && l.textContent).slice(0, 90);
+  };
+  // LOCKSTEP with atsDecoyKind — see the note above.
+  const isDecoy = (e) => {
+    const nm = clean((e.name || "") + " " + (e.getAttribute("aria-label") || ""));
+    if (/\bhoney[\s_-]?pot\b/i.test(nm)) return true;
+    return e.getAttribute("aria-hidden") === "true" && e.getAttribute("tabindex") === "-1";
+  };
+  const describe = (e) => (e ? { sel: selOf(e), id: e.id || null, name: e.name || null,
+    label: labelOf(e), type: String(e.type || "").toLowerCase(),
+    prefilled: !!(e.value && String(e.value).length) } : null);
+
+  const all = [...document.querySelectorAll("input:not([type=hidden]), select, textarea")];
+  const decoys = all.filter(isDecoy).map((e) => ({ sel: selOf(e), name: e.name || null,
+    ariaLabel: e.getAttribute("aria-label"), tabIndex: e.getAttribute("tabindex"),
+    ariaHidden: e.getAttribute("aria-hidden"), cssClassAttr: e.getAttribute("cssclass") }));
+  // Every candidate list below is drawn from this, so a decoy can never become a selector.
+  const shown = all.filter((e) => vis(e) && !isDecoy(e));
+
+  const pins = [...document.querySelectorAll('[id^="pin-code-"]')]
+    .filter((e) => !isDecoy(e))
+    .sort((a, b) => (parseInt(String(a.id).replace(/\D+/g, ""), 10) || 0) - (parseInt(String(b.id).replace(/\D+/g, ""), 10) || 0))
+    .map((e) => "#" + esc(e.id));
+
+  const emailEl = shown.find((e) => String(e.type || "").toLowerCase() === "email")
+    || shown.find((e) => /^primary-email/.test(e.id || "") || /\b(e-?mail|username|login)\b/i.test(clean((e.name || "") + " " + labelOf(e))));
+  const passEl = shown.find((e) => String(e.type || "").toLowerCase() === "password");
+
+  const clickables = [...document.querySelectorAll('button, input[type="submit"], input[type="button"], a[role="button"]')].filter(vis);
+  const cap = (b) => clean(b.value || b.textContent).slice(0, 60);
+  const byText = (re) => { const b = clickables.find((x) => re.test(cap(x))); return b ? { sel: b.id ? "#" + esc(b.id) : null, caption: cap(b) } : null; };
+
+  // The apply opener. Class is stable across tenants (`apply-now-button`); the caption is not
+  // (localised sites), so key on the class and report the caption for the log only.
+  const applyEl = document.querySelector("button.apply-now-button");
+
+  // Same VISIBLE-challenge rule as atsInjAuthScan: a dormant invisible-mode container is a
+  // full-viewport hidden iframe and must not read as a challenge.
+  const captchaChallenge = [...document.querySelectorAll('iframe[src*="hcaptcha"], iframe[src*="recaptcha"]')].some((f) => {
+    const cs = getComputedStyle(f);
+    if (cs.visibility === "hidden" || cs.display === "none" || Number(cs.opacity) < 0.1) return false;
+    const r = f.getBoundingClientRect();
+    return r.width > 60 && r.height > 60 && r.width < 700;
+  });
+
+  // Consent boxes are REPORTED with their surrounding text; atsConsentKind decides. Only an
+  // "accept" is ever ticked, and never an opt-in or an attestation.
+  const consents = [...document.querySelectorAll('input[type="checkbox"]')].filter((e) => vis(e) || (e.getBoundingClientRect().width === 0 && e.closest("label")))
+    .filter((e) => !isDecoy(e))
+    .map((e) => {
+      const row = e.closest(".input-row, .legal-disclaimer-container, div");
+      // ⚠ THE PAGE'S OWN FILING BEATS ITS PROSE. Oracle wraps its job-alerts box in
+      // <job-alerts-opt-in>/<opt-in> while WORDING it as an acceptance ("I agree to receive new job
+      // opportunities…"), which the text recognizer read as `accept` — i.e. it would have been
+      // ticked. So the enclosing custom-element names travel with the report and atsConsentKind
+      // consults them FIRST. Reported, not judged, here: the rule stays in one SW-side place.
+      const containers = [];
+      for (let p = e.parentElement; p && containers.length < 6; p = p.parentElement) {
+        const n = p.tagName.toLowerCase();
+        if (n.includes("-")) containers.push(n);
+      }
+      return { sel: selOf(e), checked: !!e.checked, label: labelOf(e),
+        id: e.id || null, name: e.name || null, containers,
+        rowText: clean(row && row.textContent).slice(0, 220),
+        // the CSS-clipped box is clicked through its LABEL (the Workday radio rule)
+        labelSel: e.id ? 'label[for="' + esc(e.id) + '"]' : null };
+    }).slice(0, 8);
+
+  const secs = [...document.querySelectorAll("apply-flow-section")];
+  return {
+    ok: true, url: location.href, title: document.title,
+    // The form's own structural tell — measured absent (0) on the gate and the pin screen.
+    formSectionVisible: secs.some(vis), sectionCount: secs.length,
+    emailGate: !!document.querySelector("quick-email-verification-form"),
+    emailInput: describe(emailEl), passwordInput: describe(passEl),
+    pinInputs: pins.length, pinSels: pins,
+    submit: byText(/^(next|verify|continue|sign in|log ?in|submit)\b/i),
+    resend: byText(/send\s+new\s+code|resend/i),
+    applyControl: applyEl ? { sel: "button.apply-now-button", caption: cap(applyEl) } : null,
+    federated: clickables.map(cap).filter((t) => /\b(with|using)\s+(google|linkedin|apple|microsoft|facebook)\b|\b(sso|single sign[ -]?on)\b/i.test(t)).slice(0, 5),
+    createAccount: clickables.map(cap).filter((t) => /\b(create (an? )?account|register|sign ?up)\b/i.test(t)).slice(0, 5),
+    captchaChallenge, consents, decoys,
+    errors: [...document.querySelectorAll('[role="alert"], .error, .cx-error, cx-notifications')].filter(vis)
+      .map((e) => clean(e.textContent)).filter(Boolean).slice(0, 4),
+  };
+}
+
+// ── ORC REPEATING BLOCKS: the entry lifecycle (2026-08-19) ───────────────────────────────
+// A repeating section on ORC is an `<apply-flow-block>` identified by its `<apply-flow-block-title>`,
+// holding an Add control. Pressing it materialises the entry form's fields INSIDE THAT BLOCK through
+// the ordinary `<form-builder>`.
+//
+// ⚠ DO NOT KEY ON THE TIMELINE ELEMENTS. Baylor renders entries through `<beautiful-timeline>` →
+// `<timeline-form-inline>` → `<timeline-form-builder>`; Oracle has NONE of those and renders in-block.
+// The block + its title is the only portable handle, which is why this takes a title pattern.
+//
+// ⚠⚠ THE COMMIT BUTTON IS A HOMONYM OF THE OPENER. Both read "Add Experience", and on Oracle both
+// live in the SAME block — so scoping by container cannot separate them (recon (c) proposed exactly
+// that, and it does not work here). The discriminator is the sibling **Cancel**, which exists only
+// while an entry form is open:
+//
+//     block closed → [ "Add Experience" ]
+//     block OPEN   → [ "Cancel", "Add Experience" ]   ← the second one COMMITS
+//
+// Verified in both directions: after pressing Cancel the block returned to 0 inputs and Cancel
+// disappeared. So `open` refuses when a form is already open, and `commit` refuses when one is not —
+// each would otherwise press the other's button.
+var ATS_ORC_ENTRY_MAX = 8;   // same backstop as ATS_ENTRY_MAX: a runaway Add loop is worse than a short history
+
+// ⚠ A REPEATING BLOCK WITH ZERO INPUTS CANNOT BE FOUND BY THE FIELD SCAN, which is the whole reason
+// this read exists. ORC builds Experience / Education entries ON DEMAND — recon measured §3 at "0
+// inputs" — so the block is a heading and an Add button and nothing else until something is pressed.
+// The scan derives a field's block from its ANCESTOR, so a block with no fields contributes nothing
+// and the entry pass would conclude the section is absent. Live 2026-08-19 that is exactly what
+// happened: step 2 reported 4 fields (three uploads and a link) and the whole employment history
+// went unfilled, with nothing in the log saying a block had been skipped.
+function atsInjOrcBlocks() {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // VISIBLE blocks only, and for the standing ORC reason: every step is mounted at once and the
+  // inactive ones report aria-hidden="false" at 0×0, so geometry is the trustworthy signal here.
+  return { ok: true, blocks: [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    // ⚠ COUNT WHAT CAN BE ANSWERED, NOT WHAT IS AN `<input>`. ORC's yes/no questions are BUTTON
+    // pairs, so a block holding three of them counted 0 and the settle spent 15s concluding it was
+    // still loading — of a block that was visible at 680×331 with every question rendered. "Zero
+    // inputs" and "nothing to answer" are different claims and this read was making the wrong one.
+    .map((b) => ({ title: t(b.querySelector("apply-flow-block-title")),
+                   inputs: b.querySelectorAll("input, textarea, select").length
+                         + b.querySelectorAll("ul.cx-select-pills-container").length,
+                   addCaption: ([...b.querySelectorAll("button")].filter(vis).map(t)
+                     .find((c) => /^add\b/i.test(c))) || null }))
+    .filter((b) => b.title) };
+}
+
+// ⚠⚠ WHAT DID THE SCAN NOT SEE? A scan is a CONVENIENCE LIST, NOT AN INVENTORY — the Workday lesson,
+// written down there after an approved field turned out to be absent from `cdpPageScan.fields` twice
+// live. This makes the same gap VISIBLE on Oracle instead of leaving it to be noticed by a human
+// reading the form: live 2026-08-19 step 3 recorded 7 fields while the operator could see THREE
+// REQUIRED yes/no application questions on it, and nothing anywhere said a control had been missed.
+// A missing required field is not a cosmetic gap — it blocks the step and the walk halts on a page
+// that looks, in the log, like it filled cleanly.
+//
+// It reports rather than classifies (the standing split: the page answers what it can observe, the
+// judgement lives SW-side), and it reports the ROW CLASS specifically, because the ORC classifier
+// keys the widget off `div.input-row--<kind>` — so an unrecognised row class is the answer to "why
+// was this not scanned?" in the same line that raises the question.
+function atsInjOrcUnclaimed(claimedNames) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const claimed = new Set((claimedNames || []).map(String));
+  const secs = [...document.querySelectorAll("apply-flow-section")].filter(vis);
+  if (!secs.length) return { ok: true, unclaimed: [] };
+
+  const seen = new Map();   // group key → report
+  for (const sec of secs) {
+    const controls = [...sec.querySelectorAll("input, select, textarea")]
+      .filter((e) => e.type !== "hidden" && vis(e));
+    for (const e of controls) {
+      // ⚠ A DECOY IS NOT AN OVERSIGHT. Same declared-intent test as the scan (LOCKSTEP with
+      // atsDecoyKind): reporting the honeypot as "a field we missed" would invite someone to fix it
+      // by filling it, which is the one thing that must never happen.
+      const nm = ((e.name || "") + " " + (e.getAttribute("aria-label") || "")).replace(/\s+/g, " ");
+      if (/\bhoney[\s_-]?pot\b/i.test(nm)) continue;
+      if (e.getAttribute("aria-hidden") === "true" && e.getAttribute("tabindex") === "-1") continue;
+
+      // Radios and checkboxes group by `name`, so a yes/no pair reports ONCE rather than twice —
+      // otherwise a three-question step reads as six missing controls.
+      const isGroup = e.type === "radio" || e.type === "checkbox";
+      const key = (isGroup && e.name) ? "group:" + e.name : (e.name || e.id || "");
+      if (!key) continue;
+      // ⚠ THE SCAN KEYS A GROUP TWO WAYS — `group:<name>` when the inputs share a name, and
+      // `group:<label-slug>` when they do not (measured: `group:ethnicity` next to
+      // `group:select-the-races-you-identify-with` on one step). Testing only one shape makes the
+      // OTHER one look unscanned, so a correctly-filled races group would be reported as missing
+      // every run and the real signal would be lost in it.
+      const slug = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      const rowEl = e.closest("div.input-row") || e.closest("[class*=input-row]");
+      const q = isGroup
+        ? ((e.closest("fieldset") && e.closest("fieldset").querySelector("legend") ? t(e.closest("fieldset").querySelector("legend")) : "")
+           || t(rowEl ? rowEl.querySelector(".input-row__label, label") : null))
+        : "";
+      if (claimed.has(e.name || "") || claimed.has(e.id || "") || claimed.has(key)) continue;
+      if (isGroup && q && claimed.has("group:" + slug(q))) continue;
+      // ⚠ OVER-REPORTING IS THE SAFE DIRECTION and this stays a DIAGNOSTIC: a false positive costs
+      // one noisy log line, while a miss costs a required field that silently never gets filled. The
+      // line carries the row class, the block and the question, which is enough to dismiss a false
+      // positive at a glance.
+      if (seen.has(key)) { const r = seen.get(key); r.count++; if (isGroup && t(e.closest("label")) ) r.options.push(t(e.closest("label")).slice(0, 40)); continue; }
+
+      const row = e.closest("div.input-row") || e.closest("[class*=input-row]");
+      const rowClass = row ? String(row.className || "").split(/\s+/).filter((c) => /input-row/.test(c)).join(" ") : null;
+      const block = e.closest("apply-flow-block");
+      const lbl = (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "")
+        || t(e.closest("label")) || e.getAttribute("aria-label") || "";
+      // The QUESTION for a grouped control is the fieldset's legend, not the option's own label.
+      const legend = isGroup ? (t((e.closest("fieldset") || {}).querySelector ? e.closest("fieldset").querySelector("legend") : null)
+        || t(row ? row.querySelector(".input-row__label, label") : null)) : "";
+      seen.set(key, {
+        key, name: e.name || null, id: e.id || null, type: e.type, tag: e.tagName.toLowerCase(),
+        role: e.getAttribute("role") || null, grouped: isGroup, count: 1,
+        question: (legend || lbl || "").slice(0, 120),
+        options: isGroup && t(e.closest("label")) ? [t(e.closest("label")).slice(0, 40)] : [],
+        rowClass, block: block ? t(block.querySelector("apply-flow-block-title")).slice(0, 60) : null,
+        required: e.required === true || e.getAttribute("aria-required") === "true"
+          || !!(row && /required/.test(String(row.className || ""))),
+      });
+    }
+  }
+  // ⚠⚠ AND THE CONTROLS THAT ARE NOT NATIVE ELEMENTS AT ALL. The sweep above queries
+  // `input, select, textarea`, which is every control ORC has used so far — and it reported NOTHING
+  // on a step the operator could see three REQUIRED yes/no application questions on. Oracle JET
+  // renders its own widgets as custom elements (`oj-radioset`, `oj-select-single`, …) with ARIA
+  // roles instead of native inputs, so a question can be plainly visible, plainly required, and
+  // invisible to every selector this file uses.
+  //
+  // Reported SEPARATELY from the native list because the two mean different things: a native control
+  // we missed is a classifier gap, while an ARIA-only control is a whole widget FAMILY with no
+  // handler. Conflating them would make the second look like the first and send the fix at the row
+  // classifier, which cannot see these at all.
+  const aria = [];
+  const ROLES = "[role=radiogroup], [role=radio], [role=combobox], [role=listbox], [role=checkbox], [role=spinbutton], [role=switch]";
+  for (const sec of secs) {
+    // Custom elements first: their tag name is the most useful single fact about them, because it
+    // names the JET component and therefore what a handler would have to drive.
+    const custom = [...sec.querySelectorAll("*")].filter((e) => e.tagName.indexOf("-") > 0 && vis(e));
+    for (const e of custom) {
+      const tag = e.tagName.toLowerCase();
+      if (!/^oj-|-form$|^apply-flow|^form-builder|^cx-/.test(tag)) continue;
+      // only leaves that actually look like a CONTROL — a layout custom element is not a field
+      if (!e.matches(ROLES) && !e.querySelector(ROLES) && !e.hasAttribute("required") && e.getAttribute("aria-required") !== "true") continue;
+      // …and skip one that merely CONTAINS native controls the sweep above already accounted for
+      if (e.querySelector("input, select, textarea")) continue;
+      const lbl = t(e.querySelector("[class*=label], label, legend")) || e.getAttribute("aria-label") || "";
+      aria.push({ tag, role: e.getAttribute("role") || (e.querySelector(ROLES) ? e.querySelector(ROLES).getAttribute("role") : null),
+        id: e.id || null, question: (lbl || "").slice(0, 120),
+        required: e.hasAttribute("required") || e.getAttribute("aria-required") === "true",
+        options: [...e.querySelectorAll("[role=radio], [role=option]")].map((o) => t(o).slice(0, 40)).filter(Boolean).slice(0, 6),
+        block: (e.closest("apply-flow-block") ? t(e.closest("apply-flow-block").querySelector("apply-flow-block-title")).slice(0, 60) : null) });
+    }
+    // …then any bare ARIA control that is not inside one of those and not a native element.
+    for (const e of [...sec.querySelectorAll(ROLES)].filter(vis)) {
+      if (/^(input|select|textarea)$/i.test(e.tagName)) continue;
+      if (e.closest("oj-radioset, oj-select-single, oj-select-many, oj-combobox-one")) continue;
+      if (aria.some((a) => a.id && a.id === e.id)) continue;
+      // ⚠⚠ A WRAPPER AROUND NATIVE INPUTS IS NOT AN UNHANDLED WIDGET. ORC marks a native radio group
+      // with `<div role="radiogroup">` around real `<input type=radio>`s, and this reported the
+      // disability question as "an ARIA-only control with NO handler" on a run where that very field
+      // came back `filled_review`. The custom-element branch above already excluded this shape; the
+      // bare-ARIA branch did not.
+      //
+      // Left unfixed it is worse than a cosmetic bug: this sweep exists to surface a REAL missing
+      // widget family, and a false positive on every native radiogroup is precisely the noise that
+      // would bury the thing it was built to find. Over-reporting is the safe direction for the
+      // NATIVE list, where the cost is a line; here the cost is the signal itself.
+      if (e.querySelector("input, select, textarea")) continue;
+      aria.push({ tag: e.tagName.toLowerCase(), role: e.getAttribute("role"), id: e.id || null,
+        question: (t(e.closest("[class*=input-row]") ? e.closest("[class*=input-row]").querySelector("[class*=label], label, legend") : null) || e.getAttribute("aria-label") || "").slice(0, 120),
+        required: e.getAttribute("aria-required") === "true",
+        options: [...e.querySelectorAll("[role=radio], [role=option]")].map((o) => t(o).slice(0, 40)).filter(Boolean).slice(0, 6),
+        block: (e.closest("apply-flow-block") ? t(e.closest("apply-flow-block").querySelector("apply-flow-block-title")).slice(0, 60) : null) });
+    }
+  }
+  return { ok: true, unclaimed: [...seen.values()], aria };
+}
+
+// Scroll named blocks into view. READ-ONLY in the sense that matters: it moves the viewport and
+// touches nothing else, so it cannot change an answer — which is what makes it a safe probe for
+// "does this block render only when looked at?".
+function atsInjOrcScrollBlocks(titles) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const want = new Set((titles || []).map(String));
+  let n = 0;
+  for (const b of document.querySelectorAll("apply-flow-block")) {
+    const title = t(b.querySelector("apply-flow-block-title"));
+    if (!want.has(title)) continue;
+    try { b.scrollIntoView({ block: "center" }); n++; } catch (e) { /* older engines */ }
+  }
+  return { ok: true, scrolled: n };
+}
+
+// ⚠⚠ A COMMITTED ENTRY IS A **TILE**, AND ITS CONTROLS ARE ICON-ONLY (live 2026-08-20).
+// Measured on a returning candidate's form:
+//   <button class="apply-flow-profile-item-tile__edit-item-icon"  aria-label="Edit">    (no text)
+//   <button class="apply-flow-profile-item-tile__delete-icon"     aria-label="Delete">  (no text)
+//   …and the Add control is button.apply-flow-profile-item-tile__new-tile ("Add Experience")
+// The tile's own text is the entry summary:
+//   "Characterization and Test Automation Intern Rivian and Volkswagon Technologies 05/2026 - 08/2026"
+//
+// The first attempt at detecting pre-existing entries matched button CAPTIONS against
+// /^(edit|delete|remove)/ and counted ZERO, because these buttons have no textContent at all — so the
+// guard did not fire and a second run duplicated the history again. The label is in `aria-label`
+// and `title`, never in the text. Skills render ONE TILE PER SKILL, which is what makes
+// "only add the ones that are missing" possible at all.
+// The `<candidate-links>` repeating family. Its control is `name="siteLink-<n>"` `type="url"` and the
+// add control is `button.candidate-links__add-link` ("Add Another Link"). The ordinal lives in the
+// NAME (the trailing `-7` on the id is the render counter), so it is a POSITION and safe to index by.
+// ⚠⚠ ONE OPEN PER PICKER: CLASSIFY AND COMMIT IN THE SAME VISIT (speed round, 2026-08-20).
+// The date pair used to CAPTURE each half's options (open → poll → Escape) and then PICK it
+// (open → type → match → click) — four opens per pair, and the operator noticed exactly that: "it
+// opens the dropdown before going back and filling it when it could definitely fill it just once."
+//
+// Measured cost of the split: `startDate` ~11s while `endDate` — same widget, same code — cost ~2s.
+// The difference is that startDate is the FIRST picker touched in a freshly-created entry form, where
+// the open-click does not register because the combobox is not wired yet. The capture then polled its
+// WHOLE 8s budget for rows that were never going to appear, and only the retry's second click worked.
+// That is ~8s wasted per entry, ~24s across three — and it is also the "sometimes it lags until I
+// click the page" symptom, because the run is sitting in a poll on a picker that never opened.
+//
+// So: open, and if no rows appear quickly, CLICK AGAIN (the cheap, targeted fix for an open that did
+// not take) rather than waiting out a budget. Then classify from the rows in front of us and click the
+// matching one. Classification stays evidence-based — each half is still judged by its OWN options, so
+// a tenant that renders year-then-month is still handled — it just no longer costs a second visit.
+async function atsInjOrcPickFromOwnList(inputSel, monthCands, yearCands, budgetMs) {
+  // `InputEvent` exists in every browser this runs in but NOT in the Node stub the tests evaluate
+  // this source under, so it is built defensively. The events are the load-bearing part — see below.
+  const mkInputEvt = (type, data) => {
+    try { return new InputEvent(type, { bubbles: true, cancelable: type === "beforeinput", inputType: "insertText", data }); }
+    catch (e) { return new Event(type, { bubbles: true, cancelable: type === "beforeinput" }); }
+  };
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const norm = (v) => String(v == null ? "" : v).toLowerCase().replace(/\s+/g, " ").trim();
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  // ⚠ A STEP-BY-STEP TRACE, because the operator watched this at 240fps and saw something no duration
+  // could have told us: "I see it click open the end month dropdown, I see it fill the month for 1
+  // frame, and then somehow it doesn't commit, then after a wait, it refills and then fills the year."
+  // A value present for ~4ms is invisible to a 60ms read-back poll, so the caller would record "not
+  // retained" for a commit that DID happen — and then retry it, which is the double-fill observed.
+  const T0 = Date.now();
+  const tr = { openedByUs: false, autoOpenWait: null, autoOpened: null, waitedForSibling: null, siblingStillUp: null, rowsAt: null, rowsN: 0, typedAt: null, narrowedAt: null,
+               firstRow: null, enterAt: null, samples: [], reopens: 0 };
+  const lbId = el.getAttribute("aria-controls") || (el.id ? el.id + "-listbox" : null);
+  const readRows = () => {
+    const lb = lbId ? document.getElementById(lbId) : null;
+    return lb ? [...lb.querySelectorAll('[role="row"]')] : [];
+  };
+  // ⚠⚠ DO NOT CLICK A PICKER THAT IS ALREADY OPEN — the click TOGGLES (operator saw it, 2026-08-21:
+  // "I did see it physically open, but it closes right after it opens, no options even render").
+  //
+  // That observation is what identifies this. After the previous half's Enter, ORC moves focus to the
+  // next date input and opens its list on focus — so by the time this runs, the list is ALREADY UP.
+  // `el.focus()` is then a no-op and `el.click()` SHUTS it. The re-click at ~700ms opens it again,
+  // which is the "2 tries" and the extra second or two.
+  //
+  // It explains the asymmetry that no other theory did: startDate is the first picker touched in the
+  // entry, so nothing has focused it and the click is what opens it (773/797/798ms, no re-open).
+  // endDate follows a commit, so it arrives already open and the click closes it (1580/1710ms, with a
+  // logged re-open).
+  //
+  // ⚠ Two earlier explanations of this same symptom were WRONG and are recorded in the commit: the
+  // widget re-rendering (refuted — the ids survive), and the first click being spent dismissing the
+  // PREVIOUS list (refuted by the operator seeing this one open). The discriminator is the same one
+  // the re-click guard below uses: the listbox exists only when the widget is open.
+  const listUp = () => !!(lbId && document.getElementById(lbId));
+  const deadline = Date.now() + (budgetMs || 6000);
+  // ⚠⚠ WAIT FOR THE **PREVIOUS** PICKER'S LIST TO UNMOUNT FIRST (operator, 2026-08-21: "did you make
+  // sure the start date dropdown is closed before end date begins to fill?").
+  //
+  // This is the WORKDAY LINGERING-LISTBOX RULE, which this repo learned the hard way and never applied
+  // to ORC: "a close is confirmed by the options being GONE, not by aria-expanded — options linger a
+  // beat while unmounting and STAY CLICKABLE, and a lingering option strays the next field's
+  // open-click." `listUp()` only ever asked about OUR OWN listbox, so a still-mounted sibling was
+  // invisible to it.
+  //
+  // The measurement is what makes this the leading suspect: startDate is the FIRST picker touched in an
+  // entry and costs 722/701/723ms; endDate follows two commits and costs 3000/2774/2729ms — with the
+  // SAME ~250ms of page-side work per half. A predecessor's list still being up is the difference
+  // between those two situations.
+  //
+  // Page-side and bounded, so it costs ZERO extra round trips and cannot hang: if the sibling never
+  // goes away we proceed exactly as before and the trace says we waited.
+  const otherListUp = () => [...document.querySelectorAll(".cx-select__listbox")]
+    .some((lb) => lb.id !== lbId && lb.querySelectorAll('[role="row"]').length > 0);
+  const sibT0 = Date.now();
+  while (otherListUp() && Date.now() - sibT0 < 600) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  tr.waitedForSibling = Date.now() - sibT0;
+  tr.siblingStillUp = otherListUp();
+
+  // -- DETECT WHETHER ORC IS ALREADY OPENING THIS PICKER, rather than delaying blindly ------------
+  // Operator, 2026-08-22: "instead of hardcoding it, find a way to detect it and answer still as fast
+  // as possible."
+  //
+  // WHY A FIXED DELAY WORKED AT ALL, measured: the slow endDate half traced as `rows 12@946ms,
+  // reopens 1` with a no-op probe of **2ms** taken immediately before it. The page was FREE, so those
+  // 946ms were entirely OUR OWN doing: the picker clicked, saw nothing, waited its 700ms, re-clicked.
+  // That is the TOGGLE RACE this file already suspected -- ORC moves focus to the next date input and
+  // opens its list ON FOCUS, so a click arriving mid-open SHUTS it. A fixed 100ms only helped by
+  // letting the auto-open finish first, which is a guess at someone else's timing; 1 of 3 pairs still
+  // lost the race (1639ms, one re-open).
+  //
+  // The detectable version, from signals this file has already measured:
+  //   * rows already up      => nothing to do. Fastest path, zero clicks.
+  //   * the input is FOCUSED => ORC is opening it. WAIT for the listbox instead of clicking, because
+  //                             the click is exactly what would close it. "The listbox element does
+  //                             not exist at all while the widget is closed", so its APPEARANCE is the
+  //                             confirmation -- evidence, not a timer.
+  //   * not focused          => nothing is opening it. Click IMMEDIATELY and pay nothing. This is the
+  //                             first picker in an entry (startDate), which never needed a wait.
+  // Both waits are bounded, so a tenant that focuses without auto-opening falls through to the click
+  // quickly rather than stalling.
+  const lbExists = () => !!(lbId && document.getElementById(lbId));
+  if (!listUp()) {
+    if (document.activeElement === el) {
+      const aT0 = Date.now();
+      while (!lbExists() && Date.now() - aT0 < 300) await new Promise((r) => setTimeout(r, 15));
+      if (lbExists()) {
+        while (!listUp() && Date.now() - aT0 < 700) await new Promise((r) => setTimeout(r, 15));
+      }
+      tr.autoOpenWait = Date.now() - aT0;
+      tr.autoOpened = listUp();
+    }
+    if (!listUp()) { el.focus(); el.click(); tr.openedByUs = true; }
+  }
+  let rows = [], reopens = 0;
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 120));
+    rows = readRows();
+    if (rows.length) { tr.rowsAt = Date.now() - T0; tr.rowsN = rows.length; break; }
+    // ⚠ AN OPEN THAT DID NOT TAKE IS RE-CLICKED, not waited out. Two extra clicks at ~700ms and
+    // ~1400ms cost almost nothing and replace an 8-second stall.
+    //
+    // ⚠⚠ BUT GUARD IT ON THE LISTBOX NOT EXISTING, NOT ON "NO ROWS YET" (operator, 2026-08-21: the
+    // end date "still took 2 tries"). `el.click()` TOGGLES this picker, so re-clicking one that is
+    // already open CLOSES it — and "zero rows" is true both when the open never happened AND when the
+    // widget is open and still populating. Re-clicking in the second case shuts a dropdown that was
+    // on its way up, and the extra second or two is it being reopened.
+    //
+    // MEASURED, this run: startDate 796/786/787ms with no re-open; endDate 1579ms **(1 re-open)**,
+    // 2950ms, 2854ms — systematically the SECOND half of the pair, never the first.
+    //
+    // ⚠ THE "IT RE-RENDERS THE WIDGET" EXPLANATION IS WRONG — retire it (operator, 2026-08-21).
+    // An older comment in this file said committing the first half re-renders the widget, and I
+    // repeated it; the operator pushed back that nothing like that is visible on screen, and the
+    // evidence already in hand agrees with them. ORC ids carry a render-ASSIGNMENT counter
+    // (`month-endDate-53`), and this picker is addressed as `#month-endDate-<n>` resolved AFTER
+    // startDate has been committed. A re-render would mint a new counter and that selector would come
+    // back `not-found` — which never happens; endDate fills every time. So the nodes survive and
+    // there is no re-render.
+    //
+    // What DOES make the second half's open slower is still unestablished. The likeliest candidate is
+    // a lingering teardown of the first picker's listbox (the Workday lingering-options pattern), but
+    // nobody has instrumented it, so it stays a hypothesis. THE GUARD DOES NOT REST ON THE ANSWER: it
+    // rests on two directly measured facts — the click toggles, and the listbox is absent when closed
+    // but present-and-empty while populating.
+    //
+    // The listbox element does not exist at all while the widget is closed (measured: absent, then 12
+    // rows at 122ms), so its PRESENCE is exactly the signal that separates the two cases. Absent ⇒ the
+    // open genuinely did not take, and a re-click is the right recovery. Present-but-empty ⇒ leave it
+    // alone and keep polling.
+    const listboxUp = !!(lbId && document.getElementById(lbId));
+    const waited = Date.now() - (deadline - (budgetMs || 6000));
+    if (!listboxUp && reopens < 2 && waited > (reopens + 1) * 700) { reopens++; el.click(); }
+  }
+  if (!rows.length) return { ok: false, error: "no-rows", reopens };
+
+  const texts = rows.map(t);
+  const yearish = texts.filter((x) => /^\s*(19|20)\d{2}\s*$/.test(x)).length;
+  const monthish = texts.filter((x) => /^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)/i.test(x)).length;
+  const kind = yearish > monthish ? "year" : (monthish > 0 ? "month" : null);
+  if (!kind) return { ok: false, error: "unclassified", rows: texts.slice(0, 4), reopens };
+
+  const cands = (kind === "year" ? yearCands : monthCands) || [];
+  // The wording the picker itself uses for this value ("May" / "05" / "5" are all shapes a tenant
+  // may render), taken from the rows in front of us rather than from a hardcoded table.
+  let want = null;
+  for (const c of cands) {
+    const row = rows.find((r) => norm(t(r)) === norm(c));
+    if (row) { want = t(row); break; }
+  }
+  // Even a no-match hands back the vocabulary: the operator then gets a real picker to choose from,
+  // which is the whole point of scanning it — a half we could not fill is exactly the one they need
+  // to set by hand.
+  if (!want) return { ok: false, error: "no-match", kind, rows: texts.slice(0, 6), reopens, options: texts };
+
+  // ⚠⚠ THE COMMIT IS TYPE-THEN-**ENTER**, NOT A CLICK ON THE ROW. Measured 2026-08-20: the first
+  // version of this clicked the matching row with the full pointer sequence and ORC ignored it —
+  // both halves of every date came back `commit-not-accepted … got nothing`. atsInjOrcPick has always
+  // committed by typing the value and pressing Enter on the INPUT, and that is the mechanism this
+  // widget actually honours. Fusing the visits was the right idea; changing the commit with it was
+  // not, and it cost a run to find out.
+  //
+  // Typing re-filters the list, which is fine — it filters TO the value we already confirmed is
+  // present, so this cannot invent a match that was not there.
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  el.focus();
+  setter.call(el, "");
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  for (const ch of String(want)) {
+    // ⚠⚠ THE FULL KEYSTROKE SHAPE — THIS IS WHAT MAKES ONE OPEN ENOUGH (measured live 2026-08-21).
+    // With only `keydown` + `input` this widget's filter never reacts: measured by hand, the month
+    // list stayed at all 12 rows with "January" first while the input displayed "May". Enter then had
+    // no narrowed row to take, so nothing reached Oracle's model — which is why the pick appeared to
+    // fail, the outer retry fired, and the operator saw the dropdown open TWICE.
+    //
+    // Adding `beforeinput` and a `keypress` carrying charCode filtered 12 rows -> 1, and Enter
+    // committed it: verified end to end by hand, both halves narrowing to a single row and the
+    // entry's required-date errors going empty. So the double open is not fixed by making the OPEN
+    // cleverer (that was tried, and it broke the fill) — it is fixed by making the first attempt
+    // actually work.
+    const cc = ch.charCodeAt(0);
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, keyCode: cc, which: cc, bubbles: true, cancelable: true }));
+    el.dispatchEvent(mkInputEvt("beforeinput", ch));
+    setter.call(el, el.value + ch);
+    el.dispatchEvent(mkInputEvt("input", ch));
+    el.dispatchEvent(new KeyboardEvent("keypress", { key: ch, keyCode: cc, which: cc, charCode: cc, bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, keyCode: cc, which: cc, bubbles: true }));
+  }
+  tr.typedAt = Date.now() - T0;
+  // ⚠⚠ ENTER TAKES THE LIST'S OWN CHOICE, SO WAIT FOR THE LIST TO BE OURS (operator: "make sure what
+  // you type is actually a part of the dropdown — these are similar to the workday typeaheads").
+  // Half of that always held: `want` is taken from the rows the widget itself showed, so we can never
+  // type a value this form does not offer. The half that did not: Enter commits the FIRST row, and on
+  // an unfiltered list that was "January" while the input read "May". Being merely PRESENT is not
+  // enough — it has to be the row Enter will take.
+  let narrowed = false, shown = [];
+  for (let i = 0; i < 14; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    shown = readRows().map(t);
+    if (shown.length && norm(shown[0]) === norm(want)) { narrowed = true; tr.narrowedAt = Date.now() - T0; break; }
+  }
+  tr.firstRow = shown.length ? shown[0] : null;
+  // ⚠ AND IF IT NEVER NARROWS, DO NOT PRESS. Reporting beats committing a month nobody asked for onto
+  // a work-history date; the caller turns this into needs_review.
+  if (!narrowed) { tr.reopens = reopens; return { ok: false, error: "filter-did-not-narrow", kind, want, rows: shown.slice(0, 6), reopens, options: texts, trace: tr }; }
+  el.focus();
+  for (const type of ["keydown", "keypress", "keyup"]) {
+    el.dispatchEvent(new KeyboardEvent(type, { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true, cancelable: true }));
+  }
+
+  // ⚠⚠ THE READ-BACK SETTLES **HERE**, PAGE-SIDE, AND THAT IS THE WHOLE POINT (speed round,
+  // 2026-08-20). Shortening the SW-side poll from 150ms to 80ms bought nothing, because the MV3
+  // worker's timers are STARVED: the run's own PACE warnings measured `a 80ms pace took 1226ms` and
+  // `a 150ms pace took 1555ms`. So the cost of a poll is the NUMBER of awaits, not their length —
+  // sixteen 80ms SW awaits is sixteen ~1s stalls, which is exactly the 5067ms / 3200ms / 1701ms gaps
+  // that showed up between an entry form's discovery read and its first 20ms text write.
+  //
+  // Page-side timers are real, so settling in here costs the caller ONE cdpEval round-trip instead of
+  // sixteen starved ones. `value` comes back with the result and the SW does no further waiting.
+  //
+  // ⚠ This does NOT relax the house rule that pacing lives SW-side. That rule exists because a hidden
+  // or throttled tab's page timers stall — and it is about PACING (spacing actuation so a throttled
+  // page keeps up). This is a read-back SETTLE on a visible tab, bounded by the caller's own budget,
+  // and if the page never settles it simply returns `value: null` and the caller reports the failure
+  // exactly as before. Nothing is assumed from a timer that did not fire.
+  let value = null, invalid = false;
+  tr.enterAt = Date.now() - T0;
+  const vDeadline = Date.now() + 2500;
+  // ⚠⚠ THE FIRST STRETCH IS SAMPLED AT 8ms, NOT 60ms (operator at 240fps: the month was present for ONE
+  // FRAME). A 60ms poll can step straight over a ~4ms appearance, and the caller then treats a commit
+  // that HAPPENED as "not retained" and RETRIES it — which is exactly the refill that was observed.
+  // Fine sampling for the first ~240ms costs 30 in-page iterations and nothing over the wire.
+  let tick = 0;
+  while (Date.now() < vDeadline) {
+    await new Promise((r) => setTimeout(r, tick < 30 ? 8 : 60));
+    tick++;
+    const v = String(el.value || "").trim();
+    invalid = /cx-select-input--invalid/.test(String(el.className || ""));
+    if (tr.samples.length < 24) tr.samples.push({ t: Date.now() - T0, v: v.slice(0, 14), i: invalid ? 1 : 0 });
+    if (v && !invalid) { value = v; break; }
+  }
+  tr.reopens = reopens;
+  // ⚠ `options` IS THE UNFILTERED VOCABULARY, captured at OPEN before a keystroke narrowed it
+  // (operator, 2026-08-21: "each one is a dropdown, those should be scanned"). It is what lets the
+  // review page render each half as a real picker instead of a text box — and it is free, because
+  // classifying month-vs-year already had to read every row. Taken from `texts`, NOT from `shown`:
+  // `shown` is the list AFTER typing filtered it to one row, which would make the review editor offer
+  // a one-option dropdown containing only the value we already chose.
+  return { ok: true, kind, committed: want, reopens, value, invalid, options: texts, trace: tr };
+}
+
+function atsInjOrcLinks() {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const inputs = [...document.querySelectorAll('input[name^="siteLink"]')].filter(vis);
+  const add = [...document.querySelectorAll("button, a[role=button]")].filter(vis)
+    .find((b) => /add another link/i.test(t(b)) || /candidate-links__add-link/.test(String(b.className || "")));
+  return { ok: true, count: inputs.length, addPresent: !!add,
+    links: inputs.map((e) => ({ name: e.name || null, id: e.id || null, value: String(e.value || "").trim() })) };
+}
+
+function atsInjOrcAddLink() {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const add = [...document.querySelectorAll("button, a[role=button]")].filter(vis)
+    .find((b) => /add another link/i.test(t(b)) || /candidate-links__add-link/.test(String(b.className || "")));
+  if (!add) return { ok: false, error: "no-add-link-control" };
+  if (add.disabled || add.getAttribute("aria-disabled") === "true") return { ok: false, error: "add-link-disabled" };
+  add.click();
+  return { ok: true };
+}
+
+function atsInjOrcTiles(blockTitlePattern) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const block = [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  if (!block) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+
+  // A tile is identified by its DELETE control, then walked up to the smallest ancestor that holds
+  // exactly that one control — the tile itself. Keyed off the control rather than a tile class so a
+  // tenant that renames the wrapper still works.
+  const dels = [...block.querySelectorAll("button, a[role=button]")].filter(vis)
+    .filter((b) => /delete|remove/i.test(String(b.getAttribute("aria-label") || b.getAttribute("title") || "")));
+  const tiles = dels.map((del) => {
+    let tile = del.parentElement;
+    for (let i = 0; i < 5 && tile; i++) {
+      if (tile.querySelectorAll("button, a[role=button]").length > 3) break;   // walked too far — into the block
+      const txt = t(tile);
+      // ⚠ `> 0`, NOT `> 1`. The text is already trimmed, so a length test above zero drops nothing
+      // real — and `> 1` dropped the skill **"C"**, which came back as "" and would have looked
+      // ABSENT on every visit, re-added forever. One-character skills are ordinary (C, R, Go).
+      if (txt && txt.length > 0) return { text: txt.slice(0, 140) };
+      tile = tile.parentElement;
+    }
+    return { text: t(del.parentElement).slice(0, 140) };
+  });
+  const add = [...block.querySelectorAll("button, a[role=button]")].filter(vis)
+    .find((b) => /^add\b/i.test(t(b)));
+  return { ok: true, count: tiles.length, tiles, addCaption: add ? t(add) : null };
+}
+
+// Press a tile's Delete, then REPORT whatever appeared. ORC may put a confirmation in front of it,
+// and a surprise modal is exactly what wedges a run — so this never assumes, it describes.
+// ⚠ It reports the dialog rather than dismissing it: the judgement about pressing a confirm belongs
+// SW-side, like every other consequential decision in this file.
+function atsInjOrcDeleteTile(blockTitlePattern, index) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const block = [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  if (!block) return { ok: false, error: "block-not-found" };
+  const dels = [...block.querySelectorAll("button, a[role=button]")].filter(vis)
+    .filter((b) => /delete|remove/i.test(String(b.getAttribute("aria-label") || b.getAttribute("title") || "")));
+  const i = index == null ? dels.length - 1 : index;      // last-first keeps earlier indexes stable
+  if (i < 0 || i >= dels.length) return { ok: false, error: "no-such-tile", count: dels.length };
+  dels[i].click();
+  const dlg = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], oj-dialog')].filter(vis);
+  return { ok: true, remaining: dels.length - 1,
+    dialog: dlg.length ? { present: true, text: t(dlg[0]).slice(0, 160),
+      buttons: [...dlg[0].querySelectorAll("button")].filter(vis).map((b) => t(b)).slice(0, 6) } : { present: false } };
+}
+
+// Press a named control inside a visible dialog. Separate from the delete so the caller decides.
+function atsInjOrcDialogPress(patternSource) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(patternSource, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const dlg = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], oj-dialog')].filter(vis)[0];
+  if (!dlg) return { ok: false, error: "no-dialog" };
+  const hit = [...dlg.querySelectorAll("button")].filter(vis).find((b) => re.test(t(b)));
+  if (!hit) return { ok: false, error: "no-button", offered: [...dlg.querySelectorAll("button")].filter(vis).map((b) => t(b)).slice(0, 6) };
+  hit.click();
+  return { ok: true, pressed: t(hit) };
+}
+
+function atsInjOrcEntryState(blockTitlePattern) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const block = [...document.querySelectorAll("apply-flow-block")]
+    .filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  if (!block) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+  const buttons = [...block.querySelectorAll("button")].filter(vis).map((b) => t(b)).filter(Boolean);
+  // An OPEN entry form is the one state we can read without ambiguity.
+  const open = buttons.some((c) => /^cancel$/i.test(c));
+  const fields = [...block.querySelectorAll("input, textarea, select")].filter((e) => e.type !== "hidden" && vis(e))
+    .map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
+      role: e.getAttribute("role") || null,
+      label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
+      value: e.value || null }));
+  // ⚠⚠ WHAT IS ALREADY HERE? (live 2026-08-20) A run landed on a form Oracle had PREFILLED from an
+  // existing candidate record, and the pass pressed Add three times on top of it — leaving TWO copies
+  // of every job. Workday's repeating-section rule is "reconcile to exactly N, then fill each entry —
+  // true idempotency, proven from ARBITRARY dirty state", and only the second half of that was ever
+  // built here. Add-N-times is correct on a blank form and duplicates on every other kind.
+  //
+  // Counting is a READ, and it is reported rather than interpreted: `entryControls` are the per-row
+  // controls a committed entry renders (Edit / Delete / Remove), which is the only count available —
+  // a saved entry leaves no live inputs behind. The captions come back too, because the structure of a
+  // POPULATED block has never been observed and this log is what will describe it.
+  const rowCtl = [...block.querySelectorAll("button, a[role=button]")].filter(vis)
+    .map((b) => t(b)).filter((c) => /^(edit|delete|remove)\b/i.test(c));
+  return { ok: true, title: t(block.querySelector("apply-flow-block-title")), open, buttons, fields,
+    entryControls: rowCtl.length, entryControlCaptions: rowCtl.slice(0, 8),
+    // every distinct caption in the block, so one run describes a populated block completely
+    allCaptions: buttons.slice(0, 12),
+    // rows already committed: a saved entry leaves no live inputs, so the block's own list length is
+    // the only count available. Reported, not interpreted.
+    addCaption: buttons.find((c) => /^add\b/i.test(c)) || null };
+}
+
+// `action`: "open" | "commit" | "cancel". Refuses rather than pressing the wrong homonym.
+// ⚠⚠ OPEN-AND-WAIT IN ONE CALL, because the WAIT is what costs (speed round, 2026-08-20).
+// The SW-side poll for "has the entry form appeared" was 28 awaits of 150ms; the MV3 worker's timers
+// are starved, so each of those is ~1s in practice — the run's own PACE lines measured `a 150ms pace
+// took 1555ms`. That is the 5067ms / 3200ms / 1701ms gap between an entry form's discovery read and
+// its first 20ms text write.
+//
+// Page-side timers are real, so waiting here costs ONE cdpEval instead of N starved ones. The wait is
+// bounded and it reports what it saw: a form that never appeared comes back `fields: 0` and the caller
+// halts the block exactly as before — nothing is assumed from a timer that did not fire.
+async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const findBlock = () => [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  const block0 = findBlock();
+  if (!block0) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+  const btns0 = [...block0.querySelectorAll("button")].filter(vis);
+  if (btns0.some((b) => /^cancel$/i.test(t(b)))) return { ok: false, error: "entry-already-open" };
+  const add = btns0.find((b) => /^add\b/i.test(t(b)));
+  if (!add) return { ok: false, error: "no-add-control", offered: btns0.map((b) => t(b)).slice(0, 6) };
+  add.click();
+
+  // ⚠ POLL FINE AND CHECK FIRST — measured on the live form: ORC renders the entry form in **36ms**
+  // and tears it down in **33ms**. Sleeping 80ms before the first look therefore paid 80–160ms per
+  // phase for nothing, on every entry: with twelve entries (8 skills + 3 experience + 1 education)
+  // that is over a second of pure floor, and it is the "half a second before every action" the
+  // operator could feel on the skills block.
+  // ⚠ AND POLLING DENSELY HERE IS FREE, unlike SW-side pacing. These are PAGE timers inside an
+  // injected function — real, unthrottled, and not a starvation exposure. The "cost of a poll is the
+  // NUMBER of awaits" rule applies to act.delay in the service worker, NOT to this loop.
+  const deadline = Date.now() + (budgetMs || 6000);
+  let fields = [];
+  const before = [...block0.querySelectorAll("input, textarea, select")]
+    .filter((e) => e.type !== "hidden" && vis(e)).length;
+  let first = true;
+  while (Date.now() < deadline) {
+    if (!first) await new Promise((r) => setTimeout(r, 25));
+    first = false;
+    const block = findBlock();
+    if (!block) continue;
+    // ⚠⚠ THE EVIDENCE THAT A FORM OPENED IS THAT **INPUTS APPEARED**, not that a button says
+    // "Cancel" (operator, 2026-08-20). Requiring the Cancel caption made this report
+    // `pressed "Add Experience" but no entry form appeared` on a form whose entry fields were
+    // plainly there — the tenant simply does not render that button, or words it differently.
+    // A caption is tenant wording; a control that did not exist a moment ago is structure.
+    //
+    // The Cancel test still earns its keep on the COMMIT side, where it disambiguates the Add
+    // homonym — but even there it is now backed up by the input count, below.
+    const live = [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e));
+    if (live.length > before) {
+      fields = live.map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
+        role: e.getAttribute("role") || null,
+        label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
+        value: e.value || null }));
+      break;
+    }
+  }
+  return { ok: true, pressed: t(add), fields, count: fields.length };
+}
+
+// ── THE RÉSUMÉ IS ALWAYS REMOVED AND REPLACED ON A REPLAY (operator, 2026-08-21) ─────────────
+// "A rehearsal should only remove and replace the resume since there is no way to tell which is
+// actually uploaded." That is the exact reason it is the ONE exception to read-before-write: every
+// other field can be verified by LOOKING at the page, but a file field shows only a NAME, and a
+// filename says nothing about which bytes the server is holding. Re-uploading is the only way to
+// know, so the résumé is re-uploaded unconditionally.
+//
+// This also fixes the failure that exposed it: on the re-visit ORC renders the ATTACHED state
+// instead of the upload control, so `resume-upload` was absent from the scan entirely and the strict
+// verify reported the approved résumé as "no matching field on the live form". Removing it first
+// brings the file input back, after which the ORDINARY field loop attaches it — no second attach
+// path, and the route that maps exactly one field to the résumé still decides which slot gets it.
+//
+// ⚠ IT REPORTS WHAT IT FOUND RATHER THAN ASSUMING. I have not seen ORC's attached-résumé markup, and
+// inventing a selector for it is what the trace-first rule exists to prevent — so the remove control
+// is discovered the same way the tile controls are (aria-label / title / text), and when there is no
+// such control this returns the controls it DID see. That way a miss is a diagnosable report instead
+// of a silent no-op, and the next run has the DOM evidence.
+async function atsInjOrcResumeReset(budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const FILE_RE = /\.(pdf|docx?|rtf|txt|odt)\b/i;
+  const findWrap = () => {
+    const own = [...document.querySelectorAll("resume-upload-button")].filter(vis)[0];
+    if (own) return own;
+    // Fall back to the row/block whose own label names a résumé — never a document-wide sweep, so a
+    // cover-letter or attachment slot can never be mistaken for it.
+    return [...document.querySelectorAll("div.input-row, apply-flow-block")].filter(vis)
+      .find((d) => /r[ée]sum[ée]/i.test(t(d.querySelector("label")) || "")
+                || /r[ée]sum[ée]/i.test(t(d.querySelector("apply-flow-block-title")) || "")) || null;
+  };
+  const wrap0 = findWrap();
+  if (!wrap0) return { ok: true, present: false };
+  const controlsOf = (w) => [...w.querySelectorAll("button, a[role=button]")].filter(vis);
+  const nameIn = (w) => {
+    const el = [...w.querySelectorAll("*")].find((e) => FILE_RE.test(t(e)) && t(e).length < 120);
+    return el ? t(el) : null;
+  };
+  const attachedName = nameIn(wrap0);
+  const offered = controlsOf(wrap0)
+    .map((b) => (b.getAttribute("aria-label") || b.getAttribute("title") || t(b) || "").slice(0, 40))
+    .filter(Boolean);
+  if (!attachedName) {
+    return { ok: true, present: true, attached: false, offered,
+      hasFileInput: !!wrap0.querySelector('input[type="file"]') };
+  }
+  const rm = controlsOf(wrap0).find((b) => /remove|delete|clear|discard|trash|replace/i
+    .test(String(b.getAttribute("aria-label") || b.getAttribute("title") || t(b))));
+  if (!rm) return { ok: true, present: true, attached: true, attachedName, removed: false,
+    error: "no-remove-control", offered };
+  rm.click();
+  const deadline = Date.now() + (budgetMs || 6000);
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 100));
+    const w = findWrap();
+    if (!w) return { ok: true, present: true, attached: true, attachedName, removed: true, hasFileInput: false };
+    if (nameIn(w) !== attachedName) {
+      return { ok: true, present: true, attached: true, attachedName, removed: true,
+        hasFileInput: !!w.querySelector('input[type="file"]') };
+    }
+  }
+  return { ok: true, present: true, attached: true, attachedName, removed: false,
+    error: "still-attached", offered };
+}
+
+// OPEN AN EXISTING TILE FOR EDIT — the read side of the replay's verify (2026-08-20).
+// Same shape as the open above and the same evidence rule: a form is open when INPUTS APPEARED, not
+// when a button says Cancel. The tile is addressed by INDEX in the same order atsInjOrcTiles returns
+// them (both walk the block's Delete controls), so a caller that read tiles can act on tile k.
+async function atsInjOrcOpenTileAndWait(blockTitlePattern, tileIndex, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const findBlock = () => [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  const block0 = findBlock();
+  if (!block0) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+  const btns0 = [...block0.querySelectorAll("button")].filter(vis);
+  if (btns0.some((b) => /^cancel$/i.test(t(b)))) return { ok: false, error: "entry-already-open" };
+
+  // ⚠ THE TILE CONTROLS ARE ICON-ONLY — no textContent — so they are found by aria-label/title, the
+  // same way the delete pass finds its own. Ordered by the DELETE controls so the index agrees with
+  // atsInjOrcTiles; the Edit control is the one nearest that tile.
+  const dels = [...block0.querySelectorAll("button, a[role=button]")].filter(vis)
+    .filter((b) => /delete|remove/i.test(String(b.getAttribute("aria-label") || b.getAttribute("title") || "")));
+  if (!dels.length) return { ok: false, error: "no-tiles" };
+  if (tileIndex < 0 || tileIndex >= dels.length) return { ok: false, error: "tile-index-out-of-range:" + tileIndex + "/" + dels.length };
+  const del = dels[tileIndex];
+  let edit = null, scope = del.parentElement;
+  for (let i = 0; i < 5 && scope && !edit; i++) {
+    edit = [...scope.querySelectorAll("button, a[role=button]")].filter(vis)
+      .find((b) => /edit|change|update/i.test(String(b.getAttribute("aria-label") || b.getAttribute("title") || "")));
+    if (!edit) scope = scope.parentElement;
+  }
+  if (!edit) return { ok: false, error: "no-edit-control" };
+
+  const before = [...block0.querySelectorAll("input, textarea, select")]
+    .filter((e) => e.type !== "hidden" && vis(e)).length;
+  edit.click();
+
+  const deadline = Date.now() + (budgetMs || 6000);
+  let fields = [];
+  let firstT = true;
+  while (Date.now() < deadline) {                 // fine + check-first; see the note on the open above
+    if (!firstT) await new Promise((r) => setTimeout(r, 25));
+    firstT = false;
+    const block = findBlock();
+    if (!block) continue;
+    const live = [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e));
+    if (live.length > before) {
+      fields = live.map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
+        role: e.getAttribute("role") || null,
+        label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
+        value: e.value || null }));
+      break;
+    }
+  }
+  if (!fields.length) return { ok: false, error: "entry-form-never-rendered" };
+  return { ok: true, fields, count: fields.length };
+}
+
+// CLOSE AN OPEN ENTRY WITHOUT SAVING. Cancel is preferred because it asserts nothing; a tenant that
+// renders no Cancel falls back to the commit control, which is equivalent HERE and only here —
+// this is called on a path that has written nothing, so committing re-saves the entry unchanged.
+// ⚠ It must never be reused after a write unless a save is what you mean.
+async function atsInjOrcCloseEntry(blockTitlePattern, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const findBlock = () => [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  const block0 = findBlock();
+  if (!block0) return { ok: false, error: "block-not-found" };
+  // ⚠⚠ THE CANCEL CLICK IS IGNORED IF IT ARRIVES TOO EARLY — MEASURED, not inferred (2026-08-21).
+  // Diagnosed by hand on the operator's own live form, which settled two wrong theories of mine:
+  //
+  //   • NOT stale nodes. After pressing Edit, every previously-held button reported
+  //     `isConnected: true` and the block node was identical — nothing is detached, and the tiles
+  //     stay in the DOM alongside the open form.
+  //   • NOT a mis-targeted control. Resolving Cancel and clicking it by hand took the block from
+  //     6 visible inputs to 0 in under 200ms, and it stayed 0.
+  //
+  // And it explained the diagnostic that misled me: `offered: ["","","","","",""]` was not six
+  // orphaned nodes, it was the three Edit/Delete tile pairs — ORC's tile controls are ICON-ONLY, so
+  // their textContent is empty, and the report sliced the first six of the block's buttons.
+  //
+  // What is left is TIMING. The verify pass opens an entry, reads its fields page-side (fast), and
+  // clicks Cancel almost immediately; ORC does not have the handler wired that early, so the press
+  // is a no-op. Entry 1 escapes it because the first open is slower (component bootstrap), and the
+  // SELF-HEAL close succeeds because by then the form has been open for a while — which is exactly
+  // why the failure looked like "every entry after the first".
+  //
+  // ⚠ THE FIX IS A RE-PRESS, NOT A SLEEP. There is no readable "the form is ready" signal to poll,
+  // and the standing rule refuses fixed delays — but the predicate here ("the form is closed") is
+  // MONOTONE, so pressing again is free: if the first press worked we have already returned. Cancel
+  // twice, then the commit control as a last resort, each round re-resolved and each round polling
+  // its own share of the budget.
+  const pick = (rx) => {
+    const block = findBlock();
+    if (!block) return null;
+    return [...block.querySelectorAll("button")].filter(vis).find((b) => rx.test(t(b))) || null;
+  };
+  const openCount = () => {
+    const block = findBlock();
+    return block ? [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e)).length : -1;
+  };
+  // ⚠⚠ TRY THE OTHER CONTROL BEFORE GIVING UP (live 2026-08-20). Measured on the first rehearsal to
+  // run this path: entry 1 closed via Cancel every time and **entry 2's close always failed**, in
+  // BOTH the Experience and the Skills block — deterministic, not flaky. A form left open then made
+  // every later tile unopenable (`entry-already-open`), so ONE stuck close cost 10 of that run's 16
+  // verify failures. Whatever makes the second Cancel a no-op, a second press of the OTHER control
+  // is a cheap way out, and it is safe HERE for the same reason the fallback already was: this path
+  // writes nothing, so committing re-saves the entry unchanged.
+  const attempts = [];
+  // Cancel, Cancel again, then the commit control — which is equivalent HERE and only here, because
+  // this path writes nothing, so committing re-saves the entry unchanged.
+  const rounds = [/^cancel$/i, /^cancel$/i, /^(add|save|update)\b/i];
+  const perRound = Math.max(600, Math.round((budgetMs || 6000) / rounds.length));
+  for (const rx of rounds) {
+    if (openCount() === 0) return { ok: true, via: attempts[attempts.length - 1] || "already-closed", attempts };
+    const ctl = pick(rx);                       // resolved NOW, not once at the top
+    if (!ctl) continue;
+    const label = t(ctl) || "?";
+    ctl.click();
+    attempts.push(label);
+    const deadline = Date.now() + perRound;
+    let firstC = true;
+    while (Date.now() < deadline) {               // fine + check-first; see the note on the open above
+      if (!firstC) await new Promise((r) => setTimeout(r, 25));
+      firstC = false;
+      if (openCount() === 0) return { ok: true, via: label, attempts };
+    }
+  }
+  // Read the controls LIVE for the report as well — the stale-node version of this line is what made
+  // the Experience failure look like a block with six nameless buttons.
+  const offeredNow = (() => {
+    const block = findBlock();
+    return block ? [...block.querySelectorAll("button")].filter(vis).map((b) => t(b)).slice(0, 6) : [];
+  })();
+  if (!attempts.length) return { ok: false, error: "no-close-control", offered: offeredNow };
+  return { ok: false, error: "entry-still-open", attempts, stillOpen: openCount(), offered: offeredNow };
+}
+
+// COMMIT-AND-WAIT, same reasoning: press the (homonymous) Add and wait page-side for the form to be
+// GONE. `closed` is the evidence; a form still open means Oracle refused the entry.
+async function atsInjOrcCommitEntryAndWait(blockTitlePattern, budgetMs) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const findBlock = () => [...document.querySelectorAll("apply-flow-block")].filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  const block0 = findBlock();
+  if (!block0) return { ok: false, error: "block-not-found" };
+  const btns0 = [...block0.querySelectorAll("button")].filter(vis);
+  // ⚠ REFUSE if nothing is open: the SAME caption would OPEN a blank entry instead of committing one.
+  // "Open" is a Cancel button OR live inputs — the caption is tenant wording, the inputs are
+  // structure, and a tenant that renders no Cancel must still be able to commit.
+  const liveNow = [...block0.querySelectorAll("input, textarea, select")]
+    .filter((e) => e.type !== "hidden" && vis(e)).length;
+  if (!btns0.some((b) => /^cancel$/i.test(t(b))) && !liveNow) return { ok: false, error: "no-open-entry-to-commit" };
+  // ⚠⚠ RE-PRESS, FOR THE SAME REASON CANCEL HAD TO (2026-08-21). Measured on the live form: ORC
+  // ignores a click that lands before it has wired the handler — that is what made the verify pass's
+  // Cancel a no-op on every entry after the first. The commit is pressed even sooner (immediately
+  // after the field write), so it is exposed to the same thing, and the symptom is a skill that
+  // silently never got added — the flakiness the operator reported.
+  // Safe because the predicate is MONOTONE: once the form is closed we have already returned, so a
+  // second press can only ever hit a form that is still open. The caption is re-resolved each round
+  // ("Add Skill" while adding, "Save" while editing).
+  // ⚠ A commit is NOT a cancel: pressing twice must never be able to add a SECOND entry. The
+  // already-closed check at the top of each round is what guarantees that — if the first press
+  // worked, the loop exits before pressing anything again.
+  const openNow = () => {
+    const block = findBlock();
+    if (!block) return 0;
+    return [...block.querySelectorAll("input, textarea, select")]
+      .filter((e) => e.type !== "hidden" && vis(e)).length;
+  };
+  const pickCommit = () => {
+    const block = findBlock();
+    if (!block) return null;
+    return [...block.querySelectorAll("button")].filter(vis)
+      .find((b) => /^(add|save|update)\b/i.test(t(b))) || null;
+  };
+  const add0 = pickCommit();
+  if (!add0) return { ok: false, error: "no-add-control" };
+  const perRound = Math.max(500, Math.round((budgetMs || 6000) / 3));
+  let closed = false, presses = 0, pressed = t(add0) || "?";
+  for (let round = 0; round < 3 && !closed; round++) {
+    if (openNow() === 0) { closed = true; break; }
+    const ctl = pickCommit();
+    if (!ctl) break;
+    pressed = t(ctl) || pressed;
+    ctl.click();
+    presses++;
+    const deadline = Date.now() + perRound;
+    let firstP = true;
+    while (Date.now() < deadline) {
+      if (!firstP) await new Promise((r) => setTimeout(r, 25));
+      firstP = false;
+      if (openNow() === 0) { closed = true; break; }
+    }
+  }
+  return { ok: true, pressed, closed, presses };
+}
+
+function atsInjOrcEntryAction(blockTitlePattern, action) {
+  const t = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+  const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  let re;
+  try { re = new RegExp(blockTitlePattern, "i"); } catch (e) { return { ok: false, error: "bad-pattern" }; }
+  const block = [...document.querySelectorAll("apply-flow-block")]
+    .filter(vis)
+    .find((b) => re.test(t(b.querySelector("apply-flow-block-title"))));
+  if (!block) return { ok: false, error: "block-not-found:" + blockTitlePattern };
+  const buttons = [...block.querySelectorAll("button")].filter(vis);
+  const cap = (b) => t(b);
+  const isOpen = buttons.some((b) => /^cancel$/i.test(cap(b)));
+
+  if (action === "cancel") {
+    const c = buttons.find((b) => /^cancel$/i.test(cap(b)));
+    if (!c) return { ok: false, error: "no-open-entry" };
+    c.click();
+    return { ok: true, pressed: "Cancel" };
+  }
+  const addBtn = buttons.find((b) => /^add\b/i.test(cap(b)));
+  if (!addBtn) return { ok: false, error: "no-add-control", offered: buttons.map(cap).slice(0, 6) };
+  if (action === "open") {
+    // ⚠ REFUSE if a form is already open: the same caption would COMMIT the entry instead.
+    if (isOpen) return { ok: false, error: "entry-already-open", caption: cap(addBtn) };
+    addBtn.click();
+    return { ok: true, pressed: cap(addBtn), was: "closed" };
+  }
+  if (action === "commit") {
+    // ⚠ REFUSE if no form is open: the same caption would OPEN a blank entry instead.
+    if (!isOpen) return { ok: false, error: "no-open-entry-to-commit", caption: cap(addBtn) };
+    addBtn.click();
+    return { ok: true, pressed: cap(addBtn), was: "open" };
+  }
+  return { ok: false, error: "unknown-action:" + action };
+}
+
+// ── WHICH ORC BLOCKS REPEAT, AND FROM WHAT (pure) ────────────────────────────────────────
+// Block titles are the tenant's own wording, so these are PATTERNS rather than exact strings, and the
+// profile source is named explicitly. Anything not listed is left alone — a block we cannot source is
+// the operator's to fill, not ours to guess at.
+// ⚠ `Skills` and the résumé arrive PREFILLED from a returning candidate's account (measured: skills
+// already populated, `Kevin_s_Resume (6).pdf` already attached), so an entry pass here must reconcile
+// UP only and never assume a block starts empty.
+// ── PICKER READ-BACK: FRONT-LOADED, SAME BUDGET (operator reported slow skills, 2026-08-21) ──
+// Every ORC picker commit polls its read-back eight times. A flat 250ms wait meant even a value that
+// landed instantly cost 250ms before the first LOOK — and a fill crosses ~30 pickers (both halves of
+// every date pair, the dial code, the degree, and one per skill), so the floor alone was seconds.
+//
+// This schedule sums to the SAME 2000ms over the SAME eight awaits, so nothing is traded away: the
+// worst case is unchanged and the number of chances to be descheduled is unchanged — which matters,
+// because on this codebase the cost of a poll is the NUMBER of awaits, not their length. All that
+// changes is that the early looks happen sooner, so the common case (the widget already settled)
+// returns in 60ms instead of 250ms.
+//
+// ⚠ Do NOT "improve" this by adding more polls. A stability predicate gets WEAKER with denser
+// sampling, and every extra await is another starvation exposure (docs/fill-speed-log.md round 15).
+const ATS_ORC_READBACK_MS = [60, 100, 140, 200, 260, 320, 420, 500];
+
+var ATS_ORC_ENTRY_BLOCKS = [
+  { pattern: "^Experience", source: "work_experience", label: "Experience" },
+  { pattern: "^Education", source: "education", label: "Education" },
+  { pattern: "^Licenses? and Certificates?", source: "certifications", label: "Licenses and Certificates" },
+  { pattern: "^Skills", source: "skills", label: "Skills" },
+];
+
+// The entry forms, MEASURED — each one was read off the live DOM by the entry pass's own discovery
+// log (2026-08-19), which is why the shapes here are shorter and stranger than a guess would be.
+//
+// ⚠⚠ A DATE IS **TWO COMBOBOXES SHARING ONE `name`**, not one field. Measured verbatim:
+//   Experience entry 1 — 6 field(s): employerName[text], jobTitle[text],
+//                        startDate[combobox], startDate[combobox], endDate[combobox], endDate[combobox]
+// The first pass treated `startDate` as a single field, wrote "2025-05" into whichever id came
+// first, and burned 8.2s failing — the slowest field of the whole run. `date_pair` says so, and the
+// pass decides WHICH half is which by reading each picker's own options (a month list vs a year
+// list) rather than by position: a tenant that renders year-then-month would otherwise file every
+// start date backwards, and nothing about that failure would look like an ordering bug.
+//
+// ⚠ AND EXPERIENCE HAS NO CITY, COUNTRY OR RESPONSIBILITIES ON THIS TENANT. The earlier map carried
+// all three from the iCIMS shape; they never existed here. Left OUT rather than kept "just in case",
+// because a map entry that matches nothing is indistinguishable from one that is broken.
+// Which of an entry's fields IDENTIFY it, for deciding whether an approved entry is already on the
+// form. Deliberately the human-readable ones and never a DATE: two jobs can share a start month, and
+// a date is also the field most likely to be the reason the entry went missing in the first place.
+// Mirrors atsOrcEntryIdentity, but keyed by the FORM's field names because a replay reads the bundle.
+var ATS_ORC_ENTRY_IDENTITY_KEYS = {
+  work_experience: ["employerName", "jobTitle"],
+  education: ["educationalEstablishment"],
+  skills: ["skills"],
+};
+
+var ATS_ORC_ENTRY_MAPS = {
+  work_experience: {
+    "employerName": { path: "company" },
+    "jobTitle": { path: "job_title" },
+    "startDate": { path: "from", kind: "date_pair" },
+    // ⚠ A JOB YOU STILL HOLD HAS NO END DATE — the entry pass skips this when
+    // `currently_work_here` is true, exactly as the iCIMS entry resolver does. Writing today's date
+    // there would assert you had left.
+    "endDate": { path: "to", kind: "date_pair", blankWhenCurrent: true },
+  },
+  education: {
+    // `contentItemId` is Oracle's own name for the DEGREE picker — an opaque platform id whose label
+    // is the only thing that says so, which is why the discovery log prints the label next to the
+    // name. The profile stores degree and field-of-study as TIERED ARRAYS ("Bachelor of Science" →
+    // "Bachelor's Degree" → "Bachelors"), so both go through the ladder as candidates and the form's
+    // own vocabulary picks the wording it has.
+    "contentItemId": { path: "degree", kind: "tiered" },
+    "educationalEstablishment": { path: "school_or_university" },
+    "major": { path: "field_of_study", kind: "tiered" },
+    "gpa": { path: "gpa" },
+  },
+  skills: {
+    // ⚠ A SKILLS ENTRY IS A BARE STRING, NOT AN OBJECT. `profile.skills` is an array of names, so
+    // there is no property to read — `kind:"self"` says "the entry IS the value". Without it the
+    // resolver would index a string and answer nothing, which is what left every skill blank.
+    "skills": { kind: "self" },
+    // `yearsOfExperience` is deliberately unmapped: the profile does not record per-skill years, and
+    // inventing a number on a form an employer reads is the confidently-wrong class. If Oracle
+    // REQUIRES it the entry is refused and the pass says so — which is the honest outcome, and the
+    // evidence for either adding the data or dropping this block.
+  },
+};
+
+// Resolve ONE field of ONE entry. Pure, so the kinds are unit-pinnable without a page.
+//
+// ⚠ EVERY VALUE COMES FROM THE ENTRY, NEVER FROM THE PROFILE ROOT — the iCIMS seal, and it holds for
+// the same reason: a "City" inside an Experience entry is the EMPLOYER's city, so answering it from
+// the candidate's home address is a DIFFERENT FACT, not a near-miss. A kind that cannot answer
+// returns null and the caller reports the field UNANSWERED rather than falling through to a wider
+// scope.
+function atsOrcEntryValue(spec, entry) {
+  if (!spec || !entry) return null;
+  const raw = (k) => {
+    const v = entry[k];
+    return v === undefined || v === null || (typeof v === "string" && !v.trim()) ? null : v;
+  };
+  if (spec.kind === "skip") return null;
+  if (!spec.kind) { const v = raw(spec.path); return v == null ? null : String(v); }
+  // The entry IS the value (profile.skills is an array of bare strings).
+  if (spec.kind === "self") {
+    const v = typeof entry === "string" ? entry : null;
+    return v && v.trim() ? v.trim() : null;
+  }
+  // A TIERED profile array passes through as a ready-made candidate list, most-specific first —
+  // the same contract `resolve()` has everywhere else here, so the form's vocabulary decides.
+  if (spec.kind === "tiered") {
+    const v = raw(spec.path);
+    if (v == null) return null;
+    if (Array.isArray(v)) { const list = v.map((x) => String(x)).filter((x) => x.trim()); return list.length ? list : null; }
+    return String(v);
+  }
+  if (spec.kind === "date_pair") {
+    // A job still held has no end date; asserting one would say you had left.
+    if (spec.blankWhenCurrent && entry.currently_work_here === true) return null;
+    const v = raw(spec.path);
+    if (v == null) return null;
+    const m = /^(\d{4})-(\d{1,2})/.exec(String(v));
+    if (!m) { const y = /^(\d{4})$/.exec(String(v).trim()); return y ? { year: y[1], month: null } : null; }
+    return { year: m[1], month: String(Number(m[2])) };
+  }
+
+  // "Tallahassee, FL" → the city half. The profile stores one `location` string per entry and ORC
+  // asks for the parts separately, so the comma is the form's own delimiter, not an inference.
+  if (spec.kind === "city_of") {
+    const loc = raw(spec.path);
+    if (!loc) return null;
+    const first = String(loc).split(",")[0].trim();
+    return first || null;
+  }
+  // ⚠ THE COUNTRY IS IMPLIED BY THE STATE, AND ONLY WHEN THE STATE IS ONE WE RECOGNISE. A US state
+  // abbreviation implies the US; anything else returns null rather than guessing a country from a
+  // city name. Same rule the iCIMS education entry uses, and the same reason: a wrong country on an
+  // employment record is a confidently wrong fact, and blank is recoverable at review.
+  if (spec.kind === "country_of") {
+    const loc = raw(spec.path);
+    if (!loc) return null;
+    const parts = String(loc).split(",").map((x) => x.trim()).filter(Boolean);
+    const tail = parts.length > 1 ? parts[parts.length - 1] : "";
+    if (!tail) return null;
+    const ab = atsLib.REGION_ABBREV || {};
+    const up = tail.toUpperCase();
+    const known = Object.prototype.hasOwnProperty.call(ab, up)
+      || Object.keys(ab).some((k) => String(ab[k]).toLowerCase() === tail.toLowerCase());
+    return known ? "United States" : null;
+  }
+  if (spec.kind === "join") {
+    const v = raw(spec.path);
+    if (!v) return null;
+    return Array.isArray(v) ? (atsLib.joinBullets ? atsLib.joinBullets(v) : v.join("\n")) : String(v);
+  }
+  // A month-precision date, passed through as the profile stores it ("2025-05"). The WIDGET decides
+  // how it is entered, which is read live rather than assumed — see the entry pass's field report.
+  if (spec.kind === "date") { const v = raw(spec.path); return v == null ? null : String(v); }
+  return null;
+}
+
+// ── THE LINKS PASS ───────────────────────────────────────────────────────────────────────
+// `siteLink` is a REPEATING section (operator, 2026-08-20): "Add Another Link" creates siteLink-2,
+// -3… and ALL of the operator's profile links belong on the form, not just the first.
+//
+// The flat loop already fills whichever link inputs EXIST at scan time — and correctly, one url each,
+// because the map's `website` kind indexes the profile list by the ordinal in the field name. This
+// pass exists for the urls with nowhere to go yet: it presses Add Another Link and fills the input
+// that appears.
+//
+// ⚠ IDEMPOTENT BY URL, like skills. Oracle's form arrives prepopulated for a returning candidate, so
+// a url already on the form is SKIPPED rather than added again — otherwise every run would grow the
+// list. Comparison is on the https-normalized string, which is what both sides already hold.
+async function atsOrcFillLinks(act, profile, opts) {
+  const o = opts || {};
+  const log = o.log || (() => {});
+  const records = [], notes = [];
+  const want = atsProfileWebsites(profile);
+  if (!want.length) return { records, notes };
+
+  const st0 = await act.eval(atsInjOrcLinks).catch(() => null);
+  if (!st0 || !st0.ok) return { records, notes };
+  if (!st0.count && !st0.addPresent) return { records, notes };   // no links section on this step
+
+  const norm = (v) => atsLib.normalize(String(v || "")).replace(/\/+$/, "");
+  const have = st0.links.map((l) => norm(l.value)).filter(Boolean);
+  const missing = want.filter((u) => have.indexOf(norm(u)) === -1);
+  log(`links: profile has ${want.length}, the form holds ${have.length} (${JSON.stringify(st0.links.map((l) => l.value).filter(Boolean))}) — ${missing.length} to add`);
+
+  // ⚠ REPORT THE LINKS ALREADY ON THE FORM, for the same reason as the entries above: a link the run
+  // did not have to add is still part of the application, and a review page that omits it tells the
+  // operator their links are missing.
+  // ⚠ THE FLAT LOOP ALREADY RECORDED `siteLink-1` (it is in the static map), so reporting every link
+  // here would DOUBLE it in review — the field would appear twice, which reads as two links.
+  const already = new Set((o.recorded || []).map(String));
+  for (const l of st0.links) {
+    if (!l.value) continue;
+    if (l.name && already.has(l.name)) continue;
+    records.push({
+      fieldName: l.name || "siteLink", label: "Link " + ((String(l.name || "").split("-")[1]) || "?"),
+      widgetType: "text", isRequired: false, mappedPath: "websites[].url",
+      status: "filled", verified: true, after: l.value, elapsedMs: 0,
+      detail: want.indexOf(l.value) !== -1 || have.indexOf(norm(l.value)) !== -1
+        ? "already on the form" + (want.some((u) => norm(u) === norm(l.value)) ? " and it is one of your profile's links — verified, not re-entered" : "")
+        : "already on the form",
+    });
+  }
+  if (!missing.length) return { records, notes };
+
+  if (!st0.addPresent) {
+    notes.push(`${missing.length} profile link(s) could not be added — this form has no "Add Another Link" control`);
+    return { records, notes };
+  }
+
+  for (const url of missing.slice(0, ATS_ORC_ENTRY_MAX)) {
+    const before = await act.eval(atsInjOrcLinks).catch(() => null);
+    const n = before && before.ok ? before.count : 0;
+    // An EMPTY input already on the form is used before creating another one — pressing Add with a
+    // blank row sitting there would leave a hole the operator has to notice.
+    let slot = (before && before.ok ? before.links : []).find((l) => !l.value);
+    if (!slot) {
+      const add = await act.eval(atsInjOrcAddLink).catch(() => null);
+      if (!add || !add.ok) {
+        log(`⛔ links: could not press "Add Another Link" (${(add && add.error) || "unknown"})`);
+        notes.push(`could not add a row for ${url}`);
+        break;
+      }
+      // MONOTONE: a new input exists. Polled, never a fixed sleep.
+      for (let i = 0; i < 12 && !slot; i++) {
+        await act.delayFull(250);
+        const now = await act.eval(atsInjOrcLinks).catch(() => null);
+        if (now && now.ok && now.count > n) slot = now.links.find((l) => !l.value) || null;
+      }
+      if (!slot) {
+        log("⛔ links: pressed \"Add Another Link\" but no new empty input appeared");
+        notes.push(`could not add a row for ${url}`);
+        break;
+      }
+    }
+    const sel = slot.id ? "#" + slot.id.replace(/([^\w-])/g, "\\$1") : 'input[name="' + slot.name + '"]';
+    const rec = { fieldName: slot.name || "siteLink", label: "Link " + ((slot.name || "").split("-")[1] || "?"),
+                  widgetType: "text", isRequired: false, mappedPath: "websites[].url",
+                  status: "skipped", after: null, elapsedMs: 0 };
+    const t0 = Date.now();
+    await act.eval(atsInjSetText, sel, url).catch(() => null);
+    const back = await act.eval(atsInjReadValue, "oracle", sel, "text").catch(() => null);
+    rec.after = back && back.ok ? back.value : null;
+    rec.elapsedMs = Date.now() - t0;
+    const ok = String(rec.after || "").trim() === url;
+    rec.status = ok ? "filled" : "needs_review";
+    if (!ok) { rec.flag = "commit-not-accepted"; rec.detail = `wrote ${JSON.stringify(url)} but the field holds ${JSON.stringify(rec.after)}`; }
+    else rec.detail = "added a link row for this profile website";
+    records.push(rec);
+    log(`  ${rec.fieldName} → ${rec.status} · after=${JSON.stringify(rec.after)}`);
+  }
+  return { records, notes };
+}
+
+// ── THE ENTRY PASS ───────────────────────────────────────────────────────────────────────
+// One entry at a time: OPEN → read the form ORC just built → fill → COMMIT → confirm it closed.
+//
+// ⚠ DISCOVERY-FIRST, AND DELIBERATELY SO. Recon could not describe this form because it does not
+// exist until an Add is pressed ("0 inputs, built on demand"), and the standing rule on this
+// codebase is to trace the real DOM before writing a handler — every hard widget here only cracked
+// after blind guesses failed. So the pass READS the entry form it just created, LOGS every field it
+// found (always, not behind a debug flag: that log is the recon record for the next tenant), fills
+// what the map claims by NAME, and reports the rest as unanswered rather than pretending they were
+// absent. A field the map does not know about is then one line to add, evidenced.
+//
+// ⚠ THE FIELD KEY IS `name`, NEVER `id`. Measured: every ORC control is `id="<name>-<N>"` where N is
+// a render-assignment counter — `country-19` numbers BELOW `email-27` while appearing after it — so
+// an id is an in-visit address and nothing more. The id IS used for the actuation selector, resolved
+// from the same read that produced it, which is the only safe way to use it.
+//
+// ⚠ AND `Add` IS A HOMONYM. The same button opens a blank entry and commits the open one, so both
+// actions are gated on whether a Cancel is present (atsInjOrcEntryAction refuses the wrong one).
+// Pressing it twice in a row on a misread state would silently create an empty entry.
+// -- REMOVE ONE TILE THE APPROVED BUNDLE DOES NOT WANT (operator, 2026-08-21) -------------
+// "for 4 you say purely additive however I need it to subtract if in any case the current experience
+// block is wrong."
+//
+// WHY THIS IS NOW SAFE WHEN IT WAS FORBIDDEN BEFORE, and the distinction is the whole point. The rule
+// was "a replay must never delete", and its reason was SPECIFIC: the reconcile was driven by the
+// PROFILE, which a replay passes as `{}`, so it read "wants 0, the form has 3" and would have deleted
+// a whole work history. That hazard is about the SOURCE of the count, not about deletion itself.
+// Every decision here is driven by the APPROVED BUNDLE, which carries real counts and real values, so
+// "wants 0" can only be true when the human genuinely approved nothing — and that case is refused
+// outright by the caller's `approvedCount > 0` guard.
+//
+// Deletes ONE tile BY INDEX, and re-reads afterwards, because tile indexes shift under a deletion.
+// A confirmation dialog is REPORTED by the primitive and answered here — the same split the fill path
+// uses, so the decision to confirm a destructive press stays in the driver.
+async function atsOrcDeleteTileAt(act, spec, index, log) {
+  const before = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+  const n = before && before.ok ? before.count : 0;
+  if (!n) return { ok: false, error: "no-tiles" };
+  const del = await act.eval(atsInjOrcDeleteTile, spec.pattern, index).catch(() => null);
+  if (!del || !del.ok) return { ok: false, error: (del && del.error) || "delete-not-pressable" };
+  if (del.dialog && del.dialog.present) {
+    log("  " + spec.label + ": a confirmation appeared — " + JSON.stringify(del.dialog.text));
+    const okd = await act.eval(atsInjOrcDialogPress, "^(yes|delete|remove|confirm|ok)\\b").catch(() => null);
+    if (!okd || !okd.ok) return { ok: false, error: "confirmation-unanswered" };
+  }
+  // Gated on the count actually DROPPING. A delete that did not take must be reported, never assumed.
+  for (let w = 0; w < 24; w++) {
+    await act.delayFull(150);
+    const after = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+    if (after && after.ok && after.count < n) return { ok: true, remaining: after.count };
+  }
+  return { ok: false, error: "count-did-not-drop" };
+}
+
+// -- RESTORE AN APPROVED ENTRY THAT THE FORM NO LONGER HAS (operator, 2026-08-21) ---------
+// "there were 3 experience fields approved. the reherse run only saw 1 repeating section and did not
+// add the other 2 that were approved. it must add them and get the page to match what is approved."
+//
+// WHY AN ENTRY GOES MISSING: Oracle REFUSES an entry whose required date is incomplete, and a refused
+// entry never persists. So a fill can end with fewer tiles than the bundle has entries -- which
+// invalidated the old premise that "ORC saves entries server-side, so the tiles the fill created are
+// still there". The strict verify then reported every field of the absent entries as "approved value
+// has NO matching field on the live form": true, but it says neither which entry nor why.
+//
+// STRICTLY ADDITIVE, AND THAT IS THE SAFETY PROPERTY. It only ever presses Add and fills a FRESH
+// form. It never opens, edits or deletes an entry that is present, so it cannot damage data already
+// on the application -- the reason the surrounding pass refuses to actuate at all is that a
+// profile-derived reconcile reads `profile:{}` as "wants 0" and DELETES the work history. Nothing
+// here reads the profile; every value comes from the approved bundle via `valueFor`.
+//
+// Values come back in the form's OWN vocabulary because that is what the fill recorded: a date half
+// is stored as the option text the picker committed ("September" / "2024"), so it is handed straight
+// back as the sole candidate. No display-string parsing, and nothing is re-derived.
+async function atsOrcAddApprovedEntry(act, spec, idx, emap, valueFor, log) {
+  const records = [];
+  const get = (fieldName, wt) => {
+    try { return valueFor({ fieldName, entrySection: spec.source, entryIndex: idx, widgetType: wt || "text" }); }
+    catch (e) { return undefined; }
+  };
+  const tag = spec.label + " entry " + (idx + 1);
+  const opened = await act.eval(atsInjOrcOpenEntryAndWait, spec.pattern, ATS_ORC_PICK_MS)
+    .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (!opened || !opened.ok || !(opened.fields || []).length) {
+    const why = (opened && opened.error) || "the entry form never rendered";
+    log("⛔ " + tag + ": could not open a form to restore it — " + why);
+    return { ok: false, error: why, records };
+  }
+  const byName = new Map();
+  for (const f of opened.fields) {
+    const k = f.name || f.id || "";
+    if (!k) continue;
+    if (!byName.has(k)) byName.set(k, []);
+    byName.get(k).push(f);
+  }
+  const esc = (id) => "#" + String(id).replace(/([^\w-])/g, "\\$1");
+  let wrote = 0, failed = 0;
+  for (const [key, group] of byName) {
+    const mapSpec = emap[key];
+    if (!mapSpec || mapSpec.kind === "skip") continue;
+
+    if (mapSpec.kind === "date_pair" && group.length >= 2) {
+      for (const g of group.slice(0, 2)) {
+        const h = /^month-/.test(String(g.id || "")) ? "month"
+          : (/^year-/.test(String(g.id || "")) ? "year" : null);
+        if (!h || !g.id) continue;
+        let want = get(spec.source + "[" + idx + "]." + key + "." + h, "dropdown");
+        if (want === undefined || !String(want).trim()) {
+          // A pre-split approval keys the whole date as one row — take this half out of it.
+          const merged = get(spec.source + "[" + idx + "]." + key, "dropdown");
+          want = merged === undefined ? undefined : atsOrcLegacyDateHalf(merged, h);
+        }
+        if (want === undefined || want === null || !String(want).trim()) continue;   // not approved => nothing to restore
+        const cands = [String(want).trim()];
+        let r = null;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          if (attempt) await act.delayFull(400);
+          r = await act.eval(atsInjOrcPickFromOwnList, esc(g.id),
+            h === "month" ? cands : [], h === "year" ? cands : [], ATS_ORC_PICK_MS).catch(() => null);
+          if (r && r.ok && r.value && !r.invalid) break;
+        }
+        const ok = !!(r && r.ok && r.value && !r.invalid);
+        if (ok) wrote++; else failed++;
+        records.push({
+          fieldName: spec.source + "[" + idx + "]." + key + "." + h,
+          label: (group[0].label || key) + " (" + h + ")",
+          widgetType: "dropdown", isRequired: false,
+          entrySection: spec.source, entryIndex: idx,
+          question_key: spec.source + "[" + idx + "]." + key,
+          part_label: h === "year" ? "Year" : "Month",
+          options: (r && Array.isArray(r.options) && r.options.length) ? r.options : null,
+          status: ok ? "filled" : "needs_review", verified: !!ok,
+          after: ok ? r.value : null, elapsedMs: 0,
+          flag: ok ? null : "commit-not-accepted",
+          detail: ok
+            ? "restored onto the form from your approved review (" + JSON.stringify(r.value) + ")"
+            : "could not restore " + JSON.stringify(cands[0]) + (r && r.error ? " (" + r.error + ")" : ""),
+        });
+      }
+      continue;
+    }
+
+    const f = group[0];
+    if (!f.id) continue;
+    const want = get(spec.source + "[" + idx + "]." + key, f.role === "combobox" ? "dropdown" : "text");
+    if (want === undefined || !String(want).trim()) continue;
+    const flat = String(Array.isArray(want) ? want[0] : want).trim();
+    let after = null;
+    if (f.role === "combobox") {
+      const r = await act.eval(atsInjOrcPick, esc(f.id), flat, [flat], ATS_ORC_PICK_MS, false, true).catch(() => null);
+      const back = await act.eval(atsInjOrcReadPicker, esc(f.id)).catch(() => null);
+      if (r && r.ok && back && back.ok && String(back.value || "").trim() && !back.invalid) after = back.value;
+    } else {
+      const w = await act.eval(atsInjSetText, esc(f.id), flat).catch(() => null);
+      const back = await act.eval(atsInjReadValue, "oracle", esc(f.id), "text").catch(() => null);
+      if (w && w.ok && back && back.ok && String(back.value || "").trim()) after = back.value;
+    }
+    if (after) wrote++; else failed++;
+    records.push({
+      fieldName: spec.source + "[" + idx + "]." + key, label: f.label || key,
+      widgetType: f.role === "combobox" ? "dropdown" : "text", isRequired: false,
+      entrySection: spec.source, entryIndex: idx,
+      status: after ? "filled" : "needs_review", verified: !!after,
+      after: after || null, elapsedMs: 0,
+      flag: after ? null : "commit-not-accepted",
+      detail: after
+        ? "restored onto the form from your approved review"
+        : "wrote " + JSON.stringify(flat) + " from your approved review but the field did not keep it",
+    });
+  }
+
+  // THE COMMIT IS THE ONLY THING THAT MAKES IT REAL, and Oracle refuses an incomplete entry -- the
+  // very failure that lost this entry at fill time. A form left open would block Next, so a refusal
+  // is CANCELLED to leave the block clean, and reported.
+  const done = await act.eval(atsInjOrcCommitEntryAndWait, spec.pattern, ATS_ORC_PICK_MS)
+    .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (!done || !done.ok || !done.closed) {
+    const why = (done && done.error) || "Oracle refused the entry (a required field in it is unanswered)";
+    log("⛔ " + tag + ": filled " + wrote + " field(s) from your approved review but the entry would NOT commit — " + why);
+    await act.eval(atsInjOrcEntryAction, spec.pattern, "cancel").catch(() => null);
+    return { ok: false, error: why, records, wrote, failed };
+  }
+  log("✔ " + tag + ": RESTORED from your approved review — " + wrote + " field(s) written"
+    + (failed ? ", " + failed + " could not be set" : ""));
+  return { ok: true, records, wrote, failed };
+}
+
+async function atsOrcFillEntries(act, profile, jc, opts) {
+  const o = opts || {};
+  const log = o.log || (() => {});
+  const records = [], notes = [];
+  const read = await act.eval(atsInjOrcBlocks).catch(() => null);
+  const blocks = (read && read.ok && read.blocks) || [];
+  if (!blocks.length) { log("no visible apply-flow-block on this step"); return { records, notes }; }
+  // ⚠ THE WHOLE BLOCK INVENTORY, EVERY STEP. The operator reported three REQUIRED yes/no application
+  // questions that no pass has ever recorded — and with no inventory there is no way to tell whether
+  // the block holding them is on a step we walked, on one we did not, or present with zero controls.
+  // Printing the blocks and their control counts answers that in one line per step, and costs nothing
+  // (the read already happened).
+  log(`blocks on this step: ${blocks.map((b) => JSON.stringify(b.title) + " (" + b.inputs + " input(s)" + (b.addCaption ? ", add=" + JSON.stringify(b.addCaption) : "") + ")").join(", ") || "none"}`);
+  const plan = atsOrcEntryPlan(profile, blocks.map((b) => b.title));
+
+  // ⚠⚠ A SUBMIT/REHEARSAL VISIT REPORTS THE ENTRIES; IT MUST NOT REBUILD THEM (2026-08-20).
+  // The replay passes `profile: {}` by design — every value comes from the approved bundle — so the
+  // plan above is EMPTY on a submit run. Doing nothing is the right ACTION (ORC saves entries to the
+  // candidate profile server-side, so the tiles the fill created are still on the form, and re-adding
+  // them would duplicate the work history) but it is not a complete ANSWER: the approved bundle
+  // carries one record per entry, and a replay that emits none of them makes the strict verify report
+  // every Experience and Education row as "approved value has NO matching field on the live form".
+  // That is the exact shape that produced 28 of an iCIMS rehearsal's 32 failures — except here it
+  // would block a submit whose entries are all present and correct.
+  //
+  // So a report-only visit READS the tiles and records them, and clicks nothing. The verify then
+  // means what it should — "the entries you approved are still on the form" — and a tile that changed
+  // or vanished between the fill and the submit FAILS the gate instead of passing unnoticed.
+  if (o.reportOnly) {
+    // ⚠⚠ PER-FIELD, NOT PER-ENTRY. The fill records one row per entry FIELD
+    // (`work_experience[0].employerName`), and for Oracle atsSubmitKey is just the durable field
+    // name — so the replay's rows must carry the SAME names or the strict verify reports every
+    // approved entry field as "no matching field on the live form". An earlier version of this
+    // branch emitted one summary row per entry, which lined up only because the fill was emitting
+    // summaries too; both are gone.
+    //
+    // The operator's rule for this visit: "see if nothing is wrong, then don't change it, but if
+    // something is filled wrong, change it." This half does the seeing. Each tile is opened, its
+    // fields are read, and each is compared with the value the human approved:
+    //   • equal  ⇒ `filled`, verified, nothing written and nothing to review;
+    //   • differs ⇒ `needs_review` + `entry-mismatch`, which BLOCKS the gate and names the field.
+    // ⚠ The repair itself is deliberately NOT done here yet — writing into an entry form means
+    // driving the date-pair and tiered-degree resolvers from a committed DISPLAY value ("May 2026",
+    // the degree wording the form chose), and a repair that mis-parses one would damage an entry
+    // that was merely reported wrong. Blocking is the safe half and is correct on its own: a
+    // mismatch stops the submit instead of passing unnoticed.
+    for (const spec of ATS_ORC_ENTRY_BLOCKS) {
+      const re = new RegExp(spec.pattern, "i");
+      if (!blocks.some((b) => re.test(String(b.title || "")))) continue;
+      const t0 = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+      const tiles = (t0 && t0.ok && t0.tiles) || [];
+      const emap = ATS_ORC_ENTRY_MAPS[spec.source] || {};
+      // ⚠⚠ DID ORACLE KEEP EVERY ENTRY THE HUMAN APPROVED? (live 2026-08-21) This branch's premise was
+      // "ORC saves entries server-side, so the tiles the fill created are still on the form", and that
+      // is MEASURED FALSE: a fill whose entry Oracle REFUSED (an incomplete required date is enough —
+      // see the date-picker note) never persisted it, so the form can serve FEWER tiles than the
+      // bundle has entries. Live, a 2-entry bundle met a 1-tile form and the operator saw "the
+      // rehearsal did not add experience".
+      //
+      // It already blocked the gate — the strict verify reported each absent field as "approved value
+      // has NO matching field on the live form" — but four per-field failures do not say WHICH entry
+      // is missing or WHY, and the cause was three steps upstream. So the shortfall is named here, at
+      // the one place that can see both numbers.
+      //
+      // ⚠ THIS IS THE DIAGNOSIS HALF ONLY. Re-ADDING the missing entry is the operator's actual
+      // request and is NOT done here: it means writing into a fresh entry form from committed DISPLAY
+      // values on the SUBMIT path, and it must never delete or duplicate an entry that IS present.
+      // `entryCounts` is now in scope for exactly that work. Reporting is strictly better than the
+      // status quo and cannot damage an entry that is merely absent.
+      // ⚠⚠ RESTORE ANY APPROVED ENTRY THE FORM NO LONGER HAS (operator, 2026-08-21): "it must add
+      // them and get the page to match what is approved." Oracle refuses an entry whose required date
+      // is incomplete and a refused entry never persists, so a fill can leave FEWER tiles than the
+      // bundle has entries — which is exactly what happened live (3 approved, 1 on the form).
+      //
+      // ⚠ WHICH entries are missing is DECIDED BY EVIDENCE, not by assuming the tail. Taking
+      // "indices tiles.length…approvedCount-1" would be wrong whenever the entry Oracle refused was
+      // the SECOND of three — it would re-add the third (already present, now duplicated) and still
+      // leave the second absent. So each approved index is looked for among the tiles by its own
+      // identifying values, and only the genuinely absent ones are added.
+      const approvedCount = Number((o.entryCounts || {})[spec.source] || 0);
+      if (approvedCount > tiles.length) {
+        const idKeys = ATS_ORC_ENTRY_IDENTITY_KEYS[spec.source] || [];
+        const absent = [];
+        for (let bi = 0; bi < approvedCount; bi++) {
+          const idVals = idKeys.map((kk) => {
+            const v = typeof o.valueFor === "function"
+              ? o.valueFor({ fieldName: `${spec.source}[${bi}].${kk}`, entrySection: spec.source, entryIndex: bi, widgetType: "text" })
+              : undefined;
+            return v === undefined ? null : String(v).trim();
+          }).filter(Boolean);
+          // No identifying value ⇒ we cannot tell whether it is present, and adding it might
+          // duplicate a real entry. Refusing to guess is the safe direction here.
+          if (!idVals.length) continue;
+          const present = tiles.some((t) => idVals.every((v) => atsOrcTileHoldsValue(t && t.text, v)));
+          if (!present) absent.push({ idx: bi, idVals });
+        }
+        if (absent.length) {
+          log(`⚠ ${spec.label}: the form has ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} but you approved `
+            + `${approvedCount} — RESTORING ${absent.length} that Oracle did not keep: `
+            + absent.map((a) => JSON.stringify(a.idVals.join(" · "))).join(", "));
+          for (const a of absent) {
+            const res = await atsOrcAddApprovedEntry(act, spec, a.idx, emap, o.valueFor, log);
+            for (const r of res.records || []) records.push(r);
+            if (!res.ok) {
+              notes.push(`${spec.label} entry ${a.idx + 1}: approved but MISSING from the form, and it could not be restored `
+                + `(${res.error || "unknown"}) — the submit gate will refuse until this is fixed by hand or the fill is re-run`);
+            } else {
+              notes.push(`${spec.label} entry ${a.idx + 1}: was missing from the form and has been RESTORED from your approved review`);
+            }
+          }
+          // Re-read the tiles: the ones we just added are part of what has to be verified below, and
+          // their positions shift whatever the form's own ordering is.
+          const t1 = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+          const after = (t1 && t1.ok && t1.tiles) || [];
+          log(`${spec.label}: ${after.length} entr${after.length === 1 ? "y" : "ies"} on the form after restoring`);
+          tiles.length = 0;
+          for (const t of after) tiles.push(t);
+        } else {
+          const why = `${spec.label}: you approved ${approvedCount} entr${approvedCount === 1 ? "y" : "ies"} and the form shows `
+            + `${tiles.length}, but every approved entry was found on the form — nothing was added (the count differs for a `
+            + `reason this pass cannot see; check the page by hand).`;
+          log(`⚠ ${why}`);
+          notes.push(why);
+        }
+      }
+      // ⚠⚠ AND SUBTRACT A TILE THE APPROVED REVIEW DOES NOT WANT AT ALL (operator, 2026-08-21).
+      // The form can hold MORE than was approved — a previous run's entry, or one Oracle kept from a
+      // draft — and "the page matches what is approved" is not true while a stray entry is on it. An
+      // entry matching no approved identity is not a near-miss to repair, it is one to remove.
+      //
+      // ⚠ GUARDED ON THE BUNDLE WANTING SOMETHING HERE (`approvedCount > 0`). That single condition is
+      // what separates this from the failure the never-delete rule was written for: a replay passes
+      // profile:{}, so anything profile-derived reads "wants 0, the form has 3" and deletes a whole
+      // work history. With nothing approved for a section this does not run at all.
+      // ⚠ And identity must be KNOWABLE for the tile to be condemned — a tile we cannot evaluate is
+      // left alone, because absence of evidence is not evidence it is stray.
+      const approvedNow = Number((o.entryCounts || {})[spec.source] || 0);
+      if (approvedNow > 0 && tiles.length > approvedNow) {
+        const idKeys2 = ATS_ORC_ENTRY_IDENTITY_KEYS[spec.source] || [];
+        const approvedIds = [];
+        for (let bi = 0; bi < approvedNow; bi++) {
+          const vals = idKeys2.map((kk) => {
+            const v = typeof o.valueFor === "function"
+              ? o.valueFor({ fieldName: `${spec.source}[${bi}].${kk}`, entrySection: spec.source, entryIndex: bi, widgetType: "text" })
+              : undefined;
+            return v === undefined ? null : String(v).trim();
+          }).filter(Boolean);
+          if (vals.length) approvedIds.push(vals);
+        }
+        if (approvedIds.length) {
+          // LAST-FIRST, so the earlier indexes this loop still has to consider stay valid.
+          for (let ti = tiles.length - 1; ti >= 0; ti--) {
+            const txt = tiles[ti] && tiles[ti].text;
+            const wanted = approvedIds.some((vals) => vals.every((v) => atsOrcTileHoldsValue(txt, v)));
+            if (wanted) continue;
+            log(`⚠ ${spec.label} entry ${ti + 1}: on the form but NOT in your approved review `
+              + `(${JSON.stringify(String(txt || "").slice(0, 60))}) — removing it so the page matches what you approved`);
+            const gone = await atsOrcDeleteTileAt(act, spec, ti, log);
+            if (gone.ok) {
+              notes.push(`${spec.label} entry ${ti + 1}: was on the form but not in your approved review — REMOVED`);
+              tiles.splice(ti, 1);
+            } else {
+              notes.push(`${spec.label} entry ${ti + 1}: is on the form but not in your approved review, and could NOT be removed `
+                + `(${gone.error}) — remove it by hand`);
+              log(`⛔ ${spec.label} entry ${ti + 1}: could not remove the unapproved entry (${gone.error})`);
+            }
+          }
+        }
+      }
+      if (!tiles.length) { log(`${spec.label}: no entries on the form`); continue; }
+      log(`${spec.label}: ${tiles.length} entr${tiles.length === 1 ? "y" : "ies"} on the form — opening each to check it against your approved values (nothing is rewritten unless it disagrees)`);
+
+      for (let k = 0; k < tiles.length; k++) {
+        // ── THE CHEAP CHECK FIRST: is everything the human approved already visible in the tile? ──
+        // The map tells us which fields this section has, so the expected values can be looked up
+        // without opening anything. All present ⇒ verified from the DOM, nothing touched.
+        const lookup = (fieldName, widgetType) => (typeof o.valueFor === "function"
+          ? o.valueFor({ fieldName, entrySection: spec.source, entryIndex: k, widgetType: widgetType || "text" })
+          : undefined);
+        const expected = [];
+        for (const key of Object.keys(emap)) {
+          // ⚠⚠ A DATE IS TWO BUNDLE ROWS NOW, AND THE TILE SHOWS ONE STRING (operator, 2026-08-21:
+          // "you can just read from the dom and put the answer together since the actual fields don't
+          // show, and only correct something if there is any wrong info"). The fill records the month
+          // and the year separately so each is editable, so the replay must RE-ASSEMBLE them before
+          // comparing — the tile renders "05/2026", and testing "May" against that on its own would
+          // call every date wrong and open every entry.
+          if (emap[key] && emap[key].kind === "date_pair") {
+            let parts = ["month", "year"].map((h) => ({
+              half: h, fieldName: `${spec.source}[${k}].${key}.${h}`,
+              want: lookup(`${spec.source}[${k}].${key}.${h}`, "dropdown"),
+            })).filter((pp) => pp.want !== undefined && String(pp.want).trim() !== "");
+            if (!parts.length) {
+              // ⚠ A PRE-SPLIT APPROVAL: the date is ONE bundle row. Verify it as one, and report it
+              // under ITS OWN key — emitting the halves instead would leave the legacy row unmatched,
+              // which the strict verify reports as "approved value has NO matching field on the live
+              // form" and which refuses a submit whose values are all present. Measured live.
+              const legacy = lookup(`${spec.source}[${k}].${key}`, "dropdown");
+              if (legacy === undefined || !String(legacy).trim()) continue;
+              expected.push({ key, fieldName: `${spec.source}[${k}].${key}`, want: String(legacy) });
+              continue;
+            }
+            const byHalf = {};
+            for (const pp of parts) byHalf[pp.half] = String(pp.want).trim();
+            // Assembled in the vocabulary atsYearMonthKey understands ("May 2026"). A half the human
+            // never approved is simply absent — "if certain info are not shown, that is fine".
+            const asm = [byHalf.month, byHalf.year].filter(Boolean).join(" ");
+            expected.push({ key, fieldName: `${spec.source}[${k}].${key}`, want: asm, parts });
+            continue;
+          }
+          const fieldName = `${spec.source}[${k}].${key}`;
+          const want = lookup(fieldName);
+          if (want === undefined || String(want).trim() === "") continue;
+          expected.push({ key, fieldName, want: String(want) });
+        }
+        // ⚠⚠ NOTHING APPROVED FOR THIS ENTRY ⇒ NOTHING TO VERIFY. SKIP IT (live 2026-08-21).
+        // This fell through to the per-field open, and on a form that had accumulated 33 skills tiles
+        // that meant opening, reading and closing THIRTY-THREE entries one at a time — about a second
+        // each, for no information. The operator saw it as the rehearsal "adding skills super slowly";
+        // it was not adding anything, it was inspecting tiles it had no expectation for.
+        //
+        // A replay verifies what the human APPROVED. An entry the bundle says nothing about cannot
+        // disagree with the bundle, so there is nothing to check and nothing to report.
+        if (!expected.length) {
+          log(`  ${spec.label} entry ${k + 1}: nothing approved for it — skipped (a replay only verifies what you approved)`);
+          continue;
+        }
+        const missing = expected.filter((e) => !atsOrcTileHoldsValue(tiles[k].text, e.want));
+        if (!missing.length) {
+          log(`  ${spec.label} entry ${k + 1}: all ${expected.length} approved value(s) are visible on the tile — verified from the DOM, not opened`);
+          for (const e of expected) {
+            // ⚠ ONE RECORD PER BUNDLE ROW. A date verified as a whole still has to report its two
+            // halves under the keys the bundle actually carries, or the strict verify's set-difference
+            // reports both as "approved value has NO matching field on the live form" — the shape that
+            // refuses a submit whose values are all present and correct.
+            const rows = e.parts
+              ? e.parts.map((pp) => ({ fieldName: pp.fieldName, after: String(pp.want),
+                                       label: `${spec.label} ${e.key} (${pp.half})` }))
+              : [{ fieldName: e.fieldName, after: e.want, label: `${spec.label} ${e.key}` }];
+            for (const row of rows) {
+              records.push({
+                fieldName: row.fieldName, label: row.label, widgetType: "text",
+                isRequired: false, entrySection: spec.source, entryIndex: k,
+                status: "filled", verified: true, after: row.after, elapsedMs: 0,
+                detail: e.parts
+                  ? "assembled from the entry's own summary on the form — the date matches what you approved, so the entry was not opened"
+                  : "read from the entry's own summary on the form — it matches what you approved, so the entry was not opened",
+              });
+            }
+          }
+          continue;
+        }
+        // ── something disagrees (or the tile does not display it) ⇒ open THIS entry and look ──
+        log(`  ${spec.label} entry ${k + 1}: ${missing.length ? `the tile does not show ${JSON.stringify(missing.map((m) => m.key))}` : "nothing approved to compare"} — opening it to check field by field`);
+        let opened = await act.eval(atsInjOrcOpenTileAndWait, spec.pattern, k, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        // ⚠ SELF-HEAL A STUCK-OPEN FORM. A close that did not take is a local failure; letting it
+        // block every REMAINING tile turns one lost entry into a whole lost section — measured, one
+        // stuck close cost 10 of a rehearsal's 16 verify failures. Clear it and try this tile once
+        // more, so the damage stops at the entry that actually went wrong.
+        if (opened && opened.error === "entry-already-open") {
+          log(`${spec.label} entry ${k + 1}: an entry form was still open — closing it and retrying`);
+          await act.eval(atsInjOrcCloseEntry, spec.pattern, ATS_ORC_PICK_MS).catch(() => null);
+          opened = await act.eval(atsInjOrcOpenTileAndWait, spec.pattern, k, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        }
+        if (!opened || !opened.ok) {
+          // A tile we could not open is NOT a tile we can vouch for.
+          log(`⛔ ${spec.label} entry ${k + 1}: could not open it to check — ${(opened && opened.error) || "unknown"}`);
+          records.push({
+            fieldName: `${spec.source}[${k}]`, label: `${spec.label} entry ${k + 1}`,
+            widgetType: "text", isRequired: false, entrySection: spec.source, entryIndex: k,
+            status: "needs_review", flag: "entry-unverifiable", after: tiles[k].text, elapsedMs: 0,
+            detail: "this entry is on the form but could not be opened to check its fields — "
+              + ((opened && opened.error) || "unknown") + ". Check it by hand.",
+          });
+          continue;
+        }
+        const byName = new Map();
+        for (const f of opened.fields || []) {
+          const key = f.name || f.id || "";
+          if (!key) continue;
+          if (!byName.has(key)) byName.set(key, []);
+          byName.get(key).push(f);
+        }
+        let same = 0, diff = 0;
+        for (const [key, group] of byName) {
+          if (!emap[key]) continue;                       // unmapped on the fill side too
+
+          // ⚠⚠ A DATE PAIR IS READ PER HALF FROM THE OPEN FORM, and each half is reported under its
+          // own bundle key. The two controls share one `name`, so `group` holds BOTH — joining their
+          // values into one string (what this did before the split) produced "May 2026" and compared
+          // it against a single merged approval that no longer exists.
+          if (emap[key].kind === "date_pair") {
+            for (const g of group.slice(0, 2)) {
+              const h = /^month-/.test(String(g.id || "")) ? "month" : (/^year-/.test(String(g.id || "")) ? "year" : null);
+              if (!h) continue;                           // an unidentifiable half is not one we can vouch for
+              const hName = `${spec.source}[${k}].${key}.${h}`;
+              let hWant = typeof o.valueFor === "function"
+                ? o.valueFor({ fieldName: hName, entrySection: spec.source, entryIndex: k, widgetType: "dropdown" })
+                : undefined;
+              if (hWant === undefined) {
+                const merged = typeof o.valueFor === "function"
+                  ? o.valueFor({ fieldName: `${spec.source}[${k}].${key}`, entrySection: spec.source, entryIndex: k, widgetType: "dropdown" })
+                  : undefined;
+                hWant = merged === undefined ? undefined : atsOrcLegacyDateHalf(merged, h);
+              }
+              if (hWant === undefined || hWant === null) continue;
+              const hLive = String(g.value == null ? "" : g.value).trim();
+              const hAgrees = atsLib.normalize(hLive) === atsLib.normalize(String(hWant));
+              records.push({
+                fieldName: hName, label: `${group[0].label || key} (${h})`, widgetType: "dropdown",
+                isRequired: false, entrySection: spec.source, entryIndex: k,
+                status: hAgrees ? "filled" : "needs_review",
+                flag: hAgrees ? null : "entry-mismatch",
+                verified: !!hAgrees, after: hLive || null, elapsedMs: 0,
+                detail: hAgrees
+                  ? "already on the form and it matches what you approved — checked, not rewritten"
+                  : `the form holds ${JSON.stringify(hLive)} but you approved ${JSON.stringify(String(hWant))} — fix it on the form, then re-run`,
+              });
+              if (hAgrees) same++; else diff++;
+            }
+            continue;
+          }
+
+          const fieldName = `${spec.source}[${k}].${key}`;
+          const want = typeof o.valueFor === "function"
+            ? o.valueFor({ fieldName, entrySection: spec.source, entryIndex: k, widgetType: group[0].role === "combobox" ? "dropdown" : "text" })
+            : undefined;
+          if (want === undefined) continue;               // not in the bundle ⇒ nothing was approved
+          const live = group.map((g) => String(g.value == null ? "" : g.value).trim()).filter(Boolean).join(" ");
+          const agrees = atsLib.normalize(live) === atsLib.normalize(want)
+            || (live && atsLib.normalize(live).indexOf(atsLib.normalize(want)) !== -1)
+            || (want && atsLib.normalize(want).indexOf(atsLib.normalize(live)) !== -1 && live.length > 0);
+          records.push({
+            fieldName, label: group[0].label || key, widgetType: "text", isRequired: false,
+            entrySection: spec.source, entryIndex: k,
+            status: agrees ? "filled" : "needs_review",
+            flag: agrees ? null : "entry-mismatch",
+            verified: !!agrees, after: live || null, elapsedMs: 0,
+            detail: agrees
+              ? "already on the form and it matches what you approved — checked, not rewritten"
+              : `the form holds ${JSON.stringify(live)} but you approved ${JSON.stringify(want)} — fix it on the form, then re-run`,
+          });
+          if (agrees) same++; else diff++;
+        }
+        const closed = await act.eval(atsInjOrcCloseEntry, spec.pattern, ATS_ORC_PICK_MS).catch(() => null);
+        if (!closed || !closed.ok) {
+          const why = (closed && closed.error) || "unknown";
+          const extra = closed && closed.attempts ? ` after pressing ${JSON.stringify(closed.attempts)}` : "";
+          notes.push(`${spec.label} entry ${k + 1}: its form was left OPEN (${why})${extra} — check the page by hand`);
+          log(`⛔ ${spec.label} entry ${k + 1}: could not close the entry form — ${why}${extra}`
+            + (closed && closed.offered ? `; the block offered ${JSON.stringify(closed.offered)}` : ""));
+        }
+        log(`  ${spec.label} entry ${k + 1}: ${same} field(s) match${diff ? `, ${diff} DIFFER` : ""}${closed && closed.ok ? ` (closed via ${closed.via})` : ""}`);
+
+        // ⚠⚠ A WRONG ENTRY IS REPLACED, NOT JUST REPORTED (operator, 2026-08-21: "I need it to
+        // subtract if in any case the current experience block is wrong"). Blocking the gate was the
+        // safe half and it is no longer enough: the page has to END UP matching what was approved.
+        //
+        // Delete-and-re-add rather than repair-in-place, because re-adding is the path that is already
+        // proven (atsOrcAddApprovedEntry, live + unit) and because writing INTO a wrong entry has to
+        // negotiate whichever fields are wrong one at a time. The cost is a window in which the entry
+        // does not exist, which is why the guards below are not optional.
+        if (diff > 0 && closed && closed.ok) {
+          // GUARD 1 — the bundle must actually want entries here. This is the original "wants 0" trap:
+          // a replay passes profile:{}, so anything profile-derived would read "delete everything".
+          const wantN = Number((o.entryCounts || {})[spec.source] || 0);
+          // GUARD 2 — we must be able to REBUILD it. Deleting something we cannot put back is the one
+          // outcome worse than leaving it wrong, so the entry's identifying values must be approved.
+          const idKeys = ATS_ORC_ENTRY_IDENTITY_KEYS[spec.source] || [];
+          const haveId = idKeys.length && idKeys.every((kk) => {
+            const v = typeof o.valueFor === "function"
+              ? o.valueFor({ fieldName: `${spec.source}[${k}].${kk}`, entrySection: spec.source, entryIndex: k, widgetType: "text" })
+              : undefined;
+            return v !== undefined && String(v).trim() !== "";
+          });
+          if (!wantN || !haveId) {
+            notes.push(`${spec.label} entry ${k + 1}: ${diff} field(s) disagree with what you approved and it was LEFT ALONE `
+              + `(${!wantN ? "the approved review lists no entries for this section" : "the approved review does not carry enough of it to rebuild"}) `
+              + "— the submit gate will refuse; fix it on the form by hand");
+            log(`  ${spec.label} entry ${k + 1}: DISAGREES but was left alone — ${!wantN ? "nothing approved for this section" : "not enough approved data to rebuild it"}`);
+          } else {
+            log(`  ${spec.label} entry ${k + 1}: ${diff} field(s) DISAGREE with your approved review — removing it and re-adding it from the approved values`);
+            const gone = await atsOrcDeleteTileAt(act, spec, k, log);
+            if (!gone.ok) {
+              notes.push(`${spec.label} entry ${k + 1}: disagrees with your approved review and could NOT be removed (${gone.error}) — fix it on the form by hand`);
+              log(`⛔ ${spec.label} entry ${k + 1}: could not remove it (${gone.error})`);
+            } else {
+              const re = await atsOrcAddApprovedEntry(act, spec, k, emap, o.valueFor, log);
+              // ⚠ THE REPLACEMENT'S RECORDS SUPERSEDE THE MISMATCH ROWS. Without this the bundle
+              // carries both the "DIFFER" verdict and the corrected one for the same field, and the
+              // gate would refuse an entry it had just fixed.
+              for (let z = records.length - 1; z >= 0; z--) {
+                const rn = String(records[z].fieldName || "");
+                if (records[z].entrySection === spec.source && records[z].entryIndex === k
+                    && records[z].flag === "entry-mismatch" && rn.indexOf(`${spec.source}[${k}].`) === 0) {
+                  records.splice(z, 1);
+                }
+              }
+              for (const rr of re.records || []) records.push(rr);
+              if (re.ok) {
+                notes.push(`${spec.label} entry ${k + 1}: disagreed with your approved review and was REPLACED from it`);
+              } else {
+                notes.push(`${spec.label} entry ${k + 1}: disagreed with your approved review, was removed, and could NOT be re-added `
+                  + `(${re.error || "unknown"}) — the submit gate will refuse until this is fixed by hand`);
+              }
+              const t2 = await act.eval(atsInjOrcTiles, spec.pattern).catch(() => null);
+              const now = (t2 && t2.ok && t2.tiles) || [];
+              tiles.length = 0;
+              for (const t of now) tiles.push(t);
+            }
+          }
+        }
+      }
+    }
+    return { records, notes };
+  }
+
+  if (!plan.length) {
+    // Say WHICH blocks were present but not planned — a repeating block we cannot fill must never be
+    // silently absent from the log, because "step 2 had 4 fields" reads as a complete step.
+    const repeat = blocks.filter((b) => b.addCaption);
+    if (repeat.length) {
+      log(`repeating block(s) present but nothing to fill from the profile: ${repeat.map((b) => JSON.stringify(b.title) + " (" + b.addCaption + ")").join(", ")}`);
+      notes.push(`repeating blocks left empty (profile has no entries): ${repeat.map((b) => b.title).join(", ")}`);
+    }
+    return { records, notes };
+  }
+
+  for (const item of plan) {
+    const arr = (profile || {})[item.source] || [];
+    if (item.capped) {
+      // NO SILENT CAPS — the standing rule. Whatever a cap drops is named.
+      log(`⚠ ${item.block}: profile has ${item.capped} entries and the cap is ${ATS_ORC_ENTRY_MAX} — filling ${item.want}, the rest are NOT on the form`);
+      notes.push(`${item.block}: only ${item.want} of ${item.capped} entries filled (cap)`);
+    }
+    // ⚠⚠ RECONCILE BEFORE FILLING — the form arrives PREPOPULATED (operator, 2026-08-20).
+    // Oracle keeps a candidate record, so a RETURNING applicant's Experience / Education / Skills
+    // blocks already hold tiles, and pressing Add once per profile entry left TWO copies of every job
+    // on a real application. This is Workday's rule verbatim — "reconcile to exactly N, then fill each
+    // entry — true idempotency, proven from ARBITRARY dirty state" — and only the second half of it
+    // had ever been built here.
+    //
+    // ⚠ The FIRST attempt at detecting this counted button CAPTIONS matching /^(edit|delete|remove)/
+    // and found ZERO, so a second run duplicated the history again: a committed entry's controls are
+    // ICON-ONLY, with the word in `aria-label` and nothing in textContent. Measured, not guessed.
+    //
+    // ⚠⚠ TWO DIFFERENT POLICIES, on the operator's instruction, because the blocks mean different
+    // things:
+    //   • HISTORY (Experience / Education / Licenses) — DELETE the old tiles, then fill from the
+    //     profile. The profile is the source of truth for a history, and a stale tile from an earlier
+    //     application is not something to merge with: keeping it risks an outdated employer, an old
+    //     end date, or a job the operator has since removed.
+    //   • SKILLS — ADD ONLY WHAT IS MISSING. A skills list is a SET, so deleting and re-adding eight
+    //     tiles to reach the same set is pure page contact — and the profile's 33 skills are CAPPED at
+    //     8, so deleting first would throw away skills the operator had that we could not restore.
+    const tiles0 = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
+    const present = (tiles0 && tiles0.ok && tiles0.tiles) || [];
+    const isSkills = item.source === "skills";
+
+    // ⚠⚠ THE TILE-MATCH SKIP IS GONE (operator, 2026-08-20). It fired when the tiles already agreed
+    // with the profile and left them in place, which saved an open, ~2 picker visits per field and a
+    // commit per entry. It cost the review page twice, and the second cost is the one that settles it:
+    //
+    //   • first it emitted NOTHING, so Experience, Education and Links were missing from review
+    //     entirely on a run where all three were correctly on the form;
+    //   • then it emitted one summary record per entry, so review showed four opaque rows
+    //     ("Experience entry 1", "Education entry 1") instead of the FIELDS. A reviewer cannot check
+    //     an employer name they cannot see, and cannot correct one they cannot edit.
+    //
+    // The operator's division of labour is explicit: the FILL clicks Add, exposes the entry form and
+    // fills it — so those fields reach review — and it is the REHEARSAL that leaves a correct value
+    // alone and repairs only a wrong one. Leaving-alone therefore belongs on the replay, not here.
+    // Deleting and re-entering is also what was asked for directly ("make sure you delete old entries
+    // before filling the repeating sections"), and it makes the fill's behaviour uniform: one path,
+    // one shape of record, whatever state the form arrives in.
+    //
+    // The cost is real but it is paid on the ABNORMAL case — a form that arrives prepopulated —
+    // and correctness of the review page outranks it.
+    if (present.length && !isSkills) {
+      log(`${item.block}: ${present.length} existing tile(s) on the form — deleting before filling: ${JSON.stringify(present.map((x) => x.text.slice(0, 50)))}`);
+      let removed = 0;
+      // LAST-FIRST so earlier indexes stay valid, and gated on the count actually DROPPING — a delete
+      // that did not take must stop the loop rather than spin it.
+      for (let guard = 0; guard < present.length + 4; guard++) {
+        const before = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
+        const n = before && before.ok ? before.count : 0;
+        if (!n) break;
+        const del = await act.eval(atsInjOrcDeleteTile, item.pattern, null).catch(() => null);
+        if (!del || !del.ok) { log(`⛔ ${item.block}: could not press Delete (${(del && del.error) || "unknown"})`); break; }
+        // ⚠ A CONFIRMATION MAY APPEAR, and a surprise modal is what wedges a run. The primitive
+        // REPORTS it rather than dismissing it; the decision to confirm a delete belongs here.
+        if (del.dialog && del.dialog.present) {
+          log(`${item.block}: a confirmation appeared — ${JSON.stringify(del.dialog.text)} offering ${JSON.stringify(del.dialog.buttons)}`);
+          const okd = await act.eval(atsInjOrcDialogPress, "^(yes|delete|remove|confirm|ok)\\b").catch(() => null);
+          if (!okd || !okd.ok) { log(`⛔ ${item.block}: the confirmation could not be answered (${(okd && okd.error) || "unknown"}) — stopping`); break; }
+        }
+        let dropped = false;
+        for (let w = 0; w < 24; w++) {
+          await act.delayFull(150);
+          const after = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
+          if (after && after.ok && after.count < n) { dropped = true; removed++; break; }
+        }
+        if (!dropped) { log(`⛔ ${item.block}: pressed Delete but the tile count did not drop from ${n} — stopping rather than spinning`); break; }
+      }
+      const leftover = await act.eval(atsInjOrcTiles, item.pattern).catch(() => null);
+      const still = leftover && leftover.ok ? leftover.count : -1;
+      log(`${item.block}: deleted ${removed} of ${present.length} existing tile(s)${still > 0 ? ` — ${still} could NOT be removed` : ""}`);
+      if (still > 0) {
+        // ⚠ DO NOT FILL ON TOP OF WHAT WE COULD NOT CLEAR — that is precisely the duplicate this
+        // block exists to prevent, and a PARTIAL clear is exactly when it would happen quietly.
+        notes.push(`${item.block}: ${still} pre-existing entr(y/ies) could not be deleted, so nothing was added — check this section by hand`);
+        continue;
+      }
+    }
+
+    // SKILLS: the set already on the form, so only the missing ones get added.
+    const haveSkills = isSkills ? present.map((x) => atsLib.normalize(x.text)).filter(Boolean) : [];
+    if (isSkills && haveSkills.length) {
+      log(`${item.block}: ${haveSkills.length} skill(s) already on the form — only missing ones will be added: ${JSON.stringify(present.map((x) => x.text).slice(0, 10))}`);
+    }
+    let added = 0;
+    for (let i = 0; i < arr.length && added < item.want; i++) {
+      const entry = arr[i];
+      // ⚠ A SKILL ALREADY ON THE FORM IS SKIPPED, NOT RE-ADDED (operator, 2026-08-20). The cap counts
+      // what we ADD, which is why this walks the whole profile list and stops once `want` NEW ones are
+      // in — capping the loop at `want` iterations instead would let eight already-present skills
+      // consume the entire budget and add nothing at all.
+      if (isSkills && typeof entry === "string" && haveSkills.indexOf(atsLib.normalize(entry)) !== -1) {
+        log(`  ${item.block}: "${entry}" is already on the form — not re-added, but recorded`);
+        // ⚠⚠ SKIPPING THE WORK MUST NOT SKIP THE RECORD — the same rule the repeating entries already
+        // obey, and skills were missed (live 2026-08-21). A skill already on the form is still part of
+        // the application, and with no record it was ABSENT from the review page entirely: the
+        // operator could not see what the run had put there, and the replay then had nothing approved
+        // to verify against, which is what sent it opening 33 tiles for no reason.
+        //
+        // `filled` and unflagged: it IS on the form and it came from the profile, so there is nothing
+        // for a human to decide. Keyed exactly as a freshly-added skill would be, so the fill and the
+        // replay agree on the name.
+        records.push({
+          // ⚠ KEY ON THE PROFILE INDEX `i`, NOT `added`. `added` only counts skills we ADD, so on a
+          // form where every skill is already present it never increments and all 33 records collided
+          // on `skills[0].skills` — one key for thirty-three values, which the bundle cannot represent
+          // and the replay cannot verify. `i` is also exactly what a freshly-added skill is keyed by
+          // (`${item.source}[${i}].${key}`), so the two paths agree and a run that mixes added and
+          // already-present skills still produces distinct keys.
+          fieldName: `${item.source}[${i}].skills`,
+          // ⚠ `mappedPath` IS WHAT PUTS IT IN A SECTION. The review model derives `canonical_field`
+          // from this, and groups on its `name[index]` prefix — which is why an ADDED skill lands
+          // under a "SKILLS" heading with the same Entry / Delete / + Add entry controls the form
+          // has, while these records (which set no mappedPath) were dumped into "OTHER FIELDS" as 33
+          // loose rows. Same shape as the added path so both produce one section.
+          mappedPath: `${item.source}[${i}].skills`,
+          label: `${item.block} — ${entry}`, widgetType: "text", isRequired: false,
+          entrySection: item.source, entryIndex: i,
+          status: "filled", verified: true, after: entry, elapsedMs: 0,
+          detail: "already on the form from an earlier run — verified against your profile, not re-added",
+        });
+        continue;
+      }
+      added++;
+      const tag = `${item.block} entry ${added}`;
+
+      // ── OPEN ────────────────────────────────────────────────────────────────────────
+      // ⚠⚠ ONE CALL: press Add and wait PAGE-SIDE for the form to render. The SW-side version of this
+      // wait was 28 awaits of 150ms, and the MV3 worker's timers are STARVED — this run's own PACE
+      // lines measured `a 150ms pace took 1555ms` and `an 80ms pace took 1226ms`. So the cost of a
+      // poll is the NUMBER of awaits, not their length, and this was the largest single gap on the
+      // page: 5067ms between an entry's discovery read and its first 20ms text write.
+      //
+      // Page-side timers are real, so the wait costs ONE cdpEval instead of ~28 starved ones. The
+      // evidence is unchanged: a form that never renders comes back with no fields and the block
+      // halts exactly as before. See atsInjOrcOpenEntryAndWait.
+      const opened = await act.eval(atsInjOrcOpenEntryAndWait, item.pattern, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (!opened || !opened.ok) {
+        log(`⛔ ${tag}: could not open an entry form — ${(opened && opened.error) || "unknown"}`);
+        notes.push(`${tag}: not filled (${(opened && opened.error) || "could not open"})`);
+        break;                       // the block is not workable; do not hammer it
+      }
+      const st = { ok: true, open: true, fields: opened.fields || [] };
+      if (!st.fields.length) {
+        log(`⛔ ${tag}: pressed ${JSON.stringify(opened.pressed)} but no entry form appeared`);
+        notes.push(`${tag}: not filled (the entry form never rendered)`);
+        break;
+      }
+
+      const recordsBefore = records.length;
+      // ── THE RECON RECORD, EVERY RUN ─────────────────────────────────────────────────
+      log(`${tag} — the form offers ${st.fields.length} field(s): ${st.fields.map((f) => `${f.name || f.id}[${f.role || f.type}]${f.label ? " “" + f.label + "”" : ""}`).join(", ")}`);
+
+      // ── FILL ────────────────────────────────────────────────────────────────────────
+      // ⚠ GROUP BY `name` FIRST. A date is TWO comboboxes sharing one name (measured: `startDate`
+      // twice, `endDate` twice), so a field-at-a-time loop handed the same spec to both halves and
+      // wrote the whole "2025-05" into whichever id came first — the slowest failing field of the
+      // run at 8.2s. Grouping is also what makes the month/year split decidable at all.
+      const map = ATS_ORC_ENTRY_MAPS[item.source] || {};
+      const unmapped = [];
+      const byName = new Map();
+      for (const f of st.fields) {
+        const k = f.name || f.id || "";
+        if (!k) continue;
+        if (!byName.has(k)) byName.set(k, []);
+        byName.get(k).push(f);
+      }
+      // ⚠ A SETTLE GAP BETWEEN TWO DATE PAIRS (operator, 2026-08-22: "add a small 100 ms delay after
+      // start fills, then fill end"). The endDate pair is intermittently slow — 677/688/673ms on one
+      // run, 2854/2991ms on another — and when it bites the cost is DISPATCH, not the widget (2128ms
+      // SW-side against 441ms page-side). Giving ORC a beat to finish reacting to the committed start
+      // date before we open the next picker is the operator's call and it is cheap either way.
+      //
+      // ⚠ Applied only BETWEEN pairs, never before the first one, so an entry with a single date pays
+      // nothing. Whether it actually helps is a measurement, not a claim — the picker trace prints the
+      // SW-vs-page split for every slow half, so the next run says so either way.
+      let datePairsDone = 0;
+      // The SW-vs-page gap the last date half observed. Drives the conditional pace above: a stall is
+      // the only evidence that the worker is in the regime where a scheduled timer helps.
+      let lastStallMs = 0;
+      for (const [key, group] of byName) {
+        const spec = map[key] || null;
+        if (!spec) { unmapped.push(key + (group[0].label ? " (" + group[0].label + ")" : "")); continue; }
+
+        // ── the date pair: WHICH half is month and which is year is READ, not assumed ──
+        if (spec.kind === "date_pair" && group.length >= 2) {
+          const ym = atsOrcEntryValue(spec, entry);
+          // ⚠ THE HALVES CARRY NO LABEL AT ALL on this form, so the review page showed the raw
+          // platform name ("startDate"). Split the camelCase into words so the operator reads
+          // "Start Date" — the same string a human sees above the pickers.
+          const prettyDate = String(key).replace(/([a-z])([A-Z])/g, "$1 $2").replace(/^./, (c) => c.toUpperCase());
+          const rec0 = { fieldName: `${item.source}[${i}].${key}`, label: group[0].label || prettyDate,
+                         widgetType: "dropdown", isRequired: false, entrySection: item.source, entryIndex: i,
+                         mappedPath: `${item.source}[${i}].${spec.path}`, status: "skipped", after: null, elapsedMs: 0 };
+          if (ym == null) {
+            rec0.detail = spec.blankWhenCurrent && entry && entry.currently_work_here === true
+              ? "you still work here — the end date is deliberately left blank"
+              : "this entry has no date for it — left blank rather than answered from elsewhere";
+            rec0.flag = spec.blankWhenCurrent && entry && entry.currently_work_here === true ? null : "entry-unanswered";
+            records.push(rec0); continue;
+          }
+          const t0 = Date.now();
+          // ⚠ ONE VISIT PER HALF. Each picker is opened once, classified from the rows it shows, and
+          // committed in the same visit — see atsInjOrcPickFromOwnList for the measurement that made
+          // this necessary (the capture-then-pick split cost ~8s per entry on a picker whose first
+          // open never registered, and it is what the operator saw as the dropdown opening twice).
+          // Classification is still per-half and still evidence-based; it just no longer costs a
+          // second open.
+          const mNum = Number(ym.month);
+          const NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+          const monthCands = mNum >= 1 && mNum <= 12
+            ? [NAMES[mNum - 1], NAMES[mNum - 1].slice(0, 3), String(mNum).padStart(2, "0"), String(mNum)]
+            : [];
+          const yearCands = [String(ym.year)];
+          // ⚠⚠ THE GAP IS BACK, AND ITS MECHANISM IS THE OPPOSITE OF WHAT I ASSUMED (measured 2026-08-22).
+          //
+          // I removed this in favour of page-side "detect whether ORC is auto-opening the picker", on
+          // the theory that a click arriving mid-open toggles it shut. The detector reported
+          // **"not focused, clicked straight away"** on every single endDate half -- ORC is NOT
+          // auto-opening on focus -- so it was a no-op, and the pairs regressed from
+          // 882/848/1639ms back to 1555/2785/1546ms. The hypothesis is refuted by its own instrument.
+          //
+          // WHERE THE TIME ACTUALLY IS, from the same trace: `eval 1948ms SW-side vs 291ms page-side`,
+          // `rows 12@150ms`, and a no-op probe of **2ms** immediately before. The page is free, the
+          // picker is fast; the ~1.65s sits between OUR probe returning and OUR eval returning. It is
+          // the worker stalling, not the page -- which is why a PACE fixes it: a scheduled timer gives
+          // the MV3 worker a reason to stay scheduled, exactly like the keep-warm beat. That also means
+          // no page-side detector can ever replace it, because the condition is not on the page.
+          //
+          // ⚠ CONDITIONAL, so "as fast as possible" still holds (operator's requirement): the gap is
+          // only spent when the PREVIOUS half actually showed a dispatch stall. A healthy pair pays
+          // nothing. `lastStallMs` is the SW-vs-page difference the trace already computes, so this is
+          // detection on the axis that is genuinely observable -- our own dispatch health -- rather
+          // than on the page state, which measured innocent.
+          // ⚠⚠ UNCONDITIONAL, AND THAT IS THE MEASURED ANSWER — both attempts to make it conditional
+          // are refuted (2026-08-22):
+          //   1. PAGE-SIDE DETECTION of ORC auto-opening the picker. Its own instrument reported
+          //      "not focused, clicked straight away" on every endDate half, so it never engaged, and
+          //      the pairs regressed 882/848/1639ms -> 1555/2785/1546ms.
+          //   2. CONDITIONING ON THE PREVIOUS HALF'S STALL (`lastStallMs > 250`). Also worse:
+          //      1554/1527/1502ms, every pair carrying a re-open. The stall is not autocorrelated, so a
+          //      past stall does not predict the next one — the gate skips exactly when it is needed.
+          // The unconditional pace measures 882/848/1639ms. It is 100ms spent to avoid a ~700ms re-open,
+          // so "as fast as possible" is SATISFIED BY PAYING IT, not by trying to skip it.
+          if (datePairsDone > 0) await act.delayFull(100);
+          const got_by = {}; const failed = [];
+          // ⚠⚠ PER-HALF OUTCOMES, because each half becomes its OWN review record (operator,
+          // 2026-08-21: "the start date and end date are two separate pickers … they should reflect
+          // that on the review page so we can change each one manually"). A single merged record
+          // (`after: "May 2026"`) could only be edited as one string, so an operator who wanted to fix
+          // just the month had to retype both — and the review editor rendered it as a TEXT BOX
+          // because a merged record cannot carry two different option lists.
+          //
+          // Keyed by HALF, and the half is decided by two independent signals: the picker's own
+          // evidence (`r.kind`, read from the rows it showed — never assumed) when the visit
+          // succeeded, and the `month-`/`year-` id prefix when it FAILED and there is no kind to read.
+          // The prefix is the documented discriminator (a date's two controls share one `name`), and
+          // it is only ever a fallback so the evidence-based rule still governs every success.
+          const half_by = {};
+          const halfOf = (g, r) => (r && r.kind) || (/^month-/.test(String(g.id || "")) ? "month"
+            : (/^year-/.test(String(g.id || "")) ? "year" : null));
+          let reopenTotal = 0;
+          let halfIdx = -1;
+          for (const g of group.slice(0, 2)) {
+            halfIdx++;
+            // ⚠ PACE BETWEEN THE HALVES. Committing one half makes the NEXT half's open slower —
+            // measured as a retry firing on EVERY startDate (4108/4181/4168ms) while endDate took
+            // 809/834/795ms with no retry at all. Systematic, not flaky, so it is cheaper to wait once
+            // than to spend a failed attempt plus a 400ms recovery pace rediscovering it every entry.
+            //
+            // ⚠ THIS COMMENT USED TO SAY THE COMMIT "RE-RENDERS THE WIDGET". That is WRONG and was the
+            // source of a wrong diagnosis later (operator, 2026-08-21). ORC ids carry a render
+            // -assignment counter, and the next half is addressed by id AFTER the previous commit — a
+            // re-render would mint a new counter and that lookup would fail `not-found`, which never
+            // happens. The nodes survive. The slowdown is real but its cause is UNESTABLISHED (a
+            // lingering teardown of the previous picker's listbox is the likeliest candidate). Keep the
+            // pace, which is justified by the measurement; do not repeat the mechanism as fact.
+            if (halfIdx) await act.delayFull(150);
+            if (!g.id) { failed.push("a half with no id"); continue; }
+            const idHalf = /^month-/.test(String(g.id)) ? "month" : (/^year-/.test(String(g.id)) ? "year" : null);
+            const sel = "#" + g.id.replace(/([^\w-])/g, "\\$1");
+            // ⚠ ONE RETRY PER HALF, and only on failure. Committing the first half re-renders the
+            // widget, so the second half's open can land mid-render — measured as
+            // `after="May" … (year not retained)`: the month took and the year did not, on the FIRST
+            // pair of a freshly-created entry form (endDate, moments later, took both halves in
+            // 804ms). A retry costs nothing when the commit works and saves the whole entry when it
+            // does not — Oracle refuses an entry whose required date is incomplete, so this one flake
+            // was costing the other two work-history entries as well.
+            let r = null, got = null;
+            // ⚠ SPLIT THE HALF'S WALL CLOCK INTO PAGE-SIDE AND SW-SIDE (2026-08-21). The operator:
+            // "when filling experience, after start date, it waits before completely filling the end
+            // date." Measured, the endDate PAIR costs 3000/2774/2729ms while startDate costs
+            // 722/701/723ms — with the SAME page-side work in the trace (~250ms a half). So ~2.3s of it
+            // is outside the page, and "round trips" was my inference, not a measurement. `swMs` minus
+            // the trace's own elapsed is that difference, per half, so the next change is aimed.
+            let swMs = 0, lastProbeMs = null;
+            for (let attempt = 0; attempt < 2 && got == null; attempt++) {
+              if (attempt) await act.delayFull(400);
+              // ⚠⚠ THE DISCRIMINATOR (operator, 2026-08-22: "it seems like a flake, sometimes it fills
+              // fine and sometimes it doesn't so you are wrong" — they were right, and my round-24
+              // conclusion was drawn from ONE trace line).
+              //
+              // The endDate pair measures 677/688/673ms on one run and 2854/2991ms on another, so it is
+              // INTERMITTENT. When it bites, the cost is dispatch (2128ms SW-side vs 441ms page-side) —
+              // that part is solid. What is NOT settled is WHOSE dispatch: a busy renderer and a late
+              // worker look identical from one duration, and the pace summary cannot arbitrate because
+              // it only watches PACES, not evals.
+              //
+              // So: a TRIVIAL eval immediately before the real one. Same thread, same channel, no work.
+              //   probe ~2ms   + picker slow  ⇒ the delay is OURS (worker/handling), not the page
+              //   probe ~1.7s  + picker slow  ⇒ the page's main thread is genuinely busy
+              // One extra round trip per half, and only while the lag trace is on, so a normal run pays
+              // nothing for it.
+              let probeMs = null;
+              if (o && o.lagProbe) {
+                const pT0 = Date.now();
+                try { await act.eval(function () { return 1; }); } catch (e) { /* probe only */ }
+                probeMs = Date.now() - pT0;
+              }
+              const evT0 = Date.now();
+              r = await act.eval(atsInjOrcPickFromOwnList, sel, monthCands, yearCands, ATS_ORC_PICK_MS).catch(() => null);
+              swMs += Date.now() - evT0;
+              if (probeMs != null) lastProbeMs = probeMs;
+              // Record the dispatch stall for the NEXT pair's decision, whether or not the trace is on:
+              // page-side elapsed comes back in the trace, so the difference needs no extra probe.
+              if (r && r.trace) {
+                const pm = (r.trace.samples && r.trace.samples.length)
+                  ? r.trace.samples[r.trace.samples.length - 1].t : (r.trace.enterAt || 0);
+                lastStallMs = Math.max(0, (Date.now() - evT0) - pm);
+              }
+              reopenTotal += (r && r.reopens) || 0;
+              if (!r || !r.ok) continue;
+              // READ-BACK VERIFIED, but settled PAGE-SIDE inside the primitive — see the note there.
+              // The verification is unchanged in strength: a half whose value did not stick still
+              // comes back null and still fails the pair.
+              if (r.value && !r.invalid) got = r.value;
+            }
+            // Record the half's OUTCOME whichever way it went — the review records are built from
+            // this, so a half that failed must still produce a row (with its option list, so the
+            // operator can simply pick the right value).
+            // ⚠ SAY WHAT THE PICKER SAW when a half was slow or failed. The operator diagnosed the
+            // double-fill from a 240fps recording because the log could not: a duration cannot
+            // distinguish "never committed" from "committed, flashed, and our poll missed it".
+            if (r && r.trace && (!r.ok || !r.value || (Date.now() - t0) > 1200)) {
+              const q = r.trace;
+              const pageMs = q.samples && q.samples.length ? q.samples[q.samples.length - 1].t : (q.enterAt || 0);
+              log(`  ↳ ${key} ${idHalf || r.kind || "?"}: eval ${swMs}ms SW-side vs ${pageMs}ms page-side`
+                + (lastProbeMs != null ? ` [no-op probe just before: ${lastProbeMs}ms ⇒ ${lastProbeMs > 400 ? "the PAGE thread was busy" : "the page was FREE, so the delay is OURS"}]` : "")
+                + ` (⇒ ${Math.max(0, swMs - pageMs)}ms of transport/scheduling) ·`
+                + ` sibling-list wait ${q.waitedForSibling}ms${q.siblingStillUp ? " (STILL UP!)" : ""} ·`
+                + (q.autoOpenWait != null
+                    ? ` ORC auto-open ${q.autoOpened ? "CAUGHT" : "missed"} after ${q.autoOpenWait}ms ·`
+                    : " not focused, clicked straight away ·")
+                + ` openedByUs=${q.openedByUs} rows=${q.rowsN}@${q.rowsAt}ms`
+                + ` typed@${q.typedAt}ms narrowed@${q.narrowedAt == null ? "NEVER" : q.narrowedAt + "ms"}`
+                + ` firstRow=${JSON.stringify(q.firstRow)} enter@${q.enterAt}ms reopens=${q.reopens}`
+                + ` value=${JSON.stringify((r && r.value) || null)}`
+                + (q.samples && q.samples.length ? ` | after Enter: ${q.samples.map((x) => x.t + "ms:" + JSON.stringify(x.v) + (x.i ? "!" : "")).join(" ")}` : ""));
+            }
+            const hk = halfOf(g, r) || idHalf;
+            if (hk) half_by[hk] = { sel: g.id, error: (r && !r.ok) ? (r.error || "unknown") : null,
+                                    options: (r && r.options) || null, value: null };
+            if (!r || !r.ok) { failed.push(((r && r.error) || "unknown") + (idHalf ? ` (${idHalf})` : "")); continue; }
+            if (got == null) { failed.push(r.kind + " not retained"); if (hk) half_by[hk].error = "not-retained"; continue; }
+            got_by[r.kind] = got;
+            if (hk) half_by[hk].value = got;
+          }
+          // (rec0 above only ever serves the "no date in this entry" case; a date we ATTEMPTED is
+          // reported as its two halves below, so nothing further is written to it.)
+          // ⚠⚠ THIS VALUE GOES ON THE REVIEW PAGE AND INTO THE SUBMIT REPLAY — it is not a log line.
+          // It used to be `month="May" year="2026"`, my own debug string, which the review editor then
+          // rendered as a TEXT BOX for the operator to edit as raw markup, and which a replay would
+          // have typed at the form verbatim. `current_value` is copied straight from `rec.after`, so
+          // anything convenient for a log becomes the application's answer.
+          const okAll = !failed.length && got_by.month != null && got_by.year != null;
+
+          // ⚠⚠ TWO RECORDS, ONE QUESTION (operator, 2026-08-21). Each half is a separate ORC combobox,
+          // so each gets its own row carrying its own SCANNED option list — that is what makes it
+          // editable as a picker on the review page. They share `question_key`, which is the existing
+          // mechanism for "one form question rendered as several controls" (salary currency/amount,
+          // Workday's month/day/year), so review shows ONE "Start Date" row with its parts inside
+          // rather than two orphans labelled "Month" and "Year" that say nothing about which date.
+          //
+          // ⚠ THE MERGED RECORD IS GONE, NOT KEPT ALONGSIDE. Emitting both would double-count the
+          // field in the bundle, and the strict verify would demand a live control for a `startDate`
+          // that no longer has one — the shape that fails a submit whose values are all present.
+          // The replay reads these halves back and re-assembles them; see atsOrcTileMatch.
+          datePairsDone++;
+          const wanted = { month: monthCands[0] || null, year: yearCands[0] || null };
+          for (const hk of ["month", "year"]) {
+            const h = half_by[hk] || {};
+            const partName = hk === "year" ? "Year" : "Month";
+            const rec = {
+              fieldName: `${item.source}[${i}].${key}.${hk}`,
+              label: `${prettyDate} — ${partName}`,
+              widgetType: "dropdown", isRequired: false,
+              entrySection: item.source, entryIndex: i,
+              mappedPath: `${item.source}[${i}].${spec.path}.${hk}`,
+              // The shared question this half belongs to, so review groups them.
+              question_key: `${item.source}[${i}].${key}`,
+              question_label_full: prettyDate,
+              part_label: partName,
+              // Scanned at open, before typing narrowed it — see atsInjOrcPickFromOwnList.
+              options: Array.isArray(h.options) && h.options.length ? h.options : null,
+              after: h.value || null,
+              elapsedMs: Date.now() - t0,
+              status: h.value ? "filled" : "needs_review",
+              verified: h.value ? true : null,
+            };
+            if (h.value) {
+              rec.detail = `picked ${JSON.stringify(h.value)} from the form's own ${partName.toLowerCase()} list`
+                + `${reopenTotal ? ` (${reopenTotal} re-open(s) on the pair — the first click did not register)` : ""}`;
+            } else {
+              rec.flag = /unclassified/.test(String(h.error || "")) ? "date-halves-unidentified" : "commit-not-accepted";
+              rec.detail = `Oracle did not accept ${JSON.stringify(wanted[hk] || "")} for the ${partName.toLowerCase()}`
+                + `${h.error ? ` (${h.error})` : (half_by[hk] ? "" : " (this half was never reached)")}`
+                + `${Array.isArray(h.options) && h.options.length ? ` — pick from the ${h.options.length} option(s) offered` : ""}`;
+            }
+            records.push(rec);
+          }
+          if (!okAll) {
+            notes.push(`${tag}: ${prettyDate} is INCOMPLETE (${failed.join("; ") || "a half did not commit"})`
+              + " — Oracle refuses an entry whose required date is incomplete, so this can cost the whole entry");
+          }
+          continue;
+        }
+
+        const f = group[0];
+        if (group.length > 1) unmapped.push(`${key} ×${group.length} (only the first was filled)`);
+        const value = atsOrcEntryValue(spec, entry);
+        const rec = { fieldName: `${item.source}[${i}].${key}`, label: f.label || key,
+                      widgetType: f.role === "combobox" ? "dropdown" : (f.type === "textarea" ? "textarea" : "text"),
+                      isRequired: false, entrySection: item.source, entryIndex: i,
+                      mappedPath: `${item.source}[${i}].${spec.path}`, status: "skipped", after: null, elapsedMs: 0 };
+        if (value == null) {
+          // The seal: an entry field with no answer IN ITS OWN ENTRY stops here. It does NOT fall
+          // through to the label ladder or the AI, either of which would answer it from page-level
+          // profile data — a different fact about a different subject.
+          rec.detail = "this entry has no value for it — left blank rather than answered from elsewhere";
+          rec.flag = "entry-unanswered";
+          records.push(rec); continue;
+        }
+        if (!f.id) {
+          rec.status = "needs_review"; rec.flag = "field-unaddressable";
+          rec.detail = "the entry form rendered this field with no id, so it has no selector to actuate";
+          records.push(rec); continue;
+        }
+        const sel = "#" + (f.id.replace(/([^\w-])/g, "\\$1"));
+        const t0 = Date.now();
+        if (f.role === "combobox") {
+          // ORC's own typeahead — the same primitive step 1 uses, including the composite
+          // first-segment match, because an entry's city picker offers "Tallahassee, Leon, FL" too.
+          // ⚠ A TIERED VALUE IS TRIED MOST-SPECIFIC FIRST and stops at the first hit, which is the
+          // whole point of the profile storing degrees as ["Bachelor of Science", "Bachelor's
+          // Degree", "Bachelors"]: the form's own vocabulary decides, and nothing is guessed.
+          const cands = Array.isArray(value) ? value.map(String) : [String(value)];
+          let r = null, back = null;
+          // ⚠⚠ ZERO ROWS OFFERED IS "THE SEARCH DID NOT ANSWER", NOT "YOUR VALUE IS NOT IN THE LIST",
+          // and only the second is a finding. Measured on the Education Degree picker across two
+          // consecutive runs of the same posting: one run offered exactly one row
+          // ("BS - Bachelor of Science"), the next offered ZERO after burning the same full 8s budget.
+          // The list is server-backed and its answer is sometimes simply late — the identical shape
+          // as iCIMS' school search, where a 675ms give-up reported "no option matched" for a value
+          // that returns first when typed by hand.
+          //
+          // So the whole candidate ladder is retried ONCE, and ONLY when the last attempt saw no rows
+          // at all. A ladder that saw rows and matched none has genuinely answered, and retrying that
+          // would just spend another 8s to be told the same thing.
+          // ⚠ THE PRIMITIVE NOW SELF-HEALS A DEAD OPEN (it re-clicks), so this outer retry exists only
+          // for the case it cannot fix: a server-backed search that genuinely answered nothing in
+          // time. That is still worth one more try — zero rows is "the search did not answer", not
+          // "your value is not in the list" — but it no longer has to cover a click that never
+          // landed, which is what made it a full second 8s pass on every School pick.
+          for (let attempt = 0; attempt < 2; attempt++) {
+            for (const c of cands) {
+              r = await act.eval(atsInjOrcPick, sel, c, [c], ATS_ORC_PICK_MS, false, true).catch(() => null);
+              back = await act.eval(atsInjOrcReadPicker, sel).catch(() => null);
+              if (r && r.ok && String((back && back.value) || "").trim() && !(back && back.invalid)) break;
+            }
+            const good = r && r.ok && String((back && back.value) || "").trim() && !(back && back.invalid);
+            const sawRows = !!(r && r.rows && r.rows.length);
+            if (good || sawRows) break;
+            if (attempt === 0) {
+              await act.delayFull(400);
+              log(`  (${key}: the picker returned NO rows at all — one more try; a silent search is not the same as a search that answered)`);
+            }
+          }
+          rec.after = back && back.ok ? back.value : null;
+          rec.elapsedMs = Date.now() - t0;
+          const ok = r && r.ok && String(rec.after || "").trim() && !(back && back.invalid);
+          rec.status = ok ? "filled" : "needs_review";
+          if (!ok) {
+            rec.flag = "no-option-match";
+            rec.detail = `Oracle's list did not accept any of ${JSON.stringify(cands.slice(0, 4))}`;
+            // ⚠ ONE OPTION PER LINE, deliberately. The single combined line carrying a picker's
+            // option list was unreadable through the dev-log channel (its content tripped a filter),
+            // and "the list did not accept our value" without knowing what the list HELD is the
+            // least actionable message a picker can produce — it was the whole reason the Education
+            // entry stayed unexplained for two runs.
+            const rows = (r && r.rows) || [];
+            log(`  ↳ ${key}: wanted ${JSON.stringify(cands.slice(0, 4))}, and the picker offered ${rows.length} row(s):`);
+            for (const row of rows.slice(0, 10)) log(`      · ${String(row).slice(0, 60)}`);
+            if (!rows.length) log("      (none — the search returned nothing at all)");
+          }
+          else rec.detail = `picked ${JSON.stringify(rec.after)} from the form's own list`;
+        } else {
+          // A tiered value in a TEXT box takes the most specific wording — there is no list to
+          // negotiate with, so the fallback tiers have nothing to add.
+          const flat = Array.isArray(value) ? String(value[0]) : String(value);
+          const w = await act.eval(atsInjSetText, sel, flat).catch(() => null);
+          const back = await act.eval(atsInjReadValue, "oracle", sel, "text").catch(() => null);
+          rec.after = back && back.ok ? back.value : null;
+          rec.resolved = Array.isArray(value) ? value : undefined;
+          rec.elapsedMs = Date.now() - t0;
+          // Read-back verified like every other commit here: a write that did not stick is
+          // needs_review, never a silent pass.
+          const ok = w && w.ok && String(rec.after || "").trim();
+          rec.status = ok ? "filled" : "needs_review";
+          if (!ok) { rec.flag = "commit-not-accepted"; rec.detail = "wrote the value but the field did not keep it"; }
+        }
+        records.push(rec);
+      }
+      // ⚠ LOG EVERY ENTRY FIELD'S OUTCOME, not just whether the entry committed. Without this an
+      // "Oracle refused the entry" line is unactionable: three entries failed on one run and the log
+      // could not say whether the cause was a date half misidentified, a picker that rejected the
+      // value, or a field written and taken back. The flat loop has printed per-field outcomes from
+      // the start and that is exactly why its failures were one-run diagnoses.
+      for (const r of records.slice(recordsBefore)) {
+        log(`  ${r.fieldName} (${r.widgetType}) → ${r.status}${r.flag ? " · " + r.flag : ""}` +
+            `${r.after != null ? ' · after=' + JSON.stringify(String(r.after).slice(0, 60)) : ""}` +
+            ` · ${r.elapsedMs || 0}ms${r.detail ? " · " + r.detail : ""}`);
+      }
+      if (unmapped.length) {
+        // Evidence for the next map line, and a review note so an unfilled entry field is visible
+        // rather than merely absent.
+        log(`${tag} — UNMAPPED entry field(s), left blank: ${unmapped.join(", ")}`);
+        notes.push(`${tag}: unmapped field(s) ${unmapped.join(", ")}`);
+      }
+
+      // ── COMMIT ──────────────────────────────────────────────────────────────────────
+      // ⚠ ONE CALL again — press the homonymous Add and wait page-side for the form to be GONE, for
+      // the same starved-timer reason as the open above.
+      const done = await act.eval(atsInjOrcCommitEntryAndWait, item.pattern, ATS_ORC_PICK_MS).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+      if (!done || !done.ok) {
+        log(`⛔ ${tag}: could not commit — ${(done && done.error) || "unknown"}`);
+        notes.push(`${tag}: filled but NOT committed (${(done && done.error) || "unknown"})`);
+        break;
+      }
+      // Committed means the open form is GONE (no Cancel) — the primitive settled that page-side and
+      // reports it. A form that stays open is ORC refusing the entry, almost always a required entry
+      // field we left blank, so the pass CANCELS to leave the block clean rather than abandoning a
+      // half-open form that would block Next, and says so.
+      if (!done.closed) {
+        log(`⛔ ${tag}: pressed ${JSON.stringify(done.pressed)} but the entry form stayed open — Oracle is refusing it, usually a required entry field we could not answer`);
+        notes.push(`${tag}: Oracle refused the entry (a required field in it is unanswered)`);
+        await act.eval(atsInjOrcEntryAction, item.pattern, "cancel").catch(() => null);
+        break;
+      }
+      log(`✔ ${tag} committed`);
+    }
+  }
+  return { records, notes };
+}
+
+// ⚠⚠ DOES THIS TILE ALREADY SAY WHAT WE WOULD WRITE? (speed round, 2026-08-20)
+// On a re-run the form arrives holding exactly the entries the profile would produce, and the pass
+// deleted all of them and typed the identical thing back — the single largest waste on step 2, since
+// each entry costs an open, four fields (two of them date pairs) and a commit.
+//
+// The tile's own summary is the evidence: "Characterization and Test Automation Intern Rivian and
+// Volkswagon Technologies 05/2026 - 08/2026". A match requires EVERY identifying string to be present,
+// which is the conservative direction — anything unrecognised falls through to delete-and-refill, so a
+// changed employer, a corrected title or an edited date still rewrites the block.
+//
+// ⚠ This does NOT relax the operator's "delete old entries before filling" instruction. An entry that
+// already states the right thing is not an old entry; deleting and retyping it changes nothing on the
+// application and costs seconds. A PARTIAL match is still a full delete-and-refill.
+function atsOrcEntryIdentity(source, entry) {
+  if (!entry) return null;
+  const val = (k) => {
+    const v = entry[k];
+    if (v == null) return "";
+    return Array.isArray(v) ? String(v[0] || "") : String(v);
+  };
+  if (source === "work_experience") {
+    const parts = [val("company"), val("job_title")].map((x) => x.trim()).filter(Boolean);
+    return parts.length === 2 ? parts : null;      // both, or we cannot claim a match
+  }
+  if (source === "education") {
+    const parts = [val("school_or_university")].map((x) => x.trim()).filter(Boolean);
+    return parts.length ? parts : null;
+  }
+  if (source === "skills") return typeof entry === "string" && entry.trim() ? [entry.trim()] : null;
+  return null;                                     // an unknown section never claims a match
+}
+
+// True when the tiles on the form already are the entries we would write — same count, and each
+// wanted entry matched by a DISTINCT tile (order-independent, because the form may sort them).
+// ── DOES THIS TILE ALREADY SHOW THIS VALUE? (operator, 2026-08-21) ───────────────────────────
+// "for the experience section, no need to go in and edit each one, you can read the information and
+// parse it directly from the dom and you only change it if something is wrong. Same for education."
+//
+// The tile summary carries the entry's content, so the cheap check is whether every value the human
+// approved is visible in it. Opening an entry is then the EXCEPTION — which matters for more than
+// speed: opening is the риskiest thing this pass does (it is what produced the second-close failure
+// that cascaded through a whole section), so not doing it is strictly safer.
+//
+// ⚠ DATES ARE THE ONE THING THAT NEEDS TOLERANCE. The tile renders "05/2025" while the record stores
+// "May 2025" — the same fact in two vocabularies, and a raw containment test would call every date
+// wrong and open every entry, which is exactly the work this avoids. So a month+year on either side
+// is reduced to a canonical key before comparing.
+// ⚠ ATS_MONTHS already exists at the top of this file (capitalised). The service worker evaluates
+// this whole file into ONE scope, so a second declaration is a SyntaxError that kills the worker —
+// the documented "never re-declare an imported name" trap, caught here by node --check.
+function atsYearMonthKey(v) {
+  const t = String(v == null ? "" : v).trim().toLowerCase();
+  if (!t) return null;
+  let m = /^(\d{4})[-/](\d{1,2})$/.exec(t);                       // 2025-05
+  if (m) return m[1] + "-" + String(Number(m[2])).padStart(2, "0");
+  m = /^(\d{1,2})[-/](\d{4})$/.exec(t);                            // 05/2025
+  if (m) return m[2] + "-" + String(Number(m[1])).padStart(2, "0");
+  m = /^([a-z]+)\s+(\d{4})$/.exec(t);                              // May 2025
+  if (m) {
+    const i = ATS_MONTHS.findIndex((n) => { const l = n.toLowerCase(); return l === m[1] || l.slice(0, 3) === m[1].slice(0, 3); });
+    if (i >= 0) return m[2] + "-" + String(i + 1).padStart(2, "0");
+  }
+  return null;
+}
+// ⚠⚠ A BUNDLE APPROVED BEFORE THE DATE SPLIT KEYS A DATE AS ONE ROW (2026-08-21). The fill now
+// records `startDate.month` / `startDate.year` so each half is separately editable, but an approved
+// bundle already in Supabase carries the merged `startDate` = "May 2026". Live, that cost four verify
+// failures on an application that had passed its rehearsal the day before: the replay looked for the
+// halves, found nothing, wrote an entry with no dates, and Oracle refused it.
+//
+// So a missing half FALLS BACK to the merged row and takes its share of it. Same discipline
+// atsSubmitKey already applies to entry keys — "the two sides keying differently IS the bug" — and it
+// is why an old approval keeps working instead of silently failing with "no matching field".
+//
+// Deliberately narrow: it only ever splits a "<Month> <YYYY>" / "<MM>/<YYYY>" shape it can parse, and
+// returns null otherwise rather than guessing at half of a string it does not understand.
+function atsOrcLegacyDateHalf(merged, half) {
+  const t = String(merged == null ? "" : merged).trim();
+  if (!t) return null;
+  let m = /^([A-Za-z]+)\s+((?:19|20)\d{2})$/.exec(t);              // "May 2026"
+  if (m) return half === "year" ? m[2] : m[1];
+  m = /^(\d{1,2})[-/]((?:19|20)\d{2})$/.exec(t);                   // "05/2026"
+  if (m) {
+    if (half === "year") return m[2];
+    const i = Number(m[1]);
+    return i >= 1 && i <= 12 ? ATS_MONTHS[i - 1] : null;
+  }
+  m = /^((?:19|20)\d{2})[-/](\d{1,2})$/.exec(t);                   // "2026-05"
+  if (m) {
+    if (half === "year") return m[1];
+    const i = Number(m[2]);
+    return i >= 1 && i <= 12 ? ATS_MONTHS[i - 1] : null;
+  }
+  // A bare year is a real shape the fill can produce when only that half committed.
+  if (/^(?:19|20)\d{2}$/.test(t)) return half === "year" ? t : null;
+  return null;
+}
+
+function atsOrcTileHoldsValue(tileText, value) {
+  const tile = String(tileText == null ? "" : tileText);
+  const v = String(value == null ? "" : value).trim();
+  if (!v) return true;                          // nothing approved ⇒ nothing to disagree with
+  if (!tile) return false;
+  if (atsLib.normalize(tile).indexOf(atsLib.normalize(v)) !== -1) return true;
+  // the date case: compare canonical month+year keys, both directions
+  const want = atsYearMonthKey(v);
+  if (!want) return false;
+  const seen = (tile.match(/\b(?:[A-Za-z]+\s+\d{4}|\d{1,2}[-/]\d{4}|\d{4}[-/]\d{1,2})\b/g) || [])
+    .map(atsYearMonthKey).filter(Boolean);
+  return seen.indexOf(want) !== -1;
+}
+
+function atsOrcTilesAlreadyMatch(source, entries, want, tiles) {
+  if (!Array.isArray(tiles) || !Array.isArray(entries)) return false;
+  if (!want || tiles.length !== want) return false;
+  const norm = (v) => atsLib.normalize(String(v || ""));
+  const pool = tiles.map((x) => norm(x && x.text));
+  for (let i = 0; i < want; i++) {
+    const id = atsOrcEntryIdentity(source, entries[i]);
+    if (!id) return false;                          // cannot identify ⇒ cannot claim a match
+    const at = pool.findIndex((tx) => tx && id.every((part) => tx.indexOf(norm(part)) !== -1));
+    if (at === -1) return false;
+    pool[at] = null;                                // consume it — two entries cannot share a tile
+  }
+  return true;
+}
+
+function atsOrcEntryPlan(profile, blocks) {
+  const present = Array.isArray(blocks) ? blocks : [];
+  const out = [];
+  for (const spec of ATS_ORC_ENTRY_BLOCKS) {
+    const re = new RegExp(spec.pattern, "i");
+    if (present.length && !present.some((b) => re.test(String(b || "")))) continue;
+    const arr = (profile || {})[spec.source];
+    const n = Array.isArray(arr) ? arr.filter((e) => e != null && String(e).trim() !== "").length : 0;
+    if (!n) continue;
+    out.push({ block: spec.label, pattern: spec.pattern, source: spec.source, want: Math.min(n, ATS_ORC_ENTRY_MAX),
+      capped: n > ATS_ORC_ENTRY_MAX ? n : 0 });
+  }
+  return out;
+}
+
+// ── ORC's ADDRESS IS ONE ANSWER, NOT FIVE (operator, 2026-08-19) ─────────────────────────
+// Measured with the operator: typing a postal code and pressing Enter on its single row fills CITY,
+// STATE and COUNTY by itself -- "32312" -> "32312, Tallahassee, Leon, FL" -> city Tallahassee, state
+// FL, county Leon, all accepted, no further actuation. So the address block is ONE decision expressed
+// through the most specific field, not five independent ones.
+//
+// That also explains a failure I mis-diagnosed for most of a session. Filling the five in sequence
+// looked like "each commit deletes the others", and I wrote that down. The real cause was the house
+// CLEAR-BEFORE-TYPING step: clearing a geo picker cascades to its siblings, so every pick was wiping
+// what the previous pick had auto-filled. The fields were never deleting each other -- I was.
+//
+// So the plan is: actuate the ANCHOR only, then VERIFY the dependents. A dependent that came back
+// correct is `already-filled` (audit-excluded, never re-actuated -- the standing rule for a field
+// that holds a live value); one that came back wrong or empty is a review item, NOT something to
+// type into, because typing into it would clear the anchor that produced the rest.
+//
+// The anchor is the postal code because it is the most specific: measured, "32312" resolved to
+// exactly ONE row while "Tallahassee" resolved to TWO (Jefferson and Leon counties) -- and the
+// profile stores no county at all, so the city route is genuinely ambiguous from the data we hold.
+// Falling back to city when there is no postal code is deliberate and flagged: it can pick the wrong
+// county, which is exactly the kind of confidently-wrong value that belongs in review.
+var ATS_ORC_GEO_ANCHOR = ["postalCode", "city", "region2", "region1"];
+
+// ⚠ `valueFor` EXISTS BECAUSE A REPLAY PASSES `profile: {}` BY DESIGN. Without it this returned null
+// on the submit run -- no profile, so nothing to anchor on, so no roles stamped -- and `city` was
+// typed straight back in from the approved bundle, clearing the anchor that had just produced it.
+// Caught by a test rather than live, but it is the SAME failure iCIMS paid for with 28 of a
+// rehearsal's 32 verify failures ("grow repeating entries from the BUNDLE, not the profile"): any
+// pass that derives structure from the profile is silently disabled on replay.
+function atsOrcGeoPlan(fields, profile, valueFor) {
+  const list = Array.isArray(fields) ? fields : [];
+  const geo = list.filter((f) => f && f.searchDriven && f.widgetType === "select");
+  if (!geo.length) return null;
+  const byName = {};
+  for (const f of geo) byName[f.fieldName] = f;
+  const pi = (profile && profile.personal_info) || {};
+  // `country` is the geo ROOT and mounts the rest -- it is not an anchor candidate and is filled
+  // normally (measured: clearing it unmounts the whole block).
+  const fromProfile = { postalCode: pi.postal_code, city: pi.city, region2: pi.state_province, region1: null };
+  for (const name of ATS_ORC_GEO_ANCHOR) {
+    const f = byName[name];
+    // On a replay the approved bundle is the ONLY source; on a fill it is the profile.
+    const v = (typeof valueFor === "function" && f) ? valueFor(f) : fromProfile[name];
+    if (f && v != null && String(v).trim()) {
+      return {
+        anchor: f,
+        anchorValue: String(v).trim(),
+        // everything else in the block is verified, never actuated
+        dependents: geo.filter((g) => g !== f && g.fieldName !== "country"),
+        exact: name === "postalCode",
+        detail: name === "postalCode"
+          ? "Oracle resolves the whole address from the postal code"
+          : "no postal code in profile, so the address is anchored on " + name +
+            " -- that can resolve to more than one county, so the result needs checking",
+      };
+    }
+  }
+  return null;
+}
+
+// ── SHOULD THIS ORC PICKER BE ENUMERATED FOR REVIEW? (2026-08-19) ────────────────────────
+// The judgement half of the option capture, SW-side so there is one copy of the policy.
+//
+// The operator's rule is an ASYMMETRY, and it decides every uncertain case here: a picker MISSING
+// their answer makes them conclude the form does not offer it, while a complete list wrongly called
+// partial only costs them a typed value. So this errs toward "do not claim a list".
+//
+//   • a NON-geo picker → capture, and the result is COMPLETE, because an empty open on ORC returns
+//     the whole vocabulary (measured: country = 251 rows) and there is no pager to defeat us.
+//   • a `searchDriven` (geo-hierarchy) picker → NEVER captured. Two independent reasons, either
+//     sufficient: its list is DEPENDENT (a child with an uncommitted parent answers "No results", so
+//     a capture at scan time would record an empty or wrong vocabulary as if it were the field's),
+//     and for city/postal it is effectively UNBOUNDED, so an empty open could never be the picker —
+//     exactly why Workday's capture skips SKILLS. It reaches review as type-it-yourself, which is
+//     the honest rendering. ⚠ Touching these has also already proven destructive during recon.
+//   • anything already carrying options from the scan (radio/checkbox groups read their own labels
+//     inline) needs no capture at all.
+//
+// ⚠ `country` is the one field this deliberately under-serves: it IS a fixed 251-item vocabulary and
+// it is the geo ROOT, so it could be enumerated. It is skipped anyway because it wears the same
+// declared geo class as its dependents, and keying on "which geo field is the root" would be a
+// guess about tenant configuration. The cost is one typed value on a 251-item list; noted rather
+// than silently accepted.
+function atsOrcCaptureEligible(f) {
+  if (!f) return false;
+  if (f.searchDriven) return false;
+  if (Array.isArray(f.options) && f.options.length) return false; // already enumerated inline
+  return f.widgetType === "select";
+}
+
+// ── WHICH ORACLE APPLY-FLOW VIEW ARE WE LOOKING AT? (2026-08-19) ─────────────────────────
+// The ORC pre-form walk is a loop over views, exactly like the iCIMS one above, and this is the
+// judgement half — pure, so the sequencing in background.js has nothing to decide.
+//
+// Views, and why the ORDER is what it is:
+//   "captcha"  — FIRST, ahead of anything actionable. The bot never solves or bypasses one; the
+//                only correct response is to stop for the operator, and that must not be
+//                reachable-around by a later branch that happens to find a fillable box.
+//   "form"     — a VISIBLE apply-flow-section: we have arrived, and the stage is DONE. Checked
+//                before the auth views so a form that happens to keep an email box (ORC prefills
+//                `email` from the gate) is never mistaken for the gate itself.
+//   "code"     — the six #pin-code-N boxes ("Confirm Your Identity"). Above "email" because the
+//                code screen is where the email gate LEADS, and on some tenants the flow lands
+//                straight here with the gate's markup still in the document.
+//   "email"    — the quick-apply gate (`quick-email-verification-form` / `primary-email-*`).
+//   "password" — a real sign-in. Distinct from "email" because it needs the stored password, not
+//                just the login, and because ORC's quick gate never has one (measured: Nokia and
+//                Baylor both ask for an email and nothing else).
+//   "blocked"  — no field we can fill, but federated sign-in or account creation is on offer.
+//                Those controls are REPORTED, never pressed. Saying "blocked" beats "unknown".
+//   "posting"  — still on the job description with an Apply control: the flow has not been
+//                entered yet, so the caller should press it.
+//   "none"     — nothing recognizable.
+//
+// ⚠ Deliberately NO control-count bound, unlike icimsAuthView. iCIMS needed one because its
+// sign-in card and its application form are both "a form with an email box", so only size
+// separated them. ORC declares the difference structurally — `apply-flow-section` exists on the
+// form and does not exist on the gate (measured `sections: 0` on the pin screen) — and a declared
+// signal always beats a threshold.
+function orcApplyView(s) {
+  if (!s || !s.ok) return "unreadable";
+  if (s.captchaChallenge) return "captcha";
+  if (s.formSectionVisible) return "form";
+  if (Number(s.pinInputs || 0) > 0) return "code";
+  if (s.emailGate || s.emailInput) return "email";
+  if (s.passwordInput) return "password";
+  if ((s.federated || []).length || (s.createAccount || []).length) return "blocked";
+  if (s.applyControl) return "posting";
+  return "none";
+}
+
 // ── WHAT KIND OF CHECKBOX IS THIS? (operator, 2026-08-18) ────────────────────────────────
 // The operator read ITT's and Peraton's privacy notices themselves and instructed that **accept
 // checkboxes be ticked, now and in the future**. They are the data subject, the notices govern the
@@ -3463,14 +7235,52 @@ function icimsAuthView(s) {
 // Cookie/consent BANNERS are also out of scope — unrelated to applying, and the standing rule to
 // prefer the privacy-preserving option there is untouched.
 var ATS_CONSENT_ACCEPT_RE = /\b(i\s+(accept|agree|consent|acknowledge|have\s+read)|accept(ing)?\s+the|agree\s+to\s+the|consent\s+to\s+the)\b|\bgdpr\b|privacy\s+(notice|policy|statement)|data\s+protection|terms\s+(of\s+(use|service)|and\s+conditions)/i;
-var ATS_CONSENT_OPTIN_RE = /\b(talent\s+(community|network)|job\s+alerts?|email\s+me|notify\s+me|keep\s+me\s+(informed|posted)|marketing|newsletter|similar\s+(jobs|roles|openings)|future\s+(jobs|roles|opportunities|openings))\b/i;
+// ⚠ THE `receive … job opportunities` ARM WAS ADDED FROM A LIVE MISS (Oracle, 2026-08-19). Its
+// job-alerts box says "I agree to receive new job opportunities (see oracle.com privacy policy)" —
+// no "job alerts", no "future jobs", so none of the original arms fired and the ACCEPT arm claimed
+// it. The declared-intent check in atsConsentKind is the primary fix; this is the belt for a tenant
+// that ships the same wording without the `<opt-in>` wrapper.
+var ATS_CONSENT_OPTIN_RE = /\b(talent\s+(community|network)|job\s+alerts?|email\s+me|notify\s+me|keep\s+me\s+(informed|posted)|marketing|newsletter|similar\s+(jobs|roles|openings)|future\s+(jobs|roles|opportunities|openings))\b|\b(receive|send\s+me|text\s+me)\s+(new\s+|other\s+|additional\s+|further\s+)?(job|career|employment)\s+(opportunit|alert|posting|opening)|\bnew\s+job\s+opportunit/i;
 // A truthfulness attestation — recognized ONLY so it can be excluded on purpose rather than by
 // accident, and so a future decision about it has a name to refer to.
 var ATS_CONSENT_ATTEST_RE = /\b(i\s+certify|i\s+declare|i\s+affirm|under\s+penalty|falsif(y|ication)|to\s+the\s+best\s+of\s+my\s+knowledge)\b/i;
 // text = whatever describes the box (label, its row, the consent's own title). Most specific wins:
 // an opt-in that merely mentions "privacy" must not read as an acceptance.
-function atsConsentKind(text) {
+// ⚠ AN OPT-IN CAN BE WORDED EXACTLY LIKE AN ACCEPTANCE — so DECLARED INTENT decides first
+// (live on Oracle's own careers site, 2026-08-19). Its job-alerts box reads:
+//
+//     "I agree to receive new job opportunities (see oracle.com privacy policy)"
+//
+// which hits ATS_CONSENT_ACCEPT_RE on "i agree" and does NOT hit the opt-in wordings (it says
+// neither "job alerts" nor "future jobs"), and it even name-drops a privacy policy. Measured: it
+// classified as **accept**, i.e. it would have been TICKED — subscribing the operator to marketing
+// mail, the one thing the accept-checkbox authorisation explicitly excludes. Wording alone cannot
+// separate these two, because a marketer writes an opt-in in the language of assent.
+//
+// So `hints` (the page's own structural declaration) is consulted BEFORE any text: Oracle wraps the
+// box in `<job-alerts-opt-in>` / `<opt-in>` and ids it `job-alerts-checkbox`. A control the page
+// itself files under "opt-in" is an opt-in whatever its prose claims.
+//
+// ⚠ The remaining ambiguity is resolved toward "optin" ON PURPOSE, and the asymmetry is the reason:
+// wrongly ticking an opt-in silently signs the operator up for mail they never asked for and cannot
+// be undone from a review page, while wrongly NOT ticking an acceptance halts LOUDLY
+// (`consent-not-accepted`) and costs one operator click. Silent-and-wrong loses to loud-and-wrong.
+//
+// `hints` is optional, so every existing caller (iCIMS) behaves byte-identically.
+// ⚠ NO `\b` HERE, deliberately — and that is the difference between prose and an IDENTIFIER.
+// Hints are element names, ids and `name` attributes: `job-alerts-opt-in`, `marketingOptIn`,
+// `optInCheckbox`. camelCase has no word boundary between "marketing" and "Opt", so a
+// boundary-anchored test misses exactly the ids most likely to appear. Substring matching is safe
+// in this space because these tokens do not occur inside unrelated English words ("adoption",
+// "description" contain no "optin"), whereas in PROSE the boundaries are load-bearing — which is
+// why ATS_CONSENT_OPTIN_RE keeps them.
+var ATS_CONSENT_OPTIN_DECLARED_RE = /opt-?in|job-?alert|marketing|subscribe|newsletter/i;
+
+function atsConsentKind(text, hints) {
   const t = String(text == null ? "" : text).replace(/\s+/g, " ").trim();
+  const h = hints || {};
+  const declared = [].concat(h.containers || [], h.id ? [h.id] : [], h.name ? [h.name] : []).join(" ");
+  if (declared && ATS_CONSENT_OPTIN_DECLARED_RE.test(declared)) return "optin";
   if (!t) return null;
   if (ATS_CONSENT_OPTIN_RE.test(t)) return "optin";
   if (ATS_CONSENT_ATTEST_RE.test(t)) return "attestation";
@@ -3484,12 +7294,67 @@ function atsConsentPlan(consents) {
   const out = { tick: [], left: [] };
   for (const c of list) {
     if (!c) continue;
-    const kind = atsConsentKind([c.label, c.rowText, c.title].filter(Boolean).join(" · "));
+    // hints are FIRST-CLASS: a page that files a box under <opt-in> has told us what it is, and that
+    // outranks its prose (see atsConsentKind). Absent on iCIMS scans, so that path is unchanged.
+    const kind = atsConsentKind([c.label, c.rowText, c.title].filter(Boolean).join(" · "),
+      { containers: c.containers, id: c.id, name: c.name });
     const rec = { ...c, kind };
     if (kind === "accept" && !c.checked) out.tick.push(rec);
     else out.left.push(rec);
   }
   return out;
+}
+
+// ── A DECOY FIELD: VISIBLE BY EVERY MEASURE, AND WRITING TO IT SABOTAGES THE APPLICATION ─────────
+// Oracle Recruiting Cloud's apply gate ships a bot-detection HONEYPOT next to the real email box
+// (observed live 2026-08-19, Nokia):
+//
+//   <input class="input-row__control" id="honey-pot-1" name="honey-pot"
+//          cssclass="input-row--invisible" aria-label="honeypot" aria-hidden="true" tabindex="-1">
+//
+// ⚠ EVERY VISIBILITY TEST THIS PIPELINE OWNS PASSES IT. Measured on the live page: rect 179×38, the
+// closest `div` 179×19, `offsetParent` NOT null, `display:inline-block`, `visibility:visible`,
+// `opacity:1`. The Greenhouse/Lever scan predicate (`rect.width > 0 && rect.height > 0`, optionally
+// on `el.closest("div")`) therefore admits it as an ordinary required-less text field.
+//
+// Why that is worse than it looks. Being OPTIONAL, the AI tier never touches it (AI is REQUIRED-only)
+// and it would end blank — so the fill looks clean. But it still reaches the REVIEW EDITOR as a
+// fillable box, and anything typed there is replayed on submit. **No read-back catches this: the
+// write succeeds.** The failure is invisible from inside the pipeline and lands on the employer's
+// side as "this application was filed by a bot" — the one failure class that cannot be recovered from
+// a review page afterwards, and the reason this is a recognizer rather than a filter.
+//
+// ⛔ DO NOT "FIX" THIS BY TIGHTENING THE VISIBILITY TEST. That is the Workday dropdown-chip dead end
+// (tried twice, confirmed): the element is genuinely visible by every computed-style measure. The only
+// honest signal is the intent the PAGE DECLARES about the control.
+//
+// Judgement lives here, SW-side, and the scan only REPORTS markers — the same split `atsInjAuthScan` /
+// `atsConsentKind` uses, so there is ONE copy of a rule this consequential rather than an injected dup
+// that can drift.
+//
+// The primary signal is deliberately GENERIC, not an Oracle name match: a control the page hides from
+// assistive technology AND removes from tab order is not a control a human is being asked to fill, on
+// any platform. `aria-hidden` alone is NOT enough — a decorative wrapper around a real input can carry
+// it — and `tabindex="-1"` alone is NOT enough either, since custom widgets routinely park a
+// programmatically-focused input out of tab order. Requiring BOTH is what makes it precise. The name /
+// label match is a belt for a tenant that ships only one of them.
+function atsDecoyKind(f) {
+  if (!f) return null;
+  const name = String(f.fieldName == null ? "" : f.fieldName);
+  const label = String(f.ariaLabel == null ? "" : f.ariaLabel);
+  const cssClassAttr = String(f.cssClassAttr == null ? "" : f.cssClassAttr);
+  // A NAMED honeypot is a honeypot whatever else it does — anchored on a word boundary so a genuine
+  // field is never claimed by a substring ("phone-number" must not match "honey").
+  if (/\bhoney[\s_-]?pot\b/i.test(name) || /\bhoney[\s_-]?pot\b/i.test(label)) return "honeypot";
+  // The page's own "do not show this to anyone" pair.
+  const hiddenFromAt = f.ariaHidden === true || String(f.ariaHidden) === "true";
+  const outOfTabOrder = String(f.tabIndex) === "-1";
+  if (hiddenFromAt && outOfTabOrder) return "aria-hidden+untabbable";
+  // A wrapper the tenant itself marks invisible, via ORC's Knockout `cssclass` binding attribute.
+  // Only trusted alongside one of the two signals above, because a class NAME is the tenant's
+  // vocabulary and could plausibly mean something else on its own.
+  if (/(^|[\s_-])(invisible|hidden|offscreen)([\s_-]|$)/i.test(cssClassAttr) && (hiddenFromAt || outOfTabOrder)) return "invisible-wrapper";
+  return null;
 }
 
 // SSO refusal is URL-EVIDENCED ONLY (the Workday invariant, verbatim): a real federated login
@@ -3553,6 +7418,37 @@ function atsAssertionLead(candidate, texts) {
     ? list.filter((t) => ATS_NEG_LEAD_RE.test(t))
     : list.filter((t) => ATS_POS_LEAD_RE.test(t) && !ATS_NEG_LEAD_RE.test(t));
   return hits.length === 1 ? hits[0] : null;   // ambiguous ⇒ refuse
+}
+
+// ── A LONE ASSERTION CHECKBOX ANSWERS "NO" BY STAYING UNTICKED (operator, 2026-08-20) ──────
+// The twin of atsAssertionLead above. That one finds the option a STATED assertion matches; this one
+// recognises that for a form offering exactly ONE tickable assertion, the negative answer is not an
+// option at all — it is the ABSENCE of a tick, and the box already holds it.
+//
+// Seen first on Oracle's ethnicity question (label "Ethnicity", one option, "I am Hispanic or
+// Latino.", profile "No, I am not Hispanic"), but written for the shape rather than the question:
+// veteran status, disability, and most single-box self-ID questions are put the same way, and every
+// tenant words both halves differently. Nothing here knows what the question is ABOUT — relevance was
+// already established by whatever routed the profile value to this field.
+//
+// ⚠ THE OPTION MUST READ AFFIRMATIVELY. A negatively-worded box ("I do NOT consent…", "I decline…")
+// makes "no" a DOUBLE NEGATIVE, and which way that resolves is exactly the kind of thing this
+// codebase refuses to guess — those fall through and get flagged for a human, as before.
+//
+// ⚠ AND IT ONLY EVER RECOGNISES A NO. A yes-polarity answer is left to the tiers above (assertion-lead
+// ticks it), because a YES we fail to express must still be surfaced: the difference matters, since
+// "leave it unticked" is indistinguishable from "we never got to it" on the page itself.
+const ATS_OPTION_NEGATIVE_RE = /\b(not|never|no longer|decline|declines?|opt[- ]?out|unwilling)\b/i;
+function atsAssertionDeclined(candidate, optionText) {
+  const c = String(candidate == null ? "" : candidate).trim();
+  const o = String(optionText == null ? "" : optionText).trim();
+  if (!c || !o) return false;
+  if (ATS_NEG_LEAD_RE.test(o) || ATS_OPTION_NEGATIVE_RE.test(o)) return false;  // double negative ⇒ refuse
+  if (/^(false|no)$/i.test(c)) return true;                 // a coerced boolean, or a bare "No"
+  if (/^\s*(no|false)\b/i.test(c)) return true;             // "No, I am not Hispanic"
+  if (ATS_NEG_LEAD_RE.test(c)) return true;                 // "I am not a protected veteran"
+  if (/^\s*not\b/i.test(c)) return true;                    // "Not Hispanic or Latino"
+  return false;
 }
 
 // DEGREE LEVEL is a small closed vocabulary, and forms model it at a different granularity than a
@@ -3751,6 +7647,33 @@ function atsRouteField(ats, f, profile, defaults, jobContext, bucketIndex, crede
   if (map) {
     if (map.kind === "resume") return { kind: "resume", source: "map" };
     if (map.kind === "skip") return { kind: "skip", source: "map", detail: map.detail };
+  // ⚠⚠ `siteLink` IS A REPEATING FAMILY, so the ORDINAL picks WHICH website (operator, 2026-08-20).
+  // The control is `name="siteLink-1"` inside `<candidate-links>`, with "Add Another Link" creating
+  // `siteLink-2`, `-3`… — and atsMapKey strips a trailing `-<digits>` for Oracle, so EVERY one of
+  // them reduces to the same map key. Returning "the first website" therefore filled link 1 correctly
+  // and would have written that SAME url into every further link the moment a second input existed:
+  // a duplicate the operator would have to delete, from a rung that looked like it was working.
+  //
+  // The ordinal is a POSITION, not a render counter (unlike the `-7` on the id), so it indexes the
+  // profile's own ordered list of non-empty websites. Beyond the end ⇒ null, which leaves the extra
+  // input blank rather than repeating the last url.
+  if (map.kind === "selfid_disability") {
+    // same one-liner the map branch below uses; it is scoped inside that branch, so it is repeated
+    // here rather than hoisted — hoisting it would change the shape of a rung this file has settled.
+    const raw = map.path.split(".").reduce((o, k) => (o == null ? undefined : o[k]), profile);
+    if (raw == null || String(raw).trim() === "") return { eeoUnstated: true };
+    const list = atsFd.selfIdDisabilityCandidates(String(raw));
+    return { candidates: (list && list.length ? list : [String(raw)]), source: "eeo",
+             path: map.path };   // NO containment — the ladder ends in a polarity token that lands exactly
+  }
+  if (map.kind === "website") {
+    const list = atsProfileWebsites(profile);
+    if (!list.length) return null;
+    const m = /-(\d+)$/.exec(String(f.fieldName || ""));
+    const idx = m ? Math.max(0, Number(m[1]) - 1) : 0;
+    const hit = list[idx];
+    return hit ? { raw: hit, path: "websites[" + idx + "].url", source: "map" } : null;
+  }
     // ⚠ A LITERAL ANSWER, for a question whose answer is a fact about the FORM, not about the applicant.
     // Used by the address Type below: the one address a profile holds is the candidate's own residence, so
     // "Home" is not a guess and there is no profile field to read it from. Still a CANDIDATE list through
@@ -4091,7 +8014,15 @@ async function atsGrowIcimsEntries(act, ats, scan, profile, wantBySection) {
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
+  // ⚠ EVERYTHING BETWEEN HERE AND THE atsFillFields CALL BELOW IS DEAD AIR ON THE PAGE — the form is
+  // rendered and nothing is being written to it yet. That is the second half of the pause the operator
+  // reported on ORC (2026-08-21), and it was entirely untimed: the scan, the option capture and the
+  // geo plan all ran with no wall clock on them, so the only way to bound this phase was to subtract
+  // guesses. `prepT0` is what lets the run state its own answer.
+  const prepT0 = Date.now();
+  const scanT0 = Date.now();
   let scan = await act.eval(atsInjScan, ats);
+  const scanMs = Date.now() - scanT0;
   // Stamp which ENTRY of a repeating section each field belongs to, before anything routes it.
   if (scan && scan.fields) atsAssignEntryIndexes(ats, scan.fields);
   // ⚠ GROW REPEATING SECTIONS TO FIT THE PROFILE, BEFORE FILLING. The form renders ONE entry and
@@ -4102,6 +8033,24 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // the caller derived from the approved bundle (see atsGrowIcimsEntries — it used to be skipped
   // whenever `valueFor` was present, which is exactly the submit run).
   if (ats === "icims") scan = await atsGrowIcimsEntries(act, ats, scan, profile, o.entryCounts);
+  // ⚠ BEFORE the fill, because it is what decides whether an UNFILLED field reaches review as a real
+  // picker — the operator's standing rule. Read-only, and it enriches the scan so every downstream
+  // atsAttachOptions call works unchanged.
+  if (ats === "oracle") await atsCaptureOrcOptions(act, scan, (...a) => console.log("[ApplyPilot]", ...a));
+  // ORACLE'S ADDRESS IS ONE ANSWER. Stamp the anchor/dependent roles onto the scan so the field loop
+  // does not have to re-derive them, and so a dependent is never actuated -- typing into one clears
+  // the anchor that produced it (see atsOrcGeoPlan).
+  if (ats === "oracle") {
+    const geo = atsOrcGeoPlan((scan && scan.fields) || [], profile, o.valueFor);
+    if (geo) {
+      geo.anchor.geoAnchor = true;
+      geo.anchor.geoAnchorValue = geo.anchorValue;
+      for (const d of geo.dependents) { d.geoDependent = true; d.geoAnchorName = geo.anchor.label || geo.anchor.fieldName; }
+      console.log(`[ApplyPilot][ATS-GEO] address anchored on ${geo.anchor.fieldName}=${JSON.stringify(geo.anchorValue)}`
+        + `${geo.exact ? "" : " (NOT exact -- " + geo.detail + ")"}; ${geo.dependents.length} dependent(s) will be VERIFIED, not typed into: `
+        + geo.dependents.map((d) => d.fieldName).join(", "));
+    }
+  }
   // RECON THE LISTS BEFORE FILLING — including the OPTIONAL ones (operator, 2026-08-16). On these
   // one-page forms a field we never fill still has to be ANSWERABLE in review, and that means a
   // real picker, not a picker-shaped text box. The scan already carries every list, so the work is
@@ -4148,6 +8097,14 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // be given a second, contradicting one.
   const fillOpts = Object.assign({}, o, { aiCache: (o && o.aiCache) || new Map() });
 
+  // The last thing before the first write: how much of this step's clock went on preparation the page
+  // shows no sign of. Printed for every ATS (it is three numbers and it costs nothing), but it exists
+  // for ORC, where the capture pass and a 39-field scan both sit in this window.
+  try {
+    console.log(`[ApplyPilot][ATS-TIME] pre-fill prep ${((Date.now() - prepT0) / 1000).toFixed(1)}s`
+      + ` — scan ${(scanMs / 1000).toFixed(1)}s, then ${((Date.now() - prepT0 - scanMs) / 1000).toFixed(1)}s`
+      + ` of option capture / entry growth / planning, over ${((scan && scan.fields) || []).length} field(s)`);
+  } catch (e) { /* diagnostic only */ }
   await atsFillFields(act, ats, scan, scan.fields, results, profile, defaults, jc, bucketIndex, fillOpts);
 
   // CASCADE RE-SCAN (the Workday M1 pattern, earned again 2026-07-31 on Ramp): these SPAs
@@ -4201,7 +8158,17 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     const bare = ch.length - picker - freeText;
     if (ch.length) console.log(`[ApplyPilot][ATS-OPTIONS] review editors — ${picker} picker · ${freeText} filter-or-type (list unproven) · ${bare} with no options at all, of ${ch.length} choice record(s)`);
   } catch (e) { /* diagnostic only */ }
-  return await atsFinishFill(act, ats, scan, results, o.credentials);
+  // ⚠ `profile` and `jobContext` are handed on because the ORC entry pass runs inside the finish
+  // stage — see the entry block there for why that ORDERING is the right one (after the audit and
+  // the pre-filled sweep, before the counts). It threw `profile is not defined` on a live run when
+  // the pass was written against driveAtsPageFill's scope while sitting in atsFinishFill's; the
+  // completeness guard around it kept the flat fields and reported the failure, which is the only
+  // reason a whole step's employment history was not silently missing again.
+  // ⚠ `replay` is threaded EXPLICITLY rather than read off a variable that happens to be in scope.
+  // atsFinishFill does not receive `o`, and the entry pass inside it already cost one live run by
+  // being written against driveAtsPageFill's scope — `profile is not defined`, thrown into a silent
+  // catch. `o.valueFor` is this file's established "this is a replay" signal (see the match opts).
+  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext, !!o.valueFor, o.valueFor, o.entryCounts);
 }
 
 // ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
@@ -4505,6 +8472,64 @@ async function atsRunAiBatchGroup(act, deferred, profile, jc, cache) {
 // The per-field fill loop — extracted so the cascade pass runs the IDENTICAL ladder. THREE phases
 // (see the DEFERRED AI block above): fill deterministically and record what needs the AI → ONE call
 // for exactly those questions → a second actuation pass that fills them.
+// ── CAPTURE ORC PICKER OPTIONS SO REVIEW DRAWS A REAL PICKER (2026-08-19) ────────────────
+// Enriches the SCAN in place rather than the records, which is the whole trick: every downstream
+// `atsAttachOptions(rec, f.options)` call site then works unchanged, and a captured list reaches
+// review by exactly the same path a natively-enumerated one does.
+//
+// Why a separate pass at all: ORC's listbox does not exist until its widget is opened, so options
+// cannot be read inline the way Greenhouse's or Lever's can. This is read-only page contact — it
+// opens with NO query, reads, and closes with Escape (the only close that works — see
+// atsInjOrcCaptureOptions).
+//
+// ⚠ COST IS BOUNDED BY POLICY, NOT BY A CAP: `atsOrcCaptureEligible` refuses geo pickers (dependent
+// and unbounded) and anything already enumerated, so this opens only fixed-vocabulary lists. On the
+// observed step 1 that is 2 fields, not 7.
+// ⚠ NO SILENT CAPS: whatever it skips or fails to read is logged, because a field that quietly
+// reaches review as a text box is indistinguishable from one the form never offered options for.
+async function atsCaptureOrcOptions(act, scan, LOG) {
+  const log = LOG || (() => {});
+  const fields = (scan && scan.fields) || [];
+  const eligible = fields.filter(atsOrcCaptureEligible);
+  const skipped = fields.filter((f) => f.widgetType === "select" && !atsOrcCaptureEligible(f));
+  if (!eligible.length) {
+    if (skipped.length) log(`[ATS-OPTIONS] ORC: 0 capturable, ${skipped.length} picker(s) left as type-it-yourself (${skipped.map((f) => f.fieldName).join(", ")})`);
+    return { captured: 0, skipped: skipped.length };
+  }
+  let captured = 0, failed = 0;
+  // ⚠ THIS PASS RUNS BEFORE A SINGLE FIELD IS WRITTEN, so every second it spends is a second of the
+  // pause the operator sees between the form rendering and the fill starting (ORC, 2026-08-21). It
+  // reported COUNTS and never TIME, and its per-picker cost is not uniform: a picker whose rows never
+  // arrive pays the FULL ATS_ORC_PICK_MS budget (8s) while a healthy one exits on its first 250ms
+  // read. Two unreadable pickers therefore cost more than the whole rest of the pass, and nothing in
+  // the log could say so. Per-picker ms, and the slow ones named.
+  const capT0 = Date.now();
+  const perMs = [];
+  for (const f of eligible) {
+    let r = null;
+    const fT0 = Date.now();
+    try { r = await act.eval(atsInjOrcCaptureOptions, f.inputSel, ATS_ORC_PICK_MS); } catch (e) { r = null; }
+    perMs.push({ name: f.fieldName, ms: Date.now() - fT0, got: !!(r && r.ok && r.count) });
+    if (r && r.ok && r.count) {
+      // Complete by construction: an empty open returns ORC's WHOLE vocabulary (measured — country
+      // 251 rows, dial 247, title 17; there is no pager to defeat us the way iCIMS' 25 did).
+      f.options = r.options;
+      captured++;
+      if (r.closed === false) log(`[ATS-OPTIONS] ⚠ ${f.fieldName}: list did NOT close after Escape — a lingering list is the standing hazard`);
+    } else {
+      failed++;
+      log(`[ATS-OPTIONS] ⚠ ${f.fieldName}: no options captured${r && r.terminalNo ? " (the widget said \"No results\")" : ""} — it will reach review as a text box`);
+    }
+  }
+  log(`[ATS-OPTIONS] ORC scan-time capture — ${captured} complete list(s), ${failed} unreadable, ${skipped.length} skipped as search-driven`);
+  const capMs = Date.now() - capT0;
+  const slow = perMs.filter((x) => x.ms >= 1500).sort((a, b) => b.ms - a.ms).slice(0, 5)
+    .map((x) => `${x.name} ${(x.ms / 1000).toFixed(1)}s${x.got ? "" : " (NOTHING CAPTURED — paid the full budget)"}`);
+  log(`[ATS-TIME] ORC option capture ${(capMs / 1000).toFixed(1)}s over ${eligible.length} picker(s)`
+    + `${slow.length ? " | slowest: " + slow.join(", ") : ""}`);
+  return { captured, failed, skipped: skipped.length, capMs };
+}
+
 async function atsFillFields(act, ats, scan, fields, results, profile, defaults, jc, bucketIndex, o) {
   // Page-level, so a question repeated by a cascade round costs ZERO further calls (keyed by
   // QUESTION, not automation-id). Absent (a direct call, a test) ⇒ this loop keeps its own.
@@ -4569,6 +8594,20 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       return rec;
     };
     try {
+      // A GEO DEPENDENT IS NEVER ACTUATED, ON EITHER PATH. Oracle fills city/state/county from the
+      // postal code, and typing into one of them CLEARS the anchor that produced it -- so this is
+      // placed above the replay branch deliberately: an approved bundle carrying "Tallahassee" must
+      // not cause it to be typed back in on the submit run either.
+      // Left claiming NOTHING on purpose: atsSurfacePrefilled then re-reads the live page and, when
+      // the cascade did fill it, promotes the record to filled_review + `already-filled` with the
+      // real value. That is the existing, tested path for "the form holds something we did not type",
+      // and reusing it beats a parallel verify of my own.
+      if (f.geoDependent) {
+        rec.status = "skipped";
+        rec.detail = "Oracle fills this from " + (f.geoAnchorName || "the postal code")
+          + " -- left for the cascade, because typing here would clear that anchor";
+        results.push(fin()); continue;
+      }
       // Replay mode: the value comes from the APPROVED bundle, not the profile (the submit
       // run re-fills a blank form). Everything else — actuation + verify — is identical.
       let route = null;
@@ -4580,6 +8619,41 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       if (o.valueFor && !atsCredentialKind(ats, f)) {
         const v = o.valueFor(f);
         if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(fin()); continue; }
+        // ⚠⚠ A REHEARSAL READS BEFORE IT WRITES (operator, 2026-08-21): "the rehearsal run should not
+        // refill if it is correct. you can get all the information by looking at the page."
+        //
+        // The replay used to re-actuate every approved field unconditionally. That is a lot of
+        // avoidable page contact on a form that is already right, and every write is a chance to
+        // disturb something that was fine — a stray commit landing in a neighbouring widget is a
+        // failure mode this codebase has paid for more than once (the Workday lingering-listbox
+        // rule). The scan ALREADY carries each field's live value, so the check is free: no extra
+        // read, no extra round-trip.
+        //
+        // Equal ⇒ record it verified and move on. Different ⇒ fall through and actuate exactly as
+        // before, which is the operator's other half: "if something is filled wrong, change it."
+        //
+        // ⚠ THE COMPARISON IS DELIBERATELY CONSERVATIVE. A format difference between what the scan
+        // reads and what the fill recorded (a date read "5/2026" but stored "May 2026") simply falls
+        // through and re-writes the same value — costly, never wrong. The asymmetry matters: a false
+        // "already correct" would skip a field that needed fixing and report it verified, so anything
+        // uncertain must actuate.
+        // ⚠ FILE FIELDS ARE EXEMPT — see the résumé note below. Their "value" is a filename, which
+        // says nothing about which bytes are on the server.
+        if (f.widgetType !== "file_upload") {
+          const liveRaw = f.value;
+          const live = liveRaw == null ? "" : (typeof liveRaw === "boolean" ? (liveRaw ? "true" : "") : String(liveRaw));
+          if (live && atsLib.normalize(live) === atsLib.normalize(String(v))) {
+            rec.after = live;
+            rec.verified = true;
+            rec.status = "filled";
+            rec.tier = "already-correct";
+            // `resolved` marks this as a field we HAD a value for, which is what keeps
+            // atsSurfacePrefilled from re-reading it and re-reporting it as pre-populated.
+            rec.resolved = [String(v)];
+            rec.detail = "the form already holds the value you approved — checked, not rewritten";
+            results.push(fin()); continue;
+          }
+        }
         if (f.widgetType === "file_upload") {
           // ⚠ NOT EVERY FILE FIELD IS THE RÉSUMÉ. Greenhouse renders the COVER LETTER as a file
           // dropzone too, so attaching to every file field put the résumé in the cover-letter slot
@@ -5042,9 +9116,63 @@ async function atsCredentialRecheck(act, ats, scan, results, credentials) {
 // ⚠ RUNS AFTER THE AUDIT, deliberately: the audit compares `rec.after` against the page for fields WE
 // filled, and these are not those. Promoting them beforehand would audit the parse's work as if it were
 // ours and report `audit-mismatch` on values nobody claimed.
-async function atsSurfacePrefilled(act, ats, scan, results) {
+// ⚠⚠ IS THIS VALUE SOMETHING THE PROFILE ACTUALLY SAYS? (operator, 2026-08-20)
+// Oracle fills City / State / County from the postal code and the fill never types into them (typing
+// clears the anchor), so they arrived in review as "PRE-POPULATED — double-check this field" on every
+// run while being correct every time. Agreement with the profile is verification, not coincidence:
+// the value came from an anchor the profile itself supplied.
+//
+// ⚠ NO LABEL PATTERNS, NO PER-FIELD MAPPING — the operator's instruction, and the first version of
+// this got it wrong: it matched the label against /city|state|county|postal/ and looked each one up
+// under a named profile key. That is a list that has to be extended for every tenant's wording and
+// every locale's idea of a region, and it silently answers "no opinion" the moment a label is worded
+// unexpectedly. Instead: build the set of strings the profile's address ACTUALLY contains, and ask
+// whether the live value is one of them. A field whose value the profile does not contain is not
+// verifiable, whatever it happens to be called.
+//
+// ⚠ AND "NOT IN THE PROFILE" MEANS REVIEW — also the operator's instruction, and a correction to my
+// first version, which cleared the County because Oracle had derived it from a verified anchor. That
+// reasoning is not wrong, but it is REASONING, and the operator's rule is the safer one: the profile
+// is the authority on what the operator has actually told us, and a value it does not contain is
+// something a human should look at once. There is no third state here — verified, or reviewed.
+//
+// The only normalization is FORM: "FL" and "Florida" are the same answer, so each profile value
+// contributes its own spelling AND its abbreviation/expansion. That is data shape, not a per-field
+// rule, and it is what lets the State field verify at all.
+function atsProfileAddressValues(profile) {
+  const pi = (profile && profile.personal_info) || {};
+  const out = new Set();
+  const add = (v) => {
+    const n = atsLib.normalize(String(v == null ? "" : v));
+    if (!n) return;
+    out.add(n);
+    // both directions through the region table, so a stored "Florida" also accepts "FL" and a stored
+    // "FL" also accepts "Florida"
+    const ab = atsLib.REGION_ABBREV || {};
+    if (ab[n]) out.add(atsLib.normalize(ab[n]));
+    const full = Object.keys(ab).find((k) => atsLib.normalize(ab[k]) === n);
+    if (full) out.add(atsLib.normalize(full));
+  };
+  // every address-ish value the profile holds, whatever the form chooses to call its fields
+  for (const k of ["city", "state_province", "postal_code", "country", "address_line_1", "address_line_2"]) add(pi[k]);
+  for (const loc of (Array.isArray(profile && profile.locations) ? profile.locations : [])) {
+    if (typeof loc === "string") { for (const part of loc.split(",")) add(part); }
+    else if (loc) { add(loc.city); add(loc.state); add(loc.state_province); add(loc.country); }
+  }
+  return out;
+}
+
+// TRUE when the profile contains this value, FALSE when it does not. Deliberately two-valued: a value
+// the profile does not contain is a review item, not an "unknown" to be reasoned about.
+function atsGeoValueInProfile(liveValue, profile) {
+  const live = atsLib.normalize(String(liveValue == null ? "" : liveValue));
+  if (!live) return false;
+  return atsProfileAddressValues(profile).has(live);
+}
+
+async function atsSurfacePrefilled(act, ats, scan, results, profile, valueFor) {
   const fields = (scan && scan.fields) || [];
-  let surfaced = 0;
+  let surfaced = 0, geoAgreed = 0, geoUnverified = 0;
   for (const rec of results) {
     if (!rec || rec.credential) continue;
     // Only records that claim NOTHING: a skip, or a review item we could not give a value to.
@@ -5064,8 +9192,63 @@ async function atsSurfacePrefilled(act, ats, scan, results) {
     try { live = await act.eval(atsInjReadValue, ats, f.inputSel, f.widgetType); } catch (e) { live = null; }
     // A read we could not make says nothing — leave the record exactly as the fill left it.
     if (!live || !live.ok) continue;
+    // ⚠⚠ AN UNCHECKED CHECKBOX HOLDS NO VALUE — `false` IS NOT CONTENT (operator, 2026-08-20).
+    // atsInjReadValue answers a checkbox with a BOOLEAN, and `String(false)` is `"false"`, a
+    // perfectly non-empty string. So every unchecked box on every platform read as "the form already
+    // has something here" and was surfaced as PRE-POPULATED — "not filled by ApplyPilot; verify it's
+    // what you want" — on a box we had DELIBERATELY left alone because the profile says No.
+    // Live: ORC's optional "I am Hispanic or Latino." reached review displaying "Unchecked".
+    //
+    // Leaving an optional box unticked is an ANSWER, and a correct one; the standing rule is that a
+    // known, profile-defined empty is not a review item. This is one line, and it applies to
+    // Greenhouse, Lever, Ashby and iCIMS as much as Oracle.
+    if (live.value === false) continue;
     const v = live.value == null ? "" : String(live.value).trim();
-    if (!v) continue;
+    if (!v || v === "false") continue;
+
+    // ⚠ TWO STATES ONLY: either the profile CONTAINS this value (verified — the cascade was driven
+    // by an anchor the profile itself supplied) or it does not (a review item). No label patterns and
+    // no reasoning about derived values; see atsGeoValueInProfile.
+    if (f.geoDependent) {
+      rec.after = v;
+      rec.verified = true;
+      // ⚠⚠ ON A REPLAY THE AUTHORITY IS THE APPROVED BUNDLE, NOT THE PROFILE (live rehearsal,
+      // 2026-08-20). A submit run passes `profile: {}` by design — every value comes from the
+      // bundle — so atsGeoValueInProfile could only ever answer NO, and City / State / County were
+      // all flagged `geo-not-in-profile` and BLOCKED THE GATE on a form holding exactly the values
+      // the human had already approved. The profile test is right on a FILL, where the profile is
+      // what we know; on a replay the human's approval is strictly better evidence, and it is the
+      // thing the rest of this run is verifying against anyway.
+      const approvedHere = typeof valueFor === "function" ? valueFor(f) : undefined;
+      if (approvedHere !== undefined) {
+        const agrees = atsLib.normalize(String(approvedHere)) === atsLib.normalize(v);
+        rec.status = agrees ? "filled" : "needs_review";
+        rec.flag = agrees ? null : "geo-not-approved";
+        rec.detail = agrees
+          ? "Oracle filled this from " + (f.geoAnchorName || "the postal code")
+            + ", and it matches the value you approved — verified"
+          : "Oracle filled this from " + (f.geoAnchorName || "the postal code") + " as " + JSON.stringify(v)
+            + ", but you approved " + JSON.stringify(String(approvedHere)) + " — check it here";
+        if (agrees) geoAgreed++; else { geoUnverified++; surfaced++; }
+        continue;
+      }
+      if (atsGeoValueInProfile(v, profile)) {
+        rec.status = "filled";
+        rec.flag = null;
+        rec.detail = "Oracle filled this from " + (f.geoAnchorName || "the postal code")
+          + ", and your profile contains this value — verified, nothing to check";
+        geoAgreed++;
+      } else {
+        rec.status = "needs_review";
+        rec.flag = "geo-not-in-profile";
+        rec.detail = "Oracle filled this from " + (f.geoAnchorName || "the postal code")
+          + " as " + JSON.stringify(v) + ", and your profile does not contain that value — check it here";
+        geoUnverified++; surfaced++;
+      }
+      continue;
+    }
+
+
     rec.status = "filled_review";
     rec.flag = "already-filled";
     rec.after = v;
@@ -5076,13 +9259,18 @@ async function atsSurfacePrefilled(act, ats, scan, results) {
       + ". Your profile had no answer to overwrite it with, so check it or replace it here.";
     surfaced++;
   }
+  if (geoAgreed || geoUnverified) {
+    try { console.log(`[ApplyPilot][ATS-FILL] geo cascade: ${geoAgreed} value(s) your profile CONTAINS (not flagged)`
+      + `${geoUnverified ? `, ${geoUnverified} it does NOT (flagged for review)` : ""}`); } catch (e) { /* log only */ }
+  }
+
   if (surfaced) {
     try { console.log(`[ApplyPilot][ATS-FILL] ${surfaced} field(s) the form had ALREADY populated are now IN review with their live value — previously they were recorded blank and would have been submitted unseen`); } catch (e) { /* log only */ }
   }
   return surfaced;
 }
 
-async function atsFinishFill(act, ats, scan, results, credentials) {
+async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor, entryCounts) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
   await act.delayFull(600);
@@ -5130,7 +9318,89 @@ async function atsFinishFill(act, ats, scan, results, credentials) {
   // Cretex — the BUNDLE was right and the summary was not, which is the kind of disagreement that gets
   // read as a bug in whichever half you look at second). Placed after the audit deliberately: see
   // atsSurfacePrefilled.
-  try { await atsSurfacePrefilled(act, ats, scan, results); } catch (e) { /* completeness — never abort */ }
+  try { await atsSurfacePrefilled(act, ats, scan, results, profile, valueFor); } catch (e) { /* completeness — never abort */ }
+
+  // ⚠ THE REPEATING ENTRIES, AND THEY MUST RUN AFTER THE FLAT LOOP. Every ORC step is scanned for
+  // flat fields; a repeating block contributes NOTHING to that scan until an Add is pressed, because
+  // ORC builds Experience / Education entries on demand. So the flat pass finishing is exactly the
+  // moment to build them — before it, the fields do not exist; after the counts, the envelope would
+  // under-report (the same ordering mistake atsSurfacePrefilled documents two comments above).
+  //
+  // ⚠ AND ITS RECORDS JOIN `results`, so they reach the review bundle like any other field. An entry
+  // filled but absent from review is worse than one left blank: nobody would know to check it.
+  // ⚠ REPORT WHAT WE DID NOT SEE, BEFORE the entry pass builds anything — otherwise the entry forms
+  // it creates would themselves read as "unclaimed controls" and drown the signal.
+  let unclaimedNotes = [];
+  if (ats === "oracle") {
+    try {
+      const claimed = [];
+      for (const r of results) { if (r.fieldName) claimed.push(r.fieldName); }
+      // The scan's own identity keys: `fieldName` (the durable `name`) plus every id inside its
+      // `inputSel`, since a composite (a date's three spinbuttons) claims several controls at once.
+      for (const f of (scan.fields || [])) {
+        if (f.fieldName) claimed.push(f.fieldName);
+        for (const m of String(f.inputSel || "").matchAll(/#([\w-]+)/g)) claimed.push(m[1]);
+      }
+      const u = await act.eval(atsInjOrcUnclaimed, claimed).catch(() => null);
+      const ariaOnly = (u && u.aria) || [];
+      if (ariaOnly.length) {
+        console.log(`[ApplyPilot][ORC-UNCLAIMED] ⚠⚠ ${ariaOnly.length} ARIA-ONLY control(s) — a JET widget family with NO handler in this file, so they were never even scanned:`);
+        for (const a of ariaOnly) {
+          const line = `${a.required ? "REQUIRED " : ""}<${a.tag}> role=${a.role} ${JSON.stringify(a.question || a.id || "")}` +
+            `${a.options.length ? " options=" + JSON.stringify(a.options) : ""}${a.block ? " block=" + JSON.stringify(a.block) : ""}`;
+          unclaimedNotes.push(line);
+          console.log("[ApplyPilot][ORC-UNCLAIMED]   • " + line);
+        }
+      }
+      const miss = (u && u.unclaimed) || [];
+      if (miss.length) {
+        for (const m of miss) {
+          unclaimedNotes.push(`${m.required ? "REQUIRED " : ""}${m.grouped ? m.type + " group" : m.tag + "/" + m.type} ${JSON.stringify(m.question || m.key)}` +
+            ` [name=${m.name} row=${m.rowClass || "none"}${m.block ? " block=" + JSON.stringify(m.block) : ""}${m.options.length ? " options=" + JSON.stringify(m.options) : ""}]`);
+        }
+        console.log(`[ApplyPilot][ORC-UNCLAIMED] ⚠ ${miss.length} control(s) on this step were NOT scanned and so were never filled:`);
+        for (const n of unclaimedNotes) console.log("[ApplyPilot][ORC-UNCLAIMED]   • " + n);
+      }
+    } catch (e) {
+      // ⚠ A SILENT COMPLETENESS CATCH HIDES A BUG FOREVER, and the pair of blocks here proved it in
+      // one run: the entry pass beside this one threw `profile is not defined` (written against a
+      // different function's scope) and its catch SAID SO, which is the only reason it was found
+      // immediately. This catch swallowed everything, so an identical failure here would have left
+      // "no unclaimed controls" — indistinguishable from a clean step, on the very diagnostic built
+      // because a clean-looking step was hiding three required fields.
+      // Still never fatal: a diagnostic must not break a fill. It just has to admit it failed.
+      unclaimedNotes.push("the unclaimed-control check failed: " + String((e && e.message) || e));
+      console.log("[ApplyPilot][ORC-UNCLAIMED] ⛔ the check itself failed, so this step's coverage is UNKNOWN:", String((e && e.message) || e));
+    }
+  }
+
+  let entryNotes = [];
+  if (ats === "oracle") {
+    // LINKS FIRST: it only ever ADDS rows, so doing it before the entry pass keeps its new inputs out
+    // of anything the entry pass reads.
+    try {
+      const lp = await atsOrcFillLinks(act, profile, { log: (m) => console.log("[ApplyPilot][ORC-LINK]", m),
+        recorded: results.map((r) => r && r.fieldName).filter(Boolean) });
+      if (lp && lp.records && lp.records.length) results.push(...lp.records);
+      if (lp && lp.notes && lp.notes.length) entryNotes = entryNotes.concat(lp.notes);
+    } catch (e) {
+      entryNotes.push("the links pass failed: " + String((e && e.message) || e));
+      console.log("[ApplyPilot][ORC-LINK] ⛔ the links pass threw:", String((e && e.message) || e));
+    }
+    try {
+      const ep = await atsOrcFillEntries(act, profile, jobContext, { log: (m) => console.log("[ApplyPilot][ORC-ENTRY]", m), reportOnly: !!replay, valueFor, entryCounts, lagProbe: (typeof cdpLagActive === "function" && cdpLagActive()) });
+      if (ep && ep.records && ep.records.length) results.push(...ep.records);
+      // ⚠ CONCAT, never assign: the LINKS pass above writes into the same list, and an assignment
+      // here silently discarded its notes — the one channel that reports a link we could not add.
+      entryNotes = entryNotes.concat((ep && ep.notes) || []);
+    } catch (e) {
+      // Completeness over abort, like the sweep above: a broken entry pass must not lose the flat
+      // fields this page already filled. It IS reported, because a silently skipped employment
+      // history reads as a step that had nothing on it.
+      entryNotes = ["the repeating-entry pass failed: " + String((e && e.message) || e)];
+      console.log("[ApplyPilot][ORC-ENTRY] ⛔ the entry pass threw — flat fields are kept:", String((e && e.message) || e));
+    }
+  }
 
   const counts = results.reduce((m, r) => { m[r.status] = (m[r.status] || 0) + 1; return m; }, {});
   // DID THIS PAGE'S ASYNC WIDGETS EVER ANSWER? Greenhouse forms sometimes load in a state where their
@@ -5140,9 +9410,119 @@ async function atsFinishFill(act, ats, scan, results, credentials) {
   // full budget on each such field and hand them all to review. This flag lets the RUN decide to
   // reload once and try again, which is the same remedy a human applies.
   const deadAsync = results.filter((r) => r.listUnproven || /never answered our search|suggestions never loaded/i.test(String(r.detail || "")));
-  return { url: scan.url, title: scan.title, results, counts,
+  return { url: scan.url, title: scan.title, results, counts, entryNotes, unclaimedNotes,
     deadAsync: deadAsync.map((r) => r.fieldName),
     needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
+}
+
+// ⚠⚠ PRESS A YES/NO AND CONFIRM IT STUCK — ONE implementation for all THREE call sites.
+// Live 2026-08-20, hidden run: the two DETERMINISTIC yes/no questions both reported
+// `took 2 press(es) — the first did not register` and landed, while the AI-answered one came back
+// `needs_review` from the same page seconds later. The difference was not the widget and not the
+// answer: the deterministic path had the deadline-and-re-press logic and the AI path still did one
+// click plus a short read. A commit that only works on one of three paths is a coin flip about which
+// rung happened to answer the question.
+//
+// The rules, all of them earned the hard way today:
+//   • A DEADLINE, NOT AN ITERATION COUNT. An iteration count is a proxy for time and every proxy
+//     breaks when the clock beneath it changes — this bit three times in one day (a fixed 150ms read;
+//     10 iterations on the ADAPTIVE pace, which collapsed 1.5s into 196ms; 24 iterations that only
+//     passed because the STARVED worker clock made each one ~500ms, then went blank once page-clock
+//     pacing made the paces honest).
+//   • RE-PRESS a press that did not register, GATED on nothing being pressed yet — on a toggle a
+//     blind second press would un-press what the first one set.
+//   • Report the PRESS COUNT, so a widget that habitually needs two is visible rather than merely
+//     slow.
+// ⚠⚠ A WALL-CLOCK BUDGET CAN BE EATEN WHOLE BY ONE STARVED PACE (live 2026-08-20).
+// This reported `yes/no click not reflected after 2 press(es) over 8s (read null)` on Oracle's
+// ex-Oracle-employee question, and the field was billed 34.7s. It was read as a widget bug and it
+// was not one: the same question filled first time on the next clean run. What actually happened is
+// that the service worker was starved — measured elsewhere that run, a 120ms pace took 10883ms — so
+// `delayFull(120)` inside this loop consumed the ENTIRE 8s budget before a single read cycle
+// completed. The loop then concluded "not reflected" having gathered no evidence at all.
+//
+// ⚠ THIS IS NOT THE ATTEMPTS FLOOR THE STANDING RULE FORBIDS. That rule ("a wait that timed out
+// wants a bigger BUDGET; never add an attempts floor") is about COVERAGE of a monotone predicate,
+// where sparse sampling can only notice late and never miss. The distinction drawn here is the one
+// orcAdvanceAfterStep already draws on its own advance wait — "NOT ONE read landed, so this is
+// blindness rather than evidence the page stood still". A budget that expired before the loop could
+// look even once has measured nothing, and reporting that as a failed commit is a false negative on
+// a field that was very likely fine.
+//
+// So the budget is spent in WALL CLOCK as before, and only extended when it ran out having completed
+// fewer than MIN_CYCLES read cycles — bounded by a hard ceiling so a genuinely dead widget still
+// ends. The detail then says WHICH of the two happened, so this never has to be diagnosed twice.
+async function atsCommitYesNo(act, ats, ref, want, wt) {
+  const kind = wt || "yesno";
+  // ⚠⚠ READ BEFORE CLICKING — THE PILL IS A TOGGLE (operator, 2026-08-21): "if it is already
+  // answered, clicking it again actually clears the answer, so you see that and re-click it. instead
+  // if it is correct already, just don't click it, leave it be."
+  //
+  // That is exactly what was happening, and it explains both the flakiness and the seconds: this
+  // clicked unconditionally, so an already-correct pill got CLEARED, the read-back then saw an empty
+  // widget, `nothingPressed` fired the re-press at ~1800ms, and the second click put back what the
+  // first one removed. Two pointless clicks and a multi-second round trip to reach the answer the
+  // form already held — and if a run ended between the two clicks, it ended with the answer WIPED.
+  //
+  // A pill that already holds the wanted answer needs no click at all. A pill holding the WRONG
+  // answer is unaffected: that is a different button, so selecting it is not a toggle.
+  let pre = null;
+  try { pre = await act.eval(atsInjReadValue, ats, ref.inputSel, kind); } catch (e) { pre = null; }
+  if (pre && pre.ok && atsLib.normalize(String(pre.value || "")) === atsLib.normalize(want)) {
+    return { ok: true, value: pre.value, presses: 0, cycles: 0, starved: false, elapsedMs: 0,
+      detail: "already answered " + JSON.stringify(String(pre.value))
+        + " — left alone (clicking it again would clear it)" };
+  }
+  let r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
+  const t0 = Date.now();
+  const BUDGET_MS = 8000, HARD_CEILING_MS = 30000, MIN_CYCLES = 3;
+  let deadline = t0 + BUDGET_MS;
+  let back = null, presses = 1, cycles = 0, starved = false;
+  while (Date.now() < deadline) {
+    await act.delayFull(120);
+    cycles++;
+    back = await act.eval(atsInjReadValue, ats, ref.inputSel, kind);
+    if (back && back.ok && atsLib.normalize(String(back.value || "")) === atsLib.normalize(want)) break;
+    const nothingPressed = !(back && back.ok && String(back.value || "").trim());
+    if (nothingPressed && presses < 3 && Date.now() - t0 > presses * 1800) {
+      presses++;
+      r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
+    }
+    // Out of budget, but we have barely looked — the clock was starved, not the widget.
+    if (Date.now() >= deadline && cycles < MIN_CYCLES && Date.now() - t0 < HARD_CEILING_MS) {
+      starved = true;
+      deadline = Math.min(t0 + HARD_CEILING_MS, Date.now() + BUDGET_MS);
+    }
+  }
+  const value = back && back.ok ? back.value : null;
+  const ok = !!(r && r.ok) && atsLib.normalize(String(value || "")) === atsLib.normalize(want);
+  const secs = ((Date.now() - t0) / 1000).toFixed(1);
+  return { ok, value, presses, cycles, starved, elapsedMs: Date.now() - t0,
+    detail: ok
+      ? (presses > 1 ? "took " + presses + " press(es) — the first did not register" : null)
+      : "yes/no click not reflected after " + presses + " press(es) over " + secs + "s"
+        + " (read " + JSON.stringify(value) + ", " + cycles + " read cycle(s)"
+        + (starved ? " — the budget was EXTENDED because the service worker's clock was starved" : "") + ")" };
+}
+
+// ⚠⚠ IS THIS TIER DETERMINISTIC — i.e. does it commit `filled` rather than `filled_review`?
+// Both choice-commit paths used to hardcode `tier === "exact-normalized" || tier === "label-exact"`,
+// which is a list that cannot learn. Live 2026-08-20: the disability self-ID matched at
+// **polarity-lead** — the tier that exists precisely so a stored "No" can land "No, I do not have a
+// disability and have not had one in the past" DETERMINISTICALLY — and the hardcoded pair graded it
+// `filled_review` anyway. The operator asked the right question: "it filled deterministically, why
+// is that for review."
+//
+// ⚠ IT IS ADDITIVE, NOT A SWAP. `flagTierCategory` is fill-driver's shared grader and it returns
+// `exact` for exact-normalized and polarity-lead — but `none` for **label-exact**, which is an
+// ATS-LOCAL tier it has never heard of. Replacing the pair outright would therefore have demoted
+// every label-exact commit from filled to filled_review: a silent regression on Greenhouse, Lever
+// and Ashby, in the name of fixing Oracle. So the ATS-local tier stays named here and the shared
+// grader is consulted for everything else, which means a future tier it calls exact is picked up for
+// free while nothing already working changes.
+function atsTierIsDeterministic(tier) {
+  if (tier === "exact-normalized" || tier === "label-exact") return true;
+  try { return atsFd.flagTierCategory(tier) === "exact"; } catch (e) { return false; }
 }
 
 // Actuate one field with the resolved candidates. Returns true when it produced an outcome
@@ -5406,6 +9786,148 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   }
 
   // combobox family (react-select + ashby selects + GH location + the dial composite).
+  // ── ORACLE'S PICKERS TAKE THEIR OWN PATH (2026-08-19) ──────────────────────────────────
+  // Placed AHEAD of the generic select branch because none of that branch's primitives work here:
+  // its option read queries `[role=option]` (ORC uses `div[role=row]` in a `div[role=grid]`), and its
+  // commit is a plain click (ORC needs a full pointer sequence). Every clause is measured — the full
+  // six-part recipe lives on atsInjOrcPick.
+  //
+  // The candidates still clear the SAME match ladder against the LIVE rows, and the commit is still
+  // read-back verified — this changes HOW a value is committed, never WHETHER it had to be matched.
+  if (ats === "oracle" && (wt === "select" || wt === "dial")) {
+    if (!candidates || !candidates.length) return false;
+    rec.resolved = candidates;
+    // ⚠ THE ROWS ARE THE ONLY VOCABULARY THAT COUNTS, and it is per-field: `country` wants the full
+    // name, `region2` (State) the TWO-LETTER code, `region1` (County) "County, ST", `city`
+    // "City, County, ST", and the dial picker "+1 (United States)". So each candidate is offered as
+    // its own query and matched against what comes back, rather than assuming one shape.
+    // ⚠ THE DIAL PICKER SPEAKS "+<code> (<Country>)" AND NO PROFILE VALUE WILL EVER EQUAL THAT.
+    // Live: candidates ["United States of America (+1)", …, "+1"] against rows
+    // ["+1 (American Samoa)", "+1 (Anguilla)", …] matched nothing, and a REQUIRED field reached
+    // review for no reason. atsDialMatch already solves this — it strips the code and the parens and
+    // requires the CODE and the NAME to agree, which is order-agnostic — so route the dial picker
+    // through it and pick by the row it returns rather than by string equality.
+    const isDial = (mopts && mopts.dial) || f.fieldName === "phoneNumber"
+      || /country\s*code/i.test(String(f.label || ""));
+    if (isDial) {
+      const opened = await act.eval(atsInjOrcCaptureOptions, ref.inputSel, ATS_ORC_PICK_MS);
+      const rows = (opened && opened.options) || [];
+      const hit = rows.length ? atsDialMatch(candidates, rows) : null;
+      if (hit) {
+        const want = rows[hit.index];
+        const r = await act.eval(atsInjOrcPick, ref.inputSel, want, [want], ATS_ORC_PICK_MS, false);
+        if (r && r.ok) {
+          let back = null;
+          for (let i = 0; i < ATS_ORC_READBACK_MS.length; i++) {
+            await act.delayFull(ATS_ORC_READBACK_MS[i]);
+            back = await act.eval(atsInjOrcReadPicker, ref.inputSel);
+            if (back && back.ok && String(back.value || "").trim()) break;
+          }
+          // ⚠⚠ RECORD THE OPTION THAT WAS CHOSEN, NOT THE PICKER'S READ-BACK (live rehearsal,
+          // 2026-08-20). The widget DISPLAYS the compact code ("+1") while its option reads
+          // "+1 (United States)", and `rec.after` becomes the bundle's `current_value` — which is
+          // what the submit run replays. So a fill that had recorded the read-back handed the replay
+          // the candidate "+1", and the ladder correctly REFUSED it: +1 is the United States AND
+          // Canada, so a bare code is genuinely ambiguous and matching it would be a guess between
+          // two real countries. The rehearsal caught it as `no dial-code option agreed with ["+1"]`.
+          //
+          // The fix is not to loosen the ladder — the ambiguity is real — but to store a value that
+          // reproduces the decision. The read-back stays the VERIFICATION (it is what proves the
+          // commit landed on the page); the recorded value is the option. Safe because
+          // atsSurfacePrefilled skips any record carrying `resolved`, so no audit re-reads this
+          // field and compares the two.
+          const shown = back && back.ok ? back.value : null;
+          rec.resolved = candidates;
+          if (String(shown || "").trim() && !(back && back.invalid)) {
+            rec.after = want;
+            rec.status = "filled";
+            rec.tier = hit.tier;
+            rec.detail = "dial code matched on code+name → " + JSON.stringify(want)
+              + " (the picker displays it as " + JSON.stringify(shown) + ")";
+            return true;
+          }
+          rec.after = shown;
+        }
+      }
+      rec.status = f.isRequired ? "needs_review" : "skipped";
+      rec.flag = "no-option-match";
+      rec.resolved = candidates;
+      rec.detail = "no dial-code option agreed with " + JSON.stringify((candidates || []).slice(0, 3))
+        + (rows.length ? "; the field offered " + JSON.stringify(rows.slice(0, 4)) : " (no options read)");
+      return true;
+    }
+    let last = null;
+    for (const cand of candidates) {
+      const q = String(cand == null ? "" : cand).trim();
+      if (!q) continue;
+      // ⚠ ALWAYS CLEAR FIRST (operator, 2026-08-19). `noClear` was passed here for geo pickers on the
+      // grounds that clearing one cascades to its siblings — true, but it solved a problem my own
+      // earlier approach created, back when all five geo fields were actuated in sequence. Now only
+      // the ANCHOR is actuated and its cascade repopulates the rest, so the sibling clear is exactly
+      // what we want.
+      //
+      // Leaving it OFF was actively harmful and a live run showed it: the fields already held values,
+      // so the query was APPENDED to them — `country` held "United States", typing
+      // "United States of America" produced a nonsense query, and the widget answered "No results"
+      // on a field whose option was right there. Same for postalCode ("32312" typed onto "32312").
+      // A search box must be cleared before it is searched; that is why the house rule exists.
+      // ⚠ segmentMatch for a geo picker: its rows are composites keyed on the form's own comma.
+      const r = await act.eval(atsInjOrcPick, ref.inputSel, q, [q], ATS_ORC_PICK_MS, false, !!f.searchDriven);
+      last = r;
+      if (r && r.ok) {
+        // ⚠ READ-BACK IS POLLED, NOT READ ONCE: a read in the same beat as the click returns the
+        // PREVIOUS value (measured — `country` read "United" straight after committing "United
+        // States", and correctly a round-trip later).
+        let back = null;
+        for (let i = 0; i < ATS_ORC_READBACK_MS.length; i++) {
+          await act.delayFull(ATS_ORC_READBACK_MS[i]);
+          back = await act.eval(atsInjOrcReadPicker, ref.inputSel);
+          if (back && back.ok && String(back.value || "").trim()) break;
+        }
+        rec.after = back && back.ok ? back.value : null;
+        // ⚠ `cx-select-input--invalid` MEANS THE WIDGET IS HOLDING TEXT IT NEVER ACCEPTED. A value
+        // being present is NOT proof: a prefilled `country` wore this from first load. A commit that
+        // leaves it set must never be reported as filled.
+        if (back && back.invalid) {
+          rec.status = "needs_review";
+          rec.flag = "commit-not-accepted";
+          rec.detail = "Oracle shows " + JSON.stringify(rec.after) + " but still marks the field invalid — it is holding text it did not accept as a selection. Pick it here.";
+          return true;
+        }
+        if (String(rec.after || "").trim()) {
+          rec.status = "filled";
+          rec.tier = "exact-normalized";
+          rec.detail = "picked " + JSON.stringify(r.committed) + " from the form's own list";
+          return true;
+        }
+      }
+      if (r && r.error === "ambiguous") {
+        // two rows matched — not a confident answer, and the standing rule refuses to guess.
+        rec.status = "needs_review";
+        rec.flag = "ambiguous-option";
+        rec.detail = "more than one Oracle option matched " + JSON.stringify(q) +
+          (r.rows ? "; the form offered " + JSON.stringify(r.rows.slice(0, 6)) : "") + " — choose here";
+        return true;
+      }
+    }
+    rec.status = f.isRequired ? "needs_review" : "skipped";
+    rec.flag = rec.flag || "no-option-match";
+    rec.detail = "none of " + JSON.stringify((candidates || []).slice(0, 4)) + " matched Oracle's list" +
+      (last && last.rows && last.rows.length ? "; it offered " + JSON.stringify(last.rows.slice(0, 6)) : "") +
+      // ⚠ ATTRIBUTE THE CAUSE ONLY WHERE IT CAN APPLY. This said "a dependent geo picker whose parent
+      // is not committed does this" on EVERY no-results field, so a live run printed that explanation
+      // for `title` — a salutation list in the name block, with no parent and no cascade. A confident
+      // wrong diagnosis is worse than none: the standing lesson is that a misattributed message sends
+      // the next debugging round at the wrong subsystem (it cost one round on iCIMS' "no options" vs
+      // "awaiting parent"). A non-geo field gets the plain fact instead.
+      (last && last.error === "no-results"
+        ? (f.searchDriven
+            ? " (the field returned \"No results\" — a dependent geo picker whose parent is not committed does this)"
+            : " (the field returned \"No results\" — the form's list does not contain this answer)")
+        : "");
+    return true;
+  }
+
   if (wt === "select" || wt === "dial" || wt === "location") {
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
@@ -6118,7 +10640,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // clicked is still strong evidence of the right commit (a wrong option isn't a superstring).
     const okv = backNorm === wantNorm || (backNorm && wantNorm.includes(backNorm)) || (wt === "location" && !!backNorm);
     if (c && c.ok && okv) {
-      rec.status = hit.tier === "exact-normalized" || hit.tier === "label-exact" ? "filled" : "filled_review";
+      rec.status = atsTierIsDeterministic(hit.tier) ? "filled" : "filled_review";
       rec.matchTier = hit.tier; rec.verified = true;
       // Record the COMMITTED OPTION TEXT, not the chip display: the dial chip renders "+1"
       // while the option we clicked is "United States +1" — a bundle holding "+1" can never
@@ -6192,6 +10714,60 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         if (asrt) { pick = asrt; tier = "assertion-lead"; }
       }
     }
+    // ⚠⚠ A "NO" TO A ONE-OPTION ASSERTION CHECKBOX IS ANSWERED BY LEAVING IT UNTICKED (operator,
+    // 2026-08-20). Oracle asks the Hispanic/Latino question as a single tickable assertion — label
+    // "Ethnicity", one option, "I am Hispanic or Latino." — and the profile answers it
+    // "No, I am not Hispanic". No option can ever match that, because the form offers no "no" to
+    // pick: the negative answer IS the absence of a tick, and the box was already in exactly the
+    // right state.
+    //
+    // Without this the field fell through to the `stated-value-unmatched` rule, which exists for a
+    // real and different failure — a stated value the form genuinely cannot express (the profile
+    // says "Bachelor of Science", the form offers "Bachelor's Degree", live 2026-07-31) — and so it
+    // reached review as "ApplyPilot couldn't fill this — please fill it in yourself" on a question
+    // that was correctly and completely answered. That is review noise on a DEMOGRAPHIC, which is
+    // the worst place for it: it invites someone to "correct" a self-ID answer that was already right.
+    //
+    // Three guards, each load-bearing:
+    //   • CHECKBOX GROUPS ONLY — never a radio. Absence has to be an expressible answer, and in a
+    //     radio group it is not: leaving a radio set untouched means unanswered, not "no".
+    //   • EXACTLY ONE OPTION. A multi-option group ("Select the races you identify with") has no
+    //     single assertion for a bare "no" to deny, so this must not fire there.
+    //   • THE CANDIDATE'S POLARITY IS NO, word-anchored, so "November" or a value merely CONTAINING
+    //     "no" cannot trigger it. A yes-polarity answer is deliberately left to the tiers above —
+    //     assertion-lead already ticks it, and a yes we fail to express should still be flagged.
+    // The box is READ BACK and unticked if the form arrived with it set, because "leave it alone" is
+    // only the right action when it is already in the answer's state.
+    if (!pick && wt === "checkbox_group" && texts.length === 1
+        && atsAssertionDeclined(candidates[0], texts[0])) {
+      const cur = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+      const held = cur && cur.ok ? String(cur.value == null ? "" : cur.value).trim() : "";
+      if (held) {
+        // it arrived TICKED — the answer is "no", so untick it and verify
+        await act.eval(atsInjCheckOption, ref.inputSel, texts[0], false);
+        await act.delay(150);
+        const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+        const nowHeld = back && back.ok ? String(back.value == null ? "" : back.value).trim() : "";
+        atsAttachOptions(rec, texts);
+        rec.resolved = candidates;
+        if (nowHeld) {
+          rec.status = "needs_review";
+          rec.flag = "commit-not-accepted";
+          rec.detail = "your profile says no to " + JSON.stringify(texts[0]) + " but the box stayed ticked — untick it here";
+          return true;
+        }
+        rec.after = null; rec.verified = true; rec.status = "filled"; rec.tier = "assertion-negative";
+        rec.detail = "your profile answers this " + JSON.stringify(String(candidates[0]))
+          + ", so " + JSON.stringify(texts[0]) + " was UNTICKED — the form expresses no by leaving it unticked";
+        return true;
+      }
+      atsAttachOptions(rec, texts);
+      rec.resolved = candidates;
+      rec.after = null; rec.verified = true; rec.status = "filled"; rec.tier = "assertion-negative";
+      rec.detail = "your profile answers this " + JSON.stringify(String(candidates[0]))
+        + ", and this form only offers " + JSON.stringify(texts[0]) + " to tick — leaving it unticked IS that answer";
+      return true;
+    }
     if (!pick) { rec.detail = "no candidate matched " + texts.length + " option(s)"; atsAttachOptions(rec, texts); return false; }
     const r = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
     await act.delay(150);
@@ -6202,7 +10778,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // equal value also reads correct — same "state, not click outcome" rule as Workday).
     const readNorm = atsLib.normalize(String(rec.after || ""));
     const okv = readNorm === atsLib.normalize(pick) || (!!(r && r.ok) && readNorm.includes(atsLib.normalize(pick).slice(0, 40)));
-    rec.status = okv ? (tier === "exact-normalized" || tier === "label-exact" ? "filled" : "filled_review") : "needs_review";
+    rec.status = okv ? (atsTierIsDeterministic(tier) ? "filled" : "filled_review") : "needs_review";
     // RECORD THE OPTION WE CHOSE, not the read-back display — the dial-chip rule, earned again on a
     // radio. Lever's EEO options render their whole DESCRIPTION inside the label ("Asian (Not
     // Hispanic or Latino)A person having origins in any of the original peoples of the Far East…"),
@@ -6222,15 +10798,12 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
     const want = candidates.find((c) => c === "Yes" || c === "No") || candidates[0];
-    const r = await act.eval(atsInjClickYesNo, ref.inputSel, want);
-    await act.delay(150);
-    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
-    rec.after = back && back.ok ? back.value : null;
+    const yn = await atsCommitYesNo(act, ats, ref, want, wt);
+    rec.after = yn.value;
     rec.options = f.options || ["Yes", "No"];
-    const okv = !!(r && r.ok) && atsLib.normalize(String(rec.after || "")) === atsLib.normalize(want);
-    rec.status = okv ? "filled" : "needs_review";
-    rec.verified = okv;
-    if (!okv) rec.detail = "yes/no click not reflected (read " + JSON.stringify(rec.after) + ")";
+    rec.status = yn.ok ? "filled" : "needs_review";
+    rec.verified = yn.ok;
+    if (yn.detail) rec.detail = yn.detail;
     return true;
   }
 
@@ -6388,7 +10961,7 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       if (!dec) { rec.status = "needs_review"; rec.detail = why + " — pick from the options here"; return false; }
       let c;
       if (wt === "radio" || wt === "checkbox_group") c = await act.eval(atsInjCheckOption, ref.inputSel, dec, true);
-      else if (wt === "yesno") c = await act.eval(atsInjClickYesNo, ref.inputSel, dec);
+      else if (wt === "yesno") c = await atsCommitYesNo(act, ats, ref, dec, wt);   // …and here (see above)
       else if (wt === "dropdown_native") c = await act.eval(atsInjSelectNative, ref.inputSel, dec);
       else if (wt === "icims_dropdown") c = await act.eval(atsInjIcimsCommit, ref.inputSel, dec);
       else c = await act.eval(atsInjCommitOption, ref.inputSel, dec);
@@ -6424,7 +10997,11 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     const pick = texts[m.targetIndex];
     let committed;
     if (wt === "radio" || wt === "checkbox_group") committed = await act.eval(atsInjCheckOption, ref.inputSel, pick, true);
-    else if (wt === "yesno") committed = await act.eval(atsInjClickYesNo, ref.inputSel, pick);
+    // ⚠ THE SAME COMMIT AS THE DETERMINISTIC RUNG. Live: the two deterministic yes/no questions both
+    // needed two presses and landed, while the AI-answered one on the SAME page came back
+    // needs_review from a single click plus a short read. Which rung answered a question must not
+    // decide whether the answer sticks.
+    else if (wt === "yesno") committed = await atsCommitYesNo(act, ats, ref, pick, wt);
     else if (wt === "dropdown_native") committed = await act.eval(atsInjSelectNative, ref.inputSel, pick);
     else if (wt === "icims_dropdown") committed = await act.eval(atsInjIcimsCommit, ref.inputSel, pick);
     else committed = await act.eval(atsInjCommitOption, ref.inputSel, pick);
@@ -6454,9 +11031,10 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
 // ── UMD-lite export (Node tests) ─────────────────────────────────────────────────────────
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
-    detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue,
+    detectAts, atsFormUrl, atsCompanyFromUrl, atsPlausibleCompany, ATS_STATIC_MAPS, atsComposeValue, atsWebsiteValue, atsFirstWebsiteValue, atsProfileWebsites,
     atsRouteLabel, atsRouteField, atsDialStrip, atsEnumStrip, atsListIsComplete, atsAttachOptions, atsNearOptions, ATS_REVIEW_WIDGET, ATS_CHOICE_WIDGETS, ATS_CHOICE_REVIEW_WIDGETS, atsIcimsPageCap, atsIcimsListComplete, ATS_ICIMS_CAP_MIN, ATS_POLL, driveAtsPageFill, atsActuateField,
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
+    atsGeoValueInProfile, atsProfileAddressValues, atsTierIsDeterministic,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
     atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
     atsInjLeanSignature,
@@ -6466,13 +11044,21 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
+    atsInjOrcStepState, ATS_ORC_NEXT_RE, ATS_ORC_FORBID_RE, atsInjOrcBlocks, atsOrcEntryValue, atsOrcFillEntries,
+    atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
+    atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
+    atsOrcEntryIdentity, atsOrcTilesAlreadyMatch, atsInjOrcOpenEntryAndWait, atsInjOrcCommitEntryAndWait,
+    atsOrcAddApprovedEntry, atsOrcDeleteTileAt, ATS_ORC_ENTRY_IDENTITY_KEYS, atsOrcTileHoldsValue, atsOrcLegacyDateHalf,
+    atsInjOrcOpenTileAndWait, atsInjOrcCloseEntry, atsInjOrcResumeReset,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
-    atsConsentKind, atsConsentPlan, atsInjTickConsent,
+    atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
+    atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
-    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
+    atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsOrcDurableName,
+    atsOrcTileHoldsValue, atsYearMonthKey, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,

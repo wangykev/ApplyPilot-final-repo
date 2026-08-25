@@ -4,9 +4,16 @@
   "private": true,
   "description": "ApplyPilot Chrome extension — dev tooling (tests). The extension itself has no build step; this exists only to run unit tests for testable-without-a-page logic (e.g. the IndexedDB storage helpers).",
   "scripts": {
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "build:icons": "node scripts/build-icons.mjs",
+    "check:justifications": "node scripts/check-justifications.mjs",
+    "build:store": "node scripts/build-store-zip.mjs",
+    "build:store:dry": "node scripts/build-store-zip.mjs --dry",
+    "lint": "eslint .",
+    "pretest": "eslint ."
   },
   "devDependencies": {
+    "eslint": "^9.39.5",
     "fake-indexeddb": "^6.0.0"
   }
 }
