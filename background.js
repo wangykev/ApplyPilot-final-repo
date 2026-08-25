@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "loc-noclear-3";
+const AP_BUILD_MARKER = "loc-insert1key-5";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -709,7 +709,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     // parse re-renders the form, so "is this widget's option list empty because the tenant has none, or
     // because the PARSE left it that way?" is only answerable by filling the same form with the attach
     // OFF. Diagnostic only — a real run always attaches (the operator's résumé belongs on the form).
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "atsLocSyntheticType"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "atsLocSyntheticType", "atsLocInsertText"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -4662,10 +4662,18 @@ function makeAtsActuation(llmConfig) {
     // showed no log line at all because `act.trustedFocus` was undefined). Guarded by a test now.
     trustedFocus: workday.trustedFocus,
     trustedType: workday.trustedType,
+    // ⚠ ONE TRUSTED COMMAND FOR THE WHOLE STRING (Input.insertText), vs trustedType's per-char key
+    // events. The ATS path never had this forwarded, so its comboboxes could only be typed the
+    // expensive way — 11 chars measured at ~92ms/char visible and ~197ms/char hidden, against a
+    // suggestion lookup of 2ms. This is what makes "the entire word appears at once" possible.
+    typeText: workday.typeText,
+    clearText: workday.clearText,
+    typeKeys: workday.typeKeys,
     // Diagnostic arm for the location combobox's typing path, DECLARED here so the act-surface guard
     // can see it (the run overrides it per-run from the flag store). Default false = the trusted path,
     // which is the only one that actually wakes the widget — see the REFUTED note at its call site.
     locSyntheticType: false,
+    locInsertText: false,
     painting: workday.painting,
     paintLabel: workday.paintLabel,
     quietInstall: workday.quietInstall,
@@ -5383,8 +5391,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const act = makeAtsActuation(await getLlmConfig());
     // Diagnostic A/B for the location combobox's typing path — see the note at its call site in
     // ats.js. Read per run from the flag store, so the arm can be switched without a reload.
-    act.locSyntheticType = await new Promise((r) => chrome.storage.local.get(["atsLocSyntheticType"], (v) => r(!!(v && v.atsLocSyntheticType))));
-    if (act.locSyntheticType) LOG("⚠ atsLocSyntheticType is SET — the location box will be woken with a trusted click and then typed SYNTHETICALLY (diagnostic arm).");
+    {
+      const armFlags = await new Promise((r) => chrome.storage.local.get(["atsLocSyntheticType", "atsLocInsertText"], r));
+      act.locSyntheticType = !!(armFlags && armFlags.atsLocSyntheticType);
+      act.locInsertText = !!(armFlags && armFlags.atsLocInsertText);
+      if (act.locSyntheticType) LOG("⚠ atsLocSyntheticType is SET — the location box will be woken with a trusted click and then typed SYNTHETICALLY (diagnostic arm; REFUTED live 2026-08-25).");
+      if (act.locInsertText) LOG("⚠ atsLocInsertText is SET — the location box will be filled with ONE trusted Input.insertText instead of per-char keystrokes.");
+    }
     const prepared = prepareProfile(store.profile);
     // ⚠ `credentials` reaches the ATS driver ONLY here, and only the credential tier can consume it
     // (atsRouteField claims a recognized credential field before any other rung sees it). It is the

@@ -1788,7 +1788,68 @@ stands: fewer than ~3 runs per arm measures nothing on this field. What is estab
 *attribution* (lookup 2ms; the cost is focus + clear + type, inflated by SW drift — 9 `PACE` overruns in
 one run, worst 400ms → 3587ms), and the clear-skip's own before/after.
 
-Remaining levers, largest first, none yet tested: the **3377ms trusted focus click** (it scrolls, waits for
-a stable rect, then issues a frame-gated click); SW timer drift on the pacing around it; and typing a
-SHORTER query (a places service resolves "Talla" as readily as "Tallahassee", which would cut both the
-keystroke count and the debounce).
+Remaining levers, largest first: the **3377ms trusted focus click** (it scrolls, waits for a stable rect,
+then issues a frame-gated click); SW timer drift on the pacing around it; and the keystroke count — taken
+up in round 15 below.
+
+## Round 15 (2026-08-25) — `Input.insertText` is 38× faster and DOES NOT WORK ALONE; one keystroke fixes it
+
+Prompted by the operator: *"simplify is able to fill the form quite fast. It also is able to fill it out
+without typing — the entire word appears at once."* Round 14 established the cost is our own input, so the
+question became: what is the cheapest thing that still makes this widget search?
+
+**The ATS path never had `Input.insertText` forwarded at all.** `makeCdpActuation` has exposed
+`typeText: cdpInsertText` since the Workday recon, but `makeAtsActuation` is a hand-built object and never
+copied it — so these comboboxes could only ever be typed the expensive way. (The same hand-built-object
+trap that previously hid `trustedFocus` and the quiescence watch.)
+
+### Arm 1 — pure `Input.insertText`: 38× faster, and the field FAILS
+
+```
+[insertText]: typed "Tallahassee" (11 chars) in 218ms · lookup 6020ms → 0 option(s)
+candidate-location → needs_review · typed-unverified · 25483ms
+```
+
+**218ms against 8373ms** — the whole word in one trusted command, exactly as described. And **0 options**:
+the widget did not search. `Input.insertText` produces a genuine trusted `beforeinput`+`input` pair, so
+this refutes the framing that had survived all of round 14 — it is not TRUST that this widget wants, and
+it is not the INPUT event either. It wants a **key** event.
+
+⚠ And it failed in the most dangerous way available: the read-back PASSED (the text was in the box), so
+the fast arm reported success and the field still reached review unanswered. **A read-back proves the text
+landed; it says nothing about whether the widget searched.** Any fast path here needs an
+options-based fallback, not a value-based one.
+
+### Arm 2 — insert the head, then ONE real keystroke for the tail
+
+The search fires on the last character's keydown, and by then the other ten are already in the box. So the
+cost model becomes `insertText + 1 keystroke` instead of N keystrokes, with the complete query visible to
+the search:
+
+```
+candidate-location → filled · exact-normalized · "Tallahassee, Florida, United States" · 7105ms
+[ATS-TIME] fill 25.5s / 26 fields — 983ms/field (VISIBLE) — slowest: candidate-location 7.1s
+```
+
+The `[ATS-LOC]` line is absent, which only happens under its 1500ms log threshold: type+lookup went from
+**8375ms to under 1.5s**. The arm is self-healing — an empty menu after the fast path re-runs the per-char
+path before anything is believed.
+
+### ⚠ …and the FIELD total barely moved: 7.9s → 7.1s
+
+That is the honest headline. Typing was 8.4s of an ~8s field-level cost and is now ~1.4s, yet the field
+still takes ~7s — so **the remaining time was never in the typing at all**, and round 14's own numbers
+(focus click 3377ms in one run, 23ms in another) say the next suspect is the focus/scroll/rect path and
+the SW pacing around it, not the keystrokes.
+
+Full-fill visible totals across this round: 26.5s (trusted) · 38.4s (pure insert, FAILED) · **25.5s
+(insert+1key)**. Against round 5's 7.1–20.3s spread for this one field, a 26.5→25.5s difference is inside
+the noise, and no speed claim is made from it.
+
+### Status: FLAG-GATED OFF, deliberately
+
+`atsLocInsertText` defaults to false. One successful run is not three, the failure mode of the arm it
+replaces is a REQUIRED field silently unanswered, and the fallback costs a wasted ~6s lookup on any widget
+where insertText never searches. Promote it only after ~3 runs per arm on more than one tenant. `typeText`
+/ `typeKeys` / `clearText` are now on the ATS actuation regardless, so other slow comboboxes (school,
+degree, discipline) can use the same head+1-keystroke shape once it is proven here.

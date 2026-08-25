@@ -4918,6 +4918,10 @@ function makeCdpActuation(llmConfig) {
     quietInstall: (sel) => cdpEval(cdpInstallQuietWatch, sel),
     quietRead: (sel) => cdpEval(cdpReadQuiet, sel),
     clearText: () => cdpSelectAllDelete(),
+    // Real key events for a SHORT string, with no focus/clear of its own — the tail of a
+    // bulk-insert. Separate from trustedType (which owns the whole focus→clear→type sequence)
+    // because the caller here has already focused and already placed the text.
+    typeKeys: (text) => cdpTypeChars(String(text)),
     typeText: (text) => cdpInsertText(text), // recon (a): trusted beforeinput+input, survives blur
     readTextValue: (loc, tag) => cdpEval(cdpReadTextState, loc.wrapperSel, tag),
 

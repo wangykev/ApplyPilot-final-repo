@@ -5443,6 +5443,44 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         return { ok: true, got, stuck: atsLib.normalize(got) === atsLib.normalize(String(text)) };
       } catch (e) { return null; }
     };
+    // ⚠ THE WHOLE STRING IN ONE TRUSTED COMMAND. `Input.insertText` produces a genuine
+    // beforeinput+input pair for the entire text at once — the browser's own text-insertion path,
+    // which is how a fast autofill extension drops a value in without a keystroke stream (the
+    // operator's observation of Simplify: "the entire word appears at once"). It is TRUSTED, so it
+    // is not the synthetic write this widget refused; it is the same class of event as typing,
+    // minus the per-character cost.
+    // Clearing is CONDITIONAL for the same reason trustedType's is: insertText inserts at the
+    // cursor, so a non-empty box must be cleared first or the query concatenates — but a fill types
+    // into a FRESH form, and the trusted select-all+delete measured 2148ms to remove nothing.
+    const typeInsert = async (text) => {
+      if (!act.typeText || !act.trustedFocus) return null;
+      try {
+        const how = await act.trustedFocus(ref.inputSel);
+        if (!how) return null;
+        const pre = await act.eval(atsInjReadComboInput, ref.inputSel);
+        if (pre && pre.ok && String(pre.value || "").length && act.clearText) await act.clearText();
+        // ⚠ BULK-INSERT THE HEAD, THEN ONE REAL KEYSTROKE FOR THE TAIL. Measured 2026-08-25: a pure
+        // `Input.insertText` of the whole word lands the text in 218ms (vs 8373ms of per-char
+        // typing) and the widget then returns **0 options** — a trusted INPUT event is not what it
+        // watches for; it wants a KEY event. But it only needs ONE: the last character's keydown
+        // fires the search, and by then the other ten are already in the box.
+        // So the cost model becomes insertText + 1 keystroke instead of N keystrokes, and the
+        // search still sees the complete query. A one-character value skips the bulk step entirely.
+        const s = String(text);
+        const head = s.length > 1 ? s.slice(0, -1) : "";
+        const tail = s.length > 1 ? s.slice(-1) : s;
+        if (head) await act.typeText(head);
+        if (act.typeKeys) await act.typeKeys(tail);
+        else await act.typeText(tail);   // no key-event capability ⇒ the read-back below will fail us out
+        await act.delay(120);
+        const st = await act.eval(atsInjReadComboInput, ref.inputSel);
+        const got = st && st.ok ? String(st.value || "") : "";
+        // A read-back that does NOT hold what we asked for is a failed write, and the caller falls
+        // through to the proven per-char path rather than polling for options that cannot come.
+        if (atsLib.normalize(got) !== atsLib.normalize(String(text))) return null;
+        return { ok: true, got, stuck: true, how };
+      } catch (e) { return null; }
+    };
     const typeInto = async (text) => {
       await act.eval(atsInjTypeInCombo, ref.inputSel, "");
       await act.delay(250);   // adaptive — the read-back below is the real gate
@@ -5645,18 +5683,39 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // clear 2148ms · type 1972ms, against a lookup of **2ms**. The suggestion service is instant;
       // the cost is our own trusted input plus SW timer drift. See docs/fill-speed-log.md round 14.
       const locT0 = Date.now();
+      let locArm = "trusted-perchar";
       if (act.locSyntheticType) {
         const how = act.trustedFocus ? await act.trustedFocus(ref.inputSel) : null;
-        try { console.log(`[ApplyPilot][ATS-LOC] SYNTHETIC-TYPE arm: woke the widget with a trusted ${how || "FAILED"}, typing synthetically`); } catch (e) { /* log only */ }
+        try { console.log(`[ApplyPilot][ATS-LOC] SYNTHETIC-TYPE arm (REFUTED — see the note above): woke with a trusted ${how || "FAILED"}, typing synthetically`); } catch (e) { /* log only */ }
         await typeInto(city);
+        locArm = "synthetic";
+      } else if (act.locInsertText && (await typeInsert(city))) {
+        // ONE trusted command for the whole string. Falls through to the per-char path on ANY
+        // failure (no read-back match, no focus, missing capability) — the proven path stays the
+        // safety net, because a REQUIRED field going unanswered costs far more than the keystrokes.
+        locArm = "insertText";
       } else if (!(await typeTrusted(city))) await typeInto(city);
       const locTypedMs = Date.now() - locT0;
       const locPollT0 = Date.now();
       read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
-      const locLookupMs = Date.now() - locPollT0;
+      let locLookupMs = Date.now() - locPollT0;
+      // ⚠ THE FAST ARM MUST HEAL ITSELF, NOT JUST REPORT. A read-back match only proves the TEXT
+      // landed; it says nothing about whether the widget SEARCHED. Live 2026-08-25 the pure-insert
+      // arm passed its read-back and then returned 0 options, and the field went to review as
+      // "suggestions never loaded" — a REQUIRED field unanswered on a form where the proven path
+      // works. So an empty menu after the fast arm re-runs the per-char path before we believe it.
+      // Costs one wasted lookup on a widget that genuinely has nothing; saves the field otherwise.
+      if (locArm === "insertText" && !optsOf(read).length) {
+        try { console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName}: insertText produced NO options — falling back to per-char typing`); } catch (e) { /* log only */ }
+        if (!(await typeTrusted(city))) await typeInto(city);
+        locArm = "insertText→trusted";
+        const reT0 = Date.now();
+        read = await pollFor(6000, (t) => t.length > 0);
+        locLookupMs += Date.now() - reT0;
+      }
       if (locTypedMs + locLookupMs > 1500) {
         try {
-          console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName}: typed ${JSON.stringify(city)} (${city.length} chars) in ${locTypedMs}ms · lookup ${locLookupMs}ms → ${optsOf(read).length} option(s)` +
+          console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName} [${locArm}]: typed ${JSON.stringify(city)} (${city.length} chars) in ${locTypedMs}ms · lookup ${locLookupMs}ms → ${optsOf(read).length} option(s)` +
             ` — total ${locTypedMs + locLookupMs}ms`);
         } catch (e) { /* log only */ }
       }
