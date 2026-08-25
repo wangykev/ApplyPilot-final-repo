@@ -1720,3 +1720,75 @@ one, the fill-loop number is provider variance.
 **Diagnose with the log line itself**, which now prints the split rather than only the total:
 `[N signature read(s) costing Xms; Y s of this wait was OURS, proving quiet]`. Reading a total as the
 server's time is how an 8.6s probe cost went unnoticed for a day.
+
+## Round 14 (2026-08-25) — Greenhouse `candidate-location`: the lookup is 2ms; the cost is OUR input
+
+Raised by the operator watching a fill: *"the location for greenhouse fills too slowly… it hovered in the
+location box for a while before it typed Tallahassee."* This field has been the largest non-LLM cost on a
+Greenhouse fill since round 5 (**7.1–20.3s** across runs) and had never been broken down — a bare total
+cannot separate the focus click, the per-char typing, and the widget's own lookup, and each wants a
+different fix.
+
+### Measured (Discord `8625545002`, `#candidate-location`, city = "Tallahassee")
+
+```
+trustedType "#candidate-location" (11 chars): focus(click) 3377ms · clear 2148ms · type 1972ms — total 7497ms
+ATS-LOC candidate-location: typed "Tallahassee" (11 chars) in 8373ms · lookup 2ms → 2 option(s)
+```
+
+**The suggestion service answered in 2ms.** Every prior theory about this field — a slow places service, a
+dead `google.maps`, a third-party lookup needing a generous ceiling — is looking in the wrong place. The
+budget (`pollFor(6000, …)`, the one call site that passes a hardcoded soft deadline instead of
+`ATS_POLL.search`) is almost never the thing being spent. What is spent is **our own trusted input**, in
+three phases that were previously invisible because only their sum was logged.
+
+Per-char typing cost, both visibility arms: **~92ms/char visible, ~197ms/char hidden.**
+⚠ This is the one place on an ATS form where hidden-vs-visible matters. The standing rule — "all three
+ATSs commit from synthetic events, so visible and hidden runs are IDENTICAL" — holds for every other
+widget, and this widget is the documented trusted-input exception, so it re-imports the hidden-tab penalty
+the rest of the path is free of. Do not compare location timings across arms without checking the paint
+label.
+
+### ⚠ SYNTHETIC TYPING WAS TESTED AND REFUTED — and the refutation came from a human, not the log
+
+The hypothesis arrived from two directions: the code's own note ends *"the trust is needed for the CLICK,
+not the keystrokes"*, and the operator observed that **Chrome's autofill** drops text into this box and the
+suggestions appear — autofill being no stream of real keystrokes. `atsLocSyntheticType` was added to
+measure the cheap arm (trusted click to wake, then one synthetic write).
+
+**The arm appeared to pass**: the field committed `"Tallahassee, Florida, United States"`, the log showed
+2 options, and the run reported `filled · exact-normalized`. It was wrong. The operator was watching the
+tab and **clicked into the box** while it sat there — *"tallahassee didn't work until I clicked into the
+box, but carnegie mellon worked"*. The 5131ms "lookup" in that arm is the human. Carnegie Mellon succeeded
+because the school box still went through the trusted path; only the location branch was switched.
+
+⚠ **A contaminated arm is indistinguishable from a real one in the log.** Nothing in the captured output
+said "a human clicked here" — the field filled, the tier was exact, the options were real. Had this been
+measured headless, or graded only on the log, synthetic typing would have shipped and every Greenhouse
+location field would have gone unanswered. The flag is kept (default OFF, trusted) so the experiment is
+repeatable; re-test only with someone watching the tab and **not touching it**.
+
+### The one change that IS supported: don't trust-clear an empty box
+
+`trustedType` opened with `cdpSelectAllDelete()` unconditionally — a trusted select-all plus a trusted
+delete, both frame-gated — on an input that is empty, because a fill types into a FRESH form. Measured at
+**2148ms**, ~29% of the field's whole input cost, spent removing nothing. A one-eval emptiness read
+(p50 ~1ms) now skips it: `clear 392ms (SKIPPED — box already empty)` on the next run's school box.
+
+It **fails safe**: only a positive, confident read of an empty value skips the clear; an unreadable
+element, a missing selector or any thrown error clears exactly as before. The failure it guards — a
+rewrite concatenating onto a stale value (`"old@x.comnew@y.com"`, the iCIMS credential bug) — costs far
+more than 2s.
+
+### ⚠ What this round does NOT claim
+
+`candidate-location` read 7.9s · 19.5s · 24.4s · 9.3s across four runs — but those spanned two builds, two
+visibility states and one contaminated arm, so **no total-improvement claim is made here.** Round 5's rule
+stands: fewer than ~3 runs per arm measures nothing on this field. What is established is the
+*attribution* (lookup 2ms; the cost is focus + clear + type, inflated by SW drift — 9 `PACE` overruns in
+one run, worst 400ms → 3587ms), and the clear-skip's own before/after.
+
+Remaining levers, largest first, none yet tested: the **3377ms trusted focus click** (it scrolls, waits for
+a stable rect, then issues a frame-gated click); SW timer drift on the pacing around it; and typing a
+SHORTER query (a places service resolves "Talla" as readily as "Tallahassee", which would cut both the
+keystroke count and the debounce).

@@ -5619,8 +5619,47 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // the same query answers in ~1s — and after ONE trusted click, SYNTHETIC typing drives it fine
       // (traced both ways, 2026-08-06). So the trust is needed for the click, not the keystrokes.
       const city = String(candidates[0]).split(",")[0];
-      if (!(await typeTrusted(city))) await typeInto(city);
+      // ⚠ ATTRIBUTE THE WAIT, DON'T GUESS AT IT. This field is the single largest non-LLM cost on a
+      // Greenhouse fill (7.1–20.3s across runs, docs/fill-speed-log.md) and a bare total cannot say
+      // whether that is the trusted focus click, the per-char typing, or the widget's own lookup —
+      // which need completely different fixes. Three clocks, logged only when the field is actually
+      // slow so a healthy one stays quiet.
+      // ⚠ SYNTHETIC TYPING HERE WAS TESTED LIVE AND REFUTED — DO NOT RE-TRY IT (2026-08-25).
+      // The hypothesis was reasonable and came from two directions at once: the note above ends "the
+      // trust is needed for the CLICK, not the keystrokes", and the operator observed that Chrome's
+      // own autofill drops text into this box and the suggestions appear — autofill being no stream
+      // of real keystrokes. So `atsLocSyntheticType` was added to measure the cheap arm (trusted
+      // click to wake the widget, then ONE synthetic write) against the default.
+      //
+      // The arm APPEARED to work — the field committed "Tallahassee, Florida, United States" and the
+      // log showed 2 options — and that reading was WRONG. The operator was watching the tab and
+      // clicked into the box while it sat there; the options appeared because of THAT CLICK. The 5131ms
+      // "lookup" is the human, not the widget. A synthetic write leaves the suggestion service asleep
+      // exactly as the 2026-08-06 note says, and the same run's school box (Carnegie Mellon) succeeded
+      // only because school still went through the trusted path.
+      // ⚠ THE TELL WOULD HAVE BEEN INVISIBLE IN A HEADLESS MEASUREMENT: a contaminated arm that
+      // "passes" is indistinguishable from a real one in the log. Keep the flag for future
+      // experiments, keep the default TRUSTED, and re-test only with someone watching the tab and NOT
+      // touching it.
+      // Where the time ACTUALLY goes (measured, same field, same posting): focus(click) 3377ms ·
+      // clear 2148ms · type 1972ms, against a lookup of **2ms**. The suggestion service is instant;
+      // the cost is our own trusted input plus SW timer drift. See docs/fill-speed-log.md round 14.
+      const locT0 = Date.now();
+      if (act.locSyntheticType) {
+        const how = act.trustedFocus ? await act.trustedFocus(ref.inputSel) : null;
+        try { console.log(`[ApplyPilot][ATS-LOC] SYNTHETIC-TYPE arm: woke the widget with a trusted ${how || "FAILED"}, typing synthetically`); } catch (e) { /* log only */ }
+        await typeInto(city);
+      } else if (!(await typeTrusted(city))) await typeInto(city);
+      const locTypedMs = Date.now() - locT0;
+      const locPollT0 = Date.now();
       read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
+      const locLookupMs = Date.now() - locPollT0;
+      if (locTypedMs + locLookupMs > 1500) {
+        try {
+          console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName}: typed ${JSON.stringify(city)} (${city.length} chars) in ${locTypedMs}ms · lookup ${locLookupMs}ms → ${optsOf(read).length} option(s)` +
+            ` — total ${locTypedMs + locLookupMs}ms`);
+        } catch (e) { /* log only */ }
+      }
       // A BOX LABELLED "Location" IS NOT ALWAYS A CITY BOX (2026-08-07). ElevenLabs labels one
       // "Location" and describes it "Country you're currently residing in" — a COUNTRY list, where
       // "Pittsburgh" matches nothing. We typed the city, read an empty menu, and reported "the form's

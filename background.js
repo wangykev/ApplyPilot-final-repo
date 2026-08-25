@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "zero2sudo-3";
+const AP_BUILD_MARKER = "loc-noclear-3";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -709,7 +709,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     // parse re-renders the form, so "is this widget's option list empty because the tenant has none, or
     // because the PARSE left it that way?" is only answerable by filling the same form with the attach
     // OFF. Diagnostic only — a real run always attaches (the operator's résumé belongs on the form).
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "atsLocSyntheticType"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -1345,6 +1345,57 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     (async () => {
       const out = await runGmailSmokeTest(message.interactive !== false);
       sendResponse(out);
+    })();
+    return true;
+  }
+
+  // ── PROVE THE CODE EXTRACTOR AGAINST A REAL EMAIL, WITHOUT SUBMITTING ANYTHING ───────────
+  // The email-verification gate can only be exercised for real by ARMING a submit — the gate does
+  // not exist until a genuine submit click has been made, so the one live rehearsal that would
+  // prove it is also an irreversible application to a real employer. That makes the highest-risk
+  // piece the hardest to reach, and it is the piece written against the LEAST evidence: the cue
+  // set, the sender and the length were all authored against a PLAUSIBLE email, never an observed
+  // one (the operator's own inbox holds a real one from the attempt that started this work).
+  //
+  // So: run the real extractor over the real inbox, read-only, and report whether it would have
+  // found a code — WITHOUT typing anything, without a tab, and without a submit. A `no-cue` or
+  // `ambiguous` answer here is exactly the finding that should be made BEFORE arming, not after.
+  //
+  // ⚠ IT NEVER RETURNS THE CODE, only its LENGTH plus provenance — the same rule the fill path
+  // obeys. A probe is the easiest place to leak a secret into a transcript, precisely because it
+  // feels like debugging rather than production.
+  // `sinceMinutes` widens the freshness floor deliberately (the run path pins it to the submit
+  // click); a probe is looking BACKWARD at mail that has already arrived.
+  if (type === "AP_DEV_GMAIL_CODE_PROBE") {
+    (async () => {
+      const LOG = (...a) => console.log("[ApplyPilot][GMAIL-CODE-PROBE]", ...a);
+      const mins = Math.max(1, Math.min(1440, Number(message.sinceMinutes) || 120));
+      const length = Number(message.length) || 0; // 0 ⇒ the extractor's own 4–10 probe range
+      const sender = message.senderContains === null ? null : (message.senderContains || "greenhouse.io");
+      let tok = await gmailGetToken(message.interactive !== false);
+      if (!tok.ok) { sendResponse({ ok: false, error: "gmail-auth-failed", detail: tok.error }); return; }
+      const args = {
+        token: tok.token, senderContains: sender, length: length || undefined,
+        notBeforeMs: Date.now() - mins * 60000, skewMs: 0,
+        // ONE pass: a probe looks at mail already in the inbox, so polling would only stall.
+        timeoutMs: 1, pollMs: 1, newerThan: Math.ceil(mins / 60) + "h",
+        log: (m) => LOG(m),
+      };
+      let find = await gmailFindVerificationCode(args);
+      if (!find.ok && (find.status === 401 || find.status === 403)) {
+        await gmailRemoveCachedToken(tok.token);
+        tok = await gmailGetToken(true);
+        if (tok.ok) find = await gmailFindVerificationCode({ ...args, token: tok.token });
+      }
+      if (find.ok) {
+        LOG(`✓ WOULD HAVE FOUND a ${find.code.length}-character code — from ${String(find.from || "?").slice(0, 70)}, subject ${JSON.stringify(String(find.subject || "").slice(0, 70))}${find.widened ? " [sender filter widened]" : ""}`);
+        sendResponse({ ok: true, found: true, codeLength: find.code.length, from: find.from || null,
+          subject: String(find.subject || "").slice(0, 120), widened: !!find.widened, lookbackMinutes: mins });
+        return;
+      }
+      LOG(`✗ no code identified — ${find.error || find.reason || "unknown"} (fresh ${find.sawFresh || 0}, stale ${find.sawStale || 0}, widened ${!!find.widened})`);
+      sendResponse({ ok: true, found: false, reason: find.error || find.reason || "unknown",
+        sawFresh: find.sawFresh || 0, sawStale: find.sawStale || 0, widened: !!find.widened, lookbackMinutes: mins });
     })();
     return true;
   }
@@ -4611,6 +4662,10 @@ function makeAtsActuation(llmConfig) {
     // showed no log line at all because `act.trustedFocus` was undefined). Guarded by a test now.
     trustedFocus: workday.trustedFocus,
     trustedType: workday.trustedType,
+    // Diagnostic arm for the location combobox's typing path, DECLARED here so the act-surface guard
+    // can see it (the run overrides it per-run from the flag store). Default false = the trusted path,
+    // which is the only one that actually wakes the widget — see the REFUTED note at its call site.
+    locSyntheticType: false,
     painting: workday.painting,
     paintLabel: workday.paintLabel,
     quietInstall: workday.quietInstall,
@@ -5326,6 +5381,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     emitRunProgress("Filling the application", "single-page " + ats + " form (never submits)");
     const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
+    // Diagnostic A/B for the location combobox's typing path — see the note at its call site in
+    // ats.js. Read per run from the flag store, so the arm can be switched without a reload.
+    act.locSyntheticType = await new Promise((r) => chrome.storage.local.get(["atsLocSyntheticType"], (v) => r(!!(v && v.atsLocSyntheticType))));
+    if (act.locSyntheticType) LOG("⚠ atsLocSyntheticType is SET — the location box will be woken with a trusted click and then typed SYNTHETICALLY (diagnostic arm).");
     const prepared = prepareProfile(store.profile);
     // ⚠ `credentials` reaches the ATS driver ONLY here, and only the credential tier can consume it
     // (atsRouteField claims a recognized credential field before any other rung sees it). It is the

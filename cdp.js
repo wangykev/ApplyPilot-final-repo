@@ -4867,12 +4867,48 @@ function makeCdpActuation(llmConfig) {
     // box still showed nothing, while the manual test that worked used a real click AND real typing
     // (2026-08-06). cdpTypeChars sends genuine key events, which is what these async loaders are
     // watching for; ordinary synthetic typing keeps driving every other widget on the page.
+    // ⚠ THREE PHASES, THREE DIFFERENT FIXES — so they are timed SEPARATELY (2026-08-25). The
+    // operator watched a Greenhouse fill "hover in the location box for a while before it typed",
+    // which a single total cannot explain: the focus phase SCROLLS to the element and then issues a
+    // TRUSTED click (~1.5s on its own), the clear is another pair of trusted key events, and only
+    // then does per-char typing start. Attributing that wait is the whole point — `candidate-location`
+    // is the largest non-LLM cost on these forms (7.1–20.3s, docs/fill-speed-log.md) and "it is slow"
+    // has never been broken down. Logged only when it actually costs time, so a healthy field is quiet.
     trustedType: async (sel, text) => {
+      const t0 = Date.now();
       const how = await this_trustedFocus(sel);
+      const focusMs = Date.now() - t0;
       if (!how) return false;
       try {
-        await cdpSelectAllDelete();          // clear whatever is there, trusted
+        const t1 = Date.now();
+        // ⚠ DON'T TRUST-CLEAR AN ALREADY-EMPTY BOX. Measured on Greenhouse's location combobox:
+        // `clear` cost **2148ms** — a trusted select-all plus a trusted delete, both frame-gated —
+        // on an input that was empty, because a fill types into a FRESH form. That was ~29% of the
+        // field's whole input cost, spent removing nothing.
+        // The read is one `Runtime.evaluate` (p50 ~1ms per the lag trace), so this is a 2000:1 trade.
+        // ⚠ AND IT FAILS SAFE: only a POSITIVE, confident read of an empty value skips the clear.
+        // An unreadable element, a missing selector, or any thrown error falls through to clearing
+        // exactly as before — the failure this guards against is a rewrite concatenating onto a
+        // stale value ("old@x.comnew@y.com"), which is far more expensive than 2s.
+        let alreadyEmpty = false;
+        try {
+          const v = await cdpEval(function (s) {
+            const el = document.querySelector(s);
+            if (!el) return { ok: false };
+            return { ok: true, empty: String(el.value == null ? "" : el.value).length === 0 };
+          }, sel);
+          alreadyEmpty = !!(v && v.ok && v.empty);
+        } catch (e) { alreadyEmpty = false; }
+        if (!alreadyEmpty) await cdpSelectAllDelete();   // clear whatever is there, trusted
+        const clearMs = Date.now() - t1;
+        const t2 = Date.now();
         await cdpTypeChars(String(text));    // real keydown/keypress/keyup per character
+        const typeMs = Date.now() - t2;
+        if (Date.now() - t0 > 1200) {
+          try {
+            console.log(`[ApplyPilot][CDP-TYPE] trustedType ${JSON.stringify(sel)} (${String(text).length} chars): focus(${how}) ${focusMs}ms · clear ${clearMs}ms${alreadyEmpty ? " (SKIPPED — box already empty)" : ""} · type ${typeMs}ms — total ${Date.now() - t0}ms`);
+          } catch (e) { /* log only */ }
+        }
         return true;
       } catch (e) { return false; }
     },
