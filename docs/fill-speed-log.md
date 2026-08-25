@@ -1846,10 +1846,81 @@ Full-fill visible totals across this round: 26.5s (trusted) · 38.4s (pure inser
 (insert+1key)**. Against round 5's 7.1–20.3s spread for this one field, a 26.5→25.5s difference is inside
 the noise, and no speed claim is made from it.
 
-### Status: FLAG-GATED OFF, deliberately
+### Status: PROMOTED TO DEFAULT (see round 16 for the runs that earned it)
 
-`atsLocInsertText` defaults to false. One successful run is not three, the failure mode of the arm it
-replaces is a REQUIRED field silently unanswered, and the fallback costs a wasted ~6s lookup on any widget
-where insertText never searches. Promote it only after ~3 runs per arm on more than one tenant. `typeText`
-/ `typeKeys` / `clearText` are now on the ATS actuation regardless, so other slow comboboxes (school,
-degree, discipline) can use the same head+1-keystroke shape once it is proven here.
+`atsLocInsertText` now defaults **on**; setting it `false` is the kill-switch back to per-char typing.
+`typeText` / `typeKeys` / `clearText` are on the ATS actuation, so the other slow comboboxes (school,
+degree, discipline) can adopt the same head+1-keystroke shape — school is now the slowest field on these
+forms and is the obvious next candidate.
+
+## Round 16 (2026-08-25) — the 5s pause was a poll for options that CANNOT EXIST
+
+Round 15 ended with the field at ~7.1s and the typing already down to ~1.4s, i.e. an unexplained ~5s. The
+operator supplied the observation that closed it, from watching a run rather than reading a log:
+
+> *"in your last 7 second run you spent 5 seconds doing nothing — the field was focused, but nothing was
+> typed. it just paused for 5 seconds."*
+
+That is `atsActuateField`'s generic open-and-read-options step, which runs BEFORE the location branch:
+
+```js
+pollFor(ATS_POLL.open /* 1800 */, …)              // empty menu → burns the soft deadline
+for (2 forced toggles) pollFor(retry /* 1500 */)  // → +3000ms
+```
+
+≈ **4.8s**, and for a places box every millisecond of it is spent waiting for a list that **cannot render
+until something is typed**. The speed log has said "`location` is deliberately NOT pre-read" since round 6
+— that was true of the AI option-capture path, and quietly untrue of the actuation path.
+
+The two forced toggles are worse than merely slow: each attempt FLIPS the menu, so an odd number of clicks
+leaves it CLOSED — the exact state the search path below has a documented recovery for. Not spending the
+clicks beats recovering from them.
+
+**Fix:** `ATS_POLL.locOpen: 500` as the soft deadline for a location box, and the forced toggles skipped
+for it. ⚠ The CEILING is untouched, and that is what keeps the GitLab pick-one detection this read exists
+for: `pollFor`'s ceiling is a LOADING allowance, so a pick-one whose list is genuinely still fetching keeps
+its full budget. What shrank is only the wait on an idle, empty menu.
+
+### Measured — and then the hidden arm needed its own fix
+
+| arm | fill | `candidate-location` | split |
+|---|---|---|---|
+| baseline VISIBLE (round 14) | 26.5s | 7.9s | — |
+| baseline HIDDEN | 38.8s | 9.3s | — |
+| open-skip + insert+1key, VISIBLE | **15.9s** | **2.0s** | open 717 · typed 129 · lookup 857 |
+| open-skip + insert+1key, HIDDEN | 41s+ | 12.2s | open **9044** · typed 3004 · lookup 1 |
+| …+ fast-when-hidden, HIDDEN | **19.3s** | **3.4s** | open 609 · typed 2768 · lookup 4 |
+| second tenant (Cloudflare), HIDDEN | — | **3.7s** | open 857 · typed 1717 · lookup 975 |
+| **DEFAULT path, no flags set, HIDDEN** | 41.0s ⚠ | **1.1s** | open 588 · typed **77** · lookup 405 |
+
+⚠ That last fill total is **the LLM, not this path** — its slowest field was `question_37239553002` at
+**19.8s**, an AI-answered text question, while `candidate-location` was 1.1s. It is in the table as a
+reminder of the standing rule (subtract the `[LLM]` line before reading a fill total as a fill cost), not
+as a regression. Five runs across two tenants and both visibility arms now put this field at **1.1–3.7s**,
+every one `filled · exact-normalized`.
+
+⚠ **THE KILL-SWITCH IS NAMED FOR THE OLD BEHAVIOUR (`atsLocPerChar`) ON PURPOSE.** `AP_DEV_FLAG` cannot
+delete a key — it stores `!!value`, so "clearing" a flag writes FALSE. The first cut of this shipped as
+`atsLocInsertText:false` = kill-switch, which would have turned every profile that had ever cleared that
+flag into a permanently slow one, silently, with the log line saying it was deliberate. Absent must equal
+the default; only a positive-meaning flag survives a clear.
+
+The hidden row is the interesting one: a 500ms soft deadline still cost **9044ms**, because the deadline is
+spent through `act.delay` and hidden pacing charges full beats. **`cdpSetFastWhenHidden(true)` now applies
+to Greenhouse / Lever / Ashby too** — for a DIFFERENT reason than iCIMS, which needs it because it declined
+the timer polyfill. These three KEEP the polyfill, so the page's clock was already fast while OUR pacing
+was not; the two are independent axes and only the second was set. Latency-safe by the same argument, and
+more strongly here: actuation is page-side synthetic and every commit is read-back verified, so a pace that
+returns early costs a retry, never a silent wrong fill. Scoped per-run, so it cannot leak to Workday, whose
+trusted-input pacing this would NOT be safe for.
+
+Net: `candidate-location` **7.9s → 2.0s visible, 9.3s → 3.4s hidden**; whole fill **26.5s → 15.9s visible,
+38.8s → 19.3s hidden**. It is no longer the slowest field on the form — `school--0` is, and it still types
+per-char.
+
+### The process note worth keeping
+
+Three rounds of instrumentation attributed the cost to typing, and typing was never the largest term. The
+5s pause was invisible in every log line because it happened in a phase nobody had timed — the field was
+*focused*, so it looked busy. **An operator watching the tab found in one sentence what four instrumented
+runs had not**, and the fix was to stop doing something rather than to do it faster.

@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "loc-insert1key-5";
+const AP_BUILD_MARKER = "ats-loc-default-9";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -709,7 +709,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     // parse re-renders the form, so "is this widget's option list empty because the tenant has none, or
     // because the PARSE left it that way?" is only answerable by filling the same form with the attach
     // OFF. Diagnostic only — a real run always attaches (the operator's résumé belongs on the form).
-    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "atsLocSyntheticType", "atsLocInsertText"];
+    const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "atsLocSyntheticType", "atsLocPerChar"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -4673,7 +4673,8 @@ function makeAtsActuation(llmConfig) {
     // can see it (the run overrides it per-run from the flag store). Default false = the trusted path,
     // which is the only one that actually wakes the widget — see the REFUTED note at its call site.
     locSyntheticType: false,
-    locInsertText: false,
+    locInsertText: true,
+    locPerCharType: false,
     painting: workday.painting,
     paintLabel: workday.paintLabel,
     quietInstall: workday.quietInstall,
@@ -5150,6 +5151,17 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // reply or a synchronous DOM write — so the fast pace is allowed while hidden. See cdpSetFastWhenHidden
     // for why that is latency-safe rather than lucky: every pace site is read-back or poll gated.
     if (ats === "icims") cdpSetFastWhenHidden(true);
+    // ⚠ AND THE SAME PACE FOR THE OTHER THREE, for a DIFFERENT reason (2026-08-25). iCIMS needs this
+    // because it declined the polyfill; Greenhouse/Lever/Ashby keep the polyfill, so the PAGE's clock
+    // is already fast hidden — but OUR pacing (`act.delay`) was still charging full hidden beats, and
+    // the two are independent axes. Measured on the same Greenhouse form, same build, one arm apart:
+    // `candidate-location` 2.0s VISIBLE against 12.2s HIDDEN, and the split says why —
+    // `open 717ms · typed 129ms` visible vs `open 9044ms · typed 3004ms` hidden.
+    // Latency-safe by the same argument as iCIMS, and it holds MORE strongly here: actuation on these
+    // three is page-side synthetic, and every commit is read-back verified, so a pace that returns
+    // early costs a retry, never a silent wrong fill. Scoped per-run (reset at every attach), so it
+    // cannot leak to Workday, whose trusted-input pacing this would NOT be safe for.
+    if (ats === "greenhouse" || ats === "lever" || ats === "ashby") cdpSetFastWhenHidden(true);
     await cdpSetFocusEmulation(true).catch(() => {});
     // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
     // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
@@ -5392,11 +5404,22 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // Diagnostic A/B for the location combobox's typing path — see the note at its call site in
     // ats.js. Read per run from the flag store, so the arm can be switched without a reload.
     {
-      const armFlags = await new Promise((r) => chrome.storage.local.get(["atsLocSyntheticType", "atsLocInsertText"], r));
+      const armFlags = await new Promise((r) => chrome.storage.local.get(["atsLocSyntheticType", "atsLocPerChar"], r));
       act.locSyntheticType = !!(armFlags && armFlags.atsLocSyntheticType);
-      act.locInsertText = !!(armFlags && armFlags.atsLocInsertText);
+      // DEFAULT ON as of 2026-08-25. Promoted on 3 clean runs across 2 tenants (Discord visible 2.0s
+      // / hidden 3.4s, Cloudflare hidden 3.7s), every one `filled · exact-normalized`, against a
+      // 7.9–25.5s baseline. The correctness risk is carried by the options-based fallback, not by
+      // this default: a widget that does not search after the insert re-runs the proven per-char
+      // path before anything is believed, so the worst case is latency, not an unanswered field.
+      // ⚠ THE KILL-SWITCH IS POSITIVE-MEANING ON PURPOSE. `AP_DEV_FLAG` cannot delete a key — it
+      // stores `!!value`, so "clearing" a flag writes FALSE. A kill-switch phrased as
+      // `atsLocInsertText:false` would therefore turn every previously-cleared profile into a
+      // permanently slow one, silently. Naming the flag for the OLD behaviour keeps absent == false
+      // == the default, which is the only polarity that survives a clear.
+      act.locPerCharType = !!(armFlags && armFlags.atsLocPerChar);
+      act.locInsertText = !act.locPerCharType;
       if (act.locSyntheticType) LOG("⚠ atsLocSyntheticType is SET — the location box will be woken with a trusted click and then typed SYNTHETICALLY (diagnostic arm; REFUTED live 2026-08-25).");
-      if (act.locInsertText) LOG("⚠ atsLocInsertText is SET — the location box will be filled with ONE trusted Input.insertText instead of per-char keystrokes.");
+      if (act.locPerCharType) LOG("⚠ atsLocPerChar is SET — the location box falls back to per-char trusted typing (the slow pre-2026-08-25 path).");
     }
     const prepared = prepareProfile(store.profile);
     // ⚠ `credentials` reaches the ATS driver ONLY here, and only the credential tier can consume it

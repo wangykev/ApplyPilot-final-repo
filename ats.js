@@ -2621,6 +2621,15 @@ const ATS_POLL = {
   // dead-form state, and the remedy is the page refresh the run now performs — so waiting longer only
   // delays the fix. Was 20000, which cost ~20s per silent widget before the reload could help.
   search: 2000, searchCeil: 6000,
+  // ⚠ A PLACES BOX HAS NO LIST UNTIL SOMETHING IS TYPED, so the ordinary `open` deadline is spent
+  // waiting for something that cannot arrive. Measured 2026-08-25, and spotted by the operator
+  // watching a run: the field sat FOCUSED AND IDLE for ~5s before a character was typed — 1800ms
+  // of `open` plus two forced-toggle retries at 1500ms each.
+  // This is a SOFT deadline only. `pollFor`'s ceiling is a LOADING allowance and still applies, so
+  // a pick-one whose list is genuinely still fetching keeps its full budget — what shrinks is only
+  // the wait on an idle, empty menu. That is what preserves the GitLab pick-one detection this read
+  // exists for (a static list is already in the DOM on open, and answers the first read).
+  locOpen: 500,
   restore: 1200, restoreCeil: 3000, // clearing the query to report real options
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
   loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
@@ -5622,12 +5631,22 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // baseline by the time the poll needs it. Best effort: without it the poll falls back to
     // read latency.
     if (act.quietInstall) { try { await act.quietInstall(ref.inputSel); } catch (e) { /* fallback */ } }
+    const openPhaseT0 = Date.now();
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
-    let read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
+    // A LOCATION box gets a SHORT soft deadline here (see ATS_POLL.locOpen): this read exists only
+    // to ask "did a list render on open?", and for a places box the answer is permanently no.
+    let read = await pollFor(wt === "location" ? ATS_POLL.locOpen : ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
     // menu), so one forced click closes it and the next opens for real. Each attempt flips the
     // state, so two cover both "the click missed" and "it lied about being open".
-    for (let attempt = 0; attempt < 2 && !optsOf(read).length; attempt++) {
+    // ⚠ SKIPPED FOR A LOCATION BOX, on two counts. An empty menu there is the NORMAL state rather
+    // than evidence of a missed click, so the toggles cost ~3s to re-confirm what we already know;
+    // and each attempt FLIPS the menu, so the loser of an odd number of clicks is a CLOSED widget —
+    // which is precisely the state the search path below has a documented recovery for ("a query
+    // only filters a menu that is OPEN"). Not spending the clicks is better than recovering from
+    // them. The typed search immediately after is the real test of whether this widget answers.
+    const forceToggles = wt === "location" ? 0 : 2;
+    for (let attempt = 0; attempt < forceToggles && !optsOf(read).length; attempt++) {
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
       read = await pollFor(ATS_POLL.retry, (t) => t.length > 0, ATS_POLL.retryCeil);
     }
@@ -5636,6 +5655,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // answers it with a THREE-option pick-one already rendered on open. Typing a city there waits
     // out a suggestion service that will never respond and reports "places never loaded" on a
     // field that was answerable all along. A short list that is already showing IS the option set.
+    const openPhaseMs = Date.now() - openPhaseT0;
     const preOpts = optsOf(read);
     const locIsPickOne = wt === "location" && preOpts.length > 0 && preOpts.length <= ATS_LOC_PICKONE_MAX && hasHit(preOpts);
     // WHICH candidate the places list actually answered — the pick has to judge what we ASKED for.
@@ -5713,12 +5733,12 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         read = await pollFor(6000, (t) => t.length > 0);
         locLookupMs += Date.now() - reT0;
       }
-      if (locTypedMs + locLookupMs > 1500) {
-        try {
-          console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName} [${locArm}]: typed ${JSON.stringify(city)} (${city.length} chars) in ${locTypedMs}ms · lookup ${locLookupMs}ms → ${optsOf(read).length} option(s)` +
-            ` — total ${locTypedMs + locLookupMs}ms`);
-        } catch (e) { /* log only */ }
-      }
+      // ALWAYS logged for a places box now: the open phase is the term that was invisible, and a
+      // threshold that hides the healthy case also hides the proof that it stayed healthy.
+      try {
+        console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName} [${locArm}]: open ${openPhaseMs}ms · typed ${JSON.stringify(city)} (${city.length} chars) in ${locTypedMs}ms · lookup ${locLookupMs}ms → ${optsOf(read).length} option(s)` +
+          ` — pre-commit total ${openPhaseMs + locTypedMs + locLookupMs}ms`);
+      } catch (e) { /* log only */ }
       // A BOX LABELLED "Location" IS NOT ALWAYS A CITY BOX (2026-08-07). ElevenLabs labels one
       // "Location" and describes it "Country you're currently residing in" — a COUNTRY list, where
       // "Pittsburgh" matches nothing. We typed the city, read an empty menu, and reported "the form's

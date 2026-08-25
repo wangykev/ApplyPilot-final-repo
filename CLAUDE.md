@@ -906,6 +906,26 @@ The standing rules:
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
+- **A PLACES BOX HAS NO LIST UNTIL SOMETHING IS TYPED — so do not poll for one (2026-08-25).** The generic
+  open-and-read-options step ran before the location branch and spent ~4.8s (`ATS_POLL.open` 1800 + two
+  forced toggles at 1500) waiting for options that cannot exist; the operator saw it as the field sitting
+  *focused and idle* for 5s before a character was typed. `ATS_POLL.locOpen` (500) is the soft deadline for
+  a location box and the forced toggles are SKIPPED for it — they flip the menu, so an odd number leaves it
+  CLOSED. ⚠ The **ceiling is untouched**: it is a LOADING allowance, which is what still lets a genuinely
+  fetching pick-one (the GitLab three-option case this read exists for) finish.
+- **TYPE THE HEAD, THEN ONE REAL KEYSTROKE.** `Input.insertText` puts the whole word in at 218ms vs 8373ms
+  of per-char typing — and **alone it does NOT work**: the widget returns 0 options, because it watches for
+  a KEY event, not a trusted INPUT event (measured; this refutes "it just needs trusted input"). One
+  keystroke for the last character fires the search with the full query already in the box. ⚠ Its read-back
+  PASSES on failure (the text really is there), so the fallback must be **options-based, not value-based** —
+  an empty menu re-runs the per-char path before anything is believed. Default ON; `atsLocInsertText:false`
+  is the kill-switch.
+- **`cdpSetFastWhenHidden(true)` APPLIES TO GH/LEVER/ASHBY, for a different reason than iCIMS.** iCIMS needs
+  it because it DECLINED the timer polyfill; these three KEEP it, so the page's clock was already fast while
+  **our** pacing still charged full hidden beats — independent axes, and only one was set. Live: a 500ms
+  soft deadline still cost 9044ms hidden vs 717ms visible. Safe here for the same reason plus a stronger
+  one: actuation is page-side synthetic and every commit is read-back verified, so an early pace costs a
+  retry, never a wrong fill. Scoped per-run — **never let it reach Workday's trusted-input pacing.**
 - **⚠ INSTALL THE PAGE OVERRIDES BEFORE THE DOCUMENT EXISTS.** Landing them on an already-running document
   leaves the page half-native/half-ours, after which react-select never resolves again — **and a refresh cures
   it**. A run opens its tab BLANK, attaches, registers overrides, then navigates. *If a widget works by hand
