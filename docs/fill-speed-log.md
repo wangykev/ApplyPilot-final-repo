@@ -2973,6 +2973,46 @@ school--0 [trusted-perchar]      open 693ms (100 opt on open) · query 15 chars 
 School's residue is its OWN server (3054ms against a documented 390ms–12s spread), not our input path.
 The next honest lever there is the query, not the keystrokes.
 
+### Round 18 (2026-08-25) — re-measured after merging main's page-clock fix: the input path held, the WORKER did not
+
+Rounds 14–17 were measured before main's `cdpSetPageClock` landed on the ATS path, so they were re-run on
+the merged build (`gh-verify-merge-13`) to check nothing regressed and that the two pacing axes compose.
+
+| run | fill | `candidate-location` split | `school--0` |
+|---|---|---|---|
+| merged, HIDDEN 1 | 24.3s | open **365** · typed 3244 · lookup 829 → 4.5s | 2.4s |
+| merged, HIDDEN 2 | 29.0s | open **514** · typed 1081 · lookup 556 → 2.4s | 5.3s |
+| merged, "visible" ⚠ | **94.2s** | open **493** · typed **75** · lookup 4933 → 5.5s | 8.9s |
+
+**What held.** The parts these rounds changed are fast and stable across all three: `open` is **365–563ms**
+against the 1800ms+ it used to burn, and `typed` reached **75ms** at its best — the head+1-keystroke write
+survives the merge intact, and `school--0` correctly stays on `[trusted-perchar]`. Review counts were
+identical run to run (4), so nothing was lost.
+
+**What did not.** Fill totals ranged **24.3s → 94.2s on one form**, and the cause is neither the input path
+nor the widgets. Main's new pace diagnostic names it outright:
+
+```
+⚠ a 12ms pace took 10003ms (sw-starved) — the clock overran by 9991ms.
+  OUR OWN abandon ceiling was 8491ms late, so this is SERVICE-WORKER starvation
+question_37239549002 (text) → filled · 22193ms
+degree--0 37.4s
+```
+
+A **12ms** pace costing **10s** is MV3 worker starvation — the operator's original "lags at random times,
+fixed by clicking the page". So the page clock has NOT fully closed it on this machine, which is precisely
+the uncertainty main's `atsPageClock` A/B was added to settle, and this round is more evidence for running
+it rather than an answer to it.
+
+⚠ **The visible row is CONTAMINATED and must not be read as a visible baseline.** Polling the dev tab from
+automation ACTIVATES it, which hides the run tab and adds load — the documented trap — and this round's
+reads were frequent. It is kept only because its `typed 75ms` is the cleanest input-path number obtained,
+and that measurement does not depend on visibility.
+
+**Conclusion, stated narrowly:** the round 14–17 work still does what it claimed — per-field input cost is
+down and stayed down. It does NOT follow that a fill is reliably fast, because the dominant remaining term
+is worker starvation, which is independent of these changes and pre-dates them.
+
 ### The process note worth keeping
 
 Three rounds of instrumentation attributed the cost to typing, and typing was never the largest term. The
