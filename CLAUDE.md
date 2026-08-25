@@ -1223,6 +1223,20 @@ The standing rules:
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
+- **⚠ NEVER ENABLE A CDP DOMAIN WHOSE EVENTS NOTHING READS (2026-08-25).** `Runtime.enable` +
+  `DOM.enable` were called at attach with no `onEvent` consumer, so Chrome streamed
+  console/executionContext/DOM-mutation events at a worker that discarded them — and a saturated event
+  loop DEFERS TIMERS, which is the SW starvation everything else was blamed on. `Runtime.enable` is gone
+  (only `Runtime.evaluate` is used, which needs no enable — including inside a `createIsolatedWorld`
+  context); `DOM.enable` is LAZY (`cdpEnsureDomDomain`, used only by the fallback focus path);
+  `Page.enable` stays (`addScriptToEvaluateOnNewDocument` needs it). Live: **pace overruns went 1–3 per
+  visible run to ZERO across two runs**, with ~33 inbound events for a whole fill, all `Page.*`.
+- **⚠ UNDER STARVATION A PACE COSTS WHAT THE SCHEDULER DECIDES, NOT WHAT WAS ASKED FOR.** Measured on a
+  hidden run: `15ms×16 = 29.8s` — sixteen 15ms yields at ~1.9s each. So the **YIELD COUNT** is the cost
+  driver and the duration is nearly irrelevant, which is why shortening paces (`cdpSetFastWhenHidden`)
+  pays off only on a HEALTHY run. **A VISIBLE fill no longer lags; a HIDDEN one still can** — an
+  invisible tab gives Chrome no reason to schedule the worker, which is browser policy, not a stream we
+  can stop. Diagnose with the always-on `inbound CDP events` + `pacing: … spend:` lines.
 - **A MENU THAT SETTLED ON SHOWING NOTHING IS AN ANSWER — AND IT ARRIVES EARLY (2026-08-25).** Many of these
   widgets render no list until a query is typed (a places box, an async school/degree search), so the
   open-and-read step spent ~4.8s (`ATS_POLL.open` 1800 + two forced toggles at 1500) waiting for options

@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "gh-verify-merge-13";
+const AP_BUILD_MARKER = "no-firehose-15";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6398,6 +6398,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // the [PACE] lines; this makes any run say whether its clock was healthy, and names the culprit
     // when it was not (see cdpPaceSummary — "sw-starved" means the WORKER, not the page).
     try { LOG(`[ATS-TIME] ${cdpPaceSummary()}`); } catch (e) { /* log only */ }
+    // …and how many CDP events were pushed at the worker while it ran. Always printed, because "the
+    // worker is saturated by streams nothing reads" is a leading explanation for a late timer, and it
+    // was previously only countable behind a flag whose report the ATS path never printed.
+    try { LOG(`[ATS-TIME] ${cdpEventSummary()}`); } catch (e) { /* log only */ }
     // The lag trace's own verdict, next to the pacing summary it explains.
     try { const lag = cdpLagReport("ats run"); if (lag) LOG(lag); } catch (e) { /* log-only */ }
     // Say what ACTUALLY happened to the report. reportApplication used to return nothing, so this

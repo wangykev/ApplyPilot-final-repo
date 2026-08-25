@@ -3043,6 +3043,67 @@ way, plus the widgets' own servers.
 down and stayed down. It does NOT follow that a fill is reliably fast, because the dominant remaining term
 is worker starvation, which is independent of these changes and pre-dates them.
 
+### Round 19 (2026-08-25) — the worker was drowning in events nothing read. VISIBLE is fixed; HIDDEN is not
+
+The firehose counter's own note had the hypothesis written down since 2026-08-09 and never tested:
+
+> *we `Runtime.enable` + `DOM.enable` at attach while registering NO onEvent listener anywhere, so Chrome
+> streams console/executionContext/DOM-mutation events at a worker that never reads them… a saturated
+> event loop defers timers.*
+
+Corroborating measurement first: the SW stalled **623–984ms** at a time while a trivial page eval cost
+**2–3ms**, i.e. the channel was free and the worker was the bottleneck — the shape event saturation makes.
+
+**Fix.** `Runtime.enable` is REMOVED — the only Runtime command this codebase issues is
+`Runtime.evaluate`, which does not need the domain enabled (nor does evaluating in a
+`Page.createIsolatedWorld` context, which returns its id directly). Enabling it bought
+`consoleAPICalled` / `exceptionThrown` / `executionContextCreated` streaming off a React app mid-fill,
+all discarded on arrival. `DOM.enable` is made LAZY (`cdpEnsureDomDomain`): three DOM commands are
+genuinely used, but only by the FALLBACK focus path most runs never touch, and its mutation events are
+the noisiest of the three. `Page.enable` stays — `addScriptToEvaluateOnNewDocument` requires it.
+
+Also: the inbound-event count is now counted ALWAYS and printed with every ATS run
+(`cdpEventSummary`). It was gated behind `debugLagTrace`, and on the ATS path the lag REPORT returns
+null anyway (an intermediate detach drops its window), so the one number that answers "is the worker
+being saturated?" was unobtainable even with the flag on.
+
+### VISIBLE — fixed, two consecutive runs
+
+| | paces | overran | worst | fill |
+|---|---|---|---|---|
+| before | 40–43 | **1–3** | 1548–**10208ms** | 12.9–50.9s |
+| after (run 1) | 24 | **0 (0%)** | **0ms** | 16.2s |
+| after (run 2) | 43 | **0 (0%)** | **0ms** | 16.1s |
+
+`inbound CDP events: 33–34 [Page.frameStartedLoading×6, Page.frameStoppedLoading×4, Page.frameAttached×4,
+Page.frameRequestedNavigation×4]` — only the Page domain we actually consume, ~33 events for a whole fill
+against whatever DOM mutations a React form was previously pushing. **Zero pace overruns where every
+earlier run had one to three.** Review counts unchanged (4).
+
+### ⚠ HIDDEN — NOT fixed, and the attribution says why
+
+| | paces | overran | worst | fill |
+|---|---|---|---|---|
+| after, hidden | 41 | **10 (24%)** | **13805ms on a 15ms wait** | 119.1s |
+
+```
+spend: 15ms×16 29.8s · 400ms×4 11.5s · 150ms×4 7.7s · 450ms×2 5.5s · 300ms×4 3.5s
+```
+
+**Sixteen 15ms yields cost 29.8 seconds** — ~1.9s each for a requested 15ms. That is the load-bearing
+observation of this round: **under starvation a pace costs what the SCHEDULER decides, not what was
+asked for**, so the YIELD COUNT is the cost driver and the duration is nearly irrelevant. It also means
+`cdpSetFastWhenHidden` (round 16) neither helps nor hurts a starved run — collapsing 150ms to 15ms
+changes nothing when the wait is 1.9s either way; it only pays off on a healthy one.
+
+Removing the event firehose did not rescue the hidden arm because the cause there is different: an
+invisible tab gives Chrome no reason to schedule the worker at all. That is the browser's policy, not a
+stream we can stop.
+
+**So the honest split: a VISIBLE fill no longer lags (the operator's actual complaint), and a HIDDEN one
+still can.** The remaining lever for hidden is the one this round measured rather than guessed —
+fewer yields, starting with whatever issues sixteen 15ms paces in one fill.
+
 ### The process note worth keeping
 
 Three rounds of instrumentation attributed the cost to typing, and typing was never the largest term. The

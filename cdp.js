@@ -146,9 +146,24 @@ function cdpPageSleep(ms) {
 // out that the abandon ceiling is due at want+SLACK and fired 9.3s late, conclude the WORKER was
 // starved. That is three steps too many for something that shows up on ordinary runs, so the numbers
 // are accumulated here and printed with the run's timing summary. Reset per attach.
-let _paceStats = { n: 0, over: 0, lostMs: 0, worstMs: 0, worstWant: 0, byVia: {} };
-function cdpPaceStatsReset() { _paceStats = { n: 0, over: 0, lostMs: 0, worstMs: 0, worstWant: 0, byVia: {} }; }
-function cdpPaceStats() { return { ..._paceStats, byVia: { ..._paceStats.byVia } }; }
+// ⚠ `byWant` GROUPS PACES BY THEIR REQUESTED LENGTH, and it is the attribution that was missing
+// (2026-08-25). The summary could say "41 paces, 11.5s lost" but not WHERE, and with only ~40 paces
+// in a whole fill the lever is not "fewer awaits" in general — it is finding the two or three sites
+// that account for most of them. A requested duration is a good proxy for a call site here because
+// the pacing constants differ per site (250/150/400/450/600…), and it costs one map write per pace.
+// Inbound CDP events pushed at this worker since the attach, counted always — the number that says
+// whether the worker is being saturated by streams nothing consumes. See the onEvent listener.
+let _evtN = 0, _evtTop = {};
+function cdpEventStatsReset() { _evtN = 0; _evtTop = {}; }
+function cdpEventSummary() {
+  if (!_evtN) return "inbound CDP events: 0 (no domain is streaming at us)";
+  const top = Object.keys(_evtTop).sort((a, b) => _evtTop[b] - _evtTop[a]).slice(0, 4)
+    .map((k) => k + "×" + _evtTop[k]).join(", ");
+  return `inbound CDP events: ${_evtN} [${top}]`;
+}
+let _paceStats = { n: 0, over: 0, lostMs: 0, worstMs: 0, worstWant: 0, byVia: {}, byWant: {} };
+function cdpPaceStatsReset() { _paceStats = { n: 0, over: 0, lostMs: 0, worstMs: 0, worstWant: 0, byVia: {}, byWant: {} }; }
+function cdpPaceStats() { return { ..._paceStats, byVia: { ..._paceStats.byVia }, byWant: { ..._paceStats.byWant } }; }
 // One line, safe to print unconditionally — a healthy run says so in a few words.
 function cdpPaceSummary() {
   const p = _paceStats;
@@ -156,8 +171,14 @@ function cdpPaceSummary() {
   const pct = Math.round((p.over / p.n) * 100);
   const vias = Object.keys(p.byVia).sort((a, b) => p.byVia[b] - p.byVia[a])
     .map((k) => `${k}×${p.byVia[k]}`).join(" ");
+  // Which requested durations actually cost the run, biggest total first — the attribution that says
+  // where to look, rather than leaving "11.5s lost" as a number with no address.
+  const wants = Object.keys(p.byWant)
+    .sort((a, b) => p.byWant[b].tookMs - p.byWant[a].tookMs).slice(0, 5)
+    .map((k) => `${k}ms×${p.byWant[k].n}=${(p.byWant[k].tookMs / 1000).toFixed(1)}s`).join(" ");
   return `pacing: ${p.n} pace(s), ${p.over} overran (${pct}%), ${(p.lostMs / 1000).toFixed(1)}s lost, `
     + `worst ${p.worstMs}ms on a ${p.worstWant}ms wait · ${vias}`
+    + (wants ? ` · spend: ${wants}` : "")
     + (p.byVia["sw-starved"] ? " — ⚠ SW-STARVED paces mean the SERVICE WORKER's own timers were late; "
         + "the page clock CANNOT help there (its abandon ceiling is an SW timer too). The lever is "
         + "FEWER AWAITS, not a different clock. docs/fill-speed-log.md" : "");
@@ -167,6 +188,8 @@ function cdpPaceNote(want, took, via, watchdogLateBy) {
   const p = _paceStats;
   p.n++;
   p.byVia[via] = (p.byVia[via] || 0) + 1;
+  const wb = (p.byWant[want] = p.byWant[want] || { n: 0, tookMs: 0 });
+  wb.n++; wb.tookMs += took;
   const over = took - want;
   if (over > 0) { p.lostMs += over; }
   if (over >= PACE_OVERRUN_LOG_MS) {
@@ -334,10 +357,34 @@ function cdpAttach(tabId) {
       _frameCtxUrl = null;
       _pageClockAnnounced = false;             // ...and announce it once per run, not once per page transition
       cdpPaceStatsReset();                     // pacing stats are PER RUN — the summary is printed with the run's timing
+      cdpResetDomDomain();                     // the DOM domain is enabled ON DEMAND (see cdpEnsureDomDomain) — a new attach starts off
+      cdpEventStatsReset();                    // …and the inbound-event count is per attach too
       _wakeSkipped = 0;                        // …and so is the count of no-op wakes we skipped
       try {
-        await cdpSend("Runtime.enable", {});
-        await cdpSend("DOM.enable", {});
+        // ⚠ DO NOT ENABLE A DOMAIN WHOSE EVENTS NOTHING READS (2026-08-25).
+        // `Runtime.enable` and `DOM.enable` were both called here, and the firehose counter's own
+        // note names the consequence: "we Runtime.enable + DOM.enable at attach while registering NO
+        // onEvent listener anywhere, so Chrome streams console/executionContext/DOM-mutation events
+        // at a worker that never reads them… a saturated event loop defers timers."
+        // Measured alongside it: the SW stalls 623-984ms at a time while a trivial page eval costs
+        // 2-3ms, i.e. the channel is free and the WORKER is the bottleneck — which is the shape that
+        // event saturation produces.
+        //
+        // `Runtime.enable` is REMOVED, and it was never needed: the only Runtime command this file
+        // issues is `Runtime.evaluate`, which does not require the domain to be enabled (nor does
+        // evaluating inside a `Page.createIsolatedWorld` context — that call returns its
+        // executionContextId directly). What enabling bought was `consoleAPICalled`,
+        // `exceptionThrown` and `executionContextCreated/Destroyed` streaming from a React app
+        // mid-fill, all of it discarded on arrival.
+        //
+        // `DOM.enable` is made LAZY rather than removed: three DOM commands are genuinely used
+        // (`DOM.getDocument` / `DOM.querySelector` / `DOM.focus` in cdpDomFocus), but that is a
+        // FALLBACK path most runs never touch, and the domain's mutation events are the noisiest of
+        // the three on a form being filled. See cdpEnsureDomDomain.
+        //
+        // ⚠ If a widget ever regresses after this, the safe direction is to re-enable the ONE domain
+        // whose events are actually needed — not to re-enable both. Everything here is read-back
+        // gated, so a missing capability surfaces as needs_review rather than a wrong value.
         await cdpSend("Page.enable", {}); // required for Page.addScriptToEvaluateOnNewDocument (cdpInstallPageOverrides)
         // Refresh the debug input-trace toggle per run (popup checkbox → chrome.storage.local).
         try { const { debugInputTrace } = await new Promise((r) => chrome.storage.local.get("debugInputTrace", r)); setInputTrace(!!debugInputTrace); } catch (e) { /* default stays OFF */ }
@@ -461,6 +508,13 @@ function cdpLagFresh() { return { t0: Date.now(), cmds: new Map(), beats: [], ev
 try {
   if (typeof chrome !== "undefined" && chrome.debugger && chrome.debugger.onEvent) {
     chrome.debugger.onEvent.addListener((source, method) => {
+      // ⚠ COUNT UNCONDITIONALLY (2026-08-25). This was gated behind the lag trace, so the one number
+      // that says whether the worker is being saturated was invisible on an ordinary run — and on the
+      // ATS path the lag REPORT returns null anyway (its window is dropped by an intermediate
+      // detach), so the flag did not even deliver it when set. It is one integer and one small-map
+      // write per event; the whole point is that it is cheap enough to always be true.
+      _evtN++;
+      _evtTop[method] = (_evtTop[method] || 0) + 1;
       if (!cdpLagOn) return;
       const w = cdpLagWin;
       if (!w) return;
@@ -1820,9 +1874,22 @@ async function cdpSelectAllDelete() {
   await cdpKeyTap(CDP_KEYS.delete);
 }
 
+// ⚠ ENABLE THE DOM DOMAIN ON FIRST USE, NOT AT ATTACH (2026-08-25). Its mutation events are the
+// noisiest thing streamed at the worker during a fill, and the only consumer of the domain is the
+// fallback focus below — a path most runs never take. Enabling it lazily means a run that never
+// needs it never pays for its event stream. Reset per attach so a new tab re-enables on demand.
+let _domDomainOn = false;
+function cdpResetDomDomain() { _domDomainOn = false; }
+async function cdpEnsureDomDomain() {
+  if (_domDomainOn) return;
+  await cdpSend("DOM.enable", {});
+  _domDomainOn = true;
+}
+
 // CDP-native focus on the first match of `selector` (fallback when a CDP click
 // or page-side el.focus() doesn't take). Throws if the node isn't found.
 async function cdpDomFocus(selector) {
+  await cdpEnsureDomDomain();   // the domain's ONLY consumer — see cdpEnsureDomDomain
   const doc = await cdpSend("DOM.getDocument", { depth: 1 });
   const found = await cdpSend("DOM.querySelector", { nodeId: doc.root.nodeId, selector });
   if (!found || !found.nodeId) throw new Error("cdpDomFocus: no node for " + selector);
