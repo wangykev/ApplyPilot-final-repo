@@ -8143,6 +8143,16 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     }
   }
 
+  // ⚠ FILL THE GAP BEFORE MEASURING IT. Any choice record that still has nothing to offer gets one
+  // read-only open here, so an OPTIONAL field the fill skipped still reaches review as a real picker
+  // (operator, 2026-08-25 — see atsCaptureMissingOptions).
+  // NOT on a replay: a submit run's job is to verify approved values, and extra page contact before
+  // the gate is risk with no reviewer left to benefit from it.
+  if (!o.valueFor) {
+    try { await atsCaptureMissingOptions(act, ats, scan, results, (m) => console.log("[ApplyPilot]" + m)); }
+    catch (e) { /* diagnostic + convenience only — never fail a fill over it */ }
+  }
+
   // DID EVERY CHOICE FIELD ACTUALLY REACH REVIEW AS A PICKER? The scan-time line above says what we
   // KNEW; this says what the operator will SEE, which is the thing that was asked for and the only
   // one worth measuring. A record with `options` renders a picker; one holding `captured_options`
@@ -9268,6 +9278,79 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile, valueFor) {
     try { console.log(`[ApplyPilot][ATS-FILL] ${surfaced} field(s) the form had ALREADY populated are now IN review with their live value — previously they were recorded blank and would have been submitted unseen`); } catch (e) { /* log only */ }
   }
   return surfaced;
+}
+
+// ── AN OPTIONAL CHOICE FIELD MUST REACH REVIEW AS A REAL PICKER (operator, 2026-08-25) ─────────
+// The same requirement already recorded for iCIMS, now demanded of every ATS: a field we never
+// filled still has to be ANSWERABLE on the review page, and a picker with no options is just a
+// text box.
+//
+// ⚠ WHY IT WAS MISSING, AND WHY IT IS NOT A BUG IN THE OPTION READ. On Greenhouse/Lever/Ashby the
+// choice widget is a react-select, whose options do not exist in the DOM until it is OPENED — so the
+// scan legitimately reports `select 0/14`. Every list that DOES reach review got there because
+// something opened the widget: the deterministic commit, or the AI fallback. Both only run for a
+// field we are trying to ANSWER, and `atsOpenAndPollOptions` is called from exactly those paths. An
+// OPTIONAL, unmapped field is skipped in 0ms and therefore never opened by anyone. Measured on
+// Discord, three runs identical: `12 picker · 1 filter-or-type · 2 with no options at all, of 15`.
+//
+// So this is a LAST, READ-ONLY pass over the records that still have nothing to offer.
+//   • It never actuates. Open → read → close-confirmed, and the record's status/value are untouched.
+//   • ⚠ IT MUST CLOSE WITH `atsCloseComboConfirmed`, which gates on the options being GONE rather
+//     than on `aria-expanded`. A lingering portaled list is THE standing hazard in this codebase —
+//     every listbox renders at the same screen coordinates, and options stay clickable while
+//     unmounting, so a list left open strays the next field's click. That rule cost a full debugging
+//     round on Workday and applies verbatim here.
+//   • A list too long to be trustworthy is attached PARTIAL, not complete. `atsAttachOptions` already
+//     enforces that above ATS_OPTION_STORE_MAX, and the asymmetry is the safety property (iCIMS,
+//     2026-08-16): a picker MISSING the operator's answer makes them conclude the form does not offer
+//     it, while a complete list called partial only costs a typed value.
+//   • A widget that shows nothing until a query is typed (a places box) has no list to capture, and
+//     `pollFor`'s settled-empty rule means asking costs ~2 reads rather than a budget.
+async function atsCaptureMissingOptions(act, ats, scan, results, log) {
+  const say = typeof log === "function" ? log : () => {};
+  const need = [];
+  for (const rec of results || []) {
+    if (!rec || !ATS_CHOICE_REVIEW_WIDGETS.includes(rec.widgetType)) continue;
+    if ((rec.options || []).length || (rec.captured_options || []).length) continue;
+    // The deterministic pass already proved this one unreadable and said so in the record — asking
+    // again would pay the same budget to reach the same answer (the iCIMS `optionsUnreadable` rule).
+    if (rec.optionsUnreadable) continue;
+    const f = (scan.fields || []).find((x) => x.fieldName === rec.fieldName);
+    if (!f) continue;
+    // radio / yesno / checkbox groups carry their options ON the scan (they are real DOM already), so
+    // one with none has none — there is nothing an open could reveal.
+    if (!["select", "dial", "location", "icims_dropdown"].includes(f.widgetType)) continue;
+    need.push({ rec, f });
+  }
+  if (!need.length) return { scanned: 0, captured: 0 };
+
+  let captured = 0;
+  for (const { rec, f } of need) {
+    const ref = { inputSel: f.inputSel };
+    try {
+      let texts = [];
+      if (f.widgetType === "icims_dropdown") {
+        const o = await act.eval(atsInjIcimsOpen, ref.inputSel).catch(() => null);
+        texts = (o && o.ok && o.options) || [];
+        await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+      } else {
+        texts = await atsOpenAndPollOptions(act, ref);
+        // ⚠ CLOSE-CONFIRMED, ALWAYS — see the note above. This is the one line that keeps a
+        // read-only pass from breaking the field AFTER it.
+        await atsCloseComboConfirmed(act, ref).catch(() => {});
+      }
+      if ((texts || []).length) {
+        atsAttachOptions(rec, texts, f.widgetType === "icims_dropdown" ? true : undefined);
+        captured++;
+        rec.detail = rec.detail
+          ? rec.detail + " — its choices were read for review"
+          : "not answered from your profile; its choices were read so you can pick one here";
+      }
+    } catch (e) { /* a field we could not read stays exactly as it was */ }
+  }
+  say(`[ATS-OPTIONS] optional-field sweep — opened ${need.length} unanswered picker(s) read-only, captured ${captured} list(s)`
+    + (need.length - captured ? `, ${need.length - captured} still have nothing to offer (a search-driven box shows nothing until typed)` : ""));
+  return { scanned: need.length, captured };
 }
 
 async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor, entryCounts) {
@@ -11040,7 +11123,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjLeanSignature,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
-    atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
+    atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch, atsCaptureMissingOptions,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,

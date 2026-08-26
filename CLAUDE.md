@@ -1223,6 +1223,30 @@ The standing rules:
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
+- **AN OPTIONAL CHOICE FIELD MUST REACH REVIEW AS A REAL PICKER — EVERY ATS, NOT JUST iCIMS
+  (operator, 2026-08-25).** A field we never filled still has to be ANSWERABLE on the review page, and
+  a picker with no options is just a text box. ⚠ **The gap was not in the option read.** On
+  GH/Lever/Ashby the choice widget is a react-select whose options do not exist until it is OPENED
+  (hence the honest `scan-time coverage — select 0/14`), so every list that reaches review got there
+  because something opened the widget — the deterministic commit or the AI fallback, both of which run
+  only for a field we are trying to ANSWER. An OPTIONAL unmapped field is skipped in 0ms and opened by
+  nobody: measured `12 picker · 1 filter-or-type · 2 with no options at all, of 15`.
+  `atsCaptureMissingOptions` is a LAST, READ-ONLY pass over records that still have nothing to offer →
+  `14 picker · 1 filter-or-type · 0 with no options`, fill unchanged at 8.0s.
+  ⚠ It **must** close with `atsCloseComboConfirmed` (options GONE, not `aria-expanded`) — a lingering
+  portaled list strays the next field's click, the standing hazard. It **never runs on a replay** (a
+  submit run verifies approved values; extra page contact before the gate is risk with no reviewer
+  left to benefit). A list too long to trust stays PARTIAL — the iCIMS asymmetry holds: a picker
+  MISSING the answer makes the operator conclude the form doesn't offer it, while a complete list
+  called partial only costs a typed value.
+- **⚠ `[ATS-TIME] fill Xs` EXCLUDES THE TAIL — AND USED NOT TO (2026-08-25).** `fillMs` was measured
+  after the detach, the storage write and `reportApplication`, so a live run printed `fill 39.7s` for
+  **8.4s of filling plus a 31.3s POST to localhost** (a cold Next dev route). That number is what every
+  pacing round is tuned against. The tail is now subtracted and printed alongside
+  (`| + Ns tail (detach+store+report, tab already released)`). ⚠ Rounds 14–19 of
+  `docs/fill-speed-log.md` predate this and include a tail of unknown size — comparable to each other,
+  but they OVERSTATE the fill. The tell was there: a 39.7s fill with **no slow fields listed** and
+  perfect pacing.
 - **⚠ NEVER ENABLE A CDP DOMAIN WHOSE EVENTS NOTHING READS (2026-08-25).** `Runtime.enable` +
   `DOM.enable` were called at attach with no `onEvent` consumer, so Chrome streamed
   console/executionContext/DOM-mutation events at a worker that discarded them — and a saturated event
