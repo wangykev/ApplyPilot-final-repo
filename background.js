@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "opt-options-17";
+const AP_BUILD_MARKER = "dry-verify-18";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -715,7 +715,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
       "atsKeepWarm", "atsPageClock",
       // The combobox typing arms (2026-08-25): `atsComboPerChar` forces the pre-insertText per-char
       // path everywhere, `atsLocSyntheticType` is the REFUTED synthetic arm kept for re-testing.
-      "atsLocSyntheticType", "atsComboPerChar"];
+      "atsLocSyntheticType", "atsComboPerChar", "dryEmailVerify", "skipEmailVerify"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -6543,6 +6543,27 @@ async function atsAnswerEmailVerify(o) {
       detail: "Typed all " + boxes + " characters and the form still holds the submit button disabled. " + manual };
   }
   LOG(`code entered (${w.len}/${boxes} boxes filled, submit button ${w.submitDisabled === false ? "now ENABLED" : "state unknown"}).`);
+
+  // ── THE ONE WAY TO LIVE-TEST THIS WITHOUT SUBMITTING ANYTHING (2026-08-25) ────────────────
+  // ⚠ The gate cannot be reached by a rehearsal: it does not exist until a genuine submit click has
+  // been made. That normally makes the riskiest code in the pipeline the hardest to exercise — and
+  // it is the code written against the least evidence.
+  // What makes a safe test possible is the traced fact that **Greenhouse's FIRST click does not
+  // submit**: it mails a code and holds the button disabled. The application goes in on the SECOND
+  // click. So everything above this line — gate detection, the Gmail poll, the extraction, typing
+  // eight boxes, the read-back, and the form's OWN acceptance signal (the button unlocking) — can be
+  // proven end to end while stopping here.
+  // `chrome.storage.local.dryEmailVerify = true` does exactly that: full stage, no completing click.
+  // It is NOT a substitute for the real thing (the second click and the confirmation stay unproven),
+  // which is why it reports itself as an operator stop rather than a success.
+  const dry = await new Promise((r) => chrome.storage.local.get(["dryEmailVerify"], (v) => r(!!(v && v.dryEmailVerify))));
+  if (dry) {
+    LOG("⚠ dryEmailVerify is SET — the code is IN and the form has enabled Submit, but this run will NOT click it. "
+      + "Nothing has been submitted; the application is still waiting on that click.");
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-dry-run",
+      detail: `Read the ${boxes}-character code from Gmail and typed it into the form; the form accepted it and enabled Submit. `
+        + "Stopped there because dryEmailVerify is set — nothing was submitted. Clear the flag to let an armed run finish." };
+  }
   return { done: true, emailedTo: state.emailedTo || null };
 }
 
