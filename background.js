@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "no-firehose-15";
+const AP_BUILD_MARKER = "fill-excl-tail-16";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6370,7 +6370,18 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       + " with the tab ALREADY RELEASED (the page plays no part in either)");
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
     // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
-    const fillMs = Date.now() - fillT0;
+    // ⚠⚠ THE HEADLINE MUST NOT INCLUDE THE TAIL (2026-08-25). `fillMs` was measured HERE, after the
+    // detach, the storage write and the website report — so "fill 39.7s" on a live run was 8.4s of
+    // filling plus a 31.3s report, and the report happens with the tab ALREADY RELEASED (the line
+    // directly above says so). That is not a rounding error: this number is the one every pacing
+    // round has been tuned against, and on a cold Next dev server the report alone can be 30s, which
+    // makes a healthy fill look like a catastrophic one and sends the next investigation at the form.
+    // The operator asked "a 16 second fill still seems too much" about a number that was partly a
+    // POST to localhost.
+    // The tail is still reported — on its own line, where it belongs — so nothing is hidden; it is
+    // just no longer counted as time spent filling a form.
+    const tailMs = detMs + storeMs + repMs;
+    const fillMs = Date.now() - fillT0 - tailMs;
     // ⚠ ACROSS THE WHOLE WALK, not the last step. `out` is the final step's result, so using it here
     // would divide a four-step wall clock by one step's field count and report a per-field cost
     // several times the truth.
@@ -6393,7 +6404,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       .filter((r) => (r.elapsedMs || 0) >= 1500)
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
       .map((r) => `${r.fieldName} ${(r.elapsedMs / 1000).toFixed(1)}s`).join(", ");
-    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${allResults.length} field(s)${MULTI ? ` across ${stepsFilled} step(s)` : ""} — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`);
+    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${allResults.length} field(s)${MULTI ? ` across ${stepsFilled} step(s)` : ""} — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`
+      // Say the tail out loud on the SAME line, so the two can never be conflated again in either
+      // direction — the headline excludes it, and the reader can still see what the whole run cost.
+      + ` | + ${(tailMs / 1000).toFixed(1)}s tail (detach+store+report, tab already released)`);
     // ⚠ AND THE RUN'S OWN PACING VERDICT, every time. A 630s ORC fill had to be diagnosed by hand from
     // the [PACE] lines; this makes any run say whether its clock was healthy, and names the culprit
     // when it was not (see cdpPaceSummary — "sw-starved" means the WORKER, not the page).
