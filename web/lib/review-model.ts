@@ -317,9 +317,31 @@ export function explainFill(e: ReviewEntry): string | null {
   if (flag === "audit-unverifiable")
     return `ApplyPilot couldn’t confirm this value stuck on the form — please verify it.`;
 
+  // ── ORACLE'S ADDRESS CASCADE: the form filled it, we only VERIFIED it ────────────────────────
+  // ⚠⚠ THESE ROWS HAVE A VALUE, AND THE OLD COPY TOLD THE OPERATOR THEY DID NOT (live 2026-08-22).
+  // ORC derives City / State / County from the postal code, so the engine deliberately does not type
+  // into them — it reads them back and flags them for a human look (`atsSurfacePrefilled`, which sets
+  // `after`, `verified: true` and one of the geo flags below). The record therefore arrives as
+  // `needs_review` -> `fill_status: "not_filled"`, and the catch-all beneath printed "ApplyPilot
+  // couldn't fill this — please fill it in yourself" over a field holding **"Leon"**.
+  //
+  // That cost real confusion: County read as an unfillable required field, which is why it sat at the
+  // top of the Oracle to-do list as a fill gap. It never was one — the value was there and the submit
+  // gate was correctly reporting `bundle blockers: 0`, because that gate tests `current_value` while
+  // this copy tested `fill_status`. Two different fields, and only one of them knows about the value.
+  if (flag === "geo-not-in-profile")
+    return `The form filled this from your postal code${chose ? ` — “${chose}”` : ""}. Your profile doesn’t state it, so check it’s right.`;
+  if (flag === "geo-not-approved")
+    return `The form filled this from your postal code${chose ? ` as “${chose}”` : ""}, which differs from what you approved. Check which one is right.`;
+
   // Anything else that still needs a look: an intuitive nudge, never the raw engine string (the precise
   // `detail` stays in the bundle + service-worker logs for debugging).
-  if (e.fill_status === "error" || e.fill_status === "not_filled")
+  // ⚠ AND ONLY WHEN IT IS ACTUALLY EMPTY. `not_filled` is the bundle's word for "flagged", not for
+  // "blank" — mapFillStatus sends every `needs_review` here — so this must test the VALUE before
+  // telling the operator nothing was filled. The submit gate has always tested the value; this is the
+  // same question asked in the same way.
+  const hasValue = e.current_value != null && String(e.current_value).trim() !== "";
+  if ((e.fill_status === "error" || e.fill_status === "not_filled") && !hasValue)
     return `ApplyPilot couldn’t fill this — please fill it in yourself.`;
   if (e.needs_review) return `Please double-check this field.`;
   return null;

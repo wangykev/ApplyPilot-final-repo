@@ -222,3 +222,67 @@ test("todayForDateOrder: an empty/absent order yields nothing to fill", () => {
   assert.deepEqual(todayForDateOrder([], new Date()), []);
   assert.deepEqual(todayForDateOrder(null, new Date()), []);
 });
+
+// -- "COULDN'T FILL THIS" MUST MEAN THE FIELD IS ACTUALLY EMPTY (live 2026-08-22) --------------
+//
+// ORC derives City / State / County from the postal code, so the engine deliberately does not type
+// into them: it reads them back, sets `current_value`, marks them verified and flags them for a human
+// look. That makes the record `needs_review`, and mapFillStatus turns every needs_review into
+// `fill_status: "not_filled"` -- so the catch-all printed "ApplyPilot couldn't fill this - please fill
+// it in yourself" over a County field holding "Leon".
+//
+// It cost real confusion: County read as an unfillable required field and sat at the top of the Oracle
+// to-do list as a fill gap. It never was one. The submit gate had it right the whole time, because that
+// gate tests `current_value` while this copy tested `fill_status` -- two different fields, and only one
+// of them knows whether anything was filled.
+test("explainFill: a flagged row WITH a value never claims it could not be filled", () => {
+  const filledButFlagged = mk({
+    question_label: "County",
+    fill_status: "not_filled",   // what mapFillStatus does to every needs_review row
+    current_value: "Leon",
+    flag: "geo-not-in-profile",
+    verified: true,
+  });
+  const copy = String(explainFill(filledButFlagged) || "");
+  assert.ok(!/couldn\u2019t fill this|couldn't fill this/i.test(copy),
+    "a row holding a value must never be described as unfilled");
+  assert.match(copy, /postal code/i, "and it should say where the value came from");
+  assert.match(copy, /Leon/, "and name it, so the operator can check it at a glance");
+});
+
+test("explainFill: a geo row that DISAGREES with the approved value says so", () => {
+  const copy = String(explainFill(mk({
+    question_label: "County", fill_status: "not_filled", current_value: "Jefferson",
+    flag: "geo-not-approved", verified: true,
+  })) || "");
+  assert.match(copy, /differs from what you approved/i);
+  assert.match(copy, /Jefferson/);
+});
+
+test("explainFill: a genuinely EMPTY flagged row still says it could not be filled", () => {
+  // The guard must not swallow the real case -- this is the message's whole purpose.
+  for (const v of [undefined, null, "", "   "]) {
+    const copy = String(explainFill(mk({
+      question_label: "Some Question", fill_status: "not_filled", current_value: v as never, flag: null,
+    })) || "");
+    assert.match(copy, /couldn\u2019t fill this/i,
+      "an empty value must still prompt the operator: " + JSON.stringify(v));
+  }
+});
+
+// The guard on the CATCH-ALL, which the geo tests above do not reach (their flags return earlier).
+// A real instance: ORC's date halves. When only the year commits, the record is `commit-not-accepted`
+// with `current_value: "2026"` -- a value the operator can see on the form -- and the old copy told
+// them nothing had been filled. Mutation-checked: removing the `!hasValue` guard fails this test.
+test("explainFill: an UNFLAGGED flagged-for-review row with a value reaches the catch-all and must not claim it is empty", () => {
+  const partial = mk({
+    question_label: "End Date",
+    fill_status: "not_filled",
+    current_value: "2026",      // the year committed, the month did not
+    flag: null,
+    match_tier: null,
+  });
+  const copy = String(explainFill(partial) || "");
+  assert.ok(!/couldn\u2019t fill this|couldn't fill this/i.test(copy),
+    "a row the operator can SEE a value in must never be described as unfilled");
+});
