@@ -1447,6 +1447,30 @@ required, which is what blocked Save.
 
 For a real end-to-end run driven through Chrome, load the **`live-testing`** skill.
 
+## ORC page completeness — a RECOVERY that fires is a BUG SIGNAL (operator, 2026-08-24)
+
+⚠ **Oracle lets the walk advance off an incomplete page and then silently refuses to SUBMIT.** Workday
+refuses the advance itself, so a gap there is impossible to miss; on ORC the same gap travels to the end
+of the walk and presents as a Submit button that does nothing, three steps from its cause.
+
+- **Country is the address block's PARENT.** Committing it RE-RENDERS the whole block: new ids, new
+  labels, new option lists. Read the block before it commits and you get dead ids
+  (`set failed: not-found:#addressLine1-27`) and Oracle's DEFAULT locale — labelled **"Pin Code"**, so a
+  US ZIP has nothing to match. Postal code is the geo ANCHOR, so its failure also silences the cascade
+  and leaves city / region1 / region2 empty. Country therefore commits FIRST and the page is RE-SCANNED.
+  Same parent→child lesson as iCIMS' `data-ddd-child-link`.
+- **A short page is REFILLED, never halted** (operator: *"do not halt on a bad list, make sure it is
+  correct"*). Halting stops at step 1, which leaves the operator no review data for the later steps —
+  which is exactly where they would answer the gap. Up to 3 rounds, each RE-SCANNING; a round that
+  changes nothing stops the loop. Residual gaps ride out on the run result as `required_gaps` so a dead
+  Submit can be explained rather than discovered at the button.
+- **⚠ GEO DEPENDENTS ARE NEVER RETRIED.** Typing into city/region clears the anchor that fills them. The
+  first version of the refill did exactly that and two long-standing tests caught it. A dependent is
+  empty *because* the anchor failed — retry the anchor.
+- **⚠⚠ A REFILL ROUND FIRING IS A BUG SIGNAL, NOT THE MECHANISM WORKING.** Every known re-render cause is
+  handled before it. A `refill round 1` line means DIAGNOSE what re-rendered and why the first pass
+  missed it. The recovery working looks like the page never needing it.
+
 ## Don't write laggy code — the pacing rules (measured; read before adding any wait)
 
 Every rule here was bought with a live failure, and most of them cost a wrong theory first. `docs/fill-speed-log.md`

@@ -8164,7 +8164,15 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
           + gaps.map((f) => f.fieldName).join(", ") + " — leaving them for review rather than spinning");
         break;
       }
-      console.log(`[ApplyPilot][ATS-FILL] ⚠ refill round ${round + 1}: ${gaps.length} REQUIRED field(s) empty — `
+      // ⚠⚠ A REFILL ROUND FIRING AT ALL IS A BUG SIGNAL, NOT ROUTINE (operator, 2026-08-24: "now that
+      // we have a recovery mechanism, it should not fail the first time so if it ever does, there is an
+      // issue"). The first pass is supposed to fill the page; this loop exists to survive a re-render
+      // we did not anticipate, and every known cause of one is now handled ahead of it (country commits
+      // before the block is read, ids are resolved from the post-country scan). So treat a round-1 line
+      // in the log as something to DIAGNOSE — read what re-rendered and why the first pass missed it —
+      // rather than as the mechanism working as intended. It working is the page never needing it.
+      console.log(`[ApplyPilot][ATS-FILL] ⚠ refill round ${round + 1} — THIS SHOULD NOT HAPPEN on a healthy page, `
+        + `so treat it as a bug signal: ${gaps.length} REQUIRED field(s) empty — `
         + gaps.map((f) => f.fieldName).join(", ") + " (re-scanned, so a re-render or a refreshed list is picked up)");
       // Replace the earlier record rather than appending: the failed attempt's tier and detail describe
       // a different commit, and two records for one field is something the bundle cannot represent.
