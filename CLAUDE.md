@@ -1189,6 +1189,42 @@ Full evidence in `docs/dom-patterns.md` `2026-08-21`. The standing rules:
   a known-good commit and a single-variable re-apply to land. Four broken fills came out of not doing
   that.
 
+### "This job is no longer available" — reload ONCE, then REPORT it (operator, 2026-08-27)
+
+Oracle's SPA shell sometimes fails to boot after Apply Now and renders **"This job is no longer
+available."** over a requisition its own CX REST endpoint is still serving. A rehearsal halted
+`unknown-page` on exactly that, throwing away the plain-English sentence the page was showing.
+
+- **The sentence is AMBIGUOUS and is never a verdict on its own** — a genuinely-closed requisition says
+  the same thing. One sighting means "a reload will tell you", never "it's fine" and never "it's dead".
+  So: reload **once** (`atsOrcStuckShell`, pure + unit-pinned), then, if it says it again, halt
+  **`posting-gone`** quoting Oracle. Bounded at one, like Workday's soft-error reload.
+- **`atsPostingGone` is deliberately NOT taught this.** It judges TITLE and URL — here the title stays
+  `"Oracle Careers"` and the job id never leaves the URL — and widening it to body text would let one
+  sentence anywhere on any tenant's page condemn a live posting.
+- Costs nothing when healthy: the body text is read only **after** the 20s settle has already failed.
+- ⚠ **Measured (eeho, 2026-08-27): this tracks the REQUISITION, not us.** Req 336918 — the one that
+  session's fill had applied to — said it on 5 consecutive Apply clicks across two tabs including a
+  **fresh** one, and never resolved with time; unused req 343161 on the same pod, account and tab
+  opened its gate cleanly. So it is not tab-local `sessionStorage`, not slowness, and not the network.
+
+**⚠⚠ Open (submit), FOUND LIVE 2026-08-27 — THE ENTRY REPLAY CAN DESTROY A WORK-EXPERIENCE ENTRY.**
+When an entry DISAGREES with the approved review the replay deletes it and re-adds it from the bundle
+(correct, and it worked for Experience entry 3 and Education entry 1 in the same run). But entry 1
+filled 6 fields and then **`no-add-control`** — so the entry was deleted and never restored, and the
+run ended with 6 `work_experience[1].*` verify failures. The gate refused and nothing was submitted,
+which is the safety net working; the **saved application lost an entry anyway**.
+⚠ Two things to fix together, and the second is why one failure hid another:
+1. `atsInjOrcCommitEntryAndWait` reads the commit control **ONCE** (`const add0 = pickCommit(); if
+   (!add0) return "no-add-control"`, ats.js) — the re-press loop underneath only runs *after* it is
+   found, so the one step with no wait is finding the button at all. The comment directly above it
+   already records that ORC ignores clicks landing before it has wired the handler. **Hypothesis
+   consistent with the evidence, not proven** (n=1; sibling entries committed fine in the same run),
+   so poll for the control before concluding it is absent.
+2. The failed commit left the entry form **OPEN**, and the next entry then could not be opened
+   (`entry-already-open`) — so **Experience entry 2 was silently never checked**. A failed entry must
+   close its form before moving on, or one lost entry becomes two unverified ones.
+
 **Open (submit):** the ex-Oracle screening question fails the replay `read null` after 2 presses over
 8s (34.7s on the field) — ORC renders an option group **two ways** (radios sharing a `name`, and
 `type=checkbox` with `name: null`), so the yes/no reader likely handles only the first. Needs a live

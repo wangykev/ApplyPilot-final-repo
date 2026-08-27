@@ -5799,3 +5799,62 @@ blockers 0. **2 verify failures, so the gate refused — correctly, and nothing 
 (`profile`, `apMatch.cdpPageKey`, `preCreds`, the entry pass). Every one passed the full suite,
 because the guards scan source text. There is no linter in this repo; adding one with `no-undef` is
 the standing suggestion.
+
+---
+
+## 2026-08-27 — ORC: the review→rehearse contract, verified; and Oracle's "no longer available" reported
+
+**Goal:** prove end to end that a replay reproduces the operator's edits EXACTLY — fill a fresh
+requisition, deliberately change approved values on the tracker (including a date **month only**,
+leaving its year, to exercise the per-half split), approve, then rehearse `arm:false`.
+
+**Build proof first.** `AP_PING` reported `orc-pagegate-1`, and that marker is UNIQUE to this worktree
+across main and all eight worktrees (main was on `premerge-regress-1`) — so Chrome was demonstrably
+running this branch. The `:3000` dev server was found serving the MAIN checkout, which was stale by two
+merged PRs (no `web/app/privacy`), so it was replaced with this worktree's own server on the same port —
+same origin, so no re-link, and `apSession.reviewUrl` could not go stale.
+
+**The contract holds.** Fill on eeho req 336918: 61 fields, 3 to review, `reached-final-step`,
+`required_gaps: []`, **no `refill round` line** (the 2026-08-24 bug signal correctly silent), reported
+200. Five edits were then made on the tracker and every one was verified the hard way — the `Edited N`
+chip AND the grey `autofilled: <old>` line, never the input box — and all five survived a full page
+reload, which also showed edits autosave independently of approval. `3 / 3 flagged` → `Ready to submit`.
+The rehearsal's pull confirmed the hand-off: *"loaded the website-approved bundle (61 fields, 3/3
+flagged approved) into storage — replay will use these values."*
+
+⚠ **A date half emits no `autofilled:` line** (no `original_ai_value` on that record) — the chip is the
+only edit evidence there. The month-only edit worked: `May → March` with the year untouched at `2026`.
+
+**Then Oracle blocked the rehearsal, twice, in two different ways.**
+
+1. **"This job is no longer available."** — after Apply Now, on a live requisition. Operator: *"it is
+   stuck loading, this is a bug in oracle, if you detect this ever happens then refresh the page"*, then
+   *"it says the job is no longer available, please detect this and report it."* Both, in that order:
+   reload once, and if it says it again halt `posting-gone` in Oracle's own words. Live-verified on
+   `orc-stuckshell-2`. Measured: 336918 (the req that fill had applied to) said it on **5** consecutive
+   Apply clicks across two tabs **including a fresh one**, never resolving; unused req 343161 on the same
+   pod/account/tab opened its gate cleanly. Not tab-local `sessionStorage`, not slowness.
+   ⚠ `atsPostingGone` was deliberately left alone — it judges title + URL, and body text there would let
+   one sentence condemn a live posting on any tenant.
+
+2. **The entry replay destroyed a work-experience entry.** On a fresh fill of req 343161 (61 fields,
+   clean) with four edits approved, the rehearsal reached the form and **did enforce them**:
+   `phoneNumber--number → filled · after "(850) 666-0277"` (the edited value on the live form), and both
+   `Education entry 1` and `Experience entry 3` were detected as DISAGREEING, deleted and **RESTORED
+   from the approved review**. That is the contract working on the repeating sections too.
+   But `Experience entry 1` filled 6 fields and then **`no-add-control`** — deleted, never restored —
+   and the open form it left behind made `Experience entry 2` unopenable (`entry-already-open`), so that
+   entry was **silently never checked**. Verify: `55 replayed, 6 failure(s)`, all `work_experience[1].*`;
+   `submitted: false`, `stopped: verify-failed`. **The gate did its job — nothing was clicked — but the
+   saved application lost an entry.** Diagnosis and the two fixes are in CLAUDE.md; the first is a
+   hypothesis (n=1, siblings committed fine in the same run), not a conclusion.
+
+**Verified:** fill ✓ · edits committed + persisted ✓ · approve ✓ · approved bundle reaching the replay ✓ ·
+replay writing the operator's values ✓. **NOT reached:** a rehearsal at `0 failure(s)` — blocked by the
+entry bug above, not by the contract. Nothing was ever armed; `arm:false` throughout.
+
+**Tests:** 1750 pass / 0 fail, eslint clean. Both new tests mutation-checked in the direction that bites
+(neuter the recognizer → recognizer test fails; drop the cap → bounded test fails; rename the halt →
+report test fails). One existing guard was un-brittled: it sliced a fixed `i + 2600` window from the
+`none` branch, so adding a comment pushed `halt("unknown-page"` past the cutoff and failed a test whose
+subject still did everything it asserted — it anchors to the next branch now.
