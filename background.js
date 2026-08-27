@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "dry-verify-18";
+const AP_BUILD_MARKER = "submit-scroll-19";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6945,10 +6945,31 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // the second click is the one that actually submits. Both are inside the SAME arm
     // authorization — the operator authorized submitting this application, not a number of clicks
     // — and the gate is answered from the operator's own mailbox (atsAnswerEmailVerify).
-    LOG("⚠ ARMED — clicking Submit (trusted input).");
+    // ⚠⚠ RE-READ THE RECT **WITH A SCROLL**, AND REFUSE AN OFF-SCREEN ONE (2026-08-27).
+    // `state.rect` came from a detection read, which deliberately does not move the page — and a
+    // bounding rect is VIEWPORT-relative. Measured live on Greenhouse: the submit button sits at
+    // cy **6430** in a **719px** viewport, so the click was dispatched roughly nine screens below
+    // anything visible and hit nothing. The run then logged "⚠ ARMED — clicking Submit" and sat
+    // through its whole outcome loop seeing no confirmation, no captcha, no errors and no email
+    // gate — because the button was never pressed. The operator watched it and said exactly that.
+    // Every FIELD filled correctly throughout, because field clicks go through trustedFocus →
+    // cdpRectReady(sel, true), where the `true` is a scroll. Only this path read a raw rect.
+    const clickState = await cdpEval(atsInjSubmitState, ats, true).catch(() => null);
+    const clickRect = clickState && clickState.rect;
+    // POSITIVE evidence the coordinate is clickable. A rect still outside the viewport after a
+    // scroll means something is wrong we do not understand, and a click there is a silent no-op —
+    // the single worst outcome for this action, because "nothing happened" is indistinguishable
+    // from "the form ignored us" in every log line that follows.
+    const vh = await cdpEval(function () { return window.innerHeight; }).catch(() => null);
+    if (!clickRect || (typeof vh === "number" && (clickRect.cy < 0 || clickRect.cy > vh))) {
+      LOG(`✗ REFUSING to click: the submit button is not on screen after scrolling (cy=${clickRect ? clickRect.cy : "?"}, viewport=${vh}). Nothing was submitted.`);
+      return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "submit-offscreen", ats,
+        detail: "The submit button could not be brought into view, so clicking it would have done nothing. Everything is filled and verified — press Submit yourself in the tab." };
+    }
+    LOG(`⚠ ARMED — clicking Submit (trusted input) at ${clickRect.cx},${clickRect.cy} (viewport ${vh}px).`);
     cdpSetSyntheticInput(false);
     const clickedAtMs = Date.now();
-    await cdpClickAt(state.rect.cx, state.rect.cy);
+    await cdpClickAt(clickRect.cx, clickRect.cy);
     // Outcome: confirmation, validation errors, a captcha challenge that popped on submit, or the
     // email-verification gate. Errors are checked LAST on each tick: the gate renders its own
     // `[role="alert"]`-ish furniture, and reading that as a validation failure would report a
@@ -6974,7 +6995,9 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         if (ev && ev.done) {
           verifiedVia = ev.emailedTo || true;
           // ── the SECOND half of the same authorized submit ──
-          const s3 = await cdpEval(atsInjSubmitState, ats).catch(() => null);
+          // …and the COMPLETING click needs the same scroll for the same reason. The gate re-renders
+          // the footer, so the button has almost certainly moved since the first read.
+          const s3 = await cdpEval(atsInjSubmitState, ats, true).catch(() => null);
           if (!s3 || !s3.hasSubmit || !s3.rect) {
             return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-submit-missing", ats,
               detail: "The code is entered but the submit button could not be located to press it. Press Submit yourself in the tab." };

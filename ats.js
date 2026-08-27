@@ -2887,7 +2887,26 @@ function atsInjTickConsent(sel) {
 
 // The submit control + captcha/confirmation state — READ-ONLY (the click itself is the
 // caller's, trusted, and gated). One reader for everything the gate needs to see.
-function atsInjSubmitState(ats) {
+// ⚠⚠ `scroll` IS WHAT MAKES THE RETURNED RECT CLICKABLE (2026-08-27). `getBoundingClientRect` is
+// VIEWPORT-relative, and these application forms are enormous: measured on a live Greenhouse form,
+// the submit button sits at **cy 6430 in a 719px viewport** with `scrollY 0` — so
+// `cdpClickAt(cx, 6430)` dispatches a mouse event roughly nine screens below anything visible and
+// hits NOTHING. `document.elementFromPoint` at that coordinate returns null, which is the same
+// answer the browser gives the synthetic click.
+//
+// That is why an armed submit could log "⚠ ARMED — clicking Submit" and then sit through its whole
+// 30s outcome loop seeing no confirmation, no captcha, no validation error and no email gate: the
+// button was never pressed. The operator watched it happen and said so — "it did not press the
+// submit button at all" — which is the observation that separated this from the gate work, because
+// every one of those absences is equally consistent with "the click missed".
+//
+// ⚠ It is ALSO why this went unnoticed while every FIELD filled correctly: field clicks go through
+// `trustedFocus` → `cdpRectReady(sel, true)`, and that `true` is a scroll. Only the submit path read
+// a raw rect. Mirrors cdpRectOf's proven form (`block:"center", behavior:"instant"`).
+//
+// Default OFF so every DETECTION caller — atsLooksLikeApplicationForm, the pre-click gate, the
+// post-click outcome poll — keeps reading the page without moving it. Only the click site asks.
+function atsInjSubmitState(ats, scroll) {
   const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   let btn = null;
   if (ats === "lever") btn = document.querySelector("#btn-submit");
@@ -2916,6 +2935,9 @@ function atsInjSubmitState(ats) {
     const pag = document.querySelector("apply-flow-pagination") || document;
     flowNext = [...pag.querySelectorAll("button")].find((b) => /^(next|continue)\b/i.test((b.textContent || "").trim()) && vis(b)) || null;
   }
+  // Scroll BEFORE measuring, never after — the rect IS the thing the caller clicks. See the note
+  // on this function's signature for why an unscrolled rect made the click miss entirely.
+  if (btn && scroll) { try { if (btn.scrollIntoView) btn.scrollIntoView({ block: "center", behavior: "instant" }); } catch (e) { /* an unscrollable button still returns its rect */ } }
   const r = btn ? btn.getBoundingClientRect() : null;
   // a VISIBLE captcha challenge. ⚠ Lever's DORMANT invisible-mode hCaptcha container is a
   // FULL-VIEWPORT iframe (1547×720 live) with `visibility:hidden` — a size-only test calls
