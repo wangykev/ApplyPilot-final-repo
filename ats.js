@@ -3078,6 +3078,25 @@ function atsPostingGone(jd, requestedUrl, landedUrl) {
   return null;
 }
 
+// ⚠⚠ ORACLE'S APPLY FLOW SOMETIMES FAILS TO BOOT AND SAYS THE JOB IS GONE (operator, 2026-08-27).
+// Pressing Apply Now navigates, the SPA shell never renders the flow, and what the candidate is left
+// looking at is "This job is no longer available." — on a requisition that is perfectly live. Live
+// this halted a rehearsal `unknown-page`; refreshing the tab by hand brought APPLY NOW straight back,
+// and the CX REST endpoint answered for the same id throughout. The operator's standing instruction
+// is to refresh when this appears.
+//
+// ⚠ THE PHRASE IS AMBIGUOUS AND MUST NOT BE READ AS A VERDICT. A genuinely-closed requisition says
+// the same thing, so this can never mean "the posting is fine" — it means "one reload will tell you".
+// That is exactly why the caller reloads ONCE and then re-draws its own conclusion from the reloaded
+// page: a stuck shell comes back as the apply flow, a dead posting says it again and still halts,
+// and `atsPostingGone` (title + URL, never body text) is left to name that case as it always did.
+// Bounded at one reload per run for the same reason Workday's soft-error retry is — a reload that
+// did not help twice is evidence, not something to keep paying for.
+const ATS_ORC_STUCK_RE = /\bthis job is no longer available\b/i;
+function atsOrcStuckShell(text) {
+  return ATS_ORC_STUCK_RE.test(String(text == null ? "" : text));
+}
+
 function atsPlacePick(candidate, texts) {
   const c = String(candidate == null ? "" : candidate);
   const city = c.split(",")[0].trim().toLowerCase();
@@ -10911,7 +10930,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsOrcDurableName,
     atsOrcTileHoldsValue, atsYearMonthKey, atsDegreeLevel, atsDegreeMatch, atsDegreeAcronym, atsDialMatch, atsDialCode, atsDialName,
-    atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
+    atsPlacePick, atsPostingGone, atsOrcStuckShell, ATS_ORC_STUCK_RE, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
     atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,

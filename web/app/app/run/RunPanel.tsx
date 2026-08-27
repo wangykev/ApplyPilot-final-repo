@@ -39,6 +39,9 @@ const ONBOARD_STOP: Record<string, string> = {
   "workday-maintenance": "Workday is in planned maintenance. Try again after the maintenance window.",
   "unknown-page": "Couldn't find an Apply / sign-in / form on that page. Make sure the link is the job posting.",
   "already-applied": "You've already applied to this job — Workday won't reopen the application, so there's nothing to fill.",
+  // ⚠ The extension only reports this once the site has said it TWICE, with a reload in between — so
+  // the copy can state it plainly instead of hedging about a page that might still be loading.
+  "posting-gone": "The site says this posting is no longer available, so the application never opened. Nothing was filled. If it still looks live, the employer's site is refusing to reopen this particular requisition — try another posting.",
 };
 
 // Friendly one-liners for the fill-walk stops (from runCdpWalk).

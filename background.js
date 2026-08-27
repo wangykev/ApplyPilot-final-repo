@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-pagegate-1";
+const AP_BUILD_MARKER = "orc-stuckshell-2";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -4831,6 +4831,7 @@ async function runOrcPreForm(tabId, credentials, opts) {
   // every path that worked before is byte-identical. The `code` view keeps its own MAX_CODE_TRIES.
   let lastView = null, sameView = 0, authRetries = 0;
   const ORC_AUTH_RETRY_MAX = 3;
+  let orcShellReloads = 0;   // ORC's stuck-shell bug — ONE reload per run; see the `none` branch below
 
   // ORC's renderer blocks Runtime.evaluate for many seconds across a route transition (measured six
   // times during recon), and its page timers do not fire while that happens — so every wait here is
@@ -4924,6 +4925,48 @@ async function runOrcPreForm(tabId, credentials, opts) {
         if (v && v !== "none" && v !== "unreadable") { settled = { s: again, v }; break; }
       }
       if (!settled) {
+        // ⚠⚠ ORACLE'S SHELL SOMETIMES FAILS TO BOOT AND CLAIMS THE JOB IS GONE (operator, 2026-08-27:
+        // "it is stuck loading, this is a bug in oracle, if you detect this ever happens then refresh
+        // the page"). Live: Apply Now navigated, the flow never rendered, and the page read "This job
+        // is no longer available." on a requisition the CX REST endpoint was still serving — a
+        // rehearsal halted `unknown-page` here, and one manual refresh brought APPLY NOW back.
+        //
+        // The body text is only read on THIS path — after a 20s settle has already failed — so a
+        // healthy run pays nothing for it. And the reload is not a verdict: the same sentence is what
+        // a genuinely-closed requisition says, so we reload ONCE and let the reloaded page re-argue
+        // its own case through the unchanged routing. A stuck shell comes back as the apply flow; a
+        // dead posting says it again, halts, and `atsPostingGone` names it at the caller exactly as
+        // before. Bounded at one, like Workday's soft-error reload: a reload that did not help is
+        // evidence, not something to keep paying for.
+        const shellText = await cdpEval(function () {
+          return { ok: true, text: String((document.body && document.body.innerText) || "").slice(0, 600) };
+        }).catch(() => null);
+        if (shellText && atsOrcStuckShell(shellText.text)) {
+          if (orcShellReloads < 1) {
+            orcShellReloads++;
+            LOG("⚠ Oracle's apply flow did not boot and the page claims the job is gone — reloading once to tell a stuck shell from a real closure.");
+            await cdpReload();
+            await cdpDelay(6000);
+            continue;   // re-enter the loop and route on whatever the reloaded page actually is
+          }
+          // ⚠ IT SAID IT AGAIN AFTER THE RELOAD — REPORT IT, DO NOT BURY IT (operator, 2026-08-27:
+          // "it says the job is no longer available, please detect this and report it"). The refresh
+          // is what separates ORC's boot flake from a requisition that genuinely cannot be applied
+          // to; once it has been spent, Oracle has said the same thing twice and the operator needs
+          // ORACLE'S OWN SENTENCE, not `unknown-page`. Measured on eeho req 336918 (2026-08-27):
+          // persistent across two tabs, a fresh tab and repeated reloads, while an unused req on the
+          // same pod opened its gate cleanly — so this is a property of the requisition, not of us.
+          //
+          // ⚠ `atsPostingGone` cannot reach this case and is not the place to teach it: it judges
+          // TITLE and URL (the title here stays "Oracle Careers" and the job id never leaves the
+          // URL), and widening it to body text would let one sentence anywhere on any tenant's page
+          // condemn a live posting. This stop is Oracle-specific and evidence-specific on purpose.
+          return halt("posting-gone",
+            "Oracle says “This job is no longer available” for this requisition and said it again after a reload, " +
+            "so the apply flow never opened. Nothing was filled or submitted. If the posting looks live, it is Oracle refusing " +
+            "to reopen this particular requisition — try a different one.",
+            { oracleSaid: "This job is no longer available", reloaded: true });
+        }
         return halt("unknown-page", `No Oracle apply control, gate, code box or form section on ${(s && s.url) || "this page"} after ${((Date.now() - noneT0) / 1000).toFixed(1)}s and ${reads} read(s) — nothing safe to act on.`);
       }
       LOG(`the page was still rendering — view settled to ${settled.v} after ${((Date.now() - noneT0) / 1000).toFixed(1)}s`);

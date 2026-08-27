@@ -2291,6 +2291,58 @@ test("atsPostingGone: names a dead posting, and stays silent on a healthy one", 
   assert.strictEqual(ats.atsPostingGone(null, "https://jobs.ashbyhq.com/x/abc", "https://jobs.ashbyhq.com/x/abc"), null);
 });
 
+// ── ORC's stuck shell: the sentence that means "reload", not "give up" (live 2026-08-27) ──
+// Oracle's apply flow sometimes fails to boot after Apply Now and renders "This job is no longer
+// available." over a requisition its own REST endpoint is still serving. A rehearsal halted
+// `unknown-page` on exactly that; one refresh restored APPLY NOW.
+test("atsOrcStuckShell: recognizes Oracle's stuck apply shell, and claims nothing else", () => {
+  // the live text, verbatim from the page that halted a rehearsal
+  assert.ok(ats.atsOrcStuckShell(
+    "Skip to main content. This job is no longer available. You may also SEARCH FOR JOBS."));
+  assert.ok(ats.atsOrcStuckShell("THIS JOB IS NO LONGER AVAILABLE"));   // case-insensitive
+
+  // ⚠ It must NOT fire on an ordinary page — this gates a reload, and a reload of a page that was
+  // merely slow throws away whatever it had rendered.
+  for (const t of [
+    "",
+    null,
+    "Senior Principal Firmware Engineer (OCI) — Apply Now",
+    "This job is available",
+    "No longer accepting applications",        // a real closure notice, different wording
+    "Your application is no longer editable",  // "no longer" without the subject
+  ]) assert.strictEqual(ats.atsOrcStuckShell(t), false, JSON.stringify(t));
+});
+
+// ⚠ THE RELOAD MUST BE BOUNDED, and it is bounded by a counter the settle branch reads. A loop that
+// reloads whenever the view will not settle is an infinite reload on a genuinely dead posting — the
+// failure this whole branch exists to avoid re-introducing. Source-scanned because the guard lives
+// inside runOrcPreForm's loop and cannot be reached from a unit test; comments stripped first, since
+// the code above documents the shape it refuses (three guards in this repo have failed on their prose).
+// ⚠ THE RELOAD MUST BE BOUNDED, AND WHAT FOLLOWS IT MUST BE A REPORT (operator, 2026-08-27: "it says
+// the job is no longer available, please detect this and report it"). Unbounded, this is an infinite
+// reload on a genuinely dead posting; bounded but silent, the operator gets `unknown-page` for a site
+// that told us in plain English why it would not open. Source-scanned because the branch lives inside
+// runOrcPreForm's loop and cannot be reached from a unit test; comments stripped first, since the code
+// documents the shapes it refuses (three guards in this repo have failed on their own prose).
+test("runOrcPreForm: the ORC stuck-shell reload is capped at one, then REPORTS what Oracle said", () => {
+  const src = stripJsComments(require("fs").readFileSync(require("path").join(__dirname, "..", "background.js"), "utf8"));
+  assert.match(src, /let orcShellReloads = 0/, "the per-run counter must exist");
+  assert.match(src, /atsOrcStuckShell\(shellText\.text\)/, "the branch must be gated on the stuck-shell evidence");
+  assert.match(src, /orcShellReloads < 1/, "the reload itself must be capped");
+  assert.match(src, /orcShellReloads\+\+/, "the counter must actually advance");
+  // declaration + cap + increment, and nothing else — a second reload site would double the cap
+  assert.strictEqual((src.match(/orcShellReloads/g) || []).length, 3,
+    "declaration + cap + increment, and nothing else");
+
+  // …and once the reload is spent it must HALT with a named stop carrying Oracle's own words, never
+  // fall through to the generic unknown-page. This is the half the operator asked for.
+  const i = src.indexOf("atsOrcStuckShell(shellText.text)");
+  const branch = src.slice(i, src.indexOf('return halt("unknown-page"', i));
+  assert.ok(branch.length > 0, "the stuck-shell branch must sit ahead of the unknown-page halt");
+  assert.match(branch, /halt\("posting-gone"/, "a twice-said closure must be reported as posting-gone");
+  assert.match(branch, /no longer available/, "the halt must quote what the site actually said");
+});
+
 // ── a query can annihilate a COMPLETE list, and the answer survives anyway (live 2026-08-07) ──
 // Measured on Discord's `discipline--0`: 72 options on open; typing the profile's own wording
 // ("Electrical and Computer Engineering", which that form words differently) filters the menu to
@@ -3612,7 +3664,13 @@ test("the ORC pre-form SETTLES before concluding a page is unknown", () => {
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "background.js"), "utf8");
   const i = src.indexOf('if (view === "none") {');
   assert.ok(i > 0, "the none branch must exist");
-  const branch = src.slice(i, i + 2600);
+  // ⚠ ANCHOR THE WINDOW TO THE BRANCH, NEVER TO A CHARACTER COUNT. This read `i + 2600` until
+  // 2026-08-27, when adding the stuck-shell reload pushed `halt("unknown-page"` past the cutoff and
+  // the test failed on a branch that still did everything it asserts. A guard that breaks when a
+  // comment grows teaches the next person to delete the comment.
+  const end = src.indexOf("if (sameView > 0 &&", i);
+  assert.ok(end > i, "the branch after `none` must still follow it — the anchor moved");
+  const branch = src.slice(i, end);
   const stripComments = (t) => String(t)
     .replace(/\/\*[\s\S]*?\*\//g, " ")
     .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
