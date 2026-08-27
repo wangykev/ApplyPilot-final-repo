@@ -7868,9 +7868,42 @@ async function atsGrowIcimsEntries(act, ats, scan, profile, wantBySection) {
   return current;
 }
 
+// -- WHICH REQUIRED FIELDS DID THE PAGE END UP WITH EMPTY? (operator, 2026-08-24) ----------
+// "make sure each page is filled correctly before going to the next page. oracle allows you to go to
+// the next page even if a certain page is unfilled, but the submit won't click so make sure each page
+// is correct before moving on."
+//
+// That asymmetry is the whole reason this exists. WORKDAY refuses to advance past an incomplete page,
+// so a gap there announces itself as a nav-timeout while the operator is still watching. ORC advances
+// happily and only withholds SUBMIT -- so the same gap travels silently to the end of the walk and
+// surfaces as a submit that will not click, three steps away from its cause.
+//
+// PURE, so it is unit-testable and there is one definition of "empty". Judged from a FRESH scan of the
+// live page rather than from our own records: a record says what we THINK we wrote, and this question
+// is what the FORM actually holds.
+//
+// Exclusions, each for a stated reason:
+//   * file_upload -- ORC's file input reports no value once the upload has been accepted, exactly as
+//     iCIMS' does, so an attached resume would read as an empty required field. The resume has its own
+//     resume-not-attached halt; bundleSubmitBlockers excludes it for the same reason.
+//   * decoys -- the honeypot is `aria-hidden` + untabbable and is never ours to fill.
+//   * a checkbox -- unchecked is an ANSWER ("no"), not an empty field. Same rule the submit gate uses.
+function atsOrcRequiredGaps(fields) {
+  return (Array.isArray(fields) ? fields : []).filter((f) => {
+    if (!f || f.isRequired !== true) return false;
+    if (f.widgetType === "file_upload" || f.widgetType === "checkbox") return false;
+    if (f.decoy || atsDecoyKind(f)) return false;
+    const v = f.value == null ? "" : String(f.value).trim();
+    return v === "";
+  });
+}
+
 async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   const o = opts || {};
   const bucketIndex = atsFd.buildBucketIndex(o.buckets);
+  // Declared up here because the ORACLE country pre-pass below fills a field before the main loop and
+  // its record has to land in the same list (see the country-first note).
+  const results = [];
   // ⚠ EVERYTHING BETWEEN HERE AND THE atsFillFields CALL BELOW IS DEAD AIR ON THE PAGE — the form is
   // rendered and nothing is being written to it yet. That is the second half of the pause the operator
   // reported on ORC (2026-08-21), and it was entirely untimed: the scan, the option capture and the
@@ -7890,6 +7923,55 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // the caller derived from the approved bundle (see atsGrowIcimsEntries — it used to be skipped
   // whenever `valueFor` was present, which is exactly the submit run).
   if (ats === "icims") scan = await atsGrowIcimsEntries(act, ats, scan, profile, o.entryCounts);
+  // ⚠⚠ COUNTRY IS THE ADDRESS BLOCK'S PARENT — COMMIT IT AND RE-SCAN BEFORE TOUCHING ANYTHING ELSE
+  // (live 2026-08-24). Operator: "you did not fill out address or postal code so many fields were
+  // blank."
+  //
+  // What actually happened, from that run's own log: `country -> filled "United States" 627ms`
+  // SUCCEEDED — but it ran after the address block had already been scanned, and committing it
+  // RE-RENDERS that whole block. Three consequences, all in one page:
+  //   * ids are re-minted, so the write went to a node that no longer existed:
+  //     `addressLine1 -> set failed: not-found:#addressLine1-27`. ORC ids carry a volatile render
+  //     counter, which CLAUDE.md already states as "resolve them LIVE, never from a remembered value".
+  //   * the block we scanned was Oracle's DEFAULT locale, labelled **"Pin Code"** — so a US ZIP had
+  //     nothing to match: `postalCode -> none of ["32312"] matched Oracle's list`.
+  //   * postal code is the geo ANCHOR, so its failure meant the cascade never fired and city /
+  //     region1 / region2 were all left empty. Five review items on a page that normally has one.
+  //
+  // This is the iCIMS parent->child lesson on a different tenant: "the child's list reads 'Please
+  // select a country' until the parent commits". ORC declares the same dependency and we were reading
+  // the child before the parent had spoken.
+  //
+  // So: fill country FIRST, let the block settle, then re-scan. Everything downstream — the option
+  // capture, the geo plan, the field loop — then works from the post-country DOM, which is the only
+  // one whose ids, labels and option lists are real.
+  //
+  // ⚠ Scoped to a field the profile can actually answer, and it never re-scans when there is nothing
+  // to commit, so a form without a country field is byte-identical to before.
+  if (ats === "oracle") {
+    const cf = ((scan && scan.fields) || []).find((f) => f.fieldName === "country" && f.widgetType === "select");
+    const cval = cf ? atsFd.resolve(atsRouteField(ats, cf, profile, defaults, jobContext, bucketIndex, o.credentials), cf.widgetType) : null;
+    if (cf && cval != null && String(cval).trim() !== "") {
+      const pre = [];
+      await atsFillFields(act, ats, scan, [cf], pre, profile, defaults,
+        Object.assign({}, jobContext, { company: (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url) }),
+        bucketIndex, Object.assign({}, o, { aiCache: (o && o.aiCache) || new Map() }));
+      for (const r of pre) results.push(r);
+      const okc = pre.length && pre[0].status === "filled";
+      console.log(`[ApplyPilot][ATS-GEO] country committed FIRST (${okc ? JSON.stringify(pre[0].after) : "NOT filled"})`
+        + " — re-scanning, because committing it re-renders the whole address block (new ids, new labels, new option lists)");
+      // Settle on the block's own identity rather than a timer: the re-render changes the field SET
+      // and/or the ids, so a signature that includes both is the evidence that it has happened.
+      const sig0 = atsFormSignature(scan);
+      for (let i = 0; i < 20; i++) {
+        await act.delayFull(120);
+        const s2 = await act.eval(atsInjScan, ats).catch(() => null);
+        if (s2 && s2.fields && atsFormSignature(s2) !== sig0) { scan = s2; break; }
+        if (s2 && s2.fields) scan = s2;   // keep the freshest read even if the signature never moved
+      }
+      atsAssignEntryIndexes(ats, scan.fields);
+    }
+  }
   // ⚠ BEFORE the fill, because it is what decides whether an UNFILLED field reaches review as a real
   // picker — the operator's standing rule. Read-only, and it enriches the scan so every downstream
   // atsAttachOptions call works unchanged.
@@ -7946,7 +8028,6 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     const parts = Object.entries(per).map(([k, v]) => `${k} ${v.withOpts}/${v.total}${v.partial ? ` (${v.partial} partial)` : ""}`);
     if (parts.length) console.log(`[ApplyPilot][ATS-OPTIONS] scan-time coverage — ${parts.join(" · ")}`);
   } catch (e) { /* diagnostic only */ }
-  const results = [];
   const company = (jobContext && jobContext.company) || atsCompanyFromUrl(scan.url);
   const jc = Object.assign({}, jobContext, { company });
   // ONE AI answer cache for the whole page, keyed by normalized QUESTION — so a field a cascade
@@ -8025,7 +8106,99 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // atsFinishFill does not receive `o`, and the entry pass inside it already cost one live run by
   // being written against driveAtsPageFill's scope — `profile is not defined`, thrown into a silent
   // catch. `o.valueFor` is this file's established "this is a replay" signal (see the match opts).
-  return await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext, !!o.valueFor, o.valueFor, o.entryCounts);
+  // ⚠⚠ IS THIS PAGE ACTUALLY COMPLETE? (operator, 2026-08-24 -- see atsOrcRequiredGaps.) ORC will let
+  // the walk advance off a half-filled page and then silently refuse to submit at the end, so the page
+  // is asked its own verdict here, while there is still something to do about it.
+  //
+  // One targeted RETRY before giving up, because the common cause is a re-render that moved an id
+  // under us (`set failed: not-found`) -- and a re-render is exactly the thing a second pass on a
+  // fresh scan fixes. The retry REPLACES the earlier record rather than appending: the failed
+  // attempt's tier and detail describe a different commit, and two records for one field is something
+  // the bundle cannot represent.
+  // ⚠⚠ REFILL A REQUIRED FIELD THE PAGE LEFT EMPTY — do not halt on it (operator, 2026-08-24: "wait do
+  // not halt on a bad list, make sure it is correct" / "so refill it if it is wrong").
+  //
+  // The live failure this exists for was a WRONG LIST, not an unanswerable question: committing Country
+  // re-renders the address block, and a scan taken beforehand held Oracle's default-locale form, so a
+  // US ZIP was matched against a "Pin Code" list (`none of ["32312"] matched`) and `addressLine1` wrote
+  // to an id that had been re-minted (`set failed: not-found`). Nothing was wrong with the ANSWER — the
+  // page we were reading was stale. So the remedy is to look again and write again, which is what these
+  // rounds do; halting would have stopped a walk that a second look fixes.
+  //
+  // Each round RE-SCANS, so a re-render, a re-minted id or a refreshed option list is picked up. Rounds
+  // stop early when nothing is left, and also when a round makes NO progress — a field that cannot be
+  // answered will not become answerable by asking a third time, and spinning on it costs the operator
+  // wall-clock for nothing.
+  //
+  // ⚠⚠ GEO DEPENDENTS ARE NEVER RETRIED, and the existing tests caught me getting this wrong: the first
+  // version of this pass typed into `#city`, which CLEARS the postal-code anchor that produces it. A
+  // dependent being empty is a symptom of the ANCHOR failing, so the anchor is the thing worth retrying
+  // — and when it lands, Oracle fills the dependents itself.
+  let requiredGaps = [];
+  if (ats === "oracle") {
+    const ORC_REFILL_ROUNDS = 3;
+    let gaps = [];
+    for (let round = 0; round < ORC_REFILL_ROUNDS; round++) {
+      const gapScan = await act.eval(atsInjScan, ats).catch(() => null);
+      if (!gapScan || !gapScan.fields) break;
+      atsAssignEntryIndexes(ats, gapScan.fields);
+      // Re-derive the geo roles on THIS scan — the stamps from the earlier scan are on different objects.
+      const g2 = atsOrcGeoPlan(gapScan.fields, profile, o.valueFor);
+      if (g2) {
+        g2.anchor.geoAnchor = true;
+        g2.anchor.geoAnchorValue = g2.anchorValue;
+        for (const d of g2.dependents) { d.geoDependent = true; d.geoAnchorName = g2.anchor.label || g2.anchor.fieldName; }
+      }
+      const all = atsOrcRequiredGaps(gapScan.fields);
+      gaps = all.filter((f) => !f.geoDependent);
+      const skippedDeps = all.length - gaps.length;
+      if (!gaps.length) {
+        if (skippedDeps) {
+          console.log(`[ApplyPilot][ATS-FILL] ${skippedDeps} geo dependent(s) are still empty — NOT retried: typing into one `
+            + "clears the anchor that fills it. They reach review for a human instead.");
+        }
+        break;
+      }
+      if (round + 1 >= ORC_REFILL_ROUNDS) {
+        console.log(`[ApplyPilot][ATS-FILL] ⚠ ${gaps.length} required field(s) still empty after ${round} refill round(s): `
+          + gaps.map((f) => f.fieldName).join(", ") + " — leaving them for review rather than spinning");
+        break;
+      }
+      console.log(`[ApplyPilot][ATS-FILL] ⚠ refill round ${round + 1}: ${gaps.length} REQUIRED field(s) empty — `
+        + gaps.map((f) => f.fieldName).join(", ") + " (re-scanned, so a re-render or a refreshed list is picked up)");
+      // Replace the earlier record rather than appending: the failed attempt's tier and detail describe
+      // a different commit, and two records for one field is something the bundle cannot represent.
+      for (const f of gaps) {
+        for (let i = results.length - 1; i >= 0; i--) {
+          if (results[i].fieldName === f.fieldName) results.splice(i, 1);
+        }
+      }
+      const before = gaps.length;
+      await atsFillFields(act, ats, gapScan, gaps, results, profile, defaults, jc, bucketIndex, fillOpts);
+      scan = gapScan;
+      const check = await act.eval(atsInjScan, ats).catch(() => null);
+      const left = atsOrcRequiredGaps(check && check.fields).filter((f) => {
+        const g3 = atsOrcGeoPlan((check && check.fields) || [], profile, o.valueFor);
+        return !(g3 && g3.dependents.some((d) => d.fieldName === f.fieldName));
+      });
+      if (left.length >= before) {
+        gaps = left;
+        console.log(`[ApplyPilot][ATS-FILL] refill round ${round + 1} changed nothing (${left.length} still empty) — `
+          + "stopping: a field that cannot be answered will not become answerable by asking again");
+        break;
+      }
+      gaps = left;
+    }
+    requiredGaps = gaps.map((f) => ({ fieldName: f.fieldName, label: f.label || f.fieldName, widgetType: f.widgetType }));
+    console.log(requiredGaps.length
+      ? `[ApplyPilot][ATS-FILL] ⚠ page still has ${requiredGaps.length} required field(s) empty: `
+        + requiredGaps.map((g) => JSON.stringify(g.label)).join(", ")
+        + " — reported so review shows them; Oracle will let the walk continue but will not submit until they are answered"
+      : "[ApplyPilot][ATS-FILL] ✔ page complete — every required field on it holds a value");
+  }
+  const finished = await atsFinishFill(act, ats, scan, results, o.credentials, profile, jobContext, !!o.valueFor, o.valueFor, o.entryCounts);
+  finished.requiredGaps = requiredGaps;
+  return finished;
 }
 
 // ── DEFERRED AI: ONE batched call per page ───────────────────────────────────────────────
@@ -10719,7 +10892,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcUnclaimed, atsInjOrcScrollBlocks, atsInjOrcTiles, atsInjOrcDeleteTile, atsInjOrcDialogPress,
     atsInjOrcLinks, atsInjOrcAddLink, atsOrcFillLinks, atsInjOrcPickFromOwnList,
     atsOrcEntryIdentity, atsOrcTilesAlreadyMatch, atsInjOrcOpenEntryAndWait, atsInjOrcCommitEntryAndWait,
-    atsOrcAddApprovedEntry, atsOrcDeleteTileAt, ATS_ORC_ENTRY_IDENTITY_KEYS, atsOrcTileHoldsValue, atsOrcLegacyDateHalf,
+    atsOrcAddApprovedEntry, atsOrcDeleteTileAt, atsOrcRequiredGaps, ATS_ORC_ENTRY_IDENTITY_KEYS, atsOrcTileHoldsValue, atsOrcLegacyDateHalf,
     atsInjOrcOpenTileAndWait, atsInjOrcCloseEntry, atsInjOrcResumeReset,
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,

@@ -3658,7 +3658,10 @@ test("atsFinishFill receives what its body uses — profile and jobContext", () 
     }
   }
   // …and the single call site must actually pass them, in the right positions
-  const call = /return await atsFinishFill\(([^)]*)\)/.exec(src);
+  // ⚠ MATCH THE CALL, NOT THE `return`. The result is now captured so `requiredGaps` can be attached to
+  // it (the per-page completeness report), so the call is `const finished = await atsFinishFill(...)`.
+  // The property this test guards — that every parameter is actually passed — is unchanged.
+  const call = /await atsFinishFill\(([^)]*)\)/.exec(src);
   assert.ok(call, "the call site must exist");
   const args = call[1].split(",").map((x) => x.trim());
   assert.strictEqual(args.length, params.length,

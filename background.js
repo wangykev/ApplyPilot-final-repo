@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-merge-1";
+const AP_BUILD_MARKER = "orc-pagegate-1";
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6096,6 +6096,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     let accEntries = [], bundle = null;
     let stepsFilled = 0, walkStopped = MULTI ? null : "ats-single-page", walkDetail = null;
     const stepsWalked = [];
+    // Required fields the page could not answer, accumulated across steps and reported on the result so
+    // the caller can say WHY Oracle will not submit yet. Never a halt — see the note at the check.
+    const stepGaps = [];
     // CLEAR ONCE, before the first step (the Workday rule — a clear inside the loop is the bug).
     if (MULTI) await new Promise((r) => chrome.storage.local.set({ reviewSummary: null, reviewAudit: null }, r));
 
@@ -6178,6 +6181,34 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       for (const n of out.entryNotes || []) LOG(`⚠ step ${stepNo}: ${n}`);
       if (!MULTI) break;
 
+      // ⚠⚠ DO NOT ADVANCE OFF AN INCOMPLETE PAGE (operator, 2026-08-24): "oracle allows you to go to
+      // the next page even if a certain page is unfilled, but the submit won't click so make sure each
+      // page is correct before moving on."
+      //
+      // WORKDAY refuses the advance itself, so a gap there is impossible to miss. ORC advances and only
+      // withholds SUBMIT, so the same gap reaches the end of the walk silently and presents as a submit
+      // button that does nothing — three steps from its cause. driveAtsPageFill has already re-scanned
+      // and retried the gaps once (see atsOrcRequiredGaps); anything still empty is a real gap.
+      //
+      // Stopping here is deliberate over pressing on: the bundle is written PER PAGE, so everything
+      // filled so far is already on the tracker, the walk is marked partial, and the submit gate cannot
+      // be reached with a page the form would reject. Fixing it is one review edit plus a re-run.
+      // ⚠ REPORTED, NEVER A HALT (operator, 2026-08-24: "do not halt on a bad list, make sure it is
+      // correct" / "so refill it if it is wrong"). driveAtsPageFill has already re-scanned and refilled
+      // these up to three times — a re-render, a re-minted id or a refreshed option list is picked up by
+      // each round — so anything still empty here is a field the page cannot answer from what we hold.
+      //
+      // Halting on it would be worse than continuing: the walk would stop at step 1 and the operator
+      // would get NO review data for the later steps, which is exactly where they would fix it. Carrying
+      // on means the whole application reaches review, they answer the gap once, and the rehearsal
+      // replays it. Oracle withholds SUBMIT until then, which is the backstop that makes this safe.
+      if ((out.requiredGaps || []).length) {
+        const names = out.requiredGaps.map((g) => JSON.stringify(g.label)).join(", ");
+        LOG(`⚠ step ${stepNo} (${stepLabel}) still has ${out.requiredGaps.length} REQUIRED field(s) empty after refilling: `
+          + `${names} — continuing so the rest of the application reaches review, but Oracle will NOT submit until these `
+          + "are answered. Answer them on the review page and rehearse.");
+        stepGaps.push(...out.requiredGaps.map((g) => ({ step: stepNo, label: g.label, fieldName: g.fieldName })));
+      }
       // The advance is SHARED with the submit walk — see orcAdvanceAfterStep. Guard 1, the
       // disabled-Next wait, guard 2 and the monotone advance all live there, in one copy.
       const adv = await orcAdvanceAfterStep(stepNo, stepLabel, LOG, ats);
@@ -6300,6 +6331,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
     return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts,
       needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok),
+      // Required fields no page could answer. Surfaced so a caller can explain a submit that will not
+      // click, instead of the operator discovering it at the button.
+      required_gaps: stepGaps,
       consents_accepted: icimsConsentsAccepted, partial: !!bundle.partial,
       walk: { ok: true, pages: stepsFilled, steps: stepsWalked, stopped: walkStopped || "ats-single-page", detail: walkDetail || null } };
   } catch (e) {
