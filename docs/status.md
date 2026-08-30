@@ -179,17 +179,36 @@ A Greenhouse Submit can answer with *"enter the 8-character code"* instead of su
 is **two clicks** with a Gmail read between them. See CLAUDE.md's email-verification section (standing rules),
 `docs/dom-patterns.md` `2026-08-24` (the widget), and the progress-log entry (the two refutations).
 
-**1631 tests green** (44 new). Nothing is live-verified yet.
+**1778 tests green.** ⚠ **The feature itself is still NOT live-verified** — the gate has never been reached
+by a run (see the blocker below, which is why).
+
+### ⚠ THE BLOCKER FOUND ON 2026-08-27: the armed submit click was never landing
+
+An armed run logged `⚠ ARMED — clicking Submit` and then `no confirmation within 30s` with nothing in
+between — no confirmation, no captcha, no errors, **and no gate**. The operator watched it and said "it did
+not press the submit button at all". Measured: the submit button sits at **cy 6430 in a 719px viewport**
+(`getBoundingClientRect` is viewport-relative), so the click was dispatched ~9 screens below anything
+visible and hit nothing. Fixed in `b071cc1` — `atsInjSubmitState` takes an opt-in `scroll`, both click sites
+re-read with it, and an off-screen rect now REFUSES (`submit-offscreen`) rather than silently no-opping.
+
+⚠ **That fix is itself unverified live**, and it gates everything below: the email gate cannot appear until
+the first click actually lands. Prove the click first, then the gate — in that order, from one run.
+
+⚠ **`chrome.storage.local.dryEmailVerify` is currently SET on the dev profile.** It stops an armed run after
+the code is typed and the form re-enables Submit — so a REAL submit will not complete until it is cleared.
 
 **Remaining, in order:**
 1. Load the unpacked extension in the new browser + connect Gmail (the code path needs the same
-   `gmail.readonly` grant Workday's auto-verify uses — `docs/gmail-setup.md`).
+   `gmail.readonly` grant Workday's auto-verify uses — `docs/gmail-setup.md`). ✔ done 2026-08-27.
 2. **Rehearse first.** On a Greenhouse job with an approved bundle, expect `WOULD CLICK SUBMIT` and NOTHING
    submitted — the gate cannot appear on a rehearsal, so this only proves no regression.
-3. Then ONE armed run on a **disposable** application, eyes-on. Watch for, in order:
+3. Then ONE armed run with `dryEmailVerify` SET (submits nothing), eyes-on. Watch for, in order:
+   `⚠ ARMED — clicking Submit … at X,Y (viewport NNNpx)` — **the coordinate must be inside the viewport**;
+   that line is the whole point of the b071cc1 fix. Then:
    `EMAIL VERIFICATION GATE — the form mailed an 8-character code to …` → `✓ code found (8 chars) in a message
-   from …` → `code entered (8/8 boxes filled, submit button now ENABLED)` → `⚠ code accepted by the form —
-   clicking Submit again` → `✅ SUBMITTED`.
+   from …` → `code entered (8/8 boxes filled, submit button now ENABLED)` → then, with the dry flag set,
+   `⚠ dryEmailVerify is SET — … will NOT click it`. Clear the flag for the real thing, which continues
+   `⚠ code accepted by the form — clicking Submit again` → `✅ SUBMITTED`.
 4. **The one unproven guess is the SENDER.** `greenhouse.io` is assumed; if the mail comes from elsewhere the
    log will say `no fresh mail matched from:greenhouse.io — widening…` and still succeed. If it widens, pin
    the real sender in `atsAnswerEmailVerify`.
