@@ -1223,6 +1223,26 @@ The standing rules:
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
+- **⚠⚠ A "SELECT ALL THAT APPLY" GROUP IS ONE QUESTION — READ THE PLATFORM'S DECLARATION
+  (live 2026-08-31, Notion/Ashby).** The Ashby branch treated every checkbox in an entry as its own
+  consent box — its comment said *"one per entry"*, true of OpenAI's consents, false for a multi-option
+  question. Four grouped questions became **21 phantom fields**, each labelled with its own OPTION text,
+  and the questions themselves reached the bundle **nowhere**. Ashby declares the group on the entry
+  (`ashby-application-form-input-checkbox-group`, a `<fieldset>`; question = its `label[class*="_heading_"]`),
+  so this is a READ, not an inference — the same discipline as iCIMS' `iCIMS_FieldRow` and ORC's
+  `--radiogroup`. Beyond the noise, two things bit, both off the live bundle:
+  **(1) the label ladder routes on the LABEL** — the phantom labelled `LinkedIn` resolved to
+  `websites.0.url` and tried to write the operator's LinkedIn *profile URL* into a checkbox meaning "I
+  heard about this job on LinkedIn" (it reached review only because a URL matches no option — luck of the
+  value, not a refusal); **(2) required-ness is declared on the QUESTION, not the boxes** — no member
+  carries `required` and `aria-required` is absent, so three REQUIRED questions all reported
+  `isRequired:false`, the dangerous direction. ⚠ The key is the question id parsed out of the box id
+  (`<formId>_<questionId>-labeled-checkbox-<N>`, take after the LAST `_`) — **never `name`, which holds the
+  OPTION text**; a one-box declared group is still a group (the 2026-08-20 ORC ruling); and members are
+  excluded from the solo loop **by their container, not by `seen`**, because a member's `name` collides
+  with real fields (the live form has an input whose own key is likewise `LinkedIn`).
+  ⚠ **`test/ats-ashby-checkbox-group.test.js` is the FIRST test that executes `atsInjScan`** — every other
+  suite stubs it, which is exactly why a shape bug this size survived.
 - **AN OPTIONAL CHOICE FIELD MUST REACH REVIEW AS A REAL PICKER — EVERY ATS, NOT JUST iCIMS
   (operator, 2026-08-25).** A field we never filled still has to be ANSWERABLE on the review page, and
   a picker with no options is just a text box. ⚠ **The gap was not in the option read.** On

@@ -2227,10 +2227,88 @@ function atsInjScan(ats) {
           isRequired: list.some((r) => r.required), value: checked ? optLabel(checked) : null, options: list.map(optLabel).filter(Boolean) });
       }
     }
+    // ── DECLARED CHECKBOX GROUPS — "select all that apply" (live 2026-08-31, Notion) ─────
+    // ⚠⚠ ASHBY DECLARES THE GROUP. READ THE DECLARATION; DO NOT INFER ONE. The entry IS a
+    // <fieldset> carrying `ashby-application-form-input-checkbox-group`:
+    //
+    //   FIELDSET._container_… _fieldEntry_… ashby-application-form-input-checkbox-group
+    //    ├ LABEL._heading_…[ _required_…]      ← THE QUESTION ("How did you hear about this…")
+    //    ├ DIV._option_…  › input#<formId>_<questionId>-labeled-checkbox-0 + label ← "LinkedIn"
+    //    └ …
+    //
+    // Until this branch existed the loop below claimed these boxes. Its comment says "one per
+    // entry" — true of OpenAI's consent boxes, false here. Live on Notion that turned 4 questions
+    // into 21 phantom fields, each LABELLED WITH ITS OWN OPTION TEXT, with the questions themselves
+    // absent from the bundle entirely (`hear about` matched nothing in it). Two ways that hurts
+    // beyond the noise, both observed in the same bundle:
+    //   • THE LABEL LADDER ROUTES ON THE LABEL. The box labelled "LinkedIn" resolved to
+    //     `websites.0.url`, so the fill tried to write the operator's LinkedIn PROFILE URL into a
+    //     checkbox meaning "I heard about this job on LinkedIn". It reached needs_review only
+    //     because a URL matches no option — luck of the value, not a refusal.
+    //   • REQUIRED-NESS IS DECLARED ON THE QUESTION, NOT ON THE BOXES. Three of the four groups
+    //     are required and every phantom read `isRequired:false` — the dangerous direction
+    //     (CLAUDE.md: a required field reading false hides a field that will block submission).
+    // Same failure as ORC's `--radiogroup` and the Gusto 12-phantom-field case, in a third costume.
+    const ASHBY_CB_GROUP = "ashby-application-form-input-checkbox-group";
+    if (entry.classList && entry.classList.contains(ASHBY_CB_GROUP)) {
+      const gboxes = [...entry.querySelectorAll('input[type="checkbox"]')];
+      const heading = entry.querySelector('label[class*="_heading_"]');
+      const rawQ = stripReq(txt(heading) || entryLabel || "");
+      const optOf = (b) => {
+        const l = (b.id && document.querySelector('label[for="' + esc(b.id) + '"]')) || b.closest("label");
+        return stripReq((l ? txt(l) : "") || b.name || "");
+      };
+      // ⚠ THE KEY IS THE QUESTION, AND `name` IS NOT IT. Every box carries its OPTION text as its
+      // `name` ("LinkedIn", "New York, NY"), so ORC's fallback order (`boxes[0].name || slug`)
+      // would key the whole group on one of its options. Ashby puts the question's own id inside
+      // the box id — `<formId>_<questionId>-labeled-checkbox-<N>` — and that questionId is the
+      // SAME vocabulary a plain Ashby custom question uses for its `name` (a bare UUID), so the
+      // group ends up keyed exactly like every other question on the form. Measured: both groups
+      // on one form shared the formId and differed in the questionId, which is why the segment
+      // after the LAST underscore is the one to take.
+      const qid = (function () {
+        const s = String((gboxes[0] || {}).id || "").replace(/-labeled-checkbox-\d+$/, "");
+        const i = s.lastIndexOf("_");
+        return i >= 0 ? s.slice(i + 1) : s;
+      })();
+      const gkey = qid || ("group:" + rawQ.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48));
+      if (gboxes.length && gkey && !seen.has(gkey)) {
+        seen.add(gkey);
+        push({ fieldName: gkey,
+          // Every member has an id here, so the group resolves as a plain id list and the page is
+          // never stamped. The name fallback is for a tenant that omits them.
+          inputSel: gboxes.map((b) => (b.id ? "#" + esc(b.id) : 'input[name="' + esc(b.name) + '"]')).join(", "),
+          // ⚠⚠ A ONE-BOX DECLARED GROUP IS STILL A GROUP (operator, 2026-08-20, on ORC). The
+          // question and the option text are DIFFERENT elements here, so collapsing to a boolean
+          // always loses the half that carries the meaning — the ORC bug where a group reached the
+          // operator as "Ethnicity — Unchecked". The declaration is the evidence, not the count:
+          // that is exactly what the shared-`name` heuristic elsewhere cannot know.
+          widgetType: "checkbox_group",
+          label: rawQ || gkey,
+          // ⚠ Declared on the QUESTION's heading label (`_required_…`) — measured absent from both
+          // the inputs and any `aria-required`. The other two are kept as belt: over-flagging is
+          // the safe direction.
+          isRequired: (heading ? /_required_/.test(String(heading.className || "")) : false)
+            || gboxes.some((b) => b.required === true || b.getAttribute("aria-required") === "true"),
+          // ⚠ "; " is a LOCKSTEP dup of lib.js's GROUP_JOIN — an injected fn cannot import, and the
+          // replay splits a multi-answer value on exactly this vocabulary. Change one, change both.
+          // (The helper name is deliberately not written here: the self-containment test greps this
+          //  function's SOURCE for shim references, and a comment would trip it.)
+          value: gboxes.filter((b) => b.checked).map(optOf).join("; ") || null,
+          options: gboxes.map(optOf).filter(Boolean),
+          optionSels: gboxes.map((b) => (b.id ? "#" + esc(b.id) : null)).filter(Boolean),
+          group: "checkbox" });
+      }
+    }
     // consent checkboxes (one per entry, name = the label text itself — live, OpenAI).
     // NO `continue` (the Ramp nested-radio lesson): the generic loop below still runs for
     // any OTHER inputs sharing the entry; `seen` prevents double-scanning these.
-    const soloCbs = [...entry.querySelectorAll('input[type="checkbox"]')];
+    // ⚠ MEMBERS OF A DECLARED GROUP ARE EXCLUDED BY THEIR CONTAINER, NOT BY `seen`. A group
+    // option's `name` IS its label text ("LinkedIn"), so adding those to `seen` could shadow an
+    // unrelated real field of the same name later in the form — a collision of exactly the kind
+    // this bug was made of. The container answers the question without that risk.
+    const soloCbs = [...entry.querySelectorAll('input[type="checkbox"]')]
+      .filter((b) => !b.closest("." + ASHBY_CB_GROUP));
     if (soloCbs.length && !entry.querySelector('input[type="radio"]') && !entry.querySelector('[class*="_yesno_"]')) {
       for (const cbx of soloCbs) {
         const nm = cbx.name || cbx.id; if (!nm || seen.has(nm)) continue; seen.add(nm);

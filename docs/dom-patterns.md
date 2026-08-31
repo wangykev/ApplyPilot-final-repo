@@ -39,6 +39,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
 | **Email-verification gate (emailed code)** | `2026-08-24 — Greenhouse: SUBMIT IS TWO CLICKS` |
 | **Board redirects / the embed path / the company anchor** | `2026-08-31 — Greenhouse: A BOARD THAT REDIRECTS` |
+| **Ashby checkbox GROUPS ("select all that apply")** | `2026-08-31 — Greenhouse: A BOARD THAT REDIRECTS` §3 |
 | **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out`, `2026-08-18 — four more tenants: the Apply widget, the bare "Type", and the settle probe` |
 | **Oracle Recruiting Cloud (JET SPA, Knockout, honeypot)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON`, `2026-08-19 (j)`, `2026-08-19 (k)`, `2026-08-19 (l)`, `2026-08-20 (a) — ORC: the whole wizard walked` |
 | **ORC repeating entries (`Add` is a homonym) + `"<CODE> - <Name>"` options** | `2026-08-19 (l) — ORC repeating blocks`, `2026-08-20 (a) — ORC: the whole wizard walked` |
@@ -6262,3 +6263,70 @@ it confidently wrong.
 parameter (`flyzipline`) is the obvious evidence-based fallback and was not wired in here. Until it
 is, an embed-path fill flags its employment question for review rather than answering it, which is
 the correct-but-noisy outcome.
+
+### 3. ⚠⚠ Ashby DECLARES its checkbox groups — and we were reading past the declaration
+
+Notion's form has four "select all that apply" questions. The Ashby scan branch turned them into
+**21 phantom fields**, one per checkbox, each labelled with its own OPTION text — and the questions
+themselves appear **nowhere** in the bundle (`hear about` matched 0 times in the whole payload).
+
+The shape, traced live:
+
+```
+FIELDSET._container_1258i_28 _fieldEntry_1e3gg_28 ashby-application-form-input-checkbox-group
+ ├ LABEL._heading_f7cvd_52 [_required_f7cvd_91] _label_1e3gg_42   ← THE QUESTION
+ ├ DIV._option_1258i_34 › input#<formId>_<questionId>-labeled-checkbox-0 + label[for]  ← "LinkedIn"
+ ├ DIV._option_1258i_34 › …-labeled-checkbox-1                                          ← "Glassdoor"
+ └ …
+```
+
+The four groups measured on the Summer-2027 posting:
+
+| question | options | required |
+|---|---|---|
+| Please indicate all of the locations… | 2 | **yes** |
+| How did you hear about this opportunity? (select all that apply) | 7 | no |
+| What type of engineering role are you interested in? | 8 | **yes** |
+| Degree Type | 4 | **yes** |
+
+The scan's own comment named the assumption that broke: *"consent checkboxes (one per entry)"* —
+true of OpenAI's consent boxes, which is where that branch was written, and false the moment a
+tenant asks a multi-option question. Same failure as ORC's `--radiogroup` and the Gusto
+12-phantom-field case, in a third costume.
+
+**Two consequences beyond the noise, both read off the live bundle rather than reasoned about:**
+
+1. **The label ladder routes on the label.** The phantom labelled `LinkedIn` resolved to
+   `canonical_field: websites.0.url`, so the fill tried to write the operator's LinkedIn **profile
+   URL** into a checkbox meaning *"I heard about this job on LinkedIn."* It reached `needs_review`
+   only because a URL matches no option — luck of the value, not a refusal. Note the form also has
+   a real `LinkedIn Profile` text field, correctly filled, so the ladder had two look-alikes and
+   answered both.
+2. **Required-ness is declared on the QUESTION, not the boxes.** Measured: no member carries
+   `required`, and `aria-required` is absent everywhere; the only marker is `_required_…` in the
+   heading label's class. So three required questions each reported `isRequired:false` across all
+   their phantoms — the dangerous direction (a required field reading false hides a field that will
+   block submission).
+
+**Fix — read the declaration.** `ashby-application-form-input-checkbox-group` on the entry means
+"these boxes answer one question", so the branch emits ONE `checkbox_group` field. Details that are
+not obvious and are each pinned by test:
+
+- **The key is the question id, and `name` is not it.** Every box carries its OPTION text as its
+  `name` ("LinkedIn", "New York, NY"), so ORC's fallback order (`boxes[0].name || slug`) would key
+  the group on one of its options. Ashby puts the question id inside the box id —
+  `<formId>_<questionId>-labeled-checkbox-<N>` — and that questionId is the same vocabulary a plain
+  Ashby custom question uses for its `name` (a bare UUID). Both groups on one form share the formId
+  and differ after the **last** underscore, which is why that is the segment to take.
+- **A one-box declared group is still a group** (the operator's 2026-08-20 ORC ruling applies
+  verbatim): here the question and the option text are different elements, so collapsing to a
+  boolean always loses the half carrying the meaning.
+- **Members are excluded from the solo-checkbox loop by their CONTAINER, not by `seen`.** A member's
+  `name` IS its label text, and the live form has a real input whose own scanned key is likewise
+  `LinkedIn` — so poisoning `seen` with member names would have deleted a genuine field. Pinned.
+- Options resolve as a comma-joined id list (`#a, #b, …`), so nothing on the page is stamped.
+  Verified live: `selResolves === members` for all four groups.
+
+⚠ **This is the first test that actually EXECUTES `atsInjScan`** (`test/ats-ashby-checkbox-group.test.js`,
+with a small purpose-built DOM double). Every other suite stubs the scan, which is exactly why a
+shape bug this large survived — nothing ran it.
