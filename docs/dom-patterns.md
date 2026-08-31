@@ -38,6 +38,7 @@ during 2026-08, so a later date can appear above an earlier one.
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
 | **Email-verification gate (emailed code)** | `2026-08-24 — Greenhouse: SUBMIT IS TWO CLICKS` |
+| **Board redirects / the embed path / the company anchor** | `2026-08-31 — Greenhouse: A BOARD THAT REDIRECTS` |
 | **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out`, `2026-08-18 — four more tenants: the Apply widget, the bare "Type", and the settle probe` |
 | **Oracle Recruiting Cloud (JET SPA, Knockout, honeypot)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON`, `2026-08-19 (j)`, `2026-08-19 (k)`, `2026-08-19 (l)`, `2026-08-20 (a) — ORC: the whole wizard walked` |
 | **ORC repeating entries (`Add` is a homonym) + `"<CODE> - <Name>"` options** | `2026-08-19 (l) — ORC repeating blocks`, `2026-08-20 (a) — ORC: the whole wizard walked` |
@@ -6207,3 +6208,57 @@ This is a **possession factor**, not a captcha: a code mailed to an address the 
 granted this extension `gmail.readonly` on, for an application a human approved field-by-field. The page's
 reCAPTCHA is untouched and `captchaChallenge` still halts `needs_operator` — nothing solves, forges or hides
 a challenge. One attempt only: the code is single-use, so a rejected one is a HALT, never a retry.
+
+## 2026-08-31 — Greenhouse: A BOARD THAT REDIRECTS, and the "Embed" company anchor
+
+Two findings from a day of 2027-internship fills (5 filled: Notion ×2 Ashby, Figma GH, IMC GH,
+Zipline GH). Both are about the *approach* to a Greenhouse form, not about a widget.
+
+### 1. `job-boards.greenhouse.io/<co>/jobs/<id>` can REDIRECT to the employer's own page
+
+Zipline's board does not serve the posting: `…/flyzipline/jobs/7886501003` lands on
+`zipline.com/open-roles`, an employer-styled index with no form on it. I initially read that as
+**`posting-gone`** and wrote the job off. It is not gone — the tenant has simply pointed its board at
+its own site.
+
+The form is still there, on Greenhouse's **embed** path:
+
+```
+https://boards.greenhouse.io/embed/job_app?for=flyzipline&token=7886501003
+```
+
+Same `job_app` document the board would have served, same fields, fills normally (17 fields, 6 to
+review, 6.2s visible).
+
+> ⚠ **A redirect to an employer page is NOT evidence a posting is closed.** `atsPostingGone` reads
+> Greenhouse's redirect-to-**board-index** as gone, which is correct for a delisted job. A redirect to
+> an *employer* domain is a different thing and must not be collapsed into it — the API still lists
+> the job, and the embed URL still fills. The distinguishing signal is the public board API: a job the
+> API still returns is live regardless of where its `absolute_url` points.
+
+The `boards-api.greenhouse.io/v1/boards/<co>/jobs` listing is what makes this recoverable — it gives
+the numeric `id` that becomes `token`, so the embed URL is constructible for any company whose board
+redirects. **`absolute_url` from the API is not a trustworthy navigation target for these tenants.**
+
+### 2. ⚠ The embed form's scraped company is **"Embed"** — and that string is safety-critical
+
+The fill's `jobContext.company` came back as **`"Embed"`**. It does not come from
+`atsCompanyFromUrl` (which correctly returns null for that path segment) — it reaches `company`
+through the **JD scrape**, off the embed document, which carries no employer branding at all.
+
+That is not a cosmetic tracker label. `company` is the anchor for the employment recognizer
+("have you worked for us before?"), and a word no employer is called can never match it — so the
+question silently reads as **"not us"** rather than being flagged. Same failure class as iCIMS'
+literal `jobs` path segment, reached by a different route.
+
+`atsPlausibleCompany` now rejects the bare platform vocabulary (`embed`, `job_app`, `jobs`,
+`careers`, `apply`, `board`, and each ATS's own name), **anchored `^…$`** so a real company
+containing one of those words survives ("Embedded Systems Corp", "Greenhouse Software", "Apply
+Digital"). Rejecting it is the safe direction and the reason is worth stating plainly: an **absent**
+company makes the recognizer correctly **unevaluable** (blank + review), while a **junk** one makes
+it confidently wrong.
+
+⚠ Still open: with the junk rejected, an embed fill has *no* company anchor at all — the URL's `for=`
+parameter (`flyzipline`) is the obvious evidence-based fallback and was not wired in here. Until it
+is, an embed-path fill flags its employment question for review rather than answering it, which is
+the correct-but-noisy outcome.

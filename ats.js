@@ -189,6 +189,21 @@ function atsPlausibleCompany(name) {
   if (/[|·—]/.test(s)) return false;               // "<title> | <Company>" separators
   if (/\bin\s+[A-Z][\w.'-]+,\s*[A-Z]/.test(s)) return false;  // "… in Mountain View, California"
   if (/\b(intern|engineer|manager|analyst|developer|scientist|director|specialist|technician|associate|architect)\b/i.test(s)) return false;
+  // ⚠ A PLATFORM WORD IS NOT A COMPANY (live 2026-08-31). A Zipline fill through the embed form
+  // (`/embed/job_app?for=flyzipline&token=…`) recorded its company as **"Embed"** — a URL path
+  // segment that reached `jobContext.company` through the JD scrape, not through
+  // atsCompanyFromUrl (which already returns null for that segment).
+  //
+  // This matters beyond a cosmetic tracker label: `company` is the anchor for the safety-critical
+  // employment recognizer ("have you worked for us before?"). Handing it a word no employer is
+  // called means that question can never match the anchor — the exact failure iCIMS' `jobs` path
+  // segment produced, and the reason atsCompanyFromUrl was taught to read the subdomain there.
+  // A wrong anchor is worse than none: an absent company correctly makes the recognizer
+  // UNEVALUABLE (blank + review), while a junk one silently reads as "not us".
+  //
+  // Kept as a NEGATIVE test with named tells, matching the rest of this function: these are
+  // job-board and embed-plumbing words, never trading names.
+  if (/^(embed|embedded|job_app|jobs|job|careers?|apply|application|board|boards|greenhouse|lever|ashby|workday|icims|oracle)$/i.test(s)) return false;
   return true;
 }
 

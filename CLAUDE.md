@@ -1306,6 +1306,20 @@ The standing rules:
 - **A CLOSED POSTING IS NOT A BROKEN PIPELINE** — `atsPostingGone` reads Lever's `Not found` title and
   Greenhouse's redirect-to-board-index, and halts `posting-gone` rather than sending the operator to debug a
   fill on a job that no longer exists.
+  ⚠ **BUT A REDIRECT TO THE *EMPLOYER'S* SITE IS NOT A CLOSED POSTING (2026-08-31).** Zipline's board sends
+  `…/flyzipline/jobs/<id>` to `zipline.com/open-roles`, and I wrote the job off as gone; the form is still
+  served on Greenhouse's **embed** path, `boards.greenhouse.io/embed/job_app?for=<co>&token=<id>`, and fills
+  normally. The public board API is the authority — **a job the API still returns is live wherever its
+  `absolute_url` points**, and that `id` IS the embed `token`, so the URL is constructible for any
+  redirecting tenant. Do not collapse the two redirect shapes: board-index ⇒ gone, employer domain ⇒ use
+  the embed URL.
+  ⚠ **AND THE EMBED DOCUMENT HAS NO EMPLOYER BRANDING, so the JD scrape returned `company: "Embed"`** — a
+  URL path segment anchoring the safety-critical employment recognizer, which then silently reads as "not
+  us" instead of flagging. `atsPlausibleCompany` rejects the bare platform vocabulary (`embed`, `job_app`,
+  `jobs`, `careers`, `apply`, `board`, each ATS's own name), **anchored `^…$`** so "Embedded Systems Corp" /
+  "Greenhouse Software" survive. Rejecting is the safe direction: an ABSENT company is correctly
+  **unevaluable** (blank + review), a JUNK one is confidently wrong. ⚠ Open: nothing then supplies an anchor
+  on this path — the URL's `for=` param is the evidence-based fallback and is NOT yet wired in.
 - **AI IS DEFERRED, THEN ASKED ONCE — and the ORDER is the point (2026-08-11).** The deterministic pass runs
   FIRST and to completion; every field it could not answer is RECORDED, then **ONE** `act.llm` call asks
   about exactly those, then a **second actuation pass** fills them. ⚠ **This is the OPPOSITE ORDER to
