@@ -68,7 +68,18 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "submit-scroll-19";
+const AP_BUILD_MARKER = "confirm-window-20";
+
+// ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
+// Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
+// (Samsara) reported `no-confirmation` anyway — the operator checked the tab and it plainly said
+// "application submitted". So a genuinely-submitted application was reported as an unknown outcome,
+// which is the same false-negative class as the off-screen click: the action worked and the run said
+// it could not tell.
+// 30s is too tight for a form that navigates, re-renders and then paints its confirmation. Doubling
+// it costs nothing on the happy path (the loop returns the instant `confirmed` goes true) and is only
+// ever spent when we would otherwise have given a wrong answer.
+const SUBMIT_CONFIRM_MS = 60000;
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -6980,7 +6991,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // budget is reset for the second click: 30s to see the result of the click that was actually
     // made, in both cases.
     let verifiedVia = null;
-    let deadline = Date.now() + 30000;
+    let deadline = Date.now() + SUBMIT_CONFIRM_MS;
     while (Date.now() < deadline) {
       await cdpDelay(1000);
       const s2 = await cdpEval(atsInjSubmitState, ats).catch(() => null);
@@ -7008,7 +7019,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
           }
           LOG("⚠ code accepted by the form — clicking Submit again to complete the submission (trusted input).");
           await cdpClickAt(s3.rect.cx, s3.rect.cy);
-          deadline = Date.now() + 30000; // a fresh budget to observe THIS click's outcome (see above)
+          deadline = Date.now() + SUBMIT_CONFIRM_MS; // a fresh budget to observe THIS click's outcome (see above)
           continue;
         }
       }
@@ -7026,7 +7037,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         return { ok: true, submitted: false, replayed: true, stopped: "validation-errors", errors: errs.errors, ats };
       }
     }
-    LOG("no confirmation within 30s — VERIFY IN THE TAB before assuming either outcome.");
+    LOG(`no confirmation within ${Math.round(SUBMIT_CONFIRM_MS / 1000)}s — VERIFY IN THE TAB before assuming either outcome.`);
     return { ok: true, submitted: false, replayed: true, stopped: "no-confirmation", detail: "Submit was clicked but no confirmation rendered within 30s — check the tab.", ats };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };

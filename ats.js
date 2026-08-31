@@ -2950,7 +2950,12 @@ function atsInjSubmitState(ats, scroll) {
     return fr.width > 60 && fr.height > 60 && fr.width < 700;
   });
   const bodyText = (document.body.innerText || "").slice(0, 4000);
-  const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText) || /\/thanks(\?|$)/.test(location.href);
+  // ⚠ `/confirmation` IS A REAL CONFIRMATION URL — measured live 2026-08-31, IMC redirected to
+  // `…/jobs/4823924101/confirmation`. Only `/thanks` was matched here, so the URL signal was dead on
+  // Greenhouse and detection rested entirely on body text. That is a needlessly narrow gate for the
+  // one question this function exists to answer.
+  const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText)
+    || /\/(thanks|confirmation)(\?|$)/.test(location.href);
   return { ok: true, hasSubmit: !!btn, hasFlowControl: !!flowNext,
     flowCaption: flowNext ? (flowNext.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30) : null,
     rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
