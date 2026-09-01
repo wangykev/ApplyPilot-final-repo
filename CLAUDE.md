@@ -1683,8 +1683,29 @@ has the evidence; this is the short form.
   150ms to 80ms bought nothing; collapsing 28 SW awaits into 1 page-side wait fixed the largest gap on
   a page. A healthy ORC fill is ~280-320 `Runtime.evaluate` calls / 23-32s — that count is the surface
   area every per-round-trip stall multiplies against. **Ask "how many awaits?" before "how long is each?"**
+- **⚠⚠ FIX THE WORKER'S SCHEDULING BEFORE CUTTING AWAITS (2026-09-01).** Round trips are the cost
+  driver, but the PRICE PER ROUND TRIP is set by whether the MV3 worker is scheduled. Do it in the
+  other order and the worker's stalls get attributed to whatever code happened to be awaiting — which
+  is how one Ashby location field looked like a widget problem for three rounds. **Ashby 45.4s →
+  6.2s hidden / 9.1s visible; Whatnot 25.5s → 3.9s; pace overruns 27–31s lost → 0.**
+  ⚠ **The beat was simply too slow: 500ms → 250ms.** Found by accident — turning `debugLagTrace` ON
+  made the fill FASTER, because the trace adds a SECOND 500ms `Runtime.evaluate` interval. *A
+  diagnostic that keeps the worker warm hides the stall it exists to measure; when a trace makes a
+  problem better, the trace is part of the system.*
+  ⚠ **And it needs an OVERLAP GUARD.** The probe has no timeout, so against a WEDGED renderer every
+  beat hangs and a firing timer accumulates unresolved commands until the worker answers nothing —
+  popup and dev bridge included, recoverable only by a manual extension reload (observed live minutes
+  after halving the interval). One probe in flight at a time.
+  ⚠ **`forceToggles` is not free either:** a menu that never MOUNTED is not automatically a missed
+  click. A query-only box mounts nothing until you type, and two forced re-opens plus their 1500ms
+  polls were the entire remaining 5.6s of the location field (22.7s → **0.84s**). Location only — for
+  a plain `select` an absent menu really can mean the click missed.
+  ⚠ **ONE TENANT IS NOT A MEASUREMENT.** The same waste sat in `atsOpenAndPollOptions` (the AI-DEFER
+  pass's option read) and was invisible on Notion, whose slow widget had already been fixed by name.
+  Whatnot showed it as **94 paces on an 18-field form vs 29 on a 25-field one** — two required
+  dropdowns costing 1935ms and 3521ms each. Always re-measure a speed fix on a SECOND tenant.
 - **⚠⚠ KEEP THE WORKER WARM — an MV3 service worker with nothing scheduled stops being scheduled.**
-  `cdpAttach` starts a 500ms beat (`cdpKeepWarmStart`) for EVERY attach. Measured with it off: a 600ms
+  `cdpAttach` starts a 250ms beat (`cdpKeepWarmStart`) for EVERY attach. Measured with it off: a 600ms
   pace took **13461ms** and a run lost 16.7s; with it on, 4 runs had **zero** overruns.
   ⚠ The obvious counter-argument is wrong and I made it: *"a keep-alive interval can't help, the
   interval is the thing being starved."* **A late timer still FIRES**, and each firing runs the loop.

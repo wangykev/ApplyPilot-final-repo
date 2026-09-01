@@ -8559,6 +8559,18 @@ function atsAiBatchKind(f) {
 // lesson: "No options" at 4ms, "Loading..." at 24ms, the real answer at 4049ms).
 async function atsOpenAndPollOptions(act, ref) {
   await act.eval(atsInjOpenAndReadOptions, ref.inputSel);
+  // ⚠ ONE PAGE-SIDE AWAIT INSTEAD OF N SW ROUND TRIPS — the same fix the location open got, applied
+  // where it turns out to matter just as much (measured 2026-09-01, Whatnot). This helper is what the
+  // AI-DEFER pass uses to read a combobox's options for the prompt, and on that tenant two required
+  // dropdowns cost 1935ms and 3521ms EACH doing it: their menus show nothing until a query is typed,
+  // so the loop below simply ran its full soft deadline before giving up. 94 paces on an 18-field
+  // form, against 29 on a 25-field one.
+  // The loop below is kept verbatim as the fallback (no in-page timers, an older build, a throw), so
+  // nothing depends on the waiter being available.
+  try {
+    const w = await act.eval(atsInjAwaitOptionsOrQuiet, ref.inputSel, ATS_POLL.emptyQuietMs, ATS_POLL.openCeil);
+    if (w && w.ok) return ((w.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+  } catch (e) { /* fall through to the SW poll */ }
   const optDeadline = Date.now() + ATS_POLL.open;
   const optCeiling = Date.now() + ATS_POLL.openCeil;
   for (;;) {

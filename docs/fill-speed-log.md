@@ -3110,3 +3110,69 @@ Three rounds of instrumentation attributed the cost to typing, and typing was ne
 5s pause was invisible in every log line because it happened in a phase nobody had timed — the field was
 *focused*, so it looked busy. **An operator watching the tab found in one sentence what four instrumented
 runs had not**, and the fix was to stop doing something rather than to do it faster.
+
+## Round 20 (2026-09-01) — Ashby 45s → 6s: the keep-warm beat was too slow, and two open-polls were free
+
+**/goal: "the entire page should fill in around 15 seconds or less."** Met with margin, on two tenants.
+
+| form | before | after |
+|---|---|---|
+| Notion (25 fields), hidden | 45.4s · 87.2s | **6.2s · 7.5s** |
+| Notion (25 fields), visible | 46.1s · 79.8s | **9.1s** |
+| Whatnot (18 fields), visible | 25.5s | **3.9s** |
+
+Pace overruns went from *27–31s lost, worst 11035ms* to **0 overran, 0ms**. Field counts and
+outcomes are unchanged in every case (Notion 14 filled + 11 review; Whatnot 9 + 5 + 4), so this is
+speed, not coverage.
+
+### 1. The cause was found by accident, and that is the lesson
+
+Turning `debugLagTrace` **ON** to diagnose the slowness made the fill **faster** — 13.6s and 15.4s
+where the untraced runs were 45–87s. The trace changes nothing on the fill path. What it adds is a
+**second 500ms interval that also issues a `Runtime.evaluate`**, so the worker had a reason to be
+scheduled every ~250ms instead of every 500ms.
+
+`CDP_WARM_BEAT_MS` 500 → **250**. One extra trivial round trip per 500ms against ~30s saved.
+
+> ⚠ The instrument was not neutral. A diagnostic that keeps the worker warm *hides the very stall it
+> is there to measure* — and here it did the opposite favour, which is what exposed the cause. When a
+> trace makes a problem better, the trace is part of the system.
+
+### 2. `forceToggles` was the whole remaining cost of the location field
+
+With the open wait already moved into the page (round 19) the location field was *still* 5.6s. All of
+it was the two forced re-opens plus their 1500ms polls, fired because no menu had mounted. The
+existing guard only skipped them for a menu that MOUNTED and settled empty — but a query-only box
+mounts nothing at all until you type, which is not a missed click either.
+
+`ap-ats-combobox-5` ("Current Location"): **22.7s → 0.84s** (`open 80ms (no-menu)`).
+
+⚠ Location only. For a plain `select` an absent menu really can mean the click missed. It cannot hide
+one here: the typing path takes its own `trustedFocus` (the widget-wake), which re-clicks the control.
+
+### 3. The same waste lived in the AI-DEFER pass — found only by testing a SECOND tenant
+
+Whatnot exposed what Notion could not: **94 paces on an 18-field form** against 29 on a 25-field one.
+The defer pass reads each combobox's options for the prompt through `atsOpenAndPollOptions`, which
+still used the SW poll — and two required dropdowns whose menus show nothing until typed cost
+**1935ms and 3521ms each** running the full soft deadline. Routing that helper through the same
+page-side waiter took Whatnot **25.5s → 3.9s**, paces **94 → 21**.
+
+> **One tenant is not a measurement.** Notion never showed this because its slow widget was the
+> location box, which had already been fixed by name. The shared helper was untouched and invisible
+> until a form with several query-driven dropdowns ran through it.
+
+### 4. ⚠ Halving the beat needed an overlap guard, and skipping it cost a wedged worker
+
+The probe has no timeout of its own. Against a **wedged renderer** every beat's `Runtime.evaluate`
+hangs, and a timer that keeps firing accumulates unresolved commands until the worker answers nothing
+at all — popup and dev bridge included. Observed live minutes after the interval was halved: the
+service worker went unresponsive while the page itself still evaluated fine (a pile-up, not
+starvation), and recovery needed a manual extension reload. Halving the cadence doubled the rate of
+hanging probes, so `cdpKeepWarmStart` now allows **one probe in flight at a time**; a hung one simply
+skips beats until it settles, and the next is 250ms away.
+
+**Standing rule from this round:** the cost driver is round trips, but the *price per round trip* is
+set by whether the MV3 worker is scheduled. Fix the scheduling first — it is one constant — then cut
+awaits. Doing it in the other order attributes the worker's stalls to whatever code happened to be
+awaiting at the time, which is how the location field looked like a widget problem for three rounds.
