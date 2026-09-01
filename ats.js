@@ -2733,6 +2733,100 @@ function atsInjOpenAndReadOptions(inputSel, force) {
   return { ok: true, opened: true, already, clicked };
 }
 
+// ⚠⚠ ONE ROUND TRIP INSTEAD OF N — THE iCIMS MODEL, APPLIED TO A react-select (operator, 2026-09-01).
+//
+// The location combobox was the single largest cost on an Ashby fill: `open` measured 8.9s, 11.5s,
+// 16.4s, 21.2s and 21.3s across five runs — ALWAYS over its own 6s ceiling — while the typing beside
+// it took 82ms and the widget's own lookup 426ms. The cost was never the page. The open phase is a
+// poll (read → wait 150ms → read …) and under MV3 worker starvation a single 150ms sleep measured
+// 4956ms and 9551ms, both logged `sw-starved`. Two sleeps ARE the 21 seconds. The ceiling cannot
+// bound it, because the ceiling is only checked BETWEEN sleeps and one sleep outlasts the whole
+// budget.
+//
+// iCIMS already solved this shape and the operator pointed at it: `atsInjIcimsSearch` writes the
+// whole query in ONE synthetic write, there is NO open-poll at all, and the settle after the search
+// polls for a MATCH rather than for stillness. The lever the speed rules name is the same one —
+// "the page clock CANNOT help there (its abandon ceiling is an SW timer too). The lever is FEWER
+// AWAITS, not a different clock."
+//
+// So the waiting moves INTO the page: one `Runtime.evaluate` that returns as soon as options appear,
+// or the widget's own subtree has stopped changing (it has settled on showing nothing — go type),
+// or a ceiling. N starved SW sleeps become one.
+//
+// ⚠ The scope + `loading` detection is a LOCKSTEP DUP of atsInjReadOptions — two injected functions
+// cannot share code. Change one, change both. (Same standing rule as atsInjScan/atsInjReadValue.)
+// ⚠ Its in-page timers must be REAL, which on this path they are (`cdpInstallPageOverrides` gives
+// GH/Lever/Ashby worker-backed timers). Where they are not, the caller keeps the old poll — see the
+// fallback at the call site, and ORC's measured "an in-page setTimeout await timed out at 45s".
+async function atsInjAwaitOptionsOrQuiet(inputSel, quietMs, ceilMs) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const readNow = () => {
+    const listboxId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
+    let scope = listboxId ? document.getElementById(listboxId) : null;
+    const shell = el.closest(".select__container") || el.closest(".select") || el.closest(".ashby-application-form-field-entry") || el.parentElement;
+    if (!scope) scope = (shell || document).querySelector('.select__menu, [role="listbox"]') || null;
+    const loading = !!(
+      (shell && shell.querySelector('[class*="loading"]')) ||
+      el.getAttribute("aria-busy") === "true" ||
+      (scope && /^\s*loading\b/i.test((scope.textContent || "").replace(/\s+/g, " ")))
+    );
+    const options = scope ? [...scope.querySelectorAll('[role="option"], .select__option')].map((o) => ({
+      text: (o.textContent || "").replace(/\s+/g, " ").trim(),
+      disabled: o.getAttribute("aria-disabled") === "true",
+    })) : [];
+    return { open: !!scope, options: options, loading: loading, shell: shell };
+  };
+  const t0 = Date.now();
+  let r = readNow();
+  // An already-open menu costs nothing — the same "read BEFORE the first wait" rule the SW poll has.
+  if (r.options.length) return { ok: true, open: r.open, options: r.options, loading: r.loading, why: "on-open", waitedMs: 0 };
+  // ⚠⚠ NO MENU AT ALL ⇒ NOTHING TO WAIT FOR. RETURN NOW (measured 2026-09-01).
+  // The first cut of this waiter still cost 25187ms and reported `ceiling`: this widget mounts NO
+  // listbox until a query is typed, so `open` stayed false, the settled-empty branch (which requires
+  // a MOUNTED menu) could never fire, and it burned the whole budget waiting for a menu that only
+  // exists after typing. That is the iCIMS lesson stated exactly: there is no open-poll, you search.
+  //
+  // ⚠ THE DISTINCTION IS MOUNTED-ness, NOT EMPTINESS, and it is what keeps the GitLab pick-one safe.
+  // A widget that renders its options late still MOUNTS its listbox first (`open:true, options:0`),
+  // so it falls through and keeps the full budget below — the case where reading empty at 1.8s left
+  // a REQUIRED 3-option question unanswered. A widget with no listbox at all has not shown us a slow
+  // list; it has shown us that it has none to show, and the typed query immediately after is the
+  // real test either way.
+  //
+  // ⚠ ONE page-side tick before concluding it, so a menu that mounts a frame after the click is not
+  // mistaken for one that never mounts. It costs ~60ms IN THE PAGE and zero SW awaits, which is the
+  // whole point — the thing that was expensive was never the waiting, it was the round trips.
+  if (!r.open && !r.loading) {
+    await new Promise((res) => setTimeout(res, 60));
+    r = readNow();
+    if (r.options.length) return { ok: true, open: r.open, options: r.options, loading: r.loading, why: "on-open-late", waitedMs: 60 };
+    if (!r.open && !r.loading) return { ok: true, open: false, options: [], loading: false, why: "no-menu", waitedMs: 60 };
+  }
+  let lastMut = Date.now();
+  let mo = null;
+  try {
+    mo = new MutationObserver(() => { lastMut = Date.now(); });
+    mo.observe(r.shell || el.parentElement || document.body, { childList: true, subtree: true, characterData: true, attributes: true });
+  } catch (e) { mo = null; }
+  try {
+    for (;;) {
+      await new Promise((res) => setTimeout(res, 60));
+      r = readNow();
+      const now = Date.now();
+      if (r.options.length) return { ok: true, open: r.open, options: r.options, loading: r.loading, why: "options", waitedMs: now - t0 };
+      if (now - t0 >= ceilMs) return { ok: true, open: r.open, options: [], loading: r.loading, why: "ceiling", waitedMs: now - t0 };
+      // ⚠ MOUNTED + NOT LOADING + SUBTREE STILL = it has settled on showing nothing, which is an
+      // ANSWER (go type), not a failure. Without the observer we never claim this — a widget about
+      // to paint its list is exactly the case that must keep its budget (the GitLab 3-option
+      // pick-one misread as empty at 1.8s), and time alone cannot tell the two apart.
+      if (mo && r.open && !r.loading && now - lastMut >= quietMs) {
+        return { ok: true, open: true, options: [], loading: false, why: "settled-empty", waitedMs: now - t0 };
+      }
+    }
+  } finally { try { if (mo) mo.disconnect(); } catch (e) { /* nothing left to do */ } }
+}
+
 function atsInjReadOptions(inputSel) {
   const el = document.querySelector(inputSel);
   if (!el) return { ok: false, error: "not-found:" + inputSel };
@@ -10533,7 +10627,19 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // has settled on showing nothing (mounted + not loading + repeated empty + quiet), which covers
     // a places box, an async school/degree search and any tenant widget of the same shape without
     // naming any of them. See the early-stop note in pollFor.
-    let read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
+    // ⚠⚠ THE OPEN WAIT HAPPENS IN THE PAGE, NOT IN THE WORKER (operator, 2026-09-01 — model it on
+    // iCIMS). Measured on this exact field: `open` 8.9/11.5/16.4/21.2/21.3s across five runs, always
+    // past its own 6s ceiling, because each 150ms SW sleep in the poll below cost 4956ms and 9551ms
+    // (`sw-starved`). Typing beside it was 82ms. One page-side await replaces N starved ones.
+    // The FALLBACK is the old poll, unchanged — used when the waiter cannot run (no in-page timers,
+    // an older build, a throw), so nothing depends on the new path being available.
+    let read = null;
+    let openWhy = null;
+    try {
+      const w = await act.eval(atsInjAwaitOptionsOrQuiet, ref.inputSel, ATS_POLL.emptyQuietMs, ATS_POLL.openCeil);
+      if (w && w.ok) { read = w; openWhy = w.why; }
+    } catch (e) { read = null; }
+    if (!read) { read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil); openWhy = "sw-poll"; }
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
     // menu), so one forced click closes it and the next opens for real. Each attempt flips the
     // state, so two cover both "the click missed" and "it lied about being open".
@@ -10638,7 +10744,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // ALWAYS logged for a places box now: the open phase is the term that was invisible, and a
       // threshold that hides the healthy case also hides the proof that it stayed healthy.
       try {
-        console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName} [${locArm}]: open ${openPhaseMs}ms · typed ${JSON.stringify(city)} (${city.length} chars) in ${locTypedMs}ms · lookup ${locLookupMs}ms → ${optsOf(read).length} option(s)` +
+        console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName} [${locArm}]: open ${openPhaseMs}ms (${openWhy || "?"}) · typed ${JSON.stringify(city)} (${city.length} chars) in ${locTypedMs}ms · lookup ${locLookupMs}ms → ${optsOf(read).length} option(s)` +
           ` — pre-commit total ${openPhaseMs + locTypedMs + locLookupMs}ms`);
       } catch (e) { /* log only */ }
       // A BOX LABELLED "Location" IS NOT ALWAYS A CITY BOX (2026-08-07). ElevenLabs labels one
@@ -11466,7 +11572,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
     atsInjEmailVerifyState, atsInjFillEmailCode,
