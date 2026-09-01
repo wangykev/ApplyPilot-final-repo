@@ -6474,10 +6474,34 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       ? "Reported to the website."
       : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. ${landed}`);
+    // ⚠⚠ A DEGRADED RUN MUST SAY SO — it is indistinguishable from a hard form otherwise
+    // (operator, 2026-08-31). A HIDDEN Notion fill came back with 16 of 31 fields reading
+    // "commit failed": the AI had picked a valid option every time (e.g. "He/Him" out of the
+    // form's own list) and the write simply did not land, because Chrome had suspended the tab —
+    // 227s at 7330ms/field, "NOT painting". The deterministic fields filled fine, because they run
+    // FIRST, while the tab was still alive; the AI pass runs LAST and met a frozen page. The same
+    // fill VISIBLE: 20.5s, 854ms/field, 24/24 filled, zero failures.
+    //
+    // Nothing in the bundle distinguished that from "this form asks a lot we cannot answer" — the
+    // operator's only symptom was a review page that looked unfilled, and they had to ask. So say
+    // it here, in the run's own voice, and put it on the RESULT so a caller can surface it too.
+    // Keyed on the two facts together: commits that FAILED, and a page that was not painting.
+    // Either alone is ordinary — a hard form legitimately fails to match, and a hidden tab that
+    // keeps painting fills fine.
+    let degraded = null;
+    try {
+      const failed = (out.results || []).filter((r) => r && /commit failed/i.test(String(r.detail || ""))).length;
+      const paint = await cdpPaintLabel();
+      if (failed >= 3 && /not painting/i.test(String(paint))) {
+        degraded = `${failed} field(s) failed to commit and the tab was ${paint} — this fill was STARVED, not refused by the form. Re-run it with the tab VISIBLE before reviewing; the answers were computed, they just could not be written.`;
+        LOG(`⚠⚠ DEGRADED RUN — ${degraded}`);
+        emitRunProgress("Fill finished, but degraded", degraded);
+      }
+    } catch (e) { /* diagnostic only — never fail a completed fill over its own warning */ }
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
     return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts,
       needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok),
-      consents_accepted: icimsConsentsAccepted, partial: !!bundle.partial,
+      consents_accepted: icimsConsentsAccepted, partial: !!bundle.partial, degraded,
       walk: { ok: true, pages: stepsFilled, steps: stepsWalked, stopped: walkStopped || "ats-single-page", detail: walkDetail || null } };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };
