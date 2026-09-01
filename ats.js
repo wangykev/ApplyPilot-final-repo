@@ -2989,7 +2989,61 @@ async function atsInjCommitOption(inputSel, optionText) {
   const target = [...scope.querySelectorAll('[role="option"], .select__option')].find((o) => norm(o.textContent) === norm(optionText));
   if (!target) return { ok: false, error: "option-not-found", cleared };
   fire(target, "mousedown"); fire(target, "mouseup"); fire(target, "click");
-  return { ok: true, cleared };
+  // ⚠⚠ THE INPUT'S TEXT IS NOT EVIDENCE OF A SELECTION ON A SEARCHABLE COMBOBOX (live 2026-09-01,
+  // Whatnot). This returned `ok:true` the moment the events were fired, and the caller then verified
+  // with atsInjReadValue — which for a combobox reads `el.value`, THE BOX WE JUST TYPED THE QUERY
+  // INTO. So a click that never registered still read back as the wanted value.
+  //
+  // Live: "Please select your graduation year" was committed `exact-normalized` after
+  // `query "2028" → 1 option`, passed the pre-submit DOM read, and the form then refused the submit
+  // with "Missing entry for required field: Please select your graduation year". The field really
+  // was empty; our check was what was wrong. The house rule states it exactly — a read-back that
+  // inspects what we wrote can only ever confirm we wrote it.
+  //
+  // ⚠ WHY LOCATION NEVER SHOWED THIS: there the committed option ("Tallahassee, Florida, United
+  // States") DIFFERS from the query ("Tallahassee"), so the value changing to something we did not
+  // type IS real evidence. The vacuous case is exactly when the option text equals the query —
+  // a year, a month, any short exact value. The bug hid behind the one widget that reads correctly.
+  //
+  // So report POSITIVE evidence instead of assuming: a committed option closes the menu and unmounts
+  // its rows. `menuGone` is that evidence; the caller decides what to do with it, and nothing here
+  // changes for a widget that was already working.
+  await sleep(220);
+  const rowsLeft = () => {
+    try {
+      const live = (listboxId && document.getElementById(listboxId))
+        || (scope && scope.isConnected ? scope : null);
+      return live ? live.querySelectorAll('[role="option"], .select__option').length : 0;
+    } catch (e) { return null; }
+  };
+  let optionsLeft = rowsLeft();
+  // ⚠ IF THE MOUSE CLICK DID NOT TAKE, USE THE WIDGET'S OWN KEYBOARD PATH (2026-09-01).
+  // A combobox commits on Enter over the highlighted row — that is its documented interface, the
+  // same one the ORC picker had to be driven through ("Enter commits"), and it is a different
+  // legitimate input path rather than anything disguised. Attempted ONLY when the menu is still
+  // showing rows, so a widget the click already satisfied is untouched: `arm` records which path
+  // actually worked, so the log can say so instead of leaving it to inference.
+  // ⚠ EXACTLY ONE ROW, or not at all. ArrowDown moves RELATIVE to whatever is highlighted, so on a
+  // multi-row menu it is a guess about which row Enter will take — and committing the wrong option
+  // is the failure class this whole pipeline exists to prevent. With a single filtered row there is
+  // nothing to guess. (The value check below is still the backstop either way: a wrong pick fails
+  // the text compare and goes to review.) A multi-row menu that survived the click keeps
+  // `menuGone:false` and is reported honestly instead.
+  let arm = "click";
+  if (optionsLeft === 1) {
+    const key = (t, k, code, kc) => el.dispatchEvent(new KeyboardEvent(t, {
+      key: k, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true,
+    }));
+    // Highlight the row we want, then commit it. ArrowDown first because a filtered menu may have
+    // nothing active yet, and Enter on no active row does nothing at all.
+    key("keydown", "ArrowDown", "ArrowDown", 40); key("keyup", "ArrowDown", "ArrowDown", 40);
+    await sleep(120);
+    key("keydown", "Enter", "Enter", 13); key("keypress", "Enter", "Enter", 13); key("keyup", "Enter", "Enter", 13);
+    await sleep(260);
+    optionsLeft = rowsLeft();
+    arm = optionsLeft === 0 ? "click→enter" : "click→enter(failed)";
+  }
+  return { ok: true, cleared, menuGone: optionsLeft === 0, optionsLeft, arm, value: el.value };
 }
 
 // Close any open react-select menus WITHOUT committing (blur + outside mousedown). The
@@ -11178,7 +11232,25 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // plain select (no route → no dial override) and must accept the "+1" chip for the
     // committed "United States +1" too. A non-empty display CONTAINED in the option we
     // clicked is still strong evidence of the right commit (a wrong option isn't a superstring).
-    const okv = backNorm === wantNorm || (backNorm && wantNorm.includes(backNorm)) || (wt === "location" && !!backNorm);
+    // ⚠⚠ AFTER A SEARCH, THE VALUE READ-BACK IS VACUOUS — REQUIRE POSITIVE SELECTION EVIDENCE
+    // (live 2026-09-01, Whatnot). Everything below compares the input's text to the option we meant
+    // to pick, and once we have TYPED A QUERY INTO THAT BOX the text is ours, not the widget's. So a
+    // click that never registered still read back as a perfect match: "Please select your graduation
+    // year" committed `exact-normalized` from `query "2028" → 1 option`, passed the pre-submit DOM
+    // read, and the form refused the submit with "Missing entry for required field". The field was
+    // genuinely empty; the check was what was wrong.
+    //
+    // ⚠ It hid behind the one widget that reads correctly: a places box commits
+    // "Tallahassee, Florida, United States" for the query "Tallahassee", so the value becoming
+    // something we did NOT type is real evidence there. The vacuous case is exactly when the option
+    // text equals the query — a year, a month, any short exact value.
+    //
+    // `menuGone` is the widget's own evidence (a committed option closes the menu and unmounts its
+    // rows). Only `false` counts against us: `null` means we could not tell, and treating "unknown"
+    // as failure would block submits that should pass — the direction that costs a real application.
+    const selectionProven = !didSearch || (c && c.menuGone !== false);
+    const okv = (backNorm === wantNorm || (backNorm && wantNorm.includes(backNorm)) || (wt === "location" && !!backNorm))
+      && selectionProven;
     if (c && c.ok && okv) {
       rec.status = atsTierIsDeterministic(hit.tier) ? "filled" : "filled_review";
       rec.matchTier = hit.tier; rec.verified = true;
@@ -11193,9 +11265,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // Distinguish the two failures: the click never found its option (a LIST problem) vs the
       // click landed and the value did not stick (a COMMIT problem). Reporting the first as the
       // second sent three investigations after the wrong thing.
-      rec.detail = c && c.ok
-        ? "commit did not persist (read " + JSON.stringify(rec.after) + " wanted " + JSON.stringify(commitText) + ")"
-        : "could not click " + JSON.stringify(commitText) + " — " + ((c && c.error) || "no result") + " (the menu was not showing it)";
+      // ⚠ THREE failures now, not two. The third is the one that sank a live submit: the option was
+      // found and clicked, the box even reads the wanted text — but the MENU IS STILL OPEN, so
+      // nothing was selected and the text is only the query we typed. Naming it separately is the
+      // whole point: reported as "commit did not persist" it looks like a value problem, and the
+      // value is perfect.
+      rec.detail = (c && c.ok && !selectionProven)
+        ? "the option was clicked but the menu stayed open, so nothing was selected — the box only holds the text we typed"
+        : c && c.ok
+          ? "commit did not persist (read " + JSON.stringify(rec.after) + " wanted " + JSON.stringify(commitText) + ")"
+          : "could not click " + JSON.stringify(commitText) + " — " + ((c && c.error) || "no result") + " (the menu was not showing it)";
       await act.eval(atsInjCloseCombo, ref.inputSel);
     }
     return true;
