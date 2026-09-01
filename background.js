@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "ashby-cbgroup-21";
+const AP_BUILD_MARKER = "consent-required-23";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -1255,6 +1255,44 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             // with an emailed verification code (Greenhouse, live 2026-08-24). OFF ⇒ that gate halts
             // for the operator instead of being answered — see atsAnswerEmailVerify.
             const res = await runAtsSubmitRun(tab.id, atsKind, pull.bundle, { arm, startUrl, gmailEnabled });
+            // PERSIST THE OUTCOME. Until now this branch reported NOTHING (live 2026-08-31): the
+            // Workday path below has always called reportApplication with `status: "submitted"`,
+            // but the ATS branch returns straight to the caller — so a Greenhouse / Lever / Ashby /
+            // iCIMS application that was genuinely FILED still read "needs_review" in the tracker
+            // forever. Observed as 16 approved-but-never-submitted rows, including three submitted
+            // by hand the day before, which also means the tracker could not answer "what have I
+            // already sent?" — the question that keeps a duplicate application from going out.
+            //
+            // ⚠ ONLY ON A REAL SUBMIT, and that asymmetry is deliberate, not laziness.
+            // `reportColumns` (web/lib/report-fields.ts) ALWAYS writes `approved_at: null`, on the
+            // sound reasoning that a report normally carries a FRESH bundle and approvals given for
+            // answers that no longer exist are void. A rehearsal or a halt reporting through here
+            // would inherit that rule and silently DISCARD the operator's approvals — making them
+            // re-approve every field before they could retry the submit they just watched fail.
+            // Staying silent on those paths is exactly what this code already did, so nothing
+            // regresses; only the success case is new.
+            if (res && res.submitted) {
+              try {
+                await reportApplication(pull.bundle, store.jobContext || null, {
+                  status: "submitted",
+                  submission: {
+                    at: new Date().toISOString(),
+                    armed: arm,
+                    submitted: true,
+                    confirmed: !!res.confirmed,
+                    stopped: res.stopped || null,
+                    confirmation: res.confirmUrl || null,
+                    email_verified: res.email_verified || null,
+                    ats: atsKind,
+                  },
+                });
+                LOG("tracker updated — this application now reads SUBMITTED.");
+              } catch (e) {
+                // The application IS filed; only the bookkeeping failed. Say so in those words, so
+                // the log can never be read as "the submit did not happen".
+                LOG(`could not update the tracker (${String((e && e.message) || e)}) — THE APPLICATION IS FILED; only the status write failed.`);
+              }
+            }
             sendResponse({ ...res, job_key: jobKey, application_id: pull.application_id || null, tabId: tab.id, startUrl });
             return;
           }

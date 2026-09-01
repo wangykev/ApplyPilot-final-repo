@@ -271,3 +271,69 @@ test("⚠ a group member's `name` must not shadow a REAL later field of the same
   assert.strictEqual(out.fields.filter((f) => f.widgetType === "checkbox_group").length, 1);
   assert.strictEqual(out.fields.length, 2);
 });
+
+// ── required-ness is declared on the ENTRY, not the control ──────────────────────────────
+// Live 2026-08-31: an armed Notion submit was REFUSED by the form's own validation for four
+// fields our scan had recorded as OPTIONAL ("What pronouns…", "How many prior internships…",
+// "Graduation Date", "Degree Type"). Ashby marks a required question with `_required_…` on its
+// heading LABEL; the inputs carry neither `required` nor `aria-required`. Only the yes/no branch
+// ever consulted the entry, so every other widget under-reported — and under-reporting is the
+// dangerous direction: bundleSubmitBlockers had nothing to block on, so an approved bundle
+// reached the submit gate that the form would never accept.
+
+function entryWith(kids, required) {
+  return el("div", { class: "_fieldEntry_1e3gg_28 ashby-application-form-field-entry" }, [
+    el("label", { class: "_heading_f7cvd_52 " + (required ? "_required_f7cvd_91" : ""), text: "Graduation Date" }),
+  ].concat(kids));
+}
+
+test("⚠⚠ a text input whose ENTRY heading is marked required scans as REQUIRED", () => {
+  const req = scan(el("div", {}, [entryWith([el("input", { type: "text", name: "gradDate" })], true)]));
+  assert.strictEqual(req.fields[0].isRequired, true, "the heading's _required_ marker must be read");
+  const opt = scan(el("div", {}, [entryWith([el("input", { type: "text", name: "gradDate" })], false)]));
+  assert.strictEqual(opt.fields[0].isRequired, false, "…and an unmarked entry must stay optional");
+});
+
+test("⚠ a RADIO group inherits its entry's required-ness (the pronouns field)", () => {
+  const mk = (required) => el("div", {}, [
+    el("div", { class: "_fieldEntry_1e3gg_28 ashby-application-form-field-entry" }, [
+      el("label", { class: "_heading_f7cvd_52 " + (required ? "_required_f7cvd_91" : ""), text: "What pronouns would you like our team to use when addressing you?" }),
+      el("div", {}, [el("input", { type: "radio", name: "pronouns", id: "p1" }), el("label", { for: "p1", text: "She/Her" })]),
+      el("div", {}, [el("input", { type: "radio", name: "pronouns", id: "p2" }), el("label", { for: "p2", text: "He/Him" })]),
+    ]),
+  ]);
+  assert.strictEqual(scan(mk(true)).fields[0].isRequired, true);
+  assert.strictEqual(scan(mk(false)).fields[0].isRequired, false);
+});
+
+test("⚠ the required marker is read from the HEADING, not from anywhere in the subtree", () => {
+  // A checkbox-group entry contains its option rows. If the test were
+  // `entry.querySelector('[class*="required"]')` over the whole subtree, a stray token on any
+  // descendant would flag every group on the form.
+  const root = el("div", {}, [
+    el("fieldset", { class: GROUP_CLS }, [
+      el("label", { class: "_heading_f7cvd_52 _label_1e3gg_42", text: "Optional question" }),
+      el("div", { class: "_option_1258i_34 some_required_looking_option" }, [
+        el("input", { type: "checkbox", id: FORM_ID + "_qqq-labeled-checkbox-0", name: "A" }),
+        el("label", { for: FORM_ID + "_qqq-labeled-checkbox-0", text: "A" }),
+      ]),
+    ]),
+  ]);
+  assert.strictEqual(scan(root).fields[0].isRequired, false,
+    "a descendant's class must not make the question required");
+});
+
+// ── the ACCEPT-consent classifier reaches the GH/Lever/Ashby path ────────────────────────
+// Live 2026-08-31: an armed IMC submit was refused — "You answered some demographic questions.
+// Please accept the terms to proceed, or clear your responses." The box is
+// `gdpr_demographic_data_consent_given` and its `required` property is FALSE (it is only
+// mandatory once a demographic question carries an answer), so nothing in the bundle could see it.
+test("⚠ the IMC demographic GDPR box classifies as ACCEPT, and an opt-in still does not", () => {
+  const gdpr = "By checking this box, I consent to IMC collecting, storing, and processing my responses to the demographic data surveys above.";
+  assert.strictEqual(ats.atsConsentKind(gdpr, { name: "gdpr_demographic_data_consent_given" }), "accept");
+  // The authorised rule is unchanged in the direction that matters: a marketing opt-in is never
+  // ticked, even when it mentions privacy.
+  assert.notStrictEqual(ats.atsConsentKind("Email me about similar jobs — see our privacy policy", {}), "accept");
+  // …and a truthfulness attestation stays deliberately excluded.
+  assert.strictEqual(ats.atsConsentKind("I certify the information provided is accurate", {}), "attestation");
+});

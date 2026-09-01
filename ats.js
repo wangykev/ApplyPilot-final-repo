@@ -2194,7 +2194,35 @@ function atsInjScan(ats) {
     ...document.querySelectorAll('[class*="_fieldEntry"]'),
   ]);
   const entries = [...entrySet].sort((a, b) => (a.compareDocumentPosition(b) & 2 ? 1 : -1));
+  // ⚠⚠ REQUIRED-NESS IS DECLARED ON THE ENTRY, NOT ON THE CONTROL (live 2026-08-31, Notion).
+  // Ashby marks a required question with `_required_…` in its heading LABEL's class; measured, the
+  // inputs themselves carry neither `required` nor `aria-required`. Only the yes/no branch ever
+  // looked at the entry (`[class*="required"]`) — every other branch read the input alone and so
+  // reported `isRequired:false` for questions the form will not submit without.
+  //
+  // That is not cosmetic. An armed Notion submit was REFUSED by the form's own validation:
+  //   Missing entry for required field: What pronouns would you like our team to use…
+  //   Missing entry for required field: How many prior internships have you had
+  //   Missing entry for required field: Graduation Date / Degree Type
+  // Every one of those was scanned OPTIONAL, so `bundleSubmitBlockers` ("a REQUIRED field with NO
+  // VALUE blocks SUBMIT") had nothing to block on, the review page showed nothing to answer, and
+  // an approved bundle reached the gate that the form would never accept. Over-flagging is the safe
+  // direction and under-flagging is the dangerous one — this is that failure, live.
+  //
+  // ⚠ Scoped to the entry's own heading, NOT `entry.querySelector('[class*="required"]')` over the
+  // whole subtree: a checkbox-group entry contains its option rows, and a stray "required" token on
+  // any descendant would flag every group on the form. The heading is the element that carries the
+  // question, so it is also the one that carries the question's required-ness.
+  const entryRequired = (e) => {
+    if (!e) return false;
+    const h = e.querySelector('label[class*="_heading_"]') || e.querySelector("label");
+    if (h && /_required_/.test(String(h.className || ""))) return true;
+    // The marker Ashby renders as a separate node on some builds, plus the yes/no branch's original
+    // test kept verbatim so that path cannot regress.
+    return !!e.querySelector('[class*="_required_"]');
+  };
   for (const entry of entries) {
+    const entryReq = entryRequired(entry);
     // Yes/No button pair (hidden checkbox tracks state).
     const yesno = entry.querySelector('[class*="_yesno_"]');
     const cb = entry.querySelector('input[type="checkbox"]');
@@ -2203,7 +2231,7 @@ function atsInjScan(ats) {
       const nm = cb.name || cb.id; if (!nm || seen.has(nm)) continue; seen.add(nm);
       const picked = [...yesno.querySelectorAll("button")].find((b) => /_selected|active/i.test(String(b.className || "")) || b.getAttribute("aria-pressed") === "true");
       push({ fieldName: nm, inputSel: 'input[name="' + esc(nm) + '"]', widgetType: "yesno", label: entryLabel || nm,
-        isRequired: cb.required === true || !!entry.querySelector('[class*="required"]'), value: picked ? txt(picked) : (cb.checked ? "Yes" : null), options: ["Yes", "No"] });
+        isRequired: cb.required === true || entryReq || !!entry.querySelector('[class*="required"]'), value: picked ? txt(picked) : (cb.checked ? "Yes" : null), options: ["Yes", "No"] });
       continue;
     }
     // radio group(s) inside the entry (EEOC block: several logical questions can share one
@@ -2224,7 +2252,7 @@ function atsInjScan(ats) {
         const optLabel = (r) => { const l = (r.id && document.querySelector('label[for="' + esc(r.id) + '"]')) || r.closest("label"); return (l ? txt(l) : "") || r.value; };
         const checked = list.find((r) => r.checked);
         push({ fieldName: nm, inputSel: 'input[name="' + esc(nm) + '"]', widgetType: "radio", label: qlbl || nm,
-          isRequired: list.some((r) => r.required), value: checked ? optLabel(checked) : null, options: list.map(optLabel).filter(Boolean) });
+          isRequired: list.some((r) => r.required) || entryReq, value: checked ? optLabel(checked) : null, options: list.map(optLabel).filter(Boolean) });
       }
     }
     // ── DECLARED CHECKBOX GROUPS — "select all that apply" (live 2026-08-31, Notion) ─────
@@ -2314,7 +2342,7 @@ function atsInjScan(ats) {
         const nm = cbx.name || cbx.id; if (!nm || seen.has(nm)) continue; seen.add(nm);
         const l = (cbx.id && document.querySelector('label[for="' + esc(cbx.id) + '"]')) || cbx.closest("label");
         push({ fieldName: nm, inputSel: cbx.id ? "#" + esc(cbx.id) : 'input[name="' + esc(nm) + '"]', widgetType: "checkbox",
-          label: stripReq((l ? txt(l) : "") || entryLabel || nm), isRequired: cbx.required === true, value: cbx.checked ? true : null });
+          label: stripReq((l ? txt(l) : "") || entryLabel || nm), isRequired: cbx.required === true || entryReq, value: cbx.checked ? true : null });
       }
     }
     for (const el of entry.querySelectorAll("input, textarea")) {
@@ -2336,7 +2364,8 @@ function atsInjScan(ats) {
       const isFile = el.type === "file";
       if (!isFile && !vis(el)) continue;
       seen.add(nm);
-      const required = el.required === true;
+      // ⚠ the entry's heading, not just the control — see entryRequired above.
+      const required = el.required === true || entryReq;
       if (isFile) { push({ fieldName: nm, inputSel, widgetType: "file_upload", label: entryLabel || nm, isRequired: required, value: (el.files && el.files[0] && el.files[0].name) || null }); continue; }
       if (isCombo) { push({ fieldName: nm, inputSel, widgetType: "select", label: entryLabel || nm, isRequired: required, value: el.value || null }); continue; }
       if (el.tagName === "TEXTAREA") { push({ fieldName: nm, inputSel: "textarea[name=\"" + esc(nm) + "\"]", widgetType: "textarea", label: entryLabel || nm, isRequired: required, value: el.value || null }); continue; }
@@ -8272,6 +8301,59 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     try { await atsCaptureMissingOptions(act, ats, scan, results, (m) => console.log("[ApplyPilot]" + m)); }
     catch (e) { /* diagnostic + convenience only — never fail a fill over it */ }
   }
+
+  // ── ACCEPT CHECKBOXES, ON THIS PATH TOO (live 2026-08-31, IMC/Greenhouse) ──────────────
+  // The operator's 2026-08-18 instruction — tick ACCEPT boxes, never opt-ins or attestations —
+  // was wired only into the iCIMS and ORC PRE-FORM stages. GH / Lever / Ashby have no pre-form,
+  // so no consent was ever classified here and every accept box was simply left alone.
+  //
+  // Live consequence: an armed IMC submit was REFUSED by the form itself —
+  //   "You answered some demographic questions. Please accept the terms to proceed, or clear
+  //    your responses."
+  // The box is `gdpr_demographic_data_consent_given`, labelled "By checking this box, I consent
+  // to <company> collecting, storing, and processing my responses to the demographic data surveys
+  // above." — which `atsConsentKind` ALREADY classifies as "accept", with and without hints. So
+  // nothing about the authorised rule widens here; this path just starts asking the question.
+  //
+  // ⚠ ITS `required` PROPERTY IS FALSE. The box is CONDITIONALLY mandatory — only once a
+  // demographic question carries an answer — so neither the input nor the bundle's blocker check
+  // can see it, and the operator's approval gate passed an application the form would not take.
+  // That is the same shape as the Ashby heading-declared required-ness: required-ness is not
+  // always on the control.
+  //
+  // ⚠ RUNS ON THE REPLAY TOO, deliberately — unlike the option sweep above. A submit run must tick
+  // it or be refused, and the bundle cannot carry it: an optional consent is recorded unchecked by
+  // design ("an optional consent is the operator's to give"), so there is no approved value to
+  // replay. The action is the same authorised one either way.
+  try {
+    const consents = [];
+    for (const f of (scan.fields || [])) {
+      if (!f || f.widgetType !== "checkbox") continue;
+      const kind = atsConsentKind(f.label, { id: f.fieldName, name: f.fieldName });
+      if (kind !== "accept") continue;
+      consents.push(f);
+    }
+    for (const f of consents) {
+      const t = await act.eval(atsInjTickConsent, f.inputSel).catch(() => null);
+      const ok = !!(t && t.ok && t.checked);
+      const rec = results.find((r) => r && r.fieldName === f.fieldName);
+      // AUDITABLE, NEVER SILENT — the instruction's own requirement: an acceptance made on the
+      // operator's behalf is logged BY NAME, with the notice's own words.
+      if (ok) console.log(`[ApplyPilot][ATS-CONSENT] ✔ ACCEPTED on your instruction: ${JSON.stringify(String(f.label || f.fieldName).slice(0, 160))}${t.already ? " (already ticked)" : ""}`);
+      else console.log(`[ApplyPilot][ATS-CONSENT] ⚠ could NOT tick: ${JSON.stringify(String(f.label || f.fieldName).slice(0, 160))} — left for the operator`);
+      if (rec) {
+        // A tick that did not take must never be reported as consent given.
+        rec.status = ok ? "filled" : "needs_review";
+        rec.after = ok ? true : null;
+        rec.verified = ok;
+        rec.flag = ok ? rec.flag : "consent-not-accepted";
+        rec.detail = ok
+          ? "accepted on your standing instruction (a data-processing / privacy notice)"
+          : "this acceptance could not be ticked — the form will refuse until it is";
+      }
+    }
+    if (consents.length) results.consents_accepted = consents.map((f) => String(f.label || f.fieldName).slice(0, 200));
+  } catch (e) { /* a consent we could not reach stays untouched — the submit gate still refuses */ }
 
   // DID EVERY CHOICE FIELD ACTUALLY REACH REVIEW AS A PICKER? The scan-time line above says what we
   // KNEW; this says what the operator will SEE, which is the thing that was asked for and the only
