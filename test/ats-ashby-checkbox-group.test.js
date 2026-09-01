@@ -39,9 +39,10 @@ function parseSimple(sel) {
   const classes = (m[2] || "").split(".").filter(Boolean);
   const attrs = [];
   for (const raw of (m[3] || "").match(/\[[^\]]+\]/g) || []) {
-    const a = /^\[([A-Za-z_:][-A-Za-z0-9_:.]*)([*^$]?=)"([^"]*)"\]$/.exec(raw);
+    // `[attr="v"]`, `[attr*="v"]` — and bare `[attr]`, presence only (the scan uses `label[for]`).
+    const a = /^\[([A-Za-z_:][-A-Za-z0-9_:.]*)(?:([*^$]?=)"([^"]*)")?\]$/.exec(raw);
     if (!a) throw new Error("DOM double: unsupported attribute selector " + raw);
-    attrs.push({ name: a[1], op: a[2], value: a[3] });
+    attrs.push({ name: a[1], op: a[2] || null, value: a[3] });
   }
   return { tag, classes, attrs };
 }
@@ -65,6 +66,7 @@ class El {
     this.value = this._attrs.value == null ? "" : this._attrs.value;
     this.checked = !!this._attrs.checked;
     this.required = !!this._attrs.required;
+    this.placeholder = this._attrs.placeholder || "";   // the scan's date tell reads this
     for (const k of kids || []) this.append(k);
   }
   append(child) { child.parentElement = this; this.children.push(child); return this; }
@@ -86,7 +88,7 @@ class El {
     for (const a of p.attrs) {
       let v = a.name === "type" ? this.type : a.name === "name" ? this.name : a.name === "id" ? this.id : this.getAttribute(a.name);
       if (a.name === "class") v = this.className;
-      if (v == null) return false;
+      if (v == null || v === "") return false;   // presence: an empty attribute is not present
       v = String(v);
       if (a.op === "=" && v !== a.value) return false;
       if (a.op === "*=" && v.indexOf(a.value) === -1) return false;
@@ -117,6 +119,8 @@ function installDom(root) {
     title: "Software Engineer Intern (Summer 2027) @ Notion",
     querySelectorAll: (s) => root.querySelectorAll(s),
     querySelector: (s) => root.querySelector(s),
+    // The dangling-`for` rule needs a real answer to "does an element with this id exist?".
+    getElementById: (id) => root._descendants([]).find((e) => e.id === id) || null,
   };
 }
 
@@ -336,4 +340,72 @@ test("⚠ the IMC demographic GDPR box classifies as ACCEPT, and an opt-in still
   assert.notStrictEqual(ats.atsConsentKind("Email me about similar jobs — see our privacy policy", {}), "accept");
   // …and a truthfulness attestation stays deliberately excluded.
   assert.strictEqual(ats.atsConsentKind("I certify the information provided is accurate", {}), "attestation");
+});
+
+// ── a required control with NEITHER name NOR id ──────────────────────────────────────────
+// Live 2026-08-31, Notion: "Graduation Date" is a react-datepicker whose input carries no `name`
+// and no `id`, and whose label's `for` points at an id no element has. The scan keys on
+// `name || id`, so the field was DROPPED — no record, no review item, nothing in the bundle — and
+// an armed submit was refused by the form for exactly that field.
+//
+// Nothing upstream could have caught it, which is what makes this shape the dangerous one: an
+// ABSENT field is not an unfilled one. bundleSubmitBlockers checks required fields IN the bundle,
+// the review page shows what IS in the bundle, and the pre-submit DOM read compares APPROVED
+// values. A field nobody ever recorded is invisible to all three.
+
+function dateEntry() {
+  return el("div", { class: "_fieldEntry_1e3gg_28 ashby-application-form-field-entry" }, [
+    el("label", { class: "_heading_f7cvd_52 _required_f7cvd_91", for: "d11e9ed8-b24b-493a-8157-ddba59ff1e9c", text: "Graduation Date" }),
+    el("div", { class: "react-datepicker-wrapper" }, [
+      el("div", { class: "react-datepicker__input-container" }, [
+        el("input", { type: "text", placeholder: "Pick date...", class: "_input_gc9ve_28 ashby-application-form-input-date", required: true }),
+      ]),
+    ]),
+  ]);
+}
+
+test("⚠⚠ a required input with no name AND no id is still SCANNED, not dropped", () => {
+  const out = scan(el("div", {}, [dateEntry()]));
+  assert.strictEqual(out.fields.length, 1, "the field must not vanish from the scan");
+  assert.strictEqual(out.fields[0].label, "Graduation Date");
+  assert.strictEqual(out.fields[0].isRequired, true);
+  // "Pick date..." is the existing date tell.
+  assert.strictEqual(out.fields[0].widgetType, "date");
+});
+
+test("⚠ its key is the DANGLING label[for] — durable, not a position", () => {
+  const out = scan(el("div", {}, [dateEntry()]));
+  // Ashby's own question UUID. A positional `ap-ats-field-N` would move between visits, and a
+  // submit run must find the same field the fill recorded.
+  assert.strictEqual(out.fields[0].fieldName, "d11e9ed8-b24b-493a-8157-ddba59ff1e9c");
+  assert.ok(!/ap-ats-field/.test(out.fields[0].fieldName));
+});
+
+test("⚠ a label[for] that RESOLVES is not borrowed — it belongs to another control", () => {
+  // The dangling-ness IS the evidence. If the `for` points at a real element, that label is
+  // already spoken for, and stealing its id would key two fields the same.
+  const root = el("div", {}, [
+    el("div", { class: "_fieldEntry_1e3gg_28 ashby-application-form-field-entry" }, [
+      el("label", { for: "real-one", text: "Some Question" }),
+      el("input", { type: "text", id: "real-one", name: "real-one" }),
+      el("input", { type: "text", placeholder: "Pick date..." }),   // no name, no id
+    ]),
+  ]);
+  const out = scan(root);
+  const stamped = out.fields.filter((f) => /^ap-ats-field-/.test(f.fieldName));
+  assert.strictEqual(stamped.length, 1, "the unnamed control falls back to a positional stamp");
+  assert.strictEqual(out.fields.filter((f) => f.fieldName === "real-one").length, 1,
+    "and the real control keeps its own key exactly once");
+});
+
+test("a control that HAS a name is untouched — the ordinary path cannot regress", () => {
+  const root = el("div", {}, [
+    el("div", { class: "_fieldEntry_1e3gg_28 ashby-application-form-field-entry" }, [
+      el("label", { class: "_heading_f7cvd_52", for: "dangling-id", text: "School" }),
+      el("input", { type: "text", name: "school-field" }),
+    ]),
+  ]);
+  const out = scan(root);
+  assert.strictEqual(out.fields[0].fieldName, "school-field",
+    "a present `name` always wins over the label's for");
 });

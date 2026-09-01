@@ -2359,6 +2359,34 @@ function atsInjScan(ats) {
         nm = "ap-ats-combobox-" + out.fields.length;
         try { el.id = nm; } catch (e) { continue; }
       }
+      // ⚠⚠ A REQUIRED CONTROL CAN CARRY NEITHER `name` NOR `id`, AND WAS BEING DROPPED ENTIRELY
+      // (live 2026-08-31, Notion). The loop below skips anything with no key, so Ashby's
+      // `react-datepicker` never reached the scan at all — no record, no review item, nothing in
+      // the bundle. Its markup names it plainly enough:
+      //   <label class="_heading_ _required_" for="d11e9ed8-…">Graduation Date</label>
+      //   <div class="react-datepicker-wrapper"><div class="react-datepicker__input-container">
+      //     <input type="text" placeholder="Pick date..." class="…-input-date" required value="">
+      // An armed submit was refused by the form for exactly this field, and nothing upstream could
+      // have caught it: an absent field is not an unfilled one. `bundleSubmitBlockers` checks
+      // required fields IN the bundle, review shows what IS in the bundle, and the pre-submit DOM
+      // read compares APPROVED values — a field nobody ever recorded is invisible to all three.
+      //
+      // ⚠ THE KEY COMES FROM THE DANGLING `label[for]`, NOT A POSITION. That `for` points at an id
+      // no element has (the input has none), which is itself the evidence the label was written for
+      // THIS control — and its value is Ashby's own question UUID, so it is durable across visits
+      // the way a positional `ap-ats-field-N` would not be. A submit run must find the same field
+      // it filled, and the parse/re-render lesson from iCIMS is that positions are the thing that
+      // moves.
+      //
+      // ⚠ NOT applied to comboboxes, deliberately: they already stamp `ap-ats-combobox-N` and
+      // bundles in flight are keyed on it, so re-keying them would make every approved combobox
+      // report "no matching field on the live form". Fixing that is a separate, deliberate change.
+      if (!nm && !isCombo) {
+        const lf = entry.querySelector("label[for]");
+        const forId = lf ? lf.getAttribute("for") : "";
+        nm = (forId && !document.getElementById(forId)) ? forId : ("ap-ats-field-" + out.fields.length);
+        try { el.id = nm; } catch (e) { continue; }
+      }
       const inputSel = el.id ? "#" + esc(el.id) : 'input[name="' + esc(nm) + '"]';
       if (!nm || seen.has(nm)) continue;
       const isFile = el.type === "file";
@@ -11016,11 +11044,17 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     for (const p of picks) { await act.eval(atsInjCheckOption, ref.inputSel, p, true); await act.delay(90); }
     await act.delay(150);
     const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
-    const liveList = (back && back.ok ? String(back.value == null ? "" : back.value) : "").split(/;|,/)
-      .map((x) => atsLib.normalize(x)).filter(Boolean);
+    // ⚠ DO NOT SPLIT THE READ-BACK ON ITS SEPARATOR — AN OPTION CAN CONTAIN ONE. atsInjReadValue
+    // joins a group with ", " and this form's options are "New York, NY" / "San Francisco, CA", so
+    // splitting on commas yielded ["New York","NY","San Francisco","CA"] and NOTHING matched: the
+    // first version of this branch reported "only 0 of 2 approved answer(s) stuck" on a form that
+    // had ticked both. (The engineering-role group passed in the same run precisely because its
+    // options carry no commas — which is what identified the fault.) Containment against the whole
+    // joined string needs no separator vocabulary at all.
+    const liveJoined = atsLib.normalize(back && back.ok ? String(back.value == null ? "" : back.value) : "");
     // EVERY approved answer must be on the form — a shorter selection than the operator chose is a
     // DIFFERENT answer, which is the whole reason this branch exists.
-    const missing = picks.filter((p) => !liveList.some((l) => l === atsLib.normalize(p)));
+    const missing = picks.filter((p) => !liveJoined.includes(atsLib.normalize(p)));
     rec.after = back && back.ok ? back.value : null;
     rec.selected_options = picks;
     rec.verified = missing.length === 0;

@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "group-multianswer-25";
+const AP_BUILD_MARKER = "unnamed-field-27";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -7027,11 +7027,14 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       if (f.widgetType === "checkbox") {
         ok = String(!!live.value) === String(wantV === "true" || wantV === "Yes" || wantV === "true");
       } else if (f.widgetType === "checkbox_group" || f.widgetType === "multiselect_native") {
-        // SET-WISE: the page joins with ", " and the bundle with "; " (both vocabularies are live in
-        // this file), and neither side owns the order.
+        // SET-WISE, BY CONTAINMENT AGAINST THE WHOLE JOINED STRING — never by splitting the live
+        // value. ⚠ AN OPTION CAN CONTAIN THE SEPARATOR: the page joins with ", " and this form's
+        // options are "New York, NY" / "San Francisco, CA", so a comma split yields
+        // ["New York","NY",…] and every answer looks missing. The bundle side is safe to split
+        // (GROUP_JOIN "; " is ours), but the PAGE side must not be.
         const wantSet = atsLib.splitGroupValue(wantV).map(norm).filter(Boolean);
-        const liveSet = liveV.split(/;|,/).map(norm).filter(Boolean);
-        ok = wantSet.length > 0 && wantSet.every((w) => liveSet.some((l) => l === w || l.includes(w) || w.includes(l)));
+        const liveJoined = norm(liveV);
+        ok = wantSet.length > 0 && wantSet.every((w) => liveJoined.includes(w));
       } else {
         ok = atsFd.textValuesMatch(liveV, wantV)
           || (liveV && norm(wantV).includes(norm(liveV)))                                   // chip display
