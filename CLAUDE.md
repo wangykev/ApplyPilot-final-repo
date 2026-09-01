@@ -1223,6 +1223,46 @@ The standing rules:
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
+- **⚠⚠ THE SUBMIT GATE RE-READS THE LIVE DOM AND COMPARES IT TO THE *APPROVAL* (operator,
+  2026-08-31).** Three checks already existed and none answered that question: each commit is
+  read back, the post-fill audit re-reads the page against what the replay **wrote**, and the strict
+  verify checks each approved field ended `filled` — all three compare the page to **our own record**.
+  The new pass compares it to `current_value` from the approved bundle. ⚠ Its accept rules are the
+  AUDIT's, deliberately: **a false negative here blocks a submit that should pass.** Credentials and
+  file uploads are skipped (placeholder by design; an input never reads back a file).
+  **It earned itself on its first live run**, catching all three of the following:
+  - **A REPLAYED CHECKBOX GROUP TICKED ONLY ITS FIRST APPROVED ANSWER.** `current_value` is joined,
+    the replay splits it — then fed the set to `matchCandidates`, which is a TIERED PREFERENCE
+    ("stop at the first hit"). An operator who ticked five disciplines would have submitted one.
+    Invisible to everything else: the one option we ticked read back fine. Now N independent matches,
+    tick all, report anything unoffered — the `multiselect_native` rule. ⚠ **REPLAY ONLY**: on a FILL
+    the same shape is a ladder of alternative PHRASINGS of one answer
+    (`selfIdDisabilityCandidates`), and ticking every match would put two boxes on a self-ID
+    question. `mopts.replay` already distinguishes them.
+  - **⚠ NEVER SPLIT A GROUP READ-BACK ON ITS SEPARATOR — AN OPTION CAN CONTAIN ONE.** The page joins
+    with `", "` and the options are `"New York, NY"` / `"San Francisco, CA"`, so a comma split
+    reported `0 of 2 stuck` on a form holding both. Compare by CONTAINMENT against the whole joined
+    string. (The comma-free group passed in the same run — which is what identified the fault.)
+  - **⚠⚠ A REQUIRED CONTROL WITH NEITHER `name` NOR `id` WAS DROPPED BY THE SCAN.** Ashby's
+    Graduation Date is a `react-datepicker` whose input has no key and whose `label[for]` points at a
+    **dangling** id. The scan keys on `name || id` and skipped it, so it reached NO record, NO review
+    item and NO bundle — and **an absent field is not an unfilled one**, so `bundleSubmitBlockers`,
+    the review page and even the new DOM read are all blind to it. Only the employer's validator
+    caught it. The key is now that dangling `for` (Ashby's own question UUID — durable; a positional
+    `ap-ats-field-N` is exactly what moves between visits). A `for` that RESOLVES is never borrowed.
+    ⚠ NOT applied to comboboxes: bundles in flight are keyed on their `ap-ats-combobox-N`.
+- **⚠⚠ NEVER HAND A DATE PICKER A BARE ISO STRING — IT COMES BACK A DAY EARLY (2026-08-31).**
+  `"2028-05-01"` rendered `"04/30/2028"`: react-datepicker parses `YYYY-MM-DD` as UTC midnight and
+  renders it LOCAL, so everything west of UTC loses a day. ⚠ **The tempting fix is the wrong one** —
+  the mismatch looks like a formatting quibble, so comparing calendar dates loosely would make the
+  gate PASS and ship a date silently one day wrong. Convert by **string surgery on the ISO parts, no
+  `Date` object** (constructing one *is* the offset). A month-only `YYYY-MM` is deliberately NOT
+  converted — inventing a day is a factual claim. Stays `filled_review` + `date-format-unverified`:
+  we know the widget DISPLAYS MM/DD/YYYY, not that it INTERPRETS a typed value that way.
+- **⚠ ASHBY HIDDEN vs VISIBLE ARE EQUIVALENT — measured 2026-08-31, after the above.** 25 fields,
+  14 filled + 11 review, **0 failures** both ways (visible 46.1s / 35.9s, hidden 45.4s). The earlier
+  catastrophic hidden run (227s, 16 `commit failed`) was `NOT painting (chrome SUSPENDED it)` — a
+  deeper state than the ordinary `chrome says hidden`, and the one the DEGRADED-RUN warning keys on.
 - **⚠⚠ THE ATS SUBMIT PATH REPORTED NOTHING — a FILED application read "needs_review" forever
   (live 2026-08-31).** The Workday branch has always called `reportApplication` with
   `status:"submitted"`; the ATS branch returned straight to the caller. Observed as **16
