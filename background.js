@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "combo-selection-38";
+const AP_BUILD_MARKER = "viewport-guard-39";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -7094,13 +7094,37 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // Every FIELD filled correctly throughout, because field clicks go through trustedFocus →
     // cdpRectReady(sel, true), where the `true` is a scroll. Only this path read a raw rect.
     const clickState = await cdpEval(atsInjSubmitState, ats, true).catch(() => null);
-    const clickRect = clickState && clickState.rect;
+    let clickRect = clickState && clickState.rect;
     // POSITIVE evidence the coordinate is clickable. A rect still outside the viewport after a
     // scroll means something is wrong we do not understand, and a click there is a silent no-op —
     // the single worst outcome for this action, because "nothing happened" is indistinguishable
     // from "the form ignored us" in every log line that follows.
-    const vh = await cdpEval(function () { return window.innerHeight; }).catch(() => null);
-    if (!clickRect || (typeof vh === "number" && (clickRect.cy < 0 || clickRect.cy > vh))) {
+    // ⚠⚠ A ZERO VIEWPORT IS AN UNMEASURABLE TAB, NOT AN OFF-SCREEN BUTTON (live 2026-09-01).
+    // A Whatnot submit refused with `cy=-903, viewport=0`. With `vh === 0` the test below rejects
+    // EVERY coordinate — negative or positive — so a tab that simply had not been laid out yet was
+    // reported as "the button is not on screen", and a submit whose 18 fields had all just verified
+    // was blocked. That is the false-negative direction this guard was explicitly written to avoid
+    // on the other side, and it costs a real application.
+    //
+    // A viewport of 0 means the renderer has not laid the page out (a freshly created tab, an
+    // occluded window). The honest response is to WAIT and re-measure rather than to judge geometry
+    // that does not exist yet — and if it never becomes measurable, say THAT, because "we could not
+    // measure the page" and "the button is off screen" send an operator to different places.
+    let vh = await cdpEval(function () { return window.innerHeight; }).catch(() => null);
+    for (let i = 0; i < 3 && !(typeof vh === "number" && vh > 0); i++) {
+      await cdpDelay(700);
+      vh = await cdpEval(function () { return window.innerHeight; }).catch(() => null);
+    }
+    if (!(typeof vh === "number" && vh > 0)) {
+      LOG(`✗ REFUSING to click: the page never reported a usable viewport (innerHeight=${vh}), so the button's position cannot be judged. Nothing was submitted.`);
+      return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "submit-unmeasurable", ats,
+        detail: "The tab never laid out, so we could not tell where the submit button is. Everything is filled and verified — press Submit yourself in the tab, or re-run with the tab visible." };
+    }
+    // Re-read the rect on the now-measurable page: the earlier one was taken against that same
+    // unlaid-out viewport, so its coordinates describe nothing.
+    const reState = await cdpEval(atsInjSubmitState, ats, true).catch(() => null);
+    if (reState && reState.rect) clickRect = reState.rect;
+    if (!clickRect || clickRect.cy < 0 || clickRect.cy > vh) {
       LOG(`✗ REFUSING to click: the submit button is not on screen after scrolling (cy=${clickRect ? clickRect.cy : "?"}, viewport=${vh}). Nothing was submitted.`);
       return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "submit-offscreen", ats,
         detail: "The submit button could not be brought into view, so clicking it would have done nothing. Everything is filled and verified — press Submit yourself in the tab." };
