@@ -10979,6 +10979,65 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     return true;
   }
 
+  // ⚠⚠ A REPLAYED CHECKBOX GROUP CAN CARRY SEVERAL ANSWERS, AND ONLY THE FIRST WAS EVER TICKED
+  // (live 2026-08-31, Notion). `current_value` for a group is the joined display, and the replay
+  // already splits it back into its set — but the split then went through `matchCandidates`, which
+  // treats a candidate list as a TIERED PREFERENCE ("most specific first, stop at the first hit")
+  // and commits exactly ONE. So an operator who ticked five engineering disciplines on the review
+  // page got "Product" on the form and nothing else, and an operator who added New York alongside
+  // San Francisco got San Francisco alone.
+  //
+  // It was invisible: the one option we did tick read back correctly, so the field was `filled`,
+  // the post-fill audit matched (it compares the page to what the replay WROTE), and the strict
+  // verify passed. Only the pre-submit read against the APPROVED value catches it — which is how
+  // this was found, on that check's first live run.
+  //
+  // `multiselect_native` has always done this correctly (N independent matches → tick them all);
+  // this gives the checkbox group the same treatment.
+  //
+  // ⚠ REPLAY ONLY, and that scope is the safety property, not caution. On a REPLAY the candidate
+  // list came from splitting a group value, so every entry IS an answer. On a FILL the list is a
+  // tiered LADDER of alternative phrasings for ONE answer — `selfIdDisabilityCandidates` yields
+  // ["No, I do not have a disability…", "No"] — and ticking every match there would put two boxes
+  // on a self-ID question the operator answered once. Same list shape, opposite meaning; only the
+  // caller knows which, and it already tells us.
+  if (wt === "checkbox_group" && mopts && mopts.replay && candidates && candidates.length > 1) {
+    rec.resolved = candidates;
+    const texts = (f.options || []).slice();
+    // Each approved answer runs the ORDINARY ladder against the live options, so nothing is ticked
+    // that the form did not offer — the same rule the native multi-select path states.
+    const picks = [];
+    for (const c of candidates) {
+      const m = atsLib.matchCandidates([c], texts, { containment: allowContainment });
+      if (m && m.targetIndex >= 0 && picks.indexOf(texts[m.targetIndex]) === -1) picks.push(texts[m.targetIndex]);
+    }
+    atsAttachOptions(rec, texts);
+    if (!picks.length) { rec.detail = "none of " + candidates.length + " approved answer(s) matched " + texts.length + " option(s)"; return false; }
+    for (const p of picks) { await act.eval(atsInjCheckOption, ref.inputSel, p, true); await act.delay(90); }
+    await act.delay(150);
+    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    const liveList = (back && back.ok ? String(back.value == null ? "" : back.value) : "").split(/;|,/)
+      .map((x) => atsLib.normalize(x)).filter(Boolean);
+    // EVERY approved answer must be on the form — a shorter selection than the operator chose is a
+    // DIFFERENT answer, which is the whole reason this branch exists.
+    const missing = picks.filter((p) => !liveList.some((l) => l === atsLib.normalize(p)));
+    rec.after = back && back.ok ? back.value : null;
+    rec.selected_options = picks;
+    rec.verified = missing.length === 0;
+    rec.status = missing.length === 0 ? "filled" : "needs_review";
+    rec.matchTier = "exact-normalized";
+    if (missing.length) rec.detail = "only " + (picks.length - missing.length) + " of " + picks.length
+      + " approved answer(s) stuck — missing " + missing.map((x) => JSON.stringify(x)).join(", ");
+    // A stored answer this form does not offer is REPORTED, never dropped in silence.
+    const unoffered = candidates.filter((c) => !picks.some((p) => atsLib.normalize(p) === atsLib.normalize(c)));
+    if (!missing.length && unoffered.length) {
+      rec.status = "filled_review"; rec.flag = rec.flag || "partial-multiselect";
+      rec.detail = "ticked " + picks.length + " of your " + candidates.length
+        + " answers — this form does not offer " + unoffered.join(", ");
+    }
+    return true;
+  }
+
   if (wt === "radio" || wt === "checkbox_group") {
     if (!candidates || !candidates.length) return false;
     rec.resolved = candidates;
