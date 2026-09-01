@@ -599,14 +599,32 @@ function cdpLagNote(method, ms, err) {
 // timer probing a detached tab throws on every beat.
 // Kill-switch for the A/B: `chrome.storage.local.atsKeepWarm = false`.
 let cdpWarmTimer = null;
-const CDP_WARM_BEAT_MS = 500;
+// ⚠⚠ 250ms, NOT 500ms — MEASURED, and the measurement was an accident worth recording (2026-09-01).
+// Turning `debugLagTrace` ON to diagnose a 45-87s Ashby fill made the fill FASTER: 13.6s and 15.4s
+// hidden, with sw-starved paces gone entirely (27-31s lost -> 3.7-5.2s, worst 11035ms -> 1257ms).
+// The trace changes nothing about the fill path; what it adds is a SECOND 500ms interval that also
+// issues a Runtime.evaluate. Two staggered 500ms beats = worker activity every ~250ms, and that is
+// the whole difference — so the beat itself was simply too slow to hold the worker scheduled.
+// One extra trivial round trip per 500ms is nothing against the ~30s it saves.
+const CDP_WARM_BEAT_MS = 250;
 
 function cdpKeepWarmStart() {
   if (cdpWarmTimer) return false;
+  // ⚠⚠ NEVER LET BEATS OVERLAP. The probe has no timeout of its own, so against a WEDGED renderer
+  // every beat's Runtime.evaluate hangs — and a timer that keeps firing then accumulates unresolved
+  // commands until the worker stops answering anything, including the popup and the dev bridge.
+  // Observed live 2026-09-01 right after this beat was halved to 250ms: the service worker went
+  // unresponsive while the page itself was still fine, which is the shape of a pile-up rather than
+  // of starvation. Halving the interval doubled the rate of hanging probes, so the guard belongs
+  // here regardless of the cadence — one in flight at a time, and a hung one simply skips beats
+  // until it settles. A skipped beat costs nothing: the NEXT one is 250ms away.
+  let inFlight = false;
   cdpWarmTimer = setInterval(async () => {
-    if (cdpTabId === null) return;
+    if (cdpTabId === null || inFlight) return;
+    inFlight = true;
     try { await cdpSendRaw("Runtime.evaluate", { expression: "1", returnByValue: true }); }
     catch (e) { /* detached or navigating — the next beat re-checks */ }
+    finally { inFlight = false; }
   }, CDP_WARM_BEAT_MS);
   return true;
 }

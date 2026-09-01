@@ -10653,7 +10653,18 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // `read.open` is the positive evidence the widget mounted; the typed search immediately after is
     // the real test of whether it answers.
     const menuMounted = !!(read && read.open);
-    const forceToggles = menuMounted ? 0 : 2;
+    // ⚠⚠ A PROVEN "NO MENU" IS ALSO NOT A MISSED CLICK (measured 2026-09-01). The guard above only
+    // skipped the toggles for a menu that MOUNTED and settled empty, so a query-only location box —
+    // which mounts nothing at all until you type — still paid two forced re-opens plus their 1500ms
+    // polls. Measured: with the waiter itself down to 60ms, the open phase was STILL 5.6s, and this
+    // was all of it. The same reasoning the note above gives applies unchanged: the typed search
+    // immediately after is the real test of whether the widget answers, and each toggle FLIPS the
+    // menu, so an odd number leaves it closed.
+    // ⚠ LOCATION ONLY. For a plain `select` an absent menu really can mean the click missed, and a
+    // retry is worth its cost there. Here it cannot hide a missed click either: the typing path
+    // takes its own `trustedFocus` (the widget-wake) before it types, which re-clicks the control.
+    const provenNoMenu = openWhy === "no-menu" && wt === "location";
+    const forceToggles = (menuMounted || provenNoMenu) ? 0 : 2;
     for (let attempt = 0; attempt < forceToggles && !optsOf(read).length; attempt++) {
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
       read = await pollFor(ATS_POLL.retry, (t) => t.length > 0, ATS_POLL.retryCeil);
