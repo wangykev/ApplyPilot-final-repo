@@ -10088,6 +10088,28 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   if (wt === "text" || wt === "textarea" || wt === "date") {
     if (textValue == null && candidates && candidates.length) textValue = candidates[0];
     if (textValue == null || String(textValue).trim() === "") return false;
+    // ⚠⚠ NEVER HAND A DATE PICKER A BARE ISO STRING — IT COMES BACK A DAY EARLY (live 2026-08-31).
+    // Ashby's Graduation Date is a react-datepicker. Written "2028-05-01" it rendered **"04/30/2028"**:
+    // the widget parses a bare `YYYY-MM-DD` as UTC midnight and renders it in LOCAL time, so every
+    // timezone west of UTC loses a day. The read-back gate caught it as a mismatch, which is the only
+    // reason this was ever seen — and it is why the tempting "fix" is the wrong one: comparing
+    // calendar dates loosely instead of strings would have made the gate PASS and shipped a
+    // graduation date that is silently one day wrong.
+    //
+    // So convert to the format the widget displays, by STRING SURGERY on the ISO parts — no `Date`
+    // anywhere, because constructing one is the very thing that introduces the offset. A month-only
+    // value (`YYYY-MM`, the profile's usual precision) is deliberately NOT converted: inventing a day
+    // is a factual claim, and the existing mismatch → needs_review is the honest outcome there.
+    //
+    // ⚠ Still `filled_review` + `date-format-unverified` afterwards, as every date already is. We
+    // know the widget DISPLAYS MM/DD/YYYY (it just demonstrated that), but not that it INTERPRETS a
+    // typed value that way — a DD/MM tenant would keep our literal text and read it back unchanged,
+    // so the read-back cannot tell those apart. A human confirming the date is the right gate for a
+    // claim like this.
+    if (wt === "date") {
+      const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(textValue).trim());
+      if (iso) textValue = iso[2] + "/" + iso[3] + "/" + iso[1];
+    }
     rec.resolved = textValue;
     const r = await act.eval(atsInjSetText, ref.inputSel, String(textValue));
     await act.delay(120);

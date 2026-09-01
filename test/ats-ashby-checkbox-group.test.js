@@ -409,3 +409,35 @@ test("a control that HAS a name is untouched — the ordinary path cannot regres
   assert.strictEqual(out.fields[0].fieldName, "school-field",
     "a present `name` always wins over the label's for");
 });
+
+// ── an ISO date must never reach a date picker verbatim ──────────────────────────────────
+// Live 2026-08-31: Ashby's Graduation Date (a react-datepicker) was written "2028-05-01" and
+// rendered "04/30/2028" -- a day EARLY, because the widget parses a bare YYYY-MM-DD as UTC
+// midnight and renders it in local time. The read-back gate refused it, which is the only reason
+// it was ever seen; comparing calendar dates loosely instead would have PASSED the gate and
+// shipped a graduation date silently one day wrong.
+test("⚠⚠ a full ISO date is rewritten to the widget's displayed format, without a Date object", () => {
+  const src = require("fs").readFileSync(require("path").join(__dirname, "..", "ats.js"), "utf8");
+  const i = src.indexOf("NEVER HAND A DATE PICKER A BARE ISO STRING");
+  assert.ok(i > 0, "the rule must be stated where the conversion happens");
+  const block = src.slice(i, i + 2600);
+  assert.match(block, /\^\(\\d\{4\}\)-\(\\d\{2\}\)-\(\\d\{2\}\)\$/,
+    "it converts only a FULL iso date");
+  assert.match(block, /iso\[2\] \+ "\/" \+ iso\[3\] \+ "\/" \+ iso\[1\]/,
+    "MM/DD/YYYY assembled from the captured parts");
+  // ⚠ The whole point: no Date construction, because that is what introduces the offset.
+  assert.ok(!/new Date\(/.test(block), "no Date object may appear in the conversion");
+});
+
+test("the conversion is pure string surgery — reproduce it and check the parts", () => {
+  // Mirrors the branch exactly, so the intent is pinned rather than just the source text.
+  const conv = (v) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(v).trim()); return m ? m[2] + "/" + m[3] + "/" + m[1] : v; };
+  assert.strictEqual(conv("2028-05-01"), "05/01/2028", "the live case: May 1st stays May 1st");
+  assert.strictEqual(conv("2027-12-31"), "12/31/2027");
+  assert.strictEqual(conv("2028-01-01"), "01/01/2028", "a UTC-midnight new year must not roll back");
+  // A month-only value is deliberately left alone: inventing a day is a factual claim, and the
+  // existing mismatch -> needs_review is the honest outcome.
+  assert.strictEqual(conv("2028-05"), "2028-05");
+  assert.strictEqual(conv("May 2028"), "May 2028");
+  assert.strictEqual(conv("05/01/2028"), "05/01/2028", "an already-formatted value is untouched");
+});
