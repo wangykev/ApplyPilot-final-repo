@@ -1223,6 +1223,39 @@ The standing rules:
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
+- **⚠⚠ THE ATS SUBMIT PATH REPORTED NOTHING — a FILED application read "needs_review" forever
+  (live 2026-08-31).** The Workday branch has always called `reportApplication` with
+  `status:"submitted"`; the ATS branch returned straight to the caller. Observed as **16
+  approved-but-never-submitted rows** going back to Aug 11, three of them submitted by hand the day
+  before — so the tracker could not answer *"what have I already sent?"*, the question that stops a
+  duplicate application going out. ⚠ **It reports ONLY on a real submit, deliberately:**
+  `reportColumns` (web/lib/report-fields.ts) ALWAYS writes `approved_at: null` (a report normally
+  carries a fresh bundle, so old approvals are void) — a rehearsal or a halt reporting through here
+  would silently DISCARD the operator's approvals and force a full re-approval before they could
+  retry. Live-verified on IMC + Zipline: `tracker updated — this application now reads SUBMITTED.`
+- **⚠⚠ REQUIRED-NESS IS NOT ALWAYS ON THE CONTROL — two tenants, one lesson (live 2026-08-31).**
+  Both refusals below came from the FORM's own validation, after our approval gate had passed the
+  bundle; the gates did their job and the fault was upstream, in what we told them was required.
+  - **Ashby declares it on the ENTRY.** `_required_…` sits on the question's heading `<label>`;
+    measured, the inputs carry neither `required` nor `aria-required`. Only the yes/no branch ever
+    consulted the entry, so an armed Notion submit was refused for four fields we had scanned
+    OPTIONAL (*pronouns*, *prior internships*, *Graduation Date*, *Degree Type*) —
+    `bundleSubmitBlockers` had nothing to block on and review showed nothing to answer.
+    ⚠ Read the **heading**, never a subtree sweep for `[class*="required"]`: a checkbox-group entry
+    contains its option rows, so a stray token on any descendant would flag every group. Pinned.
+  - **Greenhouse's demographic consent is CONDITIONALLY required** — `required` is FALSE until a
+    demographic question carries an answer, then the form refuses: *"You answered some demographic
+    questions. Please accept the terms to proceed, or clear your responses."*
+- **ACCEPT CHECKBOXES NOW REACH GH / LEVER / ASHBY (live 2026-08-31).** The operator's 2026-08-18
+  instruction was wired only into the iCIMS and ORC **pre-form** stages; these three have no
+  pre-form, so no consent was ever classified. ⚠ **Nothing about the authorised rule widens** —
+  `atsConsentKind` ALREADY returns `"accept"` for `gdpr_demographic_data_consent_given` ("I consent
+  to <company> collecting, storing, and processing my responses to the demographic data surveys
+  above"), with and without hints; this path just starts asking it. Logged BY NAME as the
+  instruction requires, verified, and a tick that did not take is `needs_review` +
+  `consent-not-accepted` rather than reported as consent given. ⚠ **Runs on the REPLAY too** (unlike
+  the option sweep beside it): a submit run must tick it or be refused, and the bundle cannot carry
+  it — an optional consent is recorded UNCHECKED by design, so there is no approved value to replay.
 - **⚠⚠ A "SELECT ALL THAT APPLY" GROUP IS ONE QUESTION — READ THE PLATFORM'S DECLARATION
   (live 2026-08-31, Notion/Ashby).** The Ashby branch treated every checkbox in an entry as its own
   consent box — its comment said *"one per entry"*, true of OpenAI's consents, false for a multi-option
