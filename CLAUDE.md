@@ -1683,6 +1683,28 @@ has the evidence; this is the short form.
   150ms to 80ms bought nothing; collapsing 28 SW awaits into 1 page-side wait fixed the largest gap on
   a page. A healthy ORC fill is ~280-320 `Runtime.evaluate` calls / 23-32s — that count is the surface
   area every per-round-trip stall multiplies against. **Ask "how many awaits?" before "how long is each?"**
+- **⚠⚠ AN AUTOCOMPLETE THAT SHOWS NOTHING ON OPEN IS ANSWERED BY TYPING, AND IT NEEDS A ROUTE
+  (live 2026-09-01, Whatnot).** Three REQUIRED fields — graduation month, graduation year, "your
+  current or most recent university" — reached review as *"ApplyPilot couldn't fill this"*. All three
+  are `ashby-application-form-input-autocomplete` (`role="combobox"`, no id/name): **the same widget
+  as the location box that fills fine**, differing only in that location has a ROUTE. With no route
+  the deterministic pass produced no candidates, so the SEARCH arm never ran (it types
+  `candidates[0]`) and the AI bailed `no live options to choose from` — the menu is empty until a
+  query is typed. Measured: 0 options on open, and a purely **synthetic** write + `keyup` returns the
+  match, so no trusted keystroke is needed here.
+  ⚠ **The fix is a DETERMINISTIC rung, not a better prompt** (`atsEducationAnswer`, answering from
+  `education[0]`): a graduation month is a stated fact, so it fills exact and unflagged, where an AI
+  guess would be `ai-choice` and land back in review to re-confirm something already known. Month is
+  TIERED (`["May","05","5"]`) so the form's vocabulary decides; **month/year are tested BEFORE school**
+  ("What year will you graduate from your university?" contains a school word but is a year question);
+  a DIFFERENT school (`high school`, `law school`) is refused rather than answered with the university;
+  and an unknown fact returns null rather than guessing. Live: needs-review 4 → 1, filled 9 → 12.
+  ⚠ **GATE ON "ARE WE ABOUT TO TYPE?", NEVER ON A WIDGET NAME.** The forced-toggle skip was first
+  written as `wt === "location"`, which left these three paying `open 7050ms (0 opt on open)` each —
+  the same 5.6s waste under another name. With CANDIDATES in hand the search arm types them, and
+  typing is both the real test and its own recovery for a missed open click; with none, reading the
+  list is the only hope and the toggles still earn their cost. `open 7050ms → 64ms`, Whatnot 47.6s →
+  **4.1s**. *Naming widgets is what made this a three-round bug.*
 - **⚠⚠ FIX THE WORKER'S SCHEDULING BEFORE CUTTING AWAITS (2026-09-01).** Round trips are the cost
   driver, but the PRICE PER ROUND TRIP is set by whether the MV3 worker is scheduled. Do it in the
   other order and the worker's stalls get attributed to whatever code happened to be awaiting — which

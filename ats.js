@@ -1251,6 +1251,54 @@ function atsCredentialValue(kind, credentials) {
 // answer is worse than an AI-flagged one — the Workday matching philosophy). Returns
 //   { candidates?|value?, path?, source, review?, flag?, detail?, skip? }
 // or null (→ bucket already consulted by the caller → AI → blank).
+// EDUCATION questions answered from the profile's own education entry. Pure, so the wordings and
+// the tiering are testable without a page.
+//
+// ⚠ ENTRY 0 IS THE ANSWER, and that is the profile's own convention rather than a guess here:
+// `web/lib/buckets.ts` already binds the school question to `education.0.school_or_university`.
+// A form asking about a DIFFERENT school ("high school") is refused rather than answered with the
+// university — a wrong school is a false statement, not an approximation.
+const ATS_EDU_SCHOOL_RE = /\b(university|college|school|institution)\b/i;
+const ATS_EDU_NOT_SCHOOL_RE = /\bhigh\s+school\b|\bschool\s+district\b|\bmedical\s+school\b|\blaw\s+school\b/i;
+const ATS_EDU_MONTH_RE = /\bgraduat\w*\b[^?]{0,40}\bmonth\b|\bmonth\b[^?]{0,40}\bgraduat\w*/i;
+const ATS_EDU_YEAR_RE = /\bgraduat\w*\b[^?]{0,40}\byear\b|\byear\b[^?]{0,40}\bgraduat\w*/i;
+const ATS_MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+
+function atsEducationAnswer(label, profile) {
+  const L = String(label || "");
+  const ed = (profile && Array.isArray(profile.education) && profile.education[0]) || null;
+  if (!ed) return null;
+  const grad = String(ed.graduation_date || "").trim();
+  const gm = /^(\d{4})-(\d{2})/.exec(grad);   // "YYYY-MM" or "YYYY-MM-DD"; a bare year has no month
+
+  // ⚠ MONTH AND YEAR BEFORE SCHOOL. "Please select your graduation year" contains no school word, but
+  // a wording like "What year will you graduate from your university?" contains both — and it is a
+  // YEAR question. Testing the more specific shape first is what keeps that from filling a year box
+  // with a school name.
+  if (ATS_EDU_MONTH_RE.test(L)) {
+    if (!gm) return null;                      // month-precision unknown ⇒ say nothing, don't guess
+    const idx = parseInt(gm[2], 10) - 1;
+    if (!(idx >= 0 && idx < 12)) return null;
+    // Tiered so the form's own vocabulary decides: full name, zero-padded number, bare number.
+    return { candidates: [ATS_MONTH_NAMES[idx], gm[2], String(idx + 1)], source: "education",
+      path: "education[0].graduation_date", detail: "education[0].graduation_date" };
+  }
+  if (ATS_EDU_YEAR_RE.test(L)) {
+    const y = gm ? gm[1] : (/^(\d{4})$/.exec(grad) || [])[1] || String(ed.to_year || "").trim();
+    if (!/^\d{4}$/.test(y)) return null;
+    return { candidates: [y], source: "education", path: "education[0].graduation_date",
+      detail: "education[0].graduation_date" };
+  }
+  if (ATS_EDU_SCHOOL_RE.test(L) && !ATS_EDU_NOT_SCHOOL_RE.test(L)) {
+    const s = String(ed.school_or_university || "").trim();
+    if (!s) return null;
+    return { candidates: [s], source: "education", path: "education[0].school_or_university",
+      detail: "education[0].school_or_university" };
+  }
+  return null;
+}
+
 function atsRouteLabel(label, f, profile, defaults) {
   const L = String(label || "");
   const aq = (profile && profile.application_questions) || {};
@@ -1421,6 +1469,23 @@ function atsRouteLabel(label, f, profile, defaults) {
       if (rc.candidates) return { candidates: rc.candidates, source: "relocation", path: rc.path, detail: rc.path };
       return null;
     }
+  }
+
+  // EDUCATION — school / graduation month / graduation year, from the profile (live 2026-09-01).
+  // Whatnot asks all three as per-tenant AUTOCOMPLETES ("Please select your graduation month",
+  // "…year", "…your current or most recent university."). Nothing routed them, so the deterministic
+  // pass produced no candidates, the SEARCH arm never ran (it types `candidates[0]`, and there was
+  // none), and the AI fallback then bailed `no live options to choose from` — these widgets show an
+  // empty menu until a query is typed. Three REQUIRED fields reached review reading "ApplyPilot
+  // couldn't fill this", on a form where the profile knows every answer.
+  //
+  // ⚠ THE FIX IS DETERMINISTIC ON PURPOSE, not a better AI prompt. A graduation month is a stated
+  // fact in the profile; answering it from `education[0]` is exact and unflagged, where an AI guess
+  // would be `ai-choice` and land back in review for a human to re-confirm something already known.
+  // (The same reasoning as the relocation rung directly above.)
+  {
+    const ed = atsEducationAnswer(L, profile);
+    if (ed) return ed;
   }
 
   // How-did-you-hear — the same ladder the Workday source picker uses.
@@ -10672,10 +10737,17 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // was all of it. The same reasoning the note above gives applies unchanged: the typed search
     // immediately after is the real test of whether the widget answers, and each toggle FLIPS the
     // menu, so an odd number leaves it closed.
-    // ⚠ LOCATION ONLY. For a plain `select` an absent menu really can mean the click missed, and a
-    // retry is worth its cost there. Here it cannot hide a missed click either: the typing path
-    // takes its own `trustedFocus` (the widget-wake) before it types, which re-clicks the control.
-    const provenNoMenu = openWhy === "no-menu" && wt === "location";
+    // ⚠ THE GATE IS "ARE WE ABOUT TO TYPE?", NOT A WIDGET NAME (generalised 2026-09-01, Whatnot).
+    // First cut said `wt === "location"`, which left Whatnot's graduation-month / graduation-year /
+    // university autocompletes paying `open 7050ms (0 opt on open)` each — the same widget class as
+    // the location box, reached by a different route, so the same 5.6s waste under another name.
+    // Naming widgets is what made this a three-round bug in the first place.
+    //
+    // With CANDIDATES in hand the search arm below types them, and typing is both the real test of
+    // whether the widget answers AND its own recovery for a missed open click (the typing path takes
+    // a `trustedFocus` that re-clicks the control). With NO candidates there is nothing to type, so
+    // reading the list is the only hope left and the toggles keep earning their cost.
+    const provenNoMenu = openWhy === "no-menu" && !!(candidates && candidates.length);
     const forceToggles = (menuMounted || provenNoMenu) ? 0 : 2;
     for (let attempt = 0; attempt < forceToggles && !optsOf(read).length; attempt++) {
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
@@ -11595,7 +11667,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsEducationAnswer, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
     atsInjEmailVerifyState, atsInjFillEmailCode,
