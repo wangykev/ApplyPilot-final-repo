@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "consent-required-23";
+const AP_BUILD_MARKER = "presubmit-domread-24";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -6981,8 +6981,71 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       failures.push(`${name} ("${(e.question_label || "").slice(0, 60)}"): approved value has NO matching field on the live form`);
     }
 
+    // ── FINAL PRE-CLICK DOM READ: does the LIVE FORM hold what was APPROVED? ───────────────
+    // (operator, 2026-08-31 — "before submitting, there should be a dom read to make sure it
+    // matches the approved selections".)
+    //
+    // Everything above verifies the REPLAY, not the APPROVAL. Each field's commit was read back;
+    // the post-fill audit re-read the page against what the replay WROTE; the strict verify checks
+    // that every approved field ended `filled`. All three compare the page against OUR OWN RECORD.
+    // None of them asks the question that actually matters at an irreversible gate: does the form,
+    // right now, say what the human approved?
+    //
+    // The gap is narrow but real, and this codebase has already been bitten by its shape: a commit
+    // that lands a DIFFERENT option than the approved text reads back consistently and passes every
+    // check above (the ORC dial-code case — the widget DISPLAYED "+1" while the option read
+    // "+1 (United States)"). So this reads the live DOM one last time and compares it to
+    // `current_value` from the approved bundle itself.
+    //
+    // ⚠ ACCEPT RULES ARE THE AUDIT'S, DELIBERATELY. A FALSE NEGATIVE HERE BLOCKS A SUBMIT THAT
+    // SHOULD PASS — the failure mode that made a rehearsal report "native select commit failed" on
+    // two fields whose values were on the form the whole time. So a chip DISPLAY that is a
+    // substring of the approved text matches, a label that merely prefixes it verbosely matches,
+    // and a multi-answer value is compared SET-WISE after splitting on the group separator rather
+    // than as one string whose order we do not control.
+    const scanFields = (out.scan && out.scan.fields) || [];
+    const driftFailures = [];
+    for (const [name, e] of approved) {
+      const want = e && e.current_value;
+      if (want == null || String(want).trim() === "") continue;
+      if (e.credential) continue;                       // the bundle holds a placeholder by design
+      const rec = out.results.find((r) => durable(r) === name);
+      if (!rec) continue;                               // already reported by the absence check above
+      if (rec.credential || rec.status === "already-filled") continue;
+      const f = scanFields.find((x) => x.fieldName === rec.fieldName);
+      if (!f || f.widgetType === "file_upload") continue;  // a file input never reads back a value
+      let live = null;
+      try { live = await cdpEval(atsInjReadValue, ats, f.inputSel, f.widgetType); } catch (err) { live = null; }
+      if (!live || !live.ok) {
+        driftFailures.push(`${name} ("${(e.question_label || "").slice(0, 50)}"): could NOT be re-read from the page before submitting`);
+        continue;
+      }
+      const liveV = live.value == null ? "" : String(live.value);
+      const wantV = String(want);
+      const norm = (x) => atsLib.normalize(String(x || ""));
+      let ok;
+      if (f.widgetType === "checkbox") {
+        ok = String(!!live.value) === String(wantV === "true" || wantV === "Yes" || wantV === "true");
+      } else if (f.widgetType === "checkbox_group" || f.widgetType === "multiselect_native") {
+        // SET-WISE: the page joins with ", " and the bundle with "; " (both vocabularies are live in
+        // this file), and neither side owns the order.
+        const wantSet = atsLib.splitGroupValue(wantV).map(norm).filter(Boolean);
+        const liveSet = liveV.split(/;|,/).map(norm).filter(Boolean);
+        ok = wantSet.length > 0 && wantSet.every((w) => liveSet.some((l) => l === w || l.includes(w) || w.includes(l)));
+      } else {
+        ok = atsFd.textValuesMatch(liveV, wantV)
+          || (liveV && norm(wantV).includes(norm(liveV)))                                   // chip display
+          || (wantV.length >= 3 && norm(liveV).startsWith(norm(wantV)));                    // verbose label
+      }
+      if (!ok) {
+        driftFailures.push(`${name} ("${(e.question_label || "").slice(0, 50)}"): the form now shows ${JSON.stringify(liveV.slice(0, 60))} but you approved ${JSON.stringify(wantV.slice(0, 60))}`);
+      }
+    }
+    LOG(`pre-submit DOM read: re-read ${approved.size} approved field(s) off the live form — ${driftFailures.length ? driftFailures.length + " DISAGREE" : "all match what you approved"}`);
+    driftFailures.forEach((f) => LOG("  ✗ " + f));
+
     const state = await cdpEval(atsInjSubmitState, ats);
-    const blockers = bundleSubmitBlockers(bundle);
+    const blockers = bundleSubmitBlockers(bundle).concat(driftFailures);
     LOG(`verify: ${out.results.length} field(s) replayed, ${failures.length} failure(s); bundle blockers: ${blockers.length}; submit button: ${state && state.hasSubmit} (disabled=${state && state.disabled}); captcha challenge visible: ${state && state.captchaChallenge}`);
     failures.forEach((f) => LOG("  ✗ " + f));
     blockers.forEach((b) => LOG("  ✗ bundle: " + b));

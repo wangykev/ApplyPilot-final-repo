@@ -9696,6 +9696,10 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
   // reload once and try again, which is the same remedy a human applies.
   const deadAsync = results.filter((r) => r.listUnproven || /never answered our search|suggestions never loaded/i.test(String(r.detail || "")));
   return { url: scan.url, title: scan.title, results, counts, entryNotes, unclaimedNotes,
+    // ⚠ The SCAN travels with the result so the submit gate can do a FINAL live DOM read of each
+    // approved field (it needs inputSel + widgetType, which a result does not carry). Nothing else
+    // reads it; it is additive.
+    scan,
     deadAsync: deadAsync.map((r) => r.fieldName),
     needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
 }
