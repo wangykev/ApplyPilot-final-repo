@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "viewport-guard-39";
+const AP_BUILD_MARKER = "submit-dwell-40";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -6650,6 +6650,8 @@ async function atsAnswerEmailVerify(o) {
 async function runAtsSubmitRun(tabId, ats, bundle, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][ATS-SUBMIT]", ...a);
   const arm = !!(opts && opts.arm);
+  // ⚠ WHEN THIS RUN STARTED TOUCHING THE FORM — the floor below is measured from here.
+  const submitRunT0 = Date.now();
   // The Oracle guard that stood here is GONE as of the submit walk landing (2026-08-20) — the same
   // deletion the fill run got when its scan landed, and deliberately not one moment earlier. What
   // replaces it is not "nothing": the ORC pre-form below, the multi-step replay walk, and the rule
@@ -7128,6 +7130,27 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       LOG(`✗ REFUSING to click: the submit button is not on screen after scrolling (cy=${clickRect ? clickRect.cy : "?"}, viewport=${vh}). Nothing was submitted.`);
       return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "submit-offscreen", ats,
         detail: "The submit button could not be brought into view, so clicking it would have done nothing. Everything is filled and verified — press Submit yourself in the tab." };
+    }
+    // ⚠⚠ A MINIMUM DWELL BEFORE THE IRREVERSIBLE CLICK (operator, 2026-09-01). Round 20 took an
+    // Ashby fill from ~25s to ~4s, and 4s is genuinely aggressive against somebody else's form.
+    // This is a RATE LIMIT ON OUR OWN AUTOMATION: we do not sprint through a third party's
+    // application and hit submit the instant the last field lands.
+    //
+    // ⚠ WHAT THIS IS NOT, AND MUST NOT BECOME. It is a flat floor, not mimicry. It forges nothing,
+    // hides nothing and impersonates nobody — every other signal still says "automated" (the
+    // debugger attach, synthetic events, the page overrides). Do NOT extend it into randomised
+    // jitter, mouse paths, per-field human-like cadence, fingerprint shaping or anything else whose
+    // purpose is to make the session read as a person. That is the line, and the standing rule that
+    // the bot never solves or bypasses a captcha sits on the same side of it.
+    //
+    // Measured from the start of this run's work on the form, so a slow fill already satisfies it
+    // and pays nothing — only a fast one waits.
+    const ATS_SUBMIT_MIN_DWELL_MS = 8000;
+    const dwelt = Date.now() - submitRunT0;
+    if (dwelt < ATS_SUBMIT_MIN_DWELL_MS) {
+      const owe = ATS_SUBMIT_MIN_DWELL_MS - dwelt;
+      LOG(`pacing: this run reached submit in ${(dwelt / 1000).toFixed(1)}s — holding ${(owe / 1000).toFixed(1)}s so the whole form takes at least ${ATS_SUBMIT_MIN_DWELL_MS / 1000}s.`);
+      await cdpDelay(owe);
     }
     LOG(`⚠ ARMED — clicking Submit (trusted input) at ${clickRect.cx},${clickRect.cy} (viewport ${vh}px).`);
     cdpSetSyntheticInput(false);
