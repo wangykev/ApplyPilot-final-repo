@@ -80,6 +80,28 @@ test("⚠ atsPlausibleCompany: the live employer-page scrape returned a TITLE, n
   assert.strictEqual(ats.atsPlausibleCompany("Data Scientist in Austin, Texas"), false);
 });
 
+test("⚠ atsPlausibleCompany: a PLATFORM WORD is not a company (the live 'Embed' anchor)", () => {
+  // Live 2026-08-31: a Zipline fill through the embed form
+  // (/embed/job_app?for=flyzipline&token=…) recorded its company as "Embed" — a URL path segment
+  // that reached jobContext.company via the JD scrape, NOT via atsCompanyFromUrl (which already
+  // returns null for that segment). `company` anchors the safety-critical employment recognizer,
+  // and a junk anchor silently reads as "not us", where an ABSENT one correctly makes the
+  // recognizer unevaluable (blank + review).
+  for (const bad of ["Embed", "embed", "job_app", "Jobs", "Careers", "Apply", "Board",
+    "Greenhouse", "Lever", "Ashby", "Workday", "iCIMS", "Oracle"]) {
+    assert.strictEqual(ats.atsPlausibleCompany(bad), false, `${bad} must not pass as a company`);
+  }
+});
+
+test("atsPlausibleCompany: a platform word INSIDE a real name is still a real name", () => {
+  // The rule is anchored (^…$) on purpose — it rejects the bare plumbing word, never a company
+  // whose name happens to contain one.
+  for (const ok of ["Embedded Systems Corp", "Oracle Health Partners", "Greenhouse Software",
+    "Apply Digital", "Board Intelligence"]) {
+    assert.ok(ats.atsPlausibleCompany(ok), `${ok} should be kept`);
+  }
+});
+
 test("atsPlausibleCompany: real names are KEPT — the existing ATS behaviour must not move", () => {
   for (const ok of ["Astrion", "Anthropic", "Kraken", "US Bank", "Cambium Learning",
     "Analog Devices", "Booz Allen Hamilton", "Magna International"]) {

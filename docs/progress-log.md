@@ -40,6 +40,7 @@ For current state and open work, see **`docs/status.md`**.
 | **iCIMS / credentials tier** | `2026-08-16 — iCIMS routed, the form frame, and the Create-a-login block` |
 | **iCIMS multi-tenant triage (5 tenants, item by item)** | `2026-08-18 — five iCIMS tenants triaged item by item` |
 | **Questions the profile answers but nothing read** | `2026-08-18 — five iCIMS tenants triaged item by item` (relocation, address Type, contact opt-ins, may_contact) |
+| **Email-verification gate (an emailed code between the two submit clicks)** | `2026-08-24 — Greenhouse's emailed verification code` |
 | **Latest live sweeps** | `2026-08-09 — live sweep: marvell + moog verified`, `2026-08-09 (b) — the non-Workday merge did NOT regress Workday` |
 
 ## Progress log
@@ -5799,3 +5800,58 @@ blockers 0. **2 verify failures, so the gate refused — correctly, and nothing 
 (`profile`, `apMatch.cdpPageKey`, `preCreds`, the entry pass). Every one passed the full suite,
 because the guards scan source text. There is no linter in this repo; adding one with `no-undef` is
 the standing suggestion.
+
+## 2026-08-24 — Greenhouse's emailed verification code: the submit gate nobody could see
+
+**The report.** At the end of a Zipline Greenhouse application, clicking Submit produced *"A verification code
+was sent to …@gmail.com. To submit your application, enter the 8-character code to confirm you're a human."*
+Operator's judgement: this is fine to automate, because everything ApplyPilot submits is approved by a human
+first — and the framework for it already exists (the Workday Gmail auto-verify).
+
+**Traced, not guessed** (read-only, on the operator's own live form — nothing was clicked). Full anatomy in
+`docs/dom-patterns.md` `2026-08-24`. The load-bearing findings:
+
+- the widget is **eight** `#security-input-0…7` boxes, each `maxlength="1"`, inside
+  `div.email-verification__wrapper` — **not one text field**, which is what a naive implementation would have
+  written to;
+- they are **inside the same `<form>`** as the application, and the **same** submit button is reused,
+  `disabled` + `aria-disabled="true"` until all eight hold a character;
+- `#email-verification-error` **does not exist** until a code is rejected;
+- each box is React-controlled ⇒ native-setter + `input` event, the pattern already used everywhere here.
+
+**Why this was a silent failure, not a missing feature.** The armed submit's outcome loop watches for a
+confirmation, a VISIBLE captcha, or validation errors. This gate is none of the three, so an armed run clicked
+Submit, polled 30s, and returned `no-confirmation` — the application **unsent**, with nothing in the log to
+distinguish "the pipeline broke" from "the form is waiting on an email". That reporting failure was the actual
+bug; answering the gate is the feature.
+
+**What shipped.**
+- `gmail.js` — `gmailExtractVerificationCode` + `gmailFindVerificationCode`, **siblings** of the URL pair, so
+  Workday's live auto-verify is byte-identical (`gmailBuildQuery` hardcodes Workday's own needles and was
+  deliberately not widened).
+- `ats.js` — `atsInjEmailVerifyState` (read-only) and `atsInjFillEmailCode`, which returns a length, a match
+  boolean and per-box occupancy and **never the code**, exactly like `atsInjSetCredential`.
+- `background.js` — `atsAnswerEmailVerify`, wired into `runAtsSubmitRun` between the two clicks, plus a
+  pre-click `verification-in-flight` guard so a rehearsal reports a gate left over from an earlier attempt.
+
+**Two refutations the tests paid for**, both found by writing the failing case first:
+1. **Shape cannot find a code.** A real HTML mail is full of 8-character runs — class hashes, hex colours, a
+   tracking path segment. Prose-stripping plus a required **cue** is the only workable recognition.
+2. **The cue's own words are candidates, and so is English.** `"security"` is 8 characters and sits beside
+   every cue; `"continue"` sits in the next sentence. Fixed by excluding cue words **positionally** (testing
+   the cue regex against a lone token cannot work — the pattern needs the whole phrase) and a **shape
+   tie-break** preferring a digit-carrying or all-caps candidate. ⚠ The tie-break only chooses among
+   candidates already beside a cue: two code-shaped candidates still refuse.
+
+**The guard that matters most** is the freshness floor: the absolute moment we clicked Submit, minus 60s of
+clock skew. A code from an earlier attempt is still in the inbox and passes every other test, and typing it
+**burns the operator's real one** while reporting a rejection that looks like a bad extractor.
+
+**Not captcha handling.** A possession factor — a code mailed to an address the operator owns and has already
+granted `gmail.readonly` on, for a human-approved application. `captchaChallenge` still halts
+`needs_operator`; nothing solves, forges or hides a challenge. One attempt only: a rejected code halts.
+
+**1631 unit tests**, all green (44 new, in `test/email-verify-code.test.js`). ⚠ **Not yet live-verified** —
+the operator is on a fresh browser/account and the extension needs loading first, so the armed two-click path
+and the real email shape are unproven. The sender constant (`greenhouse.io`) is the one guess in here, and it
+is deliberately soft: a sender miss widens to any sender once, loudly, rather than stranding the run.

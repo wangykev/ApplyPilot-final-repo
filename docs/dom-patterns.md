@@ -37,6 +37,9 @@ during 2026-08, so a later date can appear above an earlier one.
 | **AI (LLM fills, tree drill, AI-4)** | `2026-06-22 — AI-0/AI-1`, `2026-06-23 — AI-4 remediation`, `2026-06-28 — Source tree-drill AI`, `2026-06-28 — Cert tree-drill AI`, `2026-07-02 — AI-4 live round 2` |
 | **Input-lock** | `2026-06-22 — operator input-lock` |
 | **Multi-ATS (Greenhouse / Lever / Ashby)** | `2026-07-31 — Greenhouse / Lever / Ashby application forms`, `2026-07-31 (b) — react-select on a HEAVY Greenhouse form`, `2026-07-31 (c) — pacing a page-side-synthetic fill`, `2026-08-01 (a)`, `2026-08-02 (a)`, `2026-08-02 (b)`, `2026-08-04 — a server-backed combobox says "No options"`, `2026-08-05 — multi-ATS end to end on GitLab`, `2026-08-05 (b) — four forms end to end`, `2026-08-07 — Greenhouse / Lever / Ashby: five observed-DOM findings`, `2026-08-07 (later) — are ATS option menus virtualized?`, `2026-08-08 — the 2.5s settle floor` |
+| **Email-verification gate (emailed code)** | `2026-08-24 — Greenhouse: SUBMIT IS TWO CLICKS` |
+| **Board redirects / the embed path / the company anchor** | `2026-08-31 — Greenhouse: A BOARD THAT REDIRECTS` |
+| **Ashby checkbox GROUPS ("select all that apply")** | `2026-08-31 — Greenhouse: A BOARD THAT REDIRECTS` §3 |
 | **iCIMS (iframe-hosted, account-creating)** | `2026-08-16 — Astrion iCIMS: the form lives in an IFRAME, and the login block is part of it`, `2026-08-16 (b) — Astrion iCIMS: the <select> that is not a select`, `2026-08-16 (c) — Astrion iCIMS: the PRE-FORM stage`, `2026-08-16 (d) — the dropdown PAGE SIZE`, `2026-08-17 (b) — the REHEARSAL, and a <select> with no placeholder`, `2026-08-17 (c) — the résumé goes on FIRST, and the parse is waited out`, `2026-08-18 — four more tenants: the Apply widget, the bare "Type", and the settle probe` |
 | **Oracle Recruiting Cloud (JET SPA, Knockout, honeypot)** | `2026-08-19 — Oracle Recruiting Cloud (ORC) / Candidate Experience: FIRST RECON`, `2026-08-19 (j)`, `2026-08-19 (k)`, `2026-08-19 (l)`, `2026-08-20 (a) — ORC: the whole wizard walked` |
 | **ORC repeating entries (`Add` is a homonym) + `"<CODE> - <Name>"` options** | `2026-08-19 (l) — ORC repeating blocks`, `2026-08-20 (a) — ORC: the whole wizard walked` |
@@ -6139,3 +6142,191 @@ differs by mode: **"Add Experience"/"Add Skill" while adding, "Save" while editi
 open/close cost: form renders in **36ms**, tears down in **33ms**. A skill's field is a plain
 `input[type=text][name=skills]` — not a combobox — so a skill is one text write, not a search.
 
+
+## 2026-08-24 — Greenhouse: SUBMIT IS TWO CLICKS — an emailed 8-character code stands between them
+
+Traced read-only on a live Zipline posting (`job-boards.greenhouse.io/embed/job_app?for=flyzipline`), on a
+form the operator had filled and reached the end of by hand. **Pressing "Submit application" does not submit
+the application.** It mails an 8-character code to the applicant's own address and re-renders the footer:
+
+```html
+<div class="email-verification__wrapper">
+  A verification code was sent to <em>…@gmail.com</em>. To submit your application, enter the
+  8-character code to confirm you're a human.
+  <label for="security-input-0">Security code</label>
+  <input id="security-input-0" type="text" aria-invalid="false"
+         aria-errormessage="email-verification-error" aria-required="true" maxlength="1" value="">
+  … security-input-1 … security-input-7
+</div>
+<button type="submit" class="btn btn--pill btn__disabled" aria-disabled="true">Submit application</button>
+```
+
+Measured facts, all read off the page itself:
+
+| | |
+|---|---|
+| boxes | **8**, `#security-input-0` … `-7`, each `maxlength="1"`, `aria-required="true"` |
+| container | `div.email-verification__wrapper`, ONE shared parent for all eight |
+| framework | React-controlled (`__reactFiber$*` / `__reactProps$*` on each box) ⇒ native-setter + `input` event |
+| form | the boxes are **inside the SAME `<form>`** as the application, and the SAME submit button is reused |
+| button | `disabled` + `aria-disabled="true"` + `btn__disabled` until every box holds a character |
+| error node | `#email-verification-error` — **does not exist** until a code is REJECTED |
+| captcha | a dormant invisible reCAPTCHA badge, present before and after; unrelated to this gate |
+
+### ⚠ Why the run could not see it, and ended `no-confirmation`
+
+The armed submit's outcome loop watches for exactly three things: a confirmation, a VISIBLE captcha, and
+validation errors. This gate is **none of them** — it is not a confirmation, the reCAPTCHA stays invisible,
+and the error node is absent until a code is rejected. So an armed run clicked Submit, polled its 30s, and
+returned `stopped:"no-confirmation"` with the application **unsent** and nothing in the log to explain why.
+*A gate we cannot name is worse than either a pass or a halt*, because the operator cannot tell a broken
+pipeline from a form that is simply waiting.
+
+### The 8-character run is NOT findable by shape — two refutations paid for by tests
+
+1. **A real HTML email is full of 8-character runs that are not the code.** Class hashes (`shell_44ff9911`),
+   hex colours, a tracking path segment (`/f/a/PXQ99KLM/x/BB771A2C`) — all match `[A-Za-z0-9]{8}` as well as
+   the code does. So the body is stripped to PROSE first (script/style bodies, tags **and their attributes**,
+   URLs, entities) and a code is only ever recognised **by the words around it**.
+2. **The cue's own words are candidates, and so is ordinary English.** At length 8 `"security"` sits
+   immediately beside every cue, and `"continue"` sits in the sentence after it. Two fixes, both load-bearing:
+   cue words are excluded **POSITIONALLY** (by span overlap — testing the cue regex against a lone token
+   fails, because the pattern needs the whole phrase `"security code"`), and a **shape tie-break** prefers a
+   candidate carrying a digit or written in caps. The tie-break only ever CHOOSES BETWEEN candidates already
+   next to a cue, never finds one: two code-shaped candidates still refuse.
+
+### The freshness floor is the guard that matters
+
+A code from an EARLIER attempt is still in the inbox, still 8 characters, still next to the same cue. The
+poll's floor is therefore the **absolute moment we clicked Submit** (minus 60s of clock skew), not a relative
+window — typing a stale code burns the operator's real one and reports a rejection that looks exactly like a
+bad extractor. A message older than that floor is counted and named in the failure text (`N older message(s)
+skipped as predating the submit click`) rather than silently ignored.
+
+### What is NOT being done here
+
+This is a **possession factor**, not a captcha: a code mailed to an address the operator owns and has already
+granted this extension `gmail.readonly` on, for an application a human approved field-by-field. The page's
+reCAPTCHA is untouched and `captchaChallenge` still halts `needs_operator` — nothing solves, forges or hides
+a challenge. One attempt only: the code is single-use, so a rejected one is a HALT, never a retry.
+
+## 2026-08-31 — Greenhouse: A BOARD THAT REDIRECTS, and the "Embed" company anchor
+
+Two findings from a day of 2027-internship fills (5 filled: Notion ×2 Ashby, Figma GH, IMC GH,
+Zipline GH). Both are about the *approach* to a Greenhouse form, not about a widget.
+
+### 1. `job-boards.greenhouse.io/<co>/jobs/<id>` can REDIRECT to the employer's own page
+
+Zipline's board does not serve the posting: `…/flyzipline/jobs/7886501003` lands on
+`zipline.com/open-roles`, an employer-styled index with no form on it. I initially read that as
+**`posting-gone`** and wrote the job off. It is not gone — the tenant has simply pointed its board at
+its own site.
+
+The form is still there, on Greenhouse's **embed** path:
+
+```
+https://boards.greenhouse.io/embed/job_app?for=flyzipline&token=7886501003
+```
+
+Same `job_app` document the board would have served, same fields, fills normally (17 fields, 6 to
+review, 6.2s visible).
+
+> ⚠ **A redirect to an employer page is NOT evidence a posting is closed.** `atsPostingGone` reads
+> Greenhouse's redirect-to-**board-index** as gone, which is correct for a delisted job. A redirect to
+> an *employer* domain is a different thing and must not be collapsed into it — the API still lists
+> the job, and the embed URL still fills. The distinguishing signal is the public board API: a job the
+> API still returns is live regardless of where its `absolute_url` points.
+
+The `boards-api.greenhouse.io/v1/boards/<co>/jobs` listing is what makes this recoverable — it gives
+the numeric `id` that becomes `token`, so the embed URL is constructible for any company whose board
+redirects. **`absolute_url` from the API is not a trustworthy navigation target for these tenants.**
+
+### 2. ⚠ The embed form's scraped company is **"Embed"** — and that string is safety-critical
+
+The fill's `jobContext.company` came back as **`"Embed"`**. It does not come from
+`atsCompanyFromUrl` (which correctly returns null for that path segment) — it reaches `company`
+through the **JD scrape**, off the embed document, which carries no employer branding at all.
+
+That is not a cosmetic tracker label. `company` is the anchor for the employment recognizer
+("have you worked for us before?"), and a word no employer is called can never match it — so the
+question silently reads as **"not us"** rather than being flagged. Same failure class as iCIMS'
+literal `jobs` path segment, reached by a different route.
+
+`atsPlausibleCompany` now rejects the bare platform vocabulary (`embed`, `job_app`, `jobs`,
+`careers`, `apply`, `board`, and each ATS's own name), **anchored `^…$`** so a real company
+containing one of those words survives ("Embedded Systems Corp", "Greenhouse Software", "Apply
+Digital"). Rejecting it is the safe direction and the reason is worth stating plainly: an **absent**
+company makes the recognizer correctly **unevaluable** (blank + review), while a **junk** one makes
+it confidently wrong.
+
+⚠ Still open: with the junk rejected, an embed fill has *no* company anchor at all — the URL's `for=`
+parameter (`flyzipline`) is the obvious evidence-based fallback and was not wired in here. Until it
+is, an embed-path fill flags its employment question for review rather than answering it, which is
+the correct-but-noisy outcome.
+
+### 3. ⚠⚠ Ashby DECLARES its checkbox groups — and we were reading past the declaration
+
+Notion's form has four "select all that apply" questions. The Ashby scan branch turned them into
+**21 phantom fields**, one per checkbox, each labelled with its own OPTION text — and the questions
+themselves appear **nowhere** in the bundle (`hear about` matched 0 times in the whole payload).
+
+The shape, traced live:
+
+```
+FIELDSET._container_1258i_28 _fieldEntry_1e3gg_28 ashby-application-form-input-checkbox-group
+ ├ LABEL._heading_f7cvd_52 [_required_f7cvd_91] _label_1e3gg_42   ← THE QUESTION
+ ├ DIV._option_1258i_34 › input#<formId>_<questionId>-labeled-checkbox-0 + label[for]  ← "LinkedIn"
+ ├ DIV._option_1258i_34 › …-labeled-checkbox-1                                          ← "Glassdoor"
+ └ …
+```
+
+The four groups measured on the Summer-2027 posting:
+
+| question | options | required |
+|---|---|---|
+| Please indicate all of the locations… | 2 | **yes** |
+| How did you hear about this opportunity? (select all that apply) | 7 | no |
+| What type of engineering role are you interested in? | 8 | **yes** |
+| Degree Type | 4 | **yes** |
+
+The scan's own comment named the assumption that broke: *"consent checkboxes (one per entry)"* —
+true of OpenAI's consent boxes, which is where that branch was written, and false the moment a
+tenant asks a multi-option question. Same failure as ORC's `--radiogroup` and the Gusto
+12-phantom-field case, in a third costume.
+
+**Two consequences beyond the noise, both read off the live bundle rather than reasoned about:**
+
+1. **The label ladder routes on the label.** The phantom labelled `LinkedIn` resolved to
+   `canonical_field: websites.0.url`, so the fill tried to write the operator's LinkedIn **profile
+   URL** into a checkbox meaning *"I heard about this job on LinkedIn."* It reached `needs_review`
+   only because a URL matches no option — luck of the value, not a refusal. Note the form also has
+   a real `LinkedIn Profile` text field, correctly filled, so the ladder had two look-alikes and
+   answered both.
+2. **Required-ness is declared on the QUESTION, not the boxes.** Measured: no member carries
+   `required`, and `aria-required` is absent everywhere; the only marker is `_required_…` in the
+   heading label's class. So three required questions each reported `isRequired:false` across all
+   their phantoms — the dangerous direction (a required field reading false hides a field that will
+   block submission).
+
+**Fix — read the declaration.** `ashby-application-form-input-checkbox-group` on the entry means
+"these boxes answer one question", so the branch emits ONE `checkbox_group` field. Details that are
+not obvious and are each pinned by test:
+
+- **The key is the question id, and `name` is not it.** Every box carries its OPTION text as its
+  `name` ("LinkedIn", "New York, NY"), so ORC's fallback order (`boxes[0].name || slug`) would key
+  the group on one of its options. Ashby puts the question id inside the box id —
+  `<formId>_<questionId>-labeled-checkbox-<N>` — and that questionId is the same vocabulary a plain
+  Ashby custom question uses for its `name` (a bare UUID). Both groups on one form share the formId
+  and differ after the **last** underscore, which is why that is the segment to take.
+- **A one-box declared group is still a group** (the operator's 2026-08-20 ORC ruling applies
+  verbatim): here the question and the option text are different elements, so collapsing to a
+  boolean always loses the half carrying the meaning.
+- **Members are excluded from the solo-checkbox loop by their CONTAINER, not by `seen`.** A member's
+  `name` IS its label text, and the live form has a real input whose own scanned key is likewise
+  `LinkedIn` — so poisoning `seen` with member names would have deleted a genuine field. Pinned.
+- Options resolve as a comma-joined id list (`#a, #b, …`), so nothing on the page is stamped.
+  Verified live: `selResolves === members` for all four groups.
+
+⚠ **This is the first test that actually EXECUTES `atsInjScan`** (`test/ats-ashby-checkbox-group.test.js`,
+with a small purpose-built DOM double). Every other suite stubs the scan, which is exactly why a
+shape bug this large survived — nothing ran it.

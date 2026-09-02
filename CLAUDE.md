@@ -1223,6 +1223,169 @@ The standing rules:
 - **Actuation is page-side synthetic via `Runtime.evaluate`** — all three commit state from synthetic events,
   so visible and hidden runs are IDENTICAL: no pacing regime, no focus emulation. The ONE trusted exception is
   the SUBMIT click. Every commit is read-back-verified; AI fills are ALWAYS flagged.
+- **⚠⚠ THE SUBMIT GATE RE-READS THE LIVE DOM AND COMPARES IT TO THE *APPROVAL* (operator,
+  2026-08-31).** Three checks already existed and none answered that question: each commit is
+  read back, the post-fill audit re-reads the page against what the replay **wrote**, and the strict
+  verify checks each approved field ended `filled` — all three compare the page to **our own record**.
+  The new pass compares it to `current_value` from the approved bundle. ⚠ Its accept rules are the
+  AUDIT's, deliberately: **a false negative here blocks a submit that should pass.** Credentials and
+  file uploads are skipped (placeholder by design; an input never reads back a file).
+  **It earned itself on its first live run**, catching all three of the following:
+  - **A REPLAYED CHECKBOX GROUP TICKED ONLY ITS FIRST APPROVED ANSWER.** `current_value` is joined,
+    the replay splits it — then fed the set to `matchCandidates`, which is a TIERED PREFERENCE
+    ("stop at the first hit"). An operator who ticked five disciplines would have submitted one.
+    Invisible to everything else: the one option we ticked read back fine. Now N independent matches,
+    tick all, report anything unoffered — the `multiselect_native` rule. ⚠ **REPLAY ONLY**: on a FILL
+    the same shape is a ladder of alternative PHRASINGS of one answer
+    (`selfIdDisabilityCandidates`), and ticking every match would put two boxes on a self-ID
+    question. `mopts.replay` already distinguishes them.
+  - **⚠ NEVER SPLIT A GROUP READ-BACK ON ITS SEPARATOR — AN OPTION CAN CONTAIN ONE.** The page joins
+    with `", "` and the options are `"New York, NY"` / `"San Francisco, CA"`, so a comma split
+    reported `0 of 2 stuck` on a form holding both. Compare by CONTAINMENT against the whole joined
+    string. (The comma-free group passed in the same run — which is what identified the fault.)
+  - **⚠⚠ A REQUIRED CONTROL WITH NEITHER `name` NOR `id` WAS DROPPED BY THE SCAN.** Ashby's
+    Graduation Date is a `react-datepicker` whose input has no key and whose `label[for]` points at a
+    **dangling** id. The scan keys on `name || id` and skipped it, so it reached NO record, NO review
+    item and NO bundle — and **an absent field is not an unfilled one**, so `bundleSubmitBlockers`,
+    the review page and even the new DOM read are all blind to it. Only the employer's validator
+    caught it. The key is now that dangling `for` (Ashby's own question UUID — durable; a positional
+    `ap-ats-field-N` is exactly what moves between visits). A `for` that RESOLVES is never borrowed.
+    ⚠ NOT applied to comboboxes: bundles in flight are keyed on their `ap-ats-combobox-N`.
+- **⚠⚠ NEVER HAND A DATE PICKER A BARE ISO STRING — IT COMES BACK A DAY EARLY (2026-08-31).**
+  `"2028-05-01"` rendered `"04/30/2028"`: react-datepicker parses `YYYY-MM-DD` as UTC midnight and
+  renders it LOCAL, so everything west of UTC loses a day. ⚠ **The tempting fix is the wrong one** —
+  the mismatch looks like a formatting quibble, so comparing calendar dates loosely would make the
+  gate PASS and ship a date silently one day wrong. Convert by **string surgery on the ISO parts, no
+  `Date` object** (constructing one *is* the offset). A month-only `YYYY-MM` is deliberately NOT
+  converted — inventing a day is a factual claim. Stays `filled_review` + `date-format-unverified`:
+  we know the widget DISPLAYS MM/DD/YYYY, not that it INTERPRETS a typed value that way.
+- **⚠ ASHBY HIDDEN vs VISIBLE ARE EQUIVALENT — measured 2026-08-31, after the above.** 25 fields,
+  14 filled + 11 review, **0 failures** both ways (visible 46.1s / 35.9s, hidden 45.4s). The earlier
+  catastrophic hidden run (227s, 16 `commit failed`) was `NOT painting (chrome SUSPENDED it)` — a
+  deeper state than the ordinary `chrome says hidden`, and the one the DEGRADED-RUN warning keys on.
+- **⚠⚠ THE ATS SUBMIT PATH REPORTED NOTHING — a FILED application read "needs_review" forever
+  (live 2026-08-31).** The Workday branch has always called `reportApplication` with
+  `status:"submitted"`; the ATS branch returned straight to the caller. Observed as **16
+  approved-but-never-submitted rows** going back to Aug 11, three of them submitted by hand the day
+  before — so the tracker could not answer *"what have I already sent?"*, the question that stops a
+  duplicate application going out. ⚠ **It reports ONLY on a real submit, deliberately:**
+  `reportColumns` (web/lib/report-fields.ts) ALWAYS writes `approved_at: null` (a report normally
+  carries a fresh bundle, so old approvals are void) — a rehearsal or a halt reporting through here
+  would silently DISCARD the operator's approvals and force a full re-approval before they could
+  retry. Live-verified on IMC + Zipline: `tracker updated — this application now reads SUBMITTED.`
+- **⚠⚠ REQUIRED-NESS IS NOT ALWAYS ON THE CONTROL — two tenants, one lesson (live 2026-08-31).**
+  Both refusals below came from the FORM's own validation, after our approval gate had passed the
+  bundle; the gates did their job and the fault was upstream, in what we told them was required.
+  - **Ashby declares it on the ENTRY.** `_required_…` sits on the question's heading `<label>`;
+    measured, the inputs carry neither `required` nor `aria-required`. Only the yes/no branch ever
+    consulted the entry, so an armed Notion submit was refused for four fields we had scanned
+    OPTIONAL (*pronouns*, *prior internships*, *Graduation Date*, *Degree Type*) —
+    `bundleSubmitBlockers` had nothing to block on and review showed nothing to answer.
+    ⚠ Read the **heading**, never a subtree sweep for `[class*="required"]`: a checkbox-group entry
+    contains its option rows, so a stray token on any descendant would flag every group. Pinned.
+  - **Greenhouse's demographic consent is CONDITIONALLY required** — `required` is FALSE until a
+    demographic question carries an answer, then the form refuses: *"You answered some demographic
+    questions. Please accept the terms to proceed, or clear your responses."*
+- **ACCEPT CHECKBOXES NOW REACH GH / LEVER / ASHBY (live 2026-08-31).** The operator's 2026-08-18
+  instruction was wired only into the iCIMS and ORC **pre-form** stages; these three have no
+  pre-form, so no consent was ever classified. ⚠ **Nothing about the authorised rule widens** —
+  `atsConsentKind` ALREADY returns `"accept"` for `gdpr_demographic_data_consent_given` ("I consent
+  to <company> collecting, storing, and processing my responses to the demographic data surveys
+  above"), with and without hints; this path just starts asking it. Logged BY NAME as the
+  instruction requires, verified, and a tick that did not take is `needs_review` +
+  `consent-not-accepted` rather than reported as consent given. ⚠ **Runs on the REPLAY too** (unlike
+  the option sweep beside it): a submit run must tick it or be refused, and the bundle cannot carry
+  it — an optional consent is recorded UNCHECKED by design, so there is no approved value to replay.
+- **⚠⚠ A "SELECT ALL THAT APPLY" GROUP IS ONE QUESTION — READ THE PLATFORM'S DECLARATION
+  (live 2026-08-31, Notion/Ashby).** The Ashby branch treated every checkbox in an entry as its own
+  consent box — its comment said *"one per entry"*, true of OpenAI's consents, false for a multi-option
+  question. Four grouped questions became **21 phantom fields**, each labelled with its own OPTION text,
+  and the questions themselves reached the bundle **nowhere**. Ashby declares the group on the entry
+  (`ashby-application-form-input-checkbox-group`, a `<fieldset>`; question = its `label[class*="_heading_"]`),
+  so this is a READ, not an inference — the same discipline as iCIMS' `iCIMS_FieldRow` and ORC's
+  `--radiogroup`. Beyond the noise, two things bit, both off the live bundle:
+  **(1) the label ladder routes on the LABEL** — the phantom labelled `LinkedIn` resolved to
+  `websites.0.url` and tried to write the operator's LinkedIn *profile URL* into a checkbox meaning "I
+  heard about this job on LinkedIn" (it reached review only because a URL matches no option — luck of the
+  value, not a refusal); **(2) required-ness is declared on the QUESTION, not the boxes** — no member
+  carries `required` and `aria-required` is absent, so three REQUIRED questions all reported
+  `isRequired:false`, the dangerous direction. ⚠ The key is the question id parsed out of the box id
+  (`<formId>_<questionId>-labeled-checkbox-<N>`, take after the LAST `_`) — **never `name`, which holds the
+  OPTION text**; a one-box declared group is still a group (the 2026-08-20 ORC ruling); and members are
+  excluded from the solo loop **by their container, not by `seen`**, because a member's `name` collides
+  with real fields (the live form has an input whose own key is likewise `LinkedIn`).
+  ⚠ **`test/ats-ashby-checkbox-group.test.js` is the FIRST test that executes `atsInjScan`** — every other
+  suite stubs it, which is exactly why a shape bug this size survived.
+- **AN OPTIONAL CHOICE FIELD MUST REACH REVIEW AS A REAL PICKER — EVERY ATS, NOT JUST iCIMS
+  (operator, 2026-08-25).** A field we never filled still has to be ANSWERABLE on the review page, and
+  a picker with no options is just a text box. ⚠ **The gap was not in the option read.** On
+  GH/Lever/Ashby the choice widget is a react-select whose options do not exist until it is OPENED
+  (hence the honest `scan-time coverage — select 0/14`), so every list that reaches review got there
+  because something opened the widget — the deterministic commit or the AI fallback, both of which run
+  only for a field we are trying to ANSWER. An OPTIONAL unmapped field is skipped in 0ms and opened by
+  nobody: measured `12 picker · 1 filter-or-type · 2 with no options at all, of 15`.
+  `atsCaptureMissingOptions` is a LAST, READ-ONLY pass over records that still have nothing to offer →
+  `14 picker · 1 filter-or-type · 0 with no options`, fill unchanged at 8.0s.
+  ⚠ It **must** close with `atsCloseComboConfirmed` (options GONE, not `aria-expanded`) — a lingering
+  portaled list strays the next field's click, the standing hazard. It **never runs on a replay** (a
+  submit run verifies approved values; extra page contact before the gate is risk with no reviewer
+  left to benefit). A list too long to trust stays PARTIAL — the iCIMS asymmetry holds: a picker
+  MISSING the answer makes the operator conclude the form doesn't offer it, while a complete list
+  called partial only costs a typed value.
+- **⚠ `[ATS-TIME] fill Xs` EXCLUDES THE TAIL — AND USED NOT TO (2026-08-25).** `fillMs` was measured
+  after the detach, the storage write and `reportApplication`, so a live run printed `fill 39.7s` for
+  **8.4s of filling plus a 31.3s POST to localhost** (a cold Next dev route). That number is what every
+  pacing round is tuned against. The tail is now subtracted and printed alongside
+  (`| + Ns tail (detach+store+report, tab already released)`). ⚠ Rounds 14–19 of
+  `docs/fill-speed-log.md` predate this and include a tail of unknown size — comparable to each other,
+  but they OVERSTATE the fill. The tell was there: a 39.7s fill with **no slow fields listed** and
+  perfect pacing.
+- **⚠ NEVER ENABLE A CDP DOMAIN WHOSE EVENTS NOTHING READS (2026-08-25).** `Runtime.enable` +
+  `DOM.enable` were called at attach with no `onEvent` consumer, so Chrome streamed
+  console/executionContext/DOM-mutation events at a worker that discarded them — and a saturated event
+  loop DEFERS TIMERS, which is the SW starvation everything else was blamed on. `Runtime.enable` is gone
+  (only `Runtime.evaluate` is used, which needs no enable — including inside a `createIsolatedWorld`
+  context); `DOM.enable` is LAZY (`cdpEnsureDomDomain`, used only by the fallback focus path);
+  `Page.enable` stays (`addScriptToEvaluateOnNewDocument` needs it). Live: **pace overruns went 1–3 per
+  visible run to ZERO across two runs**, with ~33 inbound events for a whole fill, all `Page.*`.
+- **⚠ UNDER STARVATION A PACE COSTS WHAT THE SCHEDULER DECIDES, NOT WHAT WAS ASKED FOR.** Measured on a
+  hidden run: `15ms×16 = 29.8s` — sixteen 15ms yields at ~1.9s each. So the **YIELD COUNT** is the cost
+  driver and the duration is nearly irrelevant, which is why shortening paces (`cdpSetFastWhenHidden`)
+  pays off only on a HEALTHY run. **A VISIBLE fill no longer lags; a HIDDEN one still can** — an
+  invisible tab gives Chrome no reason to schedule the worker, which is browser policy, not a stream we
+  can stop. Diagnose with the always-on `inbound CDP events` + `pacing: … spend:` lines.
+- **A MENU THAT SETTLED ON SHOWING NOTHING IS AN ANSWER — AND IT ARRIVES EARLY (2026-08-25).** Many of these
+  widgets render no list until a query is typed (a places box, an async school/degree search), so the
+  open-and-read step spent ~4.8s (`ATS_POLL.open` 1800 + two forced toggles at 1500) waiting for options
+  that cannot exist — the operator saw it as the field sitting *focused and idle* for 5s before a character
+  was typed. `pollFor` ALREADY recognised "mounted + not loading + repeated empty", but the verdict sat
+  behind `if (now < deadline) return false`, so it could never fire early. It now stops as soon as the
+  page's own **quiescence watch** says the subtree has been still for `ATS_POLL.emptyQuietMs` (350ms).
+  ⚠ Quiescence, not a shorter clock: a widget ABOUT to paint its list is still mutating, so a slow-painting
+  pick-one (the GitLab 3-option case, misread as empty at 1.8s) keeps its full budget, and the LOADING
+  ceiling is untouched. Where the watch is unavailable the rule never fires. **Forced toggles now require
+  the menu to have NEVER MOUNTED** (`read.open` is the evidence) — they exist for a missed click, and each
+  flips the menu, so an odd number leaves it CLOSED.
+- **TYPE THE HEAD, THEN ONE REAL KEYSTROKE — BUT ONLY WHERE SUCCESS IS CHEAPLY VERIFIABLE.**
+  `Input.insertText` puts the whole word in at 218ms vs 8373ms of per-char typing, and **alone it does NOT
+  work**: the widget returns 0 options, because it watches for a KEY event, not a trusted INPUT event
+  (measured — this refutes "it just needs trusted input"). One keystroke for the last character fires the
+  search with the full query already in the box.
+  ⚠ **The gate is what the widget showed ON OPEN, never a field name.** A menu EMPTY on open is query-only,
+  so "options appeared" is an unambiguous success signal and a failed fast write is caught in one settled
+  read. A menu that ALREADY LISTS options on open cannot cheaply distinguish "searched and filtered" from
+  "nothing happened, these are stale defaults" — live, `school--0` (100 opt on open) went 3.4s → **8.4s**
+  before this gate existed, so a widget that arrives with a list keeps the per-char typing it was proven
+  with. ⚠ And the fallback must be **options-based, not value-based**: the read-back PASSES on failure
+  (the text really is there). Default ON; `atsComboPerChar` forces per-char everywhere.
+  ⚠ The kill-switch is named for the OLD behaviour because `AP_DEV_FLAG` cannot delete a key — "clearing"
+  writes FALSE, so a `…InsertText:false` switch would make every cleared profile permanently slow.
+- **`cdpSetFastWhenHidden(true)` APPLIES TO GH/LEVER/ASHBY, for a different reason than iCIMS.** iCIMS needs
+  it because it DECLINED the timer polyfill; these three KEEP it, so the page's clock was already fast while
+  **our** pacing still charged full hidden beats — independent axes, and only one was set. Live: a 500ms
+  soft deadline still cost 9044ms hidden vs 717ms visible. Safe here for the same reason plus a stronger
+  one: actuation is page-side synthetic and every commit is read-back verified, so an early pace costs a
+  retry, never a wrong fill. Scoped per-run — **never let it reach Workday's trusted-input pacing.**
 - **⚠ INSTALL THE PAGE OVERRIDES BEFORE THE DOCUMENT EXISTS.** Landing them on an already-running document
   leaves the page half-native/half-ours, after which react-select never resolves again — **and a refresh cures
   it**. A run opens its tab BLANK, attaches, registers overrides, then navigates. *If a widget works by hand
@@ -1230,10 +1393,26 @@ The standing rules:
 - **`runAtsSubmitRun` gates** (all must pass before the one trusted click): bundle blockers + STRICT live
   verify + **no VISIBLE captcha challenge** + `arm===true` (absent ⇒ full dry rehearsal logging "WOULD CLICK
   SUBMIT"). **AI is OFF for submit runs regardless of the toggle.** A VISIBLE challenge halts
-  `needs_operator` — **the bot never solves or bypasses a captcha.**
+  `needs_operator` — **the bot never solves or bypasses a captcha.** ⚠ The one trusted click can become
+  **two**, when the form answers Submit by emailing a verification code — see the email-verification section
+  above; that is a possession factor, NOT a relaxation of the captcha rule.
 - **A CLOSED POSTING IS NOT A BROKEN PIPELINE** — `atsPostingGone` reads Lever's `Not found` title and
   Greenhouse's redirect-to-board-index, and halts `posting-gone` rather than sending the operator to debug a
   fill on a job that no longer exists.
+  ⚠ **BUT A REDIRECT TO THE *EMPLOYER'S* SITE IS NOT A CLOSED POSTING (2026-08-31).** Zipline's board sends
+  `…/flyzipline/jobs/<id>` to `zipline.com/open-roles`, and I wrote the job off as gone; the form is still
+  served on Greenhouse's **embed** path, `boards.greenhouse.io/embed/job_app?for=<co>&token=<id>`, and fills
+  normally. The public board API is the authority — **a job the API still returns is live wherever its
+  `absolute_url` points**, and that `id` IS the embed `token`, so the URL is constructible for any
+  redirecting tenant. Do not collapse the two redirect shapes: board-index ⇒ gone, employer domain ⇒ use
+  the embed URL.
+  ⚠ **AND THE EMBED DOCUMENT HAS NO EMPLOYER BRANDING, so the JD scrape returned `company: "Embed"`** — a
+  URL path segment anchoring the safety-critical employment recognizer, which then silently reads as "not
+  us" instead of flagging. `atsPlausibleCompany` rejects the bare platform vocabulary (`embed`, `job_app`,
+  `jobs`, `careers`, `apply`, `board`, each ATS's own name), **anchored `^…$`** so "Embedded Systems Corp" /
+  "Greenhouse Software" survive. Rejecting is the safe direction: an ABSENT company is correctly
+  **unevaluable** (blank + review), a JUNK one is confidently wrong. ⚠ Open: nothing then supplies an anchor
+  on this path — the URL's `for=` param is the evidence-based fallback and is NOT yet wired in.
 - **AI IS DEFERRED, THEN ASKED ONCE — and the ORDER is the point (2026-08-11).** The deterministic pass runs
   FIRST and to completion; every field it could not answer is RECORDED, then **ONE** `act.llm` call asks
   about exactly those, then a **second actuation pass** fills them. ⚠ **This is the OPPOSITE ORDER to
@@ -1261,6 +1440,54 @@ The standing rules:
   to the operator's yes/no model while the "Fill — essays and long answers" slot sat unused; the Workday
   twin (`aiFillText`) had always routed correctly. Live-verified: `AI batch [text → "essay" route]` next to
   `[LLM] … for "essay"`.
+
+## AN EMAILED VERIFICATION CODE IS ANSWERED FROM THE INBOX — SUBMIT IS TWO CLICKS (operator, 2026-08-24)
+
+Observed DOM (the eight `#security-input-N` boxes, the disabled button, why shape-matching an 8-char run
+fails): `docs/dom-patterns.md` `2026-08-24 — Greenhouse: SUBMIT IS TWO CLICKS`. The standing rules:
+
+- **Greenhouse can answer "Submit application" by MAILING AN 8-CHARACTER CODE** and holding the submit
+  disabled until it is typed into `div.email-verification__wrapper`. So an armed submit is **one authorized
+  ACTION that can take two clicks** — the arm gate authorizes submitting *this application*, not a number of
+  clicks — and `atsAnswerEmailVerify` (background.js) sits between them.
+- **⚠ THIS IS NOT CAPTCHA HANDLING, and the distinction is the entire licence for it.** A captcha is a
+  challenge designed to be unsolvable by a machine; the standing rule that the bot never solves or bypasses
+  one is UNTOUCHED — `captchaChallenge` still halts `needs_operator`, and nothing here solves, forges or
+  hides a challenge. This is a **possession factor**: a code mailed to an address the operator owns and has
+  already granted `gmail.readonly` on, for an application a human approved field-by-field at the review gate.
+  Operator's reasoning: everything submitted is human-approved, so proving control of the mailbox is the one
+  step in the flow carrying no judgement. **Do not generalise it to any other kind of challenge.**
+- **Why it needed code rather than a halt:** the gate is invisible to the outcome loop — not a confirmation,
+  not a visible captcha, and `#email-verification-error` does not exist until a code is REJECTED. An armed run
+  therefore ended `no-confirmation` after 30s with the application **unsent** and no log line explaining it.
+  A gate we cannot NAME is worse than either a pass or a halt.
+- **A CODE IS RECOGNISED BY THE WORDS AROUND IT, NEVER BY ITS SHAPE.** `gmailExtractVerificationCode`
+  (gmail.js — a SIBLING of `gmailExtractVerificationUrl`, never a widening of it, so Workday's live
+  auto-verify is untouched) strips the body to prose first, then requires a **cue**. Cue words are excluded
+  **positionally** (`"security"` is 8 chars and sits beside every cue; testing the cue regex against a lone
+  token fails because the pattern needs the whole phrase), and a **shape tie-break** prefers a digit-carrying
+  or all-caps candidate over ordinary English of the same length (`"continue"`). ⚠ The tie-break only CHOOSES
+  BETWEEN candidates already next to a cue — **two code-shaped candidates still REFUSE.**
+- **The LENGTH is the form's own box count**, cross-checked against its own prose. A length mismatch is
+  REFUSED and writes nothing: `maxlength="1"` would silently truncate the difference, which then looks like a
+  wrong code rather than a wrong write.
+- **⚠ THE FRESHNESS FLOOR IS THE MOMENT WE CLICKED**, absolute, not a relative window. A code from an earlier
+  attempt is still in the inbox and still matches every test; typing it **burns the operator's real one** and
+  reports a rejection that looks exactly like a bad extractor.
+- **ONE ATTEMPT. A rejected code HALTS, never retries** — the code is single-use, so re-typing the one we
+  already used cannot succeed, and guessing again spends the operator's attempts. Same for every other
+  uncertainty: a gate ALREADY on screen before we click (a prior attempt mid-flight — `verification-in-flight`,
+  checked before the click so a rehearsal reports it too), boxes already holding characters
+  (`verification-partly-entered`), Gmail off or `chrome.storage.local.skipEmailVerify`
+  (`verification-code-required`), a form that keeps Submit disabled (`verification-code-not-accepted`).
+- **The code never reaches a log line, a record or a run result.** `atsInjFillEmailCode` returns a LENGTH, a
+  MATCH BOOLEAN and per-box occupancy — never a value — exactly like `atsInjSetCredential`, and the stage logs
+  the character count and the sender, never the code.
+- **The form's own acceptance signal is the gate we trust**: the button is disabled until every box is filled,
+  so `submitDisabled:false` is the PAGE agreeing the code is complete — stronger than our string compare
+  because it is the widget's judgement rather than ours.
+- **The confirmation budget is EXTENDED, not shared.** Answering the gate can spend 120s waiting for mail,
+  which would consume the 30s outcome budget and make a SUCCESSFUL submit report `no-confirmation`.
 
 ## Onboarding walk (pre-form: JD → apply → login → verify)
 
@@ -1456,8 +1683,51 @@ has the evidence; this is the short form.
   150ms to 80ms bought nothing; collapsing 28 SW awaits into 1 page-side wait fixed the largest gap on
   a page. A healthy ORC fill is ~280-320 `Runtime.evaluate` calls / 23-32s — that count is the surface
   area every per-round-trip stall multiplies against. **Ask "how many awaits?" before "how long is each?"**
+- **⚠⚠ AN AUTOCOMPLETE THAT SHOWS NOTHING ON OPEN IS ANSWERED BY TYPING, AND IT NEEDS A ROUTE
+  (live 2026-09-01, Whatnot).** Three REQUIRED fields — graduation month, graduation year, "your
+  current or most recent university" — reached review as *"ApplyPilot couldn't fill this"*. All three
+  are `ashby-application-form-input-autocomplete` (`role="combobox"`, no id/name): **the same widget
+  as the location box that fills fine**, differing only in that location has a ROUTE. With no route
+  the deterministic pass produced no candidates, so the SEARCH arm never ran (it types
+  `candidates[0]`) and the AI bailed `no live options to choose from` — the menu is empty until a
+  query is typed. Measured: 0 options on open, and a purely **synthetic** write + `keyup` returns the
+  match, so no trusted keystroke is needed here.
+  ⚠ **The fix is a DETERMINISTIC rung, not a better prompt** (`atsEducationAnswer`, answering from
+  `education[0]`): a graduation month is a stated fact, so it fills exact and unflagged, where an AI
+  guess would be `ai-choice` and land back in review to re-confirm something already known. Month is
+  TIERED (`["May","05","5"]`) so the form's vocabulary decides; **month/year are tested BEFORE school**
+  ("What year will you graduate from your university?" contains a school word but is a year question);
+  a DIFFERENT school (`high school`, `law school`) is refused rather than answered with the university;
+  and an unknown fact returns null rather than guessing. Live: needs-review 4 → 1, filled 9 → 12.
+  ⚠ **GATE ON "ARE WE ABOUT TO TYPE?", NEVER ON A WIDGET NAME.** The forced-toggle skip was first
+  written as `wt === "location"`, which left these three paying `open 7050ms (0 opt on open)` each —
+  the same 5.6s waste under another name. With CANDIDATES in hand the search arm types them, and
+  typing is both the real test and its own recovery for a missed open click; with none, reading the
+  list is the only hope and the toggles still earn their cost. `open 7050ms → 64ms`, Whatnot 47.6s →
+  **4.1s**. *Naming widgets is what made this a three-round bug.*
+- **⚠⚠ FIX THE WORKER'S SCHEDULING BEFORE CUTTING AWAITS (2026-09-01).** Round trips are the cost
+  driver, but the PRICE PER ROUND TRIP is set by whether the MV3 worker is scheduled. Do it in the
+  other order and the worker's stalls get attributed to whatever code happened to be awaiting — which
+  is how one Ashby location field looked like a widget problem for three rounds. **Ashby 45.4s →
+  6.2s hidden / 9.1s visible; Whatnot 25.5s → 3.9s; pace overruns 27–31s lost → 0.**
+  ⚠ **The beat was simply too slow: 500ms → 250ms.** Found by accident — turning `debugLagTrace` ON
+  made the fill FASTER, because the trace adds a SECOND 500ms `Runtime.evaluate` interval. *A
+  diagnostic that keeps the worker warm hides the stall it exists to measure; when a trace makes a
+  problem better, the trace is part of the system.*
+  ⚠ **And it needs an OVERLAP GUARD.** The probe has no timeout, so against a WEDGED renderer every
+  beat hangs and a firing timer accumulates unresolved commands until the worker answers nothing —
+  popup and dev bridge included, recoverable only by a manual extension reload (observed live minutes
+  after halving the interval). One probe in flight at a time.
+  ⚠ **`forceToggles` is not free either:** a menu that never MOUNTED is not automatically a missed
+  click. A query-only box mounts nothing until you type, and two forced re-opens plus their 1500ms
+  polls were the entire remaining 5.6s of the location field (22.7s → **0.84s**). Location only — for
+  a plain `select` an absent menu really can mean the click missed.
+  ⚠ **ONE TENANT IS NOT A MEASUREMENT.** The same waste sat in `atsOpenAndPollOptions` (the AI-DEFER
+  pass's option read) and was invisible on Notion, whose slow widget had already been fixed by name.
+  Whatnot showed it as **94 paces on an 18-field form vs 29 on a 25-field one** — two required
+  dropdowns costing 1935ms and 3521ms each. Always re-measure a speed fix on a SECOND tenant.
 - **⚠⚠ KEEP THE WORKER WARM — an MV3 service worker with nothing scheduled stops being scheduled.**
-  `cdpAttach` starts a 500ms beat (`cdpKeepWarmStart`) for EVERY attach. Measured with it off: a 600ms
+  `cdpAttach` starts a 250ms beat (`cdpKeepWarmStart`) for EVERY attach. Measured with it off: a 600ms
   pace took **13461ms** and a run lost 16.7s; with it on, 4 runs had **zero** overruns.
   ⚠ The obvious counter-argument is wrong and I made it: *"a keep-alive interval can't help, the
   interval is the thing being starved."* **A late timer still FIRES**, and each firing runs the loop.

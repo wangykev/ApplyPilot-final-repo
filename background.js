@@ -68,7 +68,18 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "orc-merge-1";
+const AP_BUILD_MARKER = "viewport-guard-39";
+
+// ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
+// Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
+// (Samsara) reported `no-confirmation` anyway — the operator checked the tab and it plainly said
+// "application submitted". So a genuinely-submitted application was reported as an unknown outcome,
+// which is the same false-negative class as the off-screen click: the action worked and the run said
+// it could not tell.
+// 30s is too tight for a form that navigates, re-renders and then paints its confirmation. Doubling
+// it costs nothing on the happy path (the loop returns the instant `confirmed` goes true) and is only
+// ever spent when we would otherwise have given a wrong answer.
+const SUBMIT_CONFIRM_MS = 60000;
 console.log(`[ApplyPilot][DEV] service worker started (${new Date(AP_DEV_WORKER_START).toISOString()}) · build ${AP_BUILD_MARKER}`);
 
 // Shared IndexedDB storage helpers (saveResume/getResume/RESUME_KEY). Classic MV3
@@ -712,7 +723,10 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     const ALLOWED = ["skipPreSaveReverify", "forceTrustedInput", "forceWorkerTimersOff", "debugInputTrace", "debugGroupWatch", "disableAiBatch", "debugAiPrompts", "debugClobber", "debugPageTrace", "debugLagTrace", "skipIcimsResume", "keepWarmBeat",
       // The keep-warm beat's kill-switch — cdpKeepWarmStart documents it as the A/B lever, and it was
       // unreachable through AP_DEV_FLAG, so the "off" arm silently ran as another "on" arm.
-      "atsKeepWarm", "atsPageClock"];
+      "atsKeepWarm", "atsPageClock",
+      // The combobox typing arms (2026-08-25): `atsComboPerChar` forces the pre-insertText per-char
+      // path everywhere, `atsLocSyntheticType` is the REFUTED synthetic arm kept for re-testing.
+      "atsLocSyntheticType", "atsComboPerChar", "dryEmailVerify", "skipEmailVerify"];
     (async () => {
       if (message.key === undefined) {
         const all = await new Promise((r) => chrome.storage.local.get(ALLOWED, r));
@@ -1237,7 +1251,48 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
             const tab = await new Promise((res) => chrome.tabs.create({ url: "about:blank", active: !background }, res));
             if (!tab || tab.id === undefined) { sendResponse({ ok: false, error: "no-tab" }); return; }
             await waitTabComplete(tab.id, 20000);
-            const res = await runAtsSubmitRun(tab.id, atsKind, pull.bundle, { arm, startUrl });
+            // gmailEnabled reaches the ATS submit run for ONE purpose: a form that answers Submit
+            // with an emailed verification code (Greenhouse, live 2026-08-24). OFF ⇒ that gate halts
+            // for the operator instead of being answered — see atsAnswerEmailVerify.
+            const res = await runAtsSubmitRun(tab.id, atsKind, pull.bundle, { arm, startUrl, gmailEnabled });
+            // PERSIST THE OUTCOME. Until now this branch reported NOTHING (live 2026-08-31): the
+            // Workday path below has always called reportApplication with `status: "submitted"`,
+            // but the ATS branch returns straight to the caller — so a Greenhouse / Lever / Ashby /
+            // iCIMS application that was genuinely FILED still read "needs_review" in the tracker
+            // forever. Observed as 16 approved-but-never-submitted rows, including three submitted
+            // by hand the day before, which also means the tracker could not answer "what have I
+            // already sent?" — the question that keeps a duplicate application from going out.
+            //
+            // ⚠ ONLY ON A REAL SUBMIT, and that asymmetry is deliberate, not laziness.
+            // `reportColumns` (web/lib/report-fields.ts) ALWAYS writes `approved_at: null`, on the
+            // sound reasoning that a report normally carries a FRESH bundle and approvals given for
+            // answers that no longer exist are void. A rehearsal or a halt reporting through here
+            // would inherit that rule and silently DISCARD the operator's approvals — making them
+            // re-approve every field before they could retry the submit they just watched fail.
+            // Staying silent on those paths is exactly what this code already did, so nothing
+            // regresses; only the success case is new.
+            if (res && res.submitted) {
+              try {
+                await reportApplication(pull.bundle, store.jobContext || null, {
+                  status: "submitted",
+                  submission: {
+                    at: new Date().toISOString(),
+                    armed: arm,
+                    submitted: true,
+                    confirmed: !!res.confirmed,
+                    stopped: res.stopped || null,
+                    confirmation: res.confirmUrl || null,
+                    email_verified: res.email_verified || null,
+                    ats: atsKind,
+                  },
+                });
+                LOG("tracker updated — this application now reads SUBMITTED.");
+              } catch (e) {
+                // The application IS filed; only the bookkeeping failed. Say so in those words, so
+                // the log can never be read as "the submit did not happen".
+                LOG(`could not update the tracker (${String((e && e.message) || e)}) — THE APPLICATION IS FILED; only the status write failed.`);
+              }
+            }
             sendResponse({ ...res, job_key: jobKey, application_id: pull.application_id || null, tabId: tab.id, startUrl });
             return;
           }
@@ -1358,6 +1413,57 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     (async () => {
       const out = await runGmailSmokeTest(message.interactive !== false);
       sendResponse(out);
+    })();
+    return true;
+  }
+
+  // ── PROVE THE CODE EXTRACTOR AGAINST A REAL EMAIL, WITHOUT SUBMITTING ANYTHING ───────────
+  // The email-verification gate can only be exercised for real by ARMING a submit — the gate does
+  // not exist until a genuine submit click has been made, so the one live rehearsal that would
+  // prove it is also an irreversible application to a real employer. That makes the highest-risk
+  // piece the hardest to reach, and it is the piece written against the LEAST evidence: the cue
+  // set, the sender and the length were all authored against a PLAUSIBLE email, never an observed
+  // one (the operator's own inbox holds a real one from the attempt that started this work).
+  //
+  // So: run the real extractor over the real inbox, read-only, and report whether it would have
+  // found a code — WITHOUT typing anything, without a tab, and without a submit. A `no-cue` or
+  // `ambiguous` answer here is exactly the finding that should be made BEFORE arming, not after.
+  //
+  // ⚠ IT NEVER RETURNS THE CODE, only its LENGTH plus provenance — the same rule the fill path
+  // obeys. A probe is the easiest place to leak a secret into a transcript, precisely because it
+  // feels like debugging rather than production.
+  // `sinceMinutes` widens the freshness floor deliberately (the run path pins it to the submit
+  // click); a probe is looking BACKWARD at mail that has already arrived.
+  if (type === "AP_DEV_GMAIL_CODE_PROBE") {
+    (async () => {
+      const LOG = (...a) => console.log("[ApplyPilot][GMAIL-CODE-PROBE]", ...a);
+      const mins = Math.max(1, Math.min(1440, Number(message.sinceMinutes) || 120));
+      const length = Number(message.length) || 0; // 0 ⇒ the extractor's own 4–10 probe range
+      const sender = message.senderContains === null ? null : (message.senderContains || "greenhouse.io");
+      let tok = await gmailGetToken(message.interactive !== false);
+      if (!tok.ok) { sendResponse({ ok: false, error: "gmail-auth-failed", detail: tok.error }); return; }
+      const args = {
+        token: tok.token, senderContains: sender, length: length || undefined,
+        notBeforeMs: Date.now() - mins * 60000, skewMs: 0,
+        // ONE pass: a probe looks at mail already in the inbox, so polling would only stall.
+        timeoutMs: 1, pollMs: 1, newerThan: Math.ceil(mins / 60) + "h",
+        log: (m) => LOG(m),
+      };
+      let find = await gmailFindAlnumCode(args);
+      if (!find.ok && (find.status === 401 || find.status === 403)) {
+        await gmailRemoveCachedToken(tok.token);
+        tok = await gmailGetToken(true);
+        if (tok.ok) find = await gmailFindAlnumCode({ ...args, token: tok.token });
+      }
+      if (find.ok) {
+        LOG(`✓ WOULD HAVE FOUND a ${find.code.length}-character code — from ${String(find.from || "?").slice(0, 70)}, subject ${JSON.stringify(String(find.subject || "").slice(0, 70))}${find.widened ? " [sender filter widened]" : ""}`);
+        sendResponse({ ok: true, found: true, codeLength: find.code.length, from: find.from || null,
+          subject: String(find.subject || "").slice(0, 120), widened: !!find.widened, lookbackMinutes: mins });
+        return;
+      }
+      LOG(`✗ no code identified — ${find.error || find.reason || "unknown"} (fresh ${find.sawFresh || 0}, stale ${find.sawStale || 0}, widened ${!!find.widened})`);
+      sendResponse({ ok: true, found: false, reason: find.error || find.reason || "unknown",
+        sawFresh: find.sawFresh || 0, sawStale: find.sawStale || 0, widened: !!find.widened, lookbackMinutes: mins });
     })();
     return true;
   }
@@ -4683,6 +4789,19 @@ function makeAtsActuation(llmConfig) {
     // showed no log line at all because `act.trustedFocus` was undefined). Guarded by a test now.
     trustedFocus: workday.trustedFocus,
     trustedType: workday.trustedType,
+    // ⚠ ONE TRUSTED COMMAND FOR THE WHOLE STRING (Input.insertText), vs trustedType's per-char key
+    // events. The ATS path never had this forwarded, so its comboboxes could only be typed the
+    // expensive way — 11 chars measured at ~92ms/char visible and ~197ms/char hidden, against a
+    // suggestion lookup of 2ms. This is what makes "the entire word appears at once" possible.
+    typeText: workday.typeText,
+    clearText: workday.clearText,
+    typeKeys: workday.typeKeys,
+    // Diagnostic arm for the location combobox's typing path, DECLARED here so the act-surface guard
+    // can see it (the run overrides it per-run from the flag store). Default false = the trusted path,
+    // which is the only one that actually wakes the widget — see the REFUTED note at its call site.
+    locSyntheticType: false,
+    fastComboType: true,
+    comboPerCharType: false,
     painting: workday.painting,
     paintLabel: workday.paintLabel,
     quietInstall: workday.quietInstall,
@@ -5728,6 +5847,23 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     const usePageClock = pageClockPref !== false;      // default ON
     cdpSetPageClock(usePageClock);
     if (!usePageClock) LOG("[ATS-PACING] page clock DISABLED by atsPageClock=false — paces ride the service worker's clock");
+    // ⚠ AND A SECOND, INDEPENDENT AXIS FOR THE OTHER THREE (2026-08-25). The page clock above
+    // chooses WHERE a pace sleeps; this chooses HOW LONG it sleeps — CLAUDE.md already names them as
+    // different axes in the iCIMS note, and both are kept because they fix different halves.
+    // iCIMS needs fast-when-hidden because it DECLINES the polyfill; Greenhouse/Lever/Ashby keep it,
+    // so their page clock is already fast hidden while OUR beats were still charged at full hidden
+    // length. Measured before the page-clock change landed, same form, one arm apart:
+    // `candidate-location` 2.0s VISIBLE vs 12.2s HIDDEN — `open 717ms · typed 129ms` against
+    // `open 9044ms · typed 3004ms`.
+    // ⚠ THE INTERACTION IS WORTH STATING RATHER THAN LEAVING TO BE REDISCOVERED: the page clock
+    // removes the STARVATION that inflated those hidden beats, so it plausibly subsumes much of what
+    // this line bought, and the two have never been measured together. If the atsPageClock A/B above
+    // is being run, set `atsComboPerChar`/this line aside first — otherwise the arms are confounded.
+    // Latency-safe by the same argument as iCIMS, and more strongly here: actuation on these three is
+    // page-side synthetic and every commit is read-back verified, so a pace that returns early costs
+    // a retry, never a silent wrong fill. Scoped per-run (reset at every attach), so it cannot leak
+    // to Workday, whose trusted-input pacing this would NOT be safe for.
+    if (ats === "greenhouse" || ats === "lever" || ats === "ashby") cdpSetFastWhenHidden(true);
     await cdpSetFocusEmulation(true).catch(() => {});
     // Record the run's OWN pacing verdict, the way the Workday path already does (background.js:3368).
     // "Never assume whether a run was visible": the operator can hide or alt-tab a tab mid-run, an
@@ -6038,6 +6174,29 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     emitRunProgress("Filling the application", (ats === "oracle" ? "Oracle's multi-step wizard" : "single-page " + ats + " form") + " (never submits)");
     const fillT0 = Date.now();
     const act = makeAtsActuation(await getLlmConfig());
+    // Diagnostic A/B for the location combobox's typing path — see the note at its call site in
+    // ats.js. Read per run from the flag store, so the arm can be switched without a reload.
+    {
+      const armFlags = await new Promise((r) => chrome.storage.local.get(["atsLocSyntheticType", "atsComboPerChar"], r));
+      act.locSyntheticType = !!(armFlags && armFlags.atsLocSyntheticType);
+      // DEFAULT ON as of 2026-08-25. Promoted on 3 clean runs across 2 tenants (Discord visible 2.0s
+      // / hidden 3.4s, Cloudflare hidden 3.7s), every one `filled · exact-normalized`, against a
+      // 7.9–25.5s baseline. The correctness risk is carried by the options-based fallback, not by
+      // this default: a widget that does not search after the insert re-runs the proven per-char
+      // path before anything is believed, so the worst case is latency, not an unanswered field.
+      // ⚠ THE KILL-SWITCH IS POSITIVE-MEANING ON PURPOSE. `AP_DEV_FLAG` cannot delete a key — it
+      // stores `!!value`, so "clearing" a flag writes FALSE. A kill-switch phrased as
+      // `atsLocInsertText:false` would therefore turn every previously-cleared profile into a
+      // permanently slow one, silently. Naming the flag for the OLD behaviour keeps absent == false
+      // == the default, which is the only polarity that survives a clear.
+      // NOT location-specific any more: the same head+1-keystroke write drives EVERY searched
+      // combobox on these forms (school / degree / discipline / location), which is why the flag
+      // and the act property are named for the mechanism rather than the field.
+      act.comboPerCharType = !!(armFlags && armFlags.atsComboPerChar);
+      act.fastComboType = !act.comboPerCharType;
+      if (act.locSyntheticType) LOG("⚠ atsLocSyntheticType is SET — the location box will be woken with a trusted click and then typed SYNTHETICALLY (diagnostic arm; REFUTED live 2026-08-25).");
+      if (act.comboPerCharType) LOG("⚠ atsComboPerChar is SET — every searched combobox falls back to per-char trusted typing (the slow pre-2026-08-25 path).");
+    }
     const prepared = prepareProfile(store.profile);
     // ⚠ `credentials` reaches the ATS driver ONLY here, and only the credential tier can consume it
     // (atsRouteField claims a recognized credential field before any other rung sees it). It is the
@@ -6260,7 +6419,18 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       + " with the tab ALREADY RELEASED (the page plays no part in either)");
     // [ATS-TIME] the evidence future pacing rounds retune from (the Workday [CDP-TIME] habit):
     // per-field wall clock + the tab's visibility, so a slow HIDDEN run is diagnosable as such.
-    const fillMs = Date.now() - fillT0;
+    // ⚠⚠ THE HEADLINE MUST NOT INCLUDE THE TAIL (2026-08-25). `fillMs` was measured HERE, after the
+    // detach, the storage write and the website report — so "fill 39.7s" on a live run was 8.4s of
+    // filling plus a 31.3s report, and the report happens with the tab ALREADY RELEASED (the line
+    // directly above says so). That is not a rounding error: this number is the one every pacing
+    // round has been tuned against, and on a cold Next dev server the report alone can be 30s, which
+    // makes a healthy fill look like a catastrophic one and sends the next investigation at the form.
+    // The operator asked "a 16 second fill still seems too much" about a number that was partly a
+    // POST to localhost.
+    // The tail is still reported — on its own line, where it belongs — so nothing is hidden; it is
+    // just no longer counted as time spent filling a form.
+    const tailMs = detMs + storeMs + repMs;
+    const fillMs = Date.now() - fillT0 - tailMs;
     // ⚠ ACROSS THE WHOLE WALK, not the last step. `out` is the final step's result, so using it here
     // would divide a four-step wall clock by one step's field count and report a per-field cost
     // several times the truth.
@@ -6283,11 +6453,18 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       .filter((r) => (r.elapsedMs || 0) >= 1500)
       .sort((a, b) => (b.elapsedMs || 0) - (a.elapsedMs || 0)).slice(0, 5)
       .map((r) => `${r.fieldName} ${(r.elapsedMs / 1000).toFixed(1)}s`).join(", ");
-    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${allResults.length} field(s)${MULTI ? ` across ${stepsFilled} step(s)` : ""} — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`);
+    LOG(`[ATS-TIME] fill ${(fillMs / 1000).toFixed(1)}s for ${allResults.length} field(s)${MULTI ? ` across ${stepsFilled} step(s)` : ""} — ${perField}ms/field (tab ${visNow ? "VISIBLE" : "HIDDEN"}, ${paint})${resPart}${slow ? " | slowest: " + slow : ""}`
+      // Say the tail out loud on the SAME line, so the two can never be conflated again in either
+      // direction — the headline excludes it, and the reader can still see what the whole run cost.
+      + ` | + ${(tailMs / 1000).toFixed(1)}s tail (detach+store+report, tab already released)`);
     // ⚠ AND THE RUN'S OWN PACING VERDICT, every time. A 630s ORC fill had to be diagnosed by hand from
     // the [PACE] lines; this makes any run say whether its clock was healthy, and names the culprit
     // when it was not (see cdpPaceSummary — "sw-starved" means the WORKER, not the page).
     try { LOG(`[ATS-TIME] ${cdpPaceSummary()}`); } catch (e) { /* log only */ }
+    // …and how many CDP events were pushed at the worker while it ran. Always printed, because "the
+    // worker is saturated by streams nothing reads" is a leading explanation for a late timer, and it
+    // was previously only countable behind a flag whose report the ATS path never printed.
+    try { LOG(`[ATS-TIME] ${cdpEventSummary()}`); } catch (e) { /* log only */ }
     // The lag trace's own verdict, next to the pacing summary it explains.
     try { const lag = cdpLagReport("ats run"); if (lag) LOG(lag); } catch (e) { /* log-only */ }
     // Say what ACTUALLY happened to the report. reportApplication used to return nothing, so this
@@ -6297,10 +6474,34 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       ? "Reported to the website."
       : `NOT reported to the website (${(reported && reported.reason) || "unknown"}) — the fill is complete, but the tracker does not have it.`;
     LOG(`fill complete — ${bundle.total} field(s), ${bundle.needs_review_count} need review. ${landed}`);
+    // ⚠⚠ A DEGRADED RUN MUST SAY SO — it is indistinguishable from a hard form otherwise
+    // (operator, 2026-08-31). A HIDDEN Notion fill came back with 16 of 31 fields reading
+    // "commit failed": the AI had picked a valid option every time (e.g. "He/Him" out of the
+    // form's own list) and the write simply did not land, because Chrome had suspended the tab —
+    // 227s at 7330ms/field, "NOT painting". The deterministic fields filled fine, because they run
+    // FIRST, while the tab was still alive; the AI pass runs LAST and met a frozen page. The same
+    // fill VISIBLE: 20.5s, 854ms/field, 24/24 filled, zero failures.
+    //
+    // Nothing in the bundle distinguished that from "this form asks a lot we cannot answer" — the
+    // operator's only symptom was a review page that looked unfilled, and they had to ask. So say
+    // it here, in the run's own voice, and put it on the RESULT so a caller can surface it too.
+    // Keyed on the two facts together: commits that FAILED, and a page that was not painting.
+    // Either alone is ordinary — a hard form legitimately fails to match, and a hidden tab that
+    // keeps painting fills fine.
+    let degraded = null;
+    try {
+      const failed = (out.results || []).filter((r) => r && /commit failed/i.test(String(r.detail || ""))).length;
+      const paint = await cdpPaintLabel();
+      if (failed >= 3 && /not painting/i.test(String(paint))) {
+        degraded = `${failed} field(s) failed to commit and the tab was ${paint} — this fill was STARVED, not refused by the form. Re-run it with the tab VISIBLE before reviewing; the answers were computed, they just could not be written.`;
+        LOG(`⚠⚠ DEGRADED RUN — ${degraded}`);
+        emitRunProgress("Fill finished, but degraded", degraded);
+      }
+    } catch (e) { /* diagnostic only — never fail a completed fill over its own warning */ }
     emitRunProgress("Fill complete", `${bundle.total} fields, ${bundle.needs_review_count} to review`);
     return { ok: true, reached_form: true, walked: true, ats, jd, counts: out.counts,
       needs_review: bundle.needs_review_count, reportedUrl: bundle.url, reported: !!(reported && reported.ok),
-      consents_accepted: icimsConsentsAccepted, partial: !!bundle.partial,
+      consents_accepted: icimsConsentsAccepted, partial: !!bundle.partial, degraded,
       walk: { ok: true, pages: stepsFilled, steps: stepsWalked, stopped: walkStopped || "ats-single-page", detail: walkDetail || null } };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };
@@ -6309,11 +6510,143 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   }
 }
 
+// ── THE EMAIL-VERIFICATION GATE: ANSWER IT FROM THE INBOX WE ALREADY READ ─────────────────
+// Live 2026-08-24 (Zipline, Greenhouse): "Submit application" does not submit. It mails an
+// 8-character code to the applicant's own address and re-renders the footer as eight
+// single-character boxes with the submit button DISABLED until they are all filled. So an armed
+// submit is TWO clicks, and the run could not see the thing between them: not a confirmation,
+// not a visible captcha, and the error node does not exist until a code is REJECTED — it ended
+// `no-confirmation` after 30s with the application unsent and nothing in the log to explain it.
+//
+// ⚠ THIS IS NOT CAPTCHA HANDLING, AND THE DISTINCTION IS THE WHOLE LICENCE FOR IT. A captcha is
+// a challenge designed to be unsolvable by a machine, and the standing rule — the bot never
+// solves or bypasses one — is untouched: `captchaChallenge` still halts `needs_operator`, and
+// nothing here solves, forges or hides a challenge. This is a POSSESSION factor: a code mailed
+// to an address the operator owns and has already granted this extension gmail.readonly OAuth
+// on, for an application a human approved field-by-field at the review gate. The operator's
+// reasoning (2026-08-24): everything that gets submitted is human-approved, so proving control
+// of the mailbox is the one step in the flow that carries no judgement.
+//
+// SAFETY, in layers — every one of these is a REFUSAL, not a retry:
+//   • it runs ONLY after an armed submit click. A rehearsal never clicks, so it never gets here;
+//     a gate found BEFORE the click is a prior attempt mid-flight and halts for the operator.
+//   • `notBeforeMs` is the moment WE clicked. A code from an earlier attempt is still in the
+//     inbox and still matches every shape test — typing it would burn the real one.
+//   • the code LENGTH comes from the form's own box count, cross-checked against its own prose.
+//   • the extractor REFUSES on two candidates rather than picking (gmail.js).
+//   • ONE attempt. A rejected code is a halt, because the code is single-use and re-typing the
+//     same one cannot succeed — see the note at the rejection branch.
+//   • Gmail OFF, or the kill-switch `chrome.storage.local.skipEmailVerify`, halts with the
+//     manual instructions instead.
+//
+// Returns { done:true } when the gate is answered and the caller should keep polling for a
+// confirmation, { absent:true } when there is no gate, or a HALT object to return as-is.
+async function atsAnswerEmailVerify(o) {
+  const LOG = o.log || (() => {});
+  const state = await cdpEval(atsInjEmailVerifyState).catch(() => null);
+  if (!state || !state.present) return { absent: true };
+
+  const boxes = Number(state.boxCount || 0);
+  LOG(`EMAIL VERIFICATION GATE — the form mailed a ${boxes}-character code${state.emailedTo ? " to " + state.emailedTo : ""} and is holding the submit until it is entered.`);
+  if (state.statedLength && state.statedLength !== boxes) {
+    // Two independent statements of the length disagreeing is exactly the condition under which
+    // we must not assume: the widget is what we type into, so it wins, but say so out loud.
+    LOG(`⚠ the page SAYS ${state.statedLength} characters but renders ${boxes} boxes — filling ${boxes} (the widget is what accepts the code).`);
+  }
+  if (state.filledCount) {
+    // Already-typed boxes mean someone (or a previous stage) got here first. Overwriting blind
+    // could mix two codes; the fill clears per box, but the SOURCE of the existing characters is
+    // unknown and a wrong submit is not undoable.
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-partly-entered",
+      detail: `${state.filledCount} of ${boxes} code boxes already hold a character — this run did not type them. Finish the code yourself in the tab and press Submit, or clear the boxes and re-run.` };
+  }
+
+  const kill = await new Promise((r) => chrome.storage.local.get(["skipEmailVerify"], (v) => r(!!(v && v.skipEmailVerify))));
+  const manual = `The form emailed a ${boxes}-character verification code${state.emailedTo ? " to " + state.emailedTo : ""}. Enter it in the tab and press Submit — the application is filled and waiting on that code alone.`;
+  if (kill) {
+    LOG("skipEmailVerify is SET — not fetching the code; stopping for the operator.");
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-required", detail: manual };
+  }
+  if (!o.gmailEnabled) {
+    LOG("Gmail auto-verify is OFF — stopping for the operator.");
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-required",
+      detail: manual + " (Or enable Gmail auto-verify and Connect Gmail, and this step runs itself.)" };
+  }
+
+  emitRunProgress("Verifying your email", `reading the ${boxes}-character code from Gmail`);
+  LOG(`polling Gmail (readonly) for a ${boxes}-character code mailed after ${new Date(o.clickedAtMs).toISOString()} (up to 120s)…`);
+  let tok = await gmailGetToken(true);
+  if (!tok.ok) {
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "gmail-auth-failed",
+      detail: tok.error + " — " + manual };
+  }
+  // The sender is the WEAK half of the identification (see gmailFindAlnumCode): the cue,
+  // the exact length and the freshness floor are what actually gate it, and a sender miss widens
+  // once rather than stranding the run.
+  const args = { token: tok.token, senderContains: "greenhouse.io", length: boxes,
+    notBeforeMs: o.clickedAtMs, timeoutMs: 120000, pollMs: 5000, log: (m) => LOG("gmail: " + m) };
+  let find = await gmailFindAlnumCode(args);
+  if (!find.ok && (find.status === 401 || find.status === 403)) {
+    LOG("Gmail token 401/403 — refreshing once and retrying.");
+    await gmailRemoveCachedToken(tok.token);
+    tok = await gmailGetToken(true);
+    if (tok.ok) find = await gmailFindAlnumCode({ ...args, token: tok.token });
+  }
+  if (!find.ok) {
+    LOG("could not read a code from Gmail — " + find.error);
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-not-found",
+      detail: find.error + " — " + manual };
+  }
+  // ⚠ NEVER LOG THE CODE. It is single-use and this log is the operator's own console, but the
+  // run RESULT travels (it is returned to the website), and the habit is what keeps a value out
+  // of a place nobody audited. Length + provenance is everything needed to diagnose.
+  LOG(`✓ code found (${find.code.length} chars) in a message from ${String(find.from || "?").slice(0, 60)}` +
+    `${find.widened ? " [sender filter was widened]" : ""} — subject ${JSON.stringify(String(find.subject || "").slice(0, 60))}. Typing it into the form.`);
+
+  const w = await cdpEval(atsInjFillEmailCode, find.code).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (!w || !w.ok) {
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-not-entered",
+      detail: `Read the code from Gmail but could not type it into the form (${(w && (w.error || "read-back mismatch")) || "no result"}). ` + manual };
+  }
+  // The form's OWN acceptance signal: the button is disabled until every box holds a character,
+  // so this is the page agreeing the code is complete — stronger evidence than our string compare
+  // because it is the widget's judgement rather than ours.
+  if (w.submitDisabled === true) {
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-not-accepted",
+      detail: "Typed all " + boxes + " characters and the form still holds the submit button disabled. " + manual };
+  }
+  LOG(`code entered (${w.len}/${boxes} boxes filled, submit button ${w.submitDisabled === false ? "now ENABLED" : "state unknown"}).`);
+
+  // ── THE ONE WAY TO LIVE-TEST THIS WITHOUT SUBMITTING ANYTHING (2026-08-25) ────────────────
+  // ⚠ The gate cannot be reached by a rehearsal: it does not exist until a genuine submit click has
+  // been made. That normally makes the riskiest code in the pipeline the hardest to exercise — and
+  // it is the code written against the least evidence.
+  // What makes a safe test possible is the traced fact that **Greenhouse's FIRST click does not
+  // submit**: it mails a code and holds the button disabled. The application goes in on the SECOND
+  // click. So everything above this line — gate detection, the Gmail poll, the extraction, typing
+  // eight boxes, the read-back, and the form's OWN acceptance signal (the button unlocking) — can be
+  // proven end to end while stopping here.
+  // `chrome.storage.local.dryEmailVerify = true` does exactly that: full stage, no completing click.
+  // It is NOT a substitute for the real thing (the second click and the confirmation stay unproven),
+  // which is why it reports itself as an operator stop rather than a success.
+  const dry = await new Promise((r) => chrome.storage.local.get(["dryEmailVerify"], (v) => r(!!(v && v.dryEmailVerify))));
+  if (dry) {
+    LOG("⚠ dryEmailVerify is SET — the code is IN and the form has enabled Submit, but this run will NOT click it. "
+      + "Nothing has been submitted; the application is still waiting on that click.");
+    return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-dry-run",
+      detail: `Read the ${boxes}-character code from Gmail and typed it into the form; the form accepted it and enabled Submit. `
+        + "Stopped there because dryEmailVerify is set — nothing was submitted. Clear the flag to let an armed run finish." };
+  }
+  return { done: true, emailedTo: state.emailedTo || null };
+}
+
 // SUBMIT run: approved bundle → blank form → re-fill → verify → gate → (armed) submit.
 // The submit click is TRUSTED input (the one irreversible action; captcha vendors also
 // score event trust) and happens ONLY when: no bundle blockers, no live verify failures,
 // no visible captcha challenge, arm===true. A visible captcha challenge is a
 // needs_operator halt — NEVER solved or bypassed by the bot.
+// ⚠ That click can become TWO, on a form that answers Submit by emailing a verification code —
+// one authorized ACTION, two clicks, with atsAnswerEmailVerify (above) between them.
 async function runAtsSubmitRun(tabId, ats, bundle, opts) {
   const LOG = (...a) => console.log("[ApplyPilot][ATS-SUBMIT]", ...a);
   const arm = !!(opts && opts.arm);
@@ -6648,8 +6981,74 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       failures.push(`${name} ("${(e.question_label || "").slice(0, 60)}"): approved value has NO matching field on the live form`);
     }
 
+    // ── FINAL PRE-CLICK DOM READ: does the LIVE FORM hold what was APPROVED? ───────────────
+    // (operator, 2026-08-31 — "before submitting, there should be a dom read to make sure it
+    // matches the approved selections".)
+    //
+    // Everything above verifies the REPLAY, not the APPROVAL. Each field's commit was read back;
+    // the post-fill audit re-read the page against what the replay WROTE; the strict verify checks
+    // that every approved field ended `filled`. All three compare the page against OUR OWN RECORD.
+    // None of them asks the question that actually matters at an irreversible gate: does the form,
+    // right now, say what the human approved?
+    //
+    // The gap is narrow but real, and this codebase has already been bitten by its shape: a commit
+    // that lands a DIFFERENT option than the approved text reads back consistently and passes every
+    // check above (the ORC dial-code case — the widget DISPLAYED "+1" while the option read
+    // "+1 (United States)"). So this reads the live DOM one last time and compares it to
+    // `current_value` from the approved bundle itself.
+    //
+    // ⚠ ACCEPT RULES ARE THE AUDIT'S, DELIBERATELY. A FALSE NEGATIVE HERE BLOCKS A SUBMIT THAT
+    // SHOULD PASS — the failure mode that made a rehearsal report "native select commit failed" on
+    // two fields whose values were on the form the whole time. So a chip DISPLAY that is a
+    // substring of the approved text matches, a label that merely prefixes it verbosely matches,
+    // and a multi-answer value is compared SET-WISE after splitting on the group separator rather
+    // than as one string whose order we do not control.
+    const scanFields = (out.scan && out.scan.fields) || [];
+    const driftFailures = [];
+    for (const [name, e] of approved) {
+      const want = e && e.current_value;
+      if (want == null || String(want).trim() === "") continue;
+      if (e.credential) continue;                       // the bundle holds a placeholder by design
+      const rec = out.results.find((r) => durable(r) === name);
+      if (!rec) continue;                               // already reported by the absence check above
+      if (rec.credential || rec.status === "already-filled") continue;
+      const f = scanFields.find((x) => x.fieldName === rec.fieldName);
+      if (!f || f.widgetType === "file_upload") continue;  // a file input never reads back a value
+      let live = null;
+      try { live = await cdpEval(atsInjReadValue, ats, f.inputSel, f.widgetType); } catch (err) { live = null; }
+      if (!live || !live.ok) {
+        driftFailures.push(`${name} ("${(e.question_label || "").slice(0, 50)}"): could NOT be re-read from the page before submitting`);
+        continue;
+      }
+      const liveV = live.value == null ? "" : String(live.value);
+      const wantV = String(want);
+      const norm = (x) => atsLib.normalize(String(x || ""));
+      let ok;
+      if (f.widgetType === "checkbox") {
+        ok = String(!!live.value) === String(wantV === "true" || wantV === "Yes" || wantV === "true");
+      } else if (f.widgetType === "checkbox_group" || f.widgetType === "multiselect_native") {
+        // SET-WISE, BY CONTAINMENT AGAINST THE WHOLE JOINED STRING — never by splitting the live
+        // value. ⚠ AN OPTION CAN CONTAIN THE SEPARATOR: the page joins with ", " and this form's
+        // options are "New York, NY" / "San Francisco, CA", so a comma split yields
+        // ["New York","NY",…] and every answer looks missing. The bundle side is safe to split
+        // (GROUP_JOIN "; " is ours), but the PAGE side must not be.
+        const wantSet = atsLib.splitGroupValue(wantV).map(norm).filter(Boolean);
+        const liveJoined = norm(liveV);
+        ok = wantSet.length > 0 && wantSet.every((w) => liveJoined.includes(w));
+      } else {
+        ok = atsFd.textValuesMatch(liveV, wantV)
+          || (liveV && norm(wantV).includes(norm(liveV)))                                   // chip display
+          || (wantV.length >= 3 && norm(liveV).startsWith(norm(wantV)));                    // verbose label
+      }
+      if (!ok) {
+        driftFailures.push(`${name} ("${(e.question_label || "").slice(0, 50)}"): the form now shows ${JSON.stringify(liveV.slice(0, 60))} but you approved ${JSON.stringify(wantV.slice(0, 60))}`);
+      }
+    }
+    LOG(`pre-submit DOM read: re-read ${approved.size} approved field(s) off the live form — ${driftFailures.length ? driftFailures.length + " DISAGREE" : "all match what you approved"}`);
+    driftFailures.forEach((f) => LOG("  ✗ " + f));
+
     const state = await cdpEval(atsInjSubmitState, ats);
-    const blockers = bundleSubmitBlockers(bundle);
+    const blockers = bundleSubmitBlockers(bundle).concat(driftFailures);
     LOG(`verify: ${out.results.length} field(s) replayed, ${failures.length} failure(s); bundle blockers: ${blockers.length}; submit button: ${state && state.hasSubmit} (disabled=${state && state.disabled}); captcha challenge visible: ${state && state.captchaChallenge}`);
     failures.forEach((f) => LOG("  ✗ " + f));
     blockers.forEach((b) => LOG("  ✗ bundle: " + b));
@@ -6660,26 +7059,137 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     if (!state || !state.hasSubmit) return { ok: true, submitted: false, replayed: true, stopped: "no-submit-button", ats };
     if (state.captchaChallenge) return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "captcha-challenge", detail: "A captcha challenge is visible — solve it yourself in the tab, then submit manually or re-run.", ats };
 
+    // ⚠ A VERIFICATION GATE ALREADY ON SCREEN BEFORE WE CLICK is a PRIOR attempt mid-flight, and it
+    // must not be answered: the code sitting in the inbox belongs to a submit WE did not make, so
+    // there is nothing to tie it to this bundle, and the submit button is disabled anyway. Checked
+    // here rather than only after the click so a rehearsal reports it too — this is the one shape
+    // that can be present without an armed run having done anything.
+    {
+      const pre = await cdpEval(atsInjEmailVerifyState).catch(() => null);
+      if (pre && pre.present) {
+        LOG(`an email-verification gate is ALREADY on this form (${pre.boxCount} boxes, ${pre.filledCount} filled) — a previous submit attempt is mid-flight. Not clicking.`);
+        return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-in-flight", ats,
+          detail: `This form is already waiting on a verification code${pre.emailedTo ? " mailed to " + pre.emailedTo : ""} from an earlier submit attempt. Finish it in the tab, or reload the form and re-run.` };
+      }
+    }
+
     if (!arm) {
       LOG("▶▶ WOULD CLICK SUBMIT ◀◀ (dry rehearsal — every gate passed; arm the run to actually submit)");
       return { ok: true, submitted: false, replayed: true, would_submit: true, stopped: "simulate", ats };
     }
 
     // ── the ONE irreversible click — trusted input, forced. ──
-    LOG("⚠ ARMED — clicking Submit (trusted input).");
+    // ⚠ "ONE" IS NOW "ONE AUTHORIZED ACTION", WHICH CAN TAKE TWO CLICKS. A form behind an
+    // email-verification gate answers the first click by mailing a code and disabling the button;
+    // the second click is the one that actually submits. Both are inside the SAME arm
+    // authorization — the operator authorized submitting this application, not a number of clicks
+    // — and the gate is answered from the operator's own mailbox (atsAnswerEmailVerify).
+    // ⚠⚠ RE-READ THE RECT **WITH A SCROLL**, AND REFUSE AN OFF-SCREEN ONE (2026-08-27).
+    // `state.rect` came from a detection read, which deliberately does not move the page — and a
+    // bounding rect is VIEWPORT-relative. Measured live on Greenhouse: the submit button sits at
+    // cy **6430** in a **719px** viewport, so the click was dispatched roughly nine screens below
+    // anything visible and hit nothing. The run then logged "⚠ ARMED — clicking Submit" and sat
+    // through its whole outcome loop seeing no confirmation, no captcha, no errors and no email
+    // gate — because the button was never pressed. The operator watched it and said exactly that.
+    // Every FIELD filled correctly throughout, because field clicks go through trustedFocus →
+    // cdpRectReady(sel, true), where the `true` is a scroll. Only this path read a raw rect.
+    const clickState = await cdpEval(atsInjSubmitState, ats, true).catch(() => null);
+    let clickRect = clickState && clickState.rect;
+    // POSITIVE evidence the coordinate is clickable. A rect still outside the viewport after a
+    // scroll means something is wrong we do not understand, and a click there is a silent no-op —
+    // the single worst outcome for this action, because "nothing happened" is indistinguishable
+    // from "the form ignored us" in every log line that follows.
+    // ⚠⚠ A ZERO VIEWPORT IS AN UNMEASURABLE TAB, NOT AN OFF-SCREEN BUTTON (live 2026-09-01).
+    // A Whatnot submit refused with `cy=-903, viewport=0`. With `vh === 0` the test below rejects
+    // EVERY coordinate — negative or positive — so a tab that simply had not been laid out yet was
+    // reported as "the button is not on screen", and a submit whose 18 fields had all just verified
+    // was blocked. That is the false-negative direction this guard was explicitly written to avoid
+    // on the other side, and it costs a real application.
+    //
+    // A viewport of 0 means the renderer has not laid the page out (a freshly created tab, an
+    // occluded window). The honest response is to WAIT and re-measure rather than to judge geometry
+    // that does not exist yet — and if it never becomes measurable, say THAT, because "we could not
+    // measure the page" and "the button is off screen" send an operator to different places.
+    let vh = await cdpEval(function () { return window.innerHeight; }).catch(() => null);
+    for (let i = 0; i < 3 && !(typeof vh === "number" && vh > 0); i++) {
+      await cdpDelay(700);
+      vh = await cdpEval(function () { return window.innerHeight; }).catch(() => null);
+    }
+    if (!(typeof vh === "number" && vh > 0)) {
+      LOG(`✗ REFUSING to click: the page never reported a usable viewport (innerHeight=${vh}), so the button's position cannot be judged. Nothing was submitted.`);
+      return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "submit-unmeasurable", ats,
+        detail: "The tab never laid out, so we could not tell where the submit button is. Everything is filled and verified — press Submit yourself in the tab, or re-run with the tab visible." };
+    }
+    // Re-read the rect on the now-measurable page: the earlier one was taken against that same
+    // unlaid-out viewport, so its coordinates describe nothing.
+    const reState = await cdpEval(atsInjSubmitState, ats, true).catch(() => null);
+    if (reState && reState.rect) clickRect = reState.rect;
+    if (!clickRect || clickRect.cy < 0 || clickRect.cy > vh) {
+      LOG(`✗ REFUSING to click: the submit button is not on screen after scrolling (cy=${clickRect ? clickRect.cy : "?"}, viewport=${vh}). Nothing was submitted.`);
+      return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "submit-offscreen", ats,
+        detail: "The submit button could not be brought into view, so clicking it would have done nothing. Everything is filled and verified — press Submit yourself in the tab." };
+    }
+    LOG(`⚠ ARMED — clicking Submit (trusted input) at ${clickRect.cx},${clickRect.cy} (viewport ${vh}px).`);
     cdpSetSyntheticInput(false);
-    await cdpClickAt(state.rect.cx, state.rect.cy);
-    // Outcome: confirmation, validation errors, or a captcha challenge that popped on submit.
-    const deadline = Date.now() + 30000;
+    const clickedAtMs = Date.now();
+    await cdpClickAt(clickRect.cx, clickRect.cy);
+    // Outcome: confirmation, validation errors, a captcha challenge that popped on submit, or the
+    // email-verification gate. Errors are checked LAST on each tick: the gate renders its own
+    // `[role="alert"]`-ish furniture, and reading that as a validation failure would report a
+    // refused submit for a form that is simply waiting on a code.
+    // ⚠ THE DEADLINE IS EXTENDED, NOT SHARED. Answering the gate can spend up to 120s waiting for
+    // an email, which would consume the whole confirmation budget and make a SUCCESSFUL submit
+    // report `no-confirmation` — the outcome-reporting failure this loop exists to prevent. So the
+    // budget is reset for the second click: 30s to see the result of the click that was actually
+    // made, in both cases.
+    let verifiedVia = null;
+    let deadline = Date.now() + SUBMIT_CONFIRM_MS;
     while (Date.now() < deadline) {
       await cdpDelay(1000);
       const s2 = await cdpEval(atsInjSubmitState, ats).catch(() => null);
-      if (s2 && s2.confirmed) { LOG("✅ SUBMITTED — confirmation detected:", s2.url); return { ok: true, submitted: true, replayed: true, confirmed: true, ats, confirmUrl: s2.url }; }
+      if (s2 && s2.confirmed) { LOG("✅ SUBMITTED — confirmation detected:", s2.url); return { ok: true, submitted: true, replayed: true, confirmed: true, ats, confirmUrl: s2.url, email_verified: verifiedVia }; }
       if (s2 && s2.captchaChallenge) { LOG("captcha challenge appeared on submit — operator must solve it in the tab."); return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "captcha-challenge", ats }; }
+      // The gate, if this form has one. Answered ONCE per run: `verifiedVia` set means the code is
+      // already in and the second click has been made, so a gate still on screen after that is a
+      // REJECTION, handled below rather than re-fetched.
+      if (!verifiedVia) {
+        const ev = await atsAnswerEmailVerify({ log: LOG, gmailEnabled: !!(opts && opts.gmailEnabled), clickedAtMs });
+        if (ev && ev.stopped) return { ...ev, ats };
+        if (ev && ev.done) {
+          verifiedVia = ev.emailedTo || true;
+          // ── the SECOND half of the same authorized submit ──
+          // …and the COMPLETING click needs the same scroll for the same reason. The gate re-renders
+          // the footer, so the button has almost certainly moved since the first read.
+          const s3 = await cdpEval(atsInjSubmitState, ats, true).catch(() => null);
+          if (!s3 || !s3.hasSubmit || !s3.rect) {
+            return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-submit-missing", ats,
+              detail: "The code is entered but the submit button could not be located to press it. Press Submit yourself in the tab." };
+          }
+          if (s3.disabled) {
+            return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-not-accepted", ats,
+              detail: "The code is entered but the form still has Submit disabled. Check the code in the tab and submit there." };
+          }
+          LOG("⚠ code accepted by the form — clicking Submit again to complete the submission (trusted input).");
+          await cdpClickAt(s3.rect.cx, s3.rect.cy);
+          deadline = Date.now() + SUBMIT_CONFIRM_MS; // a fresh budget to observe THIS click's outcome (see above)
+          continue;
+        }
+      }
       const errs = await cdpEval(atsInjErrors, ats).catch(() => null);
-      if (errs && errs.errors && errs.errors.length) { LOG("submit refused — validation errors:"); errs.errors.forEach((x) => LOG("  · " + x)); return { ok: true, submitted: false, replayed: true, stopped: "validation-errors", errors: errs.errors, ats }; }
+      if (errs && errs.errors && errs.errors.length) {
+        // ⚠ A REJECTED CODE IS A HALT, NOT A RETRY. The code is single-use, so re-typing the one we
+        // already used cannot succeed, and Greenhouse does not re-mail without a resend the
+        // operator presses. Guessing again would burn attempts against the operator's application.
+        if (verifiedVia && errs.errors.some((x) => /code/i.test(String(x)))) {
+          LOG("the form REJECTED the verification code:"); errs.errors.forEach((x) => LOG("  · " + x));
+          return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "verification-code-rejected", errors: errs.errors, ats,
+            detail: "The form rejected the code read from Gmail. Enter the code from your inbox yourself in the tab and press Submit — everything else is filled and approved." };
+        }
+        LOG("submit refused — validation errors:"); errs.errors.forEach((x) => LOG("  · " + x));
+        return { ok: true, submitted: false, replayed: true, stopped: "validation-errors", errors: errs.errors, ats };
+      }
     }
-    LOG("no confirmation within 30s — VERIFY IN THE TAB before assuming either outcome.");
+    LOG(`no confirmation within ${Math.round(SUBMIT_CONFIRM_MS / 1000)}s — VERIFY IN THE TAB before assuming either outcome.`);
     return { ok: true, submitted: false, replayed: true, stopped: "no-confirmation", detail: "Submit was clicked but no confirmation rendered within 30s — check the tab.", ats };
   } catch (e) {
     return { ok: false, error: "exception:" + String((e && e.message) || e) };

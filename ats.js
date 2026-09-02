@@ -189,6 +189,21 @@ function atsPlausibleCompany(name) {
   if (/[|·—]/.test(s)) return false;               // "<title> | <Company>" separators
   if (/\bin\s+[A-Z][\w.'-]+,\s*[A-Z]/.test(s)) return false;  // "… in Mountain View, California"
   if (/\b(intern|engineer|manager|analyst|developer|scientist|director|specialist|technician|associate|architect)\b/i.test(s)) return false;
+  // ⚠ A PLATFORM WORD IS NOT A COMPANY (live 2026-08-31). A Zipline fill through the embed form
+  // (`/embed/job_app?for=flyzipline&token=…`) recorded its company as **"Embed"** — a URL path
+  // segment that reached `jobContext.company` through the JD scrape, not through
+  // atsCompanyFromUrl (which already returns null for that segment).
+  //
+  // This matters beyond a cosmetic tracker label: `company` is the anchor for the safety-critical
+  // employment recognizer ("have you worked for us before?"). Handing it a word no employer is
+  // called means that question can never match the anchor — the exact failure iCIMS' `jobs` path
+  // segment produced, and the reason atsCompanyFromUrl was taught to read the subdomain there.
+  // A wrong anchor is worse than none: an absent company correctly makes the recognizer
+  // UNEVALUABLE (blank + review), while a junk one silently reads as "not us".
+  //
+  // Kept as a NEGATIVE test with named tells, matching the rest of this function: these are
+  // job-board and embed-plumbing words, never trading names.
+  if (/^(embed|embedded|job_app|jobs|job|careers?|apply|application|board|boards|greenhouse|lever|ashby|workday|icims|oracle)$/i.test(s)) return false;
   return true;
 }
 
@@ -1236,6 +1251,54 @@ function atsCredentialValue(kind, credentials) {
 // answer is worse than an AI-flagged one — the Workday matching philosophy). Returns
 //   { candidates?|value?, path?, source, review?, flag?, detail?, skip? }
 // or null (→ bucket already consulted by the caller → AI → blank).
+// EDUCATION questions answered from the profile's own education entry. Pure, so the wordings and
+// the tiering are testable without a page.
+//
+// ⚠ ENTRY 0 IS THE ANSWER, and that is the profile's own convention rather than a guess here:
+// `web/lib/buckets.ts` already binds the school question to `education.0.school_or_university`.
+// A form asking about a DIFFERENT school ("high school") is refused rather than answered with the
+// university — a wrong school is a false statement, not an approximation.
+const ATS_EDU_SCHOOL_RE = /\b(university|college|school|institution)\b/i;
+const ATS_EDU_NOT_SCHOOL_RE = /\bhigh\s+school\b|\bschool\s+district\b|\bmedical\s+school\b|\blaw\s+school\b/i;
+const ATS_EDU_MONTH_RE = /\bgraduat\w*\b[^?]{0,40}\bmonth\b|\bmonth\b[^?]{0,40}\bgraduat\w*/i;
+const ATS_EDU_YEAR_RE = /\bgraduat\w*\b[^?]{0,40}\byear\b|\byear\b[^?]{0,40}\bgraduat\w*/i;
+const ATS_MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"];
+
+function atsEducationAnswer(label, profile) {
+  const L = String(label || "");
+  const ed = (profile && Array.isArray(profile.education) && profile.education[0]) || null;
+  if (!ed) return null;
+  const grad = String(ed.graduation_date || "").trim();
+  const gm = /^(\d{4})-(\d{2})/.exec(grad);   // "YYYY-MM" or "YYYY-MM-DD"; a bare year has no month
+
+  // ⚠ MONTH AND YEAR BEFORE SCHOOL. "Please select your graduation year" contains no school word, but
+  // a wording like "What year will you graduate from your university?" contains both — and it is a
+  // YEAR question. Testing the more specific shape first is what keeps that from filling a year box
+  // with a school name.
+  if (ATS_EDU_MONTH_RE.test(L)) {
+    if (!gm) return null;                      // month-precision unknown ⇒ say nothing, don't guess
+    const idx = parseInt(gm[2], 10) - 1;
+    if (!(idx >= 0 && idx < 12)) return null;
+    // Tiered so the form's own vocabulary decides: full name, zero-padded number, bare number.
+    return { candidates: [ATS_MONTH_NAMES[idx], gm[2], String(idx + 1)], source: "education",
+      path: "education[0].graduation_date", detail: "education[0].graduation_date" };
+  }
+  if (ATS_EDU_YEAR_RE.test(L)) {
+    const y = gm ? gm[1] : (/^(\d{4})$/.exec(grad) || [])[1] || String(ed.to_year || "").trim();
+    if (!/^\d{4}$/.test(y)) return null;
+    return { candidates: [y], source: "education", path: "education[0].graduation_date",
+      detail: "education[0].graduation_date" };
+  }
+  if (ATS_EDU_SCHOOL_RE.test(L) && !ATS_EDU_NOT_SCHOOL_RE.test(L)) {
+    const s = String(ed.school_or_university || "").trim();
+    if (!s) return null;
+    return { candidates: [s], source: "education", path: "education[0].school_or_university",
+      detail: "education[0].school_or_university" };
+  }
+  return null;
+}
+
 function atsRouteLabel(label, f, profile, defaults) {
   const L = String(label || "");
   const aq = (profile && profile.application_questions) || {};
@@ -1406,6 +1469,23 @@ function atsRouteLabel(label, f, profile, defaults) {
       if (rc.candidates) return { candidates: rc.candidates, source: "relocation", path: rc.path, detail: rc.path };
       return null;
     }
+  }
+
+  // EDUCATION — school / graduation month / graduation year, from the profile (live 2026-09-01).
+  // Whatnot asks all three as per-tenant AUTOCOMPLETES ("Please select your graduation month",
+  // "…year", "…your current or most recent university."). Nothing routed them, so the deterministic
+  // pass produced no candidates, the SEARCH arm never ran (it types `candidates[0]`, and there was
+  // none), and the AI fallback then bailed `no live options to choose from` — these widgets show an
+  // empty menu until a query is typed. Three REQUIRED fields reached review reading "ApplyPilot
+  // couldn't fill this", on a form where the profile knows every answer.
+  //
+  // ⚠ THE FIX IS DETERMINISTIC ON PURPOSE, not a better AI prompt. A graduation month is a stated
+  // fact in the profile; answering it from `education[0]` is exact and unflagged, where an AI guess
+  // would be `ai-choice` and land back in review for a human to re-confirm something already known.
+  // (The same reasoning as the relocation rung directly above.)
+  {
+    const ed = atsEducationAnswer(L, profile);
+    if (ed) return ed;
   }
 
   // How-did-you-hear — the same ladder the Workday source picker uses.
@@ -2179,7 +2259,35 @@ function atsInjScan(ats) {
     ...document.querySelectorAll('[class*="_fieldEntry"]'),
   ]);
   const entries = [...entrySet].sort((a, b) => (a.compareDocumentPosition(b) & 2 ? 1 : -1));
+  // ⚠⚠ REQUIRED-NESS IS DECLARED ON THE ENTRY, NOT ON THE CONTROL (live 2026-08-31, Notion).
+  // Ashby marks a required question with `_required_…` in its heading LABEL's class; measured, the
+  // inputs themselves carry neither `required` nor `aria-required`. Only the yes/no branch ever
+  // looked at the entry (`[class*="required"]`) — every other branch read the input alone and so
+  // reported `isRequired:false` for questions the form will not submit without.
+  //
+  // That is not cosmetic. An armed Notion submit was REFUSED by the form's own validation:
+  //   Missing entry for required field: What pronouns would you like our team to use…
+  //   Missing entry for required field: How many prior internships have you had
+  //   Missing entry for required field: Graduation Date / Degree Type
+  // Every one of those was scanned OPTIONAL, so `bundleSubmitBlockers` ("a REQUIRED field with NO
+  // VALUE blocks SUBMIT") had nothing to block on, the review page showed nothing to answer, and
+  // an approved bundle reached the gate that the form would never accept. Over-flagging is the safe
+  // direction and under-flagging is the dangerous one — this is that failure, live.
+  //
+  // ⚠ Scoped to the entry's own heading, NOT `entry.querySelector('[class*="required"]')` over the
+  // whole subtree: a checkbox-group entry contains its option rows, and a stray "required" token on
+  // any descendant would flag every group on the form. The heading is the element that carries the
+  // question, so it is also the one that carries the question's required-ness.
+  const entryRequired = (e) => {
+    if (!e) return false;
+    const h = e.querySelector('label[class*="_heading_"]') || e.querySelector("label");
+    if (h && /_required_/.test(String(h.className || ""))) return true;
+    // The marker Ashby renders as a separate node on some builds, plus the yes/no branch's original
+    // test kept verbatim so that path cannot regress.
+    return !!e.querySelector('[class*="_required_"]');
+  };
   for (const entry of entries) {
+    const entryReq = entryRequired(entry);
     // Yes/No button pair (hidden checkbox tracks state).
     const yesno = entry.querySelector('[class*="_yesno_"]');
     const cb = entry.querySelector('input[type="checkbox"]');
@@ -2188,7 +2296,7 @@ function atsInjScan(ats) {
       const nm = cb.name || cb.id; if (!nm || seen.has(nm)) continue; seen.add(nm);
       const picked = [...yesno.querySelectorAll("button")].find((b) => /_selected|active/i.test(String(b.className || "")) || b.getAttribute("aria-pressed") === "true");
       push({ fieldName: nm, inputSel: 'input[name="' + esc(nm) + '"]', widgetType: "yesno", label: entryLabel || nm,
-        isRequired: cb.required === true || !!entry.querySelector('[class*="required"]'), value: picked ? txt(picked) : (cb.checked ? "Yes" : null), options: ["Yes", "No"] });
+        isRequired: cb.required === true || entryReq || !!entry.querySelector('[class*="required"]'), value: picked ? txt(picked) : (cb.checked ? "Yes" : null), options: ["Yes", "No"] });
       continue;
     }
     // radio group(s) inside the entry (EEOC block: several logical questions can share one
@@ -2209,19 +2317,97 @@ function atsInjScan(ats) {
         const optLabel = (r) => { const l = (r.id && document.querySelector('label[for="' + esc(r.id) + '"]')) || r.closest("label"); return (l ? txt(l) : "") || r.value; };
         const checked = list.find((r) => r.checked);
         push({ fieldName: nm, inputSel: 'input[name="' + esc(nm) + '"]', widgetType: "radio", label: qlbl || nm,
-          isRequired: list.some((r) => r.required), value: checked ? optLabel(checked) : null, options: list.map(optLabel).filter(Boolean) });
+          isRequired: list.some((r) => r.required) || entryReq, value: checked ? optLabel(checked) : null, options: list.map(optLabel).filter(Boolean) });
+      }
+    }
+    // ── DECLARED CHECKBOX GROUPS — "select all that apply" (live 2026-08-31, Notion) ─────
+    // ⚠⚠ ASHBY DECLARES THE GROUP. READ THE DECLARATION; DO NOT INFER ONE. The entry IS a
+    // <fieldset> carrying `ashby-application-form-input-checkbox-group`:
+    //
+    //   FIELDSET._container_… _fieldEntry_… ashby-application-form-input-checkbox-group
+    //    ├ LABEL._heading_…[ _required_…]      ← THE QUESTION ("How did you hear about this…")
+    //    ├ DIV._option_…  › input#<formId>_<questionId>-labeled-checkbox-0 + label ← "LinkedIn"
+    //    └ …
+    //
+    // Until this branch existed the loop below claimed these boxes. Its comment says "one per
+    // entry" — true of OpenAI's consent boxes, false here. Live on Notion that turned 4 questions
+    // into 21 phantom fields, each LABELLED WITH ITS OWN OPTION TEXT, with the questions themselves
+    // absent from the bundle entirely (`hear about` matched nothing in it). Two ways that hurts
+    // beyond the noise, both observed in the same bundle:
+    //   • THE LABEL LADDER ROUTES ON THE LABEL. The box labelled "LinkedIn" resolved to
+    //     `websites.0.url`, so the fill tried to write the operator's LinkedIn PROFILE URL into a
+    //     checkbox meaning "I heard about this job on LinkedIn". It reached needs_review only
+    //     because a URL matches no option — luck of the value, not a refusal.
+    //   • REQUIRED-NESS IS DECLARED ON THE QUESTION, NOT ON THE BOXES. Three of the four groups
+    //     are required and every phantom read `isRequired:false` — the dangerous direction
+    //     (CLAUDE.md: a required field reading false hides a field that will block submission).
+    // Same failure as ORC's `--radiogroup` and the Gusto 12-phantom-field case, in a third costume.
+    const ASHBY_CB_GROUP = "ashby-application-form-input-checkbox-group";
+    if (entry.classList && entry.classList.contains(ASHBY_CB_GROUP)) {
+      const gboxes = [...entry.querySelectorAll('input[type="checkbox"]')];
+      const heading = entry.querySelector('label[class*="_heading_"]');
+      const rawQ = stripReq(txt(heading) || entryLabel || "");
+      const optOf = (b) => {
+        const l = (b.id && document.querySelector('label[for="' + esc(b.id) + '"]')) || b.closest("label");
+        return stripReq((l ? txt(l) : "") || b.name || "");
+      };
+      // ⚠ THE KEY IS THE QUESTION, AND `name` IS NOT IT. Every box carries its OPTION text as its
+      // `name` ("LinkedIn", "New York, NY"), so ORC's fallback order (`boxes[0].name || slug`)
+      // would key the whole group on one of its options. Ashby puts the question's own id inside
+      // the box id — `<formId>_<questionId>-labeled-checkbox-<N>` — and that questionId is the
+      // SAME vocabulary a plain Ashby custom question uses for its `name` (a bare UUID), so the
+      // group ends up keyed exactly like every other question on the form. Measured: both groups
+      // on one form shared the formId and differed in the questionId, which is why the segment
+      // after the LAST underscore is the one to take.
+      const qid = (function () {
+        const s = String((gboxes[0] || {}).id || "").replace(/-labeled-checkbox-\d+$/, "");
+        const i = s.lastIndexOf("_");
+        return i >= 0 ? s.slice(i + 1) : s;
+      })();
+      const gkey = qid || ("group:" + rawQ.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48));
+      if (gboxes.length && gkey && !seen.has(gkey)) {
+        seen.add(gkey);
+        push({ fieldName: gkey,
+          // Every member has an id here, so the group resolves as a plain id list and the page is
+          // never stamped. The name fallback is for a tenant that omits them.
+          inputSel: gboxes.map((b) => (b.id ? "#" + esc(b.id) : 'input[name="' + esc(b.name) + '"]')).join(", "),
+          // ⚠⚠ A ONE-BOX DECLARED GROUP IS STILL A GROUP (operator, 2026-08-20, on ORC). The
+          // question and the option text are DIFFERENT elements here, so collapsing to a boolean
+          // always loses the half that carries the meaning — the ORC bug where a group reached the
+          // operator as "Ethnicity — Unchecked". The declaration is the evidence, not the count:
+          // that is exactly what the shared-`name` heuristic elsewhere cannot know.
+          widgetType: "checkbox_group",
+          label: rawQ || gkey,
+          // ⚠ Declared on the QUESTION's heading label (`_required_…`) — measured absent from both
+          // the inputs and any `aria-required`. The other two are kept as belt: over-flagging is
+          // the safe direction.
+          isRequired: (heading ? /_required_/.test(String(heading.className || "")) : false)
+            || gboxes.some((b) => b.required === true || b.getAttribute("aria-required") === "true"),
+          // ⚠ "; " is a LOCKSTEP dup of lib.js's GROUP_JOIN — an injected fn cannot import, and the
+          // replay splits a multi-answer value on exactly this vocabulary. Change one, change both.
+          // (The helper name is deliberately not written here: the self-containment test greps this
+          //  function's SOURCE for shim references, and a comment would trip it.)
+          value: gboxes.filter((b) => b.checked).map(optOf).join("; ") || null,
+          options: gboxes.map(optOf).filter(Boolean),
+          optionSels: gboxes.map((b) => (b.id ? "#" + esc(b.id) : null)).filter(Boolean),
+          group: "checkbox" });
       }
     }
     // consent checkboxes (one per entry, name = the label text itself — live, OpenAI).
     // NO `continue` (the Ramp nested-radio lesson): the generic loop below still runs for
     // any OTHER inputs sharing the entry; `seen` prevents double-scanning these.
-    const soloCbs = [...entry.querySelectorAll('input[type="checkbox"]')];
+    // ⚠ MEMBERS OF A DECLARED GROUP ARE EXCLUDED BY THEIR CONTAINER, NOT BY `seen`. A group
+    // option's `name` IS its label text ("LinkedIn"), so adding those to `seen` could shadow an
+    // unrelated real field of the same name later in the form — a collision of exactly the kind
+    // this bug was made of. The container answers the question without that risk.
+    const soloCbs = [...entry.querySelectorAll('input[type="checkbox"]')]
+      .filter((b) => !b.closest("." + ASHBY_CB_GROUP));
     if (soloCbs.length && !entry.querySelector('input[type="radio"]') && !entry.querySelector('[class*="_yesno_"]')) {
       for (const cbx of soloCbs) {
         const nm = cbx.name || cbx.id; if (!nm || seen.has(nm)) continue; seen.add(nm);
         const l = (cbx.id && document.querySelector('label[for="' + esc(cbx.id) + '"]')) || cbx.closest("label");
         push({ fieldName: nm, inputSel: cbx.id ? "#" + esc(cbx.id) : 'input[name="' + esc(nm) + '"]', widgetType: "checkbox",
-          label: stripReq((l ? txt(l) : "") || entryLabel || nm), isRequired: cbx.required === true, value: cbx.checked ? true : null });
+          label: stripReq((l ? txt(l) : "") || entryLabel || nm), isRequired: cbx.required === true || entryReq, value: cbx.checked ? true : null });
       }
     }
     for (const el of entry.querySelectorAll("input, textarea")) {
@@ -2238,12 +2424,41 @@ function atsInjScan(ats) {
         nm = "ap-ats-combobox-" + out.fields.length;
         try { el.id = nm; } catch (e) { continue; }
       }
+      // ⚠⚠ A REQUIRED CONTROL CAN CARRY NEITHER `name` NOR `id`, AND WAS BEING DROPPED ENTIRELY
+      // (live 2026-08-31, Notion). The loop below skips anything with no key, so Ashby's
+      // `react-datepicker` never reached the scan at all — no record, no review item, nothing in
+      // the bundle. Its markup names it plainly enough:
+      //   <label class="_heading_ _required_" for="d11e9ed8-…">Graduation Date</label>
+      //   <div class="react-datepicker-wrapper"><div class="react-datepicker__input-container">
+      //     <input type="text" placeholder="Pick date..." class="…-input-date" required value="">
+      // An armed submit was refused by the form for exactly this field, and nothing upstream could
+      // have caught it: an absent field is not an unfilled one. `bundleSubmitBlockers` checks
+      // required fields IN the bundle, review shows what IS in the bundle, and the pre-submit DOM
+      // read compares APPROVED values — a field nobody ever recorded is invisible to all three.
+      //
+      // ⚠ THE KEY COMES FROM THE DANGLING `label[for]`, NOT A POSITION. That `for` points at an id
+      // no element has (the input has none), which is itself the evidence the label was written for
+      // THIS control — and its value is Ashby's own question UUID, so it is durable across visits
+      // the way a positional `ap-ats-field-N` would not be. A submit run must find the same field
+      // it filled, and the parse/re-render lesson from iCIMS is that positions are the thing that
+      // moves.
+      //
+      // ⚠ NOT applied to comboboxes, deliberately: they already stamp `ap-ats-combobox-N` and
+      // bundles in flight are keyed on it, so re-keying them would make every approved combobox
+      // report "no matching field on the live form". Fixing that is a separate, deliberate change.
+      if (!nm && !isCombo) {
+        const lf = entry.querySelector("label[for]");
+        const forId = lf ? lf.getAttribute("for") : "";
+        nm = (forId && !document.getElementById(forId)) ? forId : ("ap-ats-field-" + out.fields.length);
+        try { el.id = nm; } catch (e) { continue; }
+      }
       const inputSel = el.id ? "#" + esc(el.id) : 'input[name="' + esc(nm) + '"]';
       if (!nm || seen.has(nm)) continue;
       const isFile = el.type === "file";
       if (!isFile && !vis(el)) continue;
       seen.add(nm);
-      const required = el.required === true;
+      // ⚠ the entry's heading, not just the control — see entryRequired above.
+      const required = el.required === true || entryReq;
       if (isFile) { push({ fieldName: nm, inputSel, widgetType: "file_upload", label: entryLabel || nm, isRequired: required, value: (el.files && el.files[0] && el.files[0].name) || null }); continue; }
       if (isCombo) { push({ fieldName: nm, inputSel, widgetType: "select", label: entryLabel || nm, isRequired: required, value: el.value || null }); continue; }
       if (el.tagName === "TEXTAREA") { push({ fieldName: nm, inputSel: "textarea[name=\"" + esc(nm) + "\"]", widgetType: "textarea", label: entryLabel || nm, isRequired: required, value: el.value || null }); continue; }
@@ -2583,6 +2798,100 @@ function atsInjOpenAndReadOptions(inputSel, force) {
   return { ok: true, opened: true, already, clicked };
 }
 
+// ⚠⚠ ONE ROUND TRIP INSTEAD OF N — THE iCIMS MODEL, APPLIED TO A react-select (operator, 2026-09-01).
+//
+// The location combobox was the single largest cost on an Ashby fill: `open` measured 8.9s, 11.5s,
+// 16.4s, 21.2s and 21.3s across five runs — ALWAYS over its own 6s ceiling — while the typing beside
+// it took 82ms and the widget's own lookup 426ms. The cost was never the page. The open phase is a
+// poll (read → wait 150ms → read …) and under MV3 worker starvation a single 150ms sleep measured
+// 4956ms and 9551ms, both logged `sw-starved`. Two sleeps ARE the 21 seconds. The ceiling cannot
+// bound it, because the ceiling is only checked BETWEEN sleeps and one sleep outlasts the whole
+// budget.
+//
+// iCIMS already solved this shape and the operator pointed at it: `atsInjIcimsSearch` writes the
+// whole query in ONE synthetic write, there is NO open-poll at all, and the settle after the search
+// polls for a MATCH rather than for stillness. The lever the speed rules name is the same one —
+// "the page clock CANNOT help there (its abandon ceiling is an SW timer too). The lever is FEWER
+// AWAITS, not a different clock."
+//
+// So the waiting moves INTO the page: one `Runtime.evaluate` that returns as soon as options appear,
+// or the widget's own subtree has stopped changing (it has settled on showing nothing — go type),
+// or a ceiling. N starved SW sleeps become one.
+//
+// ⚠ The scope + `loading` detection is a LOCKSTEP DUP of atsInjReadOptions — two injected functions
+// cannot share code. Change one, change both. (Same standing rule as atsInjScan/atsInjReadValue.)
+// ⚠ Its in-page timers must be REAL, which on this path they are (`cdpInstallPageOverrides` gives
+// GH/Lever/Ashby worker-backed timers). Where they are not, the caller keeps the old poll — see the
+// fallback at the call site, and ORC's measured "an in-page setTimeout await timed out at 45s".
+async function atsInjAwaitOptionsOrQuiet(inputSel, quietMs, ceilMs) {
+  const el = document.querySelector(inputSel);
+  if (!el) return { ok: false, error: "not-found:" + inputSel };
+  const readNow = () => {
+    const listboxId = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
+    let scope = listboxId ? document.getElementById(listboxId) : null;
+    const shell = el.closest(".select__container") || el.closest(".select") || el.closest(".ashby-application-form-field-entry") || el.parentElement;
+    if (!scope) scope = (shell || document).querySelector('.select__menu, [role="listbox"]') || null;
+    const loading = !!(
+      (shell && shell.querySelector('[class*="loading"]')) ||
+      el.getAttribute("aria-busy") === "true" ||
+      (scope && /^\s*loading\b/i.test((scope.textContent || "").replace(/\s+/g, " ")))
+    );
+    const options = scope ? [...scope.querySelectorAll('[role="option"], .select__option')].map((o) => ({
+      text: (o.textContent || "").replace(/\s+/g, " ").trim(),
+      disabled: o.getAttribute("aria-disabled") === "true",
+    })) : [];
+    return { open: !!scope, options: options, loading: loading, shell: shell };
+  };
+  const t0 = Date.now();
+  let r = readNow();
+  // An already-open menu costs nothing — the same "read BEFORE the first wait" rule the SW poll has.
+  if (r.options.length) return { ok: true, open: r.open, options: r.options, loading: r.loading, why: "on-open", waitedMs: 0 };
+  // ⚠⚠ NO MENU AT ALL ⇒ NOTHING TO WAIT FOR. RETURN NOW (measured 2026-09-01).
+  // The first cut of this waiter still cost 25187ms and reported `ceiling`: this widget mounts NO
+  // listbox until a query is typed, so `open` stayed false, the settled-empty branch (which requires
+  // a MOUNTED menu) could never fire, and it burned the whole budget waiting for a menu that only
+  // exists after typing. That is the iCIMS lesson stated exactly: there is no open-poll, you search.
+  //
+  // ⚠ THE DISTINCTION IS MOUNTED-ness, NOT EMPTINESS, and it is what keeps the GitLab pick-one safe.
+  // A widget that renders its options late still MOUNTS its listbox first (`open:true, options:0`),
+  // so it falls through and keeps the full budget below — the case where reading empty at 1.8s left
+  // a REQUIRED 3-option question unanswered. A widget with no listbox at all has not shown us a slow
+  // list; it has shown us that it has none to show, and the typed query immediately after is the
+  // real test either way.
+  //
+  // ⚠ ONE page-side tick before concluding it, so a menu that mounts a frame after the click is not
+  // mistaken for one that never mounts. It costs ~60ms IN THE PAGE and zero SW awaits, which is the
+  // whole point — the thing that was expensive was never the waiting, it was the round trips.
+  if (!r.open && !r.loading) {
+    await new Promise((res) => setTimeout(res, 60));
+    r = readNow();
+    if (r.options.length) return { ok: true, open: r.open, options: r.options, loading: r.loading, why: "on-open-late", waitedMs: 60 };
+    if (!r.open && !r.loading) return { ok: true, open: false, options: [], loading: false, why: "no-menu", waitedMs: 60 };
+  }
+  let lastMut = Date.now();
+  let mo = null;
+  try {
+    mo = new MutationObserver(() => { lastMut = Date.now(); });
+    mo.observe(r.shell || el.parentElement || document.body, { childList: true, subtree: true, characterData: true, attributes: true });
+  } catch (e) { mo = null; }
+  try {
+    for (;;) {
+      await new Promise((res) => setTimeout(res, 60));
+      r = readNow();
+      const now = Date.now();
+      if (r.options.length) return { ok: true, open: r.open, options: r.options, loading: r.loading, why: "options", waitedMs: now - t0 };
+      if (now - t0 >= ceilMs) return { ok: true, open: r.open, options: [], loading: r.loading, why: "ceiling", waitedMs: now - t0 };
+      // ⚠ MOUNTED + NOT LOADING + SUBTREE STILL = it has settled on showing nothing, which is an
+      // ANSWER (go type), not a failure. Without the observer we never claim this — a widget about
+      // to paint its list is exactly the case that must keep its budget (the GitLab 3-option
+      // pick-one misread as empty at 1.8s), and time alone cannot tell the two apart.
+      if (mo && r.open && !r.loading && now - lastMut >= quietMs) {
+        return { ok: true, open: true, options: [], loading: false, why: "settled-empty", waitedMs: now - t0 };
+      }
+    }
+  } finally { try { if (mo) mo.disconnect(); } catch (e) { /* nothing left to do */ } }
+}
+
 function atsInjReadOptions(inputSel) {
   const el = document.querySelector(inputSel);
   if (!el) return { ok: false, error: "not-found:" + inputSel };
@@ -2680,7 +2989,61 @@ async function atsInjCommitOption(inputSel, optionText) {
   const target = [...scope.querySelectorAll('[role="option"], .select__option')].find((o) => norm(o.textContent) === norm(optionText));
   if (!target) return { ok: false, error: "option-not-found", cleared };
   fire(target, "mousedown"); fire(target, "mouseup"); fire(target, "click");
-  return { ok: true, cleared };
+  // ⚠⚠ THE INPUT'S TEXT IS NOT EVIDENCE OF A SELECTION ON A SEARCHABLE COMBOBOX (live 2026-09-01,
+  // Whatnot). This returned `ok:true` the moment the events were fired, and the caller then verified
+  // with atsInjReadValue — which for a combobox reads `el.value`, THE BOX WE JUST TYPED THE QUERY
+  // INTO. So a click that never registered still read back as the wanted value.
+  //
+  // Live: "Please select your graduation year" was committed `exact-normalized` after
+  // `query "2028" → 1 option`, passed the pre-submit DOM read, and the form then refused the submit
+  // with "Missing entry for required field: Please select your graduation year". The field really
+  // was empty; our check was what was wrong. The house rule states it exactly — a read-back that
+  // inspects what we wrote can only ever confirm we wrote it.
+  //
+  // ⚠ WHY LOCATION NEVER SHOWED THIS: there the committed option ("Tallahassee, Florida, United
+  // States") DIFFERS from the query ("Tallahassee"), so the value changing to something we did not
+  // type IS real evidence. The vacuous case is exactly when the option text equals the query —
+  // a year, a month, any short exact value. The bug hid behind the one widget that reads correctly.
+  //
+  // So report POSITIVE evidence instead of assuming: a committed option closes the menu and unmounts
+  // its rows. `menuGone` is that evidence; the caller decides what to do with it, and nothing here
+  // changes for a widget that was already working.
+  await sleep(220);
+  const rowsLeft = () => {
+    try {
+      const live = (listboxId && document.getElementById(listboxId))
+        || (scope && scope.isConnected ? scope : null);
+      return live ? live.querySelectorAll('[role="option"], .select__option').length : 0;
+    } catch (e) { return null; }
+  };
+  let optionsLeft = rowsLeft();
+  // ⚠ IF THE MOUSE CLICK DID NOT TAKE, USE THE WIDGET'S OWN KEYBOARD PATH (2026-09-01).
+  // A combobox commits on Enter over the highlighted row — that is its documented interface, the
+  // same one the ORC picker had to be driven through ("Enter commits"), and it is a different
+  // legitimate input path rather than anything disguised. Attempted ONLY when the menu is still
+  // showing rows, so a widget the click already satisfied is untouched: `arm` records which path
+  // actually worked, so the log can say so instead of leaving it to inference.
+  // ⚠ EXACTLY ONE ROW, or not at all. ArrowDown moves RELATIVE to whatever is highlighted, so on a
+  // multi-row menu it is a guess about which row Enter will take — and committing the wrong option
+  // is the failure class this whole pipeline exists to prevent. With a single filtered row there is
+  // nothing to guess. (The value check below is still the backstop either way: a wrong pick fails
+  // the text compare and goes to review.) A multi-row menu that survived the click keeps
+  // `menuGone:false` and is reported honestly instead.
+  let arm = "click";
+  if (optionsLeft === 1) {
+    const key = (t, k, code, kc) => el.dispatchEvent(new KeyboardEvent(t, {
+      key: k, code: code, keyCode: kc, which: kc, bubbles: true, cancelable: true,
+    }));
+    // Highlight the row we want, then commit it. ArrowDown first because a filtered menu may have
+    // nothing active yet, and Enter on no active row does nothing at all.
+    key("keydown", "ArrowDown", "ArrowDown", 40); key("keyup", "ArrowDown", "ArrowDown", 40);
+    await sleep(120);
+    key("keydown", "Enter", "Enter", 13); key("keypress", "Enter", "Enter", 13); key("keyup", "Enter", "Enter", 13);
+    await sleep(260);
+    optionsLeft = rowsLeft();
+    arm = optionsLeft === 0 ? "click→enter" : "click→enter(failed)";
+  }
+  return { ok: true, cleared, menuGone: optionsLeft === 0, optionsLeft, arm, value: el.value };
 }
 
 // Close any open react-select menus WITHOUT committing (blur + outside mousedown). The
@@ -2887,7 +3250,26 @@ function atsInjTickConsent(sel) {
 
 // The submit control + captcha/confirmation state — READ-ONLY (the click itself is the
 // caller's, trusted, and gated). One reader for everything the gate needs to see.
-function atsInjSubmitState(ats) {
+// ⚠⚠ `scroll` IS WHAT MAKES THE RETURNED RECT CLICKABLE (2026-08-27). `getBoundingClientRect` is
+// VIEWPORT-relative, and these application forms are enormous: measured on a live Greenhouse form,
+// the submit button sits at **cy 6430 in a 719px viewport** with `scrollY 0` — so
+// `cdpClickAt(cx, 6430)` dispatches a mouse event roughly nine screens below anything visible and
+// hits NOTHING. `document.elementFromPoint` at that coordinate returns null, which is the same
+// answer the browser gives the synthetic click.
+//
+// That is why an armed submit could log "⚠ ARMED — clicking Submit" and then sit through its whole
+// 30s outcome loop seeing no confirmation, no captcha, no validation error and no email gate: the
+// button was never pressed. The operator watched it happen and said so — "it did not press the
+// submit button at all" — which is the observation that separated this from the gate work, because
+// every one of those absences is equally consistent with "the click missed".
+//
+// ⚠ It is ALSO why this went unnoticed while every FIELD filled correctly: field clicks go through
+// `trustedFocus` → `cdpRectReady(sel, true)`, and that `true` is a scroll. Only the submit path read
+// a raw rect. Mirrors cdpRectOf's proven form (`block:"center", behavior:"instant"`).
+//
+// Default OFF so every DETECTION caller — atsLooksLikeApplicationForm, the pre-click gate, the
+// post-click outcome poll — keeps reading the page without moving it. Only the click site asks.
+function atsInjSubmitState(ats, scroll) {
   const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   let btn = null;
   if (ats === "lever") btn = document.querySelector("#btn-submit");
@@ -2916,6 +3298,9 @@ function atsInjSubmitState(ats) {
     const pag = document.querySelector("apply-flow-pagination") || document;
     flowNext = [...pag.querySelectorAll("button")].find((b) => /^(next|continue)\b/i.test((b.textContent || "").trim()) && vis(b)) || null;
   }
+  // Scroll BEFORE measuring, never after — the rect IS the thing the caller clicks. See the note
+  // on this function's signature for why an unscrolled rect made the click miss entirely.
+  if (btn && scroll) { try { if (btn.scrollIntoView) btn.scrollIntoView({ block: "center", behavior: "instant" }); } catch (e) { /* an unscrollable button still returns its rect */ } }
   const r = btn ? btn.getBoundingClientRect() : null;
   // a VISIBLE captcha challenge. ⚠ Lever's DORMANT invisible-mode hCaptcha container is a
   // FULL-VIEWPORT iframe (1547×720 live) with `visibility:hidden` — a size-only test calls
@@ -2928,11 +3313,148 @@ function atsInjSubmitState(ats) {
     return fr.width > 60 && fr.height > 60 && fr.width < 700;
   });
   const bodyText = (document.body.innerText || "").slice(0, 4000);
-  const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText) || /\/thanks(\?|$)/.test(location.href);
+  // ⚠ `/confirmation` IS A REAL CONFIRMATION URL — measured live 2026-08-31, IMC redirected to
+  // `…/jobs/4823924101/confirmation`. Only `/thanks` was matched here, so the URL signal was dead on
+  // Greenhouse and detection rested entirely on body text. That is a needlessly narrow gate for the
+  // one question this function exists to answer.
+  const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText)
+    || /\/(thanks|confirmation)(\?|$)/.test(location.href);
   return { ok: true, hasSubmit: !!btn, hasFlowControl: !!flowNext,
     flowCaption: flowNext ? (flowNext.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30) : null,
     rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
     disabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null, captchaChallenge: challenge, confirmed, url: location.href };
+}
+
+// ── THE EMAIL-VERIFICATION GATE: SUBMIT IS TWO CLICKS, NOT ONE (traced live 2026-08-24) ──
+// On a Zipline Greenhouse posting, pressing "Submit application" does NOT submit. It mails an
+// 8-character code to the applicant's own address and re-renders the footer as
+// `div.email-verification__wrapper`: eight `<input id="security-input-N" type="text"
+// maxlength="1" aria-required="true" aria-errormessage="email-verification-error">` boxes, and
+// the SAME submit button — now `disabled` / `aria-disabled="true"` — inside the SAME <form>.
+//
+// ⚠ WHY THIS NEEDED CODE RATHER THAN A HALT. Nothing in the post-click loop could see it: it is
+// not a confirmation, not a visible captcha, and `#email-verification-error` does not exist until
+// a code is REJECTED. So an armed run clicked Submit, waited its 30s, and ended
+// `no-confirmation` — the application NOT submitted, and the log unable to say why. A gate we
+// cannot name is the worst of the three outcomes.
+//
+// ⚠ AND IT IS NOT A CAPTCHA, WHICH IS WHY IT MAY BE ANSWERED AT ALL. The rule this repo holds —
+// "the bot never solves or bypasses a captcha" — is about a challenge designed to be unsolvable
+// by a machine. This is a POSSESSION factor: a code mailed to an address the operator owns and
+// has already granted this extension readonly OAuth on, for an application a human approved
+// field by field at the review gate. The page's reCAPTCHA is untouched, and `captchaChallenge`
+// still halts `needs_operator` exactly as before. Nothing here solves, forges or hides a
+// challenge.
+//
+// READ-ONLY. Returns everything the stage needs to decide, and NOTHING it could actuate on blind.
+function atsInjEmailVerifyState() {
+  const vis = (el) => { if (!el) return false; const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
+  // ORDER BY THE ID'S OWN INDEX, never by document order. The boxes are the code's characters, so
+  // a re-render that appends out of order would type a correct code in the wrong sequence and
+  // report a rejection that looks like a bad extraction.
+  const numbered = [...document.querySelectorAll('input[id^="security-input-"]')]
+    .map((el) => ({ el, n: Number(String(el.id).replace(/^security-input-/, "")) }))
+    .filter((x) => Number.isFinite(x.n))
+    .sort((a, b) => a.n - b.n);
+  const wrapper = document.querySelector(".email-verification__wrapper");
+  // Fallback for a tenant that renames the ids but keeps the shape: single-character boxes inside
+  // the verification wrapper. Deliberately requires the wrapper — a bare `[maxlength="1"]` sweep
+  // over a whole application form would collect unrelated inputs.
+  const boxes = numbered.length ? numbered.map((x) => x.el)
+    : (wrapper ? [...wrapper.querySelectorAll('input[maxlength="1"]')] : []);
+  const shown = boxes.filter(vis);
+
+  // The submit control. ⚠ A DELIBERATE IN-FUNCTION DUP of atsInjSubmitState's finder: each
+  // injected function is stringified on its own and cannot call a sibling, and CLAUDE.md's rule is
+  // that a lockstep dup lives INSIDE a function so it never touches the shared global scope.
+  const btn = [...document.querySelectorAll('button[type="submit"], button')]
+    .find((b) => /submit application|submit$/i.test(clean(b.textContent)) && vis(b)) || null;
+  const r = btn ? btn.getBoundingClientRect() : null;
+  const err = document.getElementById("email-verification-error");
+  // The notice names the DESTINATION address. Worth returning: "the code went to X but we are
+  // connected to Y" is a diagnosis, where a bare poll timeout is a mystery.
+  const notice = clean((wrapper && wrapper.innerText) || "")
+    || clean([...document.querySelectorAll("div, p, span")]
+      .filter((e) => e.children.length < 3 && /verification code was sent|enter the \d+-character code/i.test(e.textContent || ""))
+      .map((e) => e.textContent).pop() || "");
+  const to = /([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})/.exec(notice);
+  const nchar = /\b(\d+)-character\b/.exec(clean(document.body.innerText || "").slice(0, 20000));
+
+  return {
+    ok: true,
+    present: shown.length > 0,
+    boxCount: shown.length,
+    // How many boxes already hold a character — a re-entry guard, so a stage that already ran
+    // (or an operator who typed it by hand) is visible rather than overwritten blind.
+    filledCount: shown.filter((b) => String(b.value || "").length > 0).length,
+    // The form's OWN statement of the code length. Used to cross-check the box count, because two
+    // independent statements agreeing is what makes the length a fact rather than an assumption.
+    statedLength: nchar ? Number(nchar[1]) : null,
+    emailedTo: to ? to[1] : null,
+    notice: notice.slice(0, 240),
+    errorText: err && vis(err) ? clean(err.textContent).slice(0, 200) : null,
+    hasSubmit: !!btn,
+    submitDisabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null,
+    rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
+  };
+}
+
+// Type the code into the per-character boxes. Separate from atsInjSetText for the same two
+// reasons atsInjSetCredential is separate, both of which bite here:
+//
+// 1. ⚠ IT NEVER RETURNS THE CODE. atsInjSetText answers `{after: el.value}`, and this path's
+//    result object is logged and carried on a run result. A single-use code is not an account
+//    password, but it is the one secret in the submit run, so it leaves as a MATCH BOOLEAN.
+// 2. ⚠ IT CLEARS FIRST and does not blur between boxes. The setter SETS rather than replaces, so
+//    a re-entry over a half-typed code would concatenate — and `maxlength="1"` then silently
+//    TRUNCATES the result, which is the failure mode that looks like a wrong code rather than a
+//    wrong write. Blur per box would fire the widget's own validation eight times mid-write.
+function atsInjFillEmailCode(code) {
+  const chars = String(code == null ? "" : code).split("");
+  const numbered = [...document.querySelectorAll('input[id^="security-input-"]')]
+    .map((el) => ({ el, n: Number(String(el.id).replace(/^security-input-/, "")) }))
+    .filter((x) => Number.isFinite(x.n))
+    .sort((a, b) => a.n - b.n);
+  const wrapper = document.querySelector(".email-verification__wrapper");
+  const boxes = (numbered.length ? numbered.map((x) => x.el)
+    : (wrapper ? [...wrapper.querySelectorAll('input[maxlength="1"]')] : []))
+    .filter((el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; });
+  if (!boxes.length) return { ok: false, error: "no-code-boxes" };
+  // A 6-box widget must never be handed an 8-character code (nor the reverse): the extra
+  // characters would vanish into maxlength and the run would report a rejected code.
+  if (boxes.length !== chars.length) return { ok: false, error: "length-mismatch", boxCount: boxes.length, codeLength: chars.length };
+
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+  for (let i = 0; i < boxes.length; i++) {
+    const el = boxes[i];
+    try {
+      el.focus();
+      setter.call(el, "");
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      setter.call(el, chars[i]);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    } catch (e) { return { ok: false, error: "write-failed@" + i + ":" + String((e && e.message) || e) }; }
+  }
+  const last = boxes[boxes.length - 1];
+  try { last.blur(); last.dispatchEvent(new Event("focusout", { bubbles: true })); } catch (e) { /* the write is what matters */ }
+
+  const readBack = boxes.map((b) => String(b.value || "")).join("");
+  const btn = [...document.querySelectorAll('button[type="submit"], button')]
+    .find((b) => /submit application|submit$/i.test(String(b.textContent || "").replace(/\s+/g, " ").trim())) || null;
+  return {
+    ok: readBack === chars.join(""),
+    matches: readBack === chars.join(""),
+    len: readBack.length,
+    // Per-box occupancy, so a partial write says WHERE it stopped without ever naming a character.
+    perBox: boxes.map((b) => String(b.value || "").length),
+    // ⚠ THE WIDGET'S OWN ACCEPTANCE SIGNAL. The button is disabled until every box holds a
+    // character, so `submitDisabled:false` is the page agreeing the code is complete — a free
+    // read-back gate of exactly the kind the safety contract asks for, and stronger than our own
+    // string compare because it is the form's judgement rather than ours.
+    submitDisabled: btn ? (btn.disabled || btn.getAttribute("aria-disabled") === "true") : null,
+  };
 }
 
 // Validation errors after a refused submit — per-ATS error nodes + a generic fallback.
@@ -3014,6 +3536,17 @@ const ATS_POLL = {
   // dead-form state, and the remedy is the page refresh the run now performs — so waiting longer only
   // delays the fix. Was 20000, which cost ~20s per silent widget before the reload could help.
   search: 2000, searchCeil: 6000,
+  // ⚠ A MENU THAT HAS SETTLED ON SHOWING NOTHING IS AN ANSWER, AND IT ARRIVES EARLY (2026-08-25).
+  // Many of these widgets render no list until a query is typed — a places box, an async
+  // school/degree search — so the ordinary `open` deadline is spent waiting for something that
+  // cannot arrive. Spotted by the operator watching a run: the field sat FOCUSED AND IDLE for ~5s
+  // before a character was typed (1800ms of `open` plus two forced-toggle retries at 1500ms each).
+  // This is how long the widget's own subtree must have been STILL before an empty, mounted,
+  // not-loading menu is believed early. Deliberately a quiescence threshold rather than a shorter
+  // clock: a widget that is ABOUT to paint its options is still mutating, so a slow-painting list
+  // (the GitLab 3-option pick-one, misread as empty at 1.8s) keeps its full budget. The loading
+  // ceiling is untouched, and where the quiet watch is unavailable the rule simply never fires.
+  emptyQuietMs: 350,
   restore: 1200, restoreCeil: 3000, // clearing the query to report real options
   showing: 900, showingCeil: 3000,  // waiting for the option we are about to click
   loadingTick: 400,                 // poll interval WHILE the widget reports loading (see pollFor)
@@ -8000,6 +8533,69 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     }
   }
 
+  // ⚠ FILL THE GAP BEFORE MEASURING IT. Any choice record that still has nothing to offer gets one
+  // read-only open here, so an OPTIONAL field the fill skipped still reaches review as a real picker
+  // (operator, 2026-08-25 — see atsCaptureMissingOptions).
+  // NOT on a replay: a submit run's job is to verify approved values, and extra page contact before
+  // the gate is risk with no reviewer left to benefit from it.
+  if (!o.valueFor) {
+    try { await atsCaptureMissingOptions(act, ats, scan, results, (m) => console.log("[ApplyPilot]" + m)); }
+    catch (e) { /* diagnostic + convenience only — never fail a fill over it */ }
+  }
+
+  // ── ACCEPT CHECKBOXES, ON THIS PATH TOO (live 2026-08-31, IMC/Greenhouse) ──────────────
+  // The operator's 2026-08-18 instruction — tick ACCEPT boxes, never opt-ins or attestations —
+  // was wired only into the iCIMS and ORC PRE-FORM stages. GH / Lever / Ashby have no pre-form,
+  // so no consent was ever classified here and every accept box was simply left alone.
+  //
+  // Live consequence: an armed IMC submit was REFUSED by the form itself —
+  //   "You answered some demographic questions. Please accept the terms to proceed, or clear
+  //    your responses."
+  // The box is `gdpr_demographic_data_consent_given`, labelled "By checking this box, I consent
+  // to <company> collecting, storing, and processing my responses to the demographic data surveys
+  // above." — which `atsConsentKind` ALREADY classifies as "accept", with and without hints. So
+  // nothing about the authorised rule widens here; this path just starts asking the question.
+  //
+  // ⚠ ITS `required` PROPERTY IS FALSE. The box is CONDITIONALLY mandatory — only once a
+  // demographic question carries an answer — so neither the input nor the bundle's blocker check
+  // can see it, and the operator's approval gate passed an application the form would not take.
+  // That is the same shape as the Ashby heading-declared required-ness: required-ness is not
+  // always on the control.
+  //
+  // ⚠ RUNS ON THE REPLAY TOO, deliberately — unlike the option sweep above. A submit run must tick
+  // it or be refused, and the bundle cannot carry it: an optional consent is recorded unchecked by
+  // design ("an optional consent is the operator's to give"), so there is no approved value to
+  // replay. The action is the same authorised one either way.
+  try {
+    const consents = [];
+    for (const f of (scan.fields || [])) {
+      if (!f || f.widgetType !== "checkbox") continue;
+      const kind = atsConsentKind(f.label, { id: f.fieldName, name: f.fieldName });
+      if (kind !== "accept") continue;
+      consents.push(f);
+    }
+    for (const f of consents) {
+      const t = await act.eval(atsInjTickConsent, f.inputSel).catch(() => null);
+      const ok = !!(t && t.ok && t.checked);
+      const rec = results.find((r) => r && r.fieldName === f.fieldName);
+      // AUDITABLE, NEVER SILENT — the instruction's own requirement: an acceptance made on the
+      // operator's behalf is logged BY NAME, with the notice's own words.
+      if (ok) console.log(`[ApplyPilot][ATS-CONSENT] ✔ ACCEPTED on your instruction: ${JSON.stringify(String(f.label || f.fieldName).slice(0, 160))}${t.already ? " (already ticked)" : ""}`);
+      else console.log(`[ApplyPilot][ATS-CONSENT] ⚠ could NOT tick: ${JSON.stringify(String(f.label || f.fieldName).slice(0, 160))} — left for the operator`);
+      if (rec) {
+        // A tick that did not take must never be reported as consent given.
+        rec.status = ok ? "filled" : "needs_review";
+        rec.after = ok ? true : null;
+        rec.verified = ok;
+        rec.flag = ok ? rec.flag : "consent-not-accepted";
+        rec.detail = ok
+          ? "accepted on your standing instruction (a data-processing / privacy notice)"
+          : "this acceptance could not be ticked — the form will refuse until it is";
+      }
+    }
+    if (consents.length) results.consents_accepted = consents.map((f) => String(f.label || f.fieldName).slice(0, 200));
+  } catch (e) { /* a consent we could not reach stays untouched — the submit gate still refuses */ }
+
   // DID EVERY CHOICE FIELD ACTUALLY REACH REVIEW AS A PICKER? The scan-time line above says what we
   // KNEW; this says what the operator will SEE, which is the thing that was asked for and the only
   // one worth measuring. A record with `options` renders a picker; one holding `captured_options`
@@ -8082,6 +8678,18 @@ function atsAiBatchKind(f) {
 // lesson: "No options" at 4ms, "Loading..." at 24ms, the real answer at 4049ms).
 async function atsOpenAndPollOptions(act, ref) {
   await act.eval(atsInjOpenAndReadOptions, ref.inputSel);
+  // ⚠ ONE PAGE-SIDE AWAIT INSTEAD OF N SW ROUND TRIPS — the same fix the location open got, applied
+  // where it turns out to matter just as much (measured 2026-09-01, Whatnot). This helper is what the
+  // AI-DEFER pass uses to read a combobox's options for the prompt, and on that tenant two required
+  // dropdowns cost 1935ms and 3521ms EACH doing it: their menus show nothing until a query is typed,
+  // so the loop below simply ran its full soft deadline before giving up. 94 paces on an 18-field
+  // form, against 29 on a 25-field one.
+  // The loop below is kept verbatim as the fallback (no in-page timers, an older build, a throw), so
+  // nothing depends on the waiter being available.
+  try {
+    const w = await act.eval(atsInjAwaitOptionsOrQuiet, ref.inputSel, ATS_POLL.emptyQuietMs, ATS_POLL.openCeil);
+    if (w && w.ok) return ((w.options) || []).filter((o) => !o.disabled).map((o) => o.text);
+  } catch (e) { /* fall through to the SW poll */ }
   const optDeadline = Date.now() + ATS_POLL.open;
   const optCeiling = Date.now() + ATS_POLL.openCeil;
   for (;;) {
@@ -9127,6 +9735,79 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile, valueFor) {
   return surfaced;
 }
 
+// ── AN OPTIONAL CHOICE FIELD MUST REACH REVIEW AS A REAL PICKER (operator, 2026-08-25) ─────────
+// The same requirement already recorded for iCIMS, now demanded of every ATS: a field we never
+// filled still has to be ANSWERABLE on the review page, and a picker with no options is just a
+// text box.
+//
+// ⚠ WHY IT WAS MISSING, AND WHY IT IS NOT A BUG IN THE OPTION READ. On Greenhouse/Lever/Ashby the
+// choice widget is a react-select, whose options do not exist in the DOM until it is OPENED — so the
+// scan legitimately reports `select 0/14`. Every list that DOES reach review got there because
+// something opened the widget: the deterministic commit, or the AI fallback. Both only run for a
+// field we are trying to ANSWER, and `atsOpenAndPollOptions` is called from exactly those paths. An
+// OPTIONAL, unmapped field is skipped in 0ms and therefore never opened by anyone. Measured on
+// Discord, three runs identical: `12 picker · 1 filter-or-type · 2 with no options at all, of 15`.
+//
+// So this is a LAST, READ-ONLY pass over the records that still have nothing to offer.
+//   • It never actuates. Open → read → close-confirmed, and the record's status/value are untouched.
+//   • ⚠ IT MUST CLOSE WITH `atsCloseComboConfirmed`, which gates on the options being GONE rather
+//     than on `aria-expanded`. A lingering portaled list is THE standing hazard in this codebase —
+//     every listbox renders at the same screen coordinates, and options stay clickable while
+//     unmounting, so a list left open strays the next field's click. That rule cost a full debugging
+//     round on Workday and applies verbatim here.
+//   • A list too long to be trustworthy is attached PARTIAL, not complete. `atsAttachOptions` already
+//     enforces that above ATS_OPTION_STORE_MAX, and the asymmetry is the safety property (iCIMS,
+//     2026-08-16): a picker MISSING the operator's answer makes them conclude the form does not offer
+//     it, while a complete list called partial only costs a typed value.
+//   • A widget that shows nothing until a query is typed (a places box) has no list to capture, and
+//     `pollFor`'s settled-empty rule means asking costs ~2 reads rather than a budget.
+async function atsCaptureMissingOptions(act, ats, scan, results, log) {
+  const say = typeof log === "function" ? log : () => {};
+  const need = [];
+  for (const rec of results || []) {
+    if (!rec || !ATS_CHOICE_REVIEW_WIDGETS.includes(rec.widgetType)) continue;
+    if ((rec.options || []).length || (rec.captured_options || []).length) continue;
+    // The deterministic pass already proved this one unreadable and said so in the record — asking
+    // again would pay the same budget to reach the same answer (the iCIMS `optionsUnreadable` rule).
+    if (rec.optionsUnreadable) continue;
+    const f = (scan.fields || []).find((x) => x.fieldName === rec.fieldName);
+    if (!f) continue;
+    // radio / yesno / checkbox groups carry their options ON the scan (they are real DOM already), so
+    // one with none has none — there is nothing an open could reveal.
+    if (!["select", "dial", "location", "icims_dropdown"].includes(f.widgetType)) continue;
+    need.push({ rec, f });
+  }
+  if (!need.length) return { scanned: 0, captured: 0 };
+
+  let captured = 0;
+  for (const { rec, f } of need) {
+    const ref = { inputSel: f.inputSel };
+    try {
+      let texts = [];
+      if (f.widgetType === "icims_dropdown") {
+        const o = await act.eval(atsInjIcimsOpen, ref.inputSel).catch(() => null);
+        texts = (o && o.ok && o.options) || [];
+        await act.eval(atsInjIcimsClose, ref.inputSel).catch(() => null);
+      } else {
+        texts = await atsOpenAndPollOptions(act, ref);
+        // ⚠ CLOSE-CONFIRMED, ALWAYS — see the note above. This is the one line that keeps a
+        // read-only pass from breaking the field AFTER it.
+        await atsCloseComboConfirmed(act, ref).catch(() => {});
+      }
+      if ((texts || []).length) {
+        atsAttachOptions(rec, texts, f.widgetType === "icims_dropdown" ? true : undefined);
+        captured++;
+        rec.detail = rec.detail
+          ? rec.detail + " — its choices were read for review"
+          : "not answered from your profile; its choices were read so you can pick one here";
+      }
+    } catch (e) { /* a field we could not read stays exactly as it was */ }
+  }
+  say(`[ATS-OPTIONS] optional-field sweep — opened ${need.length} unanswered picker(s) read-only, captured ${captured} list(s)`
+    + (need.length - captured ? `, ${need.length - captured} still have nothing to offer (a search-driven box shows nothing until typed)` : ""));
+  return { scanned: need.length, captured };
+}
+
 async function atsFinishFill(act, ats, scan, results, credentials, profile, jobContext, replay, valueFor, entryCounts) {
   // M40-lite AUDIT: one independent re-read after the page settles — a record must never
   // claim a value the page no longer holds (the false-verify class).
@@ -9268,6 +9949,10 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
   // reload once and try again, which is the same remedy a human applies.
   const deadAsync = results.filter((r) => r.listUnproven || /never answered our search|suggestions never loaded/i.test(String(r.detail || "")));
   return { url: scan.url, title: scan.title, results, counts, entryNotes, unclaimedNotes,
+    // ⚠ The SCAN travels with the result so the submit gate can do a FINAL live DOM read of each
+    // approved field (it needs inputSel + widgetType, which a result does not carry). Nothing else
+    // reads it; it is additive.
+    scan,
     deadAsync: deadAsync.map((r) => r.fieldName),
     needsReview: results.filter((r) => r.status === "needs_review" || r.status === "filled_review") };
 }
@@ -9628,6 +10313,28 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
   if (wt === "text" || wt === "textarea" || wt === "date") {
     if (textValue == null && candidates && candidates.length) textValue = candidates[0];
     if (textValue == null || String(textValue).trim() === "") return false;
+    // ⚠⚠ NEVER HAND A DATE PICKER A BARE ISO STRING — IT COMES BACK A DAY EARLY (live 2026-08-31).
+    // Ashby's Graduation Date is a react-datepicker. Written "2028-05-01" it rendered **"04/30/2028"**:
+    // the widget parses a bare `YYYY-MM-DD` as UTC midnight and renders it in LOCAL time, so every
+    // timezone west of UTC loses a day. The read-back gate caught it as a mismatch, which is the only
+    // reason this was ever seen — and it is why the tempting "fix" is the wrong one: comparing
+    // calendar dates loosely instead of strings would have made the gate PASS and shipped a
+    // graduation date that is silently one day wrong.
+    //
+    // So convert to the format the widget displays, by STRING SURGERY on the ISO parts — no `Date`
+    // anywhere, because constructing one is the very thing that introduces the offset. A month-only
+    // value (`YYYY-MM`, the profile's usual precision) is deliberately NOT converted: inventing a day
+    // is a factual claim, and the existing mismatch → needs_review is the honest outcome there.
+    //
+    // ⚠ Still `filled_review` + `date-format-unverified` afterwards, as every date already is. We
+    // know the widget DISPLAYS MM/DD/YYYY (it just demonstrated that), but not that it INTERPRETS a
+    // typed value that way — a DD/MM tenant would keep our literal text and read it back unchanged,
+    // so the read-back cannot tell those apart. A human confirming the date is the right gate for a
+    // claim like this.
+    if (wt === "date") {
+      const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(textValue).trim());
+      if (iso) textValue = iso[2] + "/" + iso[3] + "/" + iso[1];
+    }
     rec.resolved = textValue;
     const r = await act.eval(atsInjSetText, ref.inputSel, String(textValue));
     await act.delay(120);
@@ -9833,6 +10540,44 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         return { ok: true, got, stuck: atsLib.normalize(got) === atsLib.normalize(String(text)) };
       } catch (e) { return null; }
     };
+    // ⚠ THE WHOLE STRING IN ONE TRUSTED COMMAND. `Input.insertText` produces a genuine
+    // beforeinput+input pair for the entire text at once — the browser's own text-insertion path,
+    // which is how a fast autofill extension drops a value in without a keystroke stream (the
+    // operator's observation of Simplify: "the entire word appears at once"). It is TRUSTED, so it
+    // is not the synthetic write this widget refused; it is the same class of event as typing,
+    // minus the per-character cost.
+    // Clearing is CONDITIONAL for the same reason trustedType's is: insertText inserts at the
+    // cursor, so a non-empty box must be cleared first or the query concatenates — but a fill types
+    // into a FRESH form, and the trusted select-all+delete measured 2148ms to remove nothing.
+    const typeInsert = async (text) => {
+      if (!act.typeText || !act.trustedFocus) return null;
+      try {
+        const how = await act.trustedFocus(ref.inputSel);
+        if (!how) return null;
+        const pre = await act.eval(atsInjReadComboInput, ref.inputSel);
+        if (pre && pre.ok && String(pre.value || "").length && act.clearText) await act.clearText();
+        // ⚠ BULK-INSERT THE HEAD, THEN ONE REAL KEYSTROKE FOR THE TAIL. Measured 2026-08-25: a pure
+        // `Input.insertText` of the whole word lands the text in 218ms (vs 8373ms of per-char
+        // typing) and the widget then returns **0 options** — a trusted INPUT event is not what it
+        // watches for; it wants a KEY event. But it only needs ONE: the last character's keydown
+        // fires the search, and by then the other ten are already in the box.
+        // So the cost model becomes insertText + 1 keystroke instead of N keystrokes, and the
+        // search still sees the complete query. A one-character value skips the bulk step entirely.
+        const s = String(text);
+        const head = s.length > 1 ? s.slice(0, -1) : "";
+        const tail = s.length > 1 ? s.slice(-1) : s;
+        if (head) await act.typeText(head);
+        if (act.typeKeys) await act.typeKeys(tail);
+        else await act.typeText(tail);   // no key-event capability ⇒ the read-back below will fail us out
+        await act.delay(120);
+        const st = await act.eval(atsInjReadComboInput, ref.inputSel);
+        const got = st && st.ok ? String(st.value || "") : "";
+        // A read-back that does NOT hold what we asked for is a failed write, and the caller falls
+        // through to the proven per-char path rather than polling for options that cannot come.
+        if (atsLib.normalize(got) !== atsLib.normalize(String(text))) return null;
+        return { ok: true, got, stuck: true, how };
+      } catch (e) { return null; }
+    };
     const typeInto = async (text) => {
       await act.eval(atsInjTypeInCombo, ref.inputSel, "");
       await act.delay(250);   // adaptive — the read-back below is the real gate
@@ -9900,6 +10645,18 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         //     is only believed once the SAME empty read repeats with the menu present.
         const emptyNow = !!(r && Array.isArray(r.options) && !r.options.length);
         const settledEmpty = emptyNow && !!(r && r.open) && sawEmptyMounted;
+        // Is this a menu that has SETTLED on showing nothing? Only asked when the cheap signals
+        // already agree (mounted + not loading + a repeated empty read), so a healthy widget never
+        // pays for the extra probe — and only BEFORE the deadline, since after it the ordinary
+        // rules below already reach the same verdict.
+        let earlyEmptyStop = false;
+        if (settledEmpty && !loading && now < deadline && act.quietRead) {
+          try {
+            const q = await act.quietRead(ref.inputSel);
+            const idle = q && q.ok ? q.idleMs : null;
+            if (idle != null && idle >= ATS_POLL.emptyQuietMs) { earlyEmptyStop = true; quietIdleMs = idle; }
+          } catch (e) { /* watch unavailable ⇒ fall through to the deadline, unchanged */ }
+        }
         if (emptyNow && r && r.open) { sawEmptyMounted = true; sawMounted = true; }
         else if (r && r.open) sawMounted = true;
         // Not every kind of "nothing yet" is progress, and the difference is worth ms:
@@ -9911,6 +10668,27 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         //     A brief grace, then stop: an absent menu is not evidence of anything to come.
         let why = "soft";
         const stop = (() => {
+          // ⚠ AN ANSWER IS AN ANSWER BEFORE THE DEADLINE TOO (generic, 2026-08-25).
+          // Everything below already knows how to recognise "mounted, not loading, confirmed
+          // empty" — but it could never SAY so early, because the soft deadline short-circuited
+          // first. So every widget whose menu legitimately renders nothing until a query is typed
+          // paid the full `open` beat (1800ms) plus two forced-toggle retries, waiting for a list
+          // that cannot exist. That was first patched per-field for the location box; this is the
+          // same finding stated once, for every widget, which is where it belonged.
+          //
+          // The evidence required is deliberately stronger than "it looks empty":
+          //   • the menu is MOUNTED (r.open) — we are looking at a real widget, not a missed click;
+          //   • it is NOT loading — the widget is not telling us a fetch is in flight;
+          //   • the SAME empty-mounted read has repeated (settledEmpty) — a react-select paints its
+          //     list a beat after the open click, and one empty frame is not an answer;
+          //   • and the page's own QUIESCENCE WATCH says the subtree has stopped mutating.
+          // That last one is what makes this safe rather than merely fast, and it is why this asks
+          // the PAGE instead of shortening a clock: a widget that is ABOUT to paint its options is
+          // still mutating, and a slow-painting list (the GitLab 3-option pick-one, misread as
+          // empty at 1.8s on 2026-08-05) keeps its full budget because it is either loading or not
+          // yet quiet. When the watch is unavailable this rule simply never fires and the old
+          // deadline behaviour stands.
+          if (earlyEmptyStop) { why = "empty-mounted-quiet"; return true; }
           if (now < deadline) return false;
           if (loading) { why = "loading-ceiling"; return now >= hardDeadline; }
           if (emptyNow && r && r.open) { why = "empty-mounted"; return settledEmpty || now >= hardDeadline; }
@@ -9974,12 +10752,58 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // baseline by the time the poll needs it. Best effort: without it the poll falls back to
     // read latency.
     if (act.quietInstall) { try { await act.quietInstall(ref.inputSel); } catch (e) { /* fallback */ } }
+    const openPhaseT0 = Date.now();
     let opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, false);
-    let read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil);
+    // No per-widget deadline here any more: `pollFor` now returns as soon as the PAGE says the menu
+    // has settled on showing nothing (mounted + not loading + repeated empty + quiet), which covers
+    // a places box, an async school/degree search and any tenant widget of the same shape without
+    // naming any of them. See the early-stop note in pollFor.
+    // ⚠⚠ THE OPEN WAIT HAPPENS IN THE PAGE, NOT IN THE WORKER (operator, 2026-09-01 — model it on
+    // iCIMS). Measured on this exact field: `open` 8.9/11.5/16.4/21.2/21.3s across five runs, always
+    // past its own 6s ceiling, because each 150ms SW sleep in the poll below cost 4956ms and 9551ms
+    // (`sw-starved`). Typing beside it was 82ms. One page-side await replaces N starved ones.
+    // The FALLBACK is the old poll, unchanged — used when the waiter cannot run (no in-page timers,
+    // an older build, a throw), so nothing depends on the new path being available.
+    let read = null;
+    let openWhy = null;
+    try {
+      const w = await act.eval(atsInjAwaitOptionsOrQuiet, ref.inputSel, ATS_POLL.emptyQuietMs, ATS_POLL.openCeil);
+      if (w && w.ok) { read = w; openWhy = w.why; }
+    } catch (e) { read = null; }
+    if (!read) { read = await pollFor(ATS_POLL.open, (t) => t.length > 0, ATS_POLL.openCeil); openWhy = "sw-poll"; }
     // Two FORCED toggles if nothing rendered: aria-expanded can be stale-true (a phantom-open
     // menu), so one forced click closes it and the next opens for real. Each attempt flips the
     // state, so two cover both "the click missed" and "it lied about being open".
-    for (let attempt = 0; attempt < 2 && !optsOf(read).length; attempt++) {
+    // ⚠ TOGGLE ONLY WHEN THE MENU NEVER APPEARED — evidence, not a field name (generic, 2026-08-25).
+    // These toggles exist for a click that MISSED or an `aria-expanded` that lied. A menu we watched
+    // MOUNT and settle on empty is neither: it is a widget that legitimately has nothing to show
+    // until a query is typed, so the toggles cost ~3s to re-confirm what we already know. Worse,
+    // each attempt FLIPS the menu, so an odd number of clicks leaves it CLOSED — precisely the state
+    // the search path below carries a documented recovery for ("a query only filters a menu that is
+    // OPEN"). Not spending the clicks beats recovering from them.
+    // `read.open` is the positive evidence the widget mounted; the typed search immediately after is
+    // the real test of whether it answers.
+    const menuMounted = !!(read && read.open);
+    // ⚠⚠ A PROVEN "NO MENU" IS ALSO NOT A MISSED CLICK (measured 2026-09-01). The guard above only
+    // skipped the toggles for a menu that MOUNTED and settled empty, so a query-only location box —
+    // which mounts nothing at all until you type — still paid two forced re-opens plus their 1500ms
+    // polls. Measured: with the waiter itself down to 60ms, the open phase was STILL 5.6s, and this
+    // was all of it. The same reasoning the note above gives applies unchanged: the typed search
+    // immediately after is the real test of whether the widget answers, and each toggle FLIPS the
+    // menu, so an odd number leaves it closed.
+    // ⚠ THE GATE IS "ARE WE ABOUT TO TYPE?", NOT A WIDGET NAME (generalised 2026-09-01, Whatnot).
+    // First cut said `wt === "location"`, which left Whatnot's graduation-month / graduation-year /
+    // university autocompletes paying `open 7050ms (0 opt on open)` each — the same widget class as
+    // the location box, reached by a different route, so the same 5.6s waste under another name.
+    // Naming widgets is what made this a three-round bug in the first place.
+    //
+    // With CANDIDATES in hand the search arm below types them, and typing is both the real test of
+    // whether the widget answers AND its own recovery for a missed open click (the typing path takes
+    // a `trustedFocus` that re-clicks the control). With NO candidates there is nothing to type, so
+    // reading the list is the only hope left and the toggles keep earning their cost.
+    const provenNoMenu = openWhy === "no-menu" && !!(candidates && candidates.length);
+    const forceToggles = (menuMounted || provenNoMenu) ? 0 : 2;
+    for (let attempt = 0; attempt < forceToggles && !optsOf(read).length; attempt++) {
       opened = await act.eval(atsInjOpenAndReadOptions, ref.inputSel, true);
       read = await pollFor(ATS_POLL.retry, (t) => t.length > 0, ATS_POLL.retryCeil);
     }
@@ -9988,6 +10812,7 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // answers it with a THREE-option pick-one already rendered on open. Typing a city there waits
     // out a suggestion service that will never respond and reports "places never loaded" on a
     // field that was answerable all along. A short list that is already showing IS the option set.
+    const openPhaseMs = Date.now() - openPhaseT0;
     const preOpts = optsOf(read);
     const locIsPickOne = wt === "location" && preOpts.length > 0 && preOpts.length <= ATS_LOC_PICKONE_MAX && hasHit(preOpts);
     // WHICH candidate the places list actually answered — the pick has to judge what we ASKED for.
@@ -10009,8 +10834,68 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // the same query answers in ~1s — and after ONE trusted click, SYNTHETIC typing drives it fine
       // (traced both ways, 2026-08-06). So the trust is needed for the click, not the keystrokes.
       const city = String(candidates[0]).split(",")[0];
-      if (!(await typeTrusted(city))) await typeInto(city);
+      // ⚠ ATTRIBUTE THE WAIT, DON'T GUESS AT IT. This field is the single largest non-LLM cost on a
+      // Greenhouse fill (7.1–20.3s across runs, docs/fill-speed-log.md) and a bare total cannot say
+      // whether that is the trusted focus click, the per-char typing, or the widget's own lookup —
+      // which need completely different fixes. Three clocks, logged only when the field is actually
+      // slow so a healthy one stays quiet.
+      // ⚠ SYNTHETIC TYPING HERE WAS TESTED LIVE AND REFUTED — DO NOT RE-TRY IT (2026-08-25).
+      // The hypothesis was reasonable and came from two directions at once: the note above ends "the
+      // trust is needed for the CLICK, not the keystrokes", and the operator observed that Chrome's
+      // own autofill drops text into this box and the suggestions appear — autofill being no stream
+      // of real keystrokes. So `atsLocSyntheticType` was added to measure the cheap arm (trusted
+      // click to wake the widget, then ONE synthetic write) against the default.
+      //
+      // The arm APPEARED to work — the field committed "Tallahassee, Florida, United States" and the
+      // log showed 2 options — and that reading was WRONG. The operator was watching the tab and
+      // clicked into the box while it sat there; the options appeared because of THAT CLICK. The 5131ms
+      // "lookup" is the human, not the widget. A synthetic write leaves the suggestion service asleep
+      // exactly as the 2026-08-06 note says, and the same run's school box (Carnegie Mellon) succeeded
+      // only because school still went through the trusted path.
+      // ⚠ THE TELL WOULD HAVE BEEN INVISIBLE IN A HEADLESS MEASUREMENT: a contaminated arm that
+      // "passes" is indistinguishable from a real one in the log. Keep the flag for future
+      // experiments, keep the default TRUSTED, and re-test only with someone watching the tab and NOT
+      // touching it.
+      // Where the time ACTUALLY goes (measured, same field, same posting): focus(click) 3377ms ·
+      // clear 2148ms · type 1972ms, against a lookup of **2ms**. The suggestion service is instant;
+      // the cost is our own trusted input plus SW timer drift. See docs/fill-speed-log.md round 14.
+      const locT0 = Date.now();
+      let locArm = "trusted-perchar";
+      if (act.locSyntheticType) {
+        const how = act.trustedFocus ? await act.trustedFocus(ref.inputSel) : null;
+        try { console.log(`[ApplyPilot][ATS-LOC] SYNTHETIC-TYPE arm (REFUTED — see the note above): woke with a trusted ${how || "FAILED"}, typing synthetically`); } catch (e) { /* log only */ }
+        await typeInto(city);
+        locArm = "synthetic";
+      } else if (act.fastComboType && (await typeInsert(city))) {
+        // ONE trusted command for the whole string. Falls through to the per-char path on ANY
+        // failure (no read-back match, no focus, missing capability) — the proven path stays the
+        // safety net, because a REQUIRED field going unanswered costs far more than the keystrokes.
+        locArm = "insertText";
+      } else if (!(await typeTrusted(city))) await typeInto(city);
+      const locTypedMs = Date.now() - locT0;
+      const locPollT0 = Date.now();
       read = await pollFor(6000, (t) => t.length > 0); // the widget's own lookup — real network time
+      let locLookupMs = Date.now() - locPollT0;
+      // ⚠ THE FAST ARM MUST HEAL ITSELF, NOT JUST REPORT. A read-back match only proves the TEXT
+      // landed; it says nothing about whether the widget SEARCHED. Live 2026-08-25 the pure-insert
+      // arm passed its read-back and then returned 0 options, and the field went to review as
+      // "suggestions never loaded" — a REQUIRED field unanswered on a form where the proven path
+      // works. So an empty menu after the fast arm re-runs the per-char path before we believe it.
+      // Costs one wasted lookup on a widget that genuinely has nothing; saves the field otherwise.
+      if (locArm === "insertText" && !optsOf(read).length) {
+        try { console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName}: insertText produced NO options — falling back to per-char typing`); } catch (e) { /* log only */ }
+        if (!(await typeTrusted(city))) await typeInto(city);
+        locArm = "insertText→trusted";
+        const reT0 = Date.now();
+        read = await pollFor(6000, (t) => t.length > 0);
+        locLookupMs += Date.now() - reT0;
+      }
+      // ALWAYS logged for a places box now: the open phase is the term that was invisible, and a
+      // threshold that hides the healthy case also hides the proof that it stayed healthy.
+      try {
+        console.log(`[ApplyPilot][ATS-LOC] ${f.fieldName} [${locArm}]: open ${openPhaseMs}ms (${openWhy || "?"}) · typed ${JSON.stringify(city)} (${city.length} chars) in ${locTypedMs}ms · lookup ${locLookupMs}ms → ${optsOf(read).length} option(s)` +
+          ` — pre-commit total ${openPhaseMs + locTypedMs + locLookupMs}ms`);
+      } catch (e) { /* log only */ }
       // A BOX LABELLED "Location" IS NOT ALWAYS A CITY BOX (2026-08-07). ElevenLabs labels one
       // "Location" and describes it "Country you're currently residing in" — a COUNTRY list, where
       // "Pittsburgh" matches nothing. We typed the city, read an empty menu, and reported "the form's
@@ -10069,9 +10954,47 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
         // resolving — when everything they have seen is synthetic: live 2026-08-06 the school box sat
         // `loading` for 19.2s and the location box showed nothing for 21.6s, while by hand each
         // answered in about a second. Once woken, ordinary synthetic typing drives them.
-        const typed = (await typeTrusted(query)) || (await typeInto(query)); didSearch = true; optionsFiltered = true;
+        // ⚠ SAME HEAD+1-KEYSTROKE WRITE AS THE LOCATION BOX (2026-08-25). School / degree /
+        // discipline are the SAME class of widget — Greenhouse's async comboboxes — and after the
+        // location work `school--0` became the slowest field on these forms, typing 15 chars
+        // ("Carnegie Mellon") at ~95ms/char visible and ~197ms/char hidden. The interaction shape is
+        // unchanged: `typeTrusted` already issued a trusted focus CLICK before typing, so this
+        // swaps only HOW the characters arrive, not whether the widget is woken.
+        const searchT0 = Date.now();
+        let searchArm = "trusted-perchar";
+        let typed = null;
+        // ⚠ THE FAST WRITE IS USED ONLY WHERE ITS SUCCESS IS CHEAPLY VERIFIABLE — and the widget
+        // tells us which kind it is, so no field is named here (generic, 2026-08-25).
+        //
+        // A menu that showed NOTHING on open is a query-only widget (a places box). There, "options
+        // appeared" is an unambiguous success signal, so a failed fast write is detected in one
+        // settled-empty read and costs almost nothing.
+        //
+        // A menu that ALREADY LISTS options on open is a different animal — measured live:
+        // `school--0: open 2454ms (100 opt on open)`. We cannot cheaply tell "the search fired and
+        // filtered the list" from "nothing happened and these are the stale defaults", so a failed
+        // fast write is only discovered after a full search budget. Live, that turned school from
+        // ~3.4s into 8.4s: the fast path is a REGRESSION on exactly the widget that has the most to
+        // lose. So a widget that arrives with a list keeps the per-char typing it was proven with.
+        const fastWriteVerifiable = preOpts.length === 0;
+        if (act.fastComboType && fastWriteVerifiable) { typed = await typeInsert(query); if (typed) searchArm = "insertText"; }
+        if (!typed) typed = (await typeTrusted(query)) || (await typeInto(query));
+        didSearch = true; optionsFiltered = true;
         const wantHit = (t) => t.length > 0 && hasHit(t);
         let found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
+        // ⚠ OPTIONS-BASED FALLBACK, NOT VALUE-BASED — the lesson the location box paid for. A
+        // read-back match only proves the TEXT landed; a widget that never SEARCHED reports exactly
+        // the same thing, and the field then reaches review unanswered. An empty menu re-runs the
+        // proven per-char path before anything is believed.
+        if (searchArm === "insertText" && !optsOf(found).length) {
+          try { console.log(`[ApplyPilot][ATS-SEARCH] ${f.fieldName}: insertText produced NO options — falling back to per-char typing`); } catch (e) { /* log only */ }
+          if (!(await typeTrusted(query))) await typeInto(query);
+          searchArm = "insertText→trusted";
+          found = await pollFor(ATS_POLL.search, wantHit, ATS_POLL.searchCeil);
+        }
+        try {
+          console.log(`[ApplyPilot][ATS-SEARCH] ${f.fieldName} [${searchArm}]: open ${openPhaseMs}ms (${preOpts.length} opt on open) · query ${JSON.stringify(query)} (${query.length} chars) → ${optsOf(found).length} option(s) in ${Date.now() - searchT0}ms`);
+        } catch (e) { /* log only */ }
         // A query only filters a menu that is OPEN. The forced-toggle recovery above can leave
         // it CLOSED (two clicks = shut), and then the text lands in the input while the widget
         // shows nothing — live 2026-07-31 this read as "the value isn't in the list" with
@@ -10309,7 +11232,25 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     // plain select (no route → no dial override) and must accept the "+1" chip for the
     // committed "United States +1" too. A non-empty display CONTAINED in the option we
     // clicked is still strong evidence of the right commit (a wrong option isn't a superstring).
-    const okv = backNorm === wantNorm || (backNorm && wantNorm.includes(backNorm)) || (wt === "location" && !!backNorm);
+    // ⚠⚠ AFTER A SEARCH, THE VALUE READ-BACK IS VACUOUS — REQUIRE POSITIVE SELECTION EVIDENCE
+    // (live 2026-09-01, Whatnot). Everything below compares the input's text to the option we meant
+    // to pick, and once we have TYPED A QUERY INTO THAT BOX the text is ours, not the widget's. So a
+    // click that never registered still read back as a perfect match: "Please select your graduation
+    // year" committed `exact-normalized` from `query "2028" → 1 option`, passed the pre-submit DOM
+    // read, and the form refused the submit with "Missing entry for required field". The field was
+    // genuinely empty; the check was what was wrong.
+    //
+    // ⚠ It hid behind the one widget that reads correctly: a places box commits
+    // "Tallahassee, Florida, United States" for the query "Tallahassee", so the value becoming
+    // something we did NOT type is real evidence there. The vacuous case is exactly when the option
+    // text equals the query — a year, a month, any short exact value.
+    //
+    // `menuGone` is the widget's own evidence (a committed option closes the menu and unmounts its
+    // rows). Only `false` counts against us: `null` means we could not tell, and treating "unknown"
+    // as failure would block submits that should pass — the direction that costs a real application.
+    const selectionProven = !didSearch || (c && c.menuGone !== false);
+    const okv = (backNorm === wantNorm || (backNorm && wantNorm.includes(backNorm)) || (wt === "location" && !!backNorm))
+      && selectionProven;
     if (c && c.ok && okv) {
       rec.status = atsTierIsDeterministic(hit.tier) ? "filled" : "filled_review";
       rec.matchTier = hit.tier; rec.verified = true;
@@ -10324,9 +11265,16 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       // Distinguish the two failures: the click never found its option (a LIST problem) vs the
       // click landed and the value did not stick (a COMMIT problem). Reporting the first as the
       // second sent three investigations after the wrong thing.
-      rec.detail = c && c.ok
-        ? "commit did not persist (read " + JSON.stringify(rec.after) + " wanted " + JSON.stringify(commitText) + ")"
-        : "could not click " + JSON.stringify(commitText) + " — " + ((c && c.error) || "no result") + " (the menu was not showing it)";
+      // ⚠ THREE failures now, not two. The third is the one that sank a live submit: the option was
+      // found and clicked, the box even reads the wanted text — but the MENU IS STILL OPEN, so
+      // nothing was selected and the text is only the query we typed. Naming it separately is the
+      // whole point: reported as "commit did not persist" it looks like a value problem, and the
+      // value is perfect.
+      rec.detail = (c && c.ok && !selectionProven)
+        ? "the option was clicked but the menu stayed open, so nothing was selected — the box only holds the text we typed"
+        : c && c.ok
+          ? "commit did not persist (read " + JSON.stringify(rec.after) + " wanted " + JSON.stringify(commitText) + ")"
+          : "could not click " + JSON.stringify(commitText) + " — " + ((c && c.error) || "no result") + " (the menu was not showing it)";
       await act.eval(atsInjCloseCombo, ref.inputSel);
     }
     return true;
@@ -10358,6 +11306,71 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
     rec.status = okv ? (m.matchTier === "exact-normalized" ? "filled" : "filled_review") : "needs_review";
     rec.matchTier = m.matchTier; rec.verified = okv;
     if (!okv) rec.detail = "native select commit failed";
+    return true;
+  }
+
+  // ⚠⚠ A REPLAYED CHECKBOX GROUP CAN CARRY SEVERAL ANSWERS, AND ONLY THE FIRST WAS EVER TICKED
+  // (live 2026-08-31, Notion). `current_value` for a group is the joined display, and the replay
+  // already splits it back into its set — but the split then went through `matchCandidates`, which
+  // treats a candidate list as a TIERED PREFERENCE ("most specific first, stop at the first hit")
+  // and commits exactly ONE. So an operator who ticked five engineering disciplines on the review
+  // page got "Product" on the form and nothing else, and an operator who added New York alongside
+  // San Francisco got San Francisco alone.
+  //
+  // It was invisible: the one option we did tick read back correctly, so the field was `filled`,
+  // the post-fill audit matched (it compares the page to what the replay WROTE), and the strict
+  // verify passed. Only the pre-submit read against the APPROVED value catches it — which is how
+  // this was found, on that check's first live run.
+  //
+  // `multiselect_native` has always done this correctly (N independent matches → tick them all);
+  // this gives the checkbox group the same treatment.
+  //
+  // ⚠ REPLAY ONLY, and that scope is the safety property, not caution. On a REPLAY the candidate
+  // list came from splitting a group value, so every entry IS an answer. On a FILL the list is a
+  // tiered LADDER of alternative phrasings for ONE answer — `selfIdDisabilityCandidates` yields
+  // ["No, I do not have a disability…", "No"] — and ticking every match there would put two boxes
+  // on a self-ID question the operator answered once. Same list shape, opposite meaning; only the
+  // caller knows which, and it already tells us.
+  if (wt === "checkbox_group" && mopts && mopts.replay && candidates && candidates.length > 1) {
+    rec.resolved = candidates;
+    const texts = (f.options || []).slice();
+    // Each approved answer runs the ORDINARY ladder against the live options, so nothing is ticked
+    // that the form did not offer — the same rule the native multi-select path states.
+    const picks = [];
+    for (const c of candidates) {
+      const m = atsLib.matchCandidates([c], texts, { containment: allowContainment });
+      if (m && m.targetIndex >= 0 && picks.indexOf(texts[m.targetIndex]) === -1) picks.push(texts[m.targetIndex]);
+    }
+    atsAttachOptions(rec, texts);
+    if (!picks.length) { rec.detail = "none of " + candidates.length + " approved answer(s) matched " + texts.length + " option(s)"; return false; }
+    for (const p of picks) { await act.eval(atsInjCheckOption, ref.inputSel, p, true); await act.delay(90); }
+    await act.delay(150);
+    const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
+    // ⚠ DO NOT SPLIT THE READ-BACK ON ITS SEPARATOR — AN OPTION CAN CONTAIN ONE. atsInjReadValue
+    // joins a group with ", " and this form's options are "New York, NY" / "San Francisco, CA", so
+    // splitting on commas yielded ["New York","NY","San Francisco","CA"] and NOTHING matched: the
+    // first version of this branch reported "only 0 of 2 approved answer(s) stuck" on a form that
+    // had ticked both. (The engineering-role group passed in the same run precisely because its
+    // options carry no commas — which is what identified the fault.) Containment against the whole
+    // joined string needs no separator vocabulary at all.
+    const liveJoined = atsLib.normalize(back && back.ok ? String(back.value == null ? "" : back.value) : "");
+    // EVERY approved answer must be on the form — a shorter selection than the operator chose is a
+    // DIFFERENT answer, which is the whole reason this branch exists.
+    const missing = picks.filter((p) => !liveJoined.includes(atsLib.normalize(p)));
+    rec.after = back && back.ok ? back.value : null;
+    rec.selected_options = picks;
+    rec.verified = missing.length === 0;
+    rec.status = missing.length === 0 ? "filled" : "needs_review";
+    rec.matchTier = "exact-normalized";
+    if (missing.length) rec.detail = "only " + (picks.length - missing.length) + " of " + picks.length
+      + " approved answer(s) stuck — missing " + missing.map((x) => JSON.stringify(x)).join(", ");
+    // A stored answer this form does not offer is REPORTED, never dropped in silence.
+    const unoffered = candidates.filter((c) => !picks.some((p) => atsLib.normalize(p) === atsLib.normalize(c)));
+    if (!missing.length && unoffered.length) {
+      rec.status = "filled_review"; rec.flag = rec.flag || "partial-multiselect";
+      rec.detail = "ticked " + picks.length + " of your " + candidates.length
+        + " answers — this form does not offer " + unoffered.join(", ");
+    }
     return true;
   }
 
@@ -10711,7 +11724,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjLeanSignature,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
-    atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch,
+    atsSameOptionSet, atsOpenAndPollOptions, atsCloseComboConfirmed, atsRunAiBatch, atsCaptureMissingOptions,
     ATS_REDIRECT_STRONG_RE, atsPickRedirectAnchor, atsInjDetectRedirect,
     atsInjFindApplyLinks, atsPickApplyLink, atsInjClickApplyButton,
     atsInjPortalEvidence, atsPortalAts, atsInjPageSignature, atsSignatureChanged, atsInjClickApplyAnchor,
@@ -10733,8 +11746,9 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsEducationAnswer, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
+    atsInjEmailVerifyState, atsInjFillEmailCode,
   };
 }

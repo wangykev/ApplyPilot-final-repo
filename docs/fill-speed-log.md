@@ -2723,3 +2723,456 @@ keep-warm beat. ⚠ **Round 24's "it's ORC's renderer" is refuted by that 2ms pr
 avoidance of a ~700ms re-open, and no observable predicts which pair will need it. A constant is the
 right shape here — the thing to avoid is a constant nobody measured, and this one now has four runs
 behind it.
+
+## Round 14 (2026-08-25) — Greenhouse `candidate-location`: the lookup is 2ms; the cost is OUR input
+
+Raised by the operator watching a fill: *"the location for greenhouse fills too slowly… it hovered in the
+location box for a while before it typed Tallahassee."* This field has been the largest non-LLM cost on a
+Greenhouse fill since round 5 (**7.1–20.3s** across runs) and had never been broken down — a bare total
+cannot separate the focus click, the per-char typing, and the widget's own lookup, and each wants a
+different fix.
+
+### Measured (Discord `8625545002`, `#candidate-location`, city = "Tallahassee")
+
+```
+trustedType "#candidate-location" (11 chars): focus(click) 3377ms · clear 2148ms · type 1972ms — total 7497ms
+ATS-LOC candidate-location: typed "Tallahassee" (11 chars) in 8373ms · lookup 2ms → 2 option(s)
+```
+
+**The suggestion service answered in 2ms.** Every prior theory about this field — a slow places service, a
+dead `google.maps`, a third-party lookup needing a generous ceiling — is looking in the wrong place. The
+budget (`pollFor(6000, …)`, the one call site that passes a hardcoded soft deadline instead of
+`ATS_POLL.search`) is almost never the thing being spent. What is spent is **our own trusted input**, in
+three phases that were previously invisible because only their sum was logged.
+
+Per-char typing cost, both visibility arms: **~92ms/char visible, ~197ms/char hidden.**
+⚠ This is the one place on an ATS form where hidden-vs-visible matters. The standing rule — "all three
+ATSs commit from synthetic events, so visible and hidden runs are IDENTICAL" — holds for every other
+widget, and this widget is the documented trusted-input exception, so it re-imports the hidden-tab penalty
+the rest of the path is free of. Do not compare location timings across arms without checking the paint
+label.
+
+### ⚠ SYNTHETIC TYPING WAS TESTED AND REFUTED — and the refutation came from a human, not the log
+
+The hypothesis arrived from two directions: the code's own note ends *"the trust is needed for the CLICK,
+not the keystrokes"*, and the operator observed that **Chrome's autofill** drops text into this box and the
+suggestions appear — autofill being no stream of real keystrokes. `atsLocSyntheticType` was added to
+measure the cheap arm (trusted click to wake, then one synthetic write).
+
+**The arm appeared to pass**: the field committed `"Tallahassee, Florida, United States"`, the log showed
+2 options, and the run reported `filled · exact-normalized`. It was wrong. The operator was watching the
+tab and **clicked into the box** while it sat there — *"tallahassee didn't work until I clicked into the
+box, but carnegie mellon worked"*. The 5131ms "lookup" in that arm is the human. Carnegie Mellon succeeded
+because the school box still went through the trusted path; only the location branch was switched.
+
+⚠ **A contaminated arm is indistinguishable from a real one in the log.** Nothing in the captured output
+said "a human clicked here" — the field filled, the tier was exact, the options were real. Had this been
+measured headless, or graded only on the log, synthetic typing would have shipped and every Greenhouse
+location field would have gone unanswered. The flag is kept (default OFF, trusted) so the experiment is
+repeatable; re-test only with someone watching the tab and **not touching it**.
+
+### The one change that IS supported: don't trust-clear an empty box
+
+`trustedType` opened with `cdpSelectAllDelete()` unconditionally — a trusted select-all plus a trusted
+delete, both frame-gated — on an input that is empty, because a fill types into a FRESH form. Measured at
+**2148ms**, ~29% of the field's whole input cost, spent removing nothing. A one-eval emptiness read
+(p50 ~1ms) now skips it: `clear 392ms (SKIPPED — box already empty)` on the next run's school box.
+
+It **fails safe**: only a positive, confident read of an empty value skips the clear; an unreadable
+element, a missing selector or any thrown error clears exactly as before. The failure it guards — a
+rewrite concatenating onto a stale value (`"old@x.comnew@y.com"`, the iCIMS credential bug) — costs far
+more than 2s.
+
+### ⚠ What this round does NOT claim
+
+`candidate-location` read 7.9s · 19.5s · 24.4s · 9.3s across four runs — but those spanned two builds, two
+visibility states and one contaminated arm, so **no total-improvement claim is made here.** Round 5's rule
+stands: fewer than ~3 runs per arm measures nothing on this field. What is established is the
+*attribution* (lookup 2ms; the cost is focus + clear + type, inflated by SW drift — 9 `PACE` overruns in
+one run, worst 400ms → 3587ms), and the clear-skip's own before/after.
+
+Remaining levers, largest first: the **3377ms trusted focus click** (it scrolls, waits for a stable rect,
+then issues a frame-gated click); SW timer drift on the pacing around it; and the keystroke count — taken
+up in round 15 below.
+
+## Round 15 (2026-08-25) — `Input.insertText` is 38× faster and DOES NOT WORK ALONE; one keystroke fixes it
+
+Prompted by the operator: *"simplify is able to fill the form quite fast. It also is able to fill it out
+without typing — the entire word appears at once."* Round 14 established the cost is our own input, so the
+question became: what is the cheapest thing that still makes this widget search?
+
+**The ATS path never had `Input.insertText` forwarded at all.** `makeCdpActuation` has exposed
+`typeText: cdpInsertText` since the Workday recon, but `makeAtsActuation` is a hand-built object and never
+copied it — so these comboboxes could only ever be typed the expensive way. (The same hand-built-object
+trap that previously hid `trustedFocus` and the quiescence watch.)
+
+### Arm 1 — pure `Input.insertText`: 38× faster, and the field FAILS
+
+```
+[insertText]: typed "Tallahassee" (11 chars) in 218ms · lookup 6020ms → 0 option(s)
+candidate-location → needs_review · typed-unverified · 25483ms
+```
+
+**218ms against 8373ms** — the whole word in one trusted command, exactly as described. And **0 options**:
+the widget did not search. `Input.insertText` produces a genuine trusted `beforeinput`+`input` pair, so
+this refutes the framing that had survived all of round 14 — it is not TRUST that this widget wants, and
+it is not the INPUT event either. It wants a **key** event.
+
+⚠ And it failed in the most dangerous way available: the read-back PASSED (the text was in the box), so
+the fast arm reported success and the field still reached review unanswered. **A read-back proves the text
+landed; it says nothing about whether the widget searched.** Any fast path here needs an
+options-based fallback, not a value-based one.
+
+### Arm 2 — insert the head, then ONE real keystroke for the tail
+
+The search fires on the last character's keydown, and by then the other ten are already in the box. So the
+cost model becomes `insertText + 1 keystroke` instead of N keystrokes, with the complete query visible to
+the search:
+
+```
+candidate-location → filled · exact-normalized · "Tallahassee, Florida, United States" · 7105ms
+[ATS-TIME] fill 25.5s / 26 fields — 983ms/field (VISIBLE) — slowest: candidate-location 7.1s
+```
+
+The `[ATS-LOC]` line is absent, which only happens under its 1500ms log threshold: type+lookup went from
+**8375ms to under 1.5s**. The arm is self-healing — an empty menu after the fast path re-runs the per-char
+path before anything is believed.
+
+### ⚠ …and the FIELD total barely moved: 7.9s → 7.1s
+
+That is the honest headline. Typing was 8.4s of an ~8s field-level cost and is now ~1.4s, yet the field
+still takes ~7s — so **the remaining time was never in the typing at all**, and round 14's own numbers
+(focus click 3377ms in one run, 23ms in another) say the next suspect is the focus/scroll/rect path and
+the SW pacing around it, not the keystrokes.
+
+Full-fill visible totals across this round: 26.5s (trusted) · 38.4s (pure insert, FAILED) · **25.5s
+(insert+1key)**. Against round 5's 7.1–20.3s spread for this one field, a 26.5→25.5s difference is inside
+the noise, and no speed claim is made from it.
+
+### Status: PROMOTED TO DEFAULT (see round 16 for the runs that earned it)
+
+`atsLocInsertText` now defaults **on**; setting it `false` is the kill-switch back to per-char typing.
+`typeText` / `typeKeys` / `clearText` are on the ATS actuation, so the other slow comboboxes (school,
+degree, discipline) can adopt the same head+1-keystroke shape — school is now the slowest field on these
+forms and is the obvious next candidate.
+
+## Round 16 (2026-08-25) — the 5s pause was a poll for options that CANNOT EXIST
+
+Round 15 ended with the field at ~7.1s and the typing already down to ~1.4s, i.e. an unexplained ~5s. The
+operator supplied the observation that closed it, from watching a run rather than reading a log:
+
+> *"in your last 7 second run you spent 5 seconds doing nothing — the field was focused, but nothing was
+> typed. it just paused for 5 seconds."*
+
+That is `atsActuateField`'s generic open-and-read-options step, which runs BEFORE the location branch:
+
+```js
+pollFor(ATS_POLL.open /* 1800 */, …)              // empty menu → burns the soft deadline
+for (2 forced toggles) pollFor(retry /* 1500 */)  // → +3000ms
+```
+
+≈ **4.8s**, and for a places box every millisecond of it is spent waiting for a list that **cannot render
+until something is typed**. The speed log has said "`location` is deliberately NOT pre-read" since round 6
+— that was true of the AI option-capture path, and quietly untrue of the actuation path.
+
+The two forced toggles are worse than merely slow: each attempt FLIPS the menu, so an odd number of clicks
+leaves it CLOSED — the exact state the search path below has a documented recovery for. Not spending the
+clicks beats recovering from them.
+
+**Fix:** `ATS_POLL.locOpen: 500` as the soft deadline for a location box, and the forced toggles skipped
+for it. ⚠ The CEILING is untouched, and that is what keeps the GitLab pick-one detection this read exists
+for: `pollFor`'s ceiling is a LOADING allowance, so a pick-one whose list is genuinely still fetching keeps
+its full budget. What shrank is only the wait on an idle, empty menu.
+
+### Measured — and then the hidden arm needed its own fix
+
+| arm | fill | `candidate-location` | split |
+|---|---|---|---|
+| baseline VISIBLE (round 14) | 26.5s | 7.9s | — |
+| baseline HIDDEN | 38.8s | 9.3s | — |
+| open-skip + insert+1key, VISIBLE | **15.9s** | **2.0s** | open 717 · typed 129 · lookup 857 |
+| open-skip + insert+1key, HIDDEN | 41s+ | 12.2s | open **9044** · typed 3004 · lookup 1 |
+| …+ fast-when-hidden, HIDDEN | **19.3s** | **3.4s** | open 609 · typed 2768 · lookup 4 |
+| second tenant (Cloudflare), HIDDEN | — | **3.7s** | open 857 · typed 1717 · lookup 975 |
+| **DEFAULT path, no flags set, HIDDEN** | 41.0s ⚠ | **1.1s** | open 588 · typed **77** · lookup 405 |
+
+⚠ That last fill total is **the LLM, not this path** — its slowest field was `question_37239553002` at
+**19.8s**, an AI-answered text question, while `candidate-location` was 1.1s. It is in the table as a
+reminder of the standing rule (subtract the `[LLM]` line before reading a fill total as a fill cost), not
+as a regression. Five runs across two tenants and both visibility arms now put this field at **1.1–3.7s**,
+every one `filled · exact-normalized`.
+
+⚠ **THE KILL-SWITCH IS NAMED FOR THE OLD BEHAVIOUR (`atsLocPerChar`) ON PURPOSE.** `AP_DEV_FLAG` cannot
+delete a key — it stores `!!value`, so "clearing" a flag writes FALSE. The first cut of this shipped as
+`atsLocInsertText:false` = kill-switch, which would have turned every profile that had ever cleared that
+flag into a permanently slow one, silently, with the log line saying it was deliberate. Absent must equal
+the default; only a positive-meaning flag survives a clear.
+
+The hidden row is the interesting one: a 500ms soft deadline still cost **9044ms**, because the deadline is
+spent through `act.delay` and hidden pacing charges full beats. **`cdpSetFastWhenHidden(true)` now applies
+to Greenhouse / Lever / Ashby too** — for a DIFFERENT reason than iCIMS, which needs it because it declined
+the timer polyfill. These three KEEP the polyfill, so the page's clock was already fast while OUR pacing
+was not; the two are independent axes and only the second was set. Latency-safe by the same argument, and
+more strongly here: actuation is page-side synthetic and every commit is read-back verified, so a pace that
+returns early costs a retry, never a silent wrong fill. Scoped per-run, so it cannot leak to Workday, whose
+trusted-input pacing this would NOT be safe for.
+
+Net: `candidate-location` **7.9s → 2.0s visible, 9.3s → 3.4s hidden**; whole fill **26.5s → 15.9s visible,
+38.8s → 19.3s hidden**. It is no longer the slowest field on the form — `school--0` is, and it still types
+per-char.
+
+### Round 17 (2026-08-25) — the same finding, stated ONCE, for every widget
+
+Operator: *"can you detect when you need to do this and make it more generic instead of hardcoding school
+picker and location picker."* Correct, and the generic form was already half-written.
+
+**`pollFor` could already recognise the condition and could never say so.** `stop()` opens with
+`if (now < deadline) return false`, so the `empty-mounted` verdict below it — mounted, not loading, empty
+confirmed by a repeat read — was unreachable before the soft deadline. Every query-only widget therefore
+paid the full `open` beat for a list that cannot exist. The `ATS_POLL.locOpen` hardcode from round 16 was
+that finding applied to one field.
+
+Now the poll stops early when the page's own **quiescence watch** reports the widget's subtree still for
+`emptyQuietMs` (350ms). ⚠ Quiescence rather than a shorter clock is the whole safety argument: a widget
+about to paint its options is still MUTATING, so the slow-painting pick-one keeps its budget, and the
+LOADING ceiling is untouched. Where the watch is unavailable the rule never fires and behaviour is
+byte-identical. Forced toggles likewise now key on evidence — `read.open` — instead of a field name.
+
+Live, hardcode REMOVED: `candidate-location open 395ms` (vs 1800ms before round 16, 588–717ms with the
+hardcode). The generic rule reproduces the win.
+
+### ⚠ …and applying the fast WRITE everywhere was a REGRESSION, caught by the fallback
+
+Extending `insertText`+1-keystroke to the by-name search path (school / degree / discipline) looked
+obviously right and was wrong:
+
+```
+[ATS-SEARCH] school--0: insertText produced NO options — falling back to per-char typing
+[ATS-SEARCH] school--0 [insertText→trusted]: open 2454ms (100 opt on open) · query "Carnegie Mellon" → 1 option(s) in 4790ms
+slowest: school--0 8.4s     ← was ~3.4s
+```
+
+The options-based fallback did its job (the field still filled), but the wasted attempt cost school ~2s
+and it became the slowest field on the form.
+
+**Why it works on one and not the other, in the widget's own terms:** `candidate-location` shows NOTHING on
+open, so "options appeared" is an unambiguous success signal and a failed write is caught in one settled
+read. `school--0` shows **100 options on open**, so a fast write that did nothing is indistinguishable from
+one that searched and filtered — the failure is only discovered after a full search budget.
+
+So the gate is `preOpts.length === 0`: **use the fast write only where its success is cheaply verifiable.**
+Evidence the widget itself supplies, no field names. Verified — location keeps `[insertText]`, school is
+back to `[trusted-perchar]` with no wasted attempt, 5 need review unchanged (nothing lost):
+
+```
+candidate-location [insertText]  open 612ms · typed 853ms · lookup 1261ms → 2.8s
+school--0 [trusted-perchar]      open 693ms (100 opt on open) · query 15 chars → 1 option in 3054ms
+[ATS-TIME] fill 18.7s / 26 fields — 719ms/field (HIDDEN)
+```
+
+School's residue is its OWN server (3054ms against a documented 390ms–12s spread), not our input path.
+The next honest lever there is the query, not the keystrokes.
+
+### Round 18 (2026-08-25) — re-measured after merging main's page-clock fix: the input path held, the WORKER did not
+
+Rounds 14–17 were measured before main's `cdpSetPageClock` landed on the ATS path, so they were re-run on
+the merged build (`gh-verify-merge-13`) to check nothing regressed and that the two pacing axes compose.
+
+| run | fill | `candidate-location` split | `school--0` |
+|---|---|---|---|
+| merged, HIDDEN 1 | 24.3s | open **365** · typed 3244 · lookup 829 → 4.5s | 2.4s |
+| merged, HIDDEN 2 | 29.0s | open **514** · typed 1081 · lookup 556 → 2.4s | 5.3s |
+| merged, "visible" ⚠ | **94.2s** | open **493** · typed **75** · lookup 4933 → 5.5s | 8.9s |
+
+**What held.** The parts these rounds changed are fast and stable across all three: `open` is **365–563ms**
+against the 1800ms+ it used to burn, and `typed` reached **75ms** at its best — the head+1-keystroke write
+survives the merge intact, and `school--0` correctly stays on `[trusted-perchar]`. Review counts were
+identical run to run (4), so nothing was lost.
+
+**What did not.** Fill totals ranged **24.3s → 94.2s on one form**, and the cause is neither the input path
+nor the widgets. Main's new pace diagnostic names it outright:
+
+```
+⚠ a 12ms pace took 10003ms (sw-starved) — the clock overran by 9991ms.
+  OUR OWN abandon ceiling was 8491ms late, so this is SERVICE-WORKER starvation
+question_37239549002 (text) → filled · 22193ms
+degree--0 37.4s
+```
+
+A **12ms** pace costing **10s** is MV3 worker starvation — the operator's original "lags at random times,
+fixed by clicking the page". So the page clock has NOT fully closed it on this machine, which is precisely
+the uncertainty main's `atsPageClock` A/B was added to settle, and this round is more evidence for running
+it rather than an answer to it.
+
+⚠ **That visible row was CONTAMINATED** — polling the dev tab from automation ACTIVATES it, which hides the
+run tab and adds load. Re-run properly below.
+
+### Round 18b — three CLEAN visible runs (nothing touched Chrome while they ran)
+
+| run | fill | `candidate-location` | `school--0` | slowest field |
+|---|---|---|---|---|
+| V1 | 32.7s | open 683 · typed **56** · lookup 408 → **1147ms** | 777ms | country 8.7s |
+| V2 | **14.2s** | open 424 · typed **50** · lookup 414 → **888ms** | 1694ms | degree 3.2s |
+| V3 | 50.9s | open 415 · typed **188** · lookup 407 → **1010ms** | **14393ms** | a question 15.1s |
+
+**No regression, and the location work is the most stable thing on the form: 888–1147ms across all three**,
+against 2.0s pre-merge and 7.9–25.5s before any of it. `typed` is 50–188ms. School correctly stays
+per-char, and its 777ms → 14393ms spread is Greenhouse's own endpoint (documented 390ms–12s), not us.
+
+### ⚠ "IT'S VISIBLE, SO WHY DOES IT STILL LAG?" — because the lag is not in the TAB
+
+The operator asked exactly this, and it is the right question with a non-obvious answer. A foreground tab is
+NOT throttled — but the stalls are in the **MV3 service worker**, a separate context whose timers Chrome
+deprioritises on its own heuristics, tab visibility included or not. Measured across these runs: **3
+`sw-starved` paces, 1 `page-abandoned`, 1 `page`** — and the worst were a 150ms pace taking 5624ms and a
+450ms pace taking 10658ms, on a VISIBLE tab.
+
+Main's diagnostic already states the consequence, and it is the load-bearing sentence for anyone tempted to
+reach for the page clock again:
+
+> *the page clock cannot help, because that ceiling is an SW timer too. **Fewer awaits is the lever.***
+
+`cdpDelay` races a page sleep against an SW-timer abandon ceiling; when the worker is starved, the ceiling
+itself fires late, so moving WHERE a pace sleeps cannot rescue it. That makes rounds 14–17 the right shape
+of fix by accident as much as design — every one of them REMOVED awaits (a 4.8s dead poll, a 2.1s clear of
+an empty box, 11 keystrokes down to 1) rather than shortening them, and each removed await is one fewer
+chance to land on a starved timer. The remaining fill-total variance is what is left to attack the same
+way, plus the widgets' own servers.
+
+**Conclusion, stated narrowly:** the round 14–17 work still does what it claimed — per-field input cost is
+down and stayed down. It does NOT follow that a fill is reliably fast, because the dominant remaining term
+is worker starvation, which is independent of these changes and pre-dates them.
+
+### Round 19 (2026-08-25) — the worker was drowning in events nothing read. VISIBLE is fixed; HIDDEN is not
+
+The firehose counter's own note had the hypothesis written down since 2026-08-09 and never tested:
+
+> *we `Runtime.enable` + `DOM.enable` at attach while registering NO onEvent listener anywhere, so Chrome
+> streams console/executionContext/DOM-mutation events at a worker that never reads them… a saturated
+> event loop defers timers.*
+
+Corroborating measurement first: the SW stalled **623–984ms** at a time while a trivial page eval cost
+**2–3ms**, i.e. the channel was free and the worker was the bottleneck — the shape event saturation makes.
+
+**Fix.** `Runtime.enable` is REMOVED — the only Runtime command this codebase issues is
+`Runtime.evaluate`, which does not need the domain enabled (nor does evaluating in a
+`Page.createIsolatedWorld` context, which returns its id directly). Enabling it bought
+`consoleAPICalled` / `exceptionThrown` / `executionContextCreated` streaming off a React app mid-fill,
+all discarded on arrival. `DOM.enable` is made LAZY (`cdpEnsureDomDomain`): three DOM commands are
+genuinely used, but only by the FALLBACK focus path most runs never touch, and its mutation events are
+the noisiest of the three. `Page.enable` stays — `addScriptToEvaluateOnNewDocument` requires it.
+
+Also: the inbound-event count is now counted ALWAYS and printed with every ATS run
+(`cdpEventSummary`). It was gated behind `debugLagTrace`, and on the ATS path the lag REPORT returns
+null anyway (an intermediate detach drops its window), so the one number that answers "is the worker
+being saturated?" was unobtainable even with the flag on.
+
+### VISIBLE — fixed, two consecutive runs
+
+| | paces | overran | worst | fill |
+|---|---|---|---|---|
+| before | 40–43 | **1–3** | 1548–**10208ms** | 12.9–50.9s |
+| after (run 1) | 24 | **0 (0%)** | **0ms** | 16.2s |
+| after (run 2) | 43 | **0 (0%)** | **0ms** | 16.1s |
+
+`inbound CDP events: 33–34 [Page.frameStartedLoading×6, Page.frameStoppedLoading×4, Page.frameAttached×4,
+Page.frameRequestedNavigation×4]` — only the Page domain we actually consume, ~33 events for a whole fill
+against whatever DOM mutations a React form was previously pushing. **Zero pace overruns where every
+earlier run had one to three.** Review counts unchanged (4).
+
+### ⚠ HIDDEN — NOT fixed, and the attribution says why
+
+| | paces | overran | worst | fill |
+|---|---|---|---|---|
+| after, hidden | 41 | **10 (24%)** | **13805ms on a 15ms wait** | 119.1s |
+
+```
+spend: 15ms×16 29.8s · 400ms×4 11.5s · 150ms×4 7.7s · 450ms×2 5.5s · 300ms×4 3.5s
+```
+
+**Sixteen 15ms yields cost 29.8 seconds** — ~1.9s each for a requested 15ms. That is the load-bearing
+observation of this round: **under starvation a pace costs what the SCHEDULER decides, not what was
+asked for**, so the YIELD COUNT is the cost driver and the duration is nearly irrelevant. It also means
+`cdpSetFastWhenHidden` (round 16) neither helps nor hurts a starved run — collapsing 150ms to 15ms
+changes nothing when the wait is 1.9s either way; it only pays off on a healthy one.
+
+Removing the event firehose did not rescue the hidden arm because the cause there is different: an
+invisible tab gives Chrome no reason to schedule the worker at all. That is the browser's policy, not a
+stream we can stop.
+
+**So the honest split: a VISIBLE fill no longer lags (the operator's actual complaint), and a HIDDEN one
+still can.** The remaining lever for hidden is the one this round measured rather than guessed —
+fewer yields, starting with whatever issues sixteen 15ms paces in one fill.
+
+### The process note worth keeping
+
+Three rounds of instrumentation attributed the cost to typing, and typing was never the largest term. The
+5s pause was invisible in every log line because it happened in a phase nobody had timed — the field was
+*focused*, so it looked busy. **An operator watching the tab found in one sentence what four instrumented
+runs had not**, and the fix was to stop doing something rather than to do it faster.
+
+## Round 20 (2026-09-01) — Ashby 45s → 6s: the keep-warm beat was too slow, and two open-polls were free
+
+**/goal: "the entire page should fill in around 15 seconds or less."** Met with margin, on two tenants.
+
+| form | before | after |
+|---|---|---|
+| Notion (25 fields), hidden | 45.4s · 87.2s | **6.2s · 7.5s** |
+| Notion (25 fields), visible | 46.1s · 79.8s | **9.1s** |
+| Whatnot (18 fields), visible | 25.5s | **3.9s** |
+
+Pace overruns went from *27–31s lost, worst 11035ms* to **0 overran, 0ms**. Field counts and
+outcomes are unchanged in every case (Notion 14 filled + 11 review; Whatnot 9 + 5 + 4), so this is
+speed, not coverage.
+
+### 1. The cause was found by accident, and that is the lesson
+
+Turning `debugLagTrace` **ON** to diagnose the slowness made the fill **faster** — 13.6s and 15.4s
+where the untraced runs were 45–87s. The trace changes nothing on the fill path. What it adds is a
+**second 500ms interval that also issues a `Runtime.evaluate`**, so the worker had a reason to be
+scheduled every ~250ms instead of every 500ms.
+
+`CDP_WARM_BEAT_MS` 500 → **250**. One extra trivial round trip per 500ms against ~30s saved.
+
+> ⚠ The instrument was not neutral. A diagnostic that keeps the worker warm *hides the very stall it
+> is there to measure* — and here it did the opposite favour, which is what exposed the cause. When a
+> trace makes a problem better, the trace is part of the system.
+
+### 2. `forceToggles` was the whole remaining cost of the location field
+
+With the open wait already moved into the page (round 19) the location field was *still* 5.6s. All of
+it was the two forced re-opens plus their 1500ms polls, fired because no menu had mounted. The
+existing guard only skipped them for a menu that MOUNTED and settled empty — but a query-only box
+mounts nothing at all until you type, which is not a missed click either.
+
+`ap-ats-combobox-5` ("Current Location"): **22.7s → 0.84s** (`open 80ms (no-menu)`).
+
+⚠ Location only. For a plain `select` an absent menu really can mean the click missed. It cannot hide
+one here: the typing path takes its own `trustedFocus` (the widget-wake), which re-clicks the control.
+
+### 3. The same waste lived in the AI-DEFER pass — found only by testing a SECOND tenant
+
+Whatnot exposed what Notion could not: **94 paces on an 18-field form** against 29 on a 25-field one.
+The defer pass reads each combobox's options for the prompt through `atsOpenAndPollOptions`, which
+still used the SW poll — and two required dropdowns whose menus show nothing until typed cost
+**1935ms and 3521ms each** running the full soft deadline. Routing that helper through the same
+page-side waiter took Whatnot **25.5s → 3.9s**, paces **94 → 21**.
+
+> **One tenant is not a measurement.** Notion never showed this because its slow widget was the
+> location box, which had already been fixed by name. The shared helper was untouched and invisible
+> until a form with several query-driven dropdowns ran through it.
+
+### 4. ⚠ Halving the beat needed an overlap guard, and skipping it cost a wedged worker
+
+The probe has no timeout of its own. Against a **wedged renderer** every beat's `Runtime.evaluate`
+hangs, and a timer that keeps firing accumulates unresolved commands until the worker answers nothing
+at all — popup and dev bridge included. Observed live minutes after the interval was halved: the
+service worker went unresponsive while the page itself still evaluated fine (a pile-up, not
+starvation), and recovery needed a manual extension reload. Halving the cadence doubled the rate of
+hanging probes, so `cdpKeepWarmStart` now allows **one probe in flight at a time**; a hung one simply
+skips beats until it settles, and the next is 250ms away.
+
+**Standing rule from this round:** the cost driver is round trips, but the *price per round trip* is
+set by whether the MV3 worker is scheduled. Fix the scheduling first — it is one constant — then cut
+awaits. Doing it in the other order attributes the worker's stalls to whatever code happened to be
+awaiting at the time, which is how the location field looked like a widget problem for three rounds.
