@@ -389,10 +389,21 @@ export function TeachInbox({
                 <p className="eyebrow">Question</p>
                 <h2 className="mt-1 text-lg font-medium leading-snug text-ink">{card.question}</h2>
               </div>
-              <button onClick={skip} className="btn-ghost shrink-0 px-3 py-1.5 text-xs" title="Don't remember this" disabled={saving}>
-                <SkipForward className="h-3.5 w-3.5" />
-                Skip
-              </button>
+              <div className="flex shrink-0 items-center gap-2">
+                {/* An essay-shaped answer belongs in the essay library, NOT in a remembered answer — a
+                    remembered answer matches on EXACT question wording, which an essay question never
+                    repeats. Offered here because auto-capture only ever sees answers typed from now on. */}
+                {essayShapeOk(card.answer, card.widget) && (
+                  <button onClick={saveAsEssay} className="btn-ghost px-3 py-1.5 text-xs" title="Save to your essay library" disabled={saving}>
+                    <PenLine className="h-3.5 w-3.5" />
+                    Save as essay
+                  </button>
+                )}
+                <button onClick={skip} className="btn-ghost px-3 py-1.5 text-xs" title="Don't remember this" disabled={saving}>
+                  <SkipForward className="h-3.5 w-3.5" />
+                  Skip
+                </button>
+              </div>
             </div>
 
             <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2">
@@ -405,26 +416,6 @@ export function TeachInbox({
                 </span>
               )}
             </div>
-
-            {/* An essay-shaped answer belongs in the essay library, NOT in a remembered answer — a
-                remembered answer matches on exact question wording, which an essay question never
-                repeats. Offered here because auto-capture only sees answers typed from now on. */}
-            {essayShapeOk(card.answer, card.widget) && (
-              <div className="mt-4 flex flex-wrap items-start gap-3 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
-                <PenLine className="mt-0.5 h-4 w-4 shrink-0 text-ink-dim" />
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-medium text-ink">This looks like an essay you wrote</p>
-                  <p className="mt-0.5 text-xs leading-relaxed text-ink-dim">
-                    Save it to your essay library and future long answers get drafted in your voice — and may
-                    reuse concrete facts from it. It won&apos;t be replayed onto a form verbatim.
-                  </p>
-                </div>
-                <button onClick={saveAsEssay} className="btn-primary shrink-0" disabled={saving}>
-                  <PenLine className="h-3.5 w-3.5" />
-                  Save as essay
-                </button>
-              </div>
-            )}
 
             {/* AI recommendation — where this answer maps. One primary "add to profile"; the popup confirms. */}
             {recLoading ? (
