@@ -156,8 +156,18 @@ export function RememberedAnswerPopup({
   const answerType = draft.widget_hint === "radio" || draft.widget_hint === "checkbox" ? draft.widget_hint : "text";
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onCancel} role="presentation">
-      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-        <div className="mb-3 flex items-center justify-between">
+      {/* ⚠ SCROLLABLE, AND THE HEADER/FOOTER STAY PUT (operator, 2026-09-03). The panel had no height
+          cap, so an answer with many question wordings — the sponsorship-future question is the one
+          that showed it — grew past the viewport, and because the overlay is `fixed` there was
+          nothing to scroll: Done and Cancel were simply unreachable. Capped with `dvh` rather than
+          `vh` so a mobile browser's collapsing toolbar cannot hide the footer either.
+          A three-row flex column (header · scrolling body · footer) is what keeps the controls
+          on screen; capping the whole panel and letting IT scroll would push them off the bottom. */}
+      <div
+        className="flex max-h-[calc(100dvh-2rem)] w-full max-w-md flex-col rounded-xl border border-hairline bg-panel shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex shrink-0 items-center justify-between px-5 pt-5 pb-3">
           <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">
             {title || (mode === "add" ? "Add remembered answer" : "Remembered answer — advanced")}
           </h3>
@@ -165,7 +175,8 @@ export function RememberedAnswerPopup({
             <X className="h-4 w-4" />
           </button>
         </div>
-        <div className="space-y-4">
+        {/* the only part that scrolls — `min-h-0` is required or flex refuses to shrink it */}
+        <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-5">
           <TagListField
             label="Question wordings"
             value={draft.questions}
@@ -177,7 +188,7 @@ export function RememberedAnswerPopup({
           <RememberedValueField widget={answerType} label="Answer" value={draft.value} onChange={(v) => patch({ value: v })} />
           <CategoryField value={draft.category} options={categoryOptions} onChange={(c) => patch({ category: c })} />
         </div>
-        <div className="mt-5 flex items-center justify-between">
+        <div className="flex shrink-0 items-center justify-between border-t border-hairline px-5 pt-4 pb-5">
           <div>{mode === "edit" && <ConfirmDeleteButton onDelete={onDelete} withLabel />}</div>
           <div className="flex gap-2">
             <button type="button" onClick={onCancel} className="btn-ghost px-3 py-1.5 text-sm">

@@ -115,14 +115,17 @@ export function AnswerEditPopup({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
-      <div className="w-full max-w-md rounded-xl border border-hairline bg-panel p-5 shadow-2xl" onClick={(e) => e.stopPropagation()}>
-        <div className="mb-3 flex items-center justify-between">
+      {/* ⚠ SCROLLABLE, HEADER AND FOOTER PINNED (operator, 2026-09-03) — the third of the three teach
+          popups that shared this bug; see RememberedAnswerPopup for the reasoning. */}
+      <div className="flex max-h-[calc(100dvh-2rem)] w-full max-w-md flex-col rounded-xl border border-hairline bg-panel shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex shrink-0 items-center justify-between px-5 pt-5 pb-3">
           <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">{label} — answer</h3>
           <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
             <X className="h-4 w-4" />
           </button>
         </div>
 
+        <div className="min-h-0 flex-1 overflow-y-auto px-5">
         <ProfileFieldEditor
           path={path}
           label={label}
@@ -152,7 +155,8 @@ export function AnswerEditPopup({
           </div>
         )}
 
-        <div className="mt-4 flex justify-end">
+        </div>
+        <div className="flex shrink-0 justify-end border-t border-hairline px-5 pt-4 pb-5">
           <button type="button" onClick={onClose} className="btn-primary">
             Done
           </button>

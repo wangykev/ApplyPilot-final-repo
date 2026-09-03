@@ -154,6 +154,47 @@ const DISCOVER_CYCLES = ["summer", "fall", "winter", "spring"];
 // "summer" + "2026" → "Summer 2026". This is the SEASON label, used as the
 // Simplify feed's `terms` filter (its rows literally carry "Summer 2026"), which
 // is why it's exact there and only advisory on the keyword-matched boards.
+// ⚠⚠ THE TERM IS ADVISORY ON THE KEYWORD BOARDS, SO CONTRADICTIONS MUST BE DROPPED HERE
+// (operator, 2026-09-02). `cycle`/`year` shape the SEARCH STRING; only Simplify's feed filters on
+// them, and LinkedIn/Handshake just keyword-match. Live: a sweep set to `summer` / `2027` queued
+// "Electrical Engineering Intern - Fall 2026" and, of 35 queued rows, 9 mentioned 2027 at all and 3
+// said Summer 2027. The operator's requirement is that it only return the term asked for.
+//
+// ⚠ DROP CONTRADICTIONS, KEEP UNKNOWNS — and that asymmetry is the whole design. Most postings
+// carry no season or year in the title ("Software Engineer Intern"), and a rule that required a
+// match would discard nearly every real result: it would look like a filter and behave like a
+// blindfold. So a row is refused only when it NAMES a cycle or year that cannot be the one asked
+// for. Silence is not a contradiction.
+//
+// ⚠ A YEAR ALONE IS NOT A SEASON. "2027 Software Engineer Intern" states the year and leaves the
+// cycle open, so it survives a `summer` request — the year is the part that was contradicted or not.
+// The two facts are tested separately for that reason.
+const DISCOVER_CYCLE_WORDS = { summer: /\bsummer\b/i, fall: /\b(fall|autumn)\b/i, winter: /\bwinter\b/i, spring: /\bspring\b/i };
+
+function discoverTermContradiction(title, cycle, year) {
+  const t = String(title || "");
+  if (!t.trim()) return null;                       // nothing said ⇒ nothing contradicted
+  const wantCycle = String(cycle || "").trim().toLowerCase();
+  const wantYear = String(year || "").trim();
+
+  // YEARS: only 4-digit years in a plausible hiring window count, so a requisition number or a
+  // "1000+ employees" blurb can never read as a season.
+  if (/^\d{4}$/.test(wantYear)) {
+    const years = [...t.matchAll(/\b(20\d{2})\b/g)].map((m) => m[1]).filter((y) => y >= "2020" && y <= "2035");
+    if (years.length && !years.includes(wantYear)) {
+      return `title names ${years.join("/")} , not ${wantYear}`;
+    }
+  }
+  // CYCLES: a named season that is not the one asked for.
+  if (DISCOVER_CYCLE_WORDS[wantCycle]) {
+    const named = Object.keys(DISCOVER_CYCLE_WORDS).filter((c) => DISCOVER_CYCLE_WORDS[c].test(t));
+    if (named.length && !named.includes(wantCycle)) {
+      return `title names ${named.join("/")}, not ${wantCycle}`;
+    }
+  }
+  return null;
+}
+
 function discoverTermLabel(cycle, year) {
   const c = String(cycle || "").trim().toLowerCase();
   const y = String(year || "").trim();
@@ -3521,7 +3562,23 @@ async function runJobDiscovery(opts) {
   // sum to 100 precisely so the number is comparable against a threshold.
   const rankOpts = { keywords, field: o.field, intern: o.intern, sinceDays: o.sinceDays, nowMs: now };
   const minPercent = o.minMatchPercent == null ? DISCOVER_DEFAULTS.minMatchPercent : Number(o.minMatchPercent);
-  const graded = pickByThreshold(fresh, minPercent, rankOpts);
+  // ⚠ REFUSE A ROW THAT NAMES A DIFFERENT TERM, BEFORE RANKING (see discoverTermContradiction).
+  // Placed here rather than inside the score so it is a REFUSAL, not a penalty: a Fall 2026 posting
+  // is not a weak Summer 2027 match, it is a different job, and no threshold should be able to let
+  // it through. Reported as its own note so a thin sweep never looks like an empty board.
+  const wrongTerm = [];
+  const onTerm = (o.cycle || o.year)
+    ? fresh.filter((j) => {
+      const why = discoverTermContradiction(j.title, o.cycle, o.year);
+      if (why) { wrongTerm.push(`${j.company || "?"} — ${j.title || "?"} (${why})`); return false; }
+      return true;
+    })
+    : fresh;
+  if (wrongTerm.length) {
+    notes.push(`${wrongTerm.length} job${wrongTerm.length === 1 ? "" : "s"} named a different term than ${discoverTermLabel(o.cycle, o.year) || "the one requested"} and were skipped.`);
+    dlog(`term filter: dropped ${wrongTerm.length} — ${wrongTerm.slice(0, 8).join(" | ")}`);
+  }
+  const graded = pickByThreshold(onTerm, minPercent, rankOpts);
   const wide = graded.kept.concat(graded.dropped); // every candidate, best first
   // maxTotal is still the hard backstop, so a low threshold can't queue hundreds.
   const capped = graded.kept.slice(0, cappedTotal);
@@ -3715,6 +3772,7 @@ if (typeof module !== "undefined" && module.exports) {
     DISCOVER_DEFAULT_LOCATION,
     DISCOVER_CYCLES,
     discoverTermLabel,
+    discoverTermContradiction,
     buildDiscoverQuery,
     buildDiscoverQueries,
     discoverKeywordTokens,

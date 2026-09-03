@@ -13,6 +13,7 @@ import {
   profileValueAt,
   humanize,
   isFuzzyTier,
+  looksLikeYesNoQuestion,
 } from "@/lib/teach";
 import { saveBuckets, saveProfile } from "@/app/app/profile/actions";
 import { liveSync } from "@/lib/extension-sync";
@@ -283,7 +284,16 @@ export function TeachInbox({
     // through unchanged. (Mode-A teaches already get this — they set a boolean profile field.)
     value: card ? boolAnswerCandidates(card.answer) : [],
     category: recCat || "Other",
-    widget_hint: card && (card.widget === "radio" || card.widget === "checkbox") ? card.widget : "text",
+    // ⚠ A YES/NO QUESTION DEFAULTS TO "Yes / No", NOT Text (operator, 2026-09-03). Only the source
+    // card's WIDGET was consulted, so a yes/no question a tenant rendered as a dropdown (or one
+    // whose card carried no widget at all) seeded as free Text — and the operator then had to
+    // notice and change the Answer type by hand on every such field. The question and its approved
+    // answer are the evidence; see looksLikeYesNoQuestion for why the answer is the stronger of the
+    // two and why the wording test anchors on a leading auxiliary verb.
+    // "radio" is this popup's value for Yes / No (ANSWER_WIDGETS, RememberedAnswerPopup).
+    widget_hint: card && (card.widget === "radio" || card.widget === "checkbox")
+      ? card.widget
+      : (card && looksLikeYesNoQuestion(card.question, card.answer) ? "radio" : "text"),
     questions: card ? [card.question] : [],
     selectors: {},
   });
