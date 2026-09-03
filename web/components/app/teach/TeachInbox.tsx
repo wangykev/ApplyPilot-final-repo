@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, ChevronDown, RotateCcw, Trash2 } from "lucide-react";
+import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, ChevronDown, RotateCcw, Trash2, PenLine } from "lucide-react";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
 import { isModeA, type Bucket } from "@/lib/buckets";
 import type { Profile } from "@/lib/profile-schema";
@@ -17,7 +17,8 @@ import {
 } from "@/lib/teach";
 import { saveBuckets, saveProfile } from "@/app/app/profile/actions";
 import { liveSync } from "@/lib/extension-sync";
-import { saveDismissed, saveDeleted, recommendField, type FieldRecommendation } from "@/app/app/teach/actions";
+import { saveDismissed, saveDeleted, recommendField, captureEssay, type FieldRecommendation } from "@/app/app/teach/actions";
+import { essayShapeOk } from "@/lib/essays";
 import { ProfilePanel } from "@/components/app/teach/ProfilePanel";
 import { AnswerEditPopup } from "@/components/app/teach/AnswerEditPopup";
 import { TeachAddPopup, type ConfirmTarget, type AddResult } from "@/components/app/teach/TeachAddPopup";
@@ -222,6 +223,44 @@ export function TeachInbox({
     }
   };
 
+  // Save this answer into the essay library instead of teaching it as a remembered answer.
+  //
+  // ⚠ A long answer is a BAD remembered answer and a GOOD voice sample, which is why this exists as
+  // its own action rather than as an extra checkbox on the teach popup. A remembered answer fills by
+  // EXACT question wording, and an essay question is never worded the same way twice — so teaching
+  // this as one would almost never match, and on the rare day it did it would replay a stale,
+  // verbatim project list into a differently-worded question. The essay library is the other shape:
+  // never replayed, only ever shown to the model as "this is how I write".
+  //
+  // Auto-capture cannot reach these. It fires inside the review editor's `commit()`, so it only ever
+  // sees an answer being typed FROM NOW ON — every essay already sitting in a past bundle (i.e. all
+  // of them, the day this shipped) needs a hand to bring it across.
+  //
+  // Saving SKIPS the card afterwards, so the same answer does not keep nagging as a remembered
+  // answer once it has a better home. Skip is restorable from the Skipped section, so this is not a
+  // one-way door.
+  const saveAsEssay = async () => {
+    if (!card) return;
+    setSaving(true);
+    setNote(null);
+    const res = await captureEssay({
+      question: card.question,
+      text: card.answer,
+      company: card.company || "",
+      source: "manual",
+    });
+    setSaving(false);
+    if (res.ok) {
+      liveSync("profile");   // the extension reads the library from storage; push it like any profile edit
+      // ⚠ ORDER: `skip` clears the note itself, so the confirmation has to be written AFTER it or the
+      // save looks like it did nothing. Both land in one React batch, so the later write is what shows.
+      skip();
+      setNote("Saved to your essays");
+    } else {
+      setNote(`Couldn't save: ${res.error}`);
+    }
+  };
+
   const skip = () => {
     if (card) {
       const next = Array.from(new Set([...dismissed, card.key]));
@@ -366,6 +405,26 @@ export function TeachInbox({
                 </span>
               )}
             </div>
+
+            {/* An essay-shaped answer belongs in the essay library, NOT in a remembered answer — a
+                remembered answer matches on exact question wording, which an essay question never
+                repeats. Offered here because auto-capture only sees answers typed from now on. */}
+            {essayShapeOk(card.answer, card.widget) && (
+              <div className="mt-4 flex flex-wrap items-start gap-3 rounded-lg border border-hairline bg-panel-raised/30 px-3 py-2.5">
+                <PenLine className="mt-0.5 h-4 w-4 shrink-0 text-ink-dim" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium text-ink">This looks like an essay you wrote</p>
+                  <p className="mt-0.5 text-xs leading-relaxed text-ink-dim">
+                    Save it to your essay library and future long answers get drafted in your voice — and may
+                    reuse concrete facts from it. It won&apos;t be replayed onto a form verbatim.
+                  </p>
+                </div>
+                <button onClick={saveAsEssay} className="btn-primary shrink-0" disabled={saving}>
+                  <PenLine className="h-3.5 w-3.5" />
+                  Save as essay
+                </button>
+              </div>
+            )}
 
             {/* AI recommendation — where this answer maps. One primary "add to profile"; the popup confirms. */}
             {recLoading ? (

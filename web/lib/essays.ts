@@ -128,6 +128,25 @@ export function looksLikeProse(text: string): boolean {
 }
 
 /**
+ * Is this TEXT essay-shaped — long enough, wordy enough, prose rather than a list?
+ *
+ * Split out of `isEssayAnswer` so the two callers can differ on the one thing that actually
+ * separates them: WHO decided this is an essay.
+ *   • auto-capture infers it, so it must also prove the operator wrote it (below);
+ *   • an explicit "Save as essay" click IS the operator saying so, which is stronger evidence than
+ *     any heuristic — so it needs the shape bar and nothing else.
+ * Keeping the shape test in one place is what stops the button from appearing on something the
+ * auto-path would have refused, which would read as the feature being broken.
+ */
+export function essayShapeOk(text: string, widget?: string | null): boolean {
+  if (NON_PROSE_WIDGETS.has(String(widget || ""))) return false;
+  const t = String(text == null ? "" : text).trim();
+  if (t.length < ESSAY_MIN_CHARS) return false;
+  if (wordsOf(t).length < ESSAY_MIN_WORDS) return false;
+  return looksLikeProse(t);
+}
+
+/**
  * Is this review entry an essay the OPERATOR wrote?
  *
  * ⚠ `wasManuallyEdited` is load-bearing, not a formality. An AI draft the operator approved
@@ -138,17 +157,16 @@ export function looksLikeProse(text: string): boolean {
  * (`edit_kind` covers both shapes that mean "they wrote it": `override` — they rewrote the draft,
  * which includes rewriting over the AI-2 "[NEEDS YOUR ANSWER" sentinel — and `filled_blank`, where
  * the AI produced nothing. `cleared` and `added_entry` are excluded by wasManuallyEdited itself.)
+ *
+ * ⚠ This gate is for the AUTOMATIC path only. It is deliberately NOT applied to an explicit save —
+ * see `essayShapeOk`.
  */
 export function isEssayAnswer(entry: ReviewEntry): boolean {
   if (!entry) return false;
   if (!wasManuallyEdited(entry)) return false;
-  if (NON_PROSE_WIDGETS.has(String(entry.widget_type || ""))) return false;
   if (entry.credential) return false;                       // never store a secret as writing
   const text = String(entry.current_value == null ? "" : entry.current_value).trim();
-  if (text.length < ESSAY_MIN_CHARS) return false;
-  if (wordsOf(text).length < ESSAY_MIN_WORDS) return false;
-  if (!looksLikeProse(text)) return false;
-  return true;
+  return essayShapeOk(text, entry.widget_type);
 }
 
 // ── library maintenance ──────────────────────────────────────────────────────────────────

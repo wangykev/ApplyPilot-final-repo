@@ -12,7 +12,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  coerceEssays, emptyEssaysDoc, isEssayAnswer, looksLikeProse, dedupeEssays, addEssay,
+  coerceEssays, emptyEssaysDoc, isEssayAnswer, essayShapeOk, looksLikeProse, dedupeEssays, addEssay,
   recentEssays, ESSAY_MIN_CHARS,
 } from "../lib/essays";
 import type { ReviewEntry } from "../lib/review-summary";
@@ -180,4 +180,47 @@ test("recentEssays is newest-first and bounded", () => {
   assert.deepEqual(recentEssays(doc, 2).map((e) => e.id), ["e3", "e2"]);
   assert.deepEqual(recentEssays(doc, 0), []);
   assert.deepEqual(recentEssays(emptyEssaysDoc(), 3), []);
+});
+
+// ── the explicit "Save as essay" path (teach card) ───────────────────────────────────────
+//
+// Auto-capture fires inside the review editor's commit(), so it can only ever see an answer being
+// typed FROM NOW ON — every essay already sitting in a past bundle needs a hand to bring it across.
+// The teach card offers that, and the button's visibility test is `essayShapeOk`.
+
+/** The operator's own answer, verbatim (2026-09-03) — the case that prompted this path. */
+const OPERATOR_TURNTABLE_ANSWER =
+  "I designed a custom direct-drive vinyl turntable PCB in Altium with closed-loop BLDC motor " +
+  "control. I also developed ROS 2 nodes and CAN bus communication protocols for robotic motor " +
+  "control. Lastly, in my last year of high school, I created a robotic car to accurately stop at " +
+  "a black dot, controlled by an openmv camera.";
+
+test("essayShapeOk accepts the operator's real answer — including through a plain text widget", () => {
+  // ⚠ `text`, not `textarea`. This answer reached the TEACH queue precisely because `text` is
+  // bucket-eligible, so the button has to appear on that widget or it never appears where it is needed.
+  assert.equal(essayShapeOk(OPERATOR_TURNTABLE_ANSWER, "text"), true);
+  assert.equal(essayShapeOk(OPERATOR_TURNTABLE_ANSWER, "textarea"), true);
+  assert.equal(essayShapeOk(REAL_ESSAY, "text"), true);
+});
+
+test("essayShapeOk refuses what auto-capture refuses — same bar, one definition", () => {
+  assert.equal(essayShapeOk("Python; C++; Verilog; Rust; SystemVerilog; MATLAB; Git; Docker; Linux; RTOS; Altium; KiCad", "text"), false);
+  assert.equal(essayShapeOk("I am a senior studying electrical engineering.", "text"), false); // too short
+  assert.equal(essayShapeOk(REAL_ESSAY, "dropdown"), false);                                   // not a prose widget
+  assert.equal(essayShapeOk(REAL_ESSAY, "checkbox_group"), false);
+  assert.equal(essayShapeOk("", "text"), false);
+  assert.equal(essayShapeOk(null as unknown as string, "text"), false);
+});
+
+test("⚠ splitting the predicate did NOT weaken auto-capture: an approved-unchanged AI draft is still refused", () => {
+  // The whole point of the split is that the OPERATOR-WROTE-IT gate belongs to the automatic path
+  // only. If this ever passes, the library will start learning the model's own voice.
+  const aiDraft = { question_label: "Projects?", current_value: REAL_ESSAY, widget_type: "textarea", is_edited: false, is_approved: true } as unknown as ReviewEntry;
+  assert.equal(essayShapeOk(REAL_ESSAY, "textarea"), true, "shape passes…");
+  assert.equal(isEssayAnswer(aiDraft), false, "…but auto-capture still refuses it");
+});
+
+test("a credential is never saved as writing, whichever path asks", () => {
+  const cred = { question_label: "Password", current_value: REAL_ESSAY, widget_type: "text", is_edited: true, edit_kind: "override", credential: true } as unknown as ReviewEntry;
+  assert.equal(isEssayAnswer(cred), false);
 });

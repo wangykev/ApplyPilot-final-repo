@@ -211,7 +211,9 @@ export async function saveEssays(raw: unknown): Promise<SaveResult> {
  * bundle — losing a style sample is a small thing, losing an approved answer is not. Every failure
  * returns ok:false and the caller ignores it.
  */
-export async function captureEssay(input: { question: string; text: string; company?: string }): Promise<SaveResult> {
+export async function captureEssay(
+  input: { question: string; text: string; company?: string; source?: "review" | "manual" }
+): Promise<SaveResult> {
   const text = String(input?.text || "").trim();
   const question = String(input?.question || "").trim();
   if (!text) return { ok: false, error: "empty" };
@@ -227,7 +229,9 @@ export async function captureEssay(input: { question: string; text: string; comp
       question,
       text,
       company: String(input?.company || "").trim(),
-      source: "review",
+      // "review" = captured on its own from a review-page edit; "manual" = the operator pressed
+      // Save as essay themselves (the teach card, or the library's own Add).
+      source: input?.source === "manual" ? "manual" : "review",
       created_at: new Date().toISOString(),
     });
     // addEssay already deduped, so a second commit of the same answer is a no-op write rather than a
