@@ -11,10 +11,14 @@ const ats = require("../ats.js");
 // Shared by the source-scanning guards below. ⚠ Every one of them must strip comments FIRST: the
 // code documents the shapes it refuses, and a textual scan cannot tell explaining a bug apart from
 // committing it — three separate guards have failed on their own prose.
+// ⚠ `[^\r\n]*`, NEVER `.*$` — see the same note in test/sw-globals.test.js. JS `.` does not match
+// `\r` and this repo checks out CRLF, so `.*` can never reach `$` and NOTHING is stripped. Every
+// source-text guard below then reads comments as code: the ORC advance guard failed on the words
+// `step >= total` inside the comment that FORBIDS them, and any presence-guard would pass on prose.
 function stripJsComments(t) {
   return String(t)
     .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+    .split("\n").map((l) => l.replace(/\/\/[^\r\n]*/, "")).join("\n");
 }
 
 test("detectAts: the four families + null for everything else", () => {

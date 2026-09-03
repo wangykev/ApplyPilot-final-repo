@@ -95,9 +95,15 @@ test("SW GLOBAL SCOPE: every importScripts file exists and parses", () => {
 // to a bare `cdpPageKey(...)` call failed this file, i.e. the guard punished the comment that exists to
 // stop the bug. Stripping comments is the same remedy the injected-fn guard and the iCIMS lockstep test
 // already use, and it makes these tests check CODE rather than spelling.
+// ⚠ `[^\r\n]*`, NEVER `.*$`. JS `.` does not match `\r`, and this repo checks out CRLF
+// (`core.autocrlf=true` against `eol=lf`), so every line here is `"…// text\r"` — `.*` cannot
+// reach `$` and the line comment is left ENTIRELY IN PLACE. That made this guard's verdict depend
+// on the checkout's line endings: a bare mention of `apMatch.cdpPageKey` inside a comment WARNING
+// against it (background.js:6318) read as a real call and failed the suite, while the git blob (LF)
+// stripped fine. Absence-guards fail falsely and presence-guards pass on prose. Keep it ending-agnostic.
 const stripComments = (text) => String(text)
   .replace(/\/\*[\s\S]*?\*\//g, " ")
-  .split("\n").map((l) => l.replace(/\/\/.*$/, "")).join("\n");
+  .split("\n").map((l) => l.replace(/\/\/[^\r\n]*/, "")).join("\n");
 
 test("apMatch: every apMatch.X used in fill-driver.js AND background.js is present in the SW object literal", () => {
   const src = fs.readFileSync(path.join(ROOT, "fill-driver.js"), "utf8");
