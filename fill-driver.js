@@ -39,6 +39,8 @@ const apMatch = (typeof module !== "undefined" && module.exports)
       isSignatureDateQuestion: isSignatureDateQuestion, signatureDateDemanded: signatureDateDemanded, signatureDateAskInText: signatureDateAskInText, isJobPostingGone: isJobPostingGone, sameCalendarDate: sameCalendarDate,
       recognizeClearanceQuestion: recognizeClearanceQuestion, clearanceCandidates: clearanceCandidates, clearanceAliases: clearanceAliases,
       recognizeRelocationQuestion: recognizeRelocationQuestion, relocationCandidates: relocationCandidates,
+      // Essay voice samples — shared with ats.js so both engines rank and phrase them identically.
+      selectEssaysForQuestion: selectEssaysForQuestion, essayPromptBlock: essayPromptBlock,
       // a checkbox GROUP holds a SET — the join/split must agree everywhere
       groupSelection: groupSelection, joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue,
       // SKILLS is the other multi-value one — its matcher is exact/qualified-only (Workday's own
@@ -1169,7 +1171,7 @@ const AI_BATCH_MAX = 24; // beyond this the prompt stops being reliable; the ove
 // A cap is not a spend — it only bounds what the model MAY produce.
 function aiBatchMaxTokens(n) { return 512 + 400 * Math.max(1, n | 0); }
 
-function buildBatchAiPrompt(items, profile, jobContext) {
+function buildBatchAiPrompt(items, profile, jobContext, essaysDoc) {
   const system = "You help an applicant fill out a job-application page. You are given the applicant's profile (JSON) and SEVERAL questions at once. Answer EVERY question, keyed by its id.\n"
     + "Each question has a \"kind\":\n"
     + "  • \"infer\" — the applicant did NOT state an answer. Choose the SINGLE best option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education/enrollment dates, criminal/background answers from the ABSENCE of any such record). These are REQUIRED: always choose the most likely option, NEVER refuse and never answer UNKNOWN.\n"
@@ -1186,9 +1188,22 @@ function buildBatchAiPrompt(items, profile, jobContext) {
     if (it.kind === "canonicalize") o.stated = Array.isArray(it.stated) ? it.stated.join(" / ") : String(it.stated == null ? "" : it.stated);
     return o;
   });
+  // ⚠⚠ THIS PROMPT CARRIED NO WRITING STYLE AT ALL until the essay library landed (2026-09-03), and
+  // it is the path a Workday essay NORMALLY takes — the single-field `aiFillText` below has read
+  // `writing_style` since the AI landed, so the same operator got styled prose on Greenhouse and
+  // unstyled prose on Workday, from the same profile, with nothing in either log saying why.
+  const doc = essaysDoc || {};
+  const style = String(doc.style_notes || "").trim()
+    || (profile && profile.application_questions && profile.application_questions.writing_style) || "";
+  // Ranked against the batch's TEXT questions only — a page full of infer/canonicalize picks would
+  // otherwise dilute the topic signal for the one essay that actually needs the samples.
+  const textQs = items.filter((it) => it.kind === "text").map((it) => String(it.label || "")).join(" ");
+  const samples = textQs ? apMatch.selectEssaysForQuestion(doc.essays, textQs, {}) : [];
   const user = "Questions: " + JSON.stringify(qs)
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
+    + (style ? "\nSTYLE RULES for free-text answers: " + style : "")
+    + apMatch.essayPromptBlock(samples, "")
     + "\n\nReply ONLY with a JSON object and nothing else, one entry per question id:\n"
     + "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<exact option text — kind infer/canonicalize; UNKNOWN for a canonicalize with no equivalent>\",\"answer\":\"<free text — kind text only>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
   return { system, user };
@@ -1631,7 +1646,7 @@ const aiFillDate = async (act, loc, f, profile, jobContext, budgets, opts) => {
 // blank** (a blank halts the walk short of review). OPTIONAL skip → blank needs_review; REQUIRED
 // skip → a CONSPICUOUS placeholder (non-blank → walk advances; the review banners it + the deferred
 // SUBMIT hard-blocks on the marker). ALWAYS filled_review. Provider-agnostic (act.llm).
-const aiFillText = async (act, loc, f, profile, jobContext, budgets, preAnswer) => {
+const aiFillText = async (act, loc, f, profile, jobContext, budgets, preAnswer, essays) => {
   const required = !!f.isRequired;
   const tag = f.widgetType === "textarea" ? "textarea" : "input";
   // OPTIONAL decline → blank+flag; REQUIRED decline → placeholder so the walk reaches review.
@@ -1734,7 +1749,15 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets, preAnswer) 
   const genAllowed = Array.isArray(genList) ? genList.indexOf("application_questions.open_ended") !== -1 : true;
   if (!genAllowed) return await declineOrPlaceholder("AI text generation is switched off for open-ended questions (the autofill_rules allowlist excludes them)");
 
-  const style = (profile && profile.application_questions && profile.application_questions.writing_style) || "";
+  // ⚠ The essays doc outranks the legacy profile read. This `writing_style` lookup has been here
+  // since the AI landed and is ALWAYS "" on the website sync path (`coerceProfile` strips unknown
+  // keys and the website schema has no `application_questions`), so the style clause below has never
+  // actually fired for a synced profile. The doc supplies it now; the legacy read stays as a
+  // fallback for a hand-edited local profile.
+  const essaysDoc = essays || {};
+  const style = String(essaysDoc.style_notes || "").trim()
+    || (profile && profile.application_questions && profile.application_questions.writing_style) || "";
+  const essaySamples = apMatch.selectEssaysForQuestion(essaysDoc.essays, f.label || "", {});
   const system = "You write a brief, human, professional answer to ONE job-application question for the applicant, using ONLY the applicant's profile (experience, projects, skills, essay_drafts, story_bank, open_ended). "
     + (style ? "Writing style: " + style + " " : "")
     + "You MAY answer when the value FOLLOWS from what the profile already says — e.g. the county for a city and state the applicant gave, the country for their city, the state a listed university is in. That is deriving, not inventing, and the profile is the source. Reply SKIP only when the answer is a fact about the applicant that the profile does NOT determine — a salary expectation, an employee or reference ID, a date they never gave, someone else's name, a document number. NEVER fabricate those. "
@@ -1742,6 +1765,7 @@ const aiFillText = async (act, loc, f, profile, jobContext, budgets, preAnswer) 
   const user = "Question / field label: " + String(f.label || "")
     + "\nApplicant profile: " + JSON.stringify(profile)
     + "\nJob context: " + JSON.stringify(jobContext || {})
+    + apMatch.essayPromptBlock(essaySamples, "")
     + "\n\nReply ONLY with a JSON object and nothing else:\n{\"answer\":\"<your answer>\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}  OR  {\"skip\":true,\"reason\":\"<short reason>\"}";
   // preAnswer = this question's entry from the page's batched TEXT call. Transport only: from here
   // down the answer takes exactly the path a per-field reply would (commit, read-back, ALWAYS
@@ -4234,7 +4258,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
       for (const action of Object.keys(groups)) {
         const group = groups[action];
         if (group.length < 2) continue;
-        const { system, user } = buildBatchAiPrompt(group, profile, jobContext);
+        const { system, user } = buildBatchAiPrompt(group, profile, jobContext, (opts && opts.essays) || null);
         // NOT awaited: this is the overlap. The deterministic loop runs against the live page while the
         // model works. Errors are captured, never thrown — a failed batch just means per-field calls.
         // OUTPUT BUDGET SCALES WITH THE BATCH (2026-08-06, operator). Every answer carries a choice, a
@@ -4856,7 +4880,7 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
             : (f.widgetType === "date")
               ? await aiFillDate(act, loc, f, profile, jobContext, budgets,
                   (() => { const s = apMatch.dateOrderOf(f.dateSegments || []); return s.length ? { segments: s } : undefined; })())
-              : await aiFillText(act, loc, f, profile, jobContext, budgets, preText);
+              : await aiFillText(act, loc, f, profile, jobContext, budgets, preText, (opts && opts.essays) || null);
           // EEO retraction: an AI-INFERRED demographic still gets the loud demographic badge. Only a
           // committed inference (filled_review); canonicalize keeps ai-canonicalized (maps a STATED value).
           if (aiRes && aiRes.status === "filled_review" && isEeoField(f)) aiRes.flag = "ai-eeo-guess";

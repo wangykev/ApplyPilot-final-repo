@@ -602,3 +602,40 @@ create index if not exists resumes_current_idx
 -- approved, and a value records when. Status is deliberately NOT touched — the enum is written by the
 -- extension, and approval is a different axis from where the application sits in the pipeline.
 alter table public.applications add column if not exists approved_at timestamptz;
+
+
+-- ==========================================================================
+-- 0019_essays.sql
+-- ==========================================================================
+-- The operator's OWN written application answers, kept as a voice library.
+--
+-- WHY. Every essay was written from scratch: the fill AI got the question, the company, the JD and
+-- the profile JSON, and nothing about how the operator actually writes. So a "list one or two
+-- projects that demonstrate your embedded systems experience (3 sentences max)" answer came back in
+-- generic model prose, the operator rewrote it by hand — and that rewrite was thrown away, because
+-- it lived only inside that one application's review_bundle_json. Now an answer they wrote is saved
+-- and fed back into later essay prompts as a voice sample the model may also mine for facts (their
+-- essays describe projects in more detail than their résumé does).
+--
+-- ONE JSONB COLUMN ON profiles, exactly like buckets_json (0002): RLS is inherited from the existing
+-- owner-only policies, so there is no new policy to keep in step.
+--   NULL  = never provisioned  → the app treats it as an empty library
+--   '{}'  = provisioned then emptied by the operator
+--
+-- ⚠ DELIBERATELY NOT INSIDE profile_json. The ATS essay prompt truncates the profile at
+-- `JSON.stringify(profile).slice(0, 12000)` (ats.js), so essays riding inside the profile would eat
+-- that budget and silently push out real profile data — the fill would get quietly worse as the
+-- library grew. Selection also needs them as an addressable list so it can rank a few against the
+-- question being answered rather than sending the lot.
+--
+-- ⚠ NOT A BUCKET, and not a candidate to become one. buckets_json holds
+-- exact-normalized-wording → verbatim-answer matches, and web/lib/teach.ts excludes essays from that
+-- store on purpose: an essay question is never phrased the same way twice. This is the complementary
+-- store — not "replay this answer" but "here is how I write".
+--
+-- Shape (see web/lib/essays.ts for the zod schema, which is the authority):
+--   { "style_notes": "3 sentences max, no buzzwords",
+--     "essays": [ { "id", "question", "text", "company", "source", "created_at" } ] }
+-- `source` is "review" (auto-captured from a review-page edit) or "manual" (typed on the page).
+alter table public.profiles
+  add column if not exists essays_json jsonb;

@@ -175,11 +175,17 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
     // application_defaults.json). A wholesale overwrite would wipe those, degrading the
     // default-matching ladder — so shallow-merge the incoming keys over the existing object.
     // `buckets` (answer buckets, Profile v2) are fully website-managed → stored wholesale.
+    // `essays` (the operator's own written answers + style notes) likewise — see web/lib/essays.ts.
+    // ⚠ NOTE WHAT THE GUARD ABOVE DOES NOT CHECK: neither `buckets` nor `essays`. That is deliberate
+    // and the website relies on it — both ride WITH the profile slice, so a payload carrying only one
+    // of them is a bug on the sender's side rather than a sync worth performing. Adding them to the
+    // guard would make an essays-only push valid and quietly split the contract in two.
     chrome.storage.local.get("defaults", ({ defaults: existingDefaults }) => {
       const data = {};
       if (message.profile !== undefined) data.profile = message.profile;
       if (message.jobContext !== undefined) data.jobContext = message.jobContext;
       if (message.buckets !== undefined) data.buckets = message.buckets;
+      if (message.essays !== undefined) data.essays = message.essays;
       if (message.defaults !== undefined) {
         data.defaults = { ...(existingDefaults || {}), ...message.defaults };
       }
@@ -359,7 +365,7 @@ chrome.runtime.onMessageExternal.addListener((message, sender, sendResponse) => 
           return;
         }
         const store = await new Promise((r) =>
-          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets"], r)
+          chrome.storage.local.get(["profile", "defaults", "jobContext", "credentials", "onboardConfig", "buckets", "essays"], r)
         );
         if (!store.profile) {
           sendResponse({ ok: false, error: "no-profile", detail: "Sync your profile to the extension first (the Connect page)." });
@@ -3511,6 +3517,10 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
   // Profile v2 — answer buckets (wording → answer). SW reads them from storage (engine computes /
   // SW does I/O) and hands them to the driver, which consults them before the AI pass.
   const buckets = await new Promise((resolve) => chrome.storage.local.get("buckets", (r) => resolve((r && Array.isArray(r.buckets)) ? r.buckets : [])));
+  // The operator's own written answers + style notes, read the same way and for the same reason
+  // (engine computes / SW does I/O). Absent ⇒ null, and every prompt site treats the block as
+  // optional — most operators have no library for a while.
+  const essays = await new Promise((resolve) => chrome.storage.local.get("essays", (r) => resolve((r && r.essays) || null)));
   // Let the flat field set finish rendering BEFORE the first fill pass. Workday form pages mount
   // their fields progressively; on page 1 the walk enters straight from onboarding (no
   // cdpWaitNextPage stabilization), so a premature scan makes drivePageFill's initial pass miss the
@@ -3621,7 +3631,7 @@ async function fillAndPersistPage(act, prepared, defaults, jobContext, LOG, opts
     if (_dbgClobber) LOG("debugClobber ON — re-scanning after EVERY field to attribute any value another field wipes.");
     if (_aiBatch) LOG("AI-batch ENABLED — this page's AI questions go out as ONE call, fired before the deterministic fill.");
     _pageAiAnswers = new Map(); // NEW page ⇒ new questions; never carry answers across pages
-    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, aiAnswers: _pageAiAnswers });
+    out = await drivePageFill(act, prepared, defaults, jobContext, { enableAiBatch: _aiBatch, debugClobber: _dbgClobber, debugPageTrace: _dbgTrace, debugLagTrace: _dbgLag }, { cachedShapes, headingToBase, buckets, essays, aiAnswers: _pageAiAnswers });
     // POST-fill sample, so the probe BRACKETS the fill instead of only sniffing the calm before it.
     // Live (2026-08-10, cat.wd5, 5 pages): every pre-fill sample read both clocks on time (+6..+23ms)
     // while the SAME run logged `delayFull(600ms) actually took 1312ms` mid-fill. One sample at the
@@ -6293,7 +6303,7 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
           + ` (the form settle + block settle + step read above account for this; the option capture and`
           + ` scan that follow are counted in "pre-fill prep")`);
       }
-      out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], credentials: store.credentials || null, resumePreattached: resumePre });
+      out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], essays: store.essays || null, credentials: store.credentials || null, resumePreattached: resumePre });
       allResults = allResults.concat(out.results || []);
       stepsFilled++;
 

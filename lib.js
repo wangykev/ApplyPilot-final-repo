@@ -922,6 +922,109 @@ function normalizeLabel(s) {
   return String(s == null ? "" : s).toLowerCase().replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
 }
 
+// ── ESSAY VOICE SAMPLES: pick the few worth spending prompt on (2026-09-03) ─────────────────────────
+//
+// The operator's own past answers are stored on the website (`profiles.essays_json`) and synced into
+// `chrome.storage.local.essays`. They go into an essay prompt as VOICE SAMPLES the model may also
+// mine for concrete facts — the operator's essays carry project detail their résumé does not.
+//
+// ⚠ A FEW, NOT ALL (operator's choice, and a hard requirement rather than a preference). Essays are
+// long; the library grows with every application; and both ATS prompt sites already truncate the
+// profile at 12 000 chars. Sending everything would grow the prompt without bound, cost more on
+// every fill, and eventually crowd out the profile itself. So: rank by overlap with the question
+// being answered, break ties by recency, and stop at a char budget.
+//
+// ⚠ RANKED ON THE STORED QUESTION FIRST, the text second. What makes a sample useful for "describe a
+// project with embedded systems" is that it ANSWERED something similar — the body is a weaker signal
+// (a long essay shares common words with everything, so weighting it equally lets the longest essay
+// win every question).
+const ESSAY_STOP_WORDS = new Set(["the", "a", "an", "and", "or", "to", "of", "in", "for", "with", "that",
+  "this", "it", "is", "are", "was", "were", "be", "been", "you", "your", "we", "our", "i", "my", "me",
+  "on", "at", "as", "by", "from", "have", "has", "had", "do", "does", "did", "please", "describe",
+  "tell", "us", "about", "why", "what", "how", "which", "who", "when", "one", "two", "any", "some",
+  "max", "words", "sentences", "characters", "answer", "question", "if", "so", "but", "not", "can"]);
+
+function essayTokens(s) {
+  return String(s == null ? "" : s)
+    .toLowerCase().replace(/[^a-z0-9+#. ]+/g, " ").split(/\s+/)
+    .filter((w) => w.length > 2 && !ESSAY_STOP_WORDS.has(w));
+}
+
+/**
+ * Choose the essays to show the model for ONE question.
+ *
+ * Returns newest-first among equally-scoring samples, each truncated to `perEssayChars` and the whole
+ * set to `totalChars`. An empty/absent library returns [] — every caller must treat the block as
+ * optional, because most operators will have none for a while.
+ */
+function selectEssaysForQuestion(essays, question, opts) {
+  const o = opts || {};
+  const max = o.max == null ? 3 : o.max;
+  const perEssayChars = o.perEssayChars == null ? 700 : o.perEssayChars;
+  const totalChars = o.totalChars == null ? 2200 : o.totalChars;
+  const list = Array.isArray(essays) ? essays.filter((e) => e && String(e.text || "").trim()) : [];
+  if (!list.length || max <= 0 || totalChars <= 0) return [];
+
+  const qTokens = new Set(essayTokens(question));
+  const scored = list.map((e, i) => {
+    const qs = new Set(essayTokens(e.question));
+    const ts = new Set(essayTokens(e.text));
+    let score = 0;
+    qTokens.forEach((t) => {
+      if (qs.has(t)) score += 3;        // it answered a question like this one — the strong signal
+      else if (ts.has(t)) score += 1;   // it merely mentions the topic
+    });
+    return { e, score, i };
+  });
+  // Recency breaks ties. `created_at` is an ISO string, so a plain compare is chronological; the
+  // original index is the last resort so the order is deterministic for equal timestamps (a test
+  // relies on that, and so does a stable prompt across re-fills of the same page).
+  scored.sort((a, b) => (b.score - a.score)
+    || String(b.e.created_at || "").localeCompare(String(a.e.created_at || ""))
+    || (a.i - b.i));
+
+  const out = [];
+  let used = 0;
+  for (const s of scored) {
+    if (out.length >= max) break;
+    const text = String(s.e.text || "").slice(0, perEssayChars);
+    if (used + text.length > totalChars) continue;   // skip this one, a shorter later one may fit
+    out.push({ ...s.e, text });
+    used += text.length;
+  }
+  return out;
+}
+
+/**
+ * The prompt block. ONE definition, so all four prompt sites (ATS single + batch, Workday single +
+ * batch) say exactly the same thing to the model — the wording is a safety property, not cosmetics.
+ *
+ * ⚠ The two instructions pull in opposite directions ON PURPOSE. "Match this voice" is why the
+ * samples are here at all; "you MAY reuse concrete facts" is the operator's explicit grant, because
+ * their essays describe projects in more detail than their résumé. The third line is the guard: a
+ * sample that answered a DIFFERENT question must not be pasted in wholesale, which is exactly what a
+ * model handed prose examples will otherwise do.
+ */
+function essayPromptBlock(essays, styleNotes) {
+  const style = String(styleNotes || "").trim();
+  const list = Array.isArray(essays) ? essays : [];
+  if (!list.length && !style) return "";
+  let out = "";
+  if (style) out += "\nHOW I WRITE (my own instructions): " + style;
+  if (list.length) {
+    out += "\nMY OWN PAST ANSWERS — my writing, not yours. Match this voice: sentence length,"
+      + " directness, how I open, how much detail I give."
+      + " You MAY reuse concrete facts from them (projects, tools, numbers) when they genuinely answer"
+      + " THIS question — they describe my work in more detail than my resume does."
+      + " Do NOT copy an answer wholesale if the question is different.";
+    list.forEach((e, i) => {
+      out += "\n--- sample " + (i + 1) + (e.question ? "\nQ: " + String(e.question).slice(0, 300) : "")
+        + "\nA: " + String(e.text || "");
+    });
+  }
+  return out;
+}
+
 // ── ERROR-TEXT ↔ FIELD-LABEL matching key (2026-08-07) ──────────────────────────────────────────────
 // `parseErrorFieldName` strips a trailing colon off the name it extracts (its own trailing-char class
 // includes ":"), but `normalizeLabel` strips only "*" and whitespace. So for any field whose visible
@@ -2506,6 +2609,7 @@ function reportOutcome(status) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+  selectEssaysForQuestion, essayPromptBlock,
   groupSelection, joinGroupValue, splitGroupValue, GROUP_JOIN, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
   recognizeClearanceQuestion, clearanceCandidates, clearanceAliases, CLEARANCE_ALIASES,
   recognizeRelocationQuestion, relocationCandidates,

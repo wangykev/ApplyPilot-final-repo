@@ -35,6 +35,9 @@ const atsLib = (typeof module !== "undefined" && module.exports)
       recognizeRelocationQuestion: recognizeRelocationQuestion, relocationCandidates: relocationCandidates,
       // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
       // join/split exactly the way groups do — see the multiselect commit path.
+      // Essay voice samples — one definition of the ranking AND the prompt block, shared by all
+      // four prompt sites so they cannot drift apart in what they tell the model.
+      selectEssaysForQuestion: selectEssaysForQuestion, essayPromptBlock: essayPromptBlock,
       joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN,
       // Work-experience bullets → one prose block for a "Responsibilities" textarea.
       joinBullets: joinBullets };
@@ -7938,15 +7941,27 @@ async function atsAiChooseOption(act, f, options, profile, jobContext) {
   return { ok: true, choice: parsed.choice, justification: parsed.justification || "", confidence: parsed.confidence || "Low", maps_to: parsed.maps_to || "", suggested_category: parsed.suggested_category || "" };
 }
 
-async function atsAiWriteText(act, f, profile, jobContext) {
+async function atsAiWriteText(act, f, profile, jobContext, essaysDoc) {
   const system = "You draft answers to job-application questions in the candidate's own plain, professional first-person voice. If the question needs a factual answer the profile clearly holds, give it concisely. Reply ONLY with JSON: {\"answer\":\"<the text to enter>\",\"confidence\":\"High|Medium|Low\",\"justification\":\"<short>\",\"maps_to\":\"\",\"suggested_category\":\"\"} — or {\"answer\":null} if you have no basis at all.";
-  const style = ((profile || {}).application_questions || {}).writing_style || "";
+  // ⚠ THE STYLE NOTES TAKE PRECEDENCE OVER THE LEGACY PROFILE FIELD.
+  // `application_questions.writing_style` has been read here since the AI landed but is ALWAYS "" on
+  // the website sync path — `coerceProfile` strips unknown keys and the website schema never had an
+  // `application_questions` object, so this prompt has been asking for something nothing supplied.
+  // Rather than add a schema key nothing else uses, the essays doc carries the notes and wins; the
+  // legacy read stays as a fallback for a hand-edited local profile.
+  const doc = essaysDoc || {};
+  const style = String(doc.style_notes || "").trim() || ((profile || {}).application_questions || {}).writing_style || "";
+  const samples = atsLib.selectEssaysForQuestion(doc.essays, f.label || f.fieldName, {});
+  // ⚠ THE BLOCK GOES AFTER the profile slice, which is truncated at 12 000 chars. Appended here it
+  // cannot be eaten by that cut — which is exactly what would happen to essays stored INSIDE the
+  // profile, and the fill would have got quietly worse as the library grew.
   const user = "QUESTION: " + (f.label || f.fieldName) +
     "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
     (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground your answer in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
     (style ? "\nSTYLE RULES: " + style : "") +
-    "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000);
+    "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000) +
+    atsLib.essayPromptBlock(samples, "");
   // ROUTE: "essay", not the default "fill" (2026-08-12). `act.llm` resolves `action || "fill"`, so
   // omitting it sent every free-text answer — the cover-letter-shaped "why do you want to work here"
   // boxes — to the model configured for yes/no picks. The AI page has had a separate
@@ -8730,23 +8745,33 @@ function atsSameOptionSet(a, b) {
 // "why do you want to work here" boxes and both are deferred by the same rule. Each kind keeps the
 // contract its single-call twin (atsAiChooseOption / atsAiWriteText) already states, so an answer
 // arriving by batch is indistinguishable downstream from one that came from its own call.
-function atsBuildBatchPrompt(items, profile, jobContext) {
+function atsBuildBatchPrompt(items, profile, jobContext, essaysDoc) {
   const system = "You help an applicant fill out ONE job-application page. You are given the applicant's profile (JSON) and SEVERAL questions at once. Answer EVERY question, keyed by its id.\n" +
     "Each question has a \"kind\":\n" +
     "  • \"choice\" — put EXACTLY ONE of that question's \"options\", VERBATIM, in the \"choice\" field. These are REQUIRED questions: always choose the most likely option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education or enrollment dates, criminal/background answers from the ABSENCE of any such record). NEVER refuse, never answer UNKNOWN, and never write an option that is not in that question's list.\n" +
     "  • \"text\" — write the answer as free text in the \"answer\" field, in the applicant's own plain, professional first-person voice. If the question wants a factual answer the profile clearly holds, give it concisely. Use null for \"answer\" ONLY if you have no basis at all.\n" +
     "For every answer give a SHORT justification — one terse phrase, about 12 words, no preamble, no restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give confidence: High, Medium, or Low. " +
     "ALSO map each question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
-  const style = ((profile || {}).application_questions || {}).writing_style || "";
+  // Style + voice samples — see atsAiWriteText for why the essays doc outranks the legacy
+  // `application_questions.writing_style` read.
+  const doc = essaysDoc || {};
+  const style = String(doc.style_notes || "").trim() || ((profile || {}).application_questions || {}).writing_style || "";
   const qs = items.map((it) => (it.kind === "choice"
     ? { id: it.id, kind: "choice", question: it.question, options: it.options }
     : { id: it.id, kind: "text", question: it.question }));
+  // ⚠ RANKED AGAINST THE BATCH'S TEXT QUESTIONS ONLY. One call answers several questions, so there is
+  // no single question to rank against — and including the CHOICE questions would let a page full of
+  // yes/no screening dilute the topic signal and pick the wrong samples for the one essay that
+  // actually needs them. A batch with no text question gets no block at all.
+  const textQs = items.filter((it) => it.kind === "text").map((it) => it.question).join(" ");
+  const samples = textQs ? atsLib.selectEssaysForQuestion(doc.essays, textQs, {}) : [];
   const user = "QUESTIONS: " + JSON.stringify(qs) +
     "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
     (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground free-text answers in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
     (style ? "\nSTYLE RULES for free-text answers: " + style : "") +
     "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000) +
+    atsLib.essayPromptBlock(samples, "") +
     "\n\nReply ONLY with a JSON object and nothing else, one entry per question id:\n" +
     "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<verbatim option — kind=choice only>\",\"answer\":\"<free text — kind=text only>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
   return { system, user };
@@ -8840,7 +8865,7 @@ const ATS_BATCH_ACTION = { choice: "fill", text: "essay" };
 // entry field cannot share a prompt with page-level questions (it would be shown the whole profile)
 // nor with a DIFFERENT entry of the same section. Group first, batch within a group. Batching is
 // preserved where it matters: all of one entry's questions still go in one call.
-async function atsRunAiBatch(act, deferred, profile, jc, cache) {
+async function atsRunAiBatch(act, deferred, profile, jc, cache, essaysDoc) {
   const groups = new Map();
   for (const d of deferred) {
     const k = d.scopeKey || "";
@@ -8849,7 +8874,7 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
   }
   let fired = false, items = 0, answers = 0;
   for (const g of groups.values()) {
-    const r = await atsRunAiBatchGroup(act, g.items, g.profile, jc, cache);
+    const r = await atsRunAiBatchGroup(act, g.items, g.profile, jc, cache, essaysDoc);
     fired = fired || !!(r && r.fired);
     items += (r && r.items) || 0;
     answers += (r && r.answers) || 0;
@@ -8857,7 +8882,7 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
   return { fired, items, answers };
 }
 
-async function atsRunAiBatchGroup(act, deferred, profile, jc, cache) {
+async function atsRunAiBatchGroup(act, deferred, profile, jc, cache, essaysDoc) {
   const byKind = { choice: [], text: [] };
   const idToKey = new Map();
   const seen = new Set();
@@ -8897,7 +8922,7 @@ async function atsRunAiBatchGroup(act, deferred, profile, jc, cache) {
   const fireOne = async (kind) => {
     const items = byKind[kind];
     const action = ATS_BATCH_ACTION[kind] || "fill";
-    const { system, user } = atsBuildBatchPrompt(items, profile, jc);
+    const { system, user } = atsBuildBatchPrompt(items, profile, jc, essaysDoc);
     try { console.log(`[ApplyPilot][ATS-FILL] AI batch [${kind} → "${action}" route]: ${items.length} deferred question(s) in ONE call (cap ${atsBatchMaxTokens(items)} tokens)${cached ? ` · ${cached} already cached` : ""}`); } catch (e) { /* log only */ }
     let res = null;
     try { res = await act.llm({ system, user, maxTokens: atsBatchMaxTokens(items), action }); }
@@ -9463,7 +9488,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
   // Never fatal: a batch that cannot even be BUILT must not cost the page its deferred fields —
   // they each make their own call below, which is exactly the pre-batch behaviour.
   let batch = { fired: false, items: 0, answers: 0 };
-  try { batch = await atsRunAiBatch(act, deferred, profile, jc, aiCache); }
+  try { batch = await atsRunAiBatch(act, deferred, profile, jc, aiCache, (o && o.essays) || null); }
   catch (e) { try { console.log(`[ApplyPilot][ATS-FILL] AI batch threw (${String((e && e.message) || e)}) — every deferred question falls back to its own call`); } catch (e2) { /* log only */ } }
 
   // ── PHASE 3: the second actuation pass ───────────────────────────────────────────────────
@@ -9480,7 +9505,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
     try {
       // scoped profile when this field belongs to a repeating entry — a solo call must obey the
       // same seal the batch does, or the scoping is only as good as whether a batch happened to fire
-      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, d.scopeProfile || profile, answer);
+      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, d.scopeProfile || profile, answer, (o && o.essays) || null);
     } catch (e) {
       d.rec.status = "needs_review";
       d.rec.detail = "AI commit pass exception: " + String((e && e.message) || e);
@@ -11567,12 +11592,12 @@ function atsInjSelectNative(inputSel, optionText) {
 
 // AI fallback for a REQUIRED field the deterministic tiers left empty. Same safety contract
 // as AI-1/AI-2: the choice must clear the match ladder vs live options; ALWAYS flagged.
-async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetched) {
+async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetched, essaysDoc) {
   const wt = f.widgetType;
   try {
     if (wt === "textarea" || wt === "text" || wt === "date") {
       // use the concurrently-prefetched answer when there is one (atsPrefetchAiText); otherwise ask now
-      const ai = prefetched || await atsAiWriteText(act, f, profile, jobContext);
+      const ai = prefetched || await atsAiWriteText(act, f, profile, jobContext, essaysDoc);
       if (!ai.ok || !ai.answer) {
         // REQUIRED text the AI can't ground: write "N/A" — a real, submittable answer that reads
         // correctly on the form (operator 2026-07-31: "never answer with AI declined, N/A would be
