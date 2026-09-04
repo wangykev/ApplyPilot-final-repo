@@ -404,12 +404,16 @@ function cdpAttach(tabId) {
           const kw = await new Promise((r) => chrome.storage.local.get(["keepWarmBeat", "atsKeepWarm"], r));
           const off = kw && (kw.keepWarmBeat === false || kw.atsKeepWarm === false);
           if (!off && cdpKeepWarmStart()) {
-            console.log("[ApplyPilot][CDP] keep-warm beat ON (500ms) — a standing reason for the MV3 worker to stay scheduled; "
+            // ⚠ INTERPOLATED, never a literal. This line said "(500ms)" for every run after the beat
+            // was halved to 250ms, so the log actively contradicted the code — and a diagnostic that
+            // lies is worse than none: the whole point of this line is to be trusted when attributing
+            // a starved pace. Read it from the constant and the two can never disagree again.
+            console.log(`[ApplyPilot][CDP] keep-warm beat ON (${CDP_WARM_BEAT_MS}ms) — a standing reason for the MV3 worker to stay scheduled; `
               + "without it a 600ms pace was measured taking 13461ms. Set keepWarmBeat=false to A/B it off.");
           } else if (off) {
             console.log("[ApplyPilot][CDP] keep-warm beat OFF by flag — expect intermittent multi-second sw-starved paces");
           }
-        } catch (e) { if (cdpKeepWarmStart()) console.log("[ApplyPilot][CDP] keep-warm beat ON (500ms)"); }
+        } catch (e) { if (cdpKeepWarmStart()) console.log(`[ApplyPilot][CDP] keep-warm beat ON (${CDP_WARM_BEAT_MS}ms)`); }
         cdpInvalidatePaint(); // a fresh attach says nothing about the previous tab's paint state
         _synthInputEnabled = false; // per-run opt-in — only the FILL entry points enable it (auth/onboarding/recon stay trusted)
         console.log(`[ApplyPilot][CDP] input mode: trusted${_forceTrustedInput ? " ALWAYS (forceTrustedInput)" : " (synthetic-when-hidden armed — the fill walk enables it)"}`);
