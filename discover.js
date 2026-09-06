@@ -370,13 +370,37 @@ function buildDiscoverQueries(opts) {
 // therefore emits only what the page honours; every richer filter goes through
 // linkedInApiSearchUrl instead. Used for the DOM-fallback sweep, the geo resolver
 // and recon — i.e. the paths that need a real rendered page.
+/**
+ * The recency window, in seconds, for a board's own "posted within" filter.
+ *
+ * ⚠ AN ABSENT `sinceDays` MEANS THE DECLARED DEFAULT (30d), NOT ONE DAY. Both board URL builders
+ * used to fall back to `|| 1`, while `matchPercent` fell back to `DISCOVER_DEFAULTS.sinceDays` — two
+ * different answers to the same missing option. The website's Discover panel has NO sinceDays
+ * control (the "Posted within N days" knob was removed 2026-07-30), so it never sends one, and every
+ * sweep from the site therefore asked LinkedIn for the last 24 HOURS while the scorer believed the
+ * window was 30 days.
+ *
+ * Measured live 2026-09-06: two sweeps run minutes apart on identical settings, the only difference
+ * being an explicit `sinceDays`. The 1-day window returned **0 new jobs** (everything found scored
+ * 21–37% and fell under the threshold); the wide window returned **7 new jobs at 63–83%**, six of
+ * them confirmed Summer 2027 in the JD. A 2027 internship is posted months ahead, so a 24-hour
+ * filter is precisely the wrong net for the thing being searched for.
+ *
+ * This restores what DISCOVER_DEFAULTS already documents: freshness is SCORED by matchPercent, not
+ * filtered here, so a wide window costs nothing — an old posting simply scores low.
+ */
+function discoverWindowSecs(o) {
+  const days = Number((o || {}).sinceDays) > 0 ? Number(o.sinceDays) : DISCOVER_DEFAULTS.sinceDays;
+  return Math.max(1, Math.round(days * 86400));
+}
+
 function discoverLinkedInSearchUrl(opts) {
   const o = opts || {};
   const keywords = String(o.keywords || "").trim();
   // HARD REFUSAL: a keyword-less LinkedIn search is the recommended feed, not a
   // search. Better to fail loudly than to queue jobs nobody asked for.
   if (!keywords) return "";
-  const secs = Math.max(1, Math.round((Number(o.sinceDays) || 1) * 86400));
+  const secs = discoverWindowSecs(o);
   let u = "https://www.linkedin.com/jobs/search-results/?keywords=" + encodeURIComponent(keywords) +
     "&f_TPR=r" + secs;
   // A numeric geoId is the ONLY location form the page keeps. No geoId ⇒ no
@@ -399,7 +423,7 @@ function linkedInApiSearchUrl(opts) {
   if (!keywords) return ""; // same refusal as the page builder
   const geoId = String(o.geoId || "").trim();
   if (!/^\d+$/.test(geoId)) return ""; // locationUnion REQUIRES a numeric geoId (locationName ⇒ HTTP 500)
-  const secs = Math.max(1, Math.round((Number(o.sinceDays) || 1) * 86400));
+  const secs = discoverWindowSecs(o);
   const start = Math.max(0, Number(o.start) || 0);
   const count = Math.max(1, Math.min(Number(o.count) || 25, 25));
 
@@ -3773,6 +3797,7 @@ if (typeof module !== "undefined" && module.exports) {
     DISCOVER_CYCLES,
     discoverTermLabel,
     discoverTermContradiction,
+    discoverWindowSecs,
     buildDiscoverQuery,
     buildDiscoverQueries,
     discoverKeywordTokens,
