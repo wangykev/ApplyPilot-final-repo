@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-aim-47";
+const AP_BUILD_MARKER = "icims-walk-49";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4668,6 +4668,204 @@ async function pullApprovedBundle(LOG, opts) {
 // discovery relies on), so NO host permissions are needed for these sites.
 // ============================================================================
 
+/**
+ * Click a control at a rect that was measured INSIDE a pinned frame.
+ *
+ * ⚠⚠ A FRAME-HOSTED FORM'S RECT IS FRAME-RELATIVE; A TRUSTED CLICK IS TOP-LEVEL. `getBoundingClientRect`
+ * is relative to the document it runs in, and on iCIMS the scan runs inside `#icims_content_iframe`,
+ * while `Input.dispatchMouseEvent` aims at the TOP viewport. Measured live 2026-09-08: the frame's
+ * top sat at y = -1647, so an armed submit aimed at 962,1930 was 1647px from the button and no
+ * iCIMS application was ever actually sent. See atsInjIcimsFrameOffset for the full evidence.
+ *
+ * ONE COPY, shared by every aimed click on this path (the fill's page advance and both halves of the
+ * submit) — two near-duplicates of this arithmetic is exactly the drift this codebase keeps paying
+ * for, and here a wrong copy misses a button silently.
+ *
+ * ⚠ AN UNREADABLE OFFSET REFUSES rather than clicking blind: aiming an irreversible control by guess
+ * is worse than not firing it. Returns `{ok:false, reason}` and clicks nothing.
+ */
+/**
+ * Pin the iCIMS content frame — the ladder, in ONE copy.
+ *
+ * The ordinary floored call first, so a gate/form page behaves exactly as it always has; only if
+ * that refuses do we fall back to a 0-floor call, which is safe ONLY because it must match the
+ * frame's own url as read from the top document's `<iframe>` element (never a hostname guess). A
+ * posting page and a mid-postback frame both legitimately hold zero controls, which is what the
+ * second rung is for.
+ *
+ * ⚠ ONE COPY because the step walk needs exactly this ladder after every advance: iCIMS' advance is
+ * a postback, the frame's document is replaced, and the pin has to be re-established before the step
+ * list can be read again. A second near-copy of a frame-pinning ladder is how this file previously
+ * ended up reading the top document and calling a live posting `posting-gone`.
+ */
+async function icimsArmFrame(LOG) {
+  if (cdpFormFrameArmed()) return true;
+  const floored = await cdpUseFormFrame(1).catch(() => ({ ok: false }));
+  if (floored && floored.ok) return true;
+  const el = await cdpEvalTop(atsInjIcimsFrameSrc).catch(() => null);
+  if (!el || !el.ok || !el.src) return false;
+  // The frame may have navigated since the attribute was written, so identity is the STABLE part of
+  // its url — origin + path, without the query (an iCIMS session query is one-time and changes).
+  let idRe = null;
+  try {
+    const u = new URL(el.src);
+    idRe = new RegExp("^" + (u.origin + u.pathname).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  } catch (e) { return false; }
+  const id = await cdpUseFormFrame(0, { identifyUrl: idRe }).catch(() => ({ ok: false }));
+  if (id && id.ok && LOG) LOG(`the posting itself is inside the iCIMS frame — driving it there (${id.controls} control(s), identified by the page's own iframe src)`);
+  return !!(id && id.ok);
+}
+
+async function atsAimedClick(ats, rect, what, LOG) {
+  let x = rect.cx, y = rect.cy;
+  if (ats === "icims" && cdpFormFrameArmed()) {
+    const off = await cdpEvalTop(atsInjIcimsFrameOffset).catch(() => null);
+    if (!off || !off.ok) return { ok: false, reason: (off && off.error) || "frame-offset-unreadable" };
+    x += off.x; y += off.y;
+    if (LOG) LOG(`  ${what}: inside the iCIMS frame — translating ${rect.cx},${rect.cy} by the frame's own offset +${off.x},+${off.y} → ${x},${y}`);
+  }
+  await cdpClickAt(x, y);
+  return { ok: true, x, y };
+}
+
+/**
+ * iCIMS' step state, normalized onto the shape the multi-step walk already reads for Oracle.
+ *
+ * ⚠⚠ ON iCIMS ONE CONTROL IS BOTH NEXT AND SUBMIT — `cp_form_submit_i` ("Submit Profile") advances
+ * on every step but the last, where it submits. That is Workday's footer-button problem, not
+ * Oracle's: ORC's guard 2 refuses a FORBIDDEN CAPTION, and a caption cannot tell these two apart
+ * because they are the same string. So terminality here comes only from the platform's own step
+ * list, and `hasNext` / `hasSubmit` are derived from WHERE WE ARE rather than from what the button
+ * says.
+ */
+async function icimsStepState() {
+  const steps = await cdpEval(atsInjIcimsSteps).catch(() => null);
+  if (!steps || !steps.ok) return { ok: false, reason: "steps-unreadable" };
+  const sub = await cdpEval(atsInjSubmitState, "icims").catch(() => null);
+  if (!steps.present) {
+    // ⚠⚠ "NO STEP LIST" HAS TWO CAUSES AND THEY MUST NOT SHARE AN ANSWER (caught live 2026-09-08 by
+    // this function's own first walk). Either this really is a single-page iCIMS form — the shape
+    // this pipeline was built against (Astrion) — or we are momentarily NOT LOOKING AT THE FORM,
+    // because a postback replaced the frame's document and the pin is stale. iCIMS' advance IS a
+    // postback, so the second case happens on every step change.
+    //
+    // Reading the second as the first was a real defect twice over: the advance's monotone wait
+    // compared `step 1 > step 1` forever and reported `step-did-not-advance` on a press that had
+    // worked (24 frameStartedLoading events say so), and — far worse — this branch claimed
+    // `isLast: true`, which is the value that authorises pressing the REAL submit.
+    //
+    // The discriminator is the submit control: every iCIMS form has one, on every step. No steps AND
+    // no control ⇒ we are not on the form, and an unreadable page must never resolve to "last step".
+    if (!sub || !sub.hasSubmit) return { ok: false, reason: "not-looking-at-the-form" };
+    return { ok: true, present: false, step: 1, total: 1, isLast: true, declaredAgrees: true,
+      hasNext: false, nextCaption: null, nextEnabled: false,
+      hasSubmit: true, submitCaption: (sub && sub.label) || null,
+      rect: (sub && sub.rect) || null,
+      visibleSections: [], sectionCount: 1 };
+  }
+  const control = !!(sub && sub.hasSubmit);
+  const enabled = control && !(sub && sub.disabled);
+  return {
+    ok: true, present: true,
+    step: steps.currentPos, total: steps.count,
+    isLast: steps.isLast, declaredAgrees: steps.declaredAgrees,
+    titles: steps.titles,
+    // NOT on the last step ⇒ that control is Next. ON the last ⇒ it is Submit. Same element.
+    hasNext: steps.isLast === false && control,
+    nextCaption: steps.isLast === false ? ((sub && sub.label) || "Submit Profile") : null,
+    nextEnabled: steps.isLast === false && enabled,
+    hasSubmit: steps.isLast === true && control,
+    submitCaption: steps.isLast === true ? ((sub && sub.label) || "Submit Profile") : null,
+    rect: (sub && sub.rect) || null,
+    visibleSections: steps.titles || [], sectionCount: steps.count,
+  };
+}
+
+/**
+ * Advance iCIMS off a NON-FINAL step. Never presses on the last step — that press is the submit.
+ *
+ * ⚠⚠ THE DOUBLE GUARD, AND WHY IT CANNOT BE ORC'S. Oracle's `orcAdvanceAfterStep` pairs "no Next
+ * control" with `atsInjOrcClickButton` refusing a forbidden CAPTION. Here both roles belong to the
+ * same element with the same caption, so a caption check is worthless and its absence cannot mark
+ * the end either. Both guards therefore read iCIMS' own step declaration, at two different times:
+ *
+ *   GUARD 1 (the caller): only advance when the step state says `isLast === false`.
+ *   GUARD 2 (here): RE-READ the steps immediately before pressing and refuse unless `isLast` is
+ *                   still exactly `false`. `true` means we are on the submit step; `null` means the
+ *                   position is unknown — and unknown must never read as "safe to press", which is
+ *                   the whole lesson of the ORC count rule.
+ *
+ * A fill reaching the final step is the SUCCESS terminal (`reached-final-step`), exactly as the
+ * Workday walk stops on the review page: it fills every step and submits nothing.
+ *
+ * ⚠ The advance predicate is MONOTONE — the declared step number went UP. A monotone predicate can
+ * only be noticed late, never missed, which is the standing rule for every wall-clock poll here.
+ */
+async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
+  const before = await icimsStepState();
+  if (!before.ok) return { advanced: false, stopped: "step-state-unreadable",
+    detail: "Could not re-read iCIMS' step indicator before advancing, so nothing was pressed." };
+  // GUARD 2 — re-read, and refuse anything that is not a definite "not the last step".
+  if (before.isLast !== false) {
+    return { advanced: false,
+      stopped: before.isLast === true ? "reached-final-step" : "step-position-unknown",
+      detail: before.isLast === true
+        ? `Step ${stepNo} (${stepLabel}) is the LAST step — the control there is the real Submit, so the fill stops here and submits nothing.`
+        : "iCIMS' step indicator did not say which step is current, so the advance refused rather than pressing a control that may be the submit." };
+  }
+  if (before.declaredAgrees === false) {
+    return { advanced: false, stopped: "step-declaration-disagrees",
+      detail: `iCIMS' own "Step N of M" does not agree with the order of its step list, so which step is last is not settled — refusing to press.` };
+  }
+  if (!before.hasNext) {
+    return { advanced: false, stopped: "no-advance-control",
+      detail: `Step ${stepNo} (${stepLabel}) is not the last step but offers no control to advance with.` };
+  }
+  if (!before.nextEnabled) {
+    return { advanced: false, stopped: "advance-disabled",
+      detail: `The control on step ${stepNo} (${stepLabel}) is disabled, so the walk stopped rather than pressing a dead button.` };
+  }
+  if (!before.rect) {
+    return { advanced: false, stopped: "advance-unaimable",
+      detail: "The advance control could not be located on the page, so nothing was pressed." };
+  }
+  LOG(`step ${stepNo} (${stepLabel}) is ${before.step} of ${before.total} — pressing ${JSON.stringify(before.nextCaption)} to ADVANCE (not submit: step ${before.total} is the last)`);
+  const clicked = await atsAimedClick("icims", before.rect, "advance", LOG);
+  if (!clicked.ok) return { advanced: false, stopped: "advance-unaimable",
+    detail: `The advance control is inside the iCIMS frame and its offset could not be read (${clicked.reason}), so nothing was pressed.` };
+  // Wait for the DECLARED step number to go UP (monotone), or for the page to say why it will not.
+  //
+  // ⚠⚠ THE ADVANCE IS A POSTBACK, SO THE FRAME'S DOCUMENT IS REPLACED UNDER US — and an isolated
+  // world dies with its document. `cdpEval` re-arms only when the stale context THROWS; a document
+  // swapped for a fresh one answers reads perfectly well while being the wrong document, so the
+  // step list simply reads absent. Without the re-pin below this loop compared `step 1 > step 1`
+  // until the budget ran out and reported `step-did-not-advance` on a press that had WORKED.
+  const deadline = Date.now() + 25000;
+  let repins = 0;
+  while (Date.now() < deadline) {
+    await cdpDelay(700);
+    const now = await icimsStepState();
+    // Not looking at the form (or no step list where there was one a moment ago) ⇒ the postback is
+    // still in flight. Re-pin and look again; never compare against a read that is not of the form.
+    if (!now.ok || now.present === false) {
+      if (repins < 12) { repins++; await icimsArmFrame(); }
+      continue;
+    }
+    if (now.step != null && before.step != null && now.step > before.step) {
+      LOG(`✓ step ${before.step} → ${now.step}${now.titles ? " (" + (now.titles[now.step - 1] || "?") + ")" : ""}`
+        + (repins ? ` (re-pinned the content frame ${repins}× while the postback landed)` : ""));
+      return { advanced: true, step: now.step };
+    }
+  }
+  // Refused: report the FORM's own words rather than guessing, and never retry in place.
+  const errs = await cdpEval(atsInjErrors, "icims").catch(() => null);
+  const list = (errs && errs.errors) || [];
+  if (list.length) { LOG(`step ${stepNo} did not advance — the form says:`); list.slice(0, 6).forEach((e) => LOG("  · " + e)); }
+  return { advanced: false, stopped: "step-did-not-advance", errors: list,
+    detail: `Step ${stepNo} (${stepLabel}) did not advance within 25s.`
+      + (list.length ? " The form says: " + list.slice(0, 3).join(" / ") : " The form gave no error text.") };
+}
+
 // Poll the form until its field count has been non-zero and UNCHANGED for a QUIET WINDOW (the
 // standing "never scan a progressively-rendered page without settling it" rule — 5th site).
 // ⚠ Timed, not counted — see the NO_CHANGE_MS note inside for why a count floor is the wrong shape
@@ -5265,35 +5463,23 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
   // that refuses do we fall back to a 0-floor call, which is safe because it must match the frame's
   // own url as read from the top document's <iframe> element (never a hostname guess).
   let armIcimsFrameLogged = false;   // throttles the not-armed-yet line to once per stage
+  // ONE COPY of the ladder lives in `icimsArmFrame`; this wrapper only adds the stage's own
+  // diagnostic. Two near-copies of a frame-pinning ladder is how this file previously ended up
+  // reading the top document and calling a live posting `posting-gone`.
   const armIcimsFrame = async () => {
-    if (cdpFormFrameArmed()) return true;
-    const floored = await cdpUseFormFrame(1).catch(() => ({ ok: false }));
-    if (floored && floored.ok) return true;
-    const el = await cdpEvalTop(atsInjIcimsFrameSrc).catch(() => null);
-    if (!el || !el.ok || !el.src) {
-      // ⚠ SAY WHICH RUNG GAVE UP, ONCE. Both rungs failing is indistinguishable in the log from "this
-      // page has no frame", and the run then reads the top document and halts `apply-not-followable`
-      // / `posting-gone` — verdicts that are FALSE on a live posting (proven 2026-09-08: the same
-      // Shure url failed VISIBLE with `frame=none` and rehearsed clean HIDDEN, 19/19 replayed). The
-      // settle re-arms every poll, so this is throttled to one line per stage to stay readable.
-      if (!armIcimsFrameLogged) {
-        armIcimsFrameLogged = true;
-        LOG(`the iCIMS content frame is not armed yet — floored(1) refused and the top document advertises no frame src`
-          + ` (${el ? (el.ok ? "probe ok, src empty" : "probe not ok: " + String(el.error || "?").slice(0, 40)) : "probe threw"})`
-          + " — if this stage ends in apply-not-followable or posting-gone, THIS is why, and the posting is probably fine");
-      }
-      return false;
+    if (await icimsArmFrame(LOG)) return true;
+    // ⚠ SAY WHICH RUNG GAVE UP, ONCE. Both rungs failing is indistinguishable in the log from "this
+    // page has no frame", and the run then reads the top document and halts `apply-not-followable`
+    // / `posting-gone` — verdicts that are FALSE on a live posting (proven 2026-09-08). The settle
+    // re-arms every poll, so this is throttled to one line per stage to stay readable.
+    if (!armIcimsFrameLogged) {
+      armIcimsFrameLogged = true;
+      const el = await cdpEvalTop(atsInjIcimsFrameSrc).catch(() => null);
+      LOG(`the iCIMS content frame is not armed yet — floored(1) refused and the top document advertises no frame src`
+        + ` (${el ? (el.ok ? "probe ok, src empty" : "probe not ok: " + String(el.error || "?").slice(0, 40)) : "probe threw"})`
+        + " — if this stage ends in apply-not-followable or posting-gone, THIS is why, and the posting is probably fine");
     }
-    // The frame may have navigated since the attribute was written, so identity is the STABLE part of
-    // its url — origin + path, without the query (an iCIMS session query is one-time and changes).
-    let idRe = null;
-    try {
-      const u = new URL(el.src);
-      idRe = new RegExp("^" + (u.origin + u.pathname).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    } catch (e) { return false; }
-    const id = await cdpUseFormFrame(0, { identifyUrl: idRe }).catch(() => ({ ok: false }));
-    if (id && id.ok) LOG(`the posting itself is inside the iCIMS frame — driving it there (${id.controls} control(s), identified by the page's own iframe src)`);
-    return !!(id && id.ok);
+    return false;
   };
 
   // The composite page identity: iCIMS frames everything, so a change can land in the TOP document
@@ -6306,7 +6492,20 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     //     the fallback signal for a tenant that advances without touching the url.
     //   • A REFUSED ADVANCE IS A GRACEFUL HALT WITH THE PAGE'S OWN ERRORS, never a guess and never a
     //     retry loop: ORC blocks Next on an empty required field exactly as Workday blocks Save.
-    const MULTI = ats === "oracle";
+    // ⚠⚠ iCIMS IS THE SECOND MULTI-PAGE FORM ON THIS PATH (operator + verified live 2026-09-08).
+    // The comment above said "Greenhouse, Lever, Ashby and iCIMS are all one page" — true of the
+    // iCIMS forms this pipeline was built against (Astrion), false in general. Shure serves
+    // "Step 1 of 2. Candidate Profile" → "Step 2 of 2. EEO", and `cp_form_submit_i` is NEXT on
+    // every step but the last. So the fill was reading page 1 correctly and completely, and the
+    // required `rcf3048` ("How did you hear about us?") on step 2 was never scanned, never
+    // reviewed, and never approved — the employer's validator was the only thing that noticed.
+    //
+    // ⚠ THE PLATFORM DIFFERENCE THAT MATTERS: Oracle has a distinct Next and Submit, so its guard 2
+    // can refuse a forbidden CAPTION. iCIMS uses ONE control for both, which is Workday's footer
+    // problem — so its guards read the platform's own STEP DECLARATION twice instead
+    // (icimsAdvanceAfterStep). Each platform keeps its own step read and its own advance; only the
+    // loop is shared, which is what keeps the never-submit invariants in one place.
+    const MULTI = ats === "oracle" || ats === "icims";
     const ORC_MAX_STEPS = 8;               // backstop, not an expectation (observed: 3 and 4 steps)
     let out = null;                        // the LAST step's raw result
     let allResults = [];                   // every step's, so the timing log covers the whole walk
@@ -6318,13 +6517,18 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
 
     for (let iter = 1; iter <= (MULTI ? ORC_MAX_STEPS : 1); iter++) {
       const stepT0 = Date.now();
-      let st = MULTI ? await cdpEval(atsInjOrcStepState).catch(() => null) : null;
+      let st = !MULTI ? null
+        : ats === "icims" ? await icimsStepState().catch(() => null)
+          : await cdpEval(atsInjOrcStepState).catch(() => null);
       if (MULTI) {
         if (!st || !st.ok) {
           walkStopped = "step-state-unreadable";
-          walkDetail = "Could not read which step of the Oracle wizard the page is on, so the walk stopped rather than pressing controls blind.";
+          walkDetail = `Could not read which step of the ${ats === "icims" ? "iCIMS application" : "Oracle wizard"} the page is on, so the walk stopped rather than pressing controls blind.`;
           break;
         }
+        // A single-page iCIMS form (no step list at all) walks exactly as it always did: one step,
+        // already the last, nothing pressed. Byte-identical behaviour for Astrion and friends.
+        if (ats === "icims" && st.present === false) LOG("no iCIMS step indicator on this form — treating it as the single page it is");
         LOG(`step ${st.step != null ? st.step : "?"}${st.total ? " of " + st.total : ""} — sections ${JSON.stringify(st.visibleSections)} visible of ${st.sectionCount} · next=${st.hasNext ? JSON.stringify(st.nextCaption) + (st.nextEnabled ? "" : " (DISABLED)") : "none"} · submit=${st.hasSubmit ? JSON.stringify(st.submitCaption) : "none"}`);
         // ⚠⚠ A BLOCK CAN BE MOUNTED WITH ITS CONTENTS STILL IN FLIGHT, and the field-set settle
         // cannot see it. Live 2026-08-19 step 3 reported `"Application Questions" (0 input(s))`
@@ -6338,8 +6542,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         // demand), so the only suspicious shape is a block with NEITHER controls NOR an add button.
         // That distinction is what makes this a settle and not a guess — and it is why the block
         // inventory had to exist before this could be written.
-        await orcAwaitBlocksPopulated(LOG);
-        emitRunProgress(`Filling step ${st.step != null ? st.step : iter}${st.total ? " of " + st.total : ""}`, "Oracle wizard (never submits)");
+        // ⚠ ORACLE ONLY. This settle exists for ORC's separately-fetched question blocks; iCIMS
+        // renders its step server-side in one document and has `waitAtsFormReady` + the résumé
+        // parse settle already, so running it here would poll for a block inventory this platform
+        // does not have.
+        if (ats !== "icims") await orcAwaitBlocksPopulated(LOG);
+        emitRunProgress(`Filling step ${st.step != null ? st.step : iter}${st.total ? " of " + st.total : ""}`,
+          ats === "icims" ? "iCIMS application (never submits)" : "Oracle wizard (never submits)");
       }
 
       // What the operator actually asked about: everything from the code being accepted to the fill
@@ -6359,6 +6568,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       const stepNo = MULTI ? (st.step != null ? st.step : iter) : 1;
       const stepLabel = (() => {
         if (!MULTI) return "Application";
+        // iCIMS NAMES ITS OWN STEPS ("Candidate Profile", "EEO") — use the platform's word rather
+        // than the document title, which on iCIMS is the job posting's title on every step and would
+        // give all of them the same label in review.
+        if (ats === "icims") {
+          const t = st && Array.isArray(st.titles) && st.step != null ? st.titles[st.step - 1] : null;
+          return t || ("Step " + stepNo);
+        }
         const name = String(out.title || "").split(" - ")[0].trim();
         return name && !/^oracle/i.test(name) ? name : "Step " + stepNo;
       })();
@@ -6397,7 +6613,13 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
 
       // The advance is SHARED with the submit walk — see orcAdvanceAfterStep. Guard 1, the
       // disabled-Next wait, guard 2 and the monotone advance all live there, in one copy.
-      const adv = await orcAdvanceAfterStep(stepNo, stepLabel, LOG, ats);
+      // ⚠ iCIMS HAS ITS OWN because its guards cannot be Oracle's: one control is both Next and
+      // Submit there, so a forbidden-caption check (ORC's guard 2) is worthless and the absence of a
+      // Next control cannot mark the end either. Both of its guards read iCIMS' own step declaration
+      // instead, at two different times — see icimsAdvanceAfterStep.
+      const adv = ats === "icims"
+        ? await icimsAdvanceAfterStep(stepNo, stepLabel, LOG)
+        : await orcAdvanceAfterStep(stepNo, stepLabel, LOG, ats);
       if (!adv.advanced) { walkStopped = adv.stopped; walkDetail = adv.detail; break; }
       if (iter === ORC_MAX_STEPS) {
         walkStopped = "max-steps";
@@ -6428,7 +6650,8 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // told WHICH step it got stuck on and what the form said, not merely that something was missed.
     if (orcSinglePageOnly) {
       bundle.partial = true;
-      bundle.partialReason = "Oracle serves this application as a multi-step wizard and this run stopped at step "
+      bundle.partialReason = (ats === "icims" ? "iCIMS serves this application in multiple steps" : "Oracle serves this application as a multi-step wizard")
+        + " and this run stopped at step "
         + (stepsWalked.length ? stepsWalked[stepsWalked.length - 1].step + " (" + stepsWalked[stepsWalked.length - 1].label + ")" : "?")
         + " — " + (walkStopped || "unknown") + ". " + (walkDetail || "")
         + " The remaining steps have not been filled or reviewed — do not treat this bundle as a complete application.";
