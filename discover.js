@@ -2380,6 +2380,69 @@ function unwrapStoryLink(raw) {
 const STORY_LINK_TRACKERS = ["fbclid", "igshid", "igsh"];
 
 /**
+ * Is this an ATS SHORT LINK — a redirector that maps 1:1 onto one posting on a known ATS?
+ *
+ * ⚠⚠ THIS IS A DEDUP FIX, WHICH `unwrapStoryLink` DELIBERATELY IS NOT (live 2026-09-08). A short
+ * link keys on ITSELF, so it cannot match the resolved posting already sitting in the tracker:
+ *
+ *   discoveryJobKey("https://grnh.se/uuce4zv48us")                                  →
+ *     "https://grnh.se/uuce4zv48us"                          (no ATS key — the url IS the key)
+ *   discoveryJobKey("https://job-boards.greenhouse.io/k2spacecorporation/jobs/5411921008") →
+ *     "greenhouse:k2spacecorporation:5411921008"
+ *
+ * So a K2 Space role SUBMITTED that morning came back as a "new" job the same afternoon, because
+ * LinkedIn stored its apply link as the shortener. The operator's standing instruction is that a job
+ * already applied to must never be reported back — and the re-key + knownSet re-check downstream was
+ * already there and correct; it was just handed a key that could never match.
+ *
+ * ⚠ A TIGHT ALLOWLIST, never a generic shortener list. `grnh.se` is Greenhouse's own and always lands
+ * on a Greenhouse posting; a bit.ly can point anywhere, and following arbitrary redirectors from
+ * scraped pages turns a dedup fix into a request-forgery surface. Add a host here only once it is
+ * known to map 1:1 onto one ATS posting.
+ */
+const DISCOVER_ATS_SHORT_HOSTS = [/^grnh\.se$/i];
+function isAtsShortLink(raw) {
+  let u;
+  try { u = new URL(String(raw == null ? "" : raw).trim()); } catch (e) { return false; }
+  if (!/^https?:$/i.test(u.protocol)) return false;
+  return DISCOVER_ATS_SHORT_HOSTS.some((re) => re.test(u.hostname));
+}
+
+/**
+ * Follow an ATS short link ONCE and return where it lands ("" when it cannot be resolved).
+ *
+ * Impure by necessity — the destination is only in the redirect, not the url (which is exactly why
+ * `unwrapStoryLink` could stay pure: Meta puts the target in `?u=`). `fetchImpl` is injectable so the
+ * unit tests can drive it without a network.
+ *
+ * NEVER THROWS and never blocks a sweep: an unresolvable short link falls back to the original url,
+ * so the job is still queued — just keyed as it was before. Degrading to a possible duplicate is the
+ * right direction; losing the job entirely is not.
+ */
+async function resolveAtsShortLink(raw, fetchImpl, timeoutMs) {
+  const url = String(raw == null ? "" : raw).trim();
+  if (!isAtsShortLink(url)) return "";
+  const f = typeof fetchImpl === "function" ? fetchImpl : (typeof fetch === "function" ? fetch : null);
+  if (!f) return "";
+  const ctl = typeof AbortController === "function" ? new AbortController() : null;
+  const t = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) { /* already gone */ } }, Number(timeoutMs) || 8000) : null;
+  try {
+    // GET, not HEAD: some redirectors answer HEAD with a 405 and never issue the Location.
+    const r = await f(url, { redirect: "follow", cache: "no-store", ...(ctl ? { signal: ctl.signal } : {}) });
+    const landed = String((r && r.url) || "");
+    if (!/^https?:\/\//i.test(landed)) return "";
+    // Landing back on the shortener means nothing was followed — report failure rather than
+    // "resolved to itself", which would look like a successful resolve in the log.
+    if (isAtsShortLink(landed)) return "";
+    return landed;
+  } catch (e) {
+    return "";
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
+/**
  * INJECTED into an instagram.com tab. Self-contained — closes over NOTHING.
  *
  * Returns the RAW sticker urls; unwrapping, filtering and job-shaping all happen
@@ -3060,8 +3123,20 @@ async function readBoardDetails(tabId, source, jobs, opts, known) {
     job.boardUrl = job.url;
     if (patch.applyUrl && /^https?:\/\//i.test(patch.applyUrl)) {
       const before = job.jobKey;
-      job.url = patch.applyUrl;
-      job.jobKey = discoveryJobKey(patch.applyUrl);
+      // ⚠ FOLLOW AN ATS SHORT LINK BEFORE KEYING (live 2026-09-08). LinkedIn stores some apply links
+      // as the ATS's own shortener, and a short link keys on ITSELF — so the knownSet re-check just
+      // below could never match the resolved posting already in the tracker, and a K2 Space role
+      // SUBMITTED that morning came back as "new" the same afternoon. Resolving first is what makes
+      // that check mean what it says. Unresolvable ⇒ keep the original url (still queued, keyed as
+      // before): a possible duplicate is recoverable, a dropped job is not.
+      let applyUrl = patch.applyUrl;
+      if (isAtsShortLink(applyUrl)) {
+        const landed = await resolveAtsShortLink(applyUrl);
+        if (landed) { dlog(`      short link followed: ${applyUrl} → ${landed}`); applyUrl = landed; }
+        else dlog(`      ⚠ short link could NOT be followed (${applyUrl}) — keying on it as-is, so a duplicate is possible`);
+      }
+      job.url = applyUrl;
+      job.jobKey = discoveryJobKey(applyUrl);
       job.applyResolved = true;
       stats.rewritten++;
       dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars · REAL LINK via ${patch.applyVia}`);
@@ -3419,8 +3494,17 @@ async function fillMissingDescriptions(jobs, opts) {
           if (isBoardUrl(job.url) && jd.applyUrl && /^https?:\/\//i.test(jd.applyUrl) && !isBoardUrl(jd.applyUrl)) {
             const before = job.jobKey;
             job.boardUrl = job.url;
-            job.url = jd.applyUrl;
-            job.jobKey = discoveryJobKey(jd.applyUrl);
+            // ⚠ SAME SHORT-LINK RESOLUTION AS readBoardDetails — the two re-key sites must agree, or
+            // dedup holds on the record path and silently fails on the tab-reader path. A shortener is
+            // not a board url, so it sails through the `!isBoardUrl` test above untouched.
+            let applyUrl = jd.applyUrl;
+            if (isAtsShortLink(applyUrl)) {
+              const landed = await resolveAtsShortLink(applyUrl);
+              if (landed) { dlog(`      short link followed: ${applyUrl} → ${landed}`); applyUrl = landed; }
+              else dlog(`      ⚠ short link could NOT be followed (${applyUrl}) — keying on it as-is, so a duplicate is possible`);
+            }
+            job.url = applyUrl;
+            job.jobKey = discoveryJobKey(applyUrl);
             job.applyResolved = true;
             rewritten++;
             dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars · REAL LINK via ${jd.applyVia}`);
@@ -3798,6 +3882,8 @@ if (typeof module !== "undefined" && module.exports) {
     discoverTermLabel,
     discoverTermContradiction,
     discoverWindowSecs,
+    isAtsShortLink,
+    resolveAtsShortLink,
     buildDiscoverQuery,
     buildDiscoverQueries,
     discoverKeywordTokens,
