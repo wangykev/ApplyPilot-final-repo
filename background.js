@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-wrapper-44";
+const AP_BUILD_MARKER = "icims-aim-47";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -5409,6 +5409,7 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
   // the log ring — says which notices were agreed to.
   let consentsAccepted = [];
   let lastView = null, sameViewRounds = 0, captchaStalls = 0;
+  let wrapperRounds = 0;   // extra looks spent waiting out iCIMS' wrapper stage — see the halt below
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     const settled = await settleAuthPage(12000);
     if (!settled.settled) LOG(`the page never settled (${settled.controls} control(s)) — reading it anyway`);
@@ -5452,6 +5453,28 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
       const applied = await clickApplyRetrying(3);
       if (applied.ok) { LOG(`Apply took after ${applied.attempts} attempt(s)`); continue; }
       LOG(`nothing to act on here — url=${(url || "?").split("?")[0]} controls=${settled.controls} frame=${cdpFormFrameArmed() ? "armed" : "none"} apply=${applied.reason}`);
+      // ⚠⚠ SPEND ANOTHER ROUND BEFORE GIVING UP ON A ROUTE THAT PROMISES A FRAME (live 2026-09-08).
+      // This branch RETURNED on the FIRST look, so `MAX_ROUNDS` never applied to it — and the one
+      // thing that reliably needs a second look is the wrapper stage: with `?hub=7` iCIMS serves a
+      // branded shell, then client-side navigates to the posting and mounts its content frame
+      // (measured: nothing at 4.5s, the posting by ~15s). Being ARMED is not the same as having
+      // ARRIVED — one armed attempt pinned the frame while it still held 1 control and no Apply, so
+      // the settle's wait had already been satisfied and this halted on a posting that was seconds
+      // from rendering. Three live Shure postings were written off as `apply-not-followable` /
+      // `posting-gone` this way.
+      //
+      // The house rule is the one the gate's own submit branch states: "NOT automatically a halt —
+      // the next round re-reads the page", and a wait that ran out wants a bigger BUDGET, never a
+      // different verdict. Bounded by its own counter as well as MAX_ROUNDS, and only for a route
+      // that genuinely promises a frame (`/jobs/<id>/…`, never `/jobs/search`), so a real dead end
+      // still ends quickly and every other platform is untouched.
+      if (icimsExpectsContentFrame(url) && wrapperRounds < 2) {
+        wrapperRounds++;
+        LOG(`  …but this url promises an iCIMS content frame, so that was probably the wrapper still in flight — looking again (${wrapperRounds}/2)`);
+        cdpClearFormFrame();   // re-pin from scratch: the pin we hold may be the wrapper's own frame
+        await cdpDelay(3000);
+        continue;
+      }
       return halt("apply-not-followable",
         applied.reason === "ambiguous"
           ? "Several different Apply controls are on this page (" + (applied.offered || []).join(" | ") + ") — the run refuses to guess which one is the application."
@@ -7203,10 +7226,36 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       LOG(`pacing: this run reached submit in ${(dwelt / 1000).toFixed(1)}s — holding ${(owe / 1000).toFixed(1)}s so the whole form takes at least ${ATS_SUBMIT_MIN_DWELL_MS / 1000}s.`);
       await cdpDelay(owe);
     }
+    // ⚠⚠ A FRAME-HOSTED FORM'S RECT IS FRAME-RELATIVE; A TRUSTED CLICK IS TOP-LEVEL. On iCIMS the
+    // submit rect comes from `getBoundingClientRect()` run INSIDE the pinned content frame, while
+    // `Input.dispatchMouseEvent` aims at the TOP viewport — so every armed iCIMS submit was issued at
+    // the wrong point and no iCIMS application has ever actually been sent. Proven by the timeout
+    // read: `submit present true (disabled false) · submitLocked FALSE · captchaFrames 2` — iCIMS'
+    // own onsubmit disables the button, so an ENABLED button after the click means the submit event
+    // never fired, and hCaptcha was initialised and innocent. See atsInjIcimsFrameOffset.
+    // A missing/failed offset read is a REFUSAL, not a blind click at the wrong place: this is the
+    // one irreversible action in the pipeline, and aiming it by guess is worse than not firing.
+    const aimAt = async (rect, what) => {
+      let x = rect.cx, y = rect.cy;
+      if (ats === "icims" && cdpFormFrameArmed()) {
+        const off = await cdpEvalTop(atsInjIcimsFrameOffset).catch(() => null);
+        if (!off || !off.ok) return { ok: false, reason: (off && off.error) || "frame-offset-unreadable" };
+        x += off.x; y += off.y;
+        LOG(`  ${what}: the form is inside the iCIMS frame — translating ${rect.cx},${rect.cy} by the frame's own offset +${off.x},+${off.y} → ${x},${y}`);
+      }
+      await cdpClickAt(x, y);
+      return { ok: true, x, y };
+    };
     LOG(`⚠ ARMED — clicking Submit (trusted input) at ${clickRect.cx},${clickRect.cy} (viewport ${vh}px).`);
     cdpSetSyntheticInput(false);
     const clickedAtMs = Date.now();
-    await cdpClickAt(clickRect.cx, clickRect.cy);
+    const aimed = await aimAt(clickRect, "submit");
+    if (!aimed.ok) {
+      return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "submit-unaimable", ats,
+        detail: "The form is inside an iframe and its offset in the page could not be read, so a trusted click could not be "
+          + `aimed at Submit (${aimed.reason}). Nothing was clicked. Everything is filled and matches what you approved — `
+          + "press Submit yourself in the tab." };
+    }
     // Outcome: confirmation, validation errors, a captcha challenge that popped on submit, or the
     // email-verification gate. Errors are checked LAST on each tick: the gate renders its own
     // `[role="alert"]`-ish furniture, and reading that as a validation failure would report a
@@ -7244,7 +7293,14 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
               detail: "The code is entered but the form still has Submit disabled. Check the code in the tab and submit there." };
           }
           LOG("⚠ code accepted by the form — clicking Submit again to complete the submission (trusted input).");
-          await cdpClickAt(s3.rect.cx, s3.rect.cy);
+          // The COMPLETING half of the same authorized submit needs the same aiming as the first —
+          // the gate re-renders the footer, so this rect is freshly read and just as frame-relative.
+          const aimed2 = await aimAt(s3.rect, "completing submit");
+          if (!aimed2.ok) {
+            return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "submit-unaimable", ats,
+              detail: "The code is entered and accepted, but the form is inside an iframe whose offset could not be read, so "
+                + `the completing click could not be aimed (${aimed2.reason}). Press Submit yourself in the tab — the code is already in.` };
+          }
           deadline = Date.now() + SUBMIT_CONFIRM_MS; // a fresh budget to observe THIS click's outcome (see above)
           continue;
         }
@@ -7273,17 +7329,48 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // preventDefault-ed and the button self-disables until hCaptcha's callback fires, so
     // `submitLocked` (the submit FIRED) against `captchaToken` (the captcha RESOLVED) separates
     // "blocked by the captcha" from "sent, confirmation not recognised". Nothing else does.
+    // ⚠⚠ THE FORM CARRIES ITS OWN INVISIBLE hCAPTCHA, AND THIS LOOP NEVER ASKED (live 2026-09-08).
+    // The gate has answered this question since 2026-08-16 — `submitLocked` (iCIMS' own onsubmit
+    // calls icimsDisableSaveAndSubmitButtons, so a DISABLED button proves the submit event FIRED)
+    // against `captchaToken` (a token proves hCaptcha RESOLVED) — but the FORM's outcome loop only
+    // ever looked for a confirmation, so a captcha-blocked submit and a submitted-but-unrecognised
+    // one produced the SAME `no-confirmation`, with nothing logged between the click and the timeout.
+    //
+    // Measured on Shure 5013: armed, 19/19 replayed, Submit clicked, 60s of silence — and the
+    // operator then confirmed from the still-open tab that it was NOT submitted and no mail arrived,
+    // with every field correctly filled. That is precisely `submitLocked && !captchaToken`, and the
+    // run had called it "verify in the tab" on a tab it had already closed.
+    //
+    // ⚠ THIS IS NOT CAPTCHA HANDLING and must never become it. Nothing is solved, forged or
+    // bypassed: we READ two of the page's own attributes to say WHY it did not move, and hand it to
+    // the operator. `captchaChallenge` (a VISIBLE challenge) is still an immediate halt above.
+    let captchaVerdict = null;
     try {
       const st = await cdpEval(atsInjSubmitState, ats).catch(() => null);
+      const d = await cdpEval(atsInjAuthScan).catch(() => null);
       const probe = ats === "icims" ? await cdpEval(atsInjIcimsPostParseProbe, ats).catch(() => null) : null;
       const url = await cdpEval(function () { return location.href; }).catch(() => null);
       LOG("  page at the timeout: "
         + `url ${JSON.stringify(String(url || "?").split("?")[0].slice(-70))}`
         + (st ? ` · submit present ${!!st.hasSubmit} (disabled ${st.disabled})` : " · submit state unreadable")
-        + (probe && probe.ok ? ` · ${probe.inTopDocument ? "TOP DOCUMENT" : "content frame"}, ${probe.controls} control(s), "${String(probe.head || "").slice(0, 90)}"` : ""));
-      LOG("  ⚠ this run does NOT know whether the application was sent — check the employer's confirmation email "
-        + "or your candidate profile on the portal BEFORE re-running, because a re-run would submit a second time.");
+        + (d ? ` · submitLocked=${d.submitLocked} captchaToken=${d.captchaToken} captchaFrames=${d.captchaFrames} challengeVisible=${d.captchaChallenge}` : "")
+        + (probe && probe.ok ? ` · ${probe.inTopDocument ? "TOP DOCUMENT" : "content frame"}, ${probe.controls} control(s)` : ""));
+      if (d && d.submitLocked && !d.captchaToken) {
+        captchaVerdict = "The form FIRED and then locked its own Submit button waiting on its invisible hCaptcha, which never "
+          + "answered — so nothing was sent. Everything is filled and matches what you approved (verified field-by-field just "
+          + "before the click), so the fastest finish is to press Submit yourself in the tab. The bot never solves or works "
+          + "around a captcha.";
+        LOG("  ⛔ the submit fired and is stuck on the form's own invisible captcha — NOT sent, and NOT retried in place "
+          + "(only the captcha callback re-enables the button, so a second press would report a different fault).");
+      } else if (d && d.captchaToken) {
+        LOG("  the captcha resolved and the POST was in flight when the budget ran out — this one may well have gone through.");
+      }
     } catch (e) { LOG("  page at the timeout: could not be read — " + String((e && e.message) || e)); }
+    if (captchaVerdict) {
+      return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "captcha-unanswered", ats, detail: captchaVerdict };
+    }
+    LOG("  ⚠ this run does NOT know whether the application was sent — check the employer's confirmation email "
+      + "or your candidate profile on the portal BEFORE re-running, because a re-run would submit a second time.");
     LOG(`no confirmation within ${Math.round(SUBMIT_CONFIRM_MS / 1000)}s — VERIFY IN THE TAB before assuming either outcome.`);
     return { ok: true, submitted: false, replayed: true, stopped: "no-confirmation", detail: "Submit was clicked but no confirmation rendered within 30s — check the tab.", ats };
   } catch (e) {

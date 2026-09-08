@@ -2726,6 +2726,42 @@ function atsInjScrollTopToFrameY(y, h) {
   return { ok: true };
 }
 
+/**
+ * INJECTED IN THE TOP DOCUMENT. Where does the iCIMS content frame sit in the top viewport?
+ *
+ * ⚠⚠ THIS IS WHY NO iCIMS SUBMIT HAS EVER LANDED (live 2026-09-08, Shure). `atsInjSubmitState`
+ * builds its rect from `getBoundingClientRect()`, which is relative to the document it runs in — and
+ * on iCIMS it runs INSIDE the pinned content frame. `cdpClickAt` then dispatches
+ * `Input.dispatchMouseEvent`, whose coordinates are TOP-LEVEL viewport coordinates. So the armed
+ * click was issued at frame coordinates against the top document and landed wherever that happened
+ * to be, never on Submit Profile.
+ *
+ * The evidence was unambiguous once the timeout said what it saw: `submit present true (disabled
+ * false) · submitLocked FALSE · captchaToken false · captchaFrames 2`. iCIMS' own onsubmit calls
+ * icimsDisableSaveAndSubmitButtons, so an ENABLED button after a click proves the submit event never
+ * fired at all — the click missed. hCaptcha was initialised and innocent (2 frames), which is what
+ * ruled out the captcha theory this had been blamed on.
+ *
+ * ⚠ ONLY THE FINAL SUBMIT WAS AFFECTED, which is why the fill and the sign-in always worked: every
+ * other iCIMS interaction is page-side synthetic and ELEMENT-based (`el.dispatchEvent`), so it needs
+ * no coordinates. `act.clickSubmit` is deliberately forced back to TRUSTED input — the one action
+ * where "did the click really happen?" must not be in doubt — and a trusted click is the only one
+ * that has to be aimed.
+ *
+ * The arithmetic itself is not new here: `atsInjScrollTopToFrameY` has added this same offset for
+ * SCROLLING since it was written, with a comment saying the top document "is the only place that
+ * arithmetic is available". It was simply never applied to clicking.
+ */
+function atsInjIcimsFrameOffset() {
+  const fr = document.getElementById("icims_content_iframe") ||
+    document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
+  if (!fr) return { ok: false, error: "no-icims-frame-in-top-document" };
+  const r = fr.getBoundingClientRect();
+  // VIEWPORT-relative, matching what Input.dispatchMouseEvent wants and what the frame's own
+  // getBoundingClientRect produced — so the two are in the same space and simply add.
+  return { ok: true, x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
+}
+
 function atsInjIcimsAddEntry(labelPattern) {
   const re = new RegExp(labelPattern, "i");
   const anchors = [...document.querySelectorAll("a, button")].filter((a) => {
@@ -11857,7 +11893,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsEducationAnswer, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsEducationAnswer, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsFrameOffset, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
     atsInjEmailVerifyState, atsInjFillEmailCode,
