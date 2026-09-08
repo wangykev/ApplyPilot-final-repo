@@ -5007,7 +5007,27 @@ async function drivePageFill(act, profile, defaults, jobContext, budgetsIn, opts
     // an assertion, not a choice.
     // …and a clearance rendered as a pick-one SET is exempt too — third of the three guess-to-reach-review
     // paths (radio above, dropdown below). Same reason: a guessed clearance is a false statement either way.
-    if (act.aiEnabled && f.isRequired && f.widgetType === "checkbox_group" && record.resolved == null
+    // ⚠⚠ `resolved == null` IS NOT THE ONLY WAY A REQUIRED GROUP ENDS BLANK — and the other way is
+    // INVISIBLE from here (live 2026-09-08, Intel). A rung can ANSWER and have its answer fit no option
+    // on this widget: Intel's *"Please indicate your geographical preference by marking sites of
+    // interest including areas you are open to relocating to"* is a multi-select of Intel SITES (Austin,
+    // Chandler, Folsom, Hillsboro, …, All, Other), but `recognizeRelocationQuestion` read "open to
+    // relocating to" and supplied `["Yes","True"]`. Nothing matched, so the group stayed empty — yet
+    // `resolved` was non-null, this rescue was gated out, the REQUIRED field ended blank and the walk
+    // halted `required-unfilled` with all 11 options sitting in the bundle unanswered.
+    //
+    // The operator's rule is the plain one: if we cannot answer it, the AI must, and it must reach
+    // review as a real picker a human can change. So the trigger is the OUTCOME (this group holds no
+    // selection) rather than our own account of why.
+    //
+    // ⚠ `record.after` is the first CHECKED option's label, or null when nothing is checked — so this
+    // is deliberately NOT "status is needs_review": `checkbox-group-multi` / `checkbox-group-partial`
+    // report needs_review with boxes ALREADY TICKED, and re-picking there would clobber a real
+    // selection. Only a group holding nothing is handed over.
+    // ⚠ The clearance exemption below still wins: a guessed clearance is a false statement either way.
+    const groupHoldsNothing = record.after == null || String(record.after).trim() === "";
+    if (act.aiEnabled && f.isRequired && f.widgetType === "checkbox_group"
+        && (record.resolved == null || groupHoldsNothing)
         && !clearanceAsk
         && record.status !== "filled" && record.status !== "filled_review") {
       try {

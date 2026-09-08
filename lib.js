@@ -4,15 +4,41 @@
 // The injected engine can't import this (it's stringified), so anything the engine
 // needs is computed in the SW from these helpers and passed in as plain values.
 
-// Parse a profile "YYYY-MM" date into zero-padded { year, month } segments for the
-// Workday date spinbuttons — or null if it isn't a real year-month. Rejecting the
-// literal "YYYY-MM" placeholder is what stops us typing it into the form. Accepts an
-// un-padded month ("2023-5" → "05") and rejects out-of-range months ("2023-13").
+// Parse a profile date into zero-padded { year, month } segments for the Workday date
+// spinbuttons — or null if it isn't a real year-month. Rejecting the literal "YYYY-MM"
+// placeholder is what stops us typing it into the form. Accepts an un-padded month
+// ("2023-5" → "05") and rejects out-of-range months ("2023-13").
+//
+// ⚠⚠ A FULL "YYYY-MM-DD" IS ACCEPTED, AND THE DAY IS DISCARDED. This was `$`-anchored after
+// the month until 2026-09-08, so every full ISO date returned NULL — and the WEBSITE's profile
+// editor stores work-experience dates as full dates (live: "2026-05-15", "2024-09-01",
+// "2025-05-01"). The consequences were all silent, and none of them looked like a date bug:
+//
+//   • `fromParsed`/`toParsed` came back null, so the REQUIRED Workday From/To composite had
+//     nothing deterministic and fell through to the AI, which answered all THREE jobs with the
+//     same 8/2024–5/2028 — the operator's EDUCATION span. Three different jobs on a real
+//     application claiming identical employment dates, flagged `ai-date-guess` for a human to
+//     re-approve one at a time, for dates that were in the profile the whole time.
+//   • `workExperienceRecency` and `sortWorkExperienceByRecency` ALSO parse through here, so
+//     every entry scored -Infinity and "most recent job first" silently degraded to the
+//     profile's stored order.
+//
+// DISCARDING THE DAY IS NOT LOSING PRECISION — the Workday composite is MM/YYYY and has no day
+// slot, so month granularity is the form's own. (The inverse rule holds elsewhere and for the
+// same reason: a form with no day must not have one invented for it, and `parseYearMonthDay`
+// still refuses a partial "YYYY-MM" because a Month/DAY/Year composite genuinely needs one.)
+//
+// An out-of-range DAY still rejects the whole string: if "2024-06-99" is not a real date, its
+// month and year are not trustworthy evidence either — the same judgement parseYearMonthDay makes.
 function parseYearMonth(iso) {
-  const m = /^(\d{4})-(\d{1,2})$/.exec(String(iso == null ? "" : iso).trim());
+  const m = /^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?$/.exec(String(iso == null ? "" : iso).trim());
   if (!m) return null;                       // no match — includes the "YYYY-MM" placeholder
   const month = parseInt(m[2], 10);
   if (month < 1 || month > 12) return null;  // out of range
+  if (m[3] !== undefined) {                  // a day was supplied — validate, then drop it
+    const day = parseInt(m[3], 10);
+    if (day < 1 || day > 31) return null;
+  }
   return { year: m[1], month: String(month).padStart(2, "0") };
 }
 
@@ -855,10 +881,40 @@ const RELOCATE_PAST_RE = /\bhave you (ever )?relocat|\bpreviously relocat|\bhave
 // ⚠ `reimburs` carries NO trailing  — the boundary fails INSIDE "reimbursed"/"reimbursement",
 // which let "Will relocation expenses be reimbursed?" through to a "Yes" about willingness.
 const RELOCATE_EMPLOYER_PROVISION_RE = /\b(assistance|package|allowance|stipend|benefit|paid for|cover the cost|who pays)\b|\breimburs|\bwill .*\bbe (provided|covered|offered)\b/i;
+// ⚠⚠ A THIRD REFUSAL: asking WHICH PLACES is not asking WHETHER (live 2026-09-08, Intel Workday).
+//
+// *"Please indicate your geographical preference by marking sites of interest including areas you are
+// open to relocating to:"* is a REQUIRED multi-select of Intel's sites — Austin TX, Chandler AZ,
+// Folsom CA, Hillsboro OR, Hudson MA, New Albany OH, Rio Rancho NM, Santa Clara CA, San Jose CA, All,
+// Other. The phrase "open to relocating to" tripped RELOCATE_ASK_RE, so this returned `willing` and
+// `relocationCandidates` supplied `["Yes","True"]` — an answer to a question nobody asked, against a
+// widget on which no option can ever match it. The group stayed empty, and because a rung HAD
+// "answered", the AI rescue downstream was gated out and the walk halted on a required blank field.
+//
+// The profile cannot answer this in ANY case: `willing_to_relocate` is a yes/no preference and holds
+// no opinion about Folsom vs Hillsboro. So the honest outcome is to refuse, let it fall through to the
+// AI, and have it arrive FLAGGED as a picker the operator can change — the same treatment the
+// employer-provision wording already gets, and for the same reason.
+//
+// ⚠ Checked BEFORE own_cost, so "mark the sites you would move to at your own expense" is refused too:
+// it is still a places question, and own_cost would answer it with a bare Yes/No just as wrongly.
+// ⚠ Kept NARROW on purpose — a genuine willingness question that merely NAMES a place must still be
+// answered ("Would you relocate to one of our offices?", "Are you willing to relocate to a different
+// location?"), so a bare place word is never enough: it takes "<place> of interest", an explicit
+// geographic PREFERENCE, a mark/select/rank verb aimed at places, or "which <place>".
+const RELOCATE_PLACE = "sites?|locations?|offices?|cities|city|campus|campuses|regions?|facilit(?:y|ies)|plants?";
+const RELOCATE_SITE_PICK_RE = new RegExp(
+  "\\b(?:" + RELOCATE_PLACE + ")\\b[^.?!]{0,30}\\bof interest\\b" +
+  "|\\bgeographic(?:al)?\\s+(?:preference|location)" +
+  "|\\b(?:mark|marking|select|selecting|choose|choosing|indicate|indicating|rank|ranking)\\b[^.?!]{0,60}\\b(?:" + RELOCATE_PLACE + ")\\b" +
+  "|\\bwhich\\s+(?:of\\s+the\\s+following\\s+)?(?:" + RELOCATE_PLACE + ")\\b",
+  "i"
+);
 function recognizeRelocationQuestion(label) {
   const t = String(label == null ? "" : label).replace(/\s+/g, " ").trim();
   if (!t || !RELOCATE_ASK_RE.test(t)) return null;
   if (RELOCATE_PAST_RE.test(t)) return null;
+  if (RELOCATE_SITE_PICK_RE.test(t)) return null;   // asks WHICH places — the profile holds no such fact
   if (RELOCATE_OWN_COST_RE.test(t)) return { kind: "own_cost" };
   if (RELOCATE_EMPLOYER_PROVISION_RE.test(t)) return null;
   return { kind: "willing" };

@@ -9495,6 +9495,93 @@ test("checkbox group: the AI's pick must clear the match ladder, and a bare chec
   assert.strictEqual(aiEligible({ widgetType: "checkbox", isRequired: true }), false);
 });
 
+// ── a REQUIRED group a RUNG ANSWERED WRONGLY still reaches the AI (Intel live 2026-09-08) ─────
+//
+// Intel's site multi-select — "Please indicate your geographical preference by marking sites of
+// interest including areas you are open to relocating to:*" over 11 city options — halted the walk
+// `required-unfilled`. Two faults stacked, and each is pinned separately below because either one
+// alone reproduces the halt:
+//   1. `recognizeRelocationQuestion` read "open to relocating to" and supplied ["Yes","True"];
+//   2. the AI rescue was gated on `record.resolved == null`, so a rung ANSWERING — even with something
+//      no option could match — silently disqualified the field from the rescue that exists for it.
+// The operator's rule: if we cannot answer it, the AI must, and it must reach review as a picker.
+const INTEL_SITES = ["Austin, TX", "Chandler, AZ", "Folsom, CA", "Hillsboro, OR", "Hudson, MA",
+  "New Albany, OH", "Rio Rancho, NM", "Santa Clara, CA", "San Jose, CA", "All", "Other"];
+const siteGroup = (label, over = {}) => Object.assign({
+  wrapperSel: "[w-sites]", fieldName: "geoPreference", widgetType: "checkbox_group", isRequired: true,
+  label,
+  options: INTEL_SITES.map((t, i) => ({ id: "s" + i, labelText: t, checked: false })),
+  groupOptions: INTEL_SITES.map((t, i) => ({ id: "s" + i, labelText: t, checked: false })),
+}, over);
+const INTEL_Q = "Please indicate your geographical preference by marking sites of interest including areas you are open to relocating to:*";
+
+test("⚠⚠ Intel's site multi-select gets an AI answer and reaches review as a real picker", async () => {
+  // The profile STATES a relocation preference — which is exactly what used to hijack this field.
+  const profile = { screening: { willing_to_relocate: true } };
+  const act = makeFakeAct([siteGroup(INTEL_Q)], { aiEnabled: true,
+    ai: '{"choice":"Santa Clara, CA","justification":"profile is CA-based","confidence":"High"}' });
+  const rec = (await drivePageFill(act, profile, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(act.log.some(([m]) => m === "llm"), "the AI must be consulted — a required blank halts the walk");
+  assert.strictEqual(rec.status, "filled_review", "an AI guess is never silently trusted");
+  assert.strictEqual(rec.after, "Santa Clara, CA");
+  assert.ok(String(rec.flag || "").startsWith("ai-"), "flagged so the operator re-checks it: " + rec.flag);
+  // …and review must render a PICKER, not a text box: all 11 options ride along in the record.
+  assert.strictEqual((rec.options || []).length, 11);
+  assert.ok((rec.options || []).includes("Hillsboro, OR"));
+});
+
+test("⚠⚠ the rescue fires when a rung ANSWERED but its answer fits no option", async () => {
+  // A genuine willingness LABEL (so the relocation rung really does claim it and resolve ["Yes","True"])
+  // rendered over SITE options — the state the old `record.resolved == null` gate could not see. This
+  // pins the gate independently of the recognizer fix: with only the recognizer fixed, any other rung
+  // or bucket supplying a non-matching value would reproduce the same silent halt.
+  const profile = { screening: { willing_to_relocate: true } };
+  const act = makeFakeAct([siteGroup("Are you willing to relocate?")], { aiEnabled: true,
+    ai: '{"choice":"All","justification":"open to relocating","confidence":"Medium"}' });
+  const rec = (await drivePageFill(act, profile, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(act.log.some(([m]) => m === "llm"),
+    "a rung answering with something unofferable must NOT disqualify the field from the AI rescue");
+  assert.strictEqual(rec.status, "filled_review");
+  assert.strictEqual(rec.after, "All");
+});
+
+test("⚠ the NEW disjunct does not fire on a group that already HOLDS a selection", async () => {
+  // Scope note, because the first draft of this test asserted the wrong contract: the pre-existing
+  // `record.resolved == null` arm fires whether or not a box is ticked, and that is untouched here.
+  // What this pins is the arm ADDED for Intel — "a rung answered but nothing matched" must be read as
+  // "this group holds NOTHING", not as "status is needs_review", because `checkbox-group-multi` and
+  // `-partial` both report needs_review with boxes ALREADY TICKED and re-picking there would clobber a
+  // real selection.
+  //
+  // So: a label the relocation rung DOES claim (⇒ resolved is non-null, the old arm is out) over site
+  // options (⇒ nothing matches) with one box already checked (⇒ the new arm is out too). Neither arm
+  // may fire, and the held selection must survive.
+  const pre = siteGroup("Are you willing to relocate?", {
+    options: INTEL_SITES.map((t, i) => ({ id: "s" + i, labelText: t, checked: t === "Folsom, CA" })),
+    groupOptions: INTEL_SITES.map((t, i) => ({ id: "s" + i, labelText: t, checked: t === "Folsom, CA" })),
+  });
+  const profile = { screening: { willing_to_relocate: true } };
+  const act = makeFakeAct([pre], { aiEnabled: true, ai: '{"choice":"Austin, TX","confidence":"High"}' });
+  const rec = (await drivePageFill(act, profile, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!act.log.some(([m]) => m === "llm"), "a held selection must not be overwritten by a guess");
+  assert.ok(String(rec.after || "").includes("Folsom, CA"), "the held selection survives: " + rec.after);
+});
+
+test("⚠ the exemptions still hold for a site group: OPTIONAL stays blank, AI OFF never fires", async () => {
+  const opt = makeFakeAct([siteGroup(INTEL_Q, { isRequired: false })], { aiEnabled: true, ai: '{"choice":"All"}' });
+  const r1 = (await drivePageFill(opt, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!opt.log.some(([m]) => m === "llm"), "optional → no AI call, no spend");
+  assert.strictEqual(r1.after, null);
+  // and it STILL reaches review as a picker, so the operator can answer it themselves
+  assert.strictEqual((r1.options || []).length, 11);
+
+  const off = makeFakeAct([siteGroup(INTEL_Q)], { aiEnabled: false, ai: '{"choice":"All"}' });
+  const r2 = (await drivePageFill(off, {}, {}, {}, T_BUDGETS)).results[0];
+  assert.ok(!off.log.some(([m]) => m === "llm"));
+  assert.strictEqual(r2.after, null);
+  assert.strictEqual((r2.options || []).length, 11);
+});
+
 // ── a requisition id is not always R<digits> (PSECU/Copart live 2026-08-03) ──
 // canonicalJobUrl only matched _R<digits>, so "HR-Intern_JR100897" fell through to origin+pathname —
 // and that is NOT stable, because Workday redirects the posting URL you paste to its own spelling
