@@ -8247,6 +8247,49 @@ function atsInjLeanSignature(ats) {
 
 // Wait for iCIMS' résumé parse to land and the panel to go quiet. Returns what it OBSERVED — never
 // throws, because a wait that cannot read the page must not abort a run that can still fill it.
+/**
+ * INJECTED. Where are we actually looking, right after the résumé parse?
+ *
+ * ⚠ THIS EXISTS BECAUSE TWO EXPLANATIONS FIT THE SAME SYMPTOM and the logs could not separate them
+ * (live 2026-09-08, Shure). The submit run reached the form with 19 fields, the parse posted back, and
+ * every scan afterwards reported 0 fields — with NO "isolated world was replaced" line, so the
+ * loud re-arm in cdpEval never fired. Either:
+ *   (a) the pin silently fell back to the TOP document, which on iCIMS is ~13 characters of branding
+ *       and legitimately has no controls, or
+ *   (b) the pin is fine and the FORM genuinely has no controls now, because the parse moved the flow
+ *       on (a review step, or an already-applied panel for a req this candidate has applied to).
+ *
+ * `inTopDocument` settles it in one boolean: `#icims_content_iframe` can only be seen from OUTSIDE
+ * the content frame. Guessing between (a) and (b) already produced two wrong diagnoses in one
+ * session, so this reports rather than infers — the same discipline as atsInjAuthScan reporting
+ * consent markers and leaving the judgement SW-side.
+ *
+ * Read-only and cheap: no actuation, one evaluate.
+ */
+function atsInjIcimsPostParseProbe() {
+  try {
+    const q = (s) => document.querySelectorAll(s).length;
+    const frame = document.getElementById("icims_content_iframe");
+    const body = document.body;
+    const text = body ? String(body.innerText || "").replace(/\s+/g, " ").trim() : "";
+    return {
+      ok: true,
+      href: String(location.href || "").split("?")[0].slice(-70),
+      // THE DISCRIMINATOR: only the top document contains the content frame.
+      inTopDocument: !!frame,
+      frameSrc: frame ? String(frame.getAttribute("src") || "").split("?")[0].slice(-60) : null,
+      controls: q("input:not([type=hidden]),textarea,select,[role=combobox]"),
+      allInputs: q("input"),
+      forms: q("form"),
+      submits: q("input[type=submit],button[type=submit]"),
+      textLen: text.length,
+      head: text.slice(0, 160),
+    };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
 async function atsIcimsAwaitParse(act, ats, opts) {
   const o = opts || {};
   const cfg = Object.assign({}, ATS_ICIMS_PARSE, o.parse || {});
@@ -8353,6 +8396,20 @@ async function atsIcimsResumeStage(act, ats, opts) {
   // like a change. A false "changed" is the dangerous direction: it lets the wait finish on the first
   // brief quiet, potentially before the parse has even started. The wait reads its own baseline now.
   const parse = await atsIcimsAwaitParse(act, ats, { log, parse: o.parse });
+  // ⚠ SAY WHAT WE CAN SEE NOW. The parse is the one moment on this platform that can leave the run
+  // reading the wrong document, and when that happens every later line ("0 field(s)", "16 still
+  // absent") describes the symptom rather than the cause. One read-only probe, always logged, so a
+  // rehearsal answers "were we even looking at the form?" without another round of guessing.
+  try {
+    const p = await act.eval(atsInjIcimsPostParseProbe, ats);
+    if (p && p.ok) {
+      log(`post-parse view: ${p.inTopDocument ? "⚠⚠ the TOP DOCUMENT (the content frame is NOT pinned — every scan from here reads ~nothing)" : "inside the content frame"}`
+        + ` · ${p.controls} control(s), ${p.allInputs} input(s), ${p.forms} form(s), ${p.submits} submit(s)`
+        + ` · ${p.textLen} chars · ${JSON.stringify(p.href)}`
+        + (p.inTopDocument && p.frameSrc ? ` · frame src ${JSON.stringify(p.frameSrc)}` : "")
+        + ` · "${p.head}"`);
+    } else log(`post-parse view: probe failed — ${(p && p.error) || "no result"}`);
+  } catch (e) { log(`post-parse view: probe threw — ${String((e && e.message) || e)}`); }
   // WHAT EVIDENCE DO WE ACTUALLY HAVE THAT THE FILE LANDED? Setting `input.files` proves nothing on
   // its own — it is a page-side write, and iCIMS uploads on the change event. Two independent kinds of
   // positive evidence, and the record is flagged for review when there is NEITHER:
@@ -11745,7 +11802,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
     atsGeoValueInProfile, atsProfileAddressValues, atsTierIsDeterministic,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
-    atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
+    atsIcimsResumeStage, atsIcimsAwaitParse, atsInjIcimsPostParseProbe, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
     atsInjLeanSignature,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,

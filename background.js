@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "we-dates-42";
+const AP_BUILD_MARKER = "icims-probe-43";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -5264,12 +5264,26 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
   // Ladder: the ordinary floored call first, so a gate/form page behaves EXACTLY as before; only if
   // that refuses do we fall back to a 0-floor call, which is safe because it must match the frame's
   // own url as read from the top document's <iframe> element (never a hostname guess).
+  let armIcimsFrameLogged = false;   // throttles the not-armed-yet line to once per stage
   const armIcimsFrame = async () => {
     if (cdpFormFrameArmed()) return true;
     const floored = await cdpUseFormFrame(1).catch(() => ({ ok: false }));
     if (floored && floored.ok) return true;
     const el = await cdpEvalTop(atsInjIcimsFrameSrc).catch(() => null);
-    if (!el || !el.ok || !el.src) return false;
+    if (!el || !el.ok || !el.src) {
+      // ⚠ SAY WHICH RUNG GAVE UP, ONCE. Both rungs failing is indistinguishable in the log from "this
+      // page has no frame", and the run then reads the top document and halts `apply-not-followable`
+      // / `posting-gone` — verdicts that are FALSE on a live posting (proven 2026-09-08: the same
+      // Shure url failed VISIBLE with `frame=none` and rehearsed clean HIDDEN, 19/19 replayed). The
+      // settle re-arms every poll, so this is throttled to one line per stage to stay readable.
+      if (!armIcimsFrameLogged) {
+        armIcimsFrameLogged = true;
+        LOG(`the iCIMS content frame is not armed yet — floored(1) refused and the top document advertises no frame src`
+          + ` (${el ? (el.ok ? "probe ok, src empty" : "probe not ok: " + String(el.error || "?").slice(0, 40)) : "probe threw"})`
+          + " — if this stage ends in apply-not-followable or posting-gone, THIS is why, and the posting is probably fine");
+      }
+      return false;
+    }
     // The frame may have navigated since the attribute was written, so identity is the STABLE part of
     // its url — origin + path, without the query (an iCIMS session query is one-time and changes).
     let idRe = null;
@@ -7017,6 +7031,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // than as one string whose order we do not control.
     const scanFields = (out.scan && out.scan.fields) || [];
     const driftFailures = [];
+    let domReadCount = 0;   // fields ACTUALLY re-read off the page — see the log line below
     for (const [name, e] of approved) {
       const want = e && e.current_value;
       if (want == null || String(want).trim() === "") continue;
@@ -7032,6 +7047,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         driftFailures.push(`${name} ("${(e.question_label || "").slice(0, 50)}"): could NOT be re-read from the page before submitting`);
         continue;
       }
+      domReadCount++;   // this one really was read off the page and is about to be compared
       const liveV = live.value == null ? "" : String(live.value);
       const wantV = String(want);
       const norm = (x) => atsLib.normalize(String(x || ""));
@@ -7056,7 +7072,21 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         driftFailures.push(`${name} ("${(e.question_label || "").slice(0, 50)}"): the form now shows ${JSON.stringify(liveV.slice(0, 60))} but you approved ${JSON.stringify(wantV.slice(0, 60))}`);
       }
     }
-    LOG(`pre-submit DOM read: re-read ${approved.size} approved field(s) off the live form — ${driftFailures.length ? driftFailures.length + " DISAGREE" : "all match what you approved"}`);
+    // ⚠⚠ REPORT WHAT WAS ACTUALLY RE-READ, NOT WHAT WE SET OUT TO READ. This printed
+    // `approved.size` — the size of the INTENT — so when the scan came back empty every field hit a
+    // `continue` above, nothing was compared, and it still announced "re-read 19 approved field(s)
+    // off the live form — all match what you approved". Live on Shure 2026-09-08 that sentence sent
+    // this session to the wrong conclusion twice: it reads as positive evidence that the form holds
+    // the approved values, when the truth was that the form could not be inspected at all.
+    //
+    // The gate itself was never unsafe — the absence check above had already pushed all 16 fields
+    // into `failures`, which is exactly why the skip is deliberate ("already reported"). This is a
+    // DIAGNOSTIC fix, and it earns its place for the same reason the keep-warm beat's stale "500ms"
+    // did: a line that overstates what it checked is worse than no line, because it is believed.
+    const skipped = approved.size - domReadCount;
+    LOG(`pre-submit DOM read: re-read ${domReadCount} of ${approved.size} approved field(s) off the live form`
+      + (skipped > 0 ? ` (${skipped} not re-readable here — credentials, uploads, or fields the strict verify already reported)` : "")
+      + ` — ${driftFailures.length ? driftFailures.length + " DISAGREE" : (domReadCount ? "all match what you approved" : "⚠ NOTHING was verified against the page")}`);
     driftFailures.forEach((f) => LOG("  ✗ " + f));
 
     const state = await cdpEval(atsInjSubmitState, ats);
