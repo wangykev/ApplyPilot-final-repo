@@ -2762,6 +2762,73 @@ function atsInjIcimsFrameOffset() {
   return { ok: true, x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
 }
 
+/**
+ * INJECTED. iCIMS' own step indicator — the platform DECLARING how many pages this application has
+ * and which one we are on.
+ *
+ * ⚠⚠ THE FORM IS MULTI-PAGE AND THE PIPELINE TREATED IT AS ONE (operator, 2026-09-08). `Submit
+ * Profile` (`cp_form_submit_i`) is a NEXT button on every page but the last, so a single press
+ * advances rather than submits. That is why the fill's scan "missed" a required field: it reads page
+ * 1 (Candidate Profile — 19 fields, verified live) correctly and completely, and `rcf3048` *"How did
+ * you hear about us?"* lives on step 2. The submit run only ever saw it because its press had
+ * already advanced, and the "validation errors" we reported were page 2 stating its own required
+ * field was empty — the click had worked.
+ *
+ * The operator's own markup:
+ *   <li class="iCIMS_Steps_First iCIMS_Steps_Current" id="Step_profileStep" title="Candidate Profile (Current Step)">
+ *     <span class="iCIMS_Steps_Content sr-only">Step 1 of 2. Candidate Profile(Current Step)</span>
+ *   <li class=" iCIMS_Steps_NotCurrent" id="Step_eeoStep" title="EEO">
+ *     <span class="iCIMS_Steps_Content sr-only">Step 2 of 2. EEO(Incomplete Step)</span>
+ *
+ * ⚠ TERMINALITY IS STRUCTURAL — "no step after this one" — NOT `index >= total`. That is the ORC
+ * ruling (`orcAdvanceAfterStep` is terminal on the ABSENCE of an advance control, never on a count,
+ * because Baylor serves 5 sections for 4 steps), and it is enforced there by a test. The declared
+ * "Step N of M" IS read, but only as a CROSS-CHECK to report against — a disagreement between the
+ * two is reported, never resolved by arithmetic, because the cost of being wrong is an application
+ * submitted a page early.
+ *
+ * ⚠ CLASS TOKENS ARE COMPARED EXACTLY, never by substring: `iCIMS_Steps_NotCurrent` contains the
+ * word "Current", so a `/Current/` test marks EVERY step current and the walk would think it was
+ * always on the last page.
+ *
+ * No steps list at all ⇒ `present:false`, and the caller keeps the existing single-page behaviour —
+ * which is right for the one-page iCIMS forms (Astrion) this pipeline was built against.
+ */
+function atsInjIcimsSteps() {
+  const lis = [...document.querySelectorAll('li[id^="Step_"], li[class*="iCIMS_Steps_"]')];
+  if (!lis.length) return { ok: true, present: false };
+  const nb = (s) => String(s || "").replace(/ /g, " ").replace(/\s+/g, " ").trim();
+  const steps = lis.map((li, i) => {
+    const tokens = String(li.className || "").split(/\s+/).filter(Boolean);
+    const txt = nb(li.textContent);
+    const m = /step\s*(\d+)\s*of\s*(\d+)/i.exec(txt);
+    return {
+      id: li.id || null,
+      title: nb(li.getAttribute("title")).replace(/\s*\(current step\)\s*$/i, ""),
+      current: tokens.indexOf("iCIMS_Steps_Current") >= 0,
+      declaredIndex: m ? parseInt(m[1], 10) : null,
+      declaredTotal: m ? parseInt(m[2], 10) : null,
+      incomplete: /\(incomplete step\)/i.test(txt),
+      pos: i + 1,
+    };
+  });
+  const cur = steps.findIndex((s) => s.current);
+  const currentStep = cur >= 0 ? steps[cur] : null;
+  // The cross-check: does iCIMS' own "Step N of M" agree with the DOM order we are about to trust?
+  const agrees = !currentStep || currentStep.declaredIndex == null
+    || (currentStep.declaredIndex === cur + 1 && currentStep.declaredTotal === steps.length);
+  return {
+    ok: true, present: true, count: steps.length,
+    currentPos: cur >= 0 ? cur + 1 : null,
+    current: currentStep,
+    // STRUCTURAL terminality — nothing after the current step in the platform's own list.
+    isLast: cur >= 0 ? cur === steps.length - 1 : null,
+    declaredAgrees: agrees,
+    titles: steps.map((s) => s.title || s.id || ("step " + s.pos)),
+    steps,
+  };
+}
+
 function atsInjIcimsAddEntry(labelPattern) {
   const re = new RegExp(labelPattern, "i");
   const anchors = [...document.querySelectorAll("a, button")].filter((a) => {
@@ -11893,7 +11960,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsEducationAnswer, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsFrameOffset, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsEducationAnswer, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsFrameOffset, atsInjIcimsSteps, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
     atsInjEmailVerifyState, atsInjFillEmailCode,
