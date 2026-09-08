@@ -1983,6 +1983,52 @@ test("form identity: a marketing widget is not an application form", () => {
   assert.equal(look(null, null).ok, false);
 });
 
+// ⚠⚠ A LATER STEP OF A MULTI-PAGE APPLICATION HAS NONE OF THE THREE IDENTITY FIELDS (live
+// 2026-09-08, Shure). Résumé / email / name are all PAGE-1 signals; iCIMS' step 2 is EEO — gender,
+// race, veteran status, disability and "How did you hear about us?". So a page with 7 controls and a
+// Submit on it was refused as "not an application form", and the run then hunted for an Apply
+// control that could not exist because it was already INSIDE the flow (`apply-not-followable`).
+// It surfaced only once the operator signed in: with a session and step 1 saved, iCIMS RESUMES the
+// application at step 2, so the landing page is no longer page 1.
+test("form identity: a DECLARED application step identifies the page, even with no name/email/résumé", () => {
+  const look = ats.atsLooksLikeApplicationForm;
+  const SUB = { hasSubmit: true }, NOSUB = { hasSubmit: false };
+  // The real EEO step: not one résumé, email or name field among them.
+  const eeo = [
+    { fieldName: "rcf3048", label: "How did you hear about us?" },
+    { fieldName: "US-STANDARD-GENDER", label: "Gender" },
+    { fieldName: "US-STANDARD-RACE", label: "Race/Ethnicity" },
+    { fieldName: "US-STANDARD-VETERAN", label: "Veteran Status" },
+  ];
+  const onStep2 = { present: true, step: 2, total: 3 };
+
+  // WITHOUT the platform's declaration it is correctly unidentifiable…
+  assert.equal(look(eeo, SUB).ok, false);
+  assert.match(look(eeo, SUB).why, /declared application step/);
+  // …and WITH it, the page is accepted.
+  assert.equal(look(eeo, SUB, onStep2).ok, true);
+  assert.equal(look(eeo, SUB, onStep2).declaredStep, true);
+
+  // ⚠ THE STEP IS EVIDENCE OF IDENTITY, NEVER OF ACTIONABILITY. No submit and no flow control still
+  // refuses: a page we cannot advance or submit is not one to fill, whatever it calls itself.
+  assert.equal(look(eeo, NOSUB, onStep2).ok, false);
+  assert.match(look(eeo, NOSUB, onStep2).why, /submit or next/i);
+
+  // ⚠ AND IT MUST NOT ADMIT A MARKETING WIDGET. Only a step list with a CURRENT step counts —
+  // an absent/malformed declaration leaves the original three signals in charge.
+  const dm = [{ fieldName: "dm-reservation-number" }, { fieldName: "dm-postal-code" }];
+  for (const bad of [null, undefined, {}, { present: false, step: 2 }, { present: true, step: null }]) {
+    assert.equal(look(dm, SUB, bad).ok, false, "stepEvidence=" + JSON.stringify(bad));
+  }
+  assert.equal(look(dm, SUB, onStep2).ok, true,
+    "a declared step DOES vouch for the page — which is why only the platform's own indicator may set it");
+
+  // ⚠ GREENHOUSE / LEVER / ASHBY PASS NOTHING HERE and are byte-identical to before.
+  const gh = [{ fieldName: "first_name", label: "First Name" }, { fieldName: "email", label: "Email" }];
+  assert.deepStrictEqual(look(gh, SUB).ok, look(gh, SUB, null).ok);
+  assert.equal(look(gh, SUB).declaredStep, false);
+});
+
 // react-select MULTI widgets (Greenhouse's demographic questions) hold their selection as CHIPS,
 // and a second commit APPENDS rather than replaces. Both facts were learned the hard way:
 // reading only .select__single-value fell through to the empty search input, so three REQUIRED

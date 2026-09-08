@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-walk-49";
+const AP_BUILD_MARKER = "icims-resume-51";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4948,7 +4948,10 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
       // The scan is the one that just produced the stable `n` — see the note above.
       const scan = lastScan;
       const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
-      const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
+      // iCIMS' own step indicator, when it has one — a declared step of the application identifies
+      // the page even though a later step carries no name/email/résumé. See the predicate's note.
+      const stepEv = ats === "icims" ? await icimsStepState().catch(() => null) : null;
+      const id = atsLooksLikeApplicationForm(scan && scan.fields, sub, stepEv);
       if (!id.ok) {
         LOG(`${n} field(s) settled here, but this is NOT an application form — ${id.why}. Not filling it.`);
         return { ready: false, fields: n, notAForm: true, why: id.why, waitedMs: Date.now() - start, polls };
@@ -4969,7 +4972,8 @@ async function waitAtsFormReady(ats, LOG, ceilingMs) {
     // Same reuse as the settle path: `lastScan` is the read that produced `prev`.
     const scan = lastScan;
     const sub = await cdpEval(atsInjSubmitState, ats).catch(() => null);
-    const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
+    const stepEv = ats === "icims" ? await icimsStepState().catch(() => null) : null;
+    const id = atsLooksLikeApplicationForm(scan && scan.fields, sub, stepEv);
     if (!id.ok) { LOG(`the ${prev} field(s) here are not an application form — ${id.why}`); return { ready: false, fields: prev, notAForm: true, why: id.why, waitedMs: Date.now() - start, polls, timedOut: true }; }
   }
   return { ready: prev > 0, fields: Math.max(prev, 0), waitedMs: Date.now() - start, polls, timedOut: true };
@@ -5624,10 +5628,21 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
     if (view === "none") {
       const scan = await cdpEval(atsInjScan, "icims").catch(() => null);
       const sub = await cdpEval(atsInjSubmitState, "icims").catch(() => null);
-      const id = atsLooksLikeApplicationForm(scan && scan.fields, sub);
+      // ⚠ THE STEP INDICATOR IS PASSED AS EVIDENCE, exactly as `waitAtsFormReady` passes it. Once the
+      // operator has a session and step 1 is saved, iCIMS RESUMES the application at a later step —
+      // and a later step carries no name/email/résumé, so the identity test alone refuses a page with
+      // 7 controls and a Submit on it, then hunts for an Apply control that cannot exist because we
+      // are already inside the flow. One predicate, one definition; see atsLooksLikeApplicationForm.
+      const stepEv = await icimsStepState().catch(() => null);
+      const id = atsLooksLikeApplicationForm(scan && scan.fields, sub, stepEv);
       if (id.ok) {
-        LOG(`signed in and on the application form — ${(scan.fields || []).length} field(s). Handing over to the fill.`);
-        return { reached_form: true, fields: (scan.fields || []).length, consentsAccepted };
+        const resumed = id.declaredStep && !(id.hasResume || id.hasEmail || id.hasName);
+        LOG(resumed
+          ? `already inside the application — iCIMS resumed it at step ${stepEv.step} of ${stepEv.total}`
+            + ` (${(stepEv.titles || [])[stepEv.step - 1] || "?"}) with ${((scan && scan.fields) || []).length} field(s). Handing over to the fill.`
+          : `signed in and on the application form — ${((scan && scan.fields) || []).length} field(s). Handing over to the fill.`);
+        return { reached_form: true, fields: ((scan && scan.fields) || []).length, consentsAccepted,
+          ...(resumed ? { resumedAtStep: stepEv.step } : {}) };
       }
       // A mailed link/code is the one "no field to fill" page worth naming: the next step is in the
       // operator's inbox, and the generic unknown-page halt would hide that completely.

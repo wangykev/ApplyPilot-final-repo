@@ -4214,7 +4214,32 @@ function atsDeclineOption(texts) {
 // POSITIVE identification, the same rule as every other control here: an application form has
 // a SUBMIT control AND at least one identity anchor (resume, email, or a name field). Both
 // hold on every Greenhouse/Lever/Ashby application form; a marketing capture fails the first.
-function atsLooksLikeApplicationForm(fields, submitState) {
+/**
+ * @param stepEvidence Optional: the platform's OWN declaration that this page is a step of the
+ *   application in progress (iCIMS' step indicator — `{present, step}` from atsInjIcimsSteps).
+ *
+ * ⚠⚠ A LATER STEP OF A MULTI-PAGE APPLICATION CARRIES NONE OF THE IDENTITY FIELDS (live 2026-09-08).
+ * The three signals below — résumé, email, name — are all PAGE-1 signals. iCIMS' step 2 is EEO:
+ * gender, race, veteran status, disability and "How did you hear about us?". Not one of them is a
+ * name or an email, so a page the pipeline can fill perfectly well was refused as "not an
+ * application form", and the run then hunted for an Apply control that does not exist because it was
+ * already INSIDE the flow — halting `apply-not-followable` on a page with 7 controls and a Submit.
+ *
+ * It only surfaced once the operator signed in: with a session and step 1 already saved, iCIMS
+ * RESUMES the application at step 2, so the landing page is no longer page 1.
+ *
+ * ⚠ THE EVIDENCE IS THE PLATFORM'S, NOT A LOOSENED HEURISTIC. "Step 2 of 3. EEO(Current Step)" is a
+ * stronger statement about what a page is than the presence of a name box, and it is read from
+ * iCIMS' own markup. Greenhouse/Lever/Ashby pass nothing here and are byte-identical — which
+ * matters, because loosening the identity test for them would let this fill a page that is not an
+ * application at all.
+ *
+ * ⚠ ONE DEFINITION, THREE CALL SITES. `waitAtsFormReady` asks this twice (its settle path and its
+ * timeout path) and the iCIMS pre-form once. Fixing only the pre-form got the run past the gate and
+ * straight into the same refusal one stage later — so the evidence belongs in the predicate, not at
+ * a call site. Same lesson as the four-place choice-widget registration.
+ */
+function atsLooksLikeApplicationForm(fields, submitState, stepEvidence) {
   const list = Array.isArray(fields) ? fields : [];
   const txt = (x) => (String((x && x.fieldName) || "") + " " + String((x && x.label) || "")).toLowerCase();
   const hasEmail = list.some((x) => /e-?mail/.test(txt(x)));
@@ -4228,10 +4253,13 @@ function atsLooksLikeApplicationForm(fields, submitState) {
   // reads, so nothing here can cause a Next to be pressed in place of a Submit.
   const hasFlow = !!(submitState && submitState.hasFlowControl);
   const canAct = hasSubmit || hasFlow;
+  // The platform declaring "this page is step N of the application" — see the note above.
+  const declaredStep = !!(stepEvidence && stepEvidence.present && stepEvidence.step != null);
+  const identified = hasResume || hasEmail || hasName || declaredStep;
   return {
-    ok: canAct && (hasResume || hasEmail || hasName),
-    hasSubmit, hasFlowControl: hasFlow, hasResume, hasEmail, hasName,
-    why: canAct ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
+    ok: canAct && identified,
+    hasSubmit, hasFlowControl: hasFlow, hasResume, hasEmail, hasName, declaredStep,
+    why: canAct ? (identified ? "" : "no resume/email/name field and no declared application step — this doesn't look like an application form")
                 : "no submit or next control on the page — this isn't a form we could fill or advance",
   };
 }
