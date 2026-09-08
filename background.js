@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-probe-43";
+const AP_BUILD_MARKER = "icims-wrapper-44";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -5385,6 +5385,17 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
       if (rendered && !cdpFormFrameArmed()) {
         const el = await cdpEvalTop(atsInjIcimsFrameSrc).catch(() => null);
         if (el && el.ok) rendered = false;
+        // ⚠⚠ AND THE FRAME MAY NOT EXIST YET AT ALL — the WRAPPER stage (live 2026-09-08, Shure).
+        // The guard above asks "advertised but not pinned?", which cannot fire while the `<iframe>`
+        // element is absent. With `?hub=7` iCIMS serves a branded wrapper first ("Careers - Shure
+        // USA": a heading, one search box, NO content frame), then client-side navigates to the
+        // posting and mounts it — measured still absent at 4.5s, present by ~15s. The wrapper
+        // satisfies `rendered` on its heading, so the run read IT, found no auth fields and no Apply
+        // control, and halted `apply-not-followable` → `posting-gone` on three live postings.
+        // `icimsExpectsContentFrame` answers from the URL (an iCIMS /jobs/<id>/… route promises a
+        // frame; /jobs/search does not), so this waits only where there is something to wait FOR and
+        // the 12s ceiling still bounds it.
+        else if (icimsExpectsContentFrame(sig && sig.url)) rendered = false;
       }
       stable = rendered && prev && !atsSignatureChanged(prev, sig) ? stable + 1 : 0;
       if (stable >= 1) return { settled: true, controls: sig.controls, waitedMs: Date.now() - (deadline - (budgetMs || 12000)) };
@@ -7252,6 +7263,27 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         return { ok: true, submitted: false, replayed: true, stopped: "validation-errors", errors: errs.errors, ats };
       }
     }
+    // ⚠⚠ SAY WHAT THE PAGE LOOKED LIKE, because this is the ONE terminal state where nobody can tell
+    // what happened (live 2026-09-08, Shure 5013: armed, 19/19 replayed, Submit clicked, then 60s of
+    // silence and a run result of `submitted:false` — with NOTHING in the log between the click and
+    // the timeout). "VERIFY IN THE TAB" is unactionable once the run has closed its own tab, and the
+    // operator is left unable to answer the only question that matters: did my application go in?
+    //
+    // On iCIMS specifically the answer is usually the pair CLAUDE.md already names — the submit is
+    // preventDefault-ed and the button self-disables until hCaptcha's callback fires, so
+    // `submitLocked` (the submit FIRED) against `captchaToken` (the captcha RESOLVED) separates
+    // "blocked by the captcha" from "sent, confirmation not recognised". Nothing else does.
+    try {
+      const st = await cdpEval(atsInjSubmitState, ats).catch(() => null);
+      const probe = ats === "icims" ? await cdpEval(atsInjIcimsPostParseProbe, ats).catch(() => null) : null;
+      const url = await cdpEval(function () { return location.href; }).catch(() => null);
+      LOG("  page at the timeout: "
+        + `url ${JSON.stringify(String(url || "?").split("?")[0].slice(-70))}`
+        + (st ? ` · submit present ${!!st.hasSubmit} (disabled ${st.disabled})` : " · submit state unreadable")
+        + (probe && probe.ok ? ` · ${probe.inTopDocument ? "TOP DOCUMENT" : "content frame"}, ${probe.controls} control(s), "${String(probe.head || "").slice(0, 90)}"` : ""));
+      LOG("  ⚠ this run does NOT know whether the application was sent — check the employer's confirmation email "
+        + "or your candidate profile on the portal BEFORE re-running, because a re-run would submit a second time.");
+    } catch (e) { LOG("  page at the timeout: could not be read — " + String((e && e.message) || e)); }
     LOG(`no confirmation within ${Math.round(SUBMIT_CONFIRM_MS / 1000)}s — VERIFY IN THE TAB before assuming either outcome.`);
     return { ok: true, submitted: false, replayed: true, stopped: "no-confirmation", detail: "Submit was clicked but no confirmation rendered within 30s — check the tab.", ats };
   } catch (e) {

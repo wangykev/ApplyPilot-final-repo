@@ -130,6 +130,35 @@ function atsFormUrl(ats, url) {
   } catch (e) { return String(url == null ? "" : url); }
 }
 
+/**
+ * Does this iCIMS url PROMISE a content frame that has not necessarily mounted yet?
+ *
+ * ⚠⚠ THE WRAPPER STAGE (measured 2026-09-08, Shure). `?hub=7` makes iCIMS serve a branded wrapper
+ * FIRST — title "Careers - Shure USA", a heading, one search input, and **no `#icims_content_iframe`
+ * element at all** — then client-side navigate to the real posting and mount the frame. Timed by
+ * hand: still absent at 4.5s, present by ~15s.
+ *
+ * That interval is what broke three armed submits. The settle's frame guard asks "is a frame
+ * ADVERTISED but not pinned yet?", which cannot fire while the `<iframe>` does not exist — so the
+ * wrapper satisfies `rendered` on its heading, the run reads it, finds no auth fields and no Apply
+ * control, and halts `apply-not-followable` → `posting-gone`. Both verdicts are FALSE: every one of
+ * these postings renders its own "Apply for this job online" seconds later.
+ *
+ * ⚠ URL EVIDENCE, NOT A GUESS — the same discipline as the SSO refusal. An iCIMS `/jobs/<id>/…` path
+ * IS the posting/apply route, so a content frame is genuinely expected there; anywhere else (the
+ * portal root, `/jobs/search`, an employer landing page) this returns false and nothing waits. The
+ * settle's 12s ceiling still bounds the wait, so the cost of being wrong is bounded and one-time.
+ */
+function icimsExpectsContentFrame(url) {
+  try {
+    const u = new URL(String(url == null ? "" : url));
+    if (detectAts(u.href) !== "icims") return false;
+    // `/jobs/<numeric id>/…` — the posting, its /job view, its /login gate and its /candidate step.
+    // `/jobs/search` is deliberately NOT matched: the id is what makes it a posting route.
+    return /^\/jobs\/\d+(\/|$)/.test(u.pathname);
+  } catch (e) { return false; }
+}
+
 // Company slug from the URL path — the FALLBACK employment-question anchor when the JD
 // scrape didn't produce a company (mirrors tenantCompanyFromUrl for Workday). First path
 // segment on all three hosts: /anthropic/jobs/1 · /kraken123/<uuid>/apply · /openai/<uuid>.
@@ -11802,7 +11831,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
     atsGeoValueInProfile, atsProfileAddressValues, atsTierIsDeterministic,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
-    atsIcimsResumeStage, atsIcimsAwaitParse, atsInjIcimsPostParseProbe, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
+    atsIcimsResumeStage, atsIcimsAwaitParse, atsInjIcimsPostParseProbe, icimsExpectsContentFrame, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
     atsInjLeanSignature,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
