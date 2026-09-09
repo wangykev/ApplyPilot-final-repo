@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-signin-61";
+const AP_BUILD_MARKER = "icims-advance-64";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4849,8 +4849,44 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
     return { advanced: false, stopped: "advance-unaimable",
       detail: "The advance control could not be located on the page, so nothing was pressed." };
   }
-  LOG(`step ${stepNo} (${stepLabel}) is ${before.step} of ${before.total} — pressing ${JSON.stringify(before.nextCaption)} to ADVANCE (not submit: step ${before.total} is the last)`);
-  const clicked = await atsAimedClick("icims", before.rect, "advance", LOG);
+  // ⚠⚠ CHOOSE THE ADVANCE CONTROL — DO NOT LET DOCUMENT ORDER CHOOSE IT (operator, 2026-09-09).
+  // `before.rect` comes from atsInjSubmitState, which takes the FIRST VISIBLE submit-ish control.
+  // Signed in, this step carries more than one, and the first is "Submit Profile" — which SAVES and
+  // stays put ("Your responses have been saved."), while "Save Profile" is what actually moves on.
+  // The operator proved it by hand: "you arent clicking save profile. I manually clicked it and it
+  // moved to the next page." Four runs were spent reading a working press as a broken one.
+  // Guards are untouched: terminality is still iCIMS' step declaration, and this line is only ever
+  // reached on a step that is definitely NOT the last.
+  let aimRect = before.rect, aimCaption = before.nextCaption;
+  const ctlProbe = await cdpEval(atsInjIcimsSubmitControls).catch(() => null);
+  const advPick = ctlProbe && ctlProbe.ok ? icimsAdvancePick(ctlProbe.controls) : null;
+  if (advPick && advPick.ok) {
+    const measured = await cdpEval(atsInjIcimsSubmitControls, advPick.control.index).catch(() => null);
+    const fresh = measured && measured.ok ? icimsAdvancePick(measured.controls) : null;
+    const chosen = fresh && fresh.ok ? fresh.control : advPick.control;
+    if (chosen.rect) { aimRect = chosen.rect; aimCaption = chosen.caption; }
+    const others = (ctlProbe.controls || []).filter((c) => c.index !== chosen.index && c.visible && !c.disabled)
+      .map((c) => JSON.stringify(c.caption));
+    LOG(`  advance control: ${JSON.stringify(chosen.caption)}${chosen.id ? " #" + chosen.id : ""}`
+      + ` (chose it over ${others.length ? others.join(", ") : "nothing else"}; matched /${advPick.matched}/)`);
+  } else if (advPick && !advPick.ok) {
+    // Never guess between two controls when one of them could be the application's own submit.
+    if (advPick.reason === "ambiguous") {
+      // Name them on their own lines: the `detail` is truncated in the log ring at 200 chars, and
+      // when this refuses the candidate list IS the whole diagnosis.
+      LOG(`  step ${stepNo} offers several equally-ranked controls — refusing to guess between them:`);
+      for (const c of (ctlProbe.controls || [])) {
+        LOG(`    · ${c.tag}${c.id ? "#" + c.id : ""} ${JSON.stringify(c.caption)}`
+          + `${c.visible ? "" : " (hidden)"}${c.disabled ? " (disabled)" : ""}`);
+      }
+      return { advanced: false, stopped: "advance-ambiguous",
+        detail: `Step ${stepNo} (${stepLabel}) offers several controls that could advance it (${(advPick.offered || []).join(" | ")}) `
+          + `— refusing to guess, because one wrong press on an iCIMS form is the application's own Submit.` };
+    }
+    LOG(`  could not read this step's controls (${advPick.reason}) — falling back to the first visible submit`);
+  }
+  LOG(`step ${stepNo} (${stepLabel}) is ${before.step} of ${before.total} — pressing ${JSON.stringify(aimCaption)} to ADVANCE (not submit: step ${before.total} is the last)`);
+  const clicked = await atsAimedClick("icims", aimRect, "advance", LOG);
   if (!clicked.ok) return { advanced: false, stopped: "advance-unaimable",
     detail: `The advance control is inside the iCIMS frame and its offset could not be read (${clicked.reason}), so nothing was pressed.` };
   // Wait for the DECLARED step number to go UP (monotone), or for the page to say why it will not.

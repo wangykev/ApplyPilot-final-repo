@@ -8046,6 +8046,88 @@ function icimsAccountExists(errors) {
   });
 }
 
+// ── WHICH CONTROL ACTUALLY MOVES AN iCIMS STEP ON (operator, 2026-09-09) ─────────────────────────
+// `atsInjSubmitState` takes the FIRST VISIBLE of `#cp_form_submit_i, input[type=submit],
+// button[type=submit]` — fine while a step had exactly one such control, which is all this pipeline
+// had ever met. Signed in, the step carries MORE THAN ONE, and DOM order picks the wrong one: the
+// run pressed "Submit Profile", the form answered "Your responses have been saved." and stayed
+// exactly where it was, while the operator clicking "Save Profile" by hand moved to the next page.
+//
+// So the advance stops relying on document order and CHOOSES, with the choice SW-side
+// (`icimsAdvancePick`) and this function only REPORTING — the same split as the login probe beside
+// it and `atsInjAuthScan` / `atsConsentKind`.
+//
+// ⚠ This does NOT weaken the never-submit guards. Which control to press and whether to press at all
+// are separate questions: terminality still comes only from iCIMS' own step declaration, and on the
+// last step nothing is pressed whatever it is captioned. That separation is why re-aiming the press
+// is safe.
+function atsInjIcimsSubmitControls(scrollToIndex) {
+  try {
+    const hits = [];
+    const seen = new Set();
+    for (const el of document.querySelectorAll('input[type="submit"], input[type="button"], button, a')) {
+      const tag = el.tagName.toLowerCase();
+      const cap = String(tag === "input" ? (el.value || "") : (el.textContent || "")).replace(/\s+/g, " ").trim();
+      if (!cap || cap.length > 60) continue;
+      if (!/\b(save|submit|update|continue|next|finish)\b/i.test(cap)) continue;
+      const key = (el.id || "") + "|" + cap;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      hits.push({ el, tag, cap });
+    }
+    // Scroll the CHOSEN one into view before any rect is taken — the press is a viewport coordinate,
+    // and an unscrolled read on a tall form lands below the fold (the `scrollSubmit` lesson).
+    if (typeof scrollToIndex === "number" && hits[scrollToIndex]) {
+      try { hits[scrollToIndex].el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) { /* older engines */ }
+    }
+    const out = hits.map((h, i) => {
+      const r = h.el.getBoundingClientRect();
+      const visible = r.width > 0 && r.height > 0;
+      return {
+        index: i, tag: h.tag, id: h.el.id || null, caption: h.cap, visible,
+        disabled: !!h.el.disabled || h.el.getAttribute("aria-disabled") === "true",
+        rect: visible ? { cx: r.left + r.width / 2, cy: r.top + r.height / 2, w: r.width, h: r.height } : null,
+      };
+    });
+    return { ok: true, controls: out };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// Preference order, most-specific first. "Submit Profile" is LAST on purpose: it is the control this
+// code pressed for weeks, and signed in it saves without advancing — so it is the fallback for a form
+// that offers nothing better, never the first choice.
+var ICIMS_ADVANCE_PREF = [
+  /\b(save|update)\s+profile\b/i,
+  /\b(continue|next)\b/i,
+  // Bare "Submit" is the EEO step's advance (`input#eeop_form_submit_i`, measured 2026-09-09). It is
+  // last because on the FINAL step the same wording is the real thing — which is why terminality is
+  // never decided here: the step declaration stops the walk before this is ever consulted there.
+  /\bsubmit\b/i,
+];
+
+// ⚠⚠ NEVER THE ADVANCE, whatever else it matches. Step 2 offers `input#eeop_form_save_i
+// "Finish Later"` right next to the control that moves on, and it is the more dangerous of the two:
+// pressing it does not fail loudly, it SAVES AND LEAVES THE FLOW, so the walk would report a
+// successful press and the remaining steps would silently never be filled. Backwards/destructive
+// wordings are refused for the same reason.
+var ICIMS_ADVANCE_DENY = /\b(finish later|save (?:it )?for later|complete later|cancel|go back|previous|delete|remove|withdraw|log\s?out|sign\s?out)\b/i;
+
+function icimsAdvancePick(controls) {
+  const all = Array.isArray(controls) ? controls : [];
+  const usable = all.filter((c) => c && c.visible && !c.disabled && c.rect && !ICIMS_ADVANCE_DENY.test(c.caption));
+  const offered = all.map((c) => (c && c.caption) || "?").slice(0, 8);
+  if (!usable.length) return { ok: false, reason: "none", offered };
+  for (const re of ICIMS_ADVANCE_PREF) {
+    const m = usable.filter((c) => re.test(c.caption));
+    // ⚠ TWO controls at the SAME preference tier is not a choice we may make — one of them could be
+    // the application's own submit. Refuse and name them, like the Apply and login pickers.
+    if (m.length > 1) return { ok: false, reason: "ambiguous", offered: m.map((c) => c.caption) };
+    if (m.length === 1) return { ok: true, control: m[0], matched: re.source };
+  }
+  if (usable.length === 1) return { ok: true, control: usable[0], matched: "only-control" };
+  return { ok: false, reason: "ambiguous", offered: usable.map((c) => c.caption).slice(0, 8) };
+}
+
 // Which of the reported login controls may be pressed. SW-side and pure, so the judgement has ONE
 // copy and can be unit-tested — the same split as atsInjAuthScan reporting markers while
 // icimsAuthView / atsConsentKind decide. Refuses on ambiguity exactly like the Apply-control picker:
@@ -12185,6 +12267,7 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, atsInjAuthControls, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsIcimsHost,
+    atsInjIcimsSubmitControls, icimsAdvancePick, ICIMS_ADVANCE_PREF, ICIMS_ADVANCE_DENY,
     ICIMS_ACCOUNT_TAKEN_RE, ICIMS_ACCOUNT_SUBJECT_RE,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,

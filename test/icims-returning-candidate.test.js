@@ -258,6 +258,81 @@ test("an invitation phrased as a sentence still counts", () => {
   assert.strictEqual(r.candidates[0].usable, true);
 });
 
+// ── which control advances a step ────────────────────────────────────────────────────────────────
+
+const { icimsAdvancePick } = require("../ats.js");
+const ctl = (caption, extra) => ({ index: 0, caption, visible: true, disabled: false, rect: { cx: 5, cy: 5 }, ...(extra || {}) });
+
+test("⚠⚠ Save Profile beats Submit Profile — the one the operator proved by hand", () => {
+  // Live 2026-09-09: signed in, the step carries both. Pressing "Submit Profile" saves and stays put
+  // ("Your responses have been saved."); the operator clicked "Save Profile" and it moved on.
+  // atsInjSubmitState took whichever came FIRST IN DOCUMENT ORDER, which is not a choice at all.
+  const r = icimsAdvancePick([ctl("Submit Profile", { index: 0 }), ctl("Save Profile", { index: 1 })]);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.control.caption, "Save Profile");
+});
+
+test("Update Profile also beats Submit Profile, and order does not matter", () => {
+  const a = icimsAdvancePick([ctl("Update Profile", { index: 0 }), ctl("Submit Profile", { index: 1 })]);
+  assert.strictEqual(a.control.caption, "Update Profile");
+  const b = icimsAdvancePick([ctl("Submit Profile", { index: 0 }), ctl("Update Profile", { index: 1 })]);
+  assert.strictEqual(b.control.caption, "Update Profile");
+});
+
+test("Submit Profile alone is still taken — the historical behaviour is the fallback", () => {
+  const r = icimsAdvancePick([ctl("Submit Profile")]);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.control.caption, "Submit Profile");
+});
+
+test("⚠⚠ two controls at the SAME tier refuse — one of them could be the application's Submit", () => {
+  const r = icimsAdvancePick([ctl("Save Profile", { index: 0 }), ctl("Update Profile", { index: 1 })]);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, "ambiguous");
+  assert.deepStrictEqual(r.offered, ["Save Profile", "Update Profile"]);
+});
+
+test("⚠ a hidden, disabled or unmeasurable control is never the advance", () => {
+  assert.strictEqual(icimsAdvancePick([ctl("Save Profile", { visible: false })]).ok, false);
+  assert.strictEqual(icimsAdvancePick([ctl("Save Profile", { disabled: true })]).ok, false);
+  assert.strictEqual(icimsAdvancePick([ctl("Save Profile", { rect: null })]).ok, false);
+  // …and a disabled preferred one does not shadow a usable fallback
+  const r = icimsAdvancePick([ctl("Save Profile", { index: 0, disabled: true }), ctl("Submit Profile", { index: 1 })]);
+  assert.strictEqual(r.control.caption, "Submit Profile");
+});
+
+test("⚠⚠ the EEO step: 'Submit' advances, 'Finish Later' must never be pressed", () => {
+  // Measured live 2026-09-09 on step 2 of 3: input#eeop_form_save_i "Finish Later" sits right next
+  // to input#eeop_form_submit_i "Submit". Finish Later is the more dangerous of the two — it does not
+  // fail loudly, it SAVES AND LEAVES THE FLOW, so the walk would report a successful press and the
+  // remaining steps would silently never be filled.
+  const r = icimsAdvancePick([
+    ctl("Finish Later", { index: 0, id: "eeop_form_save_i" }),
+    ctl("Submit", { index: 1, id: "eeop_form_submit_i" }),
+  ]);
+  assert.strictEqual(r.ok, true);
+  assert.strictEqual(r.control.caption, "Submit");
+  assert.strictEqual(r.control.id, "eeop_form_submit_i");
+});
+
+test("⚠ a step offering ONLY a leave-the-flow control advances nowhere", () => {
+  // Better to refuse than to press the one control that abandons the application.
+  const r = icimsAdvancePick([ctl("Finish Later")]);
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.reason, "none");
+});
+
+test("⚠ backwards and destructive wordings are refused too", () => {
+  for (const cap of ["Cancel", "Go Back", "Previous", "Delete", "Withdraw", "Log Out", "Complete Later"]) {
+    assert.strictEqual(icimsAdvancePick([ctl(cap)]).ok, false, cap + " must never advance a step");
+  }
+});
+
+test("no controls at all is reported, not thrown", () => {
+  assert.strictEqual(icimsAdvancePick([]).ok, false);
+  assert.strictEqual(icimsAdvancePick(undefined).reason, "none");
+});
+
 // ── SOURCE-TEXT GUARDS (background.js / cdp.js are service-worker files and cannot be require()d) ─
 // Comments are stripped FIRST — both files now *document* the shapes they refuse, and a naive grep
 // matches the explanation instead of the code. `[^\r\n]*`, never `.*$`: this repo checks out CRLF
