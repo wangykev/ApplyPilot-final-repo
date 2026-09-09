@@ -2848,6 +2848,16 @@ function atsInjIcimsSteps() {
       declaredIndex: m ? parseInt(m[1], 10) : null,
       declaredTotal: m ? parseInt(m[2], 10) : null,
       incomplete: /\(incomplete step\)/i.test(txt),
+      // ⚠ CAN THIS STEP BE JUMPED TO? A returning candidate is resumed at the first INCOMPLETE step,
+      // so a run that signs in never walks step 1 and its 19 fields never reach the review bundle
+      // even though they are saved server-side. Whether the walk can go back and collect them
+      // depends on whether the platform makes these indicators navigable — which is a READ, not
+      // something to assume from one tenant's markup. Reported so one run can answer it.
+      // ⚠ Defensive: this runs inside a page, but it must not be the thing that throws — a step read
+      // that dies takes the walk's terminality check with it, and "unreadable" is the one answer that
+      // must never be reachable by accident.
+      href: (() => { try { const a = li.querySelector && li.querySelector("a[href]"); return a ? String(a.getAttribute("href")).slice(0, 120) : null; } catch (e) { return null; } })(),
+      clickable: (() => { try { return !!((li.querySelector && li.querySelector("a,button")) || li.getAttribute("onclick")); } catch (e) { return false; } })(),
       pos: i + 1,
     };
   });

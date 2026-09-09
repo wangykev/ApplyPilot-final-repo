@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-advance-64";
+const AP_BUILD_MARKER = "icims-carry-66";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4787,6 +4787,7 @@ async function icimsStepState(opts) {
     step: steps.currentPos, total: steps.count,
     isLast: steps.isLast, declaredAgrees: steps.declaredAgrees,
     titles: steps.titles,
+    steps: steps.steps,   // per-step detail: complete/incomplete and whether it can be jumped to
     // NOT on the last step ⇒ that control is Next. ON the last ⇒ it is Submit. Same element.
     hasNext: steps.isLast === false && control,
     nextCaption: steps.isLast === false ? ((sub && sub.label) || "Submit Profile") : null,
@@ -6849,7 +6850,42 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     // attempt cannot either — the account is simply not the one we hold credentials for.
     let signInRecoveries = 0;
     // CLEAR ONCE, before the first step (the Workday rule — a clear inside the loop is the bug).
-    if (MULTI) await new Promise((r) => chrome.storage.local.set({ reviewSummary: null, reviewAudit: null }, r));
+    //
+    // ⚠⚠ EXCEPT ON A RESUMED iCIMS APPLICATION, WHERE THE CLEAR DESTROYS STEPS THIS RUN CAN NEVER
+    // SEE (operator, 2026-09-09: "the third page needs to be filled as well and all show on the
+    // review page together"). iCIMS saves each step server-side and restarts a returning candidate at
+    // the first INCOMPLETE one, so successive runs start further along: measured 1-of-3, then 2-of-3,
+    // then 3-of-3, and the bundle shrank 19 fields → 8 → 6 as the clear wiped what the walk no longer
+    // walked. And the steps are NOT navigable — measured, the indicators carry no anchor and no
+    // onclick — so the walk cannot simply go back and re-collect them.
+    //
+    // So the earlier steps are carried FORWARD instead. Safe because `accumulateBundle` is already
+    // built for exactly this: it keeps other pages VERBATIM and overwrites only the page being
+    // written, so any step this run does walk still replaces its own entry set. And the carried
+    // values are not stale guesses — they are what a previous run SAVED to this application, which is
+    // what the server now holds.
+    //
+    // ⚠ GATED ON THE JOB, never "whatever is in storage". The targeted-pull rule from the submit path
+    // applies with equal force here: merging another job's bundle into this one would put another
+    // application's answers on this review page.
+    if (MULTI) {
+      let carried = null;
+      if (ats === "icims") {
+        const prior = await new Promise((r) => chrome.storage.local.get("reviewSummary", (o) => r((o && o.reviewSummary) || null)));
+        if (prior && prior.jobKeyUrl && originUrl && prior.jobKeyUrl === originUrl && (prior.entries || []).length) carried = prior;
+        else if (prior && (prior.entries || []).length) {
+          LOG(`the stored review bundle belongs to a different job — clearing it rather than merging someone else's answers`);
+        }
+      }
+      if (carried) {
+        accEntries = carried.entries;
+        const pages = [...new Set(accEntries.map((e) => e.page).filter(Boolean))];
+        LOG(`carrying forward ${accEntries.length} field(s) from this application's earlier step(s) — iCIMS resumes at the first`
+          + ` INCOMPLETE step and its step indicators are not navigable, so they cannot be re-walked (${pages.length} page(s) kept)`);
+      } else {
+        await new Promise((r) => chrome.storage.local.set({ reviewSummary: null, reviewAudit: null }, r));
+      }
+    }
 
     for (let iter = 1; iter <= (MULTI ? ORC_MAX_STEPS : 1); iter++) {
       const stepT0 = Date.now();
@@ -6866,6 +6902,19 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
         // already the last, nothing pressed. Byte-identical behaviour for Astrion and friends.
         if (ats === "icims" && st.present === false) LOG("no iCIMS step indicator on this form — treating it as the single page it is");
         LOG(`step ${st.step != null ? st.step : "?"}${st.total ? " of " + st.total : ""} — sections ${JSON.stringify(st.visibleSections)} visible of ${st.sectionCount} · next=${st.hasNext ? JSON.stringify(st.nextCaption) + (st.nextEnabled ? "" : " (DISABLED)") : "none"} · submit=${st.hasSubmit ? JSON.stringify(st.submitCaption) : "none"}`);
+        // ⚠ ONE-TIME RECON, on the first step this walk sees. A RESUMED walk starts at the first
+        // INCOMPLETE step, so the steps before it are saved server-side and never reach the review
+        // bundle — the operator asked for all of them on the review page together. Whether the walk
+        // can go BACK and collect them depends on whether these indicators are navigable, which is a
+        // read rather than an assumption. Printed once per run, on the fill path only.
+        if (ats === "icims" && iter === 1 && st.steps) {
+          LOG(`  this application's steps (a resumed walk starts at the first INCOMPLETE one):`);
+          for (const s of st.steps) {
+            LOG(`    · ${s.pos}. ${JSON.stringify(s.title || s.id || "?")}`
+              + `${s.current ? " ← CURRENT" : ""}${s.incomplete ? " (incomplete)" : " (complete)"}`
+              + ` · ${s.clickable ? "navigable" + (s.href ? " → " + s.href : " (js)") : "NOT navigable"}`);
+          }
+        }
         // ⚠⚠ A BLOCK CAN BE MOUNTED WITH ITS CONTENTS STILL IN FLIGHT, and the field-set settle
         // cannot see it. Live 2026-08-19 step 3 reported `"Application Questions" (0 input(s))`
         // alongside Diversity (7), Veteran (1), Disability (3) and E-Signature (1) — the page was

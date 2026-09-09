@@ -24,6 +24,10 @@ function withDom(lis) {
     className: o.className || "",
     textContent: o.text || "",
     getAttribute: (k) => (k === "title" ? (o.title == null ? null : o.title) : null),
+    // The operator's real markup holds only a <span> — no anchor, no button. Measured live
+    // 2026-09-09: the step indicators are NOT navigable, which is why a resumed walk carries its
+    // earlier steps forward instead of going back to re-collect them.
+    querySelector: () => null,
   });
   const nodes = lis.map(mk);
   global.document = { querySelectorAll: (sel) => (/^li\[/.test(sel) ? nodes : []) };

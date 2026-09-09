@@ -395,6 +395,24 @@ test("⚠⚠ the walk routes account-exists to the sign-in, ONCE, and re-fills t
   assert.match(near, /continue;/, "the same step must be filled again — its values are gone");
 });
 
+test("⚠⚠ a resumed iCIMS walk carries earlier steps forward, and ONLY for the same job", () => {
+  // iCIMS saves each step and restarts a returning candidate at the first INCOMPLETE one, so
+  // successive runs start further along (measured 1-of-3, then 2-of-3, then 3-of-3) and the
+  // clear-at-start wiped the steps the walk no longer walks — the bundle shrank 19 fields -> 8 -> 6.
+  // The step indicators are not navigable, so they cannot be re-collected; they are carried instead.
+  const i = bg.indexOf("let signInRecoveries = 0;");
+  const fn = bg.slice(i, i + 2600);
+  assert.match(fn, /prior\.jobKeyUrl === originUrl/,
+    "carrying forward must be gated on the JOB — merging another application's bundle would put its answers on this review page");
+  assert.match(fn, /ats === "icims"/, "only iCIMS resumes mid-application; every other walk still clears");
+  // the clear must still happen when nothing is carried
+  assert.match(fn, /reviewSummary: null, reviewAudit: null/,
+    "a walk with nothing to carry still clears once, outside the loop");
+  const carryAt = fn.indexOf("accEntries = carried.entries");
+  const clearAt = fn.indexOf("reviewSummary: null");
+  assert.ok(carryAt > 0 && clearAt > carryAt, "the clear is the ELSE branch — never both");
+});
+
 test("⚠⚠ the press diagnosis reads the form's OWN WORDS before claiming the click missed", () => {
   const i = bg.indexOf("async function icimsAdvanceAfterStep(");
   const fn = bg.slice(i, bg.indexOf("\nasync function ", i + 10));
