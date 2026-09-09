@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-scroll-52";
+const AP_BUILD_MARKER = "icims-diag-53";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4878,6 +4878,25 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
     }
   }
   // Refused: report the FORM's own words rather than guessing, and never retry in place.
+  // ⚠⚠ THE FORM'S OWN INVISIBLE hCAPTCHA GATES THIS PRESS, AND ITS FAILURE MODE IS SILENT.
+  // CLAUDE.md records it: "the form carries its OWN captcha (2 hcaptcha frames + an
+  // h-captcha-response input), so Submit Profile is captcha-gated exactly like the gate". The submit
+  // is preventDefault-ed → `hcaptcha.execute()` → callback → `form.submit()`, so a press that lands
+  // and produces NOTHING — no navigation, no validation text — is indistinguishable from a press
+  // that missed, unless these two are read. They were added to the final-submit timeout earlier
+  // today and belong here for the same reason:
+  //   submitLocked : iCIMS' onsubmit calls icimsDisableSaveAndSubmitButtons, so a DISABLED control
+  //                  proves the submit event FIRED and we are waiting on the captcha.
+  //   captchaToken : a token present proves hCaptcha RESOLVED and the post really went.
+  // Nothing else tells "the click missed" from "the captcha never answered" from "the server said no".
+  const d = await cdpEval(atsInjAuthScan).catch(() => null);
+  if (d) {
+    LOG(`  press diagnosis: submitLocked=${d.submitLocked} captchaToken=${d.captchaToken}`
+      + ` captchaFrames=${d.captchaFrames} challengeVisible=${d.captchaChallenge}`
+      + ` — ${d.submitLocked && !d.captchaToken ? "the submit FIRED and is waiting on the form's invisible captcha"
+          : d.captchaToken ? "the captcha resolved and the post went — the step read may just be lagging"
+            : "the submit handler did not run at all (the press did not reach the control)"}`);
+  }
   const errs = await cdpEval(atsInjErrors, "icims").catch(() => null);
   const list = (errs && errs.errors) || [];
   // ⚠⚠ AN IDLE-SESSION WARNING IS NOT A VALIDATION ERROR, and reporting it as one cost two whole
