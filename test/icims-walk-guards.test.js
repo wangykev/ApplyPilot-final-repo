@@ -53,10 +53,14 @@ test("⚠⚠ the advance refuses unless isLast is EXACTLY false", () => {
 
 test("⚠⚠ guard 2 is a SECOND, LATER read — not the caller's value reused", () => {
   const fn = bodyOf("async function icimsAdvanceAfterStep(");
-  assert.match(fn, /await\s+icimsStepState\(\)/,
+  // ⚠ MATCHES ANY ARGUMENTS on purpose. This was `icimsStepState\(\)` and broke the moment the read
+  // gained `{scrollSubmit:true}` — the guard was still there and still second, so a literal pattern
+  // would have forced a REAL fix to be reverted to satisfy a test about something else. What matters
+  // is that the advance takes its OWN read and refuses before pressing, not the argument list.
+  assert.match(fn, /await\s+icimsStepState\(/,
     "the advance must re-read the step state itself; trusting the caller's read is one guard, not two");
   // and the refusal must come BEFORE anything is pressed
-  const readAt = fn.search(/await\s+icimsStepState\(\)/);
+  const readAt = fn.search(/await\s+icimsStepState\(/);
   const guardAt = fn.search(/isLast\s*!==\s*false/);
   const clickAt = fn.search(/atsAimedClick/);
   assert.ok(readAt >= 0 && guardAt > readAt, "the guard must follow its own read");

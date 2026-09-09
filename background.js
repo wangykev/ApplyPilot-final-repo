@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-resume-51";
+const AP_BUILD_MARKER = "icims-scroll-52";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4738,10 +4738,27 @@ async function atsAimedClick(ats, rect, what, LOG) {
  * list, and `hasNext` / `hasSubmit` are derived from WHERE WE ARE rather than from what the button
  * says.
  */
-async function icimsStepState() {
+async function icimsStepState(opts) {
   const steps = await cdpEval(atsInjIcimsSteps).catch(() => null);
   if (!steps || !steps.ok) return { ok: false, reason: "steps-unreadable" };
-  const sub = await cdpEval(atsInjSubmitState, "icims").catch(() => null);
+  // ⚠⚠ SCROLL THE CONTROL INTO VIEW BEFORE MEASURING IT — but ONLY when the rect is about to be
+  // CLICKED (live 2026-09-08, and this one was self-inflicted). `atsInjSubmitState`'s rect comes from
+  // `getBoundingClientRect()`, so on a page taller than the viewport an unscrolled read returns a y
+  // BELOW THE FOLD, and `Input.dispatchMouseEvent` at coordinates outside the viewport hits nothing.
+  // Measured on the EEO step: `translating 730,1153 by +25,+99 → 755,1252` against a ~565px
+  // viewport — the press went into empty space, the form never posted, and the page re-rendered from
+  // the server with Gender and Race blank again. The fill had reported both `filled` because its own
+  // read-back is immediate and correct; nothing was wrong with the commits.
+  //
+  // The submit path already does this (`atsInjSubmitState(ats, true)`, with a note that the gate
+  // re-renders the footer). The advance needs it for the same reason and did not have it.
+  //
+  // ⚠ NOT on the identity reads. `waitAtsFormReady` and the pre-form ask for the step state to work
+  // out WHAT the page is, and scrolling during a settle moves a page that may have an option list
+  // open — the standing hazard on this codebase ("watching the fill must never move the page while
+  // the fill is touching it"). So it is opt-in, and only the advance opts in.
+  const scrollSubmit = !!(opts && opts.scrollSubmit);
+  const sub = await cdpEval(atsInjSubmitState, "icims", scrollSubmit).catch(() => null);
   if (!steps.present) {
     // ⚠⚠ "NO STEP LIST" HAS TWO CAUSES AND THEY MUST NOT SHARE AN ANSWER (caught live 2026-09-08 by
     // this function's own first walk). Either this really is a single-page iCIMS form — the shape
@@ -4802,7 +4819,10 @@ async function icimsStepState() {
  * only be noticed late, never missed, which is the standing rule for every wall-clock poll here.
  */
 async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
-  const before = await icimsStepState();
+  // `scrollSubmit` — this read's rect is the one we CLICK, so the control must be on screen when it
+  // is measured. See icimsStepState's note: without it the press lands below the fold and nothing
+  // posts, which then looks exactly like the form refusing to advance.
+  const before = await icimsStepState({ scrollSubmit: true });
   if (!before.ok) return { advanced: false, stopped: "step-state-unreadable",
     detail: "Could not re-read iCIMS' step indicator before advancing, so nothing was pressed." };
   // GUARD 2 — re-read, and refuse anything that is not a definite "not the last step".
@@ -4860,10 +4880,33 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
   // Refused: report the FORM's own words rather than guessing, and never retry in place.
   const errs = await cdpEval(atsInjErrors, "icims").catch(() => null);
   const list = (errs && errs.errors) || [];
-  if (list.length) { LOG(`step ${stepNo} did not advance — the form says:`); list.slice(0, 6).forEach((e) => LOG("  · " + e)); }
+  // ⚠⚠ AN IDLE-SESSION WARNING IS NOT A VALIDATION ERROR, and reporting it as one cost two whole
+  // debugging rounds here. iCIMS renders "You will be logged out in 60 seconds due to inactivity."
+  // into a VISIBLE node, so `atsInjErrors` (which correctly filters by geometry) scrapes it and it
+  // arrives looking exactly like the form's objection to our data. It is the opposite: it says the
+  // form never judged the submission at all, because the session behind it is dying.
+  //
+  // Same class as Workday's `role="alert"` on the upload widget being the STATUS channel rather than
+  // an error channel, and ORC's hidden <session-expire> dialog answering `querySelector("h1,h2")`.
+  // Splitting them is what turns "the form says something about being logged out" into an
+  // actionable, correctly-named stop.
+  const SESSION_RE = /logged out|log out|sign(ed)? out|inactivity|session (has )?(expired|timed out|will end)|are you still/i;
+  const sessionWarn = list.filter((e) => SESSION_RE.test(e));
+  const real = list.filter((e) => !SESSION_RE.test(e));
+  if (real.length) { LOG(`step ${stepNo} did not advance — the form says:`); real.slice(0, 6).forEach((e) => LOG("  · " + e)); }
+  if (sessionWarn.length && !real.length) {
+    LOG(`step ${stepNo} did not advance, and the page is warning about the SESSION, not about the data:`);
+    sessionWarn.slice(0, 3).forEach((e) => LOG("  · " + e));
+    LOG("  ⚠ so the form never judged the submission — the fields are filled and the press landed, but the "
+      + "session behind it is expiring. Re-open the application in the tab (any interaction refreshes it) and re-run.");
+    return { advanced: false, stopped: "session-expiring", errors: sessionWarn,
+      detail: `Step ${stepNo} (${stepLabel}) did not advance, and the only thing the page said was a session warning `
+        + `(${sessionWarn[0]}). The data is filled and the control was pressed — iCIMS' idle timeout is what stopped it, `
+        + "so this is a session problem and not a form problem." };
+  }
   return { advanced: false, stopped: "step-did-not-advance", errors: list,
     detail: `Step ${stepNo} (${stepLabel}) did not advance within 25s.`
-      + (list.length ? " The form says: " + list.slice(0, 3).join(" / ") : " The form gave no error text.") };
+      + (real.length ? " The form says: " + real.slice(0, 3).join(" / ") : " The form gave no error text.") };
 }
 
 // Poll the form until its field count has been non-zero and UNCHANGED for a QUIET WINDOW (the
