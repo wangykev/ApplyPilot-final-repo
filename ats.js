@@ -2561,6 +2561,45 @@ function atsInjClickAuthSubmit(sel) {
   return { ok: true, caption: String(btn.value || btn.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40) };
 }
 
+// ── WHAT IS THIS AUTH PAGE ACTUALLY MADE OF? (diagnostics, 2026-09-09) ───────────────────────────
+// When a credential step submits and the page does not move, "nothing happened" has several causes
+// with opposite fixes — the submit control was not found, it was found but is not the one that
+// posts, the form wants a keypress rather than a click, or the server rejected us silently. Live on
+// `login.icims.eu` the run logged `submitLocked null` and `submitting "the form"`, i.e. the scan
+// found no submit control at all, and there was no way to tell which of those it was. The run closes
+// its own tab, so the page cannot be inspected afterwards: it has to report itself.
+//
+// ⚠⚠ NEVER RETURNS AN INPUT'S VALUE. These pages hold the operator's login and password, and this
+// string reaches the service-worker log. A caption is read from `value` ONLY for submit/button
+// inputs, where `value` IS the caption; for every other input it is omitted entirely. A password box
+// reports nothing but whether it is non-empty.
+function atsInjAuthControls() {
+  try {
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, 60);
+    const out = [];
+    for (const el of document.querySelectorAll("input,button,select,textarea,a[role='button']")) {
+      const tag = el.tagName.toLowerCase();
+      const type = String(el.getAttribute("type") || "").toLowerCase();
+      const isButtonish = tag === "button" || tag === "a" || type === "submit" || type === "button";
+      out.push({
+        tag, type: type || null, id: el.id || null, name: el.getAttribute("name") || null,
+        // value is the CAPTION on a submit/button input and the SECRET on every other input
+        caption: isButtonish ? clean(tag === "input" ? el.value : (el.textContent || el.getAttribute("aria-label"))) : null,
+        holdsSomething: tag === "input" && !isButtonish ? !!String(el.value || "").length : undefined,
+        visible: vis(el),
+        disabled: !!el.disabled || el.getAttribute("aria-disabled") === "true",
+      });
+    }
+    const forms = [...document.querySelectorAll("form")].map((f) => ({
+      id: f.id || null, action: clean((f.getAttribute("action") || "")).slice(0, 80),
+      method: clean(f.getAttribute("method")) || "get",
+    }));
+    const heads = [...document.querySelectorAll("h1,h2,h3")].filter(vis).map((h) => clean(h.textContent)).slice(0, 5);
+    return { ok: true, url: String(location.href).split("?")[0], controls: out.slice(0, 40), forms, headings: heads };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
 // Independent re-read of a credential box. Same no-value contract as the write.
 // `matches` is the whole point: it answers "does the page still hold what we put there?" without
 // anyone outside the page ever seeing either string.
@@ -7947,6 +7986,23 @@ function icimsIsAdminLogin(url) {
   } catch (e) { return false; }
 }
 
+// Is this iCIMS' own infrastructure at all? Used to tell "the vendor's login host" from "some third
+// party", which is a different question from whether it is the STAFF login.
+//
+// ⚠ THE HOST ALONE CANNOT SAY WHETHER A `login.icims.*` PAGE IS OURS (operator, 2026-09-09).
+// `login.icims.com` is documented here as the RECRUITER login and is refused on sight — but the
+// operator confirmed that this tenant's own candidate Login control legitimately lands on
+// `login.icims.eu`, and that "the things later in the link identify it from their backend", i.e. the
+// candidate/tenant identity rides in the path and query, not the hostname. So the discriminator is
+// PROVENANCE, not the host: a login page we reached by following the tenant form's OWN Login control
+// is the candidate login; the same host reached any other way is not vouched for and stays refused.
+function icimsIsIcimsHost(url) {
+  try {
+    const h = new URL(String(url == null ? "" : url)).hostname.toLowerCase();
+    return /(^|\.)icims\.[a-z]{2,}(\.[a-z]{2,})?$/.test(h);
+  } catch (e) { return false; }
+}
+
 // iCIMS can answer the email gate by MAILING you a one-time link instead of showing a password
 // box — that is where the `?eem=…&code=…` magic-link session this tenant was first driven with
 // came from. Such a page has no field to fill and no button worth pressing, so it must be
@@ -8056,27 +8112,29 @@ function atsInjIcimsLoginLink(scrollToIndex) {
       const r = el.getBoundingClientRect();
       const visible = r.width > 0 && r.height > 0;
       const isFormSubmit = el.id === "cp_form_submit_i" || h.tag === "input";
-      // ⚠⚠ THE CANDIDATE'S LOGIN IS ON THE TENANT'S OWN HOST — ANYTHING ELSE IS THE WRONG "login"
-      // (live 2026-09-09). The first version of this probe matched a bare lowercase `<a>login</a>`
-      // with no id, pressed it, and was taken to `login.icims.eu` — iCIMS' CENTRAL login, not
-      // careersus-shure.icims.com's candidate one. The stored candidate password was then typed into
-      // it three times before the same-view guard stopped the run. The ambiguity guard could not help:
-      // there was exactly ONE match, it was just the wrong link.
-      // The gate we DO drive successfully is always on the tenant host, so a cross-host destination is
-      // positive evidence this is not the candidate flow. An UNPARSEABLE href refuses too — the safe
-      // direction, since a link we cannot resolve is one we cannot vouch for.
+      // ⚠ THE DESTINATION MUST BE THE TENANT'S HOST OR iCIMS' OWN — NOTHING ELSE (2026-09-09).
+      // A first version refused ANY cross-host link, which was too strict and would have broken the
+      // real flow: the operator confirmed this tenant's Login control legitimately goes to
+      // `login.icims.eu`, with the candidate/tenant identity carried in the path and query rather
+      // than the hostname. What must still be refused is a link off to a third party entirely — a
+      // footer, a partner site, an employer marketing page — because pressing one of those with an
+      // application half-filled sends the run somewhere it can never sign in.
+      // An UNPARSEABLE href refuses too: a link we cannot resolve is one we cannot vouch for.
       let offSite = false, hrefAbs = null;
       const rawHref = el.getAttribute("href");
       if (rawHref && !/^(#|javascript:)/i.test(rawHref)) {
         try {
           const u = new URL(rawHref, location.href);
           hrefAbs = u.href;
-          offSite = u.hostname.toLowerCase() !== String(location.hostname || "").toLowerCase();
+          const host = u.hostname.toLowerCase();
+          const sameHost = host === String(location.hostname || "").toLowerCase();
+          const icimsHost = /(^|\.)icims\.[a-z]{2,}(\.[a-z]{2,})?$/.test(host);
+          offSite = !sameHost && !icimsHost;
         } catch (e) { offSite = true; }
       }
       const why = isFormSubmit ? "not-an-anchor-or-button"
         : !visible ? "not-visible"
-          : offSite ? "leaves-the-tenant-host" : null;
+          : offSite ? "leaves-the-tenant-and-icims" : null;
       out.push({
         index: i, tag: h.tag, sel: h.sel, caption: h.cap, visible, usable: !why, excludedBecause: why,
         // `cx`/`cy` is the shape atsAimedClick reads — it translates these by the iCIMS frame's own
@@ -12125,8 +12183,8 @@ if (typeof module !== "undefined" && module.exports) {
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
-    atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
-    icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink,
+    atsInjClickAuthSubmit, atsInjAuthControls, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
+    icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsIcimsHost,
     ICIMS_ACCOUNT_TAKEN_RE, ICIMS_ACCOUNT_SUBJECT_RE,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,

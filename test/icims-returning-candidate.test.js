@@ -17,7 +17,7 @@ const test = require("node:test");
 const assert = require("node:assert");
 const fs = require("node:fs");
 const path = require("node:path");
-const { icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsAdminLogin } = require("../ats.js");
+const { icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsAdminLogin, icimsIsIcimsHost } = require("../ats.js");
 
 // ── the recognizer ───────────────────────────────────────────────────────────────────────────────
 
@@ -176,16 +176,36 @@ test("⚠ prose that merely mentions signing in is not a candidate at all", () =
   assert.deepStrictEqual(r.candidates, [], "none of these is an invitation to sign in");
 });
 
-test("⚠⚠ a login link that LEAVES the tenant host is refused — the one that actually bit", () => {
-  // Live 2026-09-09: a bare lowercase <a>login</a> with no id was the ONLY match, so the ambiguity
-  // guard was silent, and it went to iCIMS' CENTRAL login (login.icims.eu) rather than this tenant's
-  // candidate gate. The stored candidate password was typed into it three times before the
-  // same-view guard halted the run. The candidate's login always lives on the tenant's own host.
-  const r = withDom([{ tag: "a", text: "login", attrs: { href: "https://login.icims.eu/sso/login" } }]);
-  assert.strictEqual(r.candidates[0].usable, false);
-  assert.strictEqual(r.candidates[0].excludedBecause, "leaves-the-tenant-host");
-  assert.strictEqual(r.candidates[0].offSite, true);
-  assert.strictEqual(icimsLoginControlPick(r.candidates).ok, false);
+test("⚠⚠ iCIMS' OWN login host is allowed — the operator corrected this one", () => {
+  // A first version refused ANY cross-host link, on the reasoning that the candidate login lives on
+  // the tenant host. The operator corrected it: this tenant's Login control legitimately goes to
+  // `login.icims.eu`, and "the things later in the link identify it from their backend" — the
+  // candidate/tenant identity is in the path and query, not the hostname. Refusing it would have
+  // broken the real flow, so the guard keeps only what it can actually justify.
+  const r = withDom([{ tag: "a", text: "login", attrs: { href: "https://login.icims.eu/sso/login?tenant=shure" } }]);
+  assert.strictEqual(r.candidates[0].usable, true);
+  assert.strictEqual(r.candidates[0].offSite, false);
+  assert.strictEqual(icimsLoginControlPick(r.candidates).ok, true);
+});
+
+test("⚠ a link off to a THIRD PARTY is still refused", () => {
+  // What the guard is actually for: a footer/partner/marketing link pressed with an application
+  // half-filled sends the run somewhere it can never sign in.
+  for (const href of ["https://www.shure.com/careers", "https://accounts.google.com/signin", "https://evil.example/login"]) {
+    const r = withDom([{ tag: "a", text: "Login", attrs: { href } }]);
+    assert.strictEqual(r.candidates[0].usable, false, href + " must be refused");
+    assert.strictEqual(r.candidates[0].excludedBecause, "leaves-the-tenant-and-icims");
+  }
+});
+
+test("icimsIsIcimsHost tells the vendor's own infrastructure from anything else", () => {
+  assert.ok(icimsIsIcimsHost("https://login.icims.eu/sso"));
+  assert.ok(icimsIsIcimsHost("https://careersus-shure.icims.com/jobs/1/x"));
+  assert.ok(icimsIsIcimsHost("https://icims.com/"));
+  assert.ok(!icimsIsIcimsHost("https://www.shure.com/careers"));
+  assert.ok(!icimsIsIcimsHost("https://noticims.com/x"), "the boundary must be a dot, not a substring");
+  assert.ok(!icimsIsIcimsHost("https://icims.com.evil.example/x"), "a suffix-lookalike is not iCIMS");
+  assert.ok(!icimsIsIcimsHost("not a url"));
 });
 
 test("a same-host login link (absolute or relative) is fine", () => {
@@ -200,7 +220,22 @@ test("a same-host login link (absolute or relative) is fine", () => {
   // …and an href we cannot even parse REFUSES — we cannot vouch for where it goes
   const junk = withDom([{ tag: "a", text: "Login", id: "d", attrs: { href: "http://[::bad::]" } }]);
   assert.strictEqual(junk.candidates[0].usable, false);
-  assert.strictEqual(junk.candidates[0].excludedBecause, "leaves-the-tenant-host");
+  assert.strictEqual(junk.candidates[0].excludedBecause, "leaves-the-tenant-and-icims");
+});
+
+test("⚠⚠ the staff-login bypass needs BOTH provenance AND an iCIMS host", () => {
+  // `login.icims.*` is the RECRUITER login and stays refused on sight. The single exception is a
+  // page the tenant's own application form linked to — provenance, never the hostname alone. Both
+  // halves must be required, or the exemption becomes "any login.icims.* page is fine".
+  const i = bg.indexOf("async function runIcimsPreForm(");
+  const fn = bg.slice(i, i + 9000);
+  assert.match(fn, /const vouchedIcimsLogin = viaTenantLoginLink && url && icimsIsIcimsHost\(url\)/,
+    "the bypass must require the caller's provenance AND that the destination is still iCIMS");
+  assert.match(fn, /icimsIsAdminLogin\(url\) && !vouchedIcimsLogin/,
+    "the staff-login refusal must still fire for a login.icims.* page reached any other way");
+  // …and only the returning-candidate stage may claim that provenance.
+  assert.strictEqual((bg.match(/viaTenantLoginLink: true/g) || []).length, 1,
+    "exactly one caller may vouch for a login.icims.* destination");
 });
 
 test("⚠⚠ the STAFF login is refused on every TLD, not just .com", () => {

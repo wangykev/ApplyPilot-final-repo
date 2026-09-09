@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-signin-56";
+const AP_BUILD_MARKER = "icims-signin-61";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4902,8 +4902,19 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
   // Splitting them is what turns "the form says something about being logged out" into an
   // actionable, correctly-named stop.
   const SESSION_RE = /logged out|log out|sign(ed)? out|inactivity|session (has )?(expired|timed out|will end)|are you still/i;
+  // ⚠⚠ AND A SUCCESS CONFIRMATION IS NOT AN ERROR EITHER (live 2026-09-09). Once the candidate is
+  // SIGNED IN the press stops creating an account and starts saving a profile, and iCIMS answers it
+  // with "Your responses have been saved." — rendered into the same visible node the validation
+  // errors use, so `atsInjErrors` scrapes it and it arrives looking exactly like an objection. It is
+  // the opposite: it is the form confirming the press WORKED.
+  //
+  // Third instance of the same class in this one function (session warning, now this), and the
+  // standing lesson from Workday's upload `role="alert"`: a page's message channel carries STATUS as
+  // well as ERRORS, and reporting one as the other turns a working press into a phantom failure.
+  const STATUS_RE = /\b(your (responses|answers|information|changes) (have|has) been saved|saved successfully|successfully saved|changes (have been )?saved|profile (has been )?updated)\b/i;
   const sessionWarn = list.filter((e) => SESSION_RE.test(e));
-  const real = list.filter((e) => !SESSION_RE.test(e));
+  const saved = list.filter((e) => STATUS_RE.test(e) && !SESSION_RE.test(e));
+  const real = list.filter((e) => !SESSION_RE.test(e) && !STATUS_RE.test(e));
   // ⚠⚠ VALIDATION TEXT OUTRANKS THE CAPTCHA READ — AND THE ORDER OF THESE TWO READS IS THE WHOLE FIX
   // (live 2026-09-09). This diagnosis used to run BEFORE the error scrape, so its `else` branch had
   // nothing to reason from and asserted the strongest possible claim from pure absence: "the submit
@@ -4927,6 +4938,22 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
               : sessionWarn.length ? "the form never judged the submission — the session behind it is expiring"
                 : "no validation text, no locked button and no captcha token — the press may not have reached the control"}`);
   }
+  // ⚠ THE CONTROL INVENTORY IS THE DIAGNOSIS FOR *EVERY* REFUSAL, so it is printed before the
+  // branches rather than inside one of them. It was first put inside the saved-but-did-not-advance
+  // branch and promptly missed the very next run, which took the session branch instead — and the
+  // question it answers ("which control did we press, and what else was on offer?") is the same in
+  // all of them. Value-free by construction; one extra read on a path that has already failed.
+  const inv = await cdpEval(atsInjAuthControls).catch(() => null);
+  if (inv && inv.ok) {
+    const btns = inv.controls.filter((c) => c.caption && c.visible && !c.disabled)
+      .map((c) => `${c.tag}${c.type ? "[" + c.type + "]" : ""}${c.id ? "#" + c.id : ""} ${JSON.stringify(c.caption)}`);
+    // ⚠ THREE PER LINE — the log ring truncates a line at 200 chars, and the FIRST run of this
+    // diagnostic lost everything after the third control, which is exactly where the answer was.
+    // An inventory that does not fit in the log is not an inventory.
+    LOG(`  this page is ${inv.url}${inv.headings.length ? ` — "${inv.headings[0]}"` : ""}, offering ${btns.length} control(s):`);
+    for (let i = 0; i < btns.length; i += 3) LOG(`    · ${btns.slice(i, i + 3).join(" | ")}`);
+    if (!btns.length) LOG("    · none visible — which is itself the answer");
+  }
   if (real.length) { LOG(`step ${stepNo} did not advance — the form says:`); real.slice(0, 6).forEach((e) => LOG("  · " + e)); }
   if (sessionWarn.length && !real.length) {
     LOG(`step ${stepNo} did not advance, and the page is warning about the SESSION, not about the data:`);
@@ -4937,6 +4964,19 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
       detail: `Step ${stepNo} (${stepLabel}) did not advance, and the only thing the page said was a session warning `
         + `(${sessionWarn[0]}). The data is filled and the control was pressed — iCIMS' idle timeout is what stopped it, `
         + "so this is a session problem and not a form problem." };
+  }
+  // ⚠⚠ THE FORM SAID IT SAVED — SO THE PRESS WORKED AND THIS IS A NAVIGATION PROBLEM, NOT A DATA ONE.
+  // Once signed in, the operator reports the control that moves to the next page is "Update Profile",
+  // not "Submit Profile" — so a form carrying BOTH will happily save on one of them and stay exactly
+  // where it is. Naming that separately is the difference between "your answers were rejected" and
+  // "your answers are safely stored, we just pressed the wrong button", which are opposite fixes.
+  // The control inventory is the diagnosis, and it is printed rather than guessed at.
+  if (saved.length && !real.length) {
+    LOG(`step ${stepNo} SAVED but did not move — the form says: ${saved.slice(0, 2).join(" / ")}`);
+    return { advanced: false, stopped: "saved-but-did-not-advance", errors: saved,
+      detail: `Step ${stepNo} (${stepLabel}) was SAVED — the form replied "${saved[0]}" — but the step number did not `
+        + `change, so the control that was pressed saves without advancing. The answers are stored; what is missing is `
+        + `the control that moves to the next page.` };
   }
   // ⚠ THE ONE REFUSAL WITH A RECOVERY THIS PIPELINE CAN DRIVE. iCIMS creates the account as part of
   // submitting, so a form whose email already has one is refused server-side no matter how perfectly
@@ -5534,8 +5574,16 @@ async function runOrcPreForm(tabId, credentials, opts) {
   return halt("auth-rounds-exhausted", `Still not at the Oracle application form after ${MAX_ROUNDS} rounds — the flow is looping. Walk it yourself once and re-run.`);
 }
 
-async function runIcimsPreForm(tabId, credentials, LOG) {
+async function runIcimsPreForm(tabId, credentials, LOG, opts) {
   const MAX_ROUNDS = 8;
+  // ⚠⚠ PROVENANCE, NOT HOSTNAME (operator, 2026-09-09). Set ONLY by the returning-candidate stage,
+  // which gets here by pressing the tenant application form's OWN Login control. `login.icims.*` is
+  // documented here as the RECRUITER login and is refused on sight — correct when we LANDED on it,
+  // wrong when the tenant's own page sent us there, which the operator confirmed is exactly what
+  // this tenant does ("the things later in the link identify it from their backend"). The bypass is
+  // therefore narrow in both directions: the caller must have followed the form's own link AND the
+  // destination must still be iCIMS' own infrastructure. Every use is logged by name.
+  const viaTenantLoginLink = !!(opts && opts.viaTenantLoginLink);
   const halt = (stopped, detail, extra) => {
     LOG(`⛔ ${stopped} — ${detail}`);
     return { halt: { ok: true, needs_operator: true, stopped, detail, ...(extra || {}) } };
@@ -5687,6 +5735,7 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
   // the log ring — says which notices were agreed to.
   let consentsAccepted = [];
   let lastView = null, sameViewRounds = 0, captchaStalls = 0;
+  let authControlsDumped = false;   // the page inventory is a diagnostic, printed once per stage
   let wrapperRounds = 0;   // extra looks spent waiting out iCIMS' wrapper stage — see the halt below
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     const settled = await settleAuthPage(12000);
@@ -5695,15 +5744,26 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
     const url = await cdpEval(function () { return location.href; }).catch(() => null);
     // The RECRUITER login is an icims.com host with an email box on it, so it has to be refused
     // BEFORE the SSO test (which exempts icims.com hosts) and before the auth scan ever sees it.
-    if (url && icimsIsAdminLogin(url)) {
-      return halt("wrong-login", "This landed on iCIMS' STAFF login (login.icims.com), not the candidate portal — " +
+    const vouchedIcimsLogin = viaTenantLoginLink && url && icimsIsIcimsHost(url);
+    if (url && icimsIsAdminLogin(url) && !vouchedIcimsLogin) {
+      return halt("wrong-login", "This landed on iCIMS' STAFF login (login.icims.*), not the candidate portal — " +
         "nothing was typed. Open the job's own Apply link and check where it leads.");
+    }
+    if (vouchedIcimsLogin && icimsIsAdminLogin(url)) {
+      // Said out loud every time: this is the ONE place a `login.icims.*` page is driven, and it is
+      // only allowed because the tenant's own application form linked to it.
+      LOG(`signing in on ${(url.split("?")[0] || "").slice(0, 90)} — allowed ONLY because the application form's own `
+        + `Login control led here; a login.icims.* page reached any other way is still refused`);
     }
     // TWO hosts are legitimately ours during this stage — the employer's careers domain we started
     // on, and the iCIMS tenant host the Apply control hands us to. `portalHost` covers the first;
     // detectAts covers the second, and without it a tenant whose vanity path happens to contain an
     // SSO-ish segment would be refused on its own portal.
-    if (url && detectAts(url) !== "icims" && icimsLooksLikeSso(url, portalHost)) {
+    // ⚠ The vouched candidate login can carry an SSO-ish path (`login.icims.eu/sso/…` — this tenant
+    // does), and `detectAts` only recognises `.icims.com`, so without the same provenance exemption
+    // the run would refuse `sso` on the very page the form sent it to. It is NOT a widening of the
+    // SSO rule: a federated provider on any non-iCIMS host is refused exactly as before.
+    if (url && detectAts(url) !== "icims" && !vouchedIcimsLogin && icimsLooksLikeSso(url, portalHost)) {
       return halt("sso", "This portal handed the sign-in to a federated identity provider (" + url.split("?")[0] +
         "). Sign in yourself in the tab, then re-run — the pipeline never drives an SSO login.");
     }
@@ -5896,6 +5956,24 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
         ` captchaToken=${d && d.captchaToken} captchaFrames=${d && d.captchaFrames} challengeVisible=${d && d.captchaChallenge}` +
         `${(d && d.errors || []).length ? " errors=" + d.errors.join(" / ") : ""}` +
         ` — ${d && d.submitLocked && !d.captchaToken ? "the form fired and is waiting on the invisible captcha" : d && d.captchaToken ? "the captcha resolved; the POST is in flight" : "the submit handler may not have run at all"}`);
+      // ⚠ SAY WHAT THE PAGE IS MADE OF, ONCE. `submitLocked=null` means the scan found no submit
+      // control at all — and "we pressed something and nothing happened" then has several causes with
+      // opposite fixes. The run closes its own tab, so this is the only chance to see the page.
+      // Value-free by construction (atsInjAuthControls never returns an input's value).
+      if (!authControlsDumped) {
+        authControlsDumped = true;
+        const inv = await cdpEval(atsInjAuthControls).catch(() => null);
+        if (inv && inv.ok) {
+          const btns = inv.controls.filter((c) => c.caption && c.visible)
+            .map((c) => `${c.tag}${c.type ? "[" + c.type + "]" : ""}${c.id ? "#" + c.id : ""} ${JSON.stringify(c.caption)}${c.disabled ? " DISABLED" : ""}`);
+          const flds = inv.controls.filter((c) => c.holdsSomething !== undefined)
+            .map((c) => `${c.type || "text"}${c.id ? "#" + c.id : c.name ? "[" + c.name + "]" : ""}${c.holdsSomething ? "=filled" : "=empty"}${c.visible ? "" : " hidden"}`);
+          LOG(`  this page: ${inv.url}${inv.headings.length ? ` · "${inv.headings.join('" / "')}"` : ""}`);
+          LOG(`  its form(s): ${inv.forms.map((f) => `${f.method.toUpperCase()} ${f.action || "(self)"}${f.id ? " #" + f.id : ""}`).join(" | ") || "none"}`);
+          LOG(`  its pressable controls: ${btns.join(" | ") || "NONE — that is why nothing posted"}`);
+          LOG(`  its inputs: ${flds.join(" | ") || "none"}`);
+        }
+      }
       // ⚠ THE GATE LOCKS ITS OWN BUTTON and only the captcha callback ever unlocks it
       // (`icimsDisableSaveAndSubmitButtons` runs in its onsubmit). So a captcha that never answers
       // leaves a page that CANNOT be retried in place: the next round re-presses and gets
@@ -6018,7 +6096,9 @@ async function icimsReturningCandidateSignIn(tabId, credentials, LOG) {
   cdpClearFormFrame();
   await waitTabComplete(tabId, 20000).catch(() => null);
 
-  const pre = await runIcimsPreForm(tabId, credentials, LOG);
+  // We got here by pressing the application form's OWN Login control, which is what vouches for a
+  // `login.icims.*` destination — see the note on `viaTenantLoginLink`.
+  const pre = await runIcimsPreForm(tabId, credentials, LOG, { viaTenantLoginLink: true });
   if (pre && pre.halt) {
     return give(pre.halt.stopped || "sign-in-failed",
       "Pressed the form's Login control, but signing in did not reach the application form: " + (pre.halt.detail || ""),
