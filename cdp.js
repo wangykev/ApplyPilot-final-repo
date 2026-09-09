@@ -360,6 +360,8 @@ function cdpAttach(tabId) {
       cdpResetDomDomain();                     // the DOM domain is enabled ON DEMAND (see cdpEnsureDomDomain) — a new attach starts off
       cdpEventStatsReset();                    // …and the inbound-event count is per attach too
       _wakeSkipped = 0;                        // …and so is the count of no-op wakes we skipped
+      _dlgAcceptLeaveUntil = 0;                // ⚠ a leave-dialog arm NEVER survives an attach — a stale
+      _dlgSeen = [];                           //   arm would authorise discarding the NEXT run's filled form
       try {
         // ⚠ DO NOT ENABLE A DOMAIN WHOSE EVENTS NOTHING READS (2026-08-25).
         // `Runtime.enable` and `DOM.enable` were both called here, and the firehose counter's own
@@ -527,6 +529,69 @@ try {
     });
   }
 } catch (e) { /* not in a SW context (Node tests) — counter simply absent */ }
+
+// ── JAVASCRIPT DIALOGS MUST BE ANSWERED, OR THE RENDERER STAYS WEDGED (2026-09-09) ───────────────
+// `Page.enable` is on for every attach (cdpInstallPageOverrides needs it). The side effect nothing
+// in this codebase handled until today: with the Page domain enabled Chrome stops SHOWING native
+// dialogs — alert / confirm / prompt / beforeunload — and routes each one to the DEBUGGER instead,
+// firing `Page.javascriptDialogOpening` and BLOCKING THE RENDERER until `Page.handleJavaScriptDialog`
+// answers it. No listener existed, so the answer never came: the page stops running script, every
+// later `Runtime.evaluate` hangs, and the run reads that as "the page stopped responding to the
+// press". There is no timeout and no self-recovery — only a detach clears it.
+//
+// It is reachable on the path being built right now: iCIMS' application form registers an
+// `onbeforeunload`, so the returning-candidate route the operator described ("click Login, a popup
+// asks if you want to leave the page") raises one on the very first click.
+//
+// ⚠ THE DEFAULT IS TO REFUSE, NOT TO ACCEPT — the asymmetry is the safety property. Accepting a
+// beforeunload DISCARDS a filled form, and accepting a confirm() agrees to whatever it asked, which
+// on an application form could be "withdraw this application?". Cancelling costs at most a retry;
+// accepting can cost the work, or take an irreversible action nobody asked for. So:
+//   beforeunload   → accept ONLY while explicitly armed by the code that MEANT to navigate away;
+//                    otherwise cancel (the page is kept, and its data with it) and say so loudly.
+//   confirm/prompt → always cancel. This pipeline never agrees to a question it did not ask.
+//   alert          → accept, because an alert HAS no cancel; dismissing it is the only way onward.
+// Either way it is ANSWERED, which is the half that keeps the renderer alive.
+let _dlgAcceptLeaveUntil = 0;   // wall-clock ms — a leave-dialog arm is TIME-BOXED, never sticky
+let _dlgSeen = [];              // what we answered, drained by the caller for its diagnostics
+
+// Arm accepting ONE navigation away from the current page. Time-boxed on purpose: an arm that
+// outlived its click would silently authorise discarding a form filled minutes later.
+function cdpArmLeaveDialog(ms) { _dlgAcceptLeaveUntil = Date.now() + (ms || 15000); }
+function cdpDisarmLeaveDialog() { _dlgAcceptLeaveUntil = 0; }
+function cdpLeaveDialogArmed() { return Date.now() < _dlgAcceptLeaveUntil; }
+function cdpDialogsSeen() { const s = _dlgSeen; _dlgSeen = []; return s; }
+function cdpDialogPolicy(type, armed) {
+  // Pure, so the policy can be unit-tested without a debugger attach.
+  if (type === "beforeunload") return !!armed;
+  if (type === "alert") return true;
+  return false;   // confirm, prompt, and anything Chrome adds later
+}
+
+try {
+  if (typeof chrome !== "undefined" && chrome.debugger && chrome.debugger.onEvent) {
+    chrome.debugger.onEvent.addListener((source, method, params) => {
+      if (method !== "Page.javascriptDialogOpening") return;
+      // Only answer for the tab THIS module drives — another attach's dialog is not ours to decide.
+      if (!source || cdpTabId === null || source.tabId !== cdpTabId) return;
+      const type = (params && params.type) || "";
+      const msg = String((params && params.message) || "").slice(0, 200);
+      const armed = cdpLeaveDialogArmed();
+      const accept = cdpDialogPolicy(type, armed);
+      _dlgSeen.push({ type, message: msg, accept, armed });
+      console.log(`[ApplyPilot][CDP] ${type} dialog — ${accept ? "ACCEPTED" : "CANCELLED"}`
+        + (type === "beforeunload" && !armed
+          ? " (nothing armed a navigation away from this page, so the page is KEPT and its data with it)"
+          : (type === "confirm" || type === "prompt")
+            ? " (this pipeline never agrees to a question it did not ask)" : "")
+        + (msg ? ` — ${JSON.stringify(msg)}` : ""));
+      // ⚠ ALWAYS respond, and never let a failure here go unanswered — a dialog left open is a
+      // wedged renderer, which is a worse outcome than either answer.
+      chrome.debugger.sendCommand({ tabId: source.tabId }, "Page.handleJavaScriptDialog",
+        { accept }, () => { void chrome.runtime.lastError; });
+    });
+  }
+} catch (e) { /* not in a SW context (Node tests) — dialogs simply unhandled there */ }
 
 function cdpLagPct(arr, p) {
   if (!arr || !arr.length) return null;

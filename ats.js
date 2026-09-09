@@ -7933,9 +7933,18 @@ function icimsLooksLikeSso(url, portalHost) {
 // account address into a STAFF login. The host is the whole tell, and it is a host we can never
 // have business on: the candidate portal always lives on a TENANT subdomain.
 // Checked ahead of the SSO test, because the SSO test deliberately exempts icims.com hosts.
+// ⚠ ANY TLD, NOT JUST .com (live 2026-09-09). This was an equality test against the literal
+// `login.icims.com`, and iCIMS also serves `login.icims.eu` — so a run that followed the wrong
+// "login" link walked straight past this guard and typed the stored candidate password into the
+// central login three times. A candidate NEVER signs in on a `login.icims.*` host: the tenant's own
+// portal serves the candidate gate (careersus-shure.icims.com), and this family is the STAFF login.
+// Refusing an EU-region staff login is the safe direction; the cost of over-refusing is one clear
+// halt, the cost of under-refusing is a password in the wrong box.
 function icimsIsAdminLogin(url) {
-  try { return new URL(String(url == null ? "" : url)).hostname.toLowerCase() === "login.icims.com"; }
-  catch (e) { return false; }
+  try {
+    const h = new URL(String(url == null ? "" : url)).hostname.toLowerCase();
+    return /^login\.icims\.[a-z]{2,}(\.[a-z]{2,})?$/.test(h);
+  } catch (e) { return false; }
 }
 
 // iCIMS can answer the email gate by MAILING you a one-time link instead of showing a password
@@ -7947,6 +7956,142 @@ function icimsIsAdminLogin(url) {
 var ICIMS_MAILED_LINK_RE = /\b(we('ve| have)? (just )?(sent|emailed|e-mailed)|(an? )?(email|link|code) (has been|was) sent|check your (e-?mail|inbox)|sent you (an? )?(e-?mail|link|code))\b/i;
 function icimsMailedCredential(bodyText) {
   return ICIMS_MAILED_LINK_RE.test(String(bodyText == null ? "" : bodyText));
+}
+
+// ── THE ACCOUNT ALREADY EXISTS — iCIMS' OWN WORDS FOR IT (live 2026-09-09, Shure) ────────────────
+// iCIMS creates the candidate account AS PART OF SUBMITTING, so the application form carries its own
+// "Create a login" block. When that email already has an account the advance press lands, the form
+// validates it server-side, and it comes back refusing:
+//   "This email address is already in use. Please login or use another email address."
+// That is the ONE refusal on this platform with a recovery the pipeline can drive itself — sign in
+// as the returning candidate — rather than a halt for the operator. Recognising it is also what
+// stops it being reported as the generic `step-did-not-advance`, which says nothing actionable.
+//
+// ⚠ ANCHORED ON THE COLLISION, AND THE SUBJECT OF IT — NOT ON THE WORD "login". This form says
+// "Login" in several harmless places (the field label, the section heading, a help link), and any of
+// them treated as this condition would send a fully-filled form off to a sign-in page for no reason,
+// losing the fill. BOTH halves are required: something is ALREADY taken, and the thing taken is an
+// email/login/account. Pinned in both directions.
+// ⚠ "already HAVE an account" is deliberately NOT in this list, though it reads like the same
+// condition. On this form "Already have an account?" is the HEADING PRINTED NEXT TO THE LOGIN LINK —
+// it is the invitation, present on every visit, including the very first. Matching it would make
+// every run believe the account exists, navigate a fully-filled form away to a sign-in page and lose
+// the fill. The asymmetry decides it: a false positive costs the work, a false negative only leaves
+// the operator with the generic halt they already had. So this matches a CLAIM THAT SOMETHING IS
+// TAKEN, never an offer to sign in.
+var ICIMS_ACCOUNT_TAKEN_RE = /\balready\s+(?:in\s+use|registered|exists|taken|associated|assigned)\b/i;
+var ICIMS_ACCOUNT_SUBJECT_RE = /\b(e-?mail(\s+address)?|log\s?in|user\s?name|account)\b/i;
+
+function icimsAccountExists(errors) {
+  const list = Array.isArray(errors) ? errors : (errors == null ? [] : [errors]);
+  return list.some((e) => {
+    const t = String(e == null ? "" : e);
+    return ICIMS_ACCOUNT_TAKEN_RE.test(t) && ICIMS_ACCOUNT_SUBJECT_RE.test(t);
+  });
+}
+
+// Which of the reported login controls may be pressed. SW-side and pure, so the judgement has ONE
+// copy and can be unit-tested — the same split as atsInjAuthScan reporting markers while
+// icimsAuthView / atsConsentKind decide. Refuses on ambiguity exactly like the Apply-control picker:
+// on a form carrying a live application, pressing the wrong "login" is not a recoverable mistake.
+function icimsLoginControlPick(candidates) {
+  const all = Array.isArray(candidates) ? candidates : [];
+  const usable = all.filter((c) => c && c.usable);
+  if (!usable.length) {
+    return { ok: false, reason: "none", offered: all.map((c) => (c && c.caption) || "?").slice(0, 6) };
+  }
+  if (usable.length > 1) {
+    return { ok: false, reason: "ambiguous", offered: usable.map((c) => c.caption).slice(0, 6) };
+  }
+  return { ok: true, control: usable[0] };
+}
+
+// Report the form's own "already have an account? Login" controls. REPORTS ONLY — it presses
+// nothing and decides nothing; icimsLoginControlPick does that SW-side.
+//
+// ⚠ ONLY <a> AND <button> ARE EVER MARKED USABLE. The one control on this form that must never be
+// pressed by mistake is `input#cp_form_submit_i`, which is Next on every step and the REAL SUBMIT on
+// the last — so a login probe that could return an <input type=submit> is one caption-match away
+// from submitting an unapproved application. Anything else that mentions login is still REPORTED
+// (with `usable:false` and the reason), because when this refuses, the list is the whole diagnosis.
+// ⚠ `scrollToIndex` — the rect this returns is the one that gets CLICKED, and `atsAimedClick`
+// translates it by the FRAME's offset, which is only meaningful for a control inside the viewport.
+// The submit control already paid for this exact lesson (`icimsStepState({scrollSubmit:true})`:
+// "without it the press lands below the fold and nothing posts, which then looks exactly like the
+// form refusing to advance"). Passing an index re-measures AFTER scrolling that candidate into view.
+//
+// It is ONE function rather than a read pass plus a scroll pass because two injected functions
+// cannot share code, and a duplicated match predicate is a lockstep dup waiting to drift — the
+// `atsInjScan` / `atsInjReadValue` pair is the standing warning. The default (no argument) is still
+// completely read-only.
+function atsInjIcimsLoginLink(scrollToIndex) {
+  try {
+    const out = [];
+    const seen = new Set();
+    const hits = [];
+    for (const el of document.querySelectorAll("a,button,input[type=button],input[type=submit]")) {
+      const tag = el.tagName.toLowerCase();
+      const cap = String(tag === "input" ? (el.value || "") : (el.textContent || "")).replace(/\s+/g, " ").trim();
+      if (!cap || cap.length > 90) continue;
+      // The control must ITSELF be the invitation. A row that merely mentions signing in
+      // ("Forgot your password?", "By logging in you agree…") is not a control to press.
+      const bare = /^(log\s?in|sign\s?in|login|signin)\b[\s.!:]*$/i.test(cap);
+      const invite = /\b(log\s?in|sign\s?in)\b/i.test(cap) && /\b(already|existing|returning|here|click)\b/i.test(cap);
+      if (!bare && !invite) continue;
+      const sel = el.id ? "#" + CSS.escape(el.id)
+        : el.getAttribute("name") ? "[name=" + JSON.stringify(el.getAttribute("name")) + "]" : null;
+      const key = (sel || "") + "|" + cap;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      hits.push({ el, tag, cap, sel });
+    }
+    // Scroll the CHOSEN candidate into view BEFORE any rect is taken, so the measurement the caller
+    // clicks is a viewport coordinate. Done between the two passes precisely because scrolling moves
+    // every other candidate too — measuring some before and some after would mix frames of reference.
+    if (typeof scrollToIndex === "number" && hits[scrollToIndex]) {
+      try { hits[scrollToIndex].el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) { /* older engines */ }
+    }
+    for (let i = 0; i < hits.length; i++) {
+      const h = hits[i], el = h.el;
+      const r = el.getBoundingClientRect();
+      const visible = r.width > 0 && r.height > 0;
+      const isFormSubmit = el.id === "cp_form_submit_i" || h.tag === "input";
+      // ⚠⚠ THE CANDIDATE'S LOGIN IS ON THE TENANT'S OWN HOST — ANYTHING ELSE IS THE WRONG "login"
+      // (live 2026-09-09). The first version of this probe matched a bare lowercase `<a>login</a>`
+      // with no id, pressed it, and was taken to `login.icims.eu` — iCIMS' CENTRAL login, not
+      // careersus-shure.icims.com's candidate one. The stored candidate password was then typed into
+      // it three times before the same-view guard stopped the run. The ambiguity guard could not help:
+      // there was exactly ONE match, it was just the wrong link.
+      // The gate we DO drive successfully is always on the tenant host, so a cross-host destination is
+      // positive evidence this is not the candidate flow. An UNPARSEABLE href refuses too — the safe
+      // direction, since a link we cannot resolve is one we cannot vouch for.
+      let offSite = false, hrefAbs = null;
+      const rawHref = el.getAttribute("href");
+      if (rawHref && !/^(#|javascript:)/i.test(rawHref)) {
+        try {
+          const u = new URL(rawHref, location.href);
+          hrefAbs = u.href;
+          offSite = u.hostname.toLowerCase() !== String(location.hostname || "").toLowerCase();
+        } catch (e) { offSite = true; }
+      }
+      const why = isFormSubmit ? "not-an-anchor-or-button"
+        : !visible ? "not-visible"
+          : offSite ? "leaves-the-tenant-host" : null;
+      out.push({
+        index: i, tag: h.tag, sel: h.sel, caption: h.cap, visible, usable: !why, excludedBecause: why,
+        // `cx`/`cy` is the shape atsAimedClick reads — it translates these by the iCIMS frame's own
+        // offset. Naming them x/y silently produced `translating undefined,undefined → NaN,NaN`.
+        rect: visible ? { cx: r.left + r.width / 2, cy: r.top + r.height / 2, w: r.width, h: r.height } : null,
+        offSite, href: (hrefAbs || el.getAttribute("href") || "").slice(0, 200) || null,
+        onclick: (el.getAttribute("onclick") || "").slice(0, 200) || null,
+      });
+    }
+    // Whether this page will raise the operator's "do you want to leave?" dialog, so the log can say
+    // whether the leave-arm was actually needed rather than leaving it a guess.
+    let guarded = typeof window.onbeforeunload === "function";
+    try { if (!guarded && window.jQuery) guarded = !!(window.jQuery._data(window, "events") || {}).beforeunload; } catch (e) { /* jQuery internals vary */ }
+    return { ok: true, candidates: out, beforeUnloadGuarded: guarded };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 }
 
 // A STATED demographic and the form's option can be the same answer in different words: the profile
@@ -11981,6 +12126,8 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
     atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
+    icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink,
+    ICIMS_ACCOUNT_TAKEN_RE, ICIMS_ACCOUNT_SUBJECT_RE,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsOrcDurableName,

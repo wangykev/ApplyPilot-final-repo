@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-diag-53";
+const AP_BUILD_MARKER = "icims-signin-55";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4889,14 +4889,6 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
   //                  proves the submit event FIRED and we are waiting on the captcha.
   //   captchaToken : a token present proves hCaptcha RESOLVED and the post really went.
   // Nothing else tells "the click missed" from "the captcha never answered" from "the server said no".
-  const d = await cdpEval(atsInjAuthScan).catch(() => null);
-  if (d) {
-    LOG(`  press diagnosis: submitLocked=${d.submitLocked} captchaToken=${d.captchaToken}`
-      + ` captchaFrames=${d.captchaFrames} challengeVisible=${d.captchaChallenge}`
-      + ` — ${d.submitLocked && !d.captchaToken ? "the submit FIRED and is waiting on the form's invisible captcha"
-          : d.captchaToken ? "the captcha resolved and the post went — the step read may just be lagging"
-            : "the submit handler did not run at all (the press did not reach the control)"}`);
-  }
   const errs = await cdpEval(atsInjErrors, "icims").catch(() => null);
   const list = (errs && errs.errors) || [];
   // ⚠⚠ AN IDLE-SESSION WARNING IS NOT A VALIDATION ERROR, and reporting it as one cost two whole
@@ -4912,6 +4904,29 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
   const SESSION_RE = /logged out|log out|sign(ed)? out|inactivity|session (has )?(expired|timed out|will end)|are you still/i;
   const sessionWarn = list.filter((e) => SESSION_RE.test(e));
   const real = list.filter((e) => !SESSION_RE.test(e));
+  // ⚠⚠ VALIDATION TEXT OUTRANKS THE CAPTCHA READ — AND THE ORDER OF THESE TWO READS IS THE WHOLE FIX
+  // (live 2026-09-09). This diagnosis used to run BEFORE the error scrape, so its `else` branch had
+  // nothing to reason from and asserted the strongest possible claim from pure absence: "the submit
+  // handler did not run at all (the press did not reach the control)". On a real Shure run it printed
+  // exactly that, one line above the form's own answer — "This email address is already in use.
+  // Please login or use another email address." — which can ONLY exist because the press reached the
+  // control, posted, and was judged. The operator was told the click was missing while the page was
+  // telling us the click had worked, and a session's worth of debugging went to the click geometry.
+  //
+  // Why the absence read false: `submitLocked` is iCIMS DISABLING its own button during onsubmit, so
+  // it is TRUE only mid-flight. A postback that has already come back has re-rendered the form with a
+  // fresh, enabled button and no captcha token — byte-identical to a press that never happened.
+  // The distinguishing evidence is the FORM'S OWN WORDS, so they must be read first.
+  const d = await cdpEval(atsInjAuthScan).catch(() => null);
+  if (d) {
+    LOG(`  press diagnosis: submitLocked=${d.submitLocked} captchaToken=${d.captchaToken}`
+      + ` captchaFrames=${d.captchaFrames} challengeVisible=${d.captchaChallenge}`
+      + ` — ${real.length ? "THE PRESS LANDED — the form ran its validation and rejected the submission (see its words below); this is a DATA problem, not a click problem"
+          : d.submitLocked && !d.captchaToken ? "the submit FIRED and is waiting on the form's invisible captcha"
+            : d.captchaToken ? "the captcha resolved and the post went — the step read may just be lagging"
+              : sessionWarn.length ? "the form never judged the submission — the session behind it is expiring"
+                : "no validation text, no locked button and no captcha token — the press may not have reached the control"}`);
+  }
   if (real.length) { LOG(`step ${stepNo} did not advance — the form says:`); real.slice(0, 6).forEach((e) => LOG("  · " + e)); }
   if (sessionWarn.length && !real.length) {
     LOG(`step ${stepNo} did not advance, and the page is warning about the SESSION, not about the data:`);
@@ -4922,6 +4937,17 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
       detail: `Step ${stepNo} (${stepLabel}) did not advance, and the only thing the page said was a session warning `
         + `(${sessionWarn[0]}). The data is filled and the control was pressed — iCIMS' idle timeout is what stopped it, `
         + "so this is a session problem and not a form problem." };
+  }
+  // ⚠ THE ONE REFUSAL WITH A RECOVERY THIS PIPELINE CAN DRIVE. iCIMS creates the account as part of
+  // submitting, so a form whose email already has one is refused server-side no matter how perfectly
+  // it was filled — and the answer is to SIGN IN, not to change anything about the data. Naming it
+  // separately is what lets the walk try that instead of reporting the generic "did not advance",
+  // which reads as a fill problem and sends the operator to look at the fields.
+  if (icimsAccountExists(real)) {
+    return { advanced: false, stopped: "account-exists", errors: real, recoverable: "sign-in",
+      detail: `Step ${stepNo} (${stepLabel}) filled correctly, but this iCIMS account already exists, so the form `
+        + `refused to create it again: "${real.find((e) => icimsAccountExists([e])) || real[0]}". The fix is to sign in as a `
+        + `returning candidate rather than to change any answer.` };
   }
   return { advanced: false, stopped: "step-did-not-advance", errors: list,
     detail: `Step ${stepNo} (${stepLabel}) did not advance within 25s.`
@@ -5894,6 +5920,119 @@ async function runIcimsPreForm(tabId, credentials, LOG) {
 }
 
 
+// ── THE RETURNING CANDIDATE: SIGN IN INSTEAD OF CREATING THE ACCOUNT (operator, 2026-09-09) ──────
+// iCIMS creates the candidate account as part of SUBMITTING, so step 1 embeds a "Create a login"
+// block — and once that email has an account, every later run fills the whole step perfectly and is
+// then refused by the server: "This email address is already in use. Please login or use another
+// email address." Until now the only remedy was the operator bumping `wangykev+N@gmail.com` by hand
+// before each re-test, which is a workaround for this exact gap and does not scale past testing.
+//
+// The operator walked the manual recovery: press the form's own Login control, answer the browser's
+// "do you want to leave this page?" prompt, then sign in. This drives that.
+//
+// ⚠⚠ THE CREDENTIAL LADDER IS NOT RE-IMPLEMENTED HERE. Everything after the click — the staff-login
+// refusal, the SSO refusal, captcha, a mailed code, consent boxes, the email step, the password step
+// and the "are we on the application form yet?" test — already exists ONCE, in runIcimsPreForm, and
+// this delegates to it. A second copy of a ladder that types a password is exactly the drift this
+// codebase has been bitten by (`icimsArmFrame`, `orcAdvanceAfterStep` guard 1); the invariants it
+// carries (value only from storage, written through atsInjSetCredential, never logged, every stop
+// `needs_operator`) are inherited rather than restated.
+//
+// This stage NEVER submits and never creates an account: it presses one link and hands over.
+async function icimsReturningCandidateSignIn(tabId, credentials, LOG) {
+  const give = (stopped, detail, extra) => {
+    LOG(`⛔ ${stopped} — ${detail}`);
+    return { ok: false, stopped, detail, ...(extra || {}) };
+  };
+  if (!credentials || !credentials.email || !credentials.password) {
+    return give("credentials-not-stored",
+      "This iCIMS account already exists, so the run must SIGN IN rather than create it — and no stored login/password is available to do that. "
+      + "Set them on the website's Credentials page, then re-run. The pipeline never invents a login.");
+  }
+
+  const probe = await cdpEval(atsInjIcimsLoginLink).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+  if (!probe || !probe.ok) {
+    return give("login-control-unreadable",
+      "The form refused the submission because the account already exists, but its own Login control could not be read ("
+      + ((probe && probe.error) || "no reason given") + ").");
+  }
+  const pick = icimsLoginControlPick(probe.candidates);
+  if (!pick.ok) {
+    // ⚠ THE OFFERED LIST IS THE WHOLE DIAGNOSIS when this refuses — without it the next debugging
+    // round is spent re-deriving what the page actually shows, which is how this bug has gone twice.
+    return give(pick.reason === "ambiguous" ? "login-control-ambiguous" : "login-control-not-found",
+      pick.reason === "ambiguous"
+        ? "Several controls on this form could be the Login link (" + (pick.offered || []).join(" | ")
+          + ") — refusing to guess, because one wrong press on this form is the application's own Submit."
+        : "This iCIMS account already exists, but the form offers no Login control to switch to signing in"
+          + ((pick.offered || []).length ? " (it mentions: " + pick.offered.join(" | ") + ", none of them pressable)" : "")
+          + ". Sign in yourself in the tab, then re-run.",
+      { offered: pick.offered || [] });
+  }
+  // ⚠ RE-MEASURE THE CHOSEN CONTROL WITH IT SCROLLED INTO VIEW. The first probe is read-only and the
+  // control can be anywhere on a long form, but the rect we hand atsAimedClick is translated by the
+  // frame's offset and clicked as a VIEWPORT coordinate — the exact trap `scrollSubmit` was added for
+  // on the submit control. Live 2026-09-09 the un-scrolled path produced
+  // `translating undefined,undefined → NaN,NaN` and the press went nowhere.
+  let ctl = pick.control;
+  const aimed = await cdpEval(atsInjIcimsLoginLink, ctl.index).catch(() => null);
+  const repick = aimed && aimed.ok ? icimsLoginControlPick(aimed.candidates) : null;
+  if (repick && repick.ok && repick.control.rect) ctl = repick.control;
+  if (!ctl.rect || typeof ctl.rect.cx !== "number" || typeof ctl.rect.cy !== "number") {
+    return give("login-control-unaimable",
+      `The form's ${JSON.stringify(ctl.caption)} control could not be given a clickable position, so nothing was pressed.`);
+  }
+  LOG(`the account already exists — switching to SIGN IN via the form's own ${JSON.stringify(ctl.caption)} control`
+    + ` (${ctl.tag}${ctl.sel ? " " + ctl.sel : ""}${ctl.href ? " → " + ctl.href : ""})`
+    + `. The page ${probe.beforeUnloadGuarded ? "DOES" : "does not"} guard against navigating away.`);
+  emitRunProgress("Signing in as a returning candidate", "the account already exists");
+
+  // ⚠⚠ ARM THE LEAVE DIALOG BEFORE THE CLICK, NOT AFTER. iCIMS' form registers an onbeforeunload, so
+  // this press raises a native "Leave site?" dialog — and with `Page.enable` on (it is, for every
+  // attach) Chrome hands that dialog to the DEBUGGER and BLOCKS THE RENDERER until it is answered.
+  // Unanswered, the page stops running script and every later evaluate hangs: the tab is wedged
+  // until detach. The default policy REFUSES a leave dialog precisely so a stray one cannot discard
+  // a filled form, so this is the one place that opts in — narrowly, and time-boxed.
+  cdpArmLeaveDialog(20000);
+  try {
+    const clicked = await atsAimedClick("icims", ctl.rect, "login", LOG);
+    if (!clicked.ok) {
+      return give("login-control-unaimable",
+        "The Login control is inside the iCIMS frame and its offset could not be read (" + clicked.reason + "), so nothing was pressed.");
+    }
+    // Give the navigation a chance to start and the dialog (if any) to be answered, then report what
+    // we answered — "the click did nothing" and "we cancelled its dialog" look identical otherwise.
+    await cdpDelay(1500);
+    const dialogs = cdpDialogsSeen();
+    for (const dg of dialogs) {
+      LOG(`  the page raised a ${dg.type} dialog and it was ${dg.accept ? "ACCEPTED (leaving the form, as intended)" : "CANCELLED"}`
+        + (dg.message ? ` — ${JSON.stringify(dg.message)}` : ""));
+    }
+  } finally {
+    // Never leave the arm standing: it must not still be true when the fill resumes on a form.
+    cdpDisarmLeaveDialog();
+  }
+
+  // The frame is replaced by the navigation, so the pin we hold is stale — re-pin from scratch and
+  // let the shared stage read the page fresh. Same rule the advance's postback loop obeys.
+  cdpClearFormFrame();
+  await waitTabComplete(tabId, 20000).catch(() => null);
+
+  const pre = await runIcimsPreForm(tabId, credentials, LOG);
+  if (pre && pre.halt) {
+    return give(pre.halt.stopped || "sign-in-failed",
+      "Pressed the form's Login control, but signing in did not reach the application form: " + (pre.halt.detail || ""),
+      { needs_operator: true });
+  }
+  if (!pre || !pre.reached_form) {
+    return give("sign-in-did-not-reach-form",
+      "Pressed the form's Login control, but the page that followed is neither an iCIMS sign-in nor the application form.");
+  }
+  LOG(`✔ signed in as the returning candidate — back on the application form with ${pre.fields} field(s)`);
+  return { ok: true, fields: pre.fields, consentsAccepted: pre.consentsAccepted || [], resumedAtStep: pre.resumedAtStep || null };
+}
+
+
 // ── THE BLOCK-POPULATION SETTLE — SHARED BY BOTH ORC WALKS ───────────────────────────────────
 // ⚠⚠ A BLOCK CAN BE MOUNTED WITH ITS CONTENTS STILL IN FLIGHT, and the field-set settle cannot see
 // it. Live 2026-08-19 step 3 reported `"Application Questions" (0 input(s))` alongside Diversity (7),
@@ -6589,6 +6728,10 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     let accEntries = [], bundle = null;
     let stepsFilled = 0, walkStopped = MULTI ? null : "ats-single-page", walkDetail = null;
     const stepsWalked = [];
+    // ⚠ ONE returning-candidate sign-in per walk, and no more. The recovery re-enters the SAME step,
+    // so an unbounded retry is a loop; and if signing in did not clear the collision the second
+    // attempt cannot either — the account is simply not the one we hold credentials for.
+    let signInRecoveries = 0;
     // CLEAR ONCE, before the first step (the Workday rule — a clear inside the loop is the bug).
     if (MULTI) await new Promise((r) => chrome.storage.local.set({ reviewSummary: null, reviewAudit: null }, r));
 
@@ -6697,6 +6840,20 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       const adv = ats === "icims"
         ? await icimsAdvanceAfterStep(stepNo, stepLabel, LOG)
         : await orcAdvanceAfterStep(stepNo, stepLabel, LOG, ats);
+      // ⚠⚠ "THE ACCOUNT ALREADY EXISTS" IS NOT A FILL FAILURE — SIGN IN AND RE-FILL THE SAME STEP.
+      // Everything on the step was answered correctly; iCIMS refused it because the account is made
+      // BY the submission and this email already has one. Signing in navigates away, so the step's
+      // values are gone and it must be filled again from scratch — hence `continue` onto the same
+      // step rather than treating the recovery as an advance. Bounded to one attempt.
+      if (!adv.advanced && adv.stopped === "account-exists" && ats === "icims" && signInRecoveries < 1) {
+        signInRecoveries++;
+        const back = await icimsReturningCandidateSignIn(tabId, (store && store.credentials) || null, LOG);
+        if (back.ok) {
+          LOG(`re-filling step ${stepNo} (${stepLabel}) — signing in navigated away from it, so its values are gone`);
+          continue;
+        }
+        walkStopped = back.stopped; walkDetail = back.detail; break;
+      }
       if (!adv.advanced) { walkStopped = adv.stopped; walkDetail = adv.detail; break; }
       if (iter === ORC_MAX_STEPS) {
         walkStopped = "max-steps";
