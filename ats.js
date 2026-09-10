@@ -10750,8 +10750,19 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile, valueFor) {
 async function atsAnswerConditionals(act, ats, scan, results, profile, jobContext, log) {
   const fields = (scan && scan.fields) || [];
   let done = 0;
+  // ⚠ RECORDS JOIN FIELDS ON `fieldName` — the key every other late pass uses
+  // (atsCaptureMissingOptions: `x.fieldName === rec.fieldName`). A first version matched
+  // `r.name === f.id`, which is wrong on both sides, so the lookup silently found nothing and every
+  // conditional was left untouched — indistinguishable, in the bundle, from the pass never running.
+  const recFor = (x) => (results || []).find((r) => r && r.fieldName === x.fieldName);
+  // The ordinal→answer map is built from the SCAN's labels, because that is where the printed
+  // "4." / "5." live; a record carries the platform's field NAME ("Q4"), which has no ordinal in it.
+  const answered = fields.map((x) => {
+    const r = recFor(x);
+    return { label: x.label || x.question || x.fieldName, after: r ? (r.after != null ? r.after : r.resolved) : null };
+  });
   for (const f of fields) {
-    const rec = (results || []).find((r) => r && (r.name === f.id || r.name === f.name));
+    const rec = recFor(f);
     // ONLY a field nothing else answered. A conditional the operator's profile already covers, or
     // that the AI already drafted, is left exactly as it is.
     if (!rec || (rec.status !== "skipped" && rec.status !== "needs_review")) continue;
@@ -10760,8 +10771,8 @@ async function atsAnswerConditionals(act, ats, scan, results, profile, jobContex
     if (wt !== "text" && wt !== "textarea") continue;      // an explain box is free text
     const spec = atsConditionalSpec(f.label || f.question || "");
     if (!spec) continue;
-    const res = atsResolveConditional(spec, results);
-    const sel = f.id ? "#" + String(f.id).replace(/([^\w-])/g, "\\$1") : null;
+    const res = atsResolveConditional(spec, answered);
+    const sel = f.inputSel;                     // the selector every other pass writes through
     if (!sel) continue;
 
     if (res.decision === "literal") {
@@ -10772,7 +10783,7 @@ async function atsAnswerConditionals(act, ats, scan, results, profile, jobContex
         rec.detail = `the question says to type ${JSON.stringify(res.literal)} when it does not apply, and `
           + `question(s) ${spec.refs.join("/")} were not ${spec.trigger}`;
         done++;
-        if (log) log(`[ATS-FILL] ${f.id}: conditional not met → typed ${JSON.stringify(res.literal)} as the question instructs`);
+        if (log) log(`[ATS-FILL] ${f.fieldName}: conditional not met → typed ${JSON.stringify(res.literal)} as the question instructs`);
       }
       continue;
     }
@@ -10795,7 +10806,7 @@ async function atsAnswerConditionals(act, ats, scan, results, profile, jobContex
         rec.detail = `question(s) ${spec.refs.join("/")} were answered ${spec.trigger}, so the form asks for an `
           + `explanation — AI DRAFT, please correct it: ${(ai && ai.justification) || "generated from profile"}`;
         done++;
-        if (log) log(`[ATS-FILL] ${f.id}: conditional MET (q${spec.refs.join("/")}) → AI draft written, flagged for you to fix`);
+        if (log) log(`[ATS-FILL] ${f.fieldName}: conditional MET (q${spec.refs.join("/")}) → AI draft written, flagged for you to fix`);
       }
       continue;
     }
@@ -10804,7 +10815,7 @@ async function atsAnswerConditionals(act, ats, scan, results, profile, jobContex
     rec.status = "needs_review"; rec.flag = "conditional-unresolved";
     rec.detail = `this question depends on question(s) ${spec.refs.join("/")} and ${res.reason} — `
       + `answering it either way would be a guess about your own history`;
-    if (log) log(`[ATS-FILL] ${f.id}: conditional left for you — ${res.reason}`);
+    if (log) log(`[ATS-FILL] ${f.fieldName}: conditional left for you — ${res.reason}`);
   }
   return done;
 }

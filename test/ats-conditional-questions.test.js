@@ -151,6 +151,21 @@ test("⚠ it only ever touches a field nothing else answered", () => {
   assert.match(body, /if \(rec\.after && String\(rec\.after\)\.trim\(\)\) continue/);
 });
 
+test("⚠⚠ records join fields on `fieldName`, and ordinals come from the SCAN's labels", () => {
+  // The bug this pins cost a live run and was invisible in the bundle: the first version looked
+  // records up with `r.name === f.id`, which is wrong on BOTH sides, so it found nothing and left
+  // every conditional untouched — identical, from the outside, to the pass never running at all.
+  // `fieldName` is the key every other late pass uses.
+  assert.match(body, /r\.fieldName === x\.fieldName/);
+  assert.ok(!/r\.name === f\.id/.test(body), "the broken join must not come back");
+  // …and the printed "4." / "5." live on the SCAN's label; a record carries the platform's field
+  // NAME ("Q4"), which has no ordinal in it.
+  assert.match(body, /x\.label \|\| x\.question \|\| x\.fieldName/);
+  assert.match(body, /atsResolveConditional\(spec, answered\)/);
+  // the write goes through the same selector every other pass uses
+  assert.match(body, /const sel = f\.inputSel/);
+});
+
 test("⚠ it runs LATE — a conditional cannot be decided before its siblings are answered", () => {
   const call = src.indexOf("await atsAnswerConditionals(");
   const prefilled = src.indexOf("await atsSurfacePrefilled(");
