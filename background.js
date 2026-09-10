@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-carry-66";
+const AP_BUILD_MARKER = "icims-sitecarry-69";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -5861,6 +5861,25 @@ async function runIcimsPreForm(tabId, credentials, LOG, opts) {
         await cdpDelay(3000);
         continue;
       }
+      // ⚠ SAY WHAT THIS PAGE IS before giving up on it. "Neither a sign-in nor a form, and no Apply
+      // control" is a verdict about what is ABSENT, and absence has never once been enough to
+      // diagnose a page in this file — it is what produced `apply-not-followable` on three live
+      // Shure postings that were perfectly fine. Value-free, printed once per stage.
+      if (!authControlsDumped) {
+        authControlsDumped = true;
+        const inv = await cdpEval(atsInjAuthControls).catch(() => null);
+        if (inv && inv.ok) {
+          const btns = inv.controls.filter((c) => c.caption && c.visible)
+            .map((c) => `${c.tag}${c.type ? "[" + c.type + "]" : ""}${c.id ? "#" + c.id : ""} ${JSON.stringify(c.caption)}${c.disabled ? " DISABLED" : ""}`);
+          const flds = inv.controls.filter((c) => c.holdsSomething !== undefined)
+            .map((c) => `${c.type || "text"}${c.id ? "#" + c.id : c.name ? "[" + c.name + "]" : ""}${c.holdsSomething ? "=filled" : "=empty"}`);
+          LOG(`  this page is ${inv.url}${inv.headings.length ? ` — "${inv.headings.join('" / "')}"` : ""}`);
+          LOG(`  its form(s): ${inv.forms.map((f) => `${f.method.toUpperCase()} ${f.action || "(self)"}${f.id ? " #" + f.id : ""}`).join(" | ") || "none"}`);
+          for (let i = 0; i < btns.length; i += 3) LOG(`    · ${btns.slice(i, i + 3).join(" | ")}`);
+          if (!btns.length) LOG("    · no pressable controls at all");
+          LOG(`  its inputs: ${flds.join(" | ") || "none"}`);
+        }
+      }
       return halt("apply-not-followable",
         applied.reason === "ambiguous"
           ? "Several different Apply controls are on this page (" + (applied.offered || []).join(" | ") + ") — the run refuses to guess which one is the application."
@@ -6338,6 +6357,9 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
   // Stamped when the ORC gate is cleared, consumed once by the walk below — see the comment at the
   // assignment for why this window needed a name. `null` on every other ATS (no gate to clear).
   let orcGateClearedAt = null;
+  // iCIMS scratch-alias fill (operator, 2026-09-10) — decided at the GATE and reused at fill time,
+  // then undone on every record so the bundle carries the address the submit run will actually use.
+  let scratchEmail = null, realEmail = null;
   // ⚠ ORACLE IS DETECTED BUT NOT YET DRIVEABLE — REFUSE LOUDLY RATHER THAN FALL THROUGH (2026-08-19).
   // `detectAts` learned Oracle Recruiting Cloud one increment ahead of its scan branch, and the two
   // must not be allowed to disagree quietly. `atsInjScan` has no `oracle` branch, so an ORC page would
@@ -6588,7 +6610,17 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     }
     if (ats === "icims") {
       emitRunProgress("Signing in to the careers portal", "iCIMS");
-      const pre = await runIcimsPreForm(tabId, store.credentials || null, LOG);
+      // ⚠ THE ALIAS HAS TO BE DECIDED BEFORE THE GATE, not at fill time. The gate types the account
+      // email, so signing in as the REAL candidate here would land us in the existing account with
+      // its completed pages — the very state the scratch alias exists to avoid — and step 1 would
+      // arrive with no "Create a login" block to fill.
+      realEmail = (store.profile && store.profile.personal_info && store.profile.personal_info.email) || null;
+      const alias0 = realEmail ? icimsScratchEmail(realEmail) : null;
+      if (alias0 && alias0 !== realEmail) scratchEmail = alias0;
+      const preCredsIcims = scratchEmail && store.credentials && store.credentials.email
+        ? { ...store.credentials, email: icimsScratchEmail(store.credentials.email) }
+        : (store.credentials || null);
+      const pre = await runIcimsPreForm(tabId, preCredsIcims, LOG);
       // WHICH NOTICES WERE ACCEPTED on the operator's standing instruction — carried out of the stage so
       // it reaches the run record, not just the log ring (see the accept-checkbox block in the pre-form).
       icimsConsentsAccepted = (pre && pre.consentsAccepted) || [];
@@ -6774,7 +6806,23 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       if (act.locSyntheticType) LOG("⚠ atsLocSyntheticType is SET — the location box will be woken with a trusted click and then typed SYNTHETICALLY (diagnostic arm; REFUTED live 2026-08-25).");
       if (act.comboPerCharType) LOG("⚠ atsComboPerChar is SET — every searched combobox falls back to per-char trusted typing (the slow pre-2026-08-25 path).");
     }
-    const prepared = prepareProfile(store.profile);
+    let prepared = prepareProfile(store.profile);
+    // ── iCIMS ONLY: FILL UNDER A SCRATCH ALIAS (operator, 2026-09-10) ────────────────────────────
+    // iCIMS will not let you return to a page you have already submitted, and it keys the candidate
+    // account on the profile's email — so a second fill under the real address resumes mid-way and
+    // the earlier pages can never be captured again. Filling under `+1` makes every scan a fresh
+    // application that walks end to end. The SUBMIT run deliberately does NOT do this: it uses the
+    // real address, recreating the account and refilling from the approved bundle.
+    // ⚠ The alias lives only between here and the keystroke — `atsUnscratchRecords` puts the real
+    // address back on every record before the bundle is built, so review shows what will be filed.
+    if (ats === "icims") {
+      if (scratchEmail) {
+        prepared = { ...prepared, personal_info: { ...prepared.personal_info, email: scratchEmail } };
+        LOG(`filling under the scratch alias ${scratchEmail} — iCIMS keys the candidate account on this address and will not`
+          + ` let a completed page be revisited, so a fresh alias is the only way one run can walk the whole application.`
+          + ` The review page and the submit run both use ${realEmail}.`);
+      }
+    }
     // ⚠ `credentials` reaches the ATS driver ONLY here, and only the credential tier can consume it
     // (atsRouteField claims a recognized credential field before any other rung sees it). It is the
     // same {email, password} the website's Credentials page writes and the Workday onboarding signs
@@ -6871,8 +6919,22 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
     if (MULTI) {
       let carried = null;
       if (ats === "icims") {
-        const prior = await new Promise((r) => chrome.storage.local.get("reviewSummary", (o) => r((o && o.reviewSummary) || null)));
-        if (prior && prior.jobKeyUrl && originUrl && prior.jobKeyUrl === originUrl && (prior.entries || []).length) carried = prior;
+        const readPrior = () => new Promise((r) => chrome.storage.local.get("reviewSummary", (o) => r((o && o.reviewSummary) || null)));
+        const mine = (b) => !!(b && b.jobKeyUrl && originUrl && b.jobKeyUrl === originUrl && (b.entries || []).length);
+        let prior = await readPrior();
+        // ⚠ THE EARLIER STEPS USUALLY LIVE ON THE WEBSITE, NOT IN LOCAL STORAGE (live 2026-09-09).
+        // `chrome.storage.local.reviewSummary` holds only the MOST RECENT run's bundle, so carrying
+        // forward worked for consecutive runs of one job and did nothing the moment another job ran
+        // in between — measured on Shure 5028, which resumed at step 3 and produced a 6-field bundle
+        // while its step-1 data sat safely in Supabase from an earlier fill. The site is the durable
+        // store; pull this job's bundle from it before deciding there is nothing to carry.
+        if (!mine(prior)) {
+          const pulled = await pullApprovedBundle(LOG, { url: originUrl }).catch(() => null);
+          if (pulled && pulled.pulled) prior = await readPrior();
+        }
+        // The job gate is applied to whatever we ended up holding — local OR pulled — so a pull that
+        // answers with the wrong application can no more reach this bundle than a stale local one.
+        if (mine(prior)) carried = prior;
         else if (prior && (prior.entries || []).length) {
           LOG(`the stored review bundle belongs to a different job — clearing it rather than merging someone else's answers`);
         }
@@ -6945,7 +7007,21 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
           + ` (the form settle + block settle + step read above account for this; the option capture and`
           + ` scan that follow are counted in "pre-fill prep")`);
       }
-      out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], essays: store.essays || null, credentials: store.credentials || null, resumePreattached: resumePre });
+      // ⚠ THE LOGIN TAKES THE SAME ALIAS AS THE PROFILE EMAIL, or the scratch account cannot be made:
+      // iCIMS' step 1 embeds "Create a login", so a `+1` contact address paired with the REAL login
+      // collides on the login field instead of the contact one — the same refusal in a new costume.
+      // The password is untouched, and the login still never leaves the credential tier: the record
+      // keeps its "(stored login)" placeholder, so nothing here can reach a log line or the bundle.
+      const fillCreds = scratchEmail && store.credentials && store.credentials.email
+        ? { ...store.credentials, email: icimsScratchEmail(store.credentials.email) }
+        : (store.credentials || null);
+      out = await driveAtsPageFill(act, ats, prepared, store.defaults || {}, jobContext, { buckets: store.buckets || [], essays: store.essays || null, credentials: fillCreds, resumePreattached: resumePre });
+      // ⚠ UNDO THE ALIAS BEFORE THE RECORDS BECOME A BUNDLE — this is the half that makes the scratch
+      // account honest. Everything downstream (the page bundle, the review editor, the submit
+      // replay) reads these records, and an operator approving `+1` would be approving a value that
+      // never gets filed. Done per STEP, immediately after the fill, so no accumulated bundle can
+      // ever hold the alias.
+      if (scratchEmail && realEmail) atsUnscratchRecords(out && out.results, scratchEmail, realEmail, LOG);
       allResults = allResults.concat(out.results || []);
       stepsFilled++;
 

@@ -7982,18 +7982,19 @@ function icimsLooksLikeSso(url, portalHost) {
 // account address into a STAFF login. The host is the whole tell, and it is a host we can never
 // have business on: the candidate portal always lives on a TENANT subdomain.
 // Checked ahead of the SSO test, because the SSO test deliberately exempts icims.com hosts.
-// ⚠ ANY TLD, NOT JUST .com (live 2026-09-09). This was an equality test against the literal
-// `login.icims.com`, and iCIMS also serves `login.icims.eu` — so a run that followed the wrong
-// "login" link walked straight past this guard and typed the stored candidate password into the
-// central login three times. A candidate NEVER signs in on a `login.icims.*` host: the tenant's own
-// portal serves the candidate gate (careersus-shure.icims.com), and this family is the STAFF login.
-// Refusing an EU-region staff login is the safe direction; the cost of over-refusing is one clear
-// halt, the cost of under-refusing is a password in the wrong box.
+// ⚠⚠ `.com` ONLY, AND THE ASYMMETRY IS DELIBERATE — IT FOLLOWS THE EVIDENCE (2026-09-09).
+// This was briefly widened to `login.icims.<any tld>` on the theory that a run reaching
+// `login.icims.eu` had followed the wrong link. The operator refuted it: that IS this tenant's
+// candidate login, and "the things later in the link identify it from their backend". The widening
+// then broke an ORDINARY run — Shure job 4960 halted `wrong-login` on a redirect the tenant's own
+// flow had made — because the provenance bypass only covers the returning-candidate recovery.
+//
+// So it goes back to what is actually documented and observed: `login.icims.com` is the RECRUITER
+// login (docs/dom-patterns.md) and is refused; `login.icims.eu` is a candidate login and is not.
+// Asymmetric on evidence beats symmetric on a guess — and guessing symmetry is what cost a run here.
 function icimsIsAdminLogin(url) {
-  try {
-    const h = new URL(String(url == null ? "" : url)).hostname.toLowerCase();
-    return /^login\.icims\.[a-z]{2,}(\.[a-z]{2,})?$/.test(h);
-  } catch (e) { return false; }
+  try { return new URL(String(url == null ? "" : url)).hostname.toLowerCase() === "login.icims.com"; }
+  catch (e) { return false; }
 }
 
 // Is this iCIMS' own infrastructure at all? Used to tell "the vendor's login host" from "some third
@@ -8054,6 +8055,69 @@ function icimsAccountExists(errors) {
     const t = String(e == null ? "" : e);
     return ICIMS_ACCOUNT_TAKEN_RE.test(t) && ICIMS_ACCOUNT_SUBJECT_RE.test(t);
   });
+}
+
+// ── A SCRATCH ACCOUNT FOR FILLING, THE REAL ONE FOR SUBMITTING (operator, 2026-09-10) ───────────
+// The constraint that forces this: **iCIMS will not let you go back to a page once you have
+// submitted it**, and it keys the candidate ACCOUNT on the profile's email. So the first fill walks
+// the whole application and every later one resumes at the first incomplete step — the completed
+// pages become permanently invisible, which is why successive Shure runs captured 19 fields, then 8,
+// then 6, and why the review page could never show all three pages together.
+//
+// The operator's remedy: SCAN AND FILL under a throwaway `+1` alias, so every fill starts a fresh
+// application and walks it end to end; then SUBMIT under the real address, which recreates the
+// account and refills it from the approved bundle.
+//
+// ⚠⚠ THE REVIEW PAGE MUST SHOW THE REAL ADDRESS. The scratch alias is an artefact of how we capture
+// the form, not an answer the operator gave — and approving `+1` would be approving a value that
+// never gets filed. So the alias exists ONLY between the profile and the keystroke; every record,
+// bundle and review editor carries the real address (`icimsUnscratchEmail`).
+function icimsScratchEmail(email) {
+  const s = String(email == null ? "" : email).trim();
+  const at = s.lastIndexOf("@");
+  if (at <= 0) return s;                    // not an address we can rewrite — leave it untouched
+  const local = s.slice(0, at), domain = s.slice(at);
+  // ⚠ NEVER STACK ALIASES. An operator whose profile already holds `name+foo@` must not become
+  // `name+foo+1@` — that is a different mailbox from the one Gmail auto-verify polls, and the run
+  // would sit waiting for a mail nobody receives.
+  if (local.indexOf("+") >= 0) return s;
+  return local + "+1" + domain;
+}
+
+// The inverse, applied to anything the fill RECORDED, so the bundle never carries the scratch alias.
+// Only ever strips the exact `+1` this file added — a genuine `+something` in the operator's own
+// address is left alone.
+function icimsUnscratchEmail(value) {
+  const s = String(value == null ? "" : value);
+  return s.replace(/([A-Za-z0-9._%-]+)\+1@/g, "$1@");
+}
+
+// Put the REAL address back on everything the fill RECORDED, so the bundle, the review editor and
+// the submit replay all carry the value that will actually be filed. Mutates in place (the records
+// are this run's own) and returns how many values it rewrote.
+//
+// ⚠ A CREDENTIAL RECORD IS UNTOUCHED BY CONSTRUCTION and must stay that way: its `after` is the
+// `"(stored login)"` PLACEHOLDER, never the address, so there is nothing here to rewrite — and that
+// is exactly why the login can be aliased for the fill without the alias ever reaching Supabase.
+// This pass only ever sees ordinary field values.
+//
+// ⚠ Swaps the EXACT scratch string, not a `+1` pattern: a genuine `someone+1@` that the operator
+// actually uses would be left alone, because in that case `icimsScratchEmail` refused to alias at
+// all and `scratch === real`, so this returns immediately.
+function atsUnscratchRecords(results, scratch, real, LOG) {
+  if (!Array.isArray(results) || !scratch || !real || scratch === real) return 0;
+  let n = 0;
+  for (const r of results) {
+    if (!r) continue;
+    for (const k of ["after", "resolved", "before"]) {
+      const v = r[k];
+      if (typeof v === "string" && v.indexOf(scratch) >= 0) { r[k] = v.split(scratch).join(real); n++; }
+    }
+  }
+  if (n && LOG) {
+    LOG(`review will show ${real}, not the scratch alias — ${n} recorded value(s) rewritten, and the submit run files under ${real}`);
+  }
+  return n;
 }
 
 // ── WHICH CONTROL ACTUALLY MOVES AN iCIMS STEP ON (operator, 2026-09-09) ─────────────────────────
@@ -12278,6 +12342,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjClickAuthSubmit, atsInjAuthControls, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsIcimsHost,
     atsInjIcimsSubmitControls, icimsAdvancePick, ICIMS_ADVANCE_PREF, ICIMS_ADVANCE_DENY,
+    icimsScratchEmail, icimsUnscratchEmail, atsUnscratchRecords,
     ICIMS_ACCOUNT_TAKEN_RE, ICIMS_ACCOUNT_SUBJECT_RE,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,

@@ -238,14 +238,14 @@ test("⚠⚠ the staff-login bypass needs BOTH provenance AND an iCIMS host", ()
     "exactly one caller may vouch for a login.icims.* destination");
 });
 
-test("⚠⚠ the STAFF login is refused on every TLD, not just .com", () => {
-  // The guard was an equality test against the literal "login.icims.com", and iCIMS also serves
-  // login.icims.eu — which is how a candidate password reached the central login.
-  assert.ok(icimsIsAdminLogin("https://login.icims.com/sso"));
-  assert.ok(icimsIsAdminLogin("https://login.icims.eu/sso/login"));
-  assert.ok(icimsIsAdminLogin("https://LOGIN.ICIMS.EU/x"));
-  assert.ok(icimsIsAdminLogin("https://login.icims.co.uk/x"));
-  // …and a TENANT portal is never mistaken for it, whatever its name.
+test("⚠⚠ the STAFF login is .com ONLY — login.icims.eu is a CANDIDATE login", () => {
+  // This was briefly widened to every TLD on the theory that reaching login.icims.eu meant we had
+  // followed the wrong link. The operator refuted it, and the widening then broke an ORDINARY run:
+  // Shure job 4960 halted `wrong-login` on a redirect the tenant's own flow had made, because the
+  // provenance bypass only covers the returning-candidate recovery. Asymmetric on evidence beats
+  // symmetric on a guess.
+  assert.ok(icimsIsAdminLogin("https://login.icims.com/sso"), "the documented RECRUITER login stays refused");
+  assert.ok(!icimsIsAdminLogin("https://login.icims.eu/sso/login"), "this tenant's candidate login must not be refused");
   assert.ok(!icimsIsAdminLogin("https://careersus-shure.icims.com/jobs/5013/x/login"));
   assert.ok(!icimsIsAdminLogin("https://login-services.icims.com/x"), "only the bare 'login' host is the staff login");
   assert.ok(!icimsIsAdminLogin("https://careers.astrion.us/login"));
@@ -333,6 +333,79 @@ test("no controls at all is reported, not thrown", () => {
   assert.strictEqual(icimsAdvancePick(undefined).reason, "none");
 });
 
+// ── the scratch alias: fill under +1, submit under the real address ─────────────────────────────
+
+const { icimsScratchEmail, icimsUnscratchEmail, atsUnscratchRecords } = require("../ats.js");
+
+test("⚠ the fill alias is +1, and it NEVER stacks on an address that already has one", () => {
+  assert.strictEqual(icimsScratchEmail("wangykev@gmail.com"), "wangykev+1@gmail.com");
+  // ⚠ The one that would break Gmail auto-verify: an operator whose own address already carries a
+  // tag must not become `name+foo+1@`, which is a mailbox nothing polls — the run would then sit
+  // waiting for a verification mail that never arrives.
+  assert.strictEqual(icimsScratchEmail("wangykev+foo@gmail.com"), "wangykev+foo@gmail.com");
+  assert.strictEqual(icimsScratchEmail("wangykev+1@gmail.com"), "wangykev+1@gmail.com");
+  // junk in, junk out — never a malformed address
+  assert.strictEqual(icimsScratchEmail(""), "");
+  assert.strictEqual(icimsScratchEmail(null), "");
+  assert.strictEqual(icimsScratchEmail("not-an-address"), "not-an-address");
+  assert.strictEqual(icimsScratchEmail("@nolocal.com"), "@nolocal.com");
+});
+
+test("the inverse restores the real address", () => {
+  assert.strictEqual(icimsUnscratchEmail("wangykev+1@gmail.com"), "wangykev@gmail.com");
+  assert.strictEqual(icimsUnscratchEmail("wangykev@gmail.com"), "wangykev@gmail.com");
+});
+
+test("⚠⚠ every recorded value is un-aliased before it can become a bundle", () => {
+  // The operator must review the address the submission will actually use. Approving `+1` would be
+  // approving a value that never gets filed.
+  const recs = [
+    { name: "PersonProfileFields.Email", after: "wangykev+1@gmail.com" },
+    { name: "other", after: "unrelated", resolved: "wangykev+1@gmail.com" },
+    { name: "PersonProfileFields.Login", after: "(stored login)" },
+  ];
+  const n = atsUnscratchRecords(recs, "wangykev+1@gmail.com", "wangykev@gmail.com");
+  assert.strictEqual(n, 2);
+  assert.strictEqual(recs[0].after, "wangykev@gmail.com");
+  assert.strictEqual(recs[1].resolved, "wangykev@gmail.com");
+  // ⚠ the credential record is a PLACEHOLDER and must stay one — that is what keeps the aliased
+  // login out of Supabase entirely
+  assert.strictEqual(recs[2].after, "(stored login)");
+});
+
+test("⚠ un-aliasing is a no-op when no alias was used", () => {
+  const recs = [{ after: "wangykev@gmail.com" }];
+  assert.strictEqual(atsUnscratchRecords(recs, "wangykev@gmail.com", "wangykev@gmail.com"), 0);
+  assert.strictEqual(atsUnscratchRecords(recs, null, "x"), 0);
+  assert.strictEqual(atsUnscratchRecords(null, "a", "b"), 0);
+  assert.strictEqual(recs[0].after, "wangykev@gmail.com");
+});
+
+test("⚠⚠ the SUBMIT run never aliases — it files under the real address", () => {
+  // The whole point: fill under a scratch account so one run walks the whole application, then
+  // submit under the real one, recreating the account and refilling from the approved bundle.
+  const i = bg.indexOf("async function runAtsSubmitRun(");
+  assert.ok(i > 0);
+  const fn = bg.slice(i);
+  assert.ok(!/icimsScratchEmail/.test(fn),
+    "a submit run that aliased would file the application under a throwaway address");
+});
+
+test("⚠⚠ the alias is decided BEFORE the gate, and undone BEFORE the bundle", () => {
+  const i = bg.indexOf("async function runAtsApplicationRun(");
+  const fn = bg.slice(i, bg.indexOf("async function runAtsSubmitRun("));
+  const gateAt = fn.indexOf("runIcimsPreForm(tabId, preCredsIcims");
+  const decideAt = fn.indexOf("icimsScratchEmail");
+  const fillAt = fn.indexOf("driveAtsPageFill");
+  const undoAt = fn.indexOf("atsUnscratchRecords");
+  assert.ok(decideAt > 0 && gateAt > decideAt,
+    "the gate types the account email — deciding the alias after it would sign into the REAL account");
+  assert.ok(undoAt > fillAt, "records are un-aliased immediately after the fill, per step");
+  // and the login is aliased too, or the scratch account cannot be created at all
+  assert.match(fn, /email: icimsScratchEmail\(store\.credentials\.email\)/,
+    "a +1 contact address with the REAL login just moves the collision to the login field");
+});
+
 // ── SOURCE-TEXT GUARDS (background.js / cdp.js are service-worker files and cannot be require()d) ─
 // Comments are stripped FIRST — both files now *document* the shapes they refuse, and a naive grep
 // matches the explanation instead of the code. `[^\r\n]*`, never `.*$`: this repo checks out CRLF
@@ -402,8 +475,16 @@ test("⚠⚠ a resumed iCIMS walk carries earlier steps forward, and ONLY for th
   // The step indicators are not navigable, so they cannot be re-collected; they are carried instead.
   const i = bg.indexOf("let signInRecoveries = 0;");
   const fn = bg.slice(i, i + 2600);
-  assert.match(fn, /prior\.jobKeyUrl === originUrl/,
+  // ⚠ MATCHES THE COMPARISON, NOT THE VARIABLE NAME. This was `prior\.jobKeyUrl === originUrl` and
+  // broke the moment the gate was factored into a `mine()` helper — the guard was still there and
+  // still applied to BOTH the local and the pulled bundle, so a literal pattern would have forced a
+  // real improvement to be reverted to satisfy a test about something else. (Same lesson as
+  // `icimsStepState\(\)` in test/icims-walk-guards.js.)
+  assert.match(fn, /jobKeyUrl === originUrl/,
     "carrying forward must be gated on the JOB — merging another application's bundle would put its answers on this review page");
+  // …and the website is consulted for the earlier steps, since local storage holds only the last run
+  assert.match(fn, /pullApprovedBundle\(LOG, \{ url: originUrl \}\)/,
+    "the durable copy of an earlier step lives on the site, not in chrome.storage");
   assert.match(fn, /ats === "icims"/, "only iCIMS resumes mid-application; every other walk still clears");
   // the clear must still happen when nothing is carried
   assert.match(fn, /reviewSummary: null, reviewAudit: null/,
