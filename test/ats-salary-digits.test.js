@@ -176,7 +176,31 @@ test("⚠⚠ an unstated salary is CLAIMED and left blank — no error message c
   // ABSENCE and never refuses — live, it answered "Negotiable".
   assert.match(src, /atsIsSalaryAmountField\(\{ label: L \}\)/);
   assert.match(src, /kind: "salary-unstated", review: true/);
-  assert.match(src, /path: "application_questions\.availability_and_preferences\.salary_expectation"/);
+});
+
+test("⚠⚠ the stated value is read from profile.screening — the schema's home for it", () => {
+  // The first version read `application_questions.availability_and_preferences.salary_expectation`,
+  // taken from a TEACH BINDING LABEL in web/lib/teach.ts that reads like a profile path and is not
+  // one. `salary_expectation` lives on screeningSchema. A wrong accessor fails EXACTLY like an
+  // empty field — the run reported "you have not stated one" against a profile holding 80000 — so
+  // it cost a live run to spot and is pinned here rather than left to read plausibly.
+  assert.match(src, /profile\.screening \|\| \{\}\)\.salary_expectation/);
+  assert.match(src, /path: "screening\.salary_expectation"/);
+  // ⚠ ONE rung, not two. A pre-existing one read the same value from
+  // `aq.availability_and_preferences.salary_expectation` — always undefined, so it always fell
+  // through to the AI, which is how a required salary box came to hold "Negotiable".
+  assert.ok(!/availability_and_preferences \|\| \{\}\)\.salary_expectation/.test(src),
+    "the old, always-undefined salary accessor must not survive alongside the new one");
+});
+
+test("⚠ a bare 'Salary' label is still claimed — the replaced rung matched those", () => {
+  // Dropping this would silently stop claiming the shortest and most common labels of all.
+  assert.ok(atsIsSalaryAmountField({ label: "Salary" }));
+  assert.ok(atsIsSalaryAmountField({ label: "Desired Compensation" }));
+  assert.ok(atsIsSalaryAmountField({ label: "Pay expectation" }));
+  // …while a LONG label mentioning pay is a different question and must still fall through
+  assert.ok(!atsIsSalaryAmountField({ label: "Are you willing to negotiate salary with our team?" }));
+  assert.ok(!atsIsSalaryAmountField({ label: "Describe your compensation philosophy in detail" }));
 });
 
 test("⚠ the label-triggered FORMAT coercion is gone, not merely unused", () => {

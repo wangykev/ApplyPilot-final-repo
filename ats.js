@@ -1436,16 +1436,21 @@ function atsRouteLabel(label, f, profile, defaults) {
   // A stated value IS a fact, so it fills deterministically and unflagged, coerced to bare digits by
   // the same helper both write seams use.
   if (atsIsSalaryAmountField({ label: L })) {
-    const stated = atsSalaryDigits((aq.availability_and_preferences || {}).salary_expectation);
+    // ⚠ `profile.screening`, NOT `application_questions.…` (corrected 2026-09-10). The first version
+    // took the path from a TEACH BINDING LABEL in web/lib/teach.ts, which reads like a profile path
+    // and is not one — `salary_expectation` lives on `screeningSchema`
+    // (web/lib/profile-schema.ts). It read `undefined` forever, so a profile holding 80000 still
+    // reported "you have not stated one" and the field stayed blank. A wrong accessor fails exactly
+    // like an empty field, which is why this cost a live run to notice.
+    const stated = atsSalaryDigits((profile && profile.screening || {}).salary_expectation);
     if (!stated) {
       return { kind: "salary-unstated", review: true, flag: "salary-unstated",
         detail: "this form wants a desired salary as a NUMBER and your profile does not state one — set "
           + "\"salary expectation\" on the Profile page. A figure nobody chose would anchor a real negotiation, "
           + "so it is left for you rather than guessed" };
     }
-    return { value: stated, source: "salary",
-      path: "application_questions.availability_and_preferences.salary_expectation",
-      detail: "salary_expectation = " + stated + " (digits only — these boxes reject commas, decimals and currency symbols)" };
+    return { value: stated, source: "salary", path: "screening.salary_expectation",
+      detail: "screening.salary_expectation = " + stated + " (digits only — these boxes reject commas, decimals and currency symbols)" };
   }
 
   // Profile links.
@@ -1512,12 +1517,13 @@ function atsRouteLabel(label, f, profile, defaults) {
     return { value: `${mm}/${dd}/${d.getFullYear()}`, source: "signature-date", path: "(today)" };
   }
 
-  // Compensation + availability (STATED only — an empty profile value falls through to AI/blank).
-  if (/salary|compensation|pay expectation|desired pay|expected (salary|pay)/i.test(L)) {
-    const v = (aq.availability_and_preferences || {}).salary_expectation;
-    if (has(v)) return { value: v, source: "map", detail: "salary_expectation" };
-    return null;
-  }
+  // ⚠ THE SALARY RUNG THAT USED TO SIT HERE IS GONE — see the one above (2026-09-10). It read
+  // `aq.availability_and_preferences.salary_expectation`, which is not where the schema keeps it
+  // (`screeningSchema` → `profile.screening`), so it was ALWAYS undefined and always fell through
+  // to the AI. That fall-through is how a required salary box came to hold "Negotiable" on a form
+  // demanding digits. Two rungs for one field is the duplication this file keeps paying for, so
+  // there is now one, it reads the right path, and it CLAIMS the question rather than falling
+  // through when the profile is silent.
   if (/when can you start|start date|earliest.*(start|available)|available to (start|begin)/i.test(L)) {
     const ap = aq.availability_and_preferences || {};
     const v = ap.earliest_start_date || ap.available_for_full_employment_after;
@@ -8646,6 +8652,101 @@ async function atsAiWriteText(act, f, profile, jobContext, essaysDoc) {
 // then invents a work-experience date the profile already answers (observed live 2026-08-17: "Jun 1
 // 2026", reasoned from "typical summer internship start date"). One helper, used at every label-keyed
 // rung, so a future display tweak cannot reach the matcher again.
+// ── A CONDITIONAL QUESTION CARRIES ITS OWN INSTRUCTIONS (operator, 2026-09-10) ──────────────────
+// "6. If you answered yes to questions 4 or 5, please explain, if no please type \"n/a.\""
+//
+// Same principle as reading the form's error instead of recognising the question: the FORM has
+// already said what to do, including the literal to type when the condition does not apply. There
+// is nothing to infer about the topic — only to resolve which branch we are on. Optional and
+// unmapped, these went unanswered, and on a REQUIRED one that blocks the whole walk.
+//
+// Two branches, and they are deliberately not symmetric:
+//   condition NOT met ⇒ type the literal the question itself specified. Deterministic, unflagged —
+//                       we are quoting the form back to itself, not deciding anything.
+//   condition MET     ⇒ the AI drafts the explanation and it is ALWAYS `filled_review`. An
+//                       explanation of a "yes" to a screening question is a statement about the
+//                       operator's history; the human fixes it on the tracker page, which is
+//                       exactly what the operator asked for.
+//
+// ⚠ AN UNRESOLVED CONDITION IS NEVER GUESSED. If the questions it points at cannot be found or
+// their answers cannot be read, this returns `unknown` and the field goes to review untouched —
+// typing "n/a" over a condition that was actually met would be a false statement, and inventing an
+// explanation for one that was not is worse.
+
+// Does this label carry its own conditional instruction? Pure.
+function atsConditionalSpec(label) {
+  const t = String(label == null ? "" : label).replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  // "If you answered yes to questions 4 or 5" / "If yes to #4" / "If you selected Yes above"
+  const cond = /\bif\s+(?:you\s+(?:answered|selected|responded|indicated)\s+)?(yes|no|true|false)\b/i.exec(t);
+  if (!cond) return null;
+  const trigger = cond[1].toLowerCase();
+  // Which questions it points at, by their printed number. "questions 4 or 5", "question 4",
+  // "#4 or #5", "4, 5 or 6".
+  const after = t.slice(cond.index);
+  const refs = [];
+  // ⚠ `#` CANNOT CARRY A `\b` — it is not a word character, so `\b#` only matches after one, and
+  // "yes to #7 or #8" (a space before it) silently found nothing. The marker alternatives that ARE
+  // words keep their anchors; `#` stands alone.
+  // The capture then runs over digits and the small vocabulary that joins them (", or and # /"),
+  // stopping at the first ordinary word — so "questions 1, 2 or 3, please write" yields all three
+  // while "question 2, explain" stops at the explanation.
+  const refZone = /(?:\bquestions?\b|\bitems?\b|\bnos?\.|#)\s*([\d\s,#orand&/-]+)/i.exec(after);
+  if (refZone) for (const m of refZone[1].matchAll(/\d+/g)) refs.push(m[0]);
+  // The literal it tells you to type when the condition does not apply.
+  // ⚠ Taken VERBATIM from inside its quotes — the form is being quoted back to itself, so trailing
+  // punctuation inside the quotes is the form's own and is not second-guessed.
+  let literal = null;
+  const lit = /\b(?:type|enter|write|put|state|answer)\s*[:,]?\s*["“']([^"”']{1,40})["”']/i.exec(t);
+  if (lit) literal = lit[1].trim();
+  else if (/\b(?:type|enter|write|put)\s+n\/?a\b/i.test(t)) literal = "N/A";
+  if (!refs.length && !literal) return null;   // not actually a conditional instruction
+  return { trigger, refs, literal };
+}
+
+// The printed ordinal a question label leads with ("6. If you answered…" → "6"), which is how a
+// conditional names its siblings. Null when the label is not numbered.
+function atsQuestionOrdinal(label) {
+  const m = /^\s*(\d+)\s*[.)]/.exec(String(label == null ? "" : label));
+  return m ? m[1] : null;
+}
+
+// Is a recorded answer affirmative? Only an explicit yes counts — absence is NOT a "no" here,
+// because a screening question left blank has not been answered at all.
+function atsAnswerIsAffirmative(value) {
+  const v = String(value == null ? "" : value).replace(/\s+/g, " ").trim().toLowerCase();
+  if (!v) return null;                                    // unknown, not false
+  if (/^(yes|y|true|checked|1)\b/.test(v)) return true;
+  if (/^(no|n|false|unchecked|0)\b/.test(v)) return false;
+  return null;                                            // some other text — cannot judge
+}
+
+// Resolve a conditional against the answers already recorded for this page. Pure.
+function atsResolveConditional(spec, records) {
+  if (!spec) return { decision: "unknown", reason: "not a conditional" };
+  const byOrdinal = new Map();
+  for (const r of (Array.isArray(records) ? records : [])) {
+    const ord = atsQuestionOrdinal(r && (r.label || r.question || r.name));
+    if (ord) byOrdinal.set(ord, r);
+  }
+  if (!spec.refs.length) return { decision: "unknown", reason: "the instruction names no question to check" };
+  const seen = [];
+  let anyTriggered = false, anyUnknown = false;
+  for (const ref of spec.refs) {
+    const r = byOrdinal.get(ref);
+    if (!r) { anyUnknown = true; seen.push({ ref, answer: null, found: false }); continue; }
+    const aff = atsAnswerIsAffirmative(r.after != null ? r.after : r.resolved);
+    seen.push({ ref, answer: r.after != null ? r.after : r.resolved, found: true });
+    if (aff === null) { anyUnknown = true; continue; }
+    const triggered = (spec.trigger === "yes" || spec.trigger === "true") ? aff : !aff;
+    if (triggered) anyTriggered = true;
+  }
+  if (anyTriggered) return { decision: "explain", refs: seen };
+  if (anyUnknown) return { decision: "unknown", refs: seen, reason: "could not read every question it points at" };
+  if (!spec.literal) return { decision: "unknown", refs: seen, reason: "the condition does not apply but the form named no literal to type" };
+  return { decision: "literal", literal: spec.literal, refs: seen };
+}
+
 // ── THE FORM SAYS WHAT IT WANTS — READ THAT, DON'T GUESS FROM THE QUESTION (operator, 2026-09-10)
 // "instead of hardcoding each way the question is asked, can you instead make it error detect …
 //  there are many ways to ask the same question."
@@ -8738,12 +8839,20 @@ function atsValueForDemand(current, demand) {
 // LEFT ALONE — stripping that to "" turns a real answer into a blank REQUIRED field, which is
 // strictly worse than a formatting mismatch a human can see and fix on the review page. Same reason
 // a prose "what are your salary expectations?" essay is not caught: the label must name an AMOUNT.
-var ATS_SALARY_Q_RE = /\b(salary|compensation|wage|pay\s+rate|rate\s+of\s+pay)\b/i;
+// ⚠ The `pay …` forms are carried over from the rung this replaced — bare "pay" is far too common
+// a word to match on alone, so it only counts in the phrasings that name a figure.
+var ATS_SALARY_Q_RE = /\b(salary|compensation|wage|pay\s+rate|rate\s+of\s+pay|pay\s+expectation|desired\s+pay|expected\s+pay)\b/i;
 var ATS_SALARY_AMOUNT_RE = /\b(desired|expected|requested|require[ds]?|target|minimum|acceptable|gross|annual|hourly|base|amount)\b/i;
 
 function atsIsSalaryAmountField(f) {
-  const label = String((f && (f.label || f.question || f.name)) || "");
-  return ATS_SALARY_Q_RE.test(label) && ATS_SALARY_AMOUNT_RE.test(label);
+  const label = String((f && (f.label || f.question || f.name)) || "").trim();
+  if (!ATS_SALARY_Q_RE.test(label)) return false;
+  // ⚠ A BARE "Salary" / "Desired Compensation" IS AN AMOUNT BOX. The rung this replaced matched on
+  // the salary word alone, and dropping that would silently stop claiming the shortest and most
+  // common labels of all. A SHORT label mentioning pay is asking for a figure; a long one is
+  // asking something about pay ("Are you willing to negotiate salary?", "Describe your
+  // compensation philosophy"), which is a different question and must still fall through.
+  return ATS_SALARY_AMOUNT_RE.test(label) || label.length <= 30;
 }
 
 // The first number in the value, as bare digits. `null` when there is nothing numeric to take.
@@ -10634,6 +10743,72 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile, valueFor) {
 //     it, while a complete list called partial only costs a typed value.
 //   • A widget that shows nothing until a query is typed (a places box) has no list to capture, and
 //     `pollFor`'s settled-empty rule means asking costs ~2 reads rather than a budget.
+// ── ANSWER THE CONDITIONALS, ONCE THE QUESTIONS THEY POINT AT HAVE BEEN ANSWERED ────────────────
+// Runs LATE and deliberately so: a conditional is about its SIBLINGS' answers, which do not exist
+// until the ordinary fill has run. Placed with the other completeness passes, and like them it
+// never aborts the fill.
+async function atsAnswerConditionals(act, ats, scan, results, profile, jobContext, log) {
+  const fields = (scan && scan.fields) || [];
+  let done = 0;
+  for (const f of fields) {
+    const rec = (results || []).find((r) => r && (r.name === f.id || r.name === f.name));
+    // ONLY a field nothing else answered. A conditional the operator's profile already covers, or
+    // that the AI already drafted, is left exactly as it is.
+    if (!rec || (rec.status !== "skipped" && rec.status !== "needs_review")) continue;
+    if (rec.after && String(rec.after).trim()) continue;
+    const wt = f.widgetType || "text";
+    if (wt !== "text" && wt !== "textarea") continue;      // an explain box is free text
+    const spec = atsConditionalSpec(f.label || f.question || "");
+    if (!spec) continue;
+    const res = atsResolveConditional(spec, results);
+    const sel = f.id ? "#" + String(f.id).replace(/([^\w-])/g, "\\$1") : null;
+    if (!sel) continue;
+
+    if (res.decision === "literal") {
+      // Quoting the form back to itself — no judgement, so no flag.
+      const w = await act.eval(atsInjSetText, sel, res.literal).catch(() => null);
+      if (w && w.ok) {
+        rec.status = "filled"; rec.after = res.literal; rec.resolved = res.literal;
+        rec.detail = `the question says to type ${JSON.stringify(res.literal)} when it does not apply, and `
+          + `question(s) ${spec.refs.join("/")} were not ${spec.trigger}`;
+        done++;
+        if (log) log(`[ATS-FILL] ${f.id}: conditional not met → typed ${JSON.stringify(res.literal)} as the question instructs`);
+      }
+      continue;
+    }
+
+    if (res.decision === "explain") {
+      // ⚠ ALWAYS filled_review. This explains a "yes" to a screening question — a statement about
+      // the operator's own history, which they correct on the tracker page.
+      const ai = await atsAiWriteText(act, f, profile, jobContext, null).catch(() => null);
+      const text = ai && ai.answer ? String(ai.answer).trim() : "";
+      if (!text) {
+        rec.status = "needs_review"; rec.flag = "conditional-explain";
+        rec.detail = `question(s) ${spec.refs.join("/")} were answered ${spec.trigger}, so this asks for an explanation `
+          + `and none could be drafted — please write it`;
+        continue;
+      }
+      const w = await act.eval(atsInjSetText, sel, text).catch(() => null);
+      if (w && w.ok) {
+        rec.status = "filled_review"; rec.flag = "ai-conditional-explain";
+        rec.after = text; rec.confidence = "low";
+        rec.detail = `question(s) ${spec.refs.join("/")} were answered ${spec.trigger}, so the form asks for an `
+          + `explanation — AI DRAFT, please correct it: ${(ai && ai.justification) || "generated from profile"}`;
+        done++;
+        if (log) log(`[ATS-FILL] ${f.id}: conditional MET (q${spec.refs.join("/")}) → AI draft written, flagged for you to fix`);
+      }
+      continue;
+    }
+
+    // Unresolved — say why, and touch nothing.
+    rec.status = "needs_review"; rec.flag = "conditional-unresolved";
+    rec.detail = `this question depends on question(s) ${spec.refs.join("/")} and ${res.reason} — `
+      + `answering it either way would be a guess about your own history`;
+    if (log) log(`[ATS-FILL] ${f.id}: conditional left for you — ${res.reason}`);
+  }
+  return done;
+}
+
 async function atsCaptureMissingOptions(act, ats, scan, results, log) {
   const say = typeof log === "function" ? log : () => {};
   const need = [];
@@ -10730,6 +10905,14 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
   // read as a bug in whichever half you look at second). Placed after the audit deliberately: see
   // atsSurfacePrefilled.
   try { await atsSurfacePrefilled(act, ats, scan, results, profile, valueFor); } catch (e) { /* completeness — never abort */ }
+
+  // ⚠ CONDITIONALS LAST OF THE FILLERS, because they read their SIBLINGS' answers — "If you
+  // answered yes to questions 4 or 5, please explain, if no please type \"n/a.\"" cannot be decided
+  // until 4 and 5 have been answered. Before the counts, though: it promotes records from `skipped`
+  // to `filled` / `filled_review`, and the envelope must report what it left behind (the same
+  // ordering lesson atsSurfacePrefilled records just above). Never aborts the fill.
+  try { await atsAnswerConditionals(act, ats, scan, results, profile, jobContext, (m) => console.log("[ApplyPilot]" + m)); }
+  catch (e) { /* completeness — never abort */ }
 
   // ⚠ THE REPEATING ENTRIES, AND THEY MUST RUN AFTER THE FLAT LOOP. Every ORC step is scanned for
   // flat fields; a repeating block contributes NOTHING to that scan until an Add is pressed, because
@@ -12622,6 +12805,7 @@ if (typeof module !== "undefined" && module.exports) {
     icimsScratchEmail, icimsUnscratchEmail, atsUnscratchRecords,
     atsIsSalaryAmountField, atsSalaryDigits, ATS_SALARY_Q_RE, ATS_SALARY_AMOUNT_RE,
     atsErrorDemand, atsMatchErrorToField, atsValueForDemand,
+    atsConditionalSpec, atsQuestionOrdinal, atsAnswerIsAffirmative, atsResolveConditional, atsAnswerConditionals,
     ICIMS_ACCOUNT_TAKEN_RE, ICIMS_ACCOUNT_SUBJECT_RE,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
