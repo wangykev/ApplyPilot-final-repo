@@ -7846,6 +7846,12 @@ var ATS_CONSENT_OPTIN_RE = /\b(talent\s+(community|network)|job\s+alerts?|email\
 // A truthfulness attestation — recognized ONLY so it can be excluded on purpose rather than by
 // accident, and so a future decision about it has a name to refer to.
 var ATS_CONSENT_ATTEST_RE = /\b(i\s+certify|i\s+declare|i\s+affirm|under\s+penalty|falsif(y|ication)|to\s+the\s+best\s+of\s+my\s+knowledge)\b/i;
+// ⚠ A box whose text makes ticking it conditional on WHO YOU ARE is a factual claim, not assent.
+// "If you are a European Union resident, please check this box" (RoviSys, live 2026-09-10) carries
+// GDPR wording and would otherwise classify as `accept`. Anchored on the CONDITION + a status about
+// the applicant, so an ordinary "I accept the … Privacy Notice" is untouched.
+var ATS_CONSENT_CONDITIONAL_RE =
+  /\b(if|only\s+if)\b[^.]{0,80}\b(you\s+are|you\s+reside|your\s+residence|resident|residing|located\s+in|citizen|live\s+in)\b/i;
 // text = whatever describes the box (label, its row, the consent's own title). Most specific wins:
 // an opt-in that merely mentions "privacy" must not read as an acceptance.
 // ⚠ AN OPT-IN CAN BE WORDED EXACTLY LIKE AN ACCEPTANCE — so DECLARED INTENT decides first
@@ -7886,6 +7892,18 @@ function atsConsentKind(text, hints) {
   if (!t) return null;
   if (ATS_CONSENT_OPTIN_RE.test(t)) return "optin";
   if (ATS_CONSENT_ATTEST_RE.test(t)) return "attestation";
+  // ⚠⚠ A CONDITIONAL BOX IS A FACTUAL CLAIM ABOUT THE APPLICANT, NOT ASSENT TO A NOTICE
+  // (live 2026-09-10, RoviSys). Its box reads *"If you are a European Union resident, please check
+  // this box"* — it carries GDPR wording, so ATS_CONSENT_ACCEPT_RE claimed it and the run ticked it
+  // and logged an acceptance. But ticking it ASSERTS THE OPERATOR LIVES IN THE EU, which is false,
+  // and the tick is what plausibly disabled the gate's own Next (an EU declaration reveals further
+  // required fields).
+  //
+  // This is the SAME boundary the attestation exclusion already draws, reached from the other side:
+  // the standing instruction authorised accepting a privacy notice *that governs this application*,
+  // and it cannot authorise a statement of fact about who the applicant is. NARROWING what gets
+  // ticked is the safe direction and needs no new permission; widening it would.
+  if (ATS_CONSENT_CONDITIONAL_RE.test(t)) return "conditional";
   if (ATS_CONSENT_ACCEPT_RE.test(t)) return "accept";
   return null;
 }
@@ -12338,7 +12356,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
-    ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
+    ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE, ATS_CONSENT_CONDITIONAL_RE,
     atsInjClickAuthSubmit, atsInjAuthControls, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsIcimsHost,
     atsInjIcimsSubmitControls, icimsAdvancePick, ICIMS_ADVANCE_PREF, ICIMS_ADVANCE_DENY,

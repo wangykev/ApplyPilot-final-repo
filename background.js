@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "icims-sitecarry-69";
+const AP_BUILD_MARKER = "icims-scratch-70";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -5941,6 +5941,14 @@ async function runIcimsPreForm(tabId, credentials, LOG, opts) {
       if (optins.length) LOG(`leaving ${optins.length} opt-in box(es) UNTICKED (not an acceptance): ${optins.map((c) => JSON.stringify(String(c.label || c.id).slice(0, 40))).join(", ")}`);
       const attest = plan.left.filter((c) => c.kind === "attestation" && !c.checked);
       if (attest.length) LOG(`leaving ${attest.length} truthfulness attestation(s) untouched — not a privacy consent: ${attest.map((c) => JSON.stringify(String(c.label || c.id).slice(0, 40))).join(", ")}`);
+      // ⚠ SAID OUT LOUD, because this one LOOKS like a consent and was being ticked until today.
+      // A box conditional on who the applicant is ("If you are a European Union resident…") is a
+      // statement of fact, and the standing instruction covers privacy notices, not facts.
+      const cond = plan.left.filter((c) => c.kind === "conditional" && !c.checked);
+      if (cond.length) {
+        LOG(`leaving ${cond.length} CONDITIONAL box(es) unticked — ticking one would state a fact about you, not accept a notice: `
+          + cond.map((c) => JSON.stringify(String(c.label || c.id).slice(0, 60))).join(", "));
+      }
       if (plan.tick.length && declineFlag) {
         const named = plan.tick.map((c) => JSON.stringify(String(c.label || c.id || "a consent").slice(0, 70))).join(", ");
         return halt("consent-required",
@@ -6614,9 +6622,19 @@ async function runAtsApplicationRun(tabId, ats, store, startUrl, opts0 = {}) {
       // email, so signing in as the REAL candidate here would land us in the existing account with
       // its completed pages — the very state the scratch alias exists to avoid — and step 1 would
       // arrive with no "Create a login" block to fill.
-      realEmail = (store.profile && store.profile.personal_info && store.profile.personal_info.email) || null;
+      // ⚠ THE PROFILE IS THE PREFERRED SOURCE — iCIMS keys the candidate account on the CONTACT
+      // address — but fall back to the stored login rather than silently doing nothing: a run that
+      // finds no address here would fill under the REAL account and quietly lose the whole point of
+      // the alias. Live 2026-09-10 that is exactly what happened on RoviSys (18 chars typed at the
+      // gate = the bare address), and nothing in the log said why.
+      const profEmail = (store.profile && store.profile.personal_info && store.profile.personal_info.email) || null;
+      const credEmail = (store.credentials && store.credentials.email) || null;
+      realEmail = profEmail || credEmail || null;
       const alias0 = realEmail ? icimsScratchEmail(realEmail) : null;
       if (alias0 && alias0 !== realEmail) scratchEmail = alias0;
+      LOG(`scratch alias: ${scratchEmail ? "ON — filling as " + scratchEmail : "OFF"}`
+        + ` (contact address ${profEmail ? "from the profile" : credEmail ? "ABSENT from the profile, using the stored login" : "NOT FOUND — filling under the real account"}`
+        + `${realEmail && !scratchEmail ? "; it already carries a +tag, so no alias was added" : ""})`);
       const preCredsIcims = scratchEmail && store.credentials && store.credentials.email
         ? { ...store.credentials, email: icimsScratchEmail(store.credentials.email) }
         : (store.credentials || null);

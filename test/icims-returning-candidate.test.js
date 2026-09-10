@@ -505,3 +505,31 @@ test("⚠⚠ the press diagnosis reads the form's OWN WORDS before claiming the 
   assert.match(fn, /real\.length \?\s*"THE PRESS LANDED/,
     "validation text is positive proof the press landed, and must outrank the captcha read");
 });
+
+// ── a CONDITIONAL box is a factual claim, not a consent (live 2026-09-10, RoviSys) ───────────────
+
+const { atsConsentKind: consentKind, atsConsentPlan } = require("../ats.js");
+
+test("⚠⚠ 'If you are a European Union resident, please check this box' is NOT an acceptance", () => {
+  // It carries GDPR wording, so the accept matcher claimed it and the run TICKED it — asserting the
+  // operator lives in the EU, which is false, and plausibly disabling the gate's own Next control.
+  // Same boundary the attestation exclusion draws, reached from the other side: the standing
+  // instruction authorised accepting a privacy notice, and cannot authorise a statement of fact.
+  const t = "If you are a European Union resident, please check this box";
+  assert.strictEqual(consentKind(t), "conditional");
+  const plan = atsConsentPlan([{ id: "accept_gdpr", label: t, checked: false }]);
+  assert.strictEqual(plan.tick.length, 0, "nothing conditional may be ticked");
+  assert.strictEqual(plan.left[0].kind, "conditional");
+});
+
+test("⚠ an ordinary privacy acceptance is UNCHANGED — the narrowing must not swallow it", () => {
+  for (const t of [
+    "I accept the Privacy Policy",
+    "I accept the Peraton Job Application Privacy Notice",
+    "I have read and agree to the General Data Protection Regulation (GDPR) notice",
+  ]) {
+    assert.strictEqual(consentKind(t), "accept", t + " must still be accepted");
+  }
+  assert.strictEqual(consentKind("Check this box only if you reside in California"), "conditional");
+  assert.strictEqual(consentKind("If you are a citizen of the EEA, tick here"), "conditional");
+});
