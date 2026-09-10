@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "salary-digits-71";
+const AP_BUILD_MARKER = "error-remediate-77";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4819,7 +4819,70 @@ async function icimsStepState(opts) {
  * ⚠ The advance predicate is MONOTONE — the declared step number went UP. A monotone predicate can
  * only be noticed late, never missed, which is the standing rule for every wall-clock poll here.
  */
-async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
+// ── FIX WHAT THE FORM OBJECTED TO, USING THE FORM'S OWN WORDS ────────────────────────────────────
+// Returns how many fields it actually rewrote. Deterministic where the demand is recognisable
+// (a "digits only" rule is a normalisation, not a judgement — an LLM call there would add latency
+// and a chance of being wrong about something a regex settles); the AI is the fallback for a demand
+// we do not recognise, which is where "many ways to ask the same question" really bites.
+//
+// ⚠ IT ONLY EVER REWRITES A FIELD THE ERROR NAMED. Matching is on the field's LABEL appearing in
+// the error text, so an unmatched error changes nothing rather than guessing which box to touch —
+// writing into the wrong field on an application is worse than not advancing.
+async function icimsRemediateErrors(errors, LOG) {
+  const scan = await cdpEval(atsInjScan, "icims").catch(() => null);
+  const fields = (scan && scan.fields) || [];
+  if (!fields.length) { LOG("  cannot correct anything — the form's fields could not be re-read"); return 0; }
+  let fixed = 0;
+  for (const err of errors.slice(0, 6)) {
+    const f = atsMatchErrorToField(err, fields);
+    if (!f) { LOG(`  · no field matched this error, so nothing was touched: ${String(err).slice(0, 90)}`); continue; }
+    const demand = atsErrorDemand(err);
+    const sel = f.id ? "#" + String(f.id).replace(/([^\w-])/g, "\\$1") : null;
+    if (!sel) { LOG(`  · ${f.label || f.id}: matched, but it has no id to write to`); continue; }
+    const cur = await cdpEval(atsInjReadValue, "icims", sel, f.widgetType || "text").catch(() => null);
+    const current = (cur && cur.ok && cur.value != null) ? String(cur.value) : "";
+    let next = atsValueForDemand(current, demand);
+    if (next == null && demand && demand.kind !== "required") {
+      // ⚠ THE AI IS THE FALLBACK, NOT THE FIRST RESORT — and it is asked to REFORMAT a value the
+      // operator already has, never to invent one. That distinction is what keeps this from
+      // becoming a way to answer questions nobody answered: with nothing on the form to reformat,
+      // there is nothing for it to do and the field is left for the human.
+      if (!current) { LOG(`  · ${f.label || f.id}: the form rejected it and there is nothing to reformat — left for you`); continue; }
+      next = await icimsAskAiToReformat(current, err, f, LOG);
+    }
+    if (next == null || next === current) { LOG(`  · ${f.label || f.id}: could not work out what the form wants from "${String(err).slice(0, 70)}"`); continue; }
+    const w = await cdpEval(atsInjSetText, sel, String(next)).catch(() => null);
+    if (w && w.ok) {
+      fixed++;
+      LOG(`  ✎ ${f.label || f.id}: ${JSON.stringify(current)} → ${JSON.stringify(String(next))} (${(demand && demand.detail) || "per the form's own message"})`);
+    } else {
+      LOG(`  · ${f.label || f.id}: could not write the corrected value (${(w && w.error) || "unknown"})`);
+    }
+  }
+  return fixed;
+}
+
+// Ask the model to REFORMAT one value to satisfy one error. Deliberately tiny and closed: it is
+// handed the rejected value and the rejection, and told to answer with the corrected value alone.
+// Returns null on anything unusable — a failed call must cost a retry, never a wrong value.
+async function icimsAskAiToReformat(current, errorText, f, LOG) {
+  try {
+    const { aiConfig } = await new Promise((r) => chrome.storage.local.get("aiConfig", r));
+    if (!aiConfig || !aiConfig.enabled) return null;
+    const out = await callLLM({
+      provider: aiConfig.provider, model: aiConfig.model, apiKey: aiConfig.apiKey, action: "fill", maxTokens: 60,
+      system: "You reformat a single form value so it satisfies the form's stated rule. Reply with ONLY the corrected value — no quotes, no units, no explanation. Never invent information that is not already in the value; if the rule cannot be satisfied by reformatting alone, reply exactly NONE.",
+      user: `Question: ${String((f && (f.label || f.name)) || "unknown")}\nValue that was rejected: ${current}\nThe form's error: ${String(errorText).slice(0, 400)}\nCorrected value:`,
+    });
+    if (!out || !out.ok) return null;
+    const ans = String(out.text || "").trim().split("\n")[0].trim().replace(/^["']|["']$/g, "");
+    if (!ans || /^none$/i.test(ans) || ans.length > 120) return null;
+    LOG(`  · asked the model to reformat this one (it does not recognise the rule): ${JSON.stringify(ans)}`);
+    return ans;
+  } catch (e) { return null; }
+}
+
+async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG, alreadyRemediated) {
   // `scrollSubmit` — this read's rect is the one we CLICK, so the control must be on screen when it
   // is measured. See icimsStepState's note: without it the press lands below the fold and nothing
   // posts, which then looks exactly like the form refusing to advance.
@@ -4992,6 +5055,24 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG) {
     if (!btns.length) LOG("    · none visible — which is itself the answer");
   }
   if (real.length) { LOG(`step ${stepNo} did not advance — the form says:`); real.slice(0, 6).forEach((e) => LOG("  · " + e)); }
+
+  // ── READ THE REJECTION AND FIX IT, RATHER THAN RECOGNISING THE QUESTION (operator, 2026-09-10) ──
+  // "instead of hardcoding each way the question is asked, can you instead make it error detect …
+  //  there are many ways to ask the same question." The form's own words state the rule outright
+  // ("Please enter a number using only the digits 0 to 9 … Do not include any commas, decimals, or
+  // currency symbols"), name the field, and arrive exactly when they are needed. One mechanism
+  // covers every phrasing and every tenant, where a label list covers only what someone enumerated.
+  //
+  // ⚠ ONE ROUND, and it is the retry — never a loop. A second refusal after a corrected value is a
+  // real refusal, and re-pressing a control that may be an application's Submit is not something to
+  // do speculatively. The caller passes `remediated` so the recursion is bounded by construction.
+  if (real.length && !alreadyRemediated) {
+    const fixed = await icimsRemediateErrors(real, LOG);
+    if (fixed > 0) {
+      LOG(`corrected ${fixed} field(s) from the form's own error text — pressing ${JSON.stringify(aimCaption)} once more`);
+      return await icimsAdvanceAfterStep(stepNo, stepLabel, LOG, true);
+    }
+  }
   if (sessionWarn.length && !real.length) {
     LOG(`step ${stepNo} did not advance, and the page is warning about the SESSION, not about the data:`);
     sessionWarn.slice(0, 3).forEach((e) => LOG("  · " + e));
@@ -5772,7 +5853,11 @@ async function runIcimsPreForm(tabId, credentials, LOG, opts) {
   // the log ring — says which notices were agreed to.
   let consentsAccepted = [];
   let lastView = null, sameViewRounds = 0, captchaStalls = 0;
-  let authControlsDumped = false;   // the page inventory is a diagnostic, printed once per stage
+  // ⚠ ONCE PER DISTINCT PAGE, not once per stage. It was a boolean, and the very next run spent it
+  // on the Auth0 enrolment screen — so the page that actually halted the run (a second, different
+  // unknown page) got no inventory at all, which is the one thing this diagnostic exists to prevent.
+  // Bounded so a redirect loop cannot flood the log.
+  const authControlsDumpedAt = new Set();
   let wrapperRounds = 0;   // extra looks spent waiting out iCIMS' wrapper stage — see the halt below
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     const settled = await settleAuthPage(12000);
@@ -5781,10 +5866,25 @@ async function runIcimsPreForm(tabId, credentials, LOG, opts) {
     const url = await cdpEval(function () { return location.href; }).catch(() => null);
     // The RECRUITER login is an icims.com host with an email box on it, so it has to be refused
     // BEFORE the SSO test (which exempts icims.com hosts) and before the auth scan ever sees it.
-    const vouchedIcimsLogin = viaTenantLoginLink && url && icimsIsIcimsHost(url);
+    // ⚠⚠ THE SAME HOST SERVES BOTH ROLES — ONLY PROVENANCE SEPARATES THEM (2026-09-10).
+    // `login.icims.com` is documented here as the RECRUITER login, and refusing it is why this
+    // guard exists. But Shure's candidate login is `login.icims.eu` (operator: "the link is fine,
+    // the things later in the link identify it from their backend") and RoviSys routes candidates
+    // to `login.icims.com` itself — so a hostname test cannot tell a candidate login from a staff
+    // one, in either direction, and every attempt to make it do so has broken a real run: first the
+    // any-TLD widening blocked Shure 4960, then the .com-only revert blocked RoviSys.
+    //
+    // What actually distinguishes them is HOW WE GOT HERE. This stage BEGINS on the tenant's own
+    // posting or careers portal and follows that tenant's routing; a staff login is what you reach
+    // by STARTING there. So the start host vouches: began somewhere that is not itself the staff
+    // login ⇒ an iCIMS login page this flow routed us to is the candidate one. An unknown start
+    // host vouches for nothing, which is the safe direction.
+    const startedOnStaffLogin = !portalHost || icimsIsAdminLogin("https://" + portalHost + "/");
+    const vouchedIcimsLogin = !!(url && icimsIsIcimsHost(url) && (viaTenantLoginLink || !startedOnStaffLogin));
     if (url && icimsIsAdminLogin(url) && !vouchedIcimsLogin) {
-      return halt("wrong-login", "This landed on iCIMS' STAFF login (login.icims.*), not the candidate portal — " +
-        "nothing was typed. Open the job's own Apply link and check where it leads.");
+      return halt("wrong-login", "This started at iCIMS' STAFF login (" + (portalHost || "an unknown host") +
+        ") rather than a job posting, so it is not the candidate portal — nothing was typed. " +
+        "Open the job's own Apply link and re-run.");
     }
     if (vouchedIcimsLogin && icimsIsAdminLogin(url)) {
       // Said out loud every time: this is the ONE place a `login.icims.*` page is driven, and it is
@@ -5854,9 +5954,14 @@ async function runIcimsPreForm(tabId, credentials, LOG, opts) {
       // different verdict. Bounded by its own counter as well as MAX_ROUNDS, and only for a route
       // that genuinely promises a frame (`/jobs/<id>/…`, never `/jobs/search`), so a real dead end
       // still ends quickly and every other platform is untouched.
-      if (icimsExpectsContentFrame(url) && wrapperRounds < 2) {
+      // ⚠ FOUR ROUNDS, NOT TWO (operator, 2026-09-10: "it took a bit to settle, but it eventually
+      // settled on the correct page"). The measured wrapper mounts its content frame at ~15s, and
+      // two rounds of 3s could not reach that — so the budget, not the verdict, was wrong. This is
+      // the standing rule stated in CLAUDE.md: "a wait that ran out wants a bigger BUDGET, never a
+      // different verdict." Still bounded, and still only for a route that promises a frame.
+      if (icimsExpectsContentFrame(url) && wrapperRounds < 4) {
         wrapperRounds++;
-        LOG(`  …but this url promises an iCIMS content frame, so that was probably the wrapper still in flight — looking again (${wrapperRounds}/2)`);
+        LOG(`  …but this url promises an iCIMS content frame, so that was probably the wrapper still in flight — looking again (${wrapperRounds}/4)`);
         cdpClearFormFrame();   // re-pin from scratch: the pin we hold may be the wrapper's own frame
         await cdpDelay(3000);
         continue;
@@ -5865,8 +5970,37 @@ async function runIcimsPreForm(tabId, credentials, LOG, opts) {
       // control" is a verdict about what is ABSENT, and absence has never once been enough to
       // diagnose a page in this file — it is what produced `apply-not-followable` on three live
       // Shure postings that were perfectly fine. Value-free, printed once per stage.
-      if (!authControlsDumped) {
-        authControlsDumped = true;
+      {
+        // ⚠⚠ AN ENROLMENT OFFER IS A PAGE THE LOGIN SUCCEEDED INTO, not a dead end. Auth0 interposes
+        // "Log In Faster on This Device" (Continue | Remind me later | Not on this device) after a
+        // GOOD sign-in, and the stage used to halt `apply-not-followable` here and then declare the
+        // posting gone because the id had dropped out of the Auth0 URL — two wrong verdicts about a
+        // login that had worked. Its "Continue" REGISTERS A PASSKEY on the operator's device and is
+        // never pressed; only a decline is. Checked BEFORE the halt, and it loops rather than
+        // returning, because the next page is the one we actually want.
+        const enrol = await cdpEval(atsInjAuthControls).catch(() => null);
+        const decline = atsEnrolmentDecline(enrol);
+        if (decline) {
+          LOG(`this is an enrolment offer ("${(enrol.headings || [])[0] || "?"}"), not a dead end — declining with `
+            + `${JSON.stringify(decline)} and carrying on (its other button would register a passkey on your device)`);
+          const p = await cdpEval(atsInjClickButtonByCaption, decline).catch(() => null);
+          if (p && p.ok) { await cdpDelay(2000); cdpClearFormFrame(); continue; }
+          LOG(`  could not press it (${(p && p.error) || "no reason"}) — falling through to the halt below`);
+        }
+        // …and a consent interstitial with nothing to tick is pressed through — see
+        // atsConsentGateNext for why a page with NO inputs is safe to press.
+        const gateNext = atsConsentGateNext(enrol);
+        if (gateNext) {
+          LOG(`this is a consent notice with nothing to fill ("${(enrol.headings || [])[0] || "?"}") — pressing `
+            + `${JSON.stringify(gateNext)} to carry on`);
+          const p2 = await cdpEval(atsInjClickButtonByCaption, gateNext).catch(() => null);
+          if (p2 && p2.ok) { await cdpDelay(2500); cdpClearFormFrame(); continue; }
+          LOG(`  could not press it (${(p2 && p2.error) || "no reason"}) — falling through to the halt below`);
+        }
+      }
+      const dumpKey = String(url || "?").split("?")[0];
+      if (!authControlsDumpedAt.has(dumpKey) && authControlsDumpedAt.size < 4) {
+        authControlsDumpedAt.add(dumpKey);
         const inv = await cdpEval(atsInjAuthControls).catch(() => null);
         if (inv && inv.ok) {
           const btns = inv.controls.filter((c) => c.caption && c.visible)
@@ -6024,8 +6158,9 @@ async function runIcimsPreForm(tabId, credentials, LOG, opts) {
       // control at all — and "we pressed something and nothing happened" then has several causes with
       // opposite fixes. The run closes its own tab, so this is the only chance to see the page.
       // Value-free by construction (atsInjAuthControls never returns an input's value).
-      if (!authControlsDumped) {
-        authControlsDumped = true;
+      const dumpKey = String(url || "?").split("?")[0];
+      if (!authControlsDumpedAt.has(dumpKey) && authControlsDumpedAt.size < 4) {
+        authControlsDumpedAt.add(dumpKey);
         const inv = await cdpEval(atsInjAuthControls).catch(() => null);
         if (inv && inv.ok) {
           const btns = inv.controls.filter((c) => c.caption && c.visible)

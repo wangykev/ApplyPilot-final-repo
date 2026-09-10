@@ -96,13 +96,48 @@ test("⚠ the advance predicate is MONOTONE — the declared step went UP", () =
     "a monotone predicate can be noticed late but never missed — the standing rule for every poll here");
 });
 
-test("⚠ a refused advance halts with the FORM's own words, and never retries in place", () => {
+test("⚠ a refused advance halts with the FORM's own words", () => {
   const fn = bodyOf("async function icimsAdvanceAfterStep(");
   assert.match(fn, /atsInjErrors/, "the page's own error text is what the operator needs");
   assert.match(fn, /step-did-not-advance/);
-  // no second press: exactly one aimed click in the whole function
+  // ONE aimed click per invocation. The retry below is a fresh call, not a second press here.
   assert.strictEqual((fn.match(/atsAimedClick/g) || []).length, 1,
     "one press per advance — a retry loop on a control that may be the submit is not acceptable");
+});
+
+test("⚠⚠ the ONE retry is bounded by a parameter, and only after a correction was made", () => {
+  // ⚠ THIS INVARIANT CHANGED ON 2026-09-10 and the old test's title ("never retries in place") no
+  // longer described the code. The advance now re-presses ONCE after correcting fields from the
+  // form's own error text (the operator's error-detect design) — so what must be pinned is the
+  // BOUND, not the absence of a retry. A test whose name has stopped being true is worse than none.
+  const fn = bodyOf("async function icimsAdvanceAfterStep(");
+  assert.match(fn, /!alreadyRemediated/,
+    "the retry must be gated by the caller's flag, so the recursion is bounded by construction");
+  assert.match(fn, /icimsAdvanceAfterStep\(stepNo, stepLabel, LOG, true\)/,
+    "the retry must pass the flag, or it can recurse again");
+  // …and it only happens when something was ACTUALLY corrected — never as a speculative re-press.
+  const at = fn.search(/!alreadyRemediated/);
+  const near = fn.slice(at, at + 500);
+  assert.match(near, /fixed > 0/, "no correction ⇒ no second press");
+});
+
+test("⚠⚠ remediation only ever rewrites a field the ERROR NAMED", () => {
+  const fn = bodyOf("async function icimsRemediateErrors(");
+  assert.match(fn, /atsMatchErrorToField\(err, fields\)/);
+  assert.match(fn, /if \(!f\)/, "an unmatched error must change nothing");
+  // writing into a field the error did not name is worse than not advancing
+  const at = fn.search(/if \(!f\)/);
+  assert.match(fn.slice(at, at + 200), /continue;/);
+});
+
+test("⚠ the AI may REFORMAT a value, never invent one", () => {
+  const fn = bodyOf("async function icimsRemediateErrors(");
+  assert.match(fn, /if \(!current\)/,
+    "with nothing on the form to reformat there is nothing for the model to do — the field is left for the human");
+  const ai = bodyOf("async function icimsAskAiToReformat(");
+  assert.match(ai, /Never invent information/, "the prompt must say so");
+  assert.match(ai, /NONE/, "…and give it a way to refuse");
+  assert.match(ai, /return null/, "an unusable answer costs a retry, never a wrong value");
 });
 
 test("⚠⚠ the walk routes iCIMS to its OWN advance, and Oracle to Oracle's", () => {

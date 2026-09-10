@@ -155,7 +155,14 @@ function icimsExpectsContentFrame(url) {
     if (detectAts(u.href) !== "icims") return false;
     // `/jobs/<numeric id>/…` — the posting, its /job view, its /login gate and its /candidate step.
     // `/jobs/search` is deliberately NOT matched: the id is what makes it a posting route.
-    return /^\/jobs\/\d+(\/|$)/.test(u.pathname);
+    if (/^\/jobs\/\d+(\/|$)/.test(u.pathname)) return true;
+    // ⚠ THE ID IS NOT ALWAYS IN THE PATH (live 2026-09-10, RoviSys). After the Auth0 login round
+    // trip iCIMS comes back to `…?jobid=2142&in_iframe=1` — the same posting, addressed through the
+    // query. A path-only test called that "not a posting route", so the wrapper retry never fired
+    // and the stage halted `apply-not-followable` on a page whose content frame was seconds from
+    // mounting. Same id, same route, written the other way round.
+    const q = u.searchParams.get("jobid") || u.searchParams.get("jobId");
+    return !!(q && /^\d+$/.test(q));
   } catch (e) { return false; }
 }
 
@@ -1411,6 +1418,34 @@ function atsRouteLabel(label, f, profile, defaults) {
     }
     return { candidates: cl.candidates, source: "clearance", path: "work_authorization.security_clearance",
       detail: "work_authorization.security_clearance = " + JSON.stringify(cl.level) };
+  }
+
+  // ── A SALARY EXPECTATION IS STATED, OR IT IS NOT ANSWERED (2026-09-10) ────────────────────────
+  // The same shape as the clearance rung above, and for the same reason. RoviSys asks
+  // "2. Please state your desired gross annual salary." as a REQUIRED numeric box; the profile's
+  // `salary_expectation` is empty, so the question fell through to the AI — whose prompt tells it to
+  // infer from ABSENCE and never refuse. It answered "Negotiable", the form rejected it ("enter a
+  // number using only the digits 0 to 9"), and the walk halted two steps early with a PARTIAL bundle.
+  //
+  // ⚠⚠ CLAIMING IT IS THE POINT, exactly as with clearance and `may_contact`. A better prompt is NOT
+  // the fix: the problem is not that "Negotiable" was badly formatted, it is that a number here is a
+  // NEGOTIATING POSITION and an invented one anchors a real negotiation on a figure the operator
+  // never chose — which no review page can undo once the application is filed. Recognition is what
+  // keeps the AI away from it.
+  //
+  // A stated value IS a fact, so it fills deterministically and unflagged, coerced to bare digits by
+  // the same helper both write seams use.
+  if (atsIsSalaryAmountField({ label: L })) {
+    const stated = atsSalaryDigits((aq.availability_and_preferences || {}).salary_expectation);
+    if (!stated) {
+      return { kind: "salary-unstated", review: true, flag: "salary-unstated",
+        detail: "this form wants a desired salary as a NUMBER and your profile does not state one — set "
+          + "\"salary expectation\" on the Profile page. A figure nobody chose would anchor a real negotiation, "
+          + "so it is left for you rather than guessed" };
+    }
+    return { value: stated, source: "salary",
+      path: "application_questions.availability_and_preferences.salary_expectation",
+      detail: "salary_expectation = " + stated + " (digits only — these boxes reject commas, decimals and currency symbols)" };
   }
 
   // Profile links.
@@ -8043,6 +8078,92 @@ function icimsMailedCredential(bodyText) {
   return ICIMS_MAILED_LINK_RE.test(String(bodyText == null ? "" : bodyText));
 }
 
+// ── AUTH0'S "LOG IN FASTER ON THIS DEVICE" IS AN ENROLMENT OFFER, AND IT IS DECLINED ────────────
+// iCIMS' candidate login is Auth0-hosted, and after a SUCCESSFUL sign-in Auth0 can interpose a
+// passkey/WebAuthn enrolment screen. Measured live 2026-09-10 on RoviSys:
+//     heading "Log In Faster on This Device"
+//     buttons  Continue | Remind me later | Not on this device
+// It is neither a sign-in nor an application form, so the stage halted `apply-not-followable` on a
+// login that had in fact WORKED — and then compounded it by concluding the posting was gone,
+// because the id had dropped out of the Auth0 URL.
+//
+// ⚠⚠ "Continue" REGISTERS A PASSKEY ON THE OPERATOR'S DEVICE — a persistent credential nobody asked
+// for, on hardware this pipeline does not own. It is never pressed. Only a DECLINE is.
+//
+// ⚠ Unlike the advance-control picker, several matches here are NOT an ambiguity to refuse: every
+// caption in this list declines, so any of them is a safe press and the order is only a preference.
+// The hazard the other picker guards against — one candidate being the application's own Submit —
+// has no counterpart here, which is exactly why the two behave differently.
+var ATS_ENROL_HEADING_RE = /\b(log ?in faster|sign ?in faster|add a passkey|set up (a )?passkey|use (a )?passkey|enable biometric|remember (this|your) (device|browser)|trust (this|your) (device|browser)|enroll)/i;
+var ATS_ENROL_DECLINE_ORDER = [
+  /^not now[.!]?$/i,
+  /^remind me later[.!]?$/i,
+  /^maybe later[.!]?$/i,
+  /^skip( for now)?[.!]?$/i,
+  /^no,? thanks[.!]?$/i,
+  /^continue without[\w\s]*$/i,
+  /^not on this device[.!]?$/i,
+];
+
+// Given an atsInjAuthControls report, the caption to press to get PAST an enrolment offer — or null
+// when this is not one, or when it offers nothing safe to press (then the caller stops for a human).
+function atsEnrolmentDecline(page) {
+  if (!page || !page.ok) return null;
+  const heads = (page.headings || []).join(" · ");
+  if (!ATS_ENROL_HEADING_RE.test(heads)) return null;
+  const usable = (page.controls || []).filter((c) => c && c.caption && c.visible && !c.disabled);
+  for (const re of ATS_ENROL_DECLINE_ORDER) {
+    const hit = usable.find((c) => re.test(String(c.caption).trim()));
+    if (hit) return String(hit.caption).trim();
+  }
+  return null;   // an enrolment screen with no decline is a human's problem, not ours to guess at
+}
+
+// ── A CONSENT INTERSTITIAL WITH NOTHING TO TICK STILL HAS TO BE PRESSED THROUGH (2026-09-10) ────
+// RoviSys serves `careers-rovisys.icims.com/jobs/gdpr?jobid=2142` between the login and the form:
+//     heading "General Data Protection Regulation (GDPR)", form #gdprConsentForm,
+//     buttons  input[submit]#gdprAnswerSubmitButton "Next" | input#keepMeAliveButton "Keep me logged in"
+//     inputs   NONE
+// It is not a sign-in and not an application form, so `icimsAuthView` calls it "none" and the stage
+// hunted for an Apply control that does not exist. Until today we got past it only as a SIDE EFFECT
+// of ticking its EU-resident box — so refusing that box (correctly) removed the accident that was
+// carrying the run forward. Pressing Next is the honest version of what was already happening.
+//
+// ⚠⚠ "NO INPUTS AT ALL" IS THE SAFETY GATE, and it is what makes pressing an unknown button
+// acceptable here: a page with nothing to fill cannot be an application form, so its forward
+// control cannot be an application's Submit. The forward caption is also whitelisted, so
+// "Keep me logged in" (right beside it) is never what gets pressed.
+function atsConsentGateNext(page) {
+  if (!page || !page.ok) return null;
+  const inputs = (page.controls || []).filter((c) => c && c.holdsSomething !== undefined);
+  if (inputs.length) return null;                       // something to fill ⇒ not this
+  const heads = (page.headings || []).join(" · ");
+  const formish = (page.forms || []).some((f) => /gdpr|consent|privacy/i.test(String(f.id || "") + " " + String(f.action || "")));
+  if (!formish && !/\b(gdpr|data protection|privacy)\b/i.test(heads)) return null;
+  const fwd = (page.controls || []).filter((c) => c && c.visible && !c.disabled
+    && /^(next|continue|proceed|i agree|agree|acknowledge|ok)[.!]?$/i.test(String(c.caption || "").trim()));
+  if (fwd.length !== 1) return null;                    // 0 or ambiguous ⇒ stop for a human
+  return String(fwd[0].caption).trim();
+}
+
+// Press a button by its EXACT visible caption. Exact and unambiguous on purpose: this is used to
+// decline an enrolment offer whose other button enrols, so a fuzzy match is not acceptable here.
+function atsInjClickButtonByCaption(caption) {
+  try {
+    const want = String(caption == null ? "" : caption).replace(/\s+/g, " ").trim().toLowerCase();
+    if (!want) return { ok: false, error: "no-caption" };
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const cap = (el) => String(el.tagName === "INPUT" ? (el.value || "") : (el.textContent || ""))
+      .replace(/\s+/g, " ").trim().toLowerCase();
+    const hits = [...document.querySelectorAll("button, input[type=submit], input[type=button], a[role='button']")]
+      .filter((el) => vis(el) && cap(el) === want);
+    if (!hits.length) return { ok: false, error: "not-found" };
+    if (hits.length > 1) return { ok: false, error: "ambiguous" };
+    hits[0].click();
+    return { ok: true, caption: want };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
 // ── THE ACCOUNT ALREADY EXISTS — iCIMS' OWN WORDS FOR IT (live 2026-09-09, Shure) ────────────────
 // iCIMS creates the candidate account AS PART OF SUBMITTING, so the application form carries its own
 // "Create a login" block. When that email already has an account the advance press lands, the form
@@ -8525,6 +8646,80 @@ async function atsAiWriteText(act, f, profile, jobContext, essaysDoc) {
 // then invents a work-experience date the profile already answers (observed live 2026-08-17: "Jun 1
 // 2026", reasoned from "typical summer internship start date"). One helper, used at every label-keyed
 // rung, so a future display tweak cannot reach the matcher again.
+// ── THE FORM SAYS WHAT IT WANTS — READ THAT, DON'T GUESS FROM THE QUESTION (operator, 2026-09-10)
+// "instead of hardcoding each way the question is asked, can you instead make it error detect …
+//  there are many ways to ask the same question."
+//
+// Exactly right, and it is the difference between a rule that covers one wording and one that
+// covers the constraint itself. A label recognizer has to enumerate every phrasing of "desired
+// salary" and still misses the next tenant; the form's own REJECTION states the rule outright:
+//     "Please enter a number using only the digits 0 to 9 with a value between 0 and 300000.
+//      Do not include any commas, decimals, or currency symbols."
+// That sentence is unambiguous, arrives at exactly the moment it is needed, and is the same shape
+// whatever the question was called. Workday already works this way (`aiRemediateError`); this is
+// the ATS path's equivalent.
+//
+// ⚠ DETERMINISTIC FIRST, AI ONLY FOR THE REST. A "digits only" demand is a normalisation, not a
+// judgement — spending an LLM call on it would add latency and a chance of a wrong answer to
+// something a regex settles. The AI is the fallback for a demand we do not recognise.
+
+// What is this error asking for? Pure, so every branch is unit-pinnable.
+function atsErrorDemand(errorText) {
+  const t = String(errorText == null ? "" : errorText).replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  const digits = /\bdigits?\s+0\s*(to|-|–)\s*9\b/i.test(t)
+    || /\bnumbers?\s+only\b/i.test(t)
+    || /\bonly\s+(?:the\s+)?(?:digits|numbers|numerals)\b/i.test(t)
+    || (/\bdo not include\b/i.test(t) && /\b(comma|decimal|currency|symbol|space)/i.test(t))
+    || /\benter\s+(?:a\s+)?(?:whole\s+)?number\b/i.test(t);
+  if (digits) {
+    // The bound, when the form states one — "a value between 0 and 300000".
+    const b = /\bbetween\s+([\d,]+)\s+and\s+([\d,]+)/i.exec(t);
+    return {
+      kind: "digits",
+      min: b ? parseInt(b[1].replace(/,/g, ""), 10) : null,
+      max: b ? parseInt(b[2].replace(/,/g, ""), 10) : null,
+      detail: "the form wants digits only" + (b ? ` between ${b[1]} and ${b[2]}` : ""),
+    };
+  }
+  if (/\b(is required|cannot be blank|must be (?:provided|entered)|please (?:enter|select|provide))\b/i.test(t)
+      && !/\bformat\b/i.test(t)) {
+    return { kind: "required", detail: "the form says this is required and empty" };
+  }
+  return { kind: "unknown", detail: t.slice(0, 200) };
+}
+
+// Which field is this error about? Forms prefix the message with the question's own text
+// ("2. Please state your desired gross annual salary.: Please enter a number …"), so the match is
+// on the LABEL appearing in the error — no wording list required.
+// ⚠ Longest label first: one question's label can be a prefix of another's ("Salary" vs "Salary
+// (USD)"), and the shorter would otherwise claim the longer one's error.
+function atsMatchErrorToField(errorText, fields) {
+  const t = String(errorText == null ? "" : errorText).replace(/\s+/g, " ").trim().toLowerCase();
+  if (!t) return null;
+  const norm = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().toLowerCase()
+    .replace(/^\d+[.)]\s*/, "").replace(/\s*\*+\s*$/, "").replace(/[:.]\s*$/, "");
+  const cands = (Array.isArray(fields) ? fields : [])
+    .map((f) => ({ f, key: norm(f && (f.label || f.question || f.name)) }))
+    .filter((x) => x.key && x.key.length >= 6 && t.indexOf(x.key) >= 0)
+    .sort((a, b) => b.key.length - a.key.length);
+  return cands.length ? cands[0].f : null;
+}
+
+// Apply a recognised demand to the value already on the form. Returns null when it cannot.
+function atsValueForDemand(current, demand) {
+  if (!demand) return null;
+  if (demand.kind === "digits") {
+    const d = atsSalaryDigits(current);          // the general "first number, as bare digits" reader
+    if (d == null) return null;                  // nothing numeric to salvage — a human or the AI
+    let n = parseInt(d, 10);
+    if (demand.max != null && n > demand.max) n = demand.max;
+    if (demand.min != null && n < demand.min) n = demand.min;
+    return String(n);
+  }
+  return null;
+}
+
 // ── A SALARY BOX OFTEN REFUSES EVERY HUMAN WAY OF WRITING MONEY (live 2026-09-10, RoviSys) ───────
 // The form refused the fill in its own words:
 //   "2. Please state your desired gross annual salary.: Please enter a number using only the digits
@@ -8568,18 +8763,14 @@ function atsSalaryDigits(value) {
   return String(Math.round(n));
 }
 
-// Applied at BOTH text-write seams (the deterministic one and the AI one) — one definition, two
-// call sites, so the two can never disagree about what a salary looks like.
-function atsCoerceSalaryText(f, textValue, rec) {
-  if (!atsIsSalaryAmountField(f)) return textValue;
-  const digits = atsSalaryDigits(textValue);
-  if (digits == null || digits === String(textValue == null ? "" : textValue).trim()) return textValue;
-  if (rec) {
-    rec.detail = (rec.detail ? rec.detail + "; " : "")
-      + `salary written as digits only (${JSON.stringify(String(textValue))} → ${digits}) — these boxes reject commas, decimals and currency symbols`;
-  }
-  return digits;
-}
+// ⚠ THERE IS DELIBERATELY NO LABEL-TRIGGERED FORMAT COERCION HERE ANY MORE (operator, 2026-09-10).
+// An earlier version rewrote a salary at both text-write seams whenever the LABEL looked like a
+// salary question. It worked, and it was the wrong shape: it needed a list of every phrasing, and
+// the operator's point stands — "there are many ways to ask the same question." Formatting is now
+// driven by the form's own rejection (`atsErrorDemand` → `atsValueForDemand`), which states the
+// rule instead of making us infer it. `atsSalaryDigits` survives as the NUMBER READER that
+// remediation uses, and `atsIsSalaryAmountField` survives only for the POLICY rung — refusing to
+// invent a salary is a judgement about the value, which no error message can supply.
 
 function atsMatchLabel(f) {
   return String((f && (f.partLabel || f.label)) || "");
@@ -9951,7 +10142,14 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // A clearance question we cannot answer from a STATED clearance stops here, blank and flagged —
       // it must not fall through to the AI, which would answer it by reasoning from absence. Claiming
       // the question is what keeps that from happening; see the clearance rung in atsRouteLabel.
-      if (route && route.kind === "clearance-unstated") { rec.status = "needs_review"; rec.flag = route.flag || "clearance-unstated"; rec.detail = route.detail; results.push(fin()); continue; }
+      // ⚠ SALARY JOINS IT, for the identical reason: a desired-salary box the profile does not answer
+      // would otherwise reach the AI, which answered "Negotiable" from absence on a form demanding
+      // digits (live 2026-09-10, RoviSys). Matched on the `-unstated` shape so the next rung of this
+      // kind is covered by construction rather than by remembering to add a third literal here.
+      if (route && typeof route.kind === "string" && /-unstated$/.test(route.kind)) {
+        rec.status = "needs_review"; rec.flag = route.flag || route.kind; rec.detail = route.detail;
+        results.push(fin()); continue;
+      }
       if (route && route.eeoUnstated) {
         // OPTIONAL: leave it blank — the operator's own choice, nothing blocks.
         // REQUIRED: blank blocks the submit, so take the form's OWN decline option when it
@@ -11010,10 +11208,6 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(textValue).trim());
       if (iso) textValue = iso[2] + "/" + iso[3] + "/" + iso[1];
     }
-    // A salary AMOUNT is written as bare digits — see atsCoerceSalaryText. Placed beside the date
-    // coercion above because it is the same kind of rule: the value is right, the SPELLING is what
-    // the widget will or will not accept.
-    textValue = atsCoerceSalaryText(f, textValue, rec);
     rec.resolved = textValue;
     const r = await act.eval(atsInjSetText, ref.inputSel, String(textValue));
     await act.delay(120);
@@ -12271,20 +12465,12 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
       // ⚠ THE AI PATH NEEDS THIS MORE THAN THE DETERMINISTIC ONE, not less: an unmapped salary
       // question is exactly the shape that reaches the AI, and a model asked for a desired salary
       // answers "$75,000" — the spelling the form rejects. Same helper as the deterministic seam.
-      // ⚠ `rec` is NOT passed to the coercion here: this path REPLACES rec.detail two lines below
-      // with the AI's justification, so a note written into it now would be silently dropped — and
-      // a rewrite the operator cannot see on the review page is the thing to avoid. Appended after.
-      const aiRaw = String(ai.answer);
-      const aiText = atsCoerceSalaryText(f, aiRaw, null);
-      const r = await act.eval(atsInjSetText, ref.inputSel, aiText);
+      const r = await act.eval(atsInjSetText, ref.inputSel, String(ai.answer));
       const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
       rec.after = back && back.ok ? back.value : (r && r.after) || null;
       rec.status = "filled_review"; // ALWAYS flagged — never silent AI text
       rec.flag = "ai-text"; rec.confidence = String(ai.confidence || "low").toLowerCase();
       rec.detail = "AI: " + (ai.justification || "generated answer");
-      if (aiText !== aiRaw) {
-        rec.detail += `; salary written as digits only (${JSON.stringify(aiRaw)} → ${aiText}) — these boxes reject commas, decimals and currency symbols`;
-      }
       rec.maps_to = ""; rec.suggested_category = "";
       return;
     }
@@ -12430,9 +12616,12 @@ if (typeof module !== "undefined" && module.exports) {
     ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE, ATS_CONSENT_CONDITIONAL_RE,
     atsInjClickAuthSubmit, atsInjAuthControls, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
     icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsIcimsHost,
+    atsEnrolmentDecline, atsInjClickButtonByCaption, ATS_ENROL_HEADING_RE, ATS_ENROL_DECLINE_ORDER,
+    atsConsentGateNext,
     atsInjIcimsSubmitControls, icimsAdvancePick, ICIMS_ADVANCE_PREF, ICIMS_ADVANCE_DENY,
     icimsScratchEmail, icimsUnscratchEmail, atsUnscratchRecords,
-    atsIsSalaryAmountField, atsSalaryDigits, atsCoerceSalaryText, ATS_SALARY_Q_RE, ATS_SALARY_AMOUNT_RE,
+    atsIsSalaryAmountField, atsSalaryDigits, ATS_SALARY_Q_RE, ATS_SALARY_AMOUNT_RE,
+    atsErrorDemand, atsMatchErrorToField, atsValueForDemand,
     ICIMS_ACCOUNT_TAKEN_RE, ICIMS_ACCOUNT_SUBJECT_RE,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,

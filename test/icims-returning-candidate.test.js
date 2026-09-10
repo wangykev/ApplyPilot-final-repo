@@ -229,8 +229,16 @@ test("⚠⚠ the staff-login bypass needs BOTH provenance AND an iCIMS host", ()
   // halves must be required, or the exemption becomes "any login.icims.* page is fine".
   const i = bg.indexOf("async function runIcimsPreForm(");
   const fn = bg.slice(i, i + 9000);
-  assert.match(fn, /const vouchedIcimsLogin = viaTenantLoginLink && url && icimsIsIcimsHost\(url\)/,
-    "the bypass must require the caller's provenance AND that the destination is still iCIMS");
+  // ⚠ The bypass widened once evidence showed the SAME host serves both roles: Shure's candidate
+  // login is login.icims.eu, RoviSys routes candidates to login.icims.com, and the documented staff
+  // login is login.icims.com too. Provenance is the only discriminator, so the START host vouches
+  // as well as the returning-candidate recovery. Both invariants below are unchanged:
+  assert.match(fn, /icimsIsIcimsHost\(url\)/,
+    "the bypass must still require the destination to be iCIMS' own infrastructure");
+  assert.match(fn, /viaTenantLoginLink \|\| !startedOnStaffLogin/,
+    "…and some provenance — the recovery's link, or having begun on the tenant's own posting");
+  assert.match(fn, /!portalHost \|\| icimsIsAdminLogin/,
+    "an UNKNOWN start host must vouch for nothing — the safe direction");
   assert.match(fn, /icimsIsAdminLogin\(url\) && !vouchedIcimsLogin/,
     "the staff-login refusal must still fire for a login.icims.* page reached any other way");
   // …and only the returning-candidate stage may claim that provenance.
@@ -504,6 +512,81 @@ test("⚠⚠ the press diagnosis reads the form's OWN WORDS before claiming the 
     + "one line above the form's own rejection of that very press");
   assert.match(fn, /real\.length \?\s*"THE PRESS LANDED/,
     "validation text is positive proof the press landed, and must outrank the captcha read");
+});
+
+// ── Auth0's passkey enrolment offer is DECLINED, never accepted (live 2026-09-10, RoviSys) ──────
+
+const { atsEnrolmentDecline } = require("../ats.js");
+const btn = (caption) => ({ caption, visible: true, disabled: false });
+
+test("⚠⚠ the live enrolment screen is declined, and 'Continue' is never the answer", () => {
+  // Measured: heading "Log In Faster on This Device", buttons Continue | Remind me later |
+  // Not on this device. Continue REGISTERS A PASSKEY on the operator's device.
+  const page = { ok: true, headings: ["Log In Faster on This Device"],
+    controls: [btn("Continue"), btn("Remind me later"), btn("Not on this device")] };
+  assert.strictEqual(atsEnrolmentDecline(page), "Remind me later");
+});
+
+test("⚠ several declines is a PREFERENCE, not an ambiguity — each one is safe", () => {
+  // Deliberately unlike the advance-control picker, which refuses on two matches because one of
+  // them could be the application's Submit. Here every candidate declines, so there is no hazard.
+  const page = { ok: true, headings: ["Add a passkey"], controls: [btn("Continue"), btn("Not now"), btn("Skip")] };
+  assert.strictEqual(atsEnrolmentDecline(page), "Not now");
+});
+
+test("⚠⚠ an enrolment screen with NO decline returns null — a human's problem, not a guess", () => {
+  const page = { ok: true, headings: ["Log In Faster on This Device"], controls: [btn("Continue")] };
+  assert.strictEqual(atsEnrolmentDecline(page), null, "never fall back to the enrolling button");
+});
+
+test("⚠ an ordinary page is not mistaken for an enrolment offer", () => {
+  // A "Continue" button alone must not trigger this — most pages have one.
+  assert.strictEqual(atsEnrolmentDecline({ ok: true, headings: ["Candidate Profile"], controls: [btn("Continue"), btn("Skip")] }), null);
+  assert.strictEqual(atsEnrolmentDecline({ ok: true, headings: [], controls: [btn("Not now")] }), null);
+  assert.strictEqual(atsEnrolmentDecline({ ok: false }), null);
+  assert.strictEqual(atsEnrolmentDecline(null), null);
+});
+
+test("⚠ a hidden or disabled decline is not pressable", () => {
+  const page = { ok: true, headings: ["Log In Faster on This Device"],
+    controls: [btn("Continue"), { caption: "Remind me later", visible: false, disabled: false }] };
+  assert.strictEqual(atsEnrolmentDecline(page), null);
+});
+
+// ── a consent interstitial with nothing to tick is pressed through (live 2026-09-10, RoviSys) ───
+
+const { atsConsentGateNext } = require("../ats.js");
+
+test("⚠ the live GDPR interstitial is pressed through with its own Next", () => {
+  // careers-rovisys.icims.com/jobs/gdpr?jobid=2142 — a notice with NO inputs and two buttons.
+  // Until today we only got past it as a side effect of ticking its EU-resident box; refusing that
+  // box (correctly) removed the accident that was carrying the run forward.
+  const page = { ok: true, headings: ["General Data Protection Regulation (GDPR)"],
+    forms: [{ id: "gdprConsentForm", action: "", method: "post" }],
+    controls: [btn("Next"), btn("Keep me logged in")] };
+  assert.strictEqual(atsConsentGateNext(page), "Next");
+});
+
+test("⚠⚠ a page with ANYTHING to fill is never pressed through — that is the safety gate", () => {
+  // A page with no inputs cannot be an application form, which is the whole licence for pressing an
+  // unknown button. One input and that argument is gone.
+  const page = { ok: true, headings: ["General Data Protection Regulation (GDPR)"],
+    forms: [{ id: "gdprConsentForm", action: "", method: "post" }],
+    controls: [btn("Next"), { caption: null, visible: true, disabled: false, holdsSomething: false }] };
+  assert.strictEqual(atsConsentGateNext(page), null);
+});
+
+test("⚠ 'Keep me logged in' is never mistaken for the forward control", () => {
+  const page = { ok: true, headings: ["General Data Protection Regulation (GDPR)"],
+    forms: [{ id: "gdprConsentForm", action: "", method: "post" }],
+    controls: [btn("Keep me logged in")] };
+  assert.strictEqual(atsConsentGateNext(page), null, "no whitelisted forward caption ⇒ stop for a human");
+});
+
+test("⚠ an ordinary page is not pressed through", () => {
+  assert.strictEqual(atsConsentGateNext({ ok: true, headings: ["Candidate Profile"], forms: [], controls: [btn("Next")] }), null);
+  assert.strictEqual(atsConsentGateNext({ ok: false }), null);
+  assert.strictEqual(atsConsentGateNext(null), null);
 });
 
 // ── a CONDITIONAL box is a factual claim, not a consent (live 2026-09-10, RoviSys) ───────────────
