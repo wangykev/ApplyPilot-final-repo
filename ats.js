@@ -8525,6 +8525,62 @@ async function atsAiWriteText(act, f, profile, jobContext, essaysDoc) {
 // then invents a work-experience date the profile already answers (observed live 2026-08-17: "Jun 1
 // 2026", reasoned from "typical summer internship start date"). One helper, used at every label-keyed
 // rung, so a future display tweak cannot reach the matcher again.
+// ── A SALARY BOX OFTEN REFUSES EVERY HUMAN WAY OF WRITING MONEY (live 2026-09-10, RoviSys) ───────
+// The form refused the fill in its own words:
+//   "2. Please state your desired gross annual salary.: Please enter a number using only the digits
+//    0 to 9 with a value between 0 and 300000. Do not include any commas, decimals, or currency
+//    symbols."
+// so `$75,000`, `75,000`, `75k` and `75,000 per year` are all rejected — and because this sits on a
+// mid-walk step, the refusal halted the walk two steps early and produced a PARTIAL bundle.
+//
+// ⚠ THE COERCION IS UNCONDITIONAL FOR AN AMOUNT QUESTION, and the asymmetry is the argument: a bare
+// number is the one spelling EVERY such box accepts — a form that would have taken "$75,000" takes
+// "75000" just as happily — while the constraint that rejects the formatted version is only stated
+// AFTER a failed submit, far too late to detect at fill time. Being wrong in this direction costs
+// nothing; being wrong in the other direction costs the application.
+//
+// ⚠ AMOUNT QUESTIONS ONLY. An answer with no number in it ("Negotiable", "Open to discussion") is
+// LEFT ALONE — stripping that to "" turns a real answer into a blank REQUIRED field, which is
+// strictly worse than a formatting mismatch a human can see and fix on the review page. Same reason
+// a prose "what are your salary expectations?" essay is not caught: the label must name an AMOUNT.
+var ATS_SALARY_Q_RE = /\b(salary|compensation|wage|pay\s+rate|rate\s+of\s+pay)\b/i;
+var ATS_SALARY_AMOUNT_RE = /\b(desired|expected|requested|require[ds]?|target|minimum|acceptable|gross|annual|hourly|base|amount)\b/i;
+
+function atsIsSalaryAmountField(f) {
+  const label = String((f && (f.label || f.question || f.name)) || "");
+  return ATS_SALARY_Q_RE.test(label) && ATS_SALARY_AMOUNT_RE.test(label);
+}
+
+// The first number in the value, as bare digits. `null` when there is nothing numeric to take.
+// ⚠ A RANGE takes its LOW end ("70,000-80,000" → 70000): the box wants ONE number, and asking for
+// the bottom of your own stated range is the conservative direction.
+function atsSalaryDigits(value) {
+  const m = /(\d[\d,.]*)\s*(k)?/i.exec(String(value == null ? "" : value));
+  if (!m) return null;
+  let cleaned = m[1].replace(/,/g, "");
+  // ⚠ A DOT IS NOT ALWAYS A DECIMAL POINT. "75.000" is seventy-five thousand in much of the world,
+  // and reading it as 75 would file a salary three orders of magnitude wrong — the confident-wrong
+  // -value class. Only 1–2 trailing digits are treated as cents; anything else is a separator.
+  cleaned = /\.\d{1,2}$/.test(cleaned) ? cleaned : cleaned.replace(/\./g, "");
+  let n = parseFloat(cleaned);
+  if (!isFinite(n) || n <= 0) return null;
+  if (m[2]) n *= 1000;                                  // "75k" → 75000
+  return String(Math.round(n));
+}
+
+// Applied at BOTH text-write seams (the deterministic one and the AI one) — one definition, two
+// call sites, so the two can never disagree about what a salary looks like.
+function atsCoerceSalaryText(f, textValue, rec) {
+  if (!atsIsSalaryAmountField(f)) return textValue;
+  const digits = atsSalaryDigits(textValue);
+  if (digits == null || digits === String(textValue == null ? "" : textValue).trim()) return textValue;
+  if (rec) {
+    rec.detail = (rec.detail ? rec.detail + "; " : "")
+      + `salary written as digits only (${JSON.stringify(String(textValue))} → ${digits}) — these boxes reject commas, decimals and currency symbols`;
+  }
+  return digits;
+}
+
 function atsMatchLabel(f) {
   return String((f && (f.partLabel || f.label)) || "");
 }
@@ -10954,6 +11010,10 @@ async function atsActuateField(act, ats, f, ref, rec, candidates, textValue, job
       const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(textValue).trim());
       if (iso) textValue = iso[2] + "/" + iso[3] + "/" + iso[1];
     }
+    // A salary AMOUNT is written as bare digits — see atsCoerceSalaryText. Placed beside the date
+    // coercion above because it is the same kind of rule: the value is right, the SPELLING is what
+    // the widget will or will not accept.
+    textValue = atsCoerceSalaryText(f, textValue, rec);
     rec.resolved = textValue;
     const r = await act.eval(atsInjSetText, ref.inputSel, String(textValue));
     await act.delay(120);
@@ -12208,12 +12268,23 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
           (ai && ai.error && ai.error !== "ai-declined" ? " (" + ai.error + ")" : "");
         return;
       }
-      const r = await act.eval(atsInjSetText, ref.inputSel, String(ai.answer));
+      // ⚠ THE AI PATH NEEDS THIS MORE THAN THE DETERMINISTIC ONE, not less: an unmapped salary
+      // question is exactly the shape that reaches the AI, and a model asked for a desired salary
+      // answers "$75,000" — the spelling the form rejects. Same helper as the deterministic seam.
+      // ⚠ `rec` is NOT passed to the coercion here: this path REPLACES rec.detail two lines below
+      // with the AI's justification, so a note written into it now would be silently dropped — and
+      // a rewrite the operator cannot see on the review page is the thing to avoid. Appended after.
+      const aiRaw = String(ai.answer);
+      const aiText = atsCoerceSalaryText(f, aiRaw, null);
+      const r = await act.eval(atsInjSetText, ref.inputSel, aiText);
       const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
       rec.after = back && back.ok ? back.value : (r && r.after) || null;
       rec.status = "filled_review"; // ALWAYS flagged — never silent AI text
       rec.flag = "ai-text"; rec.confidence = String(ai.confidence || "low").toLowerCase();
       rec.detail = "AI: " + (ai.justification || "generated answer");
+      if (aiText !== aiRaw) {
+        rec.detail += `; salary written as digits only (${JSON.stringify(aiRaw)} → ${aiText}) — these boxes reject commas, decimals and currency symbols`;
+      }
       rec.maps_to = ""; rec.suggested_category = "";
       return;
     }
@@ -12361,6 +12432,7 @@ if (typeof module !== "undefined" && module.exports) {
     icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsIcimsHost,
     atsInjIcimsSubmitControls, icimsAdvancePick, ICIMS_ADVANCE_PREF, ICIMS_ADVANCE_DENY,
     icimsScratchEmail, icimsUnscratchEmail, atsUnscratchRecords,
+    atsIsSalaryAmountField, atsSalaryDigits, atsCoerceSalaryText, ATS_SALARY_Q_RE, ATS_SALARY_AMOUNT_RE,
     ICIMS_ACCOUNT_TAKEN_RE, ICIMS_ACCOUNT_SUBJECT_RE,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
