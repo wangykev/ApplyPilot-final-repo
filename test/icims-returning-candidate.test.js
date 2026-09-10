@@ -389,14 +389,79 @@ test("⚠ un-aliasing is a no-op when no alias was used", () => {
   assert.strictEqual(recs[0].after, "wangykev@gmail.com");
 });
 
-test("⚠⚠ the SUBMIT run never aliases — it files under the real address", () => {
-  // The whole point: fill under a scratch account so one run walks the whole application, then
-  // submit under the real one, recreating the account and refilling from the approved bundle.
+test("⚠⚠ only the ARMED submit uses the real address — a rehearsal takes its own throwaway", () => {
+  // ⚠ THIS INVARIANT CHANGED ON 2026-09-10 (operator): "if you reherse, log out do +2 or +3 or
+  // something like that, only on the final submit run, use the non plus version." The old test said
+  // the submit run never aliases, which was true only while a rehearsal was a dry run. It is not —
+  // it walks and writes for real and only withholds the final press, so it burns a candidate
+  // account exactly as the fill does. Reusing `+1` meets that candidate's completed application;
+  // reusing the REAL address burns the identity the armed run needs.
   const i = bg.indexOf("async function runAtsSubmitRun(");
-  assert.ok(i > 0);
   const fn = bg.slice(i);
-  assert.ok(!/icimsScratchEmail/.test(fn),
-    "a submit run that aliased would file the application under a throwaway address");
+  assert.match(fn, /if \(!arm && submitCreds && submitCreds\.email\)/,
+    "the alias must be gated on NOT being armed");
+  assert.match(fn, /icimsRehearsalTag/, "…and each rehearsal takes a FRESH tag, counted in storage");
+  assert.match(fn, /Math\.max\(2,/, "…starting at +2, so it never collides with the fill's +1");
+  // the armed path must reach runIcimsPreForm with the credentials untouched
+  const armAt = fn.indexOf("} else if (arm) {");
+  assert.ok(armAt > 0, "the armed branch must be explicit rather than implied");
+});
+
+test("⚠⚠ a rehearsal re-aliases the CONTACT email in the bundle too", () => {
+  // iCIMS keys the candidate ACCOUNT on the PROFILE address, not the login. The bundle deliberately
+  // carries the real one (atsUnscratchRecords put it back so the operator approved what would
+  // actually be filed), so a rehearsal replaying it verbatim would create the account under the
+  // real address and burn the identity the armed submit needs.
+  const i = bg.indexOf("async function runAtsSubmitRun(");
+  const fn = bg.slice(i);
+  assert.match(fn, /e\.current_value\.indexOf\(realAddr\)/,
+    "the approved contact email must be swapped for the rehearsal's alias");
+});
+
+test("⚠⚠ the rehearsal's throwaway reaches the REPLAY, not only the sign-in gate", () => {
+  // The nastiest bug of this sequence, and it had a real consequence. The credential tier
+  // deliberately re-reads storage rather than taking a value from the bundle (the bundle holds only
+  // a "(stored login)" placeholder, and typing THAT into a login box is the failure that rule
+  // exists to prevent). So a rehearsal signed in at the gate as a throwaway and then filled step
+  // 1's "Create a login" block with the REAL address out of storage — creating, under the real
+  // identity, the very account the armed submit needed. The next rehearsal was refused
+  // "The given login name is already in use."
+  const i = bg.indexOf("async function runAtsSubmitRun(");
+  const fn = bg.slice(i);
+  assert.match(fn, /credentials: \(ats === "icims" && icimsSubmitCreds\)/,
+    "the replay must use THIS run's credentials, not whatever storage holds");
+  assert.match(fn, /icimsSubmitCreds = submitCreds/,
+    "…and the throwaway must be published to that variable when one is taken");
+});
+
+test("⚠⚠ an iCIMS submit signs OUT first — a shared cookie serves the previous candidate", () => {
+  const i = bg.indexOf("async function runAtsSubmitRun(");
+  const fn = bg.slice(i);
+  assert.match(fn, /if \(ats === "icims"\) await icimsSignOut\(/);
+  // ⚠ slice to the next function, NOT to a comment marker — `bg` is comment-stripped, so a `//`
+  // anchor is never found and the slice silently becomes empty (which passes some asserts and
+  // fails others for the wrong reason).
+  const so = bg.indexOf("async function icimsSignOut(");
+  const sofn = bg.slice(so, bg.indexOf("\nasync function ", so + 10));
+  assert.match(sofn, /Storage\.clearDataForOrigin/, "the session is dropped at the source, not navigated around");
+  // ⚠ READ THE RAW FILE FOR THE HOST LIST. The comment stripper is line-based and cuts at the first
+  // `//`, which inside `"https://login.icims.com"` is the URL's own separator — so the stripped copy
+  // loses the rest of that line and this assertion fails against code that is perfectly correct.
+  // Worth recording: every source-text guard in this repo shares that stripper.
+  const bgRaw = fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8");
+  const soRaw = bgRaw.indexOf("async function icimsSignOut(");
+  const sofnRaw = bgRaw.slice(soRaw, bgRaw.indexOf("\nasync function ", soRaw + 10));
+  assert.match(sofnRaw, /login\.icims\.com/, "…including the Auth0 host, or it silently re-authenticates");
+});
+
+test("⚠⚠ the SUBMIT run walks iCIMS' steps — the fill knowing and the submit not is the worst split", () => {
+  const i = bg.indexOf("async function runAtsSubmitRun(");
+  const fn = bg.slice(i);
+  assert.match(fn, /ats === "oracle" \|\| ats === "icims"/, "iCIMS must enter the multi-step replay");
+  assert.match(fn, /await icimsAdvanceAfterStep\(stepNo,/,
+    "…and press through ITS OWN guards: ORC's guard 2 is caption-based and cannot work where one control is both Next and Submit");
+  assert.match(fn, /if \(ats !== "icims"\) await orcAwaitBlocksPopulated/,
+    "ORC's block settle would poll for something iCIMS never sends");
 });
 
 test("⚠⚠ the alias is decided BEFORE the gate, and undone BEFORE the bundle", () => {

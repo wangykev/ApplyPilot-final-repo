@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "conditional-join-80";
+const AP_BUILD_MARKER = "submit-key-83";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4819,6 +4819,41 @@ async function icimsStepState(opts) {
  * ⚠ The advance predicate is MONOTONE — the declared step number went UP. A monotone predicate can
  * only be noticed late, never missed, which is the standing rule for every wall-clock poll here.
  */
+// ── DROP THE iCIMS SESSION BEFORE A RUN THAT MUST BE SOMEBODY ELSE (operator, 2026-09-10) ───────
+// "if it is logged in, you will need to log out first, then fill the form again with a different
+//  email in the profile."
+//
+// The FILL runs under a `+1` alias because iCIMS will not let you return to a page you have already
+// submitted; a REHEARSAL burns its own alias for the same reason; only the ARMED submit uses the
+// real address. None of that works while a previous candidate's session is still live: a run's tab
+// shares cookies, so iCIMS recognises the earlier candidate and serves ITS saved application.
+// Measured — the first rehearsal landed on a step 1 whose address rows already carried that
+// candidate's server ids and reported 36 of 44 approved fields "missing" from a form that was
+// simply the wrong person's.
+//
+// ⚠ COOKIES, NOT A LOGOUT LINK. Signing in as someone else does not end an existing session, and
+// the page a run lands on has no logout control to press — so the session is dropped at the source.
+// ⚠ AND `login.icims.com` TOO: the candidate login is Auth0-hosted, so leaving that cookie behind
+// lets it silently re-authenticate the account we just signed out of, which looks exactly like the
+// logout having failed.
+async function icimsSignOut(anyTenantUrl, LOG) {
+  const origins = [];
+  try { origins.push(new URL(String(anyTenantUrl)).origin); } catch (e) { /* no tenant origin */ }
+  origins.push("https://login.icims.com", "https://login.icims.eu");
+  let cleared = 0;
+  for (const origin of origins) {
+    try {
+      await cdpSend("Storage.clearDataForOrigin", { origin, storageTypes: "cookies,local_storage,session_storage" });
+      cleared++;
+    } catch (e) { /* an origin we never had state for is not a failure */ }
+  }
+  if (LOG) {
+    LOG(`signed out of iCIMS before this run — cleared the session for ${cleared} origin(s) (${origins.join(", ")}). `
+      + `A run that must be a DIFFERENT candidate cannot start inside the previous one's session.`);
+  }
+  return cleared;
+}
+
 // ── FIX WHAT THE FORM OBJECTED TO, USING THE FORM'S OWN WORDS ────────────────────────────────────
 // Returns how many fields it actually rewrote. Deterministic where the demand is recognisable
 // (a "digits only" rule is a normalisation, not a judgement — an LLM call there would add latency
@@ -7561,6 +7596,10 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
   const arm = !!(opts && opts.arm);
   // ⚠ WHEN THIS RUN STARTED TOUCHING THE FORM — the floor below is measured from here.
   const submitRunT0 = Date.now();
+  // The credentials THIS run acts as: the real ones when armed, a throwaway `+N` when rehearsing.
+  // Set in the iCIMS pre-form block below and threaded into the replay, because the credential tier
+  // re-reads storage and would otherwise use the real login on a rehearsal.
+  let icimsSubmitCreds = null;
   // The Oracle guard that stood here is GONE as of the submit walk landing (2026-08-20) — the same
   // deletion the fill run got when its scan landed, and deliberately not one moment earlier. What
   // replaces it is not "nothing": the ORC pre-form below, the multi-step replay walk, and the rule
@@ -7611,7 +7650,28 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // (correctly) refused to treat a 1-field marketing page as an application form and the
     // submit died at form-not-rendered — for a job that fills perfectly (live 2026-08-02).
     // The caller's URL stays the fallback for bundles written before this was recorded.
-    const formUrl = atsFormUrl(ats, bundle.url || (opts && opts.startUrl));
+    // ⚠⚠ ON iCIMS, GO TO THE POSTING — NOT THE SAVED FORM URL (live 2026-09-10). Everywhere else the
+    // bundle's form url is the right target and is preferred deliberately. Here the run has just
+    // signed out, so a deep link into the application (`…/candidate`, `…/questions`) has no session
+    // behind it and iCIMS bounces it to `login.icims.com` — which the pre-form then reads as the
+    // host the run STARTED on and refuses as the staff login. Correctly: from there, it IS the staff
+    // login. Starting at the posting is also what the pre-form is built for; it follows the Apply
+    // control and the gate from there, exactly as the fill run does.
+    const formUrl = ats === "icims"
+      ? ((opts && opts.startUrl) || bundle.jobKeyUrl || bundle.url)
+      : atsFormUrl(ats, bundle.url || (opts && opts.startUrl));
+    // ⚠⚠ SIGN OUT BEFORE AN iCIMS SUBMIT, OR THE SCRATCH ACCOUNT ANSWERS THE DOOR (operator,
+    // 2026-09-10). The FILL runs under a `+1` alias precisely because iCIMS will not let you return
+    // to a page you have already submitted; the SUBMIT must therefore run under the real address and
+    // fill the whole application from scratch. But a tab shares cookies with the fill's, so iCIMS
+    // recognised the scratch candidate and served ITS saved application — the rehearsal landed on a
+    // step 1 whose address rows already carried server ids (`104321_PersonProfileFields.AddressZip`)
+    // and every step-2/3/4 field reported "approved value has NO matching field on the live form".
+    // 36 of 44 approved fields "missing", on a form that was simply the wrong candidate's.
+    //
+    // The session has to be dropped, not navigated around: signing in as someone else does not
+    // undo an existing session, and there is no logout link on the page we land on.
+    if (ats === "icims") await icimsSignOut(formUrl || bundle.url || (opts && opts.startUrl), LOG);
     const here = await cdpEval(function () { return location.href; }).catch(() => null);
     if (here && formUrl && here.split("#")[0] !== formUrl) { await cdpNavigate(formUrl); await cdpDelay(1200); cdpClearFormFrame(); }
     // The submit run opens a FRESH tab, so it meets the same iCIMS email gate the fill did — and
@@ -7619,7 +7679,43 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
     // does; the submit itself stays behind its own gates below.
     if (ats === "icims") {
       const preCreds = await new Promise((r) => chrome.storage.local.get(["credentials"], r));
-      const pre = await runIcimsPreForm(tabId, (preCreds && preCreds.credentials) || null, LOG);
+      // ⚠⚠ A REHEARSAL IS NOT A DRY RUN OF THE FORM — IT FILLS IT (operator, 2026-09-10). It walks
+      // and writes exactly as the real thing does and only withholds the final press, so it burns a
+      // candidate account just as the fill did. Reusing `+1` would meet that candidate's completed
+      // application; reusing the REAL address would burn the one the submit needs. So every
+      // rehearsal takes a fresh `+N`, counted in storage, and ONLY the armed run uses the bare
+      // address that actually gets filed.
+      let submitCreds = (preCreds && preCreds.credentials) || null;
+      icimsSubmitCreds = submitCreds;   // …and re-pointed below if this run takes a throwaway
+      if (!arm && submitCreds && submitCreds.email) {
+        const { icimsRehearsalTag } = await new Promise((r) => chrome.storage.local.get("icimsRehearsalTag", r));
+        const tag = Math.max(2, Number(icimsRehearsalTag) || 2);
+        await new Promise((r) => chrome.storage.local.set({ icimsRehearsalTag: tag + 1 }, r));
+        const alias = icimsScratchEmail(submitCreds.email, tag);
+        if (alias !== submitCreds.email) {
+          const realAddr = submitCreds.email;
+          submitCreds = { ...submitCreds, email: alias };
+          icimsSubmitCreds = submitCreds;   // the replay's credential tier must see the throwaway too
+          // ⚠⚠ THE CONTACT EMAIL IN THE BUNDLE MUST BE ALIASED TOO, and this is the half that is easy
+          // to miss: iCIMS keys the candidate ACCOUNT on the PROFILE address, not on the login. The
+          // bundle deliberately carries the REAL one (atsUnscratchRecords put it back so the operator
+          // approved what would actually be filed) — so a rehearsal replaying it verbatim would
+          // create the account under the real address and burn the very identity the armed submit
+          // needs. Swapped only for THIS run's replay; the stored bundle is untouched.
+          let swapped = 0;
+          for (const e of bundle.entries || []) {
+            if (e && typeof e.current_value === "string" && e.current_value.indexOf(realAddr) >= 0) {
+              e.current_value = e.current_value.split(realAddr).join(alias); swapped++;
+            }
+          }
+          LOG(`REHEARSAL — running as ${alias}, a throwaway (${swapped} approved value(s) re-aliased for this run only). `
+            + `The armed submit is the only run that uses the real address, because iCIMS will not let a completed `
+            + `application be re-walked and a rehearsal fills the form for real.`);
+        }
+      } else if (arm) {
+        LOG(`ARMED — running as the real address, creating the account this application is filed under.`);
+      }
+      const pre = await runIcimsPreForm(tabId, submitCreds, LOG);
       // Same closed-posting rule as the fill run: a job can be pulled between the fill and the submit,
       // and "we could not find the Apply control" would send the operator to debug a dead requisition.
       if (pre.halt) {
@@ -7784,12 +7880,29 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
           detail: "The form's required résumé upload did not attach (" + (resumePre.error || "unknown") + ") — nothing was replayed or submitted. Upload a résumé in the extension/website, then re-run." };
       }
     }
-    const replayOpts = { valueFor, entryCounts, credentials: (subStore && subStore.credentials) || null, resumePreattached: resumePre };
+    // ⚠⚠ THE REHEARSAL'S ALIAS MUST REACH THE REPLAY, NOT JUST THE GATE (live 2026-09-10).
+    // The credential tier deliberately re-reads storage rather than taking a value from the bundle
+    // (the bundle holds only a `"(stored login)"` placeholder, and typing THAT into a login box is
+    // the failure that rule exists to prevent). The consequence here: a rehearsal signed in at the
+    // gate as `+3` and then filled step 1's "Create a login" block with the REAL address out of
+    // storage — creating, under the real identity, the very account the armed submit needed. The
+    // next rehearsal was then refused "The given login name is already in use".
+    // So the run's OWN credentials are threaded through; `icimsSubmitCreds` is the real ones when
+    // armed and the throwaway when rehearsing.
+    const replayOpts = { valueFor, entryCounts,
+      credentials: (ats === "icims" && icimsSubmitCreds) || (subStore && subStore.credentials) || null,
+      resumePreattached: resumePre };
     let out;
-    if (ats === "oracle") {
+    if (ats === "oracle" || ats === "icims") {
       // ⚠⚠ ORC IS THE FIRST MULTI-STEP FORM ON THIS PATH, AND A REPLAY MUST WALK IT (2026-08-20).
-      // Greenhouse, Lever, Ashby and iCIMS are all ONE page, which is why this run has always been a
-      // single fill. Replaying an approved ORC bundle into step 1 and then opening the gate would
+      // ⚠⚠ AND iCIMS JOINED IT (2026-09-10) — this branch's own comment used to say "Greenhouse,
+      // Lever, Ashby and iCIMS are all ONE page", which stopped being true the day the FILL walk
+      // landed and was never corrected here. The consequence was exactly what the next paragraph
+      // predicts for ORC: a rehearsal replayed all four steps' values into step 1 and reported 36 of
+      // 44 approved fields as "no matching field on the live form". The fill knowing a form is
+      // multi-page while the submit does not is the worst possible split, because the gate is on
+      // this side.
+      // Greenhouse, Lever and Ashby remain genuinely one page. Replaying an approved ORC bundle into step 1 and then opening the gate would
       // verify a third of the application and submit the rest unseen: every field of steps 2..N would
       // report "approved value has NO matching field on the live form".
       //
@@ -7802,16 +7915,24 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       const union = new Map();
       let stepNo = 0, walkStop = null, walkWhy = null, lastUrl = null, stepsSeen = [];
       for (let iter = 1; iter <= 8; iter++) {
-        const st = await cdpEval(atsInjOrcStepState).catch(() => null);
+        // Each platform reads its own step declaration — iCIMS' is its `iCIMS_Steps_*` list, and its
+        // read scrolls the control it is about to press into view (`scrollSubmit`), exactly as the
+        // fill walk does.
+        const st = ats === "icims"
+          ? await icimsStepState({ scrollSubmit: true }).catch(() => null)
+          : await cdpEval(atsInjOrcStepState).catch(() => null);
         if (!st || !st.ok) {
           walkStop = "step-state-unreadable";
-          walkWhy = "Could not read which step of the Oracle wizard the replay was on, so it stopped rather than pressing controls blind.";
+          walkWhy = `Could not read which step of the ${ats === "icims" ? "iCIMS application" : "Oracle wizard"} the replay was on, so it stopped rather than pressing controls blind.`;
           break;
         }
         stepNo = st.step != null ? st.step : iter;
         LOG(`replaying step ${stepNo}${st.total ? " of " + st.total : ""} — next=${st.hasNext ? JSON.stringify(st.nextCaption) : "none"} · submit=${st.hasSubmit ? JSON.stringify(st.submitCaption) : "none"}`);
-        emitRunProgress(`${arm ? "Submitting" : "Rehearsing"} — step ${stepNo}${st.total ? " of " + st.total : ""}`, "Oracle wizard");
-        await orcAwaitBlocksPopulated(LOG);
+        emitRunProgress(`${arm ? "Submitting" : "Rehearsing"} — step ${stepNo}${st.total ? " of " + st.total : ""}`,
+          ats === "icims" ? "iCIMS application" : "Oracle wizard");
+        // ORC fetches a step's question blocks separately; iCIMS does not, so polling for them here
+        // would wait on something that never arrives (the same split the fill walk makes).
+        if (ats !== "icims") await orcAwaitBlocksPopulated(LOG);
         // ⚠ THE RÉSUMÉ IS REMOVED AND RE-UPLOADED, EVERY REPLAY (operator, 2026-08-21). Every other
         // field is verified by READING the page; a file field shows only a name, which says nothing
         // about which bytes the server holds — so this is the one thing a rehearsal always redoes.
@@ -7819,7 +7940,11 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         // upload control, so until the file is removed `resume-upload` is not in the scan at all and
         // the approved résumé reported "no matching field on the live form". Removing it first brings
         // the input back and the ordinary field loop does the attaching.
-        const rr = await cdpEval(atsInjOrcResumeReset, 8000).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+        // ⚠ ORC ONLY. iCIMS has its own résumé stage (`atsIcimsResumeStage`) which attaches BEFORE
+        // anything is written, because its upload triggers a server-side parse that re-renders the
+        // form — removing and re-uploading mid-walk would land that parse on top of a replayed step.
+        const rr = ats === "icims" ? null
+          : await cdpEval(atsInjOrcResumeReset, 8000).catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
         if (rr && rr.present) {
           if (rr.removed) LOG(`résumé: removed ${JSON.stringify(rr.attachedName)} so it can be re-uploaded (a filename cannot tell us which file is really attached)`);
           else if (rr.attached) LOG(`⚠ résumé: ${JSON.stringify(rr.attachedName)} is attached and could NOT be removed (${rr.error || "unknown"})`
@@ -7831,7 +7956,14 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         for (const r of step.results || []) union.set(durable(r), r);
         stepsSeen.push(stepNo);
         LOG(`step ${stepNo}: ${(step.results || []).length} field(s) replayed · ${union.size} accumulated`);
-        const adv = await orcAdvanceAfterStep(stepNo, "step " + stepNo, LOG, ats);
+        // ⚠⚠ EACH PLATFORM'S OWN ADVANCE, and on iCIMS that is not optional: ORC's guard 2 refuses a
+        // forbidden CAPTION, which is worthless here because one control is both Next and Submit
+        // with the same caption. iCIMS' guards read its step declaration instead — the same shared
+        // function the fill walk presses through, so there is one definition of "is this the last
+        // step?" on the one press that can file an application.
+        const adv = ats === "icims"
+          ? await icimsAdvanceAfterStep(stepNo, st.titles ? (st.titles[stepNo - 1] || "step " + stepNo) : "step " + stepNo, LOG)
+          : await orcAdvanceAfterStep(stepNo, "step " + stepNo, LOG, ats);
         if (!adv.advanced) { walkStop = adv.stopped; walkWhy = adv.detail; break; }
       }
       // ⚠⚠ ANY STOP OTHER THAN `reached-final-step` REFUSES THE GATE. Reaching a Submit button having
@@ -7842,7 +7974,7 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       if (walkStop !== "reached-final-step") {
         LOG(`⛔ REFUSING to ${arm ? "submit" : "rehearse"} — the replay never reached the final step (stopped: ${walkStop || "max-steps"})`);
         return { ok: true, needs_operator: true, submitted: false, replayed: true, stopped: "replay-incomplete", ats,
-          detail: `The Oracle wizard stopped at step ${stepNo} after walking ${JSON.stringify(stepsSeen)} — ${walkStop || "max-steps"}. `
+          detail: `The ${ats === "icims" ? "iCIMS application" : "Oracle wizard"} stopped at step ${stepNo} after walking ${JSON.stringify(stepsSeen)} — ${walkStop || "max-steps"}. `
             + (walkWhy || "") + " Nothing was submitted, and the steps after it were never replayed." };
       }
       LOG(`replay walk complete — steps ${JSON.stringify(stepsSeen)}, ${union.size} field(s) accumulated across the whole wizard`);

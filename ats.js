@@ -4278,6 +4278,22 @@ function atsSubmitKey(ats, f) {
   if (section != null && String(section) !== "" && typeof idx === "number") {
     return "@" + section + "[" + idx + "]/" + atsMapKey(ats, name);
   }
+  // ⚠⚠ THE CANDIDATE'S OWN ADDRESS/PHONE BLOCK GETS SERVER ORDINALS TOO, ONCE THE ACCOUNT EXISTS
+  // (live 2026-09-10). The note above says these "the parse leaves at `-1_`", and that held while
+  // every visit was a brand-new candidate. It stops holding the moment the account is real: the
+  // rows are saved, so each visit serves them under fresh ids — measured, a bundle keyed
+  // `104321_PersonProfileFields.Address*` / `112435_…Phone*` against a form serving different ones,
+  // and all 8 reported "approved value has NO matching field on the live form".
+  //
+  // They carry no `entrySection`, so the positional key above cannot reach them — but they need no
+  // position, because `PersonProfileFields.*` is iCIMS' OWN vocabulary for the ONE candidate's own
+  // address and phone. That is the same reasoning that makes the static map safe to key on the bare
+  // id, and the same strip `atsMapKey` already performs for it. A genuinely repeating entry is
+  // untouched: it takes the section-stamped branch above, and a second unstamped row is left blank
+  // by design (atsAssignEntryIndexes' repeat rule) so nothing collides on the bare key.
+  // Scoped to the platform prefix on purpose — a per-customer `rcf<NNNN>` keeps its ordinal.
+  const bare = atsMapKey(ats, name);
+  if (/^PersonProfileFields\./.test(bare)) return bare;
   return atsDurableFieldName(name);
 }
 
@@ -8217,7 +8233,12 @@ function icimsAccountExists(errors) {
 // the form, not an answer the operator gave — and approving `+1` would be approving a value that
 // never gets filed. So the alias exists ONLY between the profile and the keystroke; every record,
 // bundle and review editor carries the real address (`icimsUnscratchEmail`).
-function icimsScratchEmail(email) {
+// ⚠ EVERY VISIT THAT FILLS THE FORM NEEDS ITS OWN ALIAS (operator, 2026-09-10). A REHEARSAL fills
+// the whole application too, so it burns its account exactly as the fill did and cannot reuse `+1`
+// — iCIMS would resume that candidate mid-application and the replay would meet pages it can no
+// longer reach. So: fill = `+1`, each rehearsal a fresh `+N`, and ONLY the armed submit uses the
+// bare address, which is what actually gets filed.
+function icimsScratchEmail(email, tag) {
   const s = String(email == null ? "" : email).trim();
   const at = s.lastIndexOf("@");
   if (at <= 0) return s;                    // not an address we can rewrite — leave it untouched
@@ -8226,7 +8247,8 @@ function icimsScratchEmail(email) {
   // `name+foo+1@` — that is a different mailbox from the one Gmail auto-verify polls, and the run
   // would sit waiting for a mail nobody receives.
   if (local.indexOf("+") >= 0) return s;
-  return local + "+1" + domain;
+  const n = String(tag == null ? 1 : tag).replace(/[^0-9]/g, "") || "1";
+  return local + "+" + n + domain;
 }
 
 // The inverse, applied to anything the fill RECORDED, so the bundle never carries the scratch alias.
@@ -8234,7 +8256,10 @@ function icimsScratchEmail(email) {
 // address is left alone.
 function icimsUnscratchEmail(value) {
   const s = String(value == null ? "" : value);
-  return s.replace(/([A-Za-z0-9._%-]+)\+1@/g, "$1@");
+  // ⚠ Only a purely NUMERIC tag is stripped — that is the only shape this file adds. An operator's
+  // own `name+jobs@` is left alone, and could not have been aliased anyway (icimsScratchEmail
+  // refuses to stack), so scratch === real there and nothing calls this.
+  return s.replace(/([A-Za-z0-9._%-]+)\+\d+@/g, "$1@");
 }
 
 // Put the REAL address back on everything the fill RECORDED, so the bundle, the review editor and

@@ -1448,9 +1448,22 @@ test("atsSubmitKey: everything WITHOUT an entry position keeps the old key exact
   const k = ats.atsSubmitKey, d = ats.atsDurableFieldName;
   // page-level iCIMS fields
   assert.strictEqual(k("icims", { fieldName: "PersonProfileFields.Login" }), d("PersonProfileFields.Login"));
-  // the candidate's OWN address block — the parse leaves it positional (`-1_`), and live not one of the
-  // 45 failures was an Address*/Phone* field, so it must not be re-keyed on a guess
-  assert.strictEqual(k("icims", { fieldName: "-1_PersonProfileFields.AddressCity" }), d("-1_PersonProfileFields.AddressCity"));
+  // ⚠⚠ THIS ONE CHANGED ON 2026-09-10, and the old reasoning is kept because it was right at the
+  // time. It read: "the parse leaves the candidate's own address block positional (`-1_`), and live
+  // not one of the 45 failures was an Address*/Phone* field, so it must not be re-keyed on a
+  // guess." That held while every visit was a brand-new candidate. Once the ACCOUNT is real the
+  // rows are saved and each visit serves them under fresh server ids — measured, a bundle keyed
+  // `104321_PersonProfileFields.Address*` / `112435_…Phone*` against a form serving different ones,
+  // and all 8 reported "no matching field on the live form".
+  //
+  // They need no position: `PersonProfileFields.*` is iCIMS' own vocabulary for the ONE candidate's
+  // address and phone, which is exactly why the static map keys on the bare id too.
+  assert.strictEqual(k("icims", { fieldName: "-1_PersonProfileFields.AddressCity" }), "PersonProfileFields.AddressCity");
+  assert.strictEqual(k("icims", { fieldName: "104321_PersonProfileFields.AddressCity" }), "PersonProfileFields.AddressCity",
+    "a server-minted ordinal must key the same as the positional one — that is the whole point");
+  // ⚠ SCOPED TO THE PLATFORM PREFIX. A per-customer question keeps its ordinal, because there the
+  // number can be a meaningful entry position rather than a row id.
+  assert.strictEqual(k("icims", { fieldName: "-2_rcf3271" }), d("-2_rcf3271"));
   // the other three tenants are byte-identical, uuid stripping included
   const ash = "aa058f67-1234-4321-abcd-0123456789ab__systemfield_eeoc_gender";
   for (const t of ["greenhouse", "lever", "ashby"]) {
