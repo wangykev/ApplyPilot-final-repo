@@ -12784,10 +12784,31 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     else if (wt === "dropdown_native") committed = await act.eval(atsInjSelectNative, ref.inputSel, pick);
     else if (wt === "icims_dropdown") committed = await act.eval(atsInjIcimsCommit, ref.inputSel, pick);
     else committed = await act.eval(atsInjCommitOption, ref.inputSel, pick);
-    const back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
+    let back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
+    let okv = committed && committed.ok && String((back && back.value) || "").trim() !== "";
+    // ⚠⚠ A CHILD DROPDOWN HAS NO OPTIONS UNTIL ITS PARENT COMMITS — and the AI batch answers both in
+    // the SAME pass (live 2026-09-13, reproduced on TWO tenants, so this is a class rather than one
+    // tenant's quirk). iCIMS declares the dependency in the DOM (`data-ddd-child-link`) and the
+    // child's list reads "Please select…" until the parent lands, so the child is committed against
+    // a list that does not exist yet: `rcf3049` ("Please specify", the child of "How did you hear
+    // about us") came back `commit failed` on both RoviSys and Rockefeller, and then failed the
+    // submit gate as an unanswered REQUIRED field.
+    //
+    // ONE retry, after a settle. This is not hoping: the parent was committed moments ago by this
+    // same pass, so the reaction being waited for is one we caused. A second failure is a real
+    // failure and still lands in review — the AI answer is flagged either way, so a retry can cost
+    // a beat but never a silent wrong value.
+    if (!okv && ats === "icims" && (wt === "dropdown" || wt === "icims_dropdown" || wt === "dropdown_native")) {
+      await act.delay(900);
+      const again = wt === "icims_dropdown" ? await act.eval(atsInjIcimsCommit, ref.inputSel, pick)
+        : wt === "dropdown_native" ? await act.eval(atsInjSelectNative, ref.inputSel, pick)
+          : await act.eval(atsInjCommitOption, ref.inputSel, pick);
+      back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
+      okv = again && again.ok && String((back && back.value) || "").trim() !== "";
+      if (okv) rec.retriedAfterParent = true;
+    }
     rec.after = back && back.ok ? back.value : null;
     atsAttachOptions(rec, texts);
-    const okv = committed && committed.ok && String(rec.after || "").trim() !== "";
     rec.status = okv ? "filled_review" : "needs_review"; // AI is NEVER a silent fill
     rec.resolved = [ai.choice];
     rec.confidence = String(ai.confidence || "low").toLowerCase();
@@ -12799,7 +12820,8 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     rec.flag = atsIsEeoLabel(f.label)
       ? "ai-eeo-guess"
       : (atsFd.legallyLoaded(f.label) ? "ai-choice-sensitive" : "ai-choice");
-    rec.detail = "AI: " + (ai.justification || "inferred") + (okv ? "" : " — commit failed");
+    rec.detail = "AI: " + (ai.justification || "inferred")
+      + (okv ? (rec.retriedAfterParent ? " — committed on a retry once its parent question had landed" : "") : " — commit failed");
     rec.maps_to = ai.maps_to || ""; rec.suggested_category = ai.suggested_category || "";
   } catch (e) {
     rec.status = "needs_review";
