@@ -9523,6 +9523,76 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     }
   }
 
+  // ── BACK-CHECK: A REQUIRED FIELD STILL HOLDING NOTHING GETS ONE MORE PASS (operator, 2026-09-13)
+  // "after the first pass, if there are any required fields unanswered, go back and answer them so
+  //  it can see questions like this and answer them."
+  //
+  // ⚠ THE CASCADE ROUNDS ABOVE CANNOT DO THIS, and that is the whole gap: they only consider fields
+  // NOT YET IN `results` (`fresh = …filter(f => !seen.has(f.fieldName))`). A field that WAS
+  // attempted and came back empty is already in results, so it was never looked at again.
+  //
+  // Measured on two tenants: `rcf3049` ("Please specify") is the CHILD of `rcf3048` ("How did you
+  // hear about us"). iCIMS declares the dependency in the DOM and the child's list reads
+  // "Please select…" until the parent commits — but the AI batch answers both in the SAME pass, so
+  // the child was asked to choose from a list nobody could read. It invented one ("placeholder
+  // sub-option required by form structure"), the commit failed, and on Rockefeller — where it is
+  // REQUIRED — the whole walk stopped at step 1.
+  //
+  // A second pass fixes it at the cause rather than by retrying: by now the parent HAS committed, so
+  // a fresh scan reads the child's real options and the ordinary routing answers it from those.
+  //
+  // ⚠ REQUIRED AND GENUINELY EMPTY ONLY. An optional blank is the operator's own choice and blocks
+  // nothing; a field that holds a value someone flagged is answered, not unanswered. Re-filling
+  // either would be a second fill pass over the whole page, which is not what this is.
+  // ⚠ ONE pass, never a loop — a field that two passes could not answer is a genuine review item.
+  {
+    let rescan2 = null;
+    try { rescan2 = await act.eval(atsInjScan, ats); } catch (e) { rescan2 = null; }
+    if (rescan2 && rescan2.fields) {
+      atsAssignEntryIndexes(ats, rescan2.fields);
+      const emptyRequired = rescan2.fields.filter((f) => {
+        if (!f || !f.isRequired) return false;
+        const rec = results.find((r) => r && r.fieldName === f.fieldName);
+        if (!rec) return false;                                   // the cascade rounds own that case
+        if (rec.credential) return false;                         // never re-typed from here
+        // ⚠⚠ ONLY AN ATTEMPT THAT FAILED — never something deliberately SKIPPED. A `skipped` record
+        // means some rung decided not to fill this field, and those decisions are load-bearing:
+        // Oracle's address block actuates only the ANCHOR and leaves `#city` and friends to the
+        // cascade *because typing into a dependent CLEARS the anchor* (its own test says so). A
+        // back-check that re-actuated every required blank would undo exactly that. `needs_review`
+        // is the honest signal that something TRIED and came back empty, which is this pass's remit.
+        if (rec.status !== "needs_review" && rec.status !== "error") return false;
+        // ⚠ A WIDGET THAT REPORTED **LOADING** IS LEFT ALONE. That is a standing rule with its own
+        // test ("a widget that reported LOADING is waited out, never re-typed"): the form's own
+        // search never answered, so a second attempt re-types over something still in flight and
+        // learns nothing. The operator has already been told the FORM was slow. Every other failure
+        // — a commit that did not take, options nobody could read, no match — is exactly what this
+        // pass exists for.
+        if (/still loading/i.test(String(rec.detail || ""))) return false;
+        return !String(rec.after == null ? "" : rec.after).trim();
+      });
+      if (emptyRequired.length) {
+        try {
+          console.log(`[ApplyPilot][ATS-FILL] back-check: ${emptyRequired.length} REQUIRED field(s) still unanswered after the first pass`
+            + ` — ${emptyRequired.map((f) => f.fieldName).slice(0, 6).join(", ")}. Re-reading the page and answering them against`
+            + ` what it shows NOW (a dependent list only exists once its parent has committed).`);
+        } catch (e) { /* log */ }
+        // Drop the stale records first: atsFillFields APPENDS, so leaving them would put two rows
+        // for one field into the bundle — and the review page would show the failed one too.
+        const redo = new Set(emptyRequired.map((f) => f.fieldName));
+        for (let i = results.length - 1; i >= 0; i--) if (redo.has(results[i].fieldName)) results.splice(i, 1);
+        const before2 = results.length;
+        await atsFillFields(act, ats, rescan2, emptyRequired, results, profile, defaults, jc, bucketIndex, fillOpts);
+        for (let i = before2; i < results.length; i++) {
+          results[i].backChecked = true;
+          if (results[i].status === "filled" || results[i].status === "filled_review") {
+            try { console.log(`[ApplyPilot][ATS-FILL] back-check: ${results[i].fieldName} answered on the second pass → ${JSON.stringify(String(results[i].after || "").slice(0, 40))}`); } catch (e) { /* log */ }
+          }
+        }
+      }
+    }
+  }
+
   // ⚠ FILL THE GAP BEFORE MEASURING IT. Any choice record that still has nothing to offer gets one
   // read-only open here, so an OPTIONAL field the fill skipped still reaches review as a real picker
   // (operator, 2026-08-25 — see atsCaptureMissingOptions).
