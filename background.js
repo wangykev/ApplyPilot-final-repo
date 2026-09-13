@@ -8016,12 +8016,41 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       if (r.status === "filled" || r.status === "filled_review") continue;
       failures.push(`${r.fieldName} ("${(e.question_label || "").slice(0, 60)}"): ${r.status} — ${r.detail || "no detail"}`);
     }
-    // Approved entries the live form no longer shows (form changed since the fill).
+    // ── APPROVED ENTRIES THE LIVE FORM NO LONGER SHOWS ────────────────────────────────────
+    // ⚠⚠ A FEW MISSING FIELDS ARE TOLERABLE; A MISSING **PAGE** IS NOT (operator, 2026-09-13:
+    // "if a field or two dissapears, it is fine, but we need to make sure an entire page does not
+    // dissapear"). Every one of these used to be fatal, which is why a submit that was otherwise
+    // perfect could not go out.
+    //
+    // The distinction is what makes relaxing it safe. A form legitimately stops rendering the odd
+    // box between the fill and the submit — a question asked once per candidate, a field the server
+    // has since filled in for us, a conditional whose parent now answers differently. That is the
+    // form saying "I am not asking this", and blocking on it helps nobody. A WHOLE PAGE absent is
+    // the opposite: it means the run never reached that step, and submitting then files an
+    // application missing everything on it — the plausible-but-incomplete failure this gate exists
+    // for, and exactly what the PARTIAL-bundle rule refuses on the fill side.
+    //
+    // Grouped by the bundle's own page key, so "a page" is the form's definition, not a guess.
     const liveNames = new Set(out.results.map((r) => durable(r)));
+    const missByPage = new Map();   // page key → { label, missing[], total }
     for (const [name, e] of approved) {
-      if (liveNames.has(name)) continue;
+      const pk = String(e.page || "?");
+      if (!missByPage.has(pk)) missByPage.set(pk, { label: e.page_label || pk, missing: [], total: 0 });
+      const g = missByPage.get(pk);
       if (e.current_value == null || String(e.current_value).trim() === "") continue;
-      failures.push(`${name} ("${(e.question_label || "").slice(0, 60)}"): approved value has NO matching field on the live form`);
+      g.total++;
+      if (!liveNames.has(name)) g.missing.push(`${name} ("${(e.question_label || "").slice(0, 60)}")`);
+    }
+    for (const [, g] of missByPage) {
+      if (!g.missing.length) continue;
+      if (g.total > 0 && g.missing.length === g.total) {
+        // EVERY approved field on this page is gone ⇒ the walk never got to it.
+        failures.push(`the whole "${g.label}" page is missing from the live form — all ${g.total} approved field(s) on it `
+          + `are absent, so this run never reached that step. Submitting now would file an application without it.`);
+      } else {
+        LOG(`⚠ ${g.missing.length} of ${g.total} approved field(s) on "${g.label}" are not on the live form and were NOT replayed `
+          + `— tolerated because the rest of the page IS there (a form may stop asking the odd question): ${g.missing.slice(0, 4).join(", ")}`);
+      }
     }
 
     // ── FINAL PRE-CLICK DOM READ: does the LIVE FORM hold what was APPROVED? ───────────────

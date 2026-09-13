@@ -8490,9 +8490,22 @@ function samePhysicalPage(a, b) {
   const A = split(a), B = split(b);
   if (A.path !== B.path) return false;
   if (!A.fields.length || !B.fields.length) return false; // field-less key ⇒ only its exact self (a===b above)
-  const setB = new Set(B.fields);
+  // ⚠⚠ COMPARE BARE NAMES — AN ENTRY ORDINAL IS NOT PART OF A FIELD'S IDENTITY (live 2026-09-13).
+  // iCIMS prefixes repeating-entry fields with an ordinal, and that ordinal CHANGES between visits:
+  // a fresh candidate renders `-1_PersonProfileFields.AddressCity`, and once the account exists the
+  // same box comes back as `104321_PersonProfileFields.AddressCity`. Measured on RoviSys, that
+  // dropped the overlap to 7 of 16 (0.44) — just under this function's 0.5 bar — so ONE physical
+  // page was recorded TWICE: 16 entries under the fresh key and 18 under the saved one, 34 for a
+  // page with 16 boxes. At submit time only one of them can exist, and the other 18 reported
+  // "approved value has NO matching field on the live form" and blocked the gate.
+  //
+  // Stripping the ordinal is the same normalisation `atsMapKey` and `atsSubmitKey` already perform
+  // for exactly this reason. It cannot merge two genuinely different pages: they still have to
+  // share a pathname AND overlap on the bare names, and a page whose boxes differ still differs.
+  const bare = (f) => String(f).replace(/^-?\d+_/, "");
+  const setB = new Set(B.fields.map(bare));
   let overlap = 0;
-  for (const f of A.fields) if (setB.has(f)) overlap++;
+  for (const f of A.fields) if (setB.has(bare(f))) overlap++;
   // same page if a meaningful fraction of the SMALLER field-set overlaps (a cascade adds/removes a few
   // fields but keeps most; two different pages share ~none).
   return overlap > 0 && overlap >= Math.min(A.fields.length, B.fields.length) * 0.5;
