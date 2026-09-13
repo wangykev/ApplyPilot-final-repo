@@ -434,6 +434,20 @@ test("⚠⚠ the rehearsal's throwaway reaches the REPLAY, not only the sign-in 
     "…and the throwaway must be published to that variable when one is taken");
 });
 
+test("⚠⚠ the SUBMIT walk recovers from account-exists, like the fill walk", () => {
+  // Found by the first ARMED run: the fill walk has signed in as a returning candidate since
+  // cf9845c, and the submit walk just stopped — so an armed submit reported `replay-incomplete` on
+  // an application that was entirely correct. iCIMS creates the account as part of submitting, so a
+  // "Create a login" block whose email already has one is refused however perfectly it was filled,
+  // and the answer is to SIGN IN rather than change any value.
+  const i = bg.indexOf("async function runAtsSubmitRun(");
+  const fn = bg.slice(i);
+  assert.match(fn, /adv\.stopped === "account-exists" && ats === "icims" && submitSignIns < 1/,
+    "bounded to one attempt — the recovery re-enters the same step, so unbounded is a loop");
+  assert.match(fn, /await icimsReturningCandidateSignIn\(tabId, icimsSubmitCreds, LOG\)/,
+    "…and it signs in as THIS run's identity, not whatever storage holds");
+});
+
 test("⚠⚠ an iCIMS submit signs OUT first — a shared cookie serves the previous candidate", () => {
   const i = bg.indexOf("async function runAtsSubmitRun(");
   const fn = bg.slice(i);

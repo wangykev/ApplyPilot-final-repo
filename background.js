@@ -68,7 +68,7 @@ try {
 // Which BUILD is actually loaded. Bumped by hand when a live run needs to prove the extension picked up
 // the edit rather than a stale copy — a whole debugging round was spent on code that turned out not to be
 // running, with nothing in the log able to say so (2026-08-07).
-const AP_BUILD_MARKER = "backcheck-replay-87";
+const AP_BUILD_MARKER = "advance-probe-89";
 
 // ⚠ HOW LONG TO WATCH FOR A CONFIRMATION AFTER THE SUBMIT CLICK (2026-08-31).
 // Was a bare 30000 inline. Live: three armed Greenhouse submits all succeeded, and the THIRD
@@ -4936,15 +4936,42 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG, alreadyRemediated) 
     return { advanced: false, stopped: "step-declaration-disagrees",
       detail: `iCIMS' own "Step N of M" does not agree with the order of its step list, so which step is last is not settled — refusing to press.` };
   }
-  if (!before.hasNext) {
+  // ⚠⚠ ASK THE FULLER PROBE BEFORE DECLARING THERE IS NO WAY ON (live 2026-09-13, Cooper).
+  // `before.hasNext` comes from `atsInjSubmitState`, whose iCIMS branch queries only
+  // `#cp_form_submit_i, input[type=submit], button[type=submit]`. A step whose advance is anything
+  // else — an `<a>`, a `<button>` with no type, an `input[type=button]` — reads as "no control at
+  // all", and the walk halted `no-advance-control` on step 3 of 4 of a form that plainly had one.
+  // `atsInjIcimsSubmitControls` looks at all of those, and `icimsAdvancePick` still applies the same
+  // deny list, so this widens what can be FOUND without widening what may be PRESSED.
+  const ctlProbe = await cdpEval(atsInjIcimsSubmitControls).catch(() => null);
+  const advPick = ctlProbe && ctlProbe.ok ? icimsAdvancePick(ctlProbe.controls) : null;
+  if (advPick && !advPick.ok && advPick.reason === "ambiguous") {
+    LOG(`  step ${stepNo} offers several equally-ranked controls — refusing to guess between them:`);
+    for (const c of (ctlProbe.controls || [])) {
+      LOG(`    · ${c.tag}${c.id ? "#" + c.id : ""} ${JSON.stringify(c.caption)}`
+        + `${c.visible ? "" : " (hidden)"}${c.disabled ? " (disabled)" : ""}`);
+    }
+    return { advanced: false, stopped: "advance-ambiguous",
+      detail: `Step ${stepNo} (${stepLabel}) offers several controls that could advance it (${(advPick.offered || []).join(" | ")}) `
+        + `— refusing to guess, because one wrong press on an iCIMS form is the application's own Submit.` };
+  }
+  const picked = advPick && advPick.ok ? advPick.control : null;
+  if (!before.hasNext && !picked) {
+    if (ctlProbe && ctlProbe.ok) {
+      LOG(`  step ${stepNo} offers no control this walk may press. What it does offer:`);
+      const list = (ctlProbe.controls || []).map((c) => `${c.tag}${c.id ? "#" + c.id : ""} ${JSON.stringify(c.caption)}`
+        + `${c.visible ? "" : " (hidden)"}${c.disabled ? " (disabled)" : ""}`);
+      for (let i = 0; i < list.length; i += 3) LOG(`    · ${list.slice(i, i + 3).join(" | ")}`);
+      if (!list.length) LOG("    · nothing submit-shaped at all — which is itself the answer");
+    }
     return { advanced: false, stopped: "no-advance-control",
       detail: `Step ${stepNo} (${stepLabel}) is not the last step but offers no control to advance with.` };
   }
-  if (!before.nextEnabled) {
+  if (!picked && !before.nextEnabled) {
     return { advanced: false, stopped: "advance-disabled",
       detail: `The control on step ${stepNo} (${stepLabel}) is disabled, so the walk stopped rather than pressing a dead button.` };
   }
-  if (!before.rect) {
+  if (!picked && !before.rect) {
     return { advanced: false, stopped: "advance-unaimable",
       detail: "The advance control could not be located on the page, so nothing was pressed." };
   }
@@ -4956,9 +4983,9 @@ async function icimsAdvanceAfterStep(stepNo, stepLabel, LOG, alreadyRemediated) 
   // moved to the next page." Four runs were spent reading a working press as a broken one.
   // Guards are untouched: terminality is still iCIMS' step declaration, and this line is only ever
   // reached on a step that is definitely NOT the last.
+  // ⚠ The probe and the pick were already made above, where they also decide whether there IS a way
+  // on at all — re-running them here would be a second full page read for the same answer.
   let aimRect = before.rect, aimCaption = before.nextCaption;
-  const ctlProbe = await cdpEval(atsInjIcimsSubmitControls).catch(() => null);
-  const advPick = ctlProbe && ctlProbe.ok ? icimsAdvancePick(ctlProbe.controls) : null;
   if (advPick && advPick.ok) {
     const measured = await cdpEval(atsInjIcimsSubmitControls, advPick.control.index).catch(() => null);
     const fresh = measured && measured.ok ? icimsAdvancePick(measured.controls) : null;
@@ -7914,6 +7941,9 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
       // on every step, and the gate must open once, at the end, on evidence from all of it.
       const union = new Map();
       let stepNo = 0, walkStop = null, walkWhy = null, lastUrl = null, stepsSeen = [];
+      // ONE returning-candidate sign-in per submit walk — it re-enters the same step, so unbounded
+      // is a loop, and a second refusal means the account is simply not the one we hold a login for.
+      let submitSignIns = 0;
       for (let iter = 1; iter <= 8; iter++) {
         // Each platform reads its own step declaration — iCIMS' is its `iCIMS_Steps_*` list, and its
         // read scrolls the control it is about to press into view (`scrollSubmit`), exactly as the
@@ -7964,6 +7994,19 @@ async function runAtsSubmitRun(tabId, ats, bundle, opts) {
         const adv = ats === "icims"
           ? await icimsAdvanceAfterStep(stepNo, st.titles ? (st.titles[stepNo - 1] || "step " + stepNo) : "step " + stepNo, LOG)
           : await orcAdvanceAfterStep(stepNo, "step " + stepNo, LOG, ats);
+        // ⚠⚠ THE FILL WALK RECOVERS FROM `account-exists` AND THE SUBMIT WALK DID NOT (live
+        // 2026-09-13, on the first armed run). iCIMS creates the account as part of submitting, so a
+        // step-1 "Create a login" block whose email already has one is refused server-side however
+        // perfectly it was filled — and the answer is to SIGN IN, not to change any value. The fill
+        // walk has done that since cf9845c; this one just stopped, so an armed submit reported
+        // `replay-incomplete` on an application that was entirely correct.
+        // Bounded to one attempt, and it re-enters the SAME step because signing in navigates away.
+        if (!adv.advanced && adv.stopped === "account-exists" && ats === "icims" && submitSignIns < 1) {
+          submitSignIns++;
+          const back = await icimsReturningCandidateSignIn(tabId, icimsSubmitCreds, LOG);
+          if (back.ok) { LOG(`re-replaying step ${stepNo} — signing in navigated away from it`); continue; }
+          walkStop = back.stopped; walkWhy = back.detail; break;
+        }
         if (!adv.advanced) { walkStop = adv.stopped; walkWhy = adv.detail; break; }
       }
       // ⚠⚠ ANY STOP OTHER THAN `reached-final-step` REFUSES THE GATE. Reaching a Submit button having
