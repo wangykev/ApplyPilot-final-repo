@@ -35,7 +35,9 @@ const body = (() => {
   assert.ok(i > 0, "the back-check pass must exist");
   // the whole enclosing block: back up to the rescan that feeds it
   const start = src.lastIndexOf("let rescan2", i);
-  return src.slice(start, src.indexOf("atsCaptureMissingOptions", i));
+  // ⚠ End at the option-capture GUARD, not at the capture call — the guard is `if (!o.valueFor)`,
+  // and including it made the "no replay guard in this block" assertion trip on the neighbour.
+  return src.slice(start, src.indexOf("if (!o.valueFor)", i));
 })();
 
 test("⚠ it re-reads the page rather than trusting the first scan", () => {
@@ -87,6 +89,23 @@ test("⚠ ONE pass — a field two passes cannot answer is a genuine review item
 
 test("⚠ what it re-filled is marked, so the bundle can show it was a second attempt", () => {
   assert.match(body, /results\[i\]\.backChecked = true/);
+});
+
+test("⚠⚠ it runs on a REPLAY too — no replay guard, unlike the option capture beside it", () => {
+  // Operator, 2026-09-13: "make sure it will work on a rehearsal as well."
+  // `atsCaptureMissingOptions` IS skipped on a replay, and the reasoning does not transfer: that one
+  // is a read-only convenience for the REVIEWER, and a submit run has no reviewer left to benefit,
+  // so its page contact is pure risk. This pass fixes a failure that happens on the replay for the
+  // same reason it happens on the fill — the parent must commit before the child's list exists.
+  // It is also SAFER on a replay: the AI is off for submit runs, so the second attempt re-uses the
+  // operator's own APPROVED value rather than generating anything.
+  assert.ok(!/o\.valueFor/.test(body),
+    "no replay guard may appear in the back-check block");
+  // …and the contrast is real rather than asserted: the option capture immediately after it IS
+  // wrapped in `if (!o.valueFor)`. Keeping the two distinct is the whole point of this test.
+  const capAt = src.indexOf("atsCaptureMissingOptions(act");
+  assert.match(src.slice(capAt - 200, capAt), /if \(!o\.valueFor\)/,
+    "the option capture is the one that skips replays");
 });
 
 test("⚠ it runs AFTER the cascade rounds and BEFORE the option capture", () => {

@@ -9545,6 +9545,17 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
   // nothing; a field that holds a value someone flagged is answered, not unanswered. Re-filling
   // either would be a second fill pass over the whole page, which is not what this is.
   // ⚠ ONE pass, never a loop — a field that two passes could not answer is a genuine review item.
+  //
+  // ⚠⚠ IT RUNS ON A REPLAY TOO, AND THAT IS DELIBERATE (operator, 2026-09-13: "make sure it will work
+  // on a rehearsal as well"). Do NOT add a replay guard here by analogy with
+  // `atsCaptureMissingOptions` a few lines below — that one is skipped on a replay because it is a
+  // READ-ONLY convenience for the REVIEWER, and a submit run has no reviewer left to benefit from it,
+  // so its page contact is pure risk. This is the opposite: the child-dropdown failure it fixes
+  // happens on the replay for exactly the same reason it happens on the fill (the parent has to
+  // commit before the child's list exists), and it was the last thing standing between the RoviSys
+  // rehearsal and a passing gate. It is also SAFER on a replay than on a fill: the AI is off for
+  // submit runs, so the second attempt re-uses the operator's own APPROVED value rather than
+  // generating anything.
   {
     let rescan2 = null;
     try { rescan2 = await act.eval(atsInjScan, ats); } catch (e) { rescan2 = null; }
