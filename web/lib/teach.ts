@@ -46,6 +46,38 @@ export function isDateOnlyQuestion(label?: string | null, widget?: string | null
   return DATE_ONLY_QUESTION.test(q);
 }
 
+/**
+ * Is this a YES/NO question? Used to seed a NEW remembered answer's "Answer type" so a yes/no
+ * question does not default to free Text (operator, 2026-09-03).
+ *
+ * ⚠ TWO SIGNALS, AND THE ANSWER IS THE STRONGER ONE. An approved answer of Yes/No/True/False is
+ * direct evidence of the field's shape — it is what the operator actually chose — whereas the
+ * wording is an inference. So the answer is tested first and alone is enough.
+ *
+ * The wording test exists for the case the answer cannot cover: creating a field from a card whose
+ * answer is blank, or one the AI left empty. It anchors on a LEADING AUXILIARY VERB, which is what
+ * makes a yes/no question yes/no in English ("Do you…", "Are you…", "Will you require…"). That
+ * anchor is the guard: a wh-question ("How many prior internships…", "What is your…", "Which
+ * office…") cannot match it, and those are exactly the ones that must stay Text.
+ *
+ * ⚠ Deliberately NOT keyed on option counts or on a `sensitive` flag: a two-option dropdown is
+ * often a real pick-one ("Bachelors/Masters"), and a legally-loaded question is not therefore a
+ * boolean.
+ */
+const YES_NO_ANSWER = /^\s*(yes|no|true|false)\s*$/i;
+const YES_NO_LEAD = /^\s*(do|does|did|are|is|was|were|will|would|have|has|had|can|could|should|may|must|shall)\b/i;
+
+export function looksLikeYesNoQuestion(question?: string | null, answer?: string | null): boolean {
+  if (YES_NO_ANSWER.test(String(answer || ""))) return true;
+  const q = String(question || "")
+    // A leading "*" / "✱" required marker, or a bracketed prefix some tenants prepend, must not
+    // hide the auxiliary verb from the anchor.
+    .replace(/^[\s*✱]+/, "")
+    .replace(/^\[[^\]]*\]\s*/, "")
+    .trim();
+  return YES_NO_LEAD.test(q);
+}
+
 /** Read a dotted profile path → a display string (a tiered array shows its first candidate). A path
  *  that lands on an OBJECT or an array-of-objects (e.g. a whole repeating section like `education`) has
  *  no scalar display → "" (guards against rendering "[object Object]"). */

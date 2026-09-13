@@ -154,6 +154,47 @@ const DISCOVER_CYCLES = ["summer", "fall", "winter", "spring"];
 // "summer" + "2026" → "Summer 2026". This is the SEASON label, used as the
 // Simplify feed's `terms` filter (its rows literally carry "Summer 2026"), which
 // is why it's exact there and only advisory on the keyword-matched boards.
+// ⚠⚠ THE TERM IS ADVISORY ON THE KEYWORD BOARDS, SO CONTRADICTIONS MUST BE DROPPED HERE
+// (operator, 2026-09-02). `cycle`/`year` shape the SEARCH STRING; only Simplify's feed filters on
+// them, and LinkedIn/Handshake just keyword-match. Live: a sweep set to `summer` / `2027` queued
+// "Electrical Engineering Intern - Fall 2026" and, of 35 queued rows, 9 mentioned 2027 at all and 3
+// said Summer 2027. The operator's requirement is that it only return the term asked for.
+//
+// ⚠ DROP CONTRADICTIONS, KEEP UNKNOWNS — and that asymmetry is the whole design. Most postings
+// carry no season or year in the title ("Software Engineer Intern"), and a rule that required a
+// match would discard nearly every real result: it would look like a filter and behave like a
+// blindfold. So a row is refused only when it NAMES a cycle or year that cannot be the one asked
+// for. Silence is not a contradiction.
+//
+// ⚠ A YEAR ALONE IS NOT A SEASON. "2027 Software Engineer Intern" states the year and leaves the
+// cycle open, so it survives a `summer` request — the year is the part that was contradicted or not.
+// The two facts are tested separately for that reason.
+const DISCOVER_CYCLE_WORDS = { summer: /\bsummer\b/i, fall: /\b(fall|autumn)\b/i, winter: /\bwinter\b/i, spring: /\bspring\b/i };
+
+function discoverTermContradiction(title, cycle, year) {
+  const t = String(title || "");
+  if (!t.trim()) return null;                       // nothing said ⇒ nothing contradicted
+  const wantCycle = String(cycle || "").trim().toLowerCase();
+  const wantYear = String(year || "").trim();
+
+  // YEARS: only 4-digit years in a plausible hiring window count, so a requisition number or a
+  // "1000+ employees" blurb can never read as a season.
+  if (/^\d{4}$/.test(wantYear)) {
+    const years = [...t.matchAll(/\b(20\d{2})\b/g)].map((m) => m[1]).filter((y) => y >= "2020" && y <= "2035");
+    if (years.length && !years.includes(wantYear)) {
+      return `title names ${years.join("/")} , not ${wantYear}`;
+    }
+  }
+  // CYCLES: a named season that is not the one asked for.
+  if (DISCOVER_CYCLE_WORDS[wantCycle]) {
+    const named = Object.keys(DISCOVER_CYCLE_WORDS).filter((c) => DISCOVER_CYCLE_WORDS[c].test(t));
+    if (named.length && !named.includes(wantCycle)) {
+      return `title names ${named.join("/")}, not ${wantCycle}`;
+    }
+  }
+  return null;
+}
+
 function discoverTermLabel(cycle, year) {
   const c = String(cycle || "").trim().toLowerCase();
   const y = String(year || "").trim();
@@ -329,13 +370,37 @@ function buildDiscoverQueries(opts) {
 // therefore emits only what the page honours; every richer filter goes through
 // linkedInApiSearchUrl instead. Used for the DOM-fallback sweep, the geo resolver
 // and recon — i.e. the paths that need a real rendered page.
+/**
+ * The recency window, in seconds, for a board's own "posted within" filter.
+ *
+ * ⚠ AN ABSENT `sinceDays` MEANS THE DECLARED DEFAULT (30d), NOT ONE DAY. Both board URL builders
+ * used to fall back to `|| 1`, while `matchPercent` fell back to `DISCOVER_DEFAULTS.sinceDays` — two
+ * different answers to the same missing option. The website's Discover panel has NO sinceDays
+ * control (the "Posted within N days" knob was removed 2026-07-30), so it never sends one, and every
+ * sweep from the site therefore asked LinkedIn for the last 24 HOURS while the scorer believed the
+ * window was 30 days.
+ *
+ * Measured live 2026-09-06: two sweeps run minutes apart on identical settings, the only difference
+ * being an explicit `sinceDays`. The 1-day window returned **0 new jobs** (everything found scored
+ * 21–37% and fell under the threshold); the wide window returned **7 new jobs at 63–83%**, six of
+ * them confirmed Summer 2027 in the JD. A 2027 internship is posted months ahead, so a 24-hour
+ * filter is precisely the wrong net for the thing being searched for.
+ *
+ * This restores what DISCOVER_DEFAULTS already documents: freshness is SCORED by matchPercent, not
+ * filtered here, so a wide window costs nothing — an old posting simply scores low.
+ */
+function discoverWindowSecs(o) {
+  const days = Number((o || {}).sinceDays) > 0 ? Number(o.sinceDays) : DISCOVER_DEFAULTS.sinceDays;
+  return Math.max(1, Math.round(days * 86400));
+}
+
 function discoverLinkedInSearchUrl(opts) {
   const o = opts || {};
   const keywords = String(o.keywords || "").trim();
   // HARD REFUSAL: a keyword-less LinkedIn search is the recommended feed, not a
   // search. Better to fail loudly than to queue jobs nobody asked for.
   if (!keywords) return "";
-  const secs = Math.max(1, Math.round((Number(o.sinceDays) || 1) * 86400));
+  const secs = discoverWindowSecs(o);
   let u = "https://www.linkedin.com/jobs/search-results/?keywords=" + encodeURIComponent(keywords) +
     "&f_TPR=r" + secs;
   // A numeric geoId is the ONLY location form the page keeps. No geoId ⇒ no
@@ -358,7 +423,7 @@ function linkedInApiSearchUrl(opts) {
   if (!keywords) return ""; // same refusal as the page builder
   const geoId = String(o.geoId || "").trim();
   if (!/^\d+$/.test(geoId)) return ""; // locationUnion REQUIRES a numeric geoId (locationName ⇒ HTTP 500)
-  const secs = Math.max(1, Math.round((Number(o.sinceDays) || 1) * 86400));
+  const secs = discoverWindowSecs(o);
   const start = Math.max(0, Number(o.start) || 0);
   const count = Math.max(1, Math.min(Number(o.count) || 25, 25));
 
@@ -2315,6 +2380,69 @@ function unwrapStoryLink(raw) {
 const STORY_LINK_TRACKERS = ["fbclid", "igshid", "igsh"];
 
 /**
+ * Is this an ATS SHORT LINK — a redirector that maps 1:1 onto one posting on a known ATS?
+ *
+ * ⚠⚠ THIS IS A DEDUP FIX, WHICH `unwrapStoryLink` DELIBERATELY IS NOT (live 2026-09-08). A short
+ * link keys on ITSELF, so it cannot match the resolved posting already sitting in the tracker:
+ *
+ *   discoveryJobKey("https://grnh.se/uuce4zv48us")                                  →
+ *     "https://grnh.se/uuce4zv48us"                          (no ATS key — the url IS the key)
+ *   discoveryJobKey("https://job-boards.greenhouse.io/k2spacecorporation/jobs/5411921008") →
+ *     "greenhouse:k2spacecorporation:5411921008"
+ *
+ * So a K2 Space role SUBMITTED that morning came back as a "new" job the same afternoon, because
+ * LinkedIn stored its apply link as the shortener. The operator's standing instruction is that a job
+ * already applied to must never be reported back — and the re-key + knownSet re-check downstream was
+ * already there and correct; it was just handed a key that could never match.
+ *
+ * ⚠ A TIGHT ALLOWLIST, never a generic shortener list. `grnh.se` is Greenhouse's own and always lands
+ * on a Greenhouse posting; a bit.ly can point anywhere, and following arbitrary redirectors from
+ * scraped pages turns a dedup fix into a request-forgery surface. Add a host here only once it is
+ * known to map 1:1 onto one ATS posting.
+ */
+const DISCOVER_ATS_SHORT_HOSTS = [/^grnh\.se$/i];
+function isAtsShortLink(raw) {
+  let u;
+  try { u = new URL(String(raw == null ? "" : raw).trim()); } catch (e) { return false; }
+  if (!/^https?:$/i.test(u.protocol)) return false;
+  return DISCOVER_ATS_SHORT_HOSTS.some((re) => re.test(u.hostname));
+}
+
+/**
+ * Follow an ATS short link ONCE and return where it lands ("" when it cannot be resolved).
+ *
+ * Impure by necessity — the destination is only in the redirect, not the url (which is exactly why
+ * `unwrapStoryLink` could stay pure: Meta puts the target in `?u=`). `fetchImpl` is injectable so the
+ * unit tests can drive it without a network.
+ *
+ * NEVER THROWS and never blocks a sweep: an unresolvable short link falls back to the original url,
+ * so the job is still queued — just keyed as it was before. Degrading to a possible duplicate is the
+ * right direction; losing the job entirely is not.
+ */
+async function resolveAtsShortLink(raw, fetchImpl, timeoutMs) {
+  const url = String(raw == null ? "" : raw).trim();
+  if (!isAtsShortLink(url)) return "";
+  const f = typeof fetchImpl === "function" ? fetchImpl : (typeof fetch === "function" ? fetch : null);
+  if (!f) return "";
+  const ctl = typeof AbortController === "function" ? new AbortController() : null;
+  const t = ctl ? setTimeout(() => { try { ctl.abort(); } catch (e) { /* already gone */ } }, Number(timeoutMs) || 8000) : null;
+  try {
+    // GET, not HEAD: some redirectors answer HEAD with a 405 and never issue the Location.
+    const r = await f(url, { redirect: "follow", cache: "no-store", ...(ctl ? { signal: ctl.signal } : {}) });
+    const landed = String((r && r.url) || "");
+    if (!/^https?:\/\//i.test(landed)) return "";
+    // Landing back on the shortener means nothing was followed — report failure rather than
+    // "resolved to itself", which would look like a successful resolve in the log.
+    if (isAtsShortLink(landed)) return "";
+    return landed;
+  } catch (e) {
+    return "";
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
+/**
  * INJECTED into an instagram.com tab. Self-contained — closes over NOTHING.
  *
  * Returns the RAW sticker urls; unwrapping, filtering and job-shaping all happen
@@ -2995,8 +3123,20 @@ async function readBoardDetails(tabId, source, jobs, opts, known) {
     job.boardUrl = job.url;
     if (patch.applyUrl && /^https?:\/\//i.test(patch.applyUrl)) {
       const before = job.jobKey;
-      job.url = patch.applyUrl;
-      job.jobKey = discoveryJobKey(patch.applyUrl);
+      // ⚠ FOLLOW AN ATS SHORT LINK BEFORE KEYING (live 2026-09-08). LinkedIn stores some apply links
+      // as the ATS's own shortener, and a short link keys on ITSELF — so the knownSet re-check just
+      // below could never match the resolved posting already in the tracker, and a K2 Space role
+      // SUBMITTED that morning came back as "new" the same afternoon. Resolving first is what makes
+      // that check mean what it says. Unresolvable ⇒ keep the original url (still queued, keyed as
+      // before): a possible duplicate is recoverable, a dropped job is not.
+      let applyUrl = patch.applyUrl;
+      if (isAtsShortLink(applyUrl)) {
+        const landed = await resolveAtsShortLink(applyUrl);
+        if (landed) { dlog(`      short link followed: ${applyUrl} → ${landed}`); applyUrl = landed; }
+        else dlog(`      ⚠ short link could NOT be followed (${applyUrl}) — keying on it as-is, so a duplicate is possible`);
+      }
+      job.url = applyUrl;
+      job.jobKey = discoveryJobKey(applyUrl);
       job.applyResolved = true;
       stats.rewritten++;
       dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars · REAL LINK via ${patch.applyVia}`);
@@ -3354,8 +3494,17 @@ async function fillMissingDescriptions(jobs, opts) {
           if (isBoardUrl(job.url) && jd.applyUrl && /^https?:\/\//i.test(jd.applyUrl) && !isBoardUrl(jd.applyUrl)) {
             const before = job.jobKey;
             job.boardUrl = job.url;
-            job.url = jd.applyUrl;
-            job.jobKey = discoveryJobKey(jd.applyUrl);
+            // ⚠ SAME SHORT-LINK RESOLUTION AS readBoardDetails — the two re-key sites must agree, or
+            // dedup holds on the record path and silently fails on the tab-reader path. A shortener is
+            // not a board url, so it sails through the `!isBoardUrl` test above untouched.
+            let applyUrl = jd.applyUrl;
+            if (isAtsShortLink(applyUrl)) {
+              const landed = await resolveAtsShortLink(applyUrl);
+              if (landed) { dlog(`      short link followed: ${applyUrl} → ${landed}`); applyUrl = landed; }
+              else dlog(`      ⚠ short link could NOT be followed (${applyUrl}) — keying on it as-is, so a duplicate is possible`);
+            }
+            job.url = applyUrl;
+            job.jobKey = discoveryJobKey(applyUrl);
             job.applyResolved = true;
             rewritten++;
             dlog(`  ✓ ${jobLine(job)} — ${job.description.length} chars · REAL LINK via ${jd.applyVia}`);
@@ -3521,7 +3670,23 @@ async function runJobDiscovery(opts) {
   // sum to 100 precisely so the number is comparable against a threshold.
   const rankOpts = { keywords, field: o.field, intern: o.intern, sinceDays: o.sinceDays, nowMs: now };
   const minPercent = o.minMatchPercent == null ? DISCOVER_DEFAULTS.minMatchPercent : Number(o.minMatchPercent);
-  const graded = pickByThreshold(fresh, minPercent, rankOpts);
+  // ⚠ REFUSE A ROW THAT NAMES A DIFFERENT TERM, BEFORE RANKING (see discoverTermContradiction).
+  // Placed here rather than inside the score so it is a REFUSAL, not a penalty: a Fall 2026 posting
+  // is not a weak Summer 2027 match, it is a different job, and no threshold should be able to let
+  // it through. Reported as its own note so a thin sweep never looks like an empty board.
+  const wrongTerm = [];
+  const onTerm = (o.cycle || o.year)
+    ? fresh.filter((j) => {
+      const why = discoverTermContradiction(j.title, o.cycle, o.year);
+      if (why) { wrongTerm.push(`${j.company || "?"} — ${j.title || "?"} (${why})`); return false; }
+      return true;
+    })
+    : fresh;
+  if (wrongTerm.length) {
+    notes.push(`${wrongTerm.length} job${wrongTerm.length === 1 ? "" : "s"} named a different term than ${discoverTermLabel(o.cycle, o.year) || "the one requested"} and were skipped.`);
+    dlog(`term filter: dropped ${wrongTerm.length} — ${wrongTerm.slice(0, 8).join(" | ")}`);
+  }
+  const graded = pickByThreshold(onTerm, minPercent, rankOpts);
   const wide = graded.kept.concat(graded.dropped); // every candidate, best first
   // maxTotal is still the hard backstop, so a low threshold can't queue hundreds.
   const capped = graded.kept.slice(0, cappedTotal);
@@ -3715,6 +3880,10 @@ if (typeof module !== "undefined" && module.exports) {
     DISCOVER_DEFAULT_LOCATION,
     DISCOVER_CYCLES,
     discoverTermLabel,
+    discoverTermContradiction,
+    discoverWindowSecs,
+    isAtsShortLink,
+    resolveAtsShortLink,
     buildDiscoverQuery,
     buildDiscoverQueries,
     discoverKeywordTokens,

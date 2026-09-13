@@ -35,6 +35,9 @@ const atsLib = (typeof module !== "undefined" && module.exports)
       recognizeRelocationQuestion: recognizeRelocationQuestion, relocationCandidates: relocationCandidates,
       // The checkbox-GROUP vocabulary. A native multi-select reaches review as a group, so it must
       // join/split exactly the way groups do — see the multiselect commit path.
+      // Essay voice samples — one definition of the ranking AND the prompt block, shared by all
+      // four prompt sites so they cannot drift apart in what they tell the model.
+      selectEssaysForQuestion: selectEssaysForQuestion, essayPromptBlock: essayPromptBlock,
       joinGroupValue: joinGroupValue, splitGroupValue: splitGroupValue, GROUP_JOIN: GROUP_JOIN,
       // Work-experience bullets → one prose block for a "Responsibilities" textarea.
       joinBullets: joinBullets };
@@ -125,6 +128,42 @@ function atsFormUrl(ats, url) {
     // `?eem=…&code=…`; strip it and the run lands on a sign-in page with no form at all.
     return u.origin + u.pathname + u.search; // greenhouse: same page (gh_jid etc. kept — harmless)
   } catch (e) { return String(url == null ? "" : url); }
+}
+
+/**
+ * Does this iCIMS url PROMISE a content frame that has not necessarily mounted yet?
+ *
+ * ⚠⚠ THE WRAPPER STAGE (measured 2026-09-08, Shure). `?hub=7` makes iCIMS serve a branded wrapper
+ * FIRST — title "Careers - Shure USA", a heading, one search input, and **no `#icims_content_iframe`
+ * element at all** — then client-side navigate to the real posting and mount the frame. Timed by
+ * hand: still absent at 4.5s, present by ~15s.
+ *
+ * That interval is what broke three armed submits. The settle's frame guard asks "is a frame
+ * ADVERTISED but not pinned yet?", which cannot fire while the `<iframe>` does not exist — so the
+ * wrapper satisfies `rendered` on its heading, the run reads it, finds no auth fields and no Apply
+ * control, and halts `apply-not-followable` → `posting-gone`. Both verdicts are FALSE: every one of
+ * these postings renders its own "Apply for this job online" seconds later.
+ *
+ * ⚠ URL EVIDENCE, NOT A GUESS — the same discipline as the SSO refusal. An iCIMS `/jobs/<id>/…` path
+ * IS the posting/apply route, so a content frame is genuinely expected there; anywhere else (the
+ * portal root, `/jobs/search`, an employer landing page) this returns false and nothing waits. The
+ * settle's 12s ceiling still bounds the wait, so the cost of being wrong is bounded and one-time.
+ */
+function icimsExpectsContentFrame(url) {
+  try {
+    const u = new URL(String(url == null ? "" : url));
+    if (detectAts(u.href) !== "icims") return false;
+    // `/jobs/<numeric id>/…` — the posting, its /job view, its /login gate and its /candidate step.
+    // `/jobs/search` is deliberately NOT matched: the id is what makes it a posting route.
+    if (/^\/jobs\/\d+(\/|$)/.test(u.pathname)) return true;
+    // ⚠ THE ID IS NOT ALWAYS IN THE PATH (live 2026-09-10, RoviSys). After the Auth0 login round
+    // trip iCIMS comes back to `…?jobid=2142&in_iframe=1` — the same posting, addressed through the
+    // query. A path-only test called that "not a posting route", so the wrapper retry never fired
+    // and the stage halted `apply-not-followable` on a page whose content frame was seconds from
+    // mounting. Same id, same route, written the other way round.
+    const q = u.searchParams.get("jobid") || u.searchParams.get("jobId");
+    return !!(q && /^\d+$/.test(q));
+  } catch (e) { return false; }
 }
 
 // Company slug from the URL path — the FALLBACK employment-question anchor when the JD
@@ -1381,6 +1420,39 @@ function atsRouteLabel(label, f, profile, defaults) {
       detail: "work_authorization.security_clearance = " + JSON.stringify(cl.level) };
   }
 
+  // ── A SALARY EXPECTATION IS STATED, OR IT IS NOT ANSWERED (2026-09-10) ────────────────────────
+  // The same shape as the clearance rung above, and for the same reason. RoviSys asks
+  // "2. Please state your desired gross annual salary." as a REQUIRED numeric box; the profile's
+  // `salary_expectation` is empty, so the question fell through to the AI — whose prompt tells it to
+  // infer from ABSENCE and never refuse. It answered "Negotiable", the form rejected it ("enter a
+  // number using only the digits 0 to 9"), and the walk halted two steps early with a PARTIAL bundle.
+  //
+  // ⚠⚠ CLAIMING IT IS THE POINT, exactly as with clearance and `may_contact`. A better prompt is NOT
+  // the fix: the problem is not that "Negotiable" was badly formatted, it is that a number here is a
+  // NEGOTIATING POSITION and an invented one anchors a real negotiation on a figure the operator
+  // never chose — which no review page can undo once the application is filed. Recognition is what
+  // keeps the AI away from it.
+  //
+  // A stated value IS a fact, so it fills deterministically and unflagged, coerced to bare digits by
+  // the same helper both write seams use.
+  if (atsIsSalaryAmountField({ label: L })) {
+    // ⚠ `profile.screening`, NOT `application_questions.…` (corrected 2026-09-10). The first version
+    // took the path from a TEACH BINDING LABEL in web/lib/teach.ts, which reads like a profile path
+    // and is not one — `salary_expectation` lives on `screeningSchema`
+    // (web/lib/profile-schema.ts). It read `undefined` forever, so a profile holding 80000 still
+    // reported "you have not stated one" and the field stayed blank. A wrong accessor fails exactly
+    // like an empty field, which is why this cost a live run to notice.
+    const stated = atsSalaryDigits((profile && profile.screening || {}).salary_expectation);
+    if (!stated) {
+      return { kind: "salary-unstated", review: true, flag: "salary-unstated",
+        detail: "this form wants a desired salary as a NUMBER and your profile does not state one — set "
+          + "\"salary expectation\" on the Profile page. A figure nobody chose would anchor a real negotiation, "
+          + "so it is left for you rather than guessed" };
+    }
+    return { value: stated, source: "salary", path: "screening.salary_expectation",
+      detail: "screening.salary_expectation = " + stated + " (digits only — these boxes reject commas, decimals and currency symbols)" };
+  }
+
   // Profile links.
   if (/linked\s*in/i.test(L)) { const v = atsWebsiteValue(profile, "linkedin"); if (v) return { value: v, source: "website" }; }
   if (/git\s*hub/i.test(L)) { const v = atsWebsiteValue(profile, "github"); if (v) return { value: v, source: "website" }; }
@@ -1445,12 +1517,13 @@ function atsRouteLabel(label, f, profile, defaults) {
     return { value: `${mm}/${dd}/${d.getFullYear()}`, source: "signature-date", path: "(today)" };
   }
 
-  // Compensation + availability (STATED only — an empty profile value falls through to AI/blank).
-  if (/salary|compensation|pay expectation|desired pay|expected (salary|pay)/i.test(L)) {
-    const v = (aq.availability_and_preferences || {}).salary_expectation;
-    if (has(v)) return { value: v, source: "map", detail: "salary_expectation" };
-    return null;
-  }
+  // ⚠ THE SALARY RUNG THAT USED TO SIT HERE IS GONE — see the one above (2026-09-10). It read
+  // `aq.availability_and_preferences.salary_expectation`, which is not where the schema keeps it
+  // (`screeningSchema` → `profile.screening`), so it was ALWAYS undefined and always fell through
+  // to the AI. That fall-through is how a required salary box came to hold "Negotiable" on a form
+  // demanding digits. Two rungs for one field is the duplication this file keeps paying for, so
+  // there is now one, it reads the right path, and it CLAIMS the question rather than falling
+  // through when the profile is silent.
   if (/when can you start|start date|earliest.*(start|available)|available to (start|begin)/i.test(L)) {
     const ap = aq.availability_and_preferences || {};
     const v = ap.earliest_start_date || ap.available_for_full_employment_after;
@@ -2529,6 +2602,45 @@ function atsInjClickAuthSubmit(sel) {
   return { ok: true, caption: String(btn.value || btn.textContent || "").replace(/\s+/g, " ").trim().slice(0, 40) };
 }
 
+// ── WHAT IS THIS AUTH PAGE ACTUALLY MADE OF? (diagnostics, 2026-09-09) ───────────────────────────
+// When a credential step submits and the page does not move, "nothing happened" has several causes
+// with opposite fixes — the submit control was not found, it was found but is not the one that
+// posts, the form wants a keypress rather than a click, or the server rejected us silently. Live on
+// `login.icims.eu` the run logged `submitLocked null` and `submitting "the form"`, i.e. the scan
+// found no submit control at all, and there was no way to tell which of those it was. The run closes
+// its own tab, so the page cannot be inspected afterwards: it has to report itself.
+//
+// ⚠⚠ NEVER RETURNS AN INPUT'S VALUE. These pages hold the operator's login and password, and this
+// string reaches the service-worker log. A caption is read from `value` ONLY for submit/button
+// inputs, where `value` IS the caption; for every other input it is omitted entirely. A password box
+// reports nothing but whether it is non-empty.
+function atsInjAuthControls() {
+  try {
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const clean = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, 60);
+    const out = [];
+    for (const el of document.querySelectorAll("input,button,select,textarea,a[role='button']")) {
+      const tag = el.tagName.toLowerCase();
+      const type = String(el.getAttribute("type") || "").toLowerCase();
+      const isButtonish = tag === "button" || tag === "a" || type === "submit" || type === "button";
+      out.push({
+        tag, type: type || null, id: el.id || null, name: el.getAttribute("name") || null,
+        // value is the CAPTION on a submit/button input and the SECRET on every other input
+        caption: isButtonish ? clean(tag === "input" ? el.value : (el.textContent || el.getAttribute("aria-label"))) : null,
+        holdsSomething: tag === "input" && !isButtonish ? !!String(el.value || "").length : undefined,
+        visible: vis(el),
+        disabled: !!el.disabled || el.getAttribute("aria-disabled") === "true",
+      });
+    }
+    const forms = [...document.querySelectorAll("form")].map((f) => ({
+      id: f.id || null, action: clean((f.getAttribute("action") || "")).slice(0, 80),
+      method: clean(f.getAttribute("method")) || "get",
+    }));
+    const heads = [...document.querySelectorAll("h1,h2,h3")].filter(vis).map((h) => clean(h.textContent)).slice(0, 5);
+    return { ok: true, url: String(location.href).split("?")[0], controls: out.slice(0, 40), forms, headings: heads };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
 // Independent re-read of a credential box. Same no-value contract as the write.
 // `matches` is the whole point: it answers "does the page still hold what we put there?" without
 // anyone outside the page ever seeing either string.
@@ -2692,6 +2804,119 @@ function atsInjScrollTopToFrameY(y, h) {
   // the fill must never move the page while the fill is touching it.
   window.scrollTo({ top: Math.max(0, Math.round(target)), behavior: "auto" });
   return { ok: true };
+}
+
+/**
+ * INJECTED IN THE TOP DOCUMENT. Where does the iCIMS content frame sit in the top viewport?
+ *
+ * ⚠⚠ THIS IS WHY NO iCIMS SUBMIT HAS EVER LANDED (live 2026-09-08, Shure). `atsInjSubmitState`
+ * builds its rect from `getBoundingClientRect()`, which is relative to the document it runs in — and
+ * on iCIMS it runs INSIDE the pinned content frame. `cdpClickAt` then dispatches
+ * `Input.dispatchMouseEvent`, whose coordinates are TOP-LEVEL viewport coordinates. So the armed
+ * click was issued at frame coordinates against the top document and landed wherever that happened
+ * to be, never on Submit Profile.
+ *
+ * The evidence was unambiguous once the timeout said what it saw: `submit present true (disabled
+ * false) · submitLocked FALSE · captchaToken false · captchaFrames 2`. iCIMS' own onsubmit calls
+ * icimsDisableSaveAndSubmitButtons, so an ENABLED button after a click proves the submit event never
+ * fired at all — the click missed. hCaptcha was initialised and innocent (2 frames), which is what
+ * ruled out the captcha theory this had been blamed on.
+ *
+ * ⚠ ONLY THE FINAL SUBMIT WAS AFFECTED, which is why the fill and the sign-in always worked: every
+ * other iCIMS interaction is page-side synthetic and ELEMENT-based (`el.dispatchEvent`), so it needs
+ * no coordinates. `act.clickSubmit` is deliberately forced back to TRUSTED input — the one action
+ * where "did the click really happen?" must not be in doubt — and a trusted click is the only one
+ * that has to be aimed.
+ *
+ * The arithmetic itself is not new here: `atsInjScrollTopToFrameY` has added this same offset for
+ * SCROLLING since it was written, with a comment saying the top document "is the only place that
+ * arithmetic is available". It was simply never applied to clicking.
+ */
+function atsInjIcimsFrameOffset() {
+  const fr = document.getElementById("icims_content_iframe") ||
+    document.querySelector('iframe[id*="icims"], iframe[name*="icims"]');
+  if (!fr) return { ok: false, error: "no-icims-frame-in-top-document" };
+  const r = fr.getBoundingClientRect();
+  // VIEWPORT-relative, matching what Input.dispatchMouseEvent wants and what the frame's own
+  // getBoundingClientRect produced — so the two are in the same space and simply add.
+  return { ok: true, x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) };
+}
+
+/**
+ * INJECTED. iCIMS' own step indicator — the platform DECLARING how many pages this application has
+ * and which one we are on.
+ *
+ * ⚠⚠ THE FORM IS MULTI-PAGE AND THE PIPELINE TREATED IT AS ONE (operator, 2026-09-08). `Submit
+ * Profile` (`cp_form_submit_i`) is a NEXT button on every page but the last, so a single press
+ * advances rather than submits. That is why the fill's scan "missed" a required field: it reads page
+ * 1 (Candidate Profile — 19 fields, verified live) correctly and completely, and `rcf3048` *"How did
+ * you hear about us?"* lives on step 2. The submit run only ever saw it because its press had
+ * already advanced, and the "validation errors" we reported were page 2 stating its own required
+ * field was empty — the click had worked.
+ *
+ * The operator's own markup:
+ *   <li class="iCIMS_Steps_First iCIMS_Steps_Current" id="Step_profileStep" title="Candidate Profile (Current Step)">
+ *     <span class="iCIMS_Steps_Content sr-only">Step 1 of 2. Candidate Profile(Current Step)</span>
+ *   <li class=" iCIMS_Steps_NotCurrent" id="Step_eeoStep" title="EEO">
+ *     <span class="iCIMS_Steps_Content sr-only">Step 2 of 2. EEO(Incomplete Step)</span>
+ *
+ * ⚠ TERMINALITY IS STRUCTURAL — "no step after this one" — NOT `index >= total`. That is the ORC
+ * ruling (`orcAdvanceAfterStep` is terminal on the ABSENCE of an advance control, never on a count,
+ * because Baylor serves 5 sections for 4 steps), and it is enforced there by a test. The declared
+ * "Step N of M" IS read, but only as a CROSS-CHECK to report against — a disagreement between the
+ * two is reported, never resolved by arithmetic, because the cost of being wrong is an application
+ * submitted a page early.
+ *
+ * ⚠ CLASS TOKENS ARE COMPARED EXACTLY, never by substring: `iCIMS_Steps_NotCurrent` contains the
+ * word "Current", so a `/Current/` test marks EVERY step current and the walk would think it was
+ * always on the last page.
+ *
+ * No steps list at all ⇒ `present:false`, and the caller keeps the existing single-page behaviour —
+ * which is right for the one-page iCIMS forms (Astrion) this pipeline was built against.
+ */
+function atsInjIcimsSteps() {
+  const lis = [...document.querySelectorAll('li[id^="Step_"], li[class*="iCIMS_Steps_"]')];
+  if (!lis.length) return { ok: true, present: false };
+  const nb = (s) => String(s || "").replace(/ /g, " ").replace(/\s+/g, " ").trim();
+  const steps = lis.map((li, i) => {
+    const tokens = String(li.className || "").split(/\s+/).filter(Boolean);
+    const txt = nb(li.textContent);
+    const m = /step\s*(\d+)\s*of\s*(\d+)/i.exec(txt);
+    return {
+      id: li.id || null,
+      title: nb(li.getAttribute("title")).replace(/\s*\(current step\)\s*$/i, ""),
+      current: tokens.indexOf("iCIMS_Steps_Current") >= 0,
+      declaredIndex: m ? parseInt(m[1], 10) : null,
+      declaredTotal: m ? parseInt(m[2], 10) : null,
+      incomplete: /\(incomplete step\)/i.test(txt),
+      // ⚠ CAN THIS STEP BE JUMPED TO? A returning candidate is resumed at the first INCOMPLETE step,
+      // so a run that signs in never walks step 1 and its 19 fields never reach the review bundle
+      // even though they are saved server-side. Whether the walk can go back and collect them
+      // depends on whether the platform makes these indicators navigable — which is a READ, not
+      // something to assume from one tenant's markup. Reported so one run can answer it.
+      // ⚠ Defensive: this runs inside a page, but it must not be the thing that throws — a step read
+      // that dies takes the walk's terminality check with it, and "unreadable" is the one answer that
+      // must never be reachable by accident.
+      href: (() => { try { const a = li.querySelector && li.querySelector("a[href]"); return a ? String(a.getAttribute("href")).slice(0, 120) : null; } catch (e) { return null; } })(),
+      clickable: (() => { try { return !!((li.querySelector && li.querySelector("a,button")) || li.getAttribute("onclick")); } catch (e) { return false; } })(),
+      pos: i + 1,
+    };
+  });
+  const cur = steps.findIndex((s) => s.current);
+  const currentStep = cur >= 0 ? steps[cur] : null;
+  // The cross-check: does iCIMS' own "Step N of M" agree with the DOM order we are about to trust?
+  const agrees = !currentStep || currentStep.declaredIndex == null
+    || (currentStep.declaredIndex === cur + 1 && currentStep.declaredTotal === steps.length);
+  return {
+    ok: true, present: true, count: steps.length,
+    currentPos: cur >= 0 ? cur + 1 : null,
+    current: currentStep,
+    // STRUCTURAL terminality — nothing after the current step in the platform's own list.
+    isLast: cur >= 0 ? cur === steps.length - 1 : null,
+    declaredAgrees: agrees,
+    titles: steps.map((s) => s.title || s.id || ("step " + s.pos)),
+    steps,
+  };
 }
 
 function atsInjIcimsAddEntry(labelPattern) {
@@ -4053,6 +4278,22 @@ function atsSubmitKey(ats, f) {
   if (section != null && String(section) !== "" && typeof idx === "number") {
     return "@" + section + "[" + idx + "]/" + atsMapKey(ats, name);
   }
+  // ⚠⚠ THE CANDIDATE'S OWN ADDRESS/PHONE BLOCK GETS SERVER ORDINALS TOO, ONCE THE ACCOUNT EXISTS
+  // (live 2026-09-10). The note above says these "the parse leaves at `-1_`", and that held while
+  // every visit was a brand-new candidate. It stops holding the moment the account is real: the
+  // rows are saved, so each visit serves them under fresh ids — measured, a bundle keyed
+  // `104321_PersonProfileFields.Address*` / `112435_…Phone*` against a form serving different ones,
+  // and all 8 reported "approved value has NO matching field on the live form".
+  //
+  // They carry no `entrySection`, so the positional key above cannot reach them — but they need no
+  // position, because `PersonProfileFields.*` is iCIMS' OWN vocabulary for the ONE candidate's own
+  // address and phone. That is the same reasoning that makes the static map safe to key on the bare
+  // id, and the same strip `atsMapKey` already performs for it. A genuinely repeating entry is
+  // untouched: it takes the section-stamped branch above, and a second unstamped row is left blank
+  // by design (atsAssignEntryIndexes' repeat rule) so nothing collides on the bare key.
+  // Scoped to the platform prefix on purpose — a per-customer `rcf<NNNN>` keeps its ordinal.
+  const bare = atsMapKey(ats, name);
+  if (/^PersonProfileFields\./.test(bare)) return bare;
   return atsDurableFieldName(name);
 }
 
@@ -4079,7 +4320,32 @@ function atsDeclineOption(texts) {
 // POSITIVE identification, the same rule as every other control here: an application form has
 // a SUBMIT control AND at least one identity anchor (resume, email, or a name field). Both
 // hold on every Greenhouse/Lever/Ashby application form; a marketing capture fails the first.
-function atsLooksLikeApplicationForm(fields, submitState) {
+/**
+ * @param stepEvidence Optional: the platform's OWN declaration that this page is a step of the
+ *   application in progress (iCIMS' step indicator — `{present, step}` from atsInjIcimsSteps).
+ *
+ * ⚠⚠ A LATER STEP OF A MULTI-PAGE APPLICATION CARRIES NONE OF THE IDENTITY FIELDS (live 2026-09-08).
+ * The three signals below — résumé, email, name — are all PAGE-1 signals. iCIMS' step 2 is EEO:
+ * gender, race, veteran status, disability and "How did you hear about us?". Not one of them is a
+ * name or an email, so a page the pipeline can fill perfectly well was refused as "not an
+ * application form", and the run then hunted for an Apply control that does not exist because it was
+ * already INSIDE the flow — halting `apply-not-followable` on a page with 7 controls and a Submit.
+ *
+ * It only surfaced once the operator signed in: with a session and step 1 already saved, iCIMS
+ * RESUMES the application at step 2, so the landing page is no longer page 1.
+ *
+ * ⚠ THE EVIDENCE IS THE PLATFORM'S, NOT A LOOSENED HEURISTIC. "Step 2 of 3. EEO(Current Step)" is a
+ * stronger statement about what a page is than the presence of a name box, and it is read from
+ * iCIMS' own markup. Greenhouse/Lever/Ashby pass nothing here and are byte-identical — which
+ * matters, because loosening the identity test for them would let this fill a page that is not an
+ * application at all.
+ *
+ * ⚠ ONE DEFINITION, THREE CALL SITES. `waitAtsFormReady` asks this twice (its settle path and its
+ * timeout path) and the iCIMS pre-form once. Fixing only the pre-form got the run past the gate and
+ * straight into the same refusal one stage later — so the evidence belongs in the predicate, not at
+ * a call site. Same lesson as the four-place choice-widget registration.
+ */
+function atsLooksLikeApplicationForm(fields, submitState, stepEvidence) {
   const list = Array.isArray(fields) ? fields : [];
   const txt = (x) => (String((x && x.fieldName) || "") + " " + String((x && x.label) || "")).toLowerCase();
   const hasEmail = list.some((x) => /e-?mail/.test(txt(x)));
@@ -4093,10 +4359,13 @@ function atsLooksLikeApplicationForm(fields, submitState) {
   // reads, so nothing here can cause a Next to be pressed in place of a Submit.
   const hasFlow = !!(submitState && submitState.hasFlowControl);
   const canAct = hasSubmit || hasFlow;
+  // The platform declaring "this page is step N of the application" — see the note above.
+  const declaredStep = !!(stepEvidence && stepEvidence.present && stepEvidence.step != null);
+  const identified = hasResume || hasEmail || hasName || declaredStep;
   return {
-    ok: canAct && (hasResume || hasEmail || hasName),
-    hasSubmit, hasFlowControl: hasFlow, hasResume, hasEmail, hasName,
-    why: canAct ? (hasResume || hasEmail || hasName ? "" : "no resume/email/name field — this doesn't look like an application form")
+    ok: canAct && identified,
+    hasSubmit, hasFlowControl: hasFlow, hasResume, hasEmail, hasName, declaredStep,
+    why: canAct ? (identified ? "" : "no resume/email/name field and no declared application step — this doesn't look like an application form")
                 : "no submit or next control on the page — this isn't a form we could fill or advance",
   };
 }
@@ -7634,6 +7903,12 @@ var ATS_CONSENT_OPTIN_RE = /\b(talent\s+(community|network)|job\s+alerts?|email\
 // A truthfulness attestation — recognized ONLY so it can be excluded on purpose rather than by
 // accident, and so a future decision about it has a name to refer to.
 var ATS_CONSENT_ATTEST_RE = /\b(i\s+certify|i\s+declare|i\s+affirm|under\s+penalty|falsif(y|ication)|to\s+the\s+best\s+of\s+my\s+knowledge)\b/i;
+// ⚠ A box whose text makes ticking it conditional on WHO YOU ARE is a factual claim, not assent.
+// "If you are a European Union resident, please check this box" (RoviSys, live 2026-09-10) carries
+// GDPR wording and would otherwise classify as `accept`. Anchored on the CONDITION + a status about
+// the applicant, so an ordinary "I accept the … Privacy Notice" is untouched.
+var ATS_CONSENT_CONDITIONAL_RE =
+  /\b(if|only\s+if)\b[^.]{0,80}\b(you\s+are|you\s+reside|your\s+residence|resident|residing|located\s+in|citizen|live\s+in)\b/i;
 // text = whatever describes the box (label, its row, the consent's own title). Most specific wins:
 // an opt-in that merely mentions "privacy" must not read as an acceptance.
 // ⚠ AN OPT-IN CAN BE WORDED EXACTLY LIKE AN ACCEPTANCE — so DECLARED INTENT decides first
@@ -7674,6 +7949,18 @@ function atsConsentKind(text, hints) {
   if (!t) return null;
   if (ATS_CONSENT_OPTIN_RE.test(t)) return "optin";
   if (ATS_CONSENT_ATTEST_RE.test(t)) return "attestation";
+  // ⚠⚠ A CONDITIONAL BOX IS A FACTUAL CLAIM ABOUT THE APPLICANT, NOT ASSENT TO A NOTICE
+  // (live 2026-09-10, RoviSys). Its box reads *"If you are a European Union resident, please check
+  // this box"* — it carries GDPR wording, so ATS_CONSENT_ACCEPT_RE claimed it and the run ticked it
+  // and logged an acceptance. But ticking it ASSERTS THE OPERATOR LIVES IN THE EU, which is false,
+  // and the tick is what plausibly disabled the gate's own Next (an EU declaration reveals further
+  // required fields).
+  //
+  // This is the SAME boundary the attestation exclusion already draws, reached from the other side:
+  // the standing instruction authorised accepting a privacy notice *that governs this application*,
+  // and it cannot authorise a statement of fact about who the applicant is. NARROWING what gets
+  // ticked is the safe direction and needs no new permission; widening it would.
+  if (ATS_CONSENT_CONDITIONAL_RE.test(t)) return "conditional";
   if (ATS_CONSENT_ACCEPT_RE.test(t)) return "accept";
   return null;
 }
@@ -7770,9 +8057,36 @@ function icimsLooksLikeSso(url, portalHost) {
 // account address into a STAFF login. The host is the whole tell, and it is a host we can never
 // have business on: the candidate portal always lives on a TENANT subdomain.
 // Checked ahead of the SSO test, because the SSO test deliberately exempts icims.com hosts.
+// ⚠⚠ `.com` ONLY, AND THE ASYMMETRY IS DELIBERATE — IT FOLLOWS THE EVIDENCE (2026-09-09).
+// This was briefly widened to `login.icims.<any tld>` on the theory that a run reaching
+// `login.icims.eu` had followed the wrong link. The operator refuted it: that IS this tenant's
+// candidate login, and "the things later in the link identify it from their backend". The widening
+// then broke an ORDINARY run — Shure job 4960 halted `wrong-login` on a redirect the tenant's own
+// flow had made — because the provenance bypass only covers the returning-candidate recovery.
+//
+// So it goes back to what is actually documented and observed: `login.icims.com` is the RECRUITER
+// login (docs/dom-patterns.md) and is refused; `login.icims.eu` is a candidate login and is not.
+// Asymmetric on evidence beats symmetric on a guess — and guessing symmetry is what cost a run here.
 function icimsIsAdminLogin(url) {
   try { return new URL(String(url == null ? "" : url)).hostname.toLowerCase() === "login.icims.com"; }
   catch (e) { return false; }
+}
+
+// Is this iCIMS' own infrastructure at all? Used to tell "the vendor's login host" from "some third
+// party", which is a different question from whether it is the STAFF login.
+//
+// ⚠ THE HOST ALONE CANNOT SAY WHETHER A `login.icims.*` PAGE IS OURS (operator, 2026-09-09).
+// `login.icims.com` is documented here as the RECRUITER login and is refused on sight — but the
+// operator confirmed that this tenant's own candidate Login control legitimately lands on
+// `login.icims.eu`, and that "the things later in the link identify it from their backend", i.e. the
+// candidate/tenant identity rides in the path and query, not the hostname. So the discriminator is
+// PROVENANCE, not the host: a login page we reached by following the tenant form's OWN Login control
+// is the candidate login; the same host reached any other way is not vouched for and stays refused.
+function icimsIsIcimsHost(url) {
+  try {
+    const h = new URL(String(url == null ? "" : url)).hostname.toLowerCase();
+    return /(^|\.)icims\.[a-z]{2,}(\.[a-z]{2,})?$/.test(h);
+  } catch (e) { return false; }
 }
 
 // iCIMS can answer the email gate by MAILING you a one-time link instead of showing a password
@@ -7784,6 +8098,384 @@ function icimsIsAdminLogin(url) {
 var ICIMS_MAILED_LINK_RE = /\b(we('ve| have)? (just )?(sent|emailed|e-mailed)|(an? )?(email|link|code) (has been|was) sent|check your (e-?mail|inbox)|sent you (an? )?(e-?mail|link|code))\b/i;
 function icimsMailedCredential(bodyText) {
   return ICIMS_MAILED_LINK_RE.test(String(bodyText == null ? "" : bodyText));
+}
+
+// ── AUTH0'S "LOG IN FASTER ON THIS DEVICE" IS AN ENROLMENT OFFER, AND IT IS DECLINED ────────────
+// iCIMS' candidate login is Auth0-hosted, and after a SUCCESSFUL sign-in Auth0 can interpose a
+// passkey/WebAuthn enrolment screen. Measured live 2026-09-10 on RoviSys:
+//     heading "Log In Faster on This Device"
+//     buttons  Continue | Remind me later | Not on this device
+// It is neither a sign-in nor an application form, so the stage halted `apply-not-followable` on a
+// login that had in fact WORKED — and then compounded it by concluding the posting was gone,
+// because the id had dropped out of the Auth0 URL.
+//
+// ⚠⚠ "Continue" REGISTERS A PASSKEY ON THE OPERATOR'S DEVICE — a persistent credential nobody asked
+// for, on hardware this pipeline does not own. It is never pressed. Only a DECLINE is.
+//
+// ⚠ Unlike the advance-control picker, several matches here are NOT an ambiguity to refuse: every
+// caption in this list declines, so any of them is a safe press and the order is only a preference.
+// The hazard the other picker guards against — one candidate being the application's own Submit —
+// has no counterpart here, which is exactly why the two behave differently.
+var ATS_ENROL_HEADING_RE = /\b(log ?in faster|sign ?in faster|add a passkey|set up (a )?passkey|use (a )?passkey|enable biometric|remember (this|your) (device|browser)|trust (this|your) (device|browser)|enroll)/i;
+var ATS_ENROL_DECLINE_ORDER = [
+  /^not now[.!]?$/i,
+  /^remind me later[.!]?$/i,
+  /^maybe later[.!]?$/i,
+  /^skip( for now)?[.!]?$/i,
+  /^no,? thanks[.!]?$/i,
+  /^continue without[\w\s]*$/i,
+  /^not on this device[.!]?$/i,
+];
+
+// Given an atsInjAuthControls report, the caption to press to get PAST an enrolment offer — or null
+// when this is not one, or when it offers nothing safe to press (then the caller stops for a human).
+function atsEnrolmentDecline(page) {
+  if (!page || !page.ok) return null;
+  const heads = (page.headings || []).join(" · ");
+  if (!ATS_ENROL_HEADING_RE.test(heads)) return null;
+  const usable = (page.controls || []).filter((c) => c && c.caption && c.visible && !c.disabled);
+  for (const re of ATS_ENROL_DECLINE_ORDER) {
+    const hit = usable.find((c) => re.test(String(c.caption).trim()));
+    if (hit) return String(hit.caption).trim();
+  }
+  return null;   // an enrolment screen with no decline is a human's problem, not ours to guess at
+}
+
+// ── A CONSENT INTERSTITIAL WITH NOTHING TO TICK STILL HAS TO BE PRESSED THROUGH (2026-09-10) ────
+// RoviSys serves `careers-rovisys.icims.com/jobs/gdpr?jobid=2142` between the login and the form:
+//     heading "General Data Protection Regulation (GDPR)", form #gdprConsentForm,
+//     buttons  input[submit]#gdprAnswerSubmitButton "Next" | input#keepMeAliveButton "Keep me logged in"
+//     inputs   NONE
+// It is not a sign-in and not an application form, so `icimsAuthView` calls it "none" and the stage
+// hunted for an Apply control that does not exist. Until today we got past it only as a SIDE EFFECT
+// of ticking its EU-resident box — so refusing that box (correctly) removed the accident that was
+// carrying the run forward. Pressing Next is the honest version of what was already happening.
+//
+// ⚠⚠ "NO INPUTS AT ALL" IS THE SAFETY GATE, and it is what makes pressing an unknown button
+// acceptable here: a page with nothing to fill cannot be an application form, so its forward
+// control cannot be an application's Submit. The forward caption is also whitelisted, so
+// "Keep me logged in" (right beside it) is never what gets pressed.
+function atsConsentGateNext(page) {
+  if (!page || !page.ok) return null;
+  const inputs = (page.controls || []).filter((c) => c && c.holdsSomething !== undefined);
+  if (inputs.length) return null;                       // something to fill ⇒ not this
+  const heads = (page.headings || []).join(" · ");
+  const formish = (page.forms || []).some((f) => /gdpr|consent|privacy/i.test(String(f.id || "") + " " + String(f.action || "")));
+  if (!formish && !/\b(gdpr|data protection|privacy)\b/i.test(heads)) return null;
+  const fwd = (page.controls || []).filter((c) => c && c.visible && !c.disabled
+    && /^(next|continue|proceed|i agree|agree|acknowledge|ok)[.!]?$/i.test(String(c.caption || "").trim()));
+  if (fwd.length !== 1) return null;                    // 0 or ambiguous ⇒ stop for a human
+  return String(fwd[0].caption).trim();
+}
+
+// Press a button by its EXACT visible caption. Exact and unambiguous on purpose: this is used to
+// decline an enrolment offer whose other button enrols, so a fuzzy match is not acceptable here.
+function atsInjClickButtonByCaption(caption) {
+  try {
+    const want = String(caption == null ? "" : caption).replace(/\s+/g, " ").trim().toLowerCase();
+    if (!want) return { ok: false, error: "no-caption" };
+    const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const cap = (el) => String(el.tagName === "INPUT" ? (el.value || "") : (el.textContent || ""))
+      .replace(/\s+/g, " ").trim().toLowerCase();
+    const hits = [...document.querySelectorAll("button, input[type=submit], input[type=button], a[role='button']")]
+      .filter((el) => vis(el) && cap(el) === want);
+    if (!hits.length) return { ok: false, error: "not-found" };
+    if (hits.length > 1) return { ok: false, error: "ambiguous" };
+    hits[0].click();
+    return { ok: true, caption: want };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// ── THE ACCOUNT ALREADY EXISTS — iCIMS' OWN WORDS FOR IT (live 2026-09-09, Shure) ────────────────
+// iCIMS creates the candidate account AS PART OF SUBMITTING, so the application form carries its own
+// "Create a login" block. When that email already has an account the advance press lands, the form
+// validates it server-side, and it comes back refusing:
+//   "This email address is already in use. Please login or use another email address."
+// That is the ONE refusal on this platform with a recovery the pipeline can drive itself — sign in
+// as the returning candidate — rather than a halt for the operator. Recognising it is also what
+// stops it being reported as the generic `step-did-not-advance`, which says nothing actionable.
+//
+// ⚠ ANCHORED ON THE COLLISION, AND THE SUBJECT OF IT — NOT ON THE WORD "login". This form says
+// "Login" in several harmless places (the field label, the section heading, a help link), and any of
+// them treated as this condition would send a fully-filled form off to a sign-in page for no reason,
+// losing the fill. BOTH halves are required: something is ALREADY taken, and the thing taken is an
+// email/login/account. Pinned in both directions.
+// ⚠ "already HAVE an account" is deliberately NOT in this list, though it reads like the same
+// condition. On this form "Already have an account?" is the HEADING PRINTED NEXT TO THE LOGIN LINK —
+// it is the invitation, present on every visit, including the very first. Matching it would make
+// every run believe the account exists, navigate a fully-filled form away to a sign-in page and lose
+// the fill. The asymmetry decides it: a false positive costs the work, a false negative only leaves
+// the operator with the generic halt they already had. So this matches a CLAIM THAT SOMETHING IS
+// TAKEN, never an offer to sign in.
+var ICIMS_ACCOUNT_TAKEN_RE = /\balready\s+(?:in\s+use|registered|exists|taken|associated|assigned)\b/i;
+var ICIMS_ACCOUNT_SUBJECT_RE = /\b(e-?mail(\s+address)?|log\s?in|user\s?name|account)\b/i;
+
+function icimsAccountExists(errors) {
+  const list = Array.isArray(errors) ? errors : (errors == null ? [] : [errors]);
+  return list.some((e) => {
+    const t = String(e == null ? "" : e);
+    return ICIMS_ACCOUNT_TAKEN_RE.test(t) && ICIMS_ACCOUNT_SUBJECT_RE.test(t);
+  });
+}
+
+// ── A SCRATCH ACCOUNT FOR FILLING, THE REAL ONE FOR SUBMITTING (operator, 2026-09-10) ───────────
+// The constraint that forces this: **iCIMS will not let you go back to a page once you have
+// submitted it**, and it keys the candidate ACCOUNT on the profile's email. So the first fill walks
+// the whole application and every later one resumes at the first incomplete step — the completed
+// pages become permanently invisible, which is why successive Shure runs captured 19 fields, then 8,
+// then 6, and why the review page could never show all three pages together.
+//
+// The operator's remedy: SCAN AND FILL under a throwaway `+1` alias, so every fill starts a fresh
+// application and walks it end to end; then SUBMIT under the real address, which recreates the
+// account and refills it from the approved bundle.
+//
+// ⚠⚠ THE REVIEW PAGE MUST SHOW THE REAL ADDRESS. The scratch alias is an artefact of how we capture
+// the form, not an answer the operator gave — and approving `+1` would be approving a value that
+// never gets filed. So the alias exists ONLY between the profile and the keystroke; every record,
+// bundle and review editor carries the real address (`icimsUnscratchEmail`).
+// ⚠ EVERY VISIT THAT FILLS THE FORM NEEDS ITS OWN ALIAS (operator, 2026-09-10). A REHEARSAL fills
+// the whole application too, so it burns its account exactly as the fill did and cannot reuse `+1`
+// — iCIMS would resume that candidate mid-application and the replay would meet pages it can no
+// longer reach. So: fill = `+1`, each rehearsal a fresh `+N`, and ONLY the armed submit uses the
+// bare address, which is what actually gets filed.
+function icimsScratchEmail(email, tag) {
+  const s = String(email == null ? "" : email).trim();
+  const at = s.lastIndexOf("@");
+  if (at <= 0) return s;                    // not an address we can rewrite — leave it untouched
+  const local = s.slice(0, at), domain = s.slice(at);
+  // ⚠ NEVER STACK ALIASES. An operator whose profile already holds `name+foo@` must not become
+  // `name+foo+1@` — that is a different mailbox from the one Gmail auto-verify polls, and the run
+  // would sit waiting for a mail nobody receives.
+  if (local.indexOf("+") >= 0) return s;
+  const n = String(tag == null ? 1 : tag).replace(/[^0-9]/g, "") || "1";
+  return local + "+" + n + domain;
+}
+
+// The inverse, applied to anything the fill RECORDED, so the bundle never carries the scratch alias.
+// Only ever strips the exact `+1` this file added — a genuine `+something` in the operator's own
+// address is left alone.
+function icimsUnscratchEmail(value) {
+  const s = String(value == null ? "" : value);
+  // ⚠ Only a purely NUMERIC tag is stripped — that is the only shape this file adds. An operator's
+  // own `name+jobs@` is left alone, and could not have been aliased anyway (icimsScratchEmail
+  // refuses to stack), so scratch === real there and nothing calls this.
+  return s.replace(/([A-Za-z0-9._%-]+)\+\d+@/g, "$1@");
+}
+
+// Put the REAL address back on everything the fill RECORDED, so the bundle, the review editor and
+// the submit replay all carry the value that will actually be filed. Mutates in place (the records
+// are this run's own) and returns how many values it rewrote.
+//
+// ⚠ A CREDENTIAL RECORD IS UNTOUCHED BY CONSTRUCTION and must stay that way: its `after` is the
+// `"(stored login)"` PLACEHOLDER, never the address, so there is nothing here to rewrite — and that
+// is exactly why the login can be aliased for the fill without the alias ever reaching Supabase.
+// This pass only ever sees ordinary field values.
+//
+// ⚠ Swaps the EXACT scratch string, not a `+1` pattern: a genuine `someone+1@` that the operator
+// actually uses would be left alone, because in that case `icimsScratchEmail` refused to alias at
+// all and `scratch === real`, so this returns immediately.
+function atsUnscratchRecords(results, scratch, real, LOG) {
+  if (!Array.isArray(results) || !scratch || !real || scratch === real) return 0;
+  let n = 0;
+  for (const r of results) {
+    if (!r) continue;
+    for (const k of ["after", "resolved", "before"]) {
+      const v = r[k];
+      if (typeof v === "string" && v.indexOf(scratch) >= 0) { r[k] = v.split(scratch).join(real); n++; }
+    }
+  }
+  if (n && LOG) {
+    LOG(`review will show ${real}, not the scratch alias — ${n} recorded value(s) rewritten, and the submit run files under ${real}`);
+  }
+  return n;
+}
+
+// ── WHICH CONTROL ACTUALLY MOVES AN iCIMS STEP ON (operator, 2026-09-09) ─────────────────────────
+// `atsInjSubmitState` takes the FIRST VISIBLE of `#cp_form_submit_i, input[type=submit],
+// button[type=submit]` — fine while a step had exactly one such control, which is all this pipeline
+// had ever met. Signed in, the step carries MORE THAN ONE, and DOM order picks the wrong one: the
+// run pressed "Submit Profile", the form answered "Your responses have been saved." and stayed
+// exactly where it was, while the operator clicking "Save Profile" by hand moved to the next page.
+//
+// So the advance stops relying on document order and CHOOSES, with the choice SW-side
+// (`icimsAdvancePick`) and this function only REPORTING — the same split as the login probe beside
+// it and `atsInjAuthScan` / `atsConsentKind`.
+//
+// ⚠ This does NOT weaken the never-submit guards. Which control to press and whether to press at all
+// are separate questions: terminality still comes only from iCIMS' own step declaration, and on the
+// last step nothing is pressed whatever it is captioned. That separation is why re-aiming the press
+// is safe.
+function atsInjIcimsSubmitControls(scrollToIndex) {
+  try {
+    const hits = [];
+    const seen = new Set();
+    for (const el of document.querySelectorAll('input[type="submit"], input[type="button"], button, a')) {
+      const tag = el.tagName.toLowerCase();
+      const cap = String(tag === "input" ? (el.value || "") : (el.textContent || "")).replace(/\s+/g, " ").trim();
+      if (!cap || cap.length > 60) continue;
+      if (!/\b(save|submit|update|continue|next|finish)\b/i.test(cap)) continue;
+      const key = (el.id || "") + "|" + cap;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      hits.push({ el, tag, cap });
+    }
+    // Scroll the CHOSEN one into view before any rect is taken — the press is a viewport coordinate,
+    // and an unscrolled read on a tall form lands below the fold (the `scrollSubmit` lesson).
+    if (typeof scrollToIndex === "number" && hits[scrollToIndex]) {
+      try { hits[scrollToIndex].el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) { /* older engines */ }
+    }
+    const out = hits.map((h, i) => {
+      const r = h.el.getBoundingClientRect();
+      const visible = r.width > 0 && r.height > 0;
+      return {
+        index: i, tag: h.tag, id: h.el.id || null, caption: h.cap, visible,
+        disabled: !!h.el.disabled || h.el.getAttribute("aria-disabled") === "true",
+        rect: visible ? { cx: r.left + r.width / 2, cy: r.top + r.height / 2, w: r.width, h: r.height } : null,
+      };
+    });
+    return { ok: true, controls: out };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
+}
+
+// Preference order, most-specific first. "Submit Profile" is LAST on purpose: it is the control this
+// code pressed for weeks, and signed in it saves without advancing — so it is the fallback for a form
+// that offers nothing better, never the first choice.
+var ICIMS_ADVANCE_PREF = [
+  /\b(save|update)\s+profile\b/i,
+  /\b(continue|next)\b/i,
+  // Bare "Submit" is the EEO step's advance (`input#eeop_form_submit_i`, measured 2026-09-09). It is
+  // last because on the FINAL step the same wording is the real thing — which is why terminality is
+  // never decided here: the step declaration stops the walk before this is ever consulted there.
+  /\bsubmit\b/i,
+];
+
+// ⚠⚠ NEVER THE ADVANCE, whatever else it matches. Step 2 offers `input#eeop_form_save_i
+// "Finish Later"` right next to the control that moves on, and it is the more dangerous of the two:
+// pressing it does not fail loudly, it SAVES AND LEAVES THE FLOW, so the walk would report a
+// successful press and the remaining steps would silently never be filled. Backwards/destructive
+// wordings are refused for the same reason.
+var ICIMS_ADVANCE_DENY = /\b(finish later|save (?:it )?for later|complete later|cancel|go back|previous|delete|remove|withdraw|log\s?out|sign\s?out)\b/i;
+
+function icimsAdvancePick(controls) {
+  const all = Array.isArray(controls) ? controls : [];
+  const usable = all.filter((c) => c && c.visible && !c.disabled && c.rect && !ICIMS_ADVANCE_DENY.test(c.caption));
+  const offered = all.map((c) => (c && c.caption) || "?").slice(0, 8);
+  if (!usable.length) return { ok: false, reason: "none", offered };
+  for (const re of ICIMS_ADVANCE_PREF) {
+    const m = usable.filter((c) => re.test(c.caption));
+    // ⚠ TWO controls at the SAME preference tier is not a choice we may make — one of them could be
+    // the application's own submit. Refuse and name them, like the Apply and login pickers.
+    if (m.length > 1) return { ok: false, reason: "ambiguous", offered: m.map((c) => c.caption) };
+    if (m.length === 1) return { ok: true, control: m[0], matched: re.source };
+  }
+  if (usable.length === 1) return { ok: true, control: usable[0], matched: "only-control" };
+  return { ok: false, reason: "ambiguous", offered: usable.map((c) => c.caption).slice(0, 8) };
+}
+
+// Which of the reported login controls may be pressed. SW-side and pure, so the judgement has ONE
+// copy and can be unit-tested — the same split as atsInjAuthScan reporting markers while
+// icimsAuthView / atsConsentKind decide. Refuses on ambiguity exactly like the Apply-control picker:
+// on a form carrying a live application, pressing the wrong "login" is not a recoverable mistake.
+function icimsLoginControlPick(candidates) {
+  const all = Array.isArray(candidates) ? candidates : [];
+  const usable = all.filter((c) => c && c.usable);
+  if (!usable.length) {
+    return { ok: false, reason: "none", offered: all.map((c) => (c && c.caption) || "?").slice(0, 6) };
+  }
+  if (usable.length > 1) {
+    return { ok: false, reason: "ambiguous", offered: usable.map((c) => c.caption).slice(0, 6) };
+  }
+  return { ok: true, control: usable[0] };
+}
+
+// Report the form's own "already have an account? Login" controls. REPORTS ONLY — it presses
+// nothing and decides nothing; icimsLoginControlPick does that SW-side.
+//
+// ⚠ ONLY <a> AND <button> ARE EVER MARKED USABLE. The one control on this form that must never be
+// pressed by mistake is `input#cp_form_submit_i`, which is Next on every step and the REAL SUBMIT on
+// the last — so a login probe that could return an <input type=submit> is one caption-match away
+// from submitting an unapproved application. Anything else that mentions login is still REPORTED
+// (with `usable:false` and the reason), because when this refuses, the list is the whole diagnosis.
+// ⚠ `scrollToIndex` — the rect this returns is the one that gets CLICKED, and `atsAimedClick`
+// translates it by the FRAME's offset, which is only meaningful for a control inside the viewport.
+// The submit control already paid for this exact lesson (`icimsStepState({scrollSubmit:true})`:
+// "without it the press lands below the fold and nothing posts, which then looks exactly like the
+// form refusing to advance"). Passing an index re-measures AFTER scrolling that candidate into view.
+//
+// It is ONE function rather than a read pass plus a scroll pass because two injected functions
+// cannot share code, and a duplicated match predicate is a lockstep dup waiting to drift — the
+// `atsInjScan` / `atsInjReadValue` pair is the standing warning. The default (no argument) is still
+// completely read-only.
+function atsInjIcimsLoginLink(scrollToIndex) {
+  try {
+    const out = [];
+    const seen = new Set();
+    const hits = [];
+    for (const el of document.querySelectorAll("a,button,input[type=button],input[type=submit]")) {
+      const tag = el.tagName.toLowerCase();
+      const cap = String(tag === "input" ? (el.value || "") : (el.textContent || "")).replace(/\s+/g, " ").trim();
+      if (!cap || cap.length > 90) continue;
+      // The control must ITSELF be the invitation. A row that merely mentions signing in
+      // ("Forgot your password?", "By logging in you agree…") is not a control to press.
+      const bare = /^(log\s?in|sign\s?in|login|signin)\b[\s.!:]*$/i.test(cap);
+      const invite = /\b(log\s?in|sign\s?in)\b/i.test(cap) && /\b(already|existing|returning|here|click)\b/i.test(cap);
+      if (!bare && !invite) continue;
+      const sel = el.id ? "#" + CSS.escape(el.id)
+        : el.getAttribute("name") ? "[name=" + JSON.stringify(el.getAttribute("name")) + "]" : null;
+      const key = (sel || "") + "|" + cap;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      hits.push({ el, tag, cap, sel });
+    }
+    // Scroll the CHOSEN candidate into view BEFORE any rect is taken, so the measurement the caller
+    // clicks is a viewport coordinate. Done between the two passes precisely because scrolling moves
+    // every other candidate too — measuring some before and some after would mix frames of reference.
+    if (typeof scrollToIndex === "number" && hits[scrollToIndex]) {
+      try { hits[scrollToIndex].el.scrollIntoView({ block: "center", inline: "nearest" }); } catch (e) { /* older engines */ }
+    }
+    for (let i = 0; i < hits.length; i++) {
+      const h = hits[i], el = h.el;
+      const r = el.getBoundingClientRect();
+      const visible = r.width > 0 && r.height > 0;
+      const isFormSubmit = el.id === "cp_form_submit_i" || h.tag === "input";
+      // ⚠ THE DESTINATION MUST BE THE TENANT'S HOST OR iCIMS' OWN — NOTHING ELSE (2026-09-09).
+      // A first version refused ANY cross-host link, which was too strict and would have broken the
+      // real flow: the operator confirmed this tenant's Login control legitimately goes to
+      // `login.icims.eu`, with the candidate/tenant identity carried in the path and query rather
+      // than the hostname. What must still be refused is a link off to a third party entirely — a
+      // footer, a partner site, an employer marketing page — because pressing one of those with an
+      // application half-filled sends the run somewhere it can never sign in.
+      // An UNPARSEABLE href refuses too: a link we cannot resolve is one we cannot vouch for.
+      let offSite = false, hrefAbs = null;
+      const rawHref = el.getAttribute("href");
+      if (rawHref && !/^(#|javascript:)/i.test(rawHref)) {
+        try {
+          const u = new URL(rawHref, location.href);
+          hrefAbs = u.href;
+          const host = u.hostname.toLowerCase();
+          const sameHost = host === String(location.hostname || "").toLowerCase();
+          const icimsHost = /(^|\.)icims\.[a-z]{2,}(\.[a-z]{2,})?$/.test(host);
+          offSite = !sameHost && !icimsHost;
+        } catch (e) { offSite = true; }
+      }
+      const why = isFormSubmit ? "not-an-anchor-or-button"
+        : !visible ? "not-visible"
+          : offSite ? "leaves-the-tenant-and-icims" : null;
+      out.push({
+        index: i, tag: h.tag, sel: h.sel, caption: h.cap, visible, usable: !why, excludedBecause: why,
+        // `cx`/`cy` is the shape atsAimedClick reads — it translates these by the iCIMS frame's own
+        // offset. Naming them x/y silently produced `translating undefined,undefined → NaN,NaN`.
+        rect: visible ? { cx: r.left + r.width / 2, cy: r.top + r.height / 2, w: r.width, h: r.height } : null,
+        offSite, href: (hrefAbs || el.getAttribute("href") || "").slice(0, 200) || null,
+        onclick: (el.getAttribute("onclick") || "").slice(0, 200) || null,
+      });
+    }
+    // Whether this page will raise the operator's "do you want to leave?" dialog, so the log can say
+    // whether the leave-arm was actually needed rather than leaving it a guess.
+    let guarded = typeof window.onbeforeunload === "function";
+    try { if (!guarded && window.jQuery) guarded = !!(window.jQuery._data(window, "events") || {}).beforeunload; } catch (e) { /* jQuery internals vary */ }
+    return { ok: true, candidates: out, beforeUnloadGuarded: guarded };
+  } catch (e) { return { ok: false, error: String((e && e.message) || e) }; }
 }
 
 // A STATED demographic and the form's option can be the same answer in different words: the profile
@@ -7938,15 +8630,27 @@ async function atsAiChooseOption(act, f, options, profile, jobContext) {
   return { ok: true, choice: parsed.choice, justification: parsed.justification || "", confidence: parsed.confidence || "Low", maps_to: parsed.maps_to || "", suggested_category: parsed.suggested_category || "" };
 }
 
-async function atsAiWriteText(act, f, profile, jobContext) {
+async function atsAiWriteText(act, f, profile, jobContext, essaysDoc) {
   const system = "You draft answers to job-application questions in the candidate's own plain, professional first-person voice. If the question needs a factual answer the profile clearly holds, give it concisely. Reply ONLY with JSON: {\"answer\":\"<the text to enter>\",\"confidence\":\"High|Medium|Low\",\"justification\":\"<short>\",\"maps_to\":\"\",\"suggested_category\":\"\"} — or {\"answer\":null} if you have no basis at all.";
-  const style = ((profile || {}).application_questions || {}).writing_style || "";
+  // ⚠ THE STYLE NOTES TAKE PRECEDENCE OVER THE LEGACY PROFILE FIELD.
+  // `application_questions.writing_style` has been read here since the AI landed but is ALWAYS "" on
+  // the website sync path — `coerceProfile` strips unknown keys and the website schema never had an
+  // `application_questions` object, so this prompt has been asking for something nothing supplied.
+  // Rather than add a schema key nothing else uses, the essays doc carries the notes and wins; the
+  // legacy read stays as a fallback for a hand-edited local profile.
+  const doc = essaysDoc || {};
+  const style = String(doc.style_notes || "").trim() || ((profile || {}).application_questions || {}).writing_style || "";
+  const samples = atsLib.selectEssaysForQuestion(doc.essays, f.label || f.fieldName, {});
+  // ⚠ THE BLOCK GOES AFTER the profile slice, which is truncated at 12 000 chars. Appended here it
+  // cannot be eaten by that cut — which is exactly what would happen to essays stored INSIDE the
+  // profile, and the fill would have got quietly worse as the library grew.
   const user = "QUESTION: " + (f.label || f.fieldName) +
     "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
     (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground your answer in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
     (style ? "\nSTYLE RULES: " + style : "") +
-    "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000);
+    "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000) +
+    atsLib.essayPromptBlock(samples, "");
   // ROUTE: "essay", not the default "fill" (2026-08-12). `act.llm` resolves `action || "fill"`, so
   // omitting it sent every free-text answer — the cover-letter-shaped "why do you want to work here"
   // boxes — to the model configured for yes/no picks. The AI page has had a separate
@@ -7973,6 +8677,235 @@ async function atsAiWriteText(act, f, profile, jobContext) {
 // then invents a work-experience date the profile already answers (observed live 2026-08-17: "Jun 1
 // 2026", reasoned from "typical summer internship start date"). One helper, used at every label-keyed
 // rung, so a future display tweak cannot reach the matcher again.
+// ── A CONDITIONAL QUESTION CARRIES ITS OWN INSTRUCTIONS (operator, 2026-09-10) ──────────────────
+// "6. If you answered yes to questions 4 or 5, please explain, if no please type \"n/a.\""
+//
+// Same principle as reading the form's error instead of recognising the question: the FORM has
+// already said what to do, including the literal to type when the condition does not apply. There
+// is nothing to infer about the topic — only to resolve which branch we are on. Optional and
+// unmapped, these went unanswered, and on a REQUIRED one that blocks the whole walk.
+//
+// Two branches, and they are deliberately not symmetric:
+//   condition NOT met ⇒ type the literal the question itself specified. Deterministic, unflagged —
+//                       we are quoting the form back to itself, not deciding anything.
+//   condition MET     ⇒ the AI drafts the explanation and it is ALWAYS `filled_review`. An
+//                       explanation of a "yes" to a screening question is a statement about the
+//                       operator's history; the human fixes it on the tracker page, which is
+//                       exactly what the operator asked for.
+//
+// ⚠ AN UNRESOLVED CONDITION IS NEVER GUESSED. If the questions it points at cannot be found or
+// their answers cannot be read, this returns `unknown` and the field goes to review untouched —
+// typing "n/a" over a condition that was actually met would be a false statement, and inventing an
+// explanation for one that was not is worse.
+
+// Does this label carry its own conditional instruction? Pure.
+function atsConditionalSpec(label) {
+  const t = String(label == null ? "" : label).replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  // "If you answered yes to questions 4 or 5" / "If yes to #4" / "If you selected Yes above"
+  const cond = /\bif\s+(?:you\s+(?:answered|selected|responded|indicated)\s+)?(yes|no|true|false)\b/i.exec(t);
+  if (!cond) return null;
+  const trigger = cond[1].toLowerCase();
+  // Which questions it points at, by their printed number. "questions 4 or 5", "question 4",
+  // "#4 or #5", "4, 5 or 6".
+  const after = t.slice(cond.index);
+  const refs = [];
+  // ⚠ `#` CANNOT CARRY A `\b` — it is not a word character, so `\b#` only matches after one, and
+  // "yes to #7 or #8" (a space before it) silently found nothing. The marker alternatives that ARE
+  // words keep their anchors; `#` stands alone.
+  // The capture then runs over digits and the small vocabulary that joins them (", or and # /"),
+  // stopping at the first ordinary word — so "questions 1, 2 or 3, please write" yields all three
+  // while "question 2, explain" stops at the explanation.
+  const refZone = /(?:\bquestions?\b|\bitems?\b|\bnos?\.|#)\s*([\d\s,#orand&/-]+)/i.exec(after);
+  if (refZone) for (const m of refZone[1].matchAll(/\d+/g)) refs.push(m[0]);
+  // The literal it tells you to type when the condition does not apply.
+  // ⚠ Taken VERBATIM from inside its quotes — the form is being quoted back to itself, so trailing
+  // punctuation inside the quotes is the form's own and is not second-guessed.
+  let literal = null;
+  const lit = /\b(?:type|enter|write|put|state|answer)\s*[:,]?\s*["“']([^"”']{1,40})["”']/i.exec(t);
+  if (lit) literal = lit[1].trim();
+  else if (/\b(?:type|enter|write|put)\s+n\/?a\b/i.test(t)) literal = "N/A";
+  if (!refs.length && !literal) return null;   // not actually a conditional instruction
+  return { trigger, refs, literal };
+}
+
+// The printed ordinal a question label leads with ("6. If you answered…" → "6"), which is how a
+// conditional names its siblings. Null when the label is not numbered.
+function atsQuestionOrdinal(label) {
+  const m = /^\s*(\d+)\s*[.)]/.exec(String(label == null ? "" : label));
+  return m ? m[1] : null;
+}
+
+// Is a recorded answer affirmative? Only an explicit yes counts — absence is NOT a "no" here,
+// because a screening question left blank has not been answered at all.
+function atsAnswerIsAffirmative(value) {
+  const v = String(value == null ? "" : value).replace(/\s+/g, " ").trim().toLowerCase();
+  if (!v) return null;                                    // unknown, not false
+  if (/^(yes|y|true|checked|1)\b/.test(v)) return true;
+  if (/^(no|n|false|unchecked|0)\b/.test(v)) return false;
+  return null;                                            // some other text — cannot judge
+}
+
+// Resolve a conditional against the answers already recorded for this page. Pure.
+function atsResolveConditional(spec, records) {
+  if (!spec) return { decision: "unknown", reason: "not a conditional" };
+  const byOrdinal = new Map();
+  for (const r of (Array.isArray(records) ? records : [])) {
+    const ord = atsQuestionOrdinal(r && (r.label || r.question || r.name));
+    if (ord) byOrdinal.set(ord, r);
+  }
+  if (!spec.refs.length) return { decision: "unknown", reason: "the instruction names no question to check" };
+  const seen = [];
+  let anyTriggered = false, anyUnknown = false;
+  for (const ref of spec.refs) {
+    const r = byOrdinal.get(ref);
+    if (!r) { anyUnknown = true; seen.push({ ref, answer: null, found: false }); continue; }
+    const aff = atsAnswerIsAffirmative(r.after != null ? r.after : r.resolved);
+    seen.push({ ref, answer: r.after != null ? r.after : r.resolved, found: true });
+    if (aff === null) { anyUnknown = true; continue; }
+    const triggered = (spec.trigger === "yes" || spec.trigger === "true") ? aff : !aff;
+    if (triggered) anyTriggered = true;
+  }
+  if (anyTriggered) return { decision: "explain", refs: seen };
+  if (anyUnknown) return { decision: "unknown", refs: seen, reason: "could not read every question it points at" };
+  if (!spec.literal) return { decision: "unknown", refs: seen, reason: "the condition does not apply but the form named no literal to type" };
+  return { decision: "literal", literal: spec.literal, refs: seen };
+}
+
+// ── THE FORM SAYS WHAT IT WANTS — READ THAT, DON'T GUESS FROM THE QUESTION (operator, 2026-09-10)
+// "instead of hardcoding each way the question is asked, can you instead make it error detect …
+//  there are many ways to ask the same question."
+//
+// Exactly right, and it is the difference between a rule that covers one wording and one that
+// covers the constraint itself. A label recognizer has to enumerate every phrasing of "desired
+// salary" and still misses the next tenant; the form's own REJECTION states the rule outright:
+//     "Please enter a number using only the digits 0 to 9 with a value between 0 and 300000.
+//      Do not include any commas, decimals, or currency symbols."
+// That sentence is unambiguous, arrives at exactly the moment it is needed, and is the same shape
+// whatever the question was called. Workday already works this way (`aiRemediateError`); this is
+// the ATS path's equivalent.
+//
+// ⚠ DETERMINISTIC FIRST, AI ONLY FOR THE REST. A "digits only" demand is a normalisation, not a
+// judgement — spending an LLM call on it would add latency and a chance of a wrong answer to
+// something a regex settles. The AI is the fallback for a demand we do not recognise.
+
+// What is this error asking for? Pure, so every branch is unit-pinnable.
+function atsErrorDemand(errorText) {
+  const t = String(errorText == null ? "" : errorText).replace(/\s+/g, " ").trim();
+  if (!t) return null;
+  const digits = /\bdigits?\s+0\s*(to|-|–)\s*9\b/i.test(t)
+    || /\bnumbers?\s+only\b/i.test(t)
+    || /\bonly\s+(?:the\s+)?(?:digits|numbers|numerals)\b/i.test(t)
+    || (/\bdo not include\b/i.test(t) && /\b(comma|decimal|currency|symbol|space)/i.test(t))
+    || /\benter\s+(?:a\s+)?(?:whole\s+)?number\b/i.test(t);
+  if (digits) {
+    // The bound, when the form states one — "a value between 0 and 300000".
+    const b = /\bbetween\s+([\d,]+)\s+and\s+([\d,]+)/i.exec(t);
+    return {
+      kind: "digits",
+      min: b ? parseInt(b[1].replace(/,/g, ""), 10) : null,
+      max: b ? parseInt(b[2].replace(/,/g, ""), 10) : null,
+      detail: "the form wants digits only" + (b ? ` between ${b[1]} and ${b[2]}` : ""),
+    };
+  }
+  if (/\b(is required|cannot be blank|must be (?:provided|entered)|please (?:enter|select|provide))\b/i.test(t)
+      && !/\bformat\b/i.test(t)) {
+    return { kind: "required", detail: "the form says this is required and empty" };
+  }
+  return { kind: "unknown", detail: t.slice(0, 200) };
+}
+
+// Which field is this error about? Forms prefix the message with the question's own text
+// ("2. Please state your desired gross annual salary.: Please enter a number …"), so the match is
+// on the LABEL appearing in the error — no wording list required.
+// ⚠ Longest label first: one question's label can be a prefix of another's ("Salary" vs "Salary
+// (USD)"), and the shorter would otherwise claim the longer one's error.
+function atsMatchErrorToField(errorText, fields) {
+  const t = String(errorText == null ? "" : errorText).replace(/\s+/g, " ").trim().toLowerCase();
+  if (!t) return null;
+  const norm = (s) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().toLowerCase()
+    .replace(/^\d+[.)]\s*/, "").replace(/\s*\*+\s*$/, "").replace(/[:.]\s*$/, "");
+  const cands = (Array.isArray(fields) ? fields : [])
+    .map((f) => ({ f, key: norm(f && (f.label || f.question || f.name)) }))
+    .filter((x) => x.key && x.key.length >= 6 && t.indexOf(x.key) >= 0)
+    .sort((a, b) => b.key.length - a.key.length);
+  return cands.length ? cands[0].f : null;
+}
+
+// Apply a recognised demand to the value already on the form. Returns null when it cannot.
+function atsValueForDemand(current, demand) {
+  if (!demand) return null;
+  if (demand.kind === "digits") {
+    const d = atsSalaryDigits(current);          // the general "first number, as bare digits" reader
+    if (d == null) return null;                  // nothing numeric to salvage — a human or the AI
+    let n = parseInt(d, 10);
+    if (demand.max != null && n > demand.max) n = demand.max;
+    if (demand.min != null && n < demand.min) n = demand.min;
+    return String(n);
+  }
+  return null;
+}
+
+// ── A SALARY BOX OFTEN REFUSES EVERY HUMAN WAY OF WRITING MONEY (live 2026-09-10, RoviSys) ───────
+// The form refused the fill in its own words:
+//   "2. Please state your desired gross annual salary.: Please enter a number using only the digits
+//    0 to 9 with a value between 0 and 300000. Do not include any commas, decimals, or currency
+//    symbols."
+// so `$75,000`, `75,000`, `75k` and `75,000 per year` are all rejected — and because this sits on a
+// mid-walk step, the refusal halted the walk two steps early and produced a PARTIAL bundle.
+//
+// ⚠ THE COERCION IS UNCONDITIONAL FOR AN AMOUNT QUESTION, and the asymmetry is the argument: a bare
+// number is the one spelling EVERY such box accepts — a form that would have taken "$75,000" takes
+// "75000" just as happily — while the constraint that rejects the formatted version is only stated
+// AFTER a failed submit, far too late to detect at fill time. Being wrong in this direction costs
+// nothing; being wrong in the other direction costs the application.
+//
+// ⚠ AMOUNT QUESTIONS ONLY. An answer with no number in it ("Negotiable", "Open to discussion") is
+// LEFT ALONE — stripping that to "" turns a real answer into a blank REQUIRED field, which is
+// strictly worse than a formatting mismatch a human can see and fix on the review page. Same reason
+// a prose "what are your salary expectations?" essay is not caught: the label must name an AMOUNT.
+// ⚠ The `pay …` forms are carried over from the rung this replaced — bare "pay" is far too common
+// a word to match on alone, so it only counts in the phrasings that name a figure.
+var ATS_SALARY_Q_RE = /\b(salary|compensation|wage|pay\s+rate|rate\s+of\s+pay|pay\s+expectation|desired\s+pay|expected\s+pay)\b/i;
+var ATS_SALARY_AMOUNT_RE = /\b(desired|expected|requested|require[ds]?|target|minimum|acceptable|gross|annual|hourly|base|amount)\b/i;
+
+function atsIsSalaryAmountField(f) {
+  const label = String((f && (f.label || f.question || f.name)) || "").trim();
+  if (!ATS_SALARY_Q_RE.test(label)) return false;
+  // ⚠ A BARE "Salary" / "Desired Compensation" IS AN AMOUNT BOX. The rung this replaced matched on
+  // the salary word alone, and dropping that would silently stop claiming the shortest and most
+  // common labels of all. A SHORT label mentioning pay is asking for a figure; a long one is
+  // asking something about pay ("Are you willing to negotiate salary?", "Describe your
+  // compensation philosophy"), which is a different question and must still fall through.
+  return ATS_SALARY_AMOUNT_RE.test(label) || label.length <= 30;
+}
+
+// The first number in the value, as bare digits. `null` when there is nothing numeric to take.
+// ⚠ A RANGE takes its LOW end ("70,000-80,000" → 70000): the box wants ONE number, and asking for
+// the bottom of your own stated range is the conservative direction.
+function atsSalaryDigits(value) {
+  const m = /(\d[\d,.]*)\s*(k)?/i.exec(String(value == null ? "" : value));
+  if (!m) return null;
+  let cleaned = m[1].replace(/,/g, "");
+  // ⚠ A DOT IS NOT ALWAYS A DECIMAL POINT. "75.000" is seventy-five thousand in much of the world,
+  // and reading it as 75 would file a salary three orders of magnitude wrong — the confident-wrong
+  // -value class. Only 1–2 trailing digits are treated as cents; anything else is a separator.
+  cleaned = /\.\d{1,2}$/.test(cleaned) ? cleaned : cleaned.replace(/\./g, "");
+  let n = parseFloat(cleaned);
+  if (!isFinite(n) || n <= 0) return null;
+  if (m[2]) n *= 1000;                                  // "75k" → 75000
+  return String(Math.round(n));
+}
+
+// ⚠ THERE IS DELIBERATELY NO LABEL-TRIGGERED FORMAT COERCION HERE ANY MORE (operator, 2026-09-10).
+// An earlier version rewrote a salary at both text-write seams whenever the LABEL looked like a
+// salary question. It worked, and it was the wrong shape: it needed a list of every phrasing, and
+// the operator's point stands — "there are many ways to ask the same question." Formatting is now
+// driven by the form's own rejection (`atsErrorDemand` → `atsValueForDemand`), which states the
+// rule instead of making us infer it. `atsSalaryDigits` survives as the NUMBER READER that
+// remediation uses, and `atsIsSalaryAmountField` survives only for the POLICY rung — refusing to
+// invent a salary is a judgement about the value, which no error message can supply.
+
 function atsMatchLabel(f) {
   return String((f && (f.partLabel || f.label)) || "");
 }
@@ -8232,6 +9165,49 @@ function atsInjLeanSignature(ats) {
 
 // Wait for iCIMS' résumé parse to land and the panel to go quiet. Returns what it OBSERVED — never
 // throws, because a wait that cannot read the page must not abort a run that can still fill it.
+/**
+ * INJECTED. Where are we actually looking, right after the résumé parse?
+ *
+ * ⚠ THIS EXISTS BECAUSE TWO EXPLANATIONS FIT THE SAME SYMPTOM and the logs could not separate them
+ * (live 2026-09-08, Shure). The submit run reached the form with 19 fields, the parse posted back, and
+ * every scan afterwards reported 0 fields — with NO "isolated world was replaced" line, so the
+ * loud re-arm in cdpEval never fired. Either:
+ *   (a) the pin silently fell back to the TOP document, which on iCIMS is ~13 characters of branding
+ *       and legitimately has no controls, or
+ *   (b) the pin is fine and the FORM genuinely has no controls now, because the parse moved the flow
+ *       on (a review step, or an already-applied panel for a req this candidate has applied to).
+ *
+ * `inTopDocument` settles it in one boolean: `#icims_content_iframe` can only be seen from OUTSIDE
+ * the content frame. Guessing between (a) and (b) already produced two wrong diagnoses in one
+ * session, so this reports rather than infers — the same discipline as atsInjAuthScan reporting
+ * consent markers and leaving the judgement SW-side.
+ *
+ * Read-only and cheap: no actuation, one evaluate.
+ */
+function atsInjIcimsPostParseProbe() {
+  try {
+    const q = (s) => document.querySelectorAll(s).length;
+    const frame = document.getElementById("icims_content_iframe");
+    const body = document.body;
+    const text = body ? String(body.innerText || "").replace(/\s+/g, " ").trim() : "";
+    return {
+      ok: true,
+      href: String(location.href || "").split("?")[0].slice(-70),
+      // THE DISCRIMINATOR: only the top document contains the content frame.
+      inTopDocument: !!frame,
+      frameSrc: frame ? String(frame.getAttribute("src") || "").split("?")[0].slice(-60) : null,
+      controls: q("input:not([type=hidden]),textarea,select,[role=combobox]"),
+      allInputs: q("input"),
+      forms: q("form"),
+      submits: q("input[type=submit],button[type=submit]"),
+      textLen: text.length,
+      head: text.slice(0, 160),
+    };
+  } catch (e) {
+    return { ok: false, error: String((e && e.message) || e) };
+  }
+}
+
 async function atsIcimsAwaitParse(act, ats, opts) {
   const o = opts || {};
   const cfg = Object.assign({}, ATS_ICIMS_PARSE, o.parse || {});
@@ -8338,6 +9314,20 @@ async function atsIcimsResumeStage(act, ats, opts) {
   // like a change. A false "changed" is the dangerous direction: it lets the wait finish on the first
   // brief quiet, potentially before the parse has even started. The wait reads its own baseline now.
   const parse = await atsIcimsAwaitParse(act, ats, { log, parse: o.parse });
+  // ⚠ SAY WHAT WE CAN SEE NOW. The parse is the one moment on this platform that can leave the run
+  // reading the wrong document, and when that happens every later line ("0 field(s)", "16 still
+  // absent") describes the symptom rather than the cause. One read-only probe, always logged, so a
+  // rehearsal answers "were we even looking at the form?" without another round of guessing.
+  try {
+    const p = await act.eval(atsInjIcimsPostParseProbe, ats);
+    if (p && p.ok) {
+      log(`post-parse view: ${p.inTopDocument ? "⚠⚠ the TOP DOCUMENT (the content frame is NOT pinned — every scan from here reads ~nothing)" : "inside the content frame"}`
+        + ` · ${p.controls} control(s), ${p.allInputs} input(s), ${p.forms} form(s), ${p.submits} submit(s)`
+        + ` · ${p.textLen} chars · ${JSON.stringify(p.href)}`
+        + (p.inTopDocument && p.frameSrc ? ` · frame src ${JSON.stringify(p.frameSrc)}` : "")
+        + ` · "${p.head}"`);
+    } else log(`post-parse view: probe failed — ${(p && p.error) || "no result"}`);
+  } catch (e) { log(`post-parse view: probe threw — ${String((e && e.message) || e)}`); }
   // WHAT EVIDENCE DO WE ACTUALLY HAVE THAT THE FILE LANDED? Setting `input.files` proves nothing on
   // its own — it is a page-side write, and iCIMS uploads on the change event. Two independent kinds of
   // positive evidence, and the record is flagged for review when there is NEITHER:
@@ -8530,6 +9520,87 @@ async function driveAtsPageFill(act, ats, profile, defaults, jobContext, opts) {
     // approved by default like them. Anything else keeps the flag and still faces the gate.
     for (let i = before; i < results.length; i++) {
       if (results[i].status !== "filled") results[i].cascadeRevealed = true;
+    }
+  }
+
+  // ── BACK-CHECK: A REQUIRED FIELD STILL HOLDING NOTHING GETS ONE MORE PASS (operator, 2026-09-13)
+  // "after the first pass, if there are any required fields unanswered, go back and answer them so
+  //  it can see questions like this and answer them."
+  //
+  // ⚠ THE CASCADE ROUNDS ABOVE CANNOT DO THIS, and that is the whole gap: they only consider fields
+  // NOT YET IN `results` (`fresh = …filter(f => !seen.has(f.fieldName))`). A field that WAS
+  // attempted and came back empty is already in results, so it was never looked at again.
+  //
+  // Measured on two tenants: `rcf3049` ("Please specify") is the CHILD of `rcf3048` ("How did you
+  // hear about us"). iCIMS declares the dependency in the DOM and the child's list reads
+  // "Please select…" until the parent commits — but the AI batch answers both in the SAME pass, so
+  // the child was asked to choose from a list nobody could read. It invented one ("placeholder
+  // sub-option required by form structure"), the commit failed, and on Rockefeller — where it is
+  // REQUIRED — the whole walk stopped at step 1.
+  //
+  // A second pass fixes it at the cause rather than by retrying: by now the parent HAS committed, so
+  // a fresh scan reads the child's real options and the ordinary routing answers it from those.
+  //
+  // ⚠ REQUIRED AND GENUINELY EMPTY ONLY. An optional blank is the operator's own choice and blocks
+  // nothing; a field that holds a value someone flagged is answered, not unanswered. Re-filling
+  // either would be a second fill pass over the whole page, which is not what this is.
+  // ⚠ ONE pass, never a loop — a field that two passes could not answer is a genuine review item.
+  //
+  // ⚠⚠ IT RUNS ON A REPLAY TOO, AND THAT IS DELIBERATE (operator, 2026-09-13: "make sure it will work
+  // on a rehearsal as well"). Do NOT add a replay guard here by analogy with
+  // `atsCaptureMissingOptions` a few lines below — that one is skipped on a replay because it is a
+  // READ-ONLY convenience for the REVIEWER, and a submit run has no reviewer left to benefit from it,
+  // so its page contact is pure risk. This is the opposite: the child-dropdown failure it fixes
+  // happens on the replay for exactly the same reason it happens on the fill (the parent has to
+  // commit before the child's list exists), and it was the last thing standing between the RoviSys
+  // rehearsal and a passing gate. It is also SAFER on a replay than on a fill: the AI is off for
+  // submit runs, so the second attempt re-uses the operator's own APPROVED value rather than
+  // generating anything.
+  {
+    let rescan2 = null;
+    try { rescan2 = await act.eval(atsInjScan, ats); } catch (e) { rescan2 = null; }
+    if (rescan2 && rescan2.fields) {
+      atsAssignEntryIndexes(ats, rescan2.fields);
+      const emptyRequired = rescan2.fields.filter((f) => {
+        if (!f || !f.isRequired) return false;
+        const rec = results.find((r) => r && r.fieldName === f.fieldName);
+        if (!rec) return false;                                   // the cascade rounds own that case
+        if (rec.credential) return false;                         // never re-typed from here
+        // ⚠⚠ ONLY AN ATTEMPT THAT FAILED — never something deliberately SKIPPED. A `skipped` record
+        // means some rung decided not to fill this field, and those decisions are load-bearing:
+        // Oracle's address block actuates only the ANCHOR and leaves `#city` and friends to the
+        // cascade *because typing into a dependent CLEARS the anchor* (its own test says so). A
+        // back-check that re-actuated every required blank would undo exactly that. `needs_review`
+        // is the honest signal that something TRIED and came back empty, which is this pass's remit.
+        if (rec.status !== "needs_review" && rec.status !== "error") return false;
+        // ⚠ A WIDGET THAT REPORTED **LOADING** IS LEFT ALONE. That is a standing rule with its own
+        // test ("a widget that reported LOADING is waited out, never re-typed"): the form's own
+        // search never answered, so a second attempt re-types over something still in flight and
+        // learns nothing. The operator has already been told the FORM was slow. Every other failure
+        // — a commit that did not take, options nobody could read, no match — is exactly what this
+        // pass exists for.
+        if (/still loading/i.test(String(rec.detail || ""))) return false;
+        return !String(rec.after == null ? "" : rec.after).trim();
+      });
+      if (emptyRequired.length) {
+        try {
+          console.log(`[ApplyPilot][ATS-FILL] back-check: ${emptyRequired.length} REQUIRED field(s) still unanswered after the first pass`
+            + ` — ${emptyRequired.map((f) => f.fieldName).slice(0, 6).join(", ")}. Re-reading the page and answering them against`
+            + ` what it shows NOW (a dependent list only exists once its parent has committed).`);
+        } catch (e) { /* log */ }
+        // Drop the stale records first: atsFillFields APPENDS, so leaving them would put two rows
+        // for one field into the bundle — and the review page would show the failed one too.
+        const redo = new Set(emptyRequired.map((f) => f.fieldName));
+        for (let i = results.length - 1; i >= 0; i--) if (redo.has(results[i].fieldName)) results.splice(i, 1);
+        const before2 = results.length;
+        await atsFillFields(act, ats, rescan2, emptyRequired, results, profile, defaults, jc, bucketIndex, fillOpts);
+        for (let i = before2; i < results.length; i++) {
+          results[i].backChecked = true;
+          if (results[i].status === "filled" || results[i].status === "filled_review") {
+            try { console.log(`[ApplyPilot][ATS-FILL] back-check: ${results[i].fieldName} answered on the second pass → ${JSON.stringify(String(results[i].after || "").slice(0, 40))}`); } catch (e) { /* log */ }
+          }
+        }
+      }
     }
   }
 
@@ -8730,23 +9801,33 @@ function atsSameOptionSet(a, b) {
 // "why do you want to work here" boxes and both are deferred by the same rule. Each kind keeps the
 // contract its single-call twin (atsAiChooseOption / atsAiWriteText) already states, so an answer
 // arriving by batch is indistinguishable downstream from one that came from its own call.
-function atsBuildBatchPrompt(items, profile, jobContext) {
+function atsBuildBatchPrompt(items, profile, jobContext, essaysDoc) {
   const system = "You help an applicant fill out ONE job-application page. You are given the applicant's profile (JSON) and SEVERAL questions at once. Answer EVERY question, keyed by its id.\n" +
     "Each question has a \"kind\":\n" +
     "  • \"choice\" — put EXACTLY ONE of that question's \"options\", VERBATIM, in the \"choice\" field. These are REQUIRED questions: always choose the most likely option, INFERRING from the profile even when it is not stated verbatim (work eligibility from citizenship/work_authorization, age from education or enrollment dates, criminal/background answers from the ABSENCE of any such record). NEVER refuse, never answer UNKNOWN, and never write an option that is not in that question's list.\n" +
     "  • \"text\" — write the answer as free text in the \"answer\" field, in the applicant's own plain, professional first-person voice. If the question wants a factual answer the profile clearly holds, give it concisely. Use null for \"answer\" ONLY if you have no basis at all.\n" +
     "For every answer give a SHORT justification — one terse phrase, about 12 words, no preamble, no restating the answer — that NAMES your basis: the positive profile fact used, OR plainly that you are inferring from the ABSENCE of information (e.g. \"no criminal record in profile\"; absence-based answers are less certain, so say so). Give confidence: High, Medium, or Low. " +
     "ALSO map each question to the applicant's profile for later curation: \"maps_to\" = the dotted path of the matching profile field (from the profile JSON's structure, e.g. \"work_authorization.authorized_to_work_in_us\"), or \"none\" if no existing field fits; \"suggested_category\" = ONE of: Screening, Work authorization, Demographics, Personal, Experience, Education, Other.";
-  const style = ((profile || {}).application_questions || {}).writing_style || "";
+  // Style + voice samples — see atsAiWriteText for why the essays doc outranks the legacy
+  // `application_questions.writing_style` read.
+  const doc = essaysDoc || {};
+  const style = String(doc.style_notes || "").trim() || ((profile || {}).application_questions || {}).writing_style || "";
   const qs = items.map((it) => (it.kind === "choice"
     ? { id: it.id, kind: "choice", question: it.question, options: it.options }
     : { id: it.id, kind: "text", question: it.question }));
+  // ⚠ RANKED AGAINST THE BATCH'S TEXT QUESTIONS ONLY. One call answers several questions, so there is
+  // no single question to rank against — and including the CHOICE questions would let a page full of
+  // yes/no screening dilute the topic signal and pick the wrong samples for the one essay that
+  // actually needs them. A batch with no text question gets no block at all.
+  const textQs = items.filter((it) => it.kind === "text").map((it) => it.question).join(" ");
+  const samples = textQs ? atsLib.selectEssaysForQuestion(doc.essays, textQs, {}) : [];
   const user = "QUESTIONS: " + JSON.stringify(qs) +
     "\nCOMPANY: " + ((jobContext && jobContext.company) || "unknown") +
     (jobContext && jobContext.title ? "\nROLE: " + jobContext.title : "") +
     (jobContext && jobContext.description ? "\nJOB DESCRIPTION (ground free-text answers in what the role actually is):\n" + String(jobContext.description).slice(0, 4000) : "") +
     (style ? "\nSTYLE RULES for free-text answers: " + style : "") +
     "\nCANDIDATE PROFILE (JSON):\n" + JSON.stringify(profile).slice(0, 12000) +
+    atsLib.essayPromptBlock(samples, "") +
     "\n\nReply ONLY with a JSON object and nothing else, one entry per question id:\n" +
     "{\"answers\":[{\"id\":\"<id>\",\"choice\":\"<verbatim option — kind=choice only>\",\"answer\":\"<free text — kind=text only>\",\"justification\":\"<short phrase, ~12 words, naming your basis>\",\"confidence\":\"High|Medium|Low\",\"maps_to\":\"<profile dotted path or none>\",\"suggested_category\":\"<one category or none>\"}]}";
   return { system, user };
@@ -8840,7 +9921,7 @@ const ATS_BATCH_ACTION = { choice: "fill", text: "essay" };
 // entry field cannot share a prompt with page-level questions (it would be shown the whole profile)
 // nor with a DIFFERENT entry of the same section. Group first, batch within a group. Batching is
 // preserved where it matters: all of one entry's questions still go in one call.
-async function atsRunAiBatch(act, deferred, profile, jc, cache) {
+async function atsRunAiBatch(act, deferred, profile, jc, cache, essaysDoc) {
   const groups = new Map();
   for (const d of deferred) {
     const k = d.scopeKey || "";
@@ -8849,7 +9930,7 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
   }
   let fired = false, items = 0, answers = 0;
   for (const g of groups.values()) {
-    const r = await atsRunAiBatchGroup(act, g.items, g.profile, jc, cache);
+    const r = await atsRunAiBatchGroup(act, g.items, g.profile, jc, cache, essaysDoc);
     fired = fired || !!(r && r.fired);
     items += (r && r.items) || 0;
     answers += (r && r.answers) || 0;
@@ -8857,7 +9938,7 @@ async function atsRunAiBatch(act, deferred, profile, jc, cache) {
   return { fired, items, answers };
 }
 
-async function atsRunAiBatchGroup(act, deferred, profile, jc, cache) {
+async function atsRunAiBatchGroup(act, deferred, profile, jc, cache, essaysDoc) {
   const byKind = { choice: [], text: [] };
   const idToKey = new Map();
   const seen = new Set();
@@ -8897,7 +9978,7 @@ async function atsRunAiBatchGroup(act, deferred, profile, jc, cache) {
   const fireOne = async (kind) => {
     const items = byKind[kind];
     const action = ATS_BATCH_ACTION[kind] || "fill";
-    const { system, user } = atsBuildBatchPrompt(items, profile, jc);
+    const { system, user } = atsBuildBatchPrompt(items, profile, jc, essaysDoc);
     try { console.log(`[ApplyPilot][ATS-FILL] AI batch [${kind} → "${action}" route]: ${items.length} deferred question(s) in ONE call (cap ${atsBatchMaxTokens(items)} tokens)${cached ? ` · ${cached} already cached` : ""}`); } catch (e) { /* log only */ }
     let res = null;
     try { res = await act.llm({ system, user, maxTokens: atsBatchMaxTokens(items), action }); }
@@ -9276,7 +10357,14 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // A clearance question we cannot answer from a STATED clearance stops here, blank and flagged —
       // it must not fall through to the AI, which would answer it by reasoning from absence. Claiming
       // the question is what keeps that from happening; see the clearance rung in atsRouteLabel.
-      if (route && route.kind === "clearance-unstated") { rec.status = "needs_review"; rec.flag = route.flag || "clearance-unstated"; rec.detail = route.detail; results.push(fin()); continue; }
+      // ⚠ SALARY JOINS IT, for the identical reason: a desired-salary box the profile does not answer
+      // would otherwise reach the AI, which answered "Negotiable" from absence on a form demanding
+      // digits (live 2026-09-10, RoviSys). Matched on the `-unstated` shape so the next rung of this
+      // kind is covered by construction rather than by remembering to add a third literal here.
+      if (route && typeof route.kind === "string" && /-unstated$/.test(route.kind)) {
+        rec.status = "needs_review"; rec.flag = route.flag || route.kind; rec.detail = route.detail;
+        results.push(fin()); continue;
+      }
       if (route && route.eeoUnstated) {
         // OPTIONAL: leave it blank — the operator's own choice, nothing blocks.
         // REQUIRED: blank blocks the submit, so take the form's OWN decline option when it
@@ -9463,7 +10551,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
   // Never fatal: a batch that cannot even be BUILT must not cost the page its deferred fields —
   // they each make their own call below, which is exactly the pre-batch behaviour.
   let batch = { fired: false, items: 0, answers: 0 };
-  try { batch = await atsRunAiBatch(act, deferred, profile, jc, aiCache); }
+  try { batch = await atsRunAiBatch(act, deferred, profile, jc, aiCache, (o && o.essays) || null); }
   catch (e) { try { console.log(`[ApplyPilot][ATS-FILL] AI batch threw (${String((e && e.message) || e)}) — every deferred question falls back to its own call`); } catch (e2) { /* log only */ } }
 
   // ── PHASE 3: the second actuation pass ───────────────────────────────────────────────────
@@ -9480,7 +10568,7 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
     try {
       // scoped profile when this field belongs to a repeating entry — a solo call must obey the
       // same seal the batch does, or the scoping is only as good as whether a batch happened to fire
-      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, d.scopeProfile || profile, answer);
+      await atsAiFallback(act, ats, d.f, d.ref, d.rec, jc, d.scopeProfile || profile, answer, (o && o.essays) || null);
     } catch (e) {
       d.rec.status = "needs_review";
       d.rec.detail = "AI commit pass exception: " + String((e && e.message) || e);
@@ -9761,6 +10849,83 @@ async function atsSurfacePrefilled(act, ats, scan, results, profile, valueFor) {
 //     it, while a complete list called partial only costs a typed value.
 //   • A widget that shows nothing until a query is typed (a places box) has no list to capture, and
 //     `pollFor`'s settled-empty rule means asking costs ~2 reads rather than a budget.
+// ── ANSWER THE CONDITIONALS, ONCE THE QUESTIONS THEY POINT AT HAVE BEEN ANSWERED ────────────────
+// Runs LATE and deliberately so: a conditional is about its SIBLINGS' answers, which do not exist
+// until the ordinary fill has run. Placed with the other completeness passes, and like them it
+// never aborts the fill.
+async function atsAnswerConditionals(act, ats, scan, results, profile, jobContext, log) {
+  const fields = (scan && scan.fields) || [];
+  let done = 0;
+  // ⚠ RECORDS JOIN FIELDS ON `fieldName` — the key every other late pass uses
+  // (atsCaptureMissingOptions: `x.fieldName === rec.fieldName`). A first version matched
+  // `r.name === f.id`, which is wrong on both sides, so the lookup silently found nothing and every
+  // conditional was left untouched — indistinguishable, in the bundle, from the pass never running.
+  const recFor = (x) => (results || []).find((r) => r && r.fieldName === x.fieldName);
+  // The ordinal→answer map is built from the SCAN's labels, because that is where the printed
+  // "4." / "5." live; a record carries the platform's field NAME ("Q4"), which has no ordinal in it.
+  const answered = fields.map((x) => {
+    const r = recFor(x);
+    return { label: x.label || x.question || x.fieldName, after: r ? (r.after != null ? r.after : r.resolved) : null };
+  });
+  for (const f of fields) {
+    const rec = recFor(f);
+    // ONLY a field nothing else answered. A conditional the operator's profile already covers, or
+    // that the AI already drafted, is left exactly as it is.
+    if (!rec || (rec.status !== "skipped" && rec.status !== "needs_review")) continue;
+    if (rec.after && String(rec.after).trim()) continue;
+    const wt = f.widgetType || "text";
+    if (wt !== "text" && wt !== "textarea") continue;      // an explain box is free text
+    const spec = atsConditionalSpec(f.label || f.question || "");
+    if (!spec) continue;
+    const res = atsResolveConditional(spec, answered);
+    const sel = f.inputSel;                     // the selector every other pass writes through
+    if (!sel) continue;
+
+    if (res.decision === "literal") {
+      // Quoting the form back to itself — no judgement, so no flag.
+      const w = await act.eval(atsInjSetText, sel, res.literal).catch(() => null);
+      if (w && w.ok) {
+        rec.status = "filled"; rec.after = res.literal; rec.resolved = res.literal;
+        rec.detail = `the question says to type ${JSON.stringify(res.literal)} when it does not apply, and `
+          + `question(s) ${spec.refs.join("/")} were not ${spec.trigger}`;
+        done++;
+        if (log) log(`[ATS-FILL] ${f.fieldName}: conditional not met → typed ${JSON.stringify(res.literal)} as the question instructs`);
+      }
+      continue;
+    }
+
+    if (res.decision === "explain") {
+      // ⚠ ALWAYS filled_review. This explains a "yes" to a screening question — a statement about
+      // the operator's own history, which they correct on the tracker page.
+      const ai = await atsAiWriteText(act, f, profile, jobContext, null).catch(() => null);
+      const text = ai && ai.answer ? String(ai.answer).trim() : "";
+      if (!text) {
+        rec.status = "needs_review"; rec.flag = "conditional-explain";
+        rec.detail = `question(s) ${spec.refs.join("/")} were answered ${spec.trigger}, so this asks for an explanation `
+          + `and none could be drafted — please write it`;
+        continue;
+      }
+      const w = await act.eval(atsInjSetText, sel, text).catch(() => null);
+      if (w && w.ok) {
+        rec.status = "filled_review"; rec.flag = "ai-conditional-explain";
+        rec.after = text; rec.confidence = "low";
+        rec.detail = `question(s) ${spec.refs.join("/")} were answered ${spec.trigger}, so the form asks for an `
+          + `explanation — AI DRAFT, please correct it: ${(ai && ai.justification) || "generated from profile"}`;
+        done++;
+        if (log) log(`[ATS-FILL] ${f.fieldName}: conditional MET (q${spec.refs.join("/")}) → AI draft written, flagged for you to fix`);
+      }
+      continue;
+    }
+
+    // Unresolved — say why, and touch nothing.
+    rec.status = "needs_review"; rec.flag = "conditional-unresolved";
+    rec.detail = `this question depends on question(s) ${spec.refs.join("/")} and ${res.reason} — `
+      + `answering it either way would be a guess about your own history`;
+    if (log) log(`[ATS-FILL] ${f.fieldName}: conditional left for you — ${res.reason}`);
+  }
+  return done;
+}
+
 async function atsCaptureMissingOptions(act, ats, scan, results, log) {
   const say = typeof log === "function" ? log : () => {};
   const need = [];
@@ -9857,6 +11022,14 @@ async function atsFinishFill(act, ats, scan, results, credentials, profile, jobC
   // read as a bug in whichever half you look at second). Placed after the audit deliberately: see
   // atsSurfacePrefilled.
   try { await atsSurfacePrefilled(act, ats, scan, results, profile, valueFor); } catch (e) { /* completeness — never abort */ }
+
+  // ⚠ CONDITIONALS LAST OF THE FILLERS, because they read their SIBLINGS' answers — "If you
+  // answered yes to questions 4 or 5, please explain, if no please type \"n/a.\"" cannot be decided
+  // until 4 and 5 have been answered. Before the counts, though: it promotes records from `skipped`
+  // to `filled` / `filled_review`, and the envelope must report what it left behind (the same
+  // ordering lesson atsSurfacePrefilled records just above). Never aborts the fill.
+  try { await atsAnswerConditionals(act, ats, scan, results, profile, jobContext, (m) => console.log("[ApplyPilot]" + m)); }
+  catch (e) { /* completeness — never abort */ }
 
   // ⚠ THE REPEATING ENTRIES, AND THEY MUST RUN AFTER THE FLAT LOOP. Every ORC step is scanned for
   // flat fields; a repeating block contributes NOTHING to that scan until an Add is pressed, because
@@ -11567,12 +12740,12 @@ function atsInjSelectNative(inputSel, optionText) {
 
 // AI fallback for a REQUIRED field the deterministic tiers left empty. Same safety contract
 // as AI-1/AI-2: the choice must clear the match ladder vs live options; ALWAYS flagged.
-async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetched) {
+async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetched, essaysDoc) {
   const wt = f.widgetType;
   try {
     if (wt === "textarea" || wt === "text" || wt === "date") {
       // use the concurrently-prefetched answer when there is one (atsPrefetchAiText); otherwise ask now
-      const ai = prefetched || await atsAiWriteText(act, f, profile, jobContext);
+      const ai = prefetched || await atsAiWriteText(act, f, profile, jobContext, essaysDoc);
       if (!ai.ok || !ai.answer) {
         // REQUIRED text the AI can't ground: write "N/A" — a real, submittable answer that reads
         // correctly on the form (operator 2026-07-31: "never answer with AI declined, N/A would be
@@ -11589,6 +12762,9 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
           (ai && ai.error && ai.error !== "ai-declined" ? " (" + ai.error + ")" : "");
         return;
       }
+      // ⚠ THE AI PATH NEEDS THIS MORE THAN THE DETERMINISTIC ONE, not less: an unmapped salary
+      // question is exactly the shape that reaches the AI, and a model asked for a desired salary
+      // answers "$75,000" — the spelling the form rejects. Same helper as the deterministic seam.
       const r = await act.eval(atsInjSetText, ref.inputSel, String(ai.answer));
       const back = await act.eval(atsInjReadValue, ats, ref.inputSel, wt);
       rec.after = back && back.ok ? back.value : (r && r.after) || null;
@@ -11689,10 +12865,31 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     else if (wt === "dropdown_native") committed = await act.eval(atsInjSelectNative, ref.inputSel, pick);
     else if (wt === "icims_dropdown") committed = await act.eval(atsInjIcimsCommit, ref.inputSel, pick);
     else committed = await act.eval(atsInjCommitOption, ref.inputSel, pick);
-    const back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
+    let back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
+    let okv = committed && committed.ok && String((back && back.value) || "").trim() !== "";
+    // ⚠⚠ A CHILD DROPDOWN HAS NO OPTIONS UNTIL ITS PARENT COMMITS — and the AI batch answers both in
+    // the SAME pass (live 2026-09-13, reproduced on TWO tenants, so this is a class rather than one
+    // tenant's quirk). iCIMS declares the dependency in the DOM (`data-ddd-child-link`) and the
+    // child's list reads "Please select…" until the parent lands, so the child is committed against
+    // a list that does not exist yet: `rcf3049` ("Please specify", the child of "How did you hear
+    // about us") came back `commit failed` on both RoviSys and Rockefeller, and then failed the
+    // submit gate as an unanswered REQUIRED field.
+    //
+    // ONE retry, after a settle. This is not hoping: the parent was committed moments ago by this
+    // same pass, so the reaction being waited for is one we caused. A second failure is a real
+    // failure and still lands in review — the AI answer is flagged either way, so a retry can cost
+    // a beat but never a silent wrong value.
+    if (!okv && ats === "icims" && (wt === "dropdown" || wt === "icims_dropdown" || wt === "dropdown_native")) {
+      await act.delay(900);
+      const again = wt === "icims_dropdown" ? await act.eval(atsInjIcimsCommit, ref.inputSel, pick)
+        : wt === "dropdown_native" ? await act.eval(atsInjSelectNative, ref.inputSel, pick)
+          : await act.eval(atsInjCommitOption, ref.inputSel, pick);
+      back = await atsReadBackSettled(act, ats, ref.inputSel, wt);
+      okv = again && again.ok && String((back && back.value) || "").trim() !== "";
+      if (okv) rec.retriedAfterParent = true;
+    }
     rec.after = back && back.ok ? back.value : null;
     atsAttachOptions(rec, texts);
-    const okv = committed && committed.ok && String(rec.after || "").trim() !== "";
     rec.status = okv ? "filled_review" : "needs_review"; // AI is NEVER a silent fill
     rec.resolved = [ai.choice];
     rec.confidence = String(ai.confidence || "low").toLowerCase();
@@ -11704,7 +12901,8 @@ async function atsAiFallback(act, ats, f, ref, rec, jobContext, profile, prefetc
     rec.flag = atsIsEeoLabel(f.label)
       ? "ai-eeo-guess"
       : (atsFd.legallyLoaded(f.label) ? "ai-choice-sensitive" : "ai-choice");
-    rec.detail = "AI: " + (ai.justification || "inferred") + (okv ? "" : " — commit failed");
+    rec.detail = "AI: " + (ai.justification || "inferred")
+      + (okv ? (rec.retriedAfterParent ? " — committed on a retry once its parent question had landed" : "") : " — commit failed");
     rec.maps_to = ai.maps_to || ""; rec.suggested_category = ai.suggested_category || "";
   } catch (e) {
     rec.status = "needs_review";
@@ -11720,7 +12918,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsCredentialKind, atsCredentialValue, atsCredentialRecheck, atsFinishFill, atsSurfacePrefilled, atsMapKey,
     atsGeoValueInProfile, atsProfileAddressValues, atsTierIsDeterministic,
     atsEntrySpec, atsAssignEntryIndexes, atsScopeForField, atsResolveEntryField, atsMayContactCandidates, atsDefaultDay, ATS_DEFAULT_DAY, atsIsFutureYearMonth, atsGrowIcimsEntries, atsMonthCandidates, ATS_ICIMS_ENTRY_MAPS, ATS_MONTHS,
-    atsIcimsResumeStage, atsIcimsAwaitParse, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
+    atsIcimsResumeStage, atsIcimsAwaitParse, atsInjIcimsPostParseProbe, icimsExpectsContentFrame, atsFormSignature, ATS_ICIMS_PARSE, ATS_ICIMS_QUIET_ROOT,
     atsInjLeanSignature,
     atsAiFallback, atsAiChooseOption, atsAiWriteText,
     ATS_AI_BATCH_MAX, atsAiBatchKind, atsBuildBatchPrompt, atsParseBatchReply, atsBatchMaxTokens,
@@ -11737,8 +12935,17 @@ if (typeof module !== "undefined" && module.exports) {
     atsInjAuthScan, icimsAuthView, icimsLooksLikeSso, ICIMS_AUTH_MAX_CONTROLS,
     atsConsentKind, atsConsentPlan, atsInjTickConsent, atsDecoyKind, orcApplyView, atsInjOrcAuthScan,
     atsInjOrcClickButton, atsInjOrcFillPin, atsInjOrcPick, atsInjOrcReadPicker, atsInjOrcCaptureOptions, atsOrcCaptureEligible, atsCaptureOrcOptions, ATS_ORC_PICK_MS, atsOrcGeoPlan, ATS_ORC_GEO_ANCHOR, atsInjOrcEntryState, atsInjOrcEntryAction, atsOrcEntryPlan, ATS_ORC_ENTRY_BLOCKS, ATS_ORC_ENTRY_MAPS, ATS_ORC_ENTRY_MAX,
-    ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE,
-    atsInjClickAuthSubmit, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
+    ATS_CONSENT_ACCEPT_RE, ATS_CONSENT_OPTIN_RE, ATS_CONSENT_ATTEST_RE, ATS_CONSENT_CONDITIONAL_RE,
+    atsInjClickAuthSubmit, atsInjAuthControls, ICIMS_MAILED_LINK_RE, icimsMailedCredential, icimsIsAdminLogin,
+    icimsAccountExists, icimsLoginControlPick, atsInjIcimsLoginLink, icimsIsIcimsHost,
+    atsEnrolmentDecline, atsInjClickButtonByCaption, ATS_ENROL_HEADING_RE, ATS_ENROL_DECLINE_ORDER,
+    atsConsentGateNext,
+    atsInjIcimsSubmitControls, icimsAdvancePick, ICIMS_ADVANCE_PREF, ICIMS_ADVANCE_DENY,
+    icimsScratchEmail, icimsUnscratchEmail, atsUnscratchRecords,
+    atsIsSalaryAmountField, atsSalaryDigits, ATS_SALARY_Q_RE, ATS_SALARY_AMOUNT_RE,
+    atsErrorDemand, atsMatchErrorToField, atsValueForDemand,
+    atsConditionalSpec, atsQuestionOrdinal, atsAnswerIsAffirmative, atsResolveConditional, atsAnswerConditionals,
+    ICIMS_ACCOUNT_TAKEN_RE, ICIMS_ACCOUNT_SUBJECT_RE,
     atsInjFindEmbeddedForms, atsPickEmbeddedForm, atsDurableFieldName, atsSubmitKey, atsDeclineOption,
     atsIsEeoLabel,
     atsPreferredNameValue, atsLooksLikeApplicationForm, atsAssertionLead, atsAssertionDeclined, atsCommitYesNo, atsOrcDurableName,
@@ -11746,7 +12953,7 @@ if (typeof module !== "undefined" && module.exports) {
     atsPlacePick, atsPostingGone, ATS_LOCATION_LABEL_RE,
     atsReadBackSettled,
     atsInjReadComboInput, atsInjScan, atsInjSetText, atsInjSetCredential, atsInjVerifyCredential, atsInjReadValue, atsInjOpenAndReadOptions, atsInjReadOptions,
-    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsEducationAnswer, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
+    atsInjFrameFieldY, atsInjScrollTopToFrameY, atsEducationAnswer, atsInjAwaitOptionsOrQuiet, atsInjIcimsFrameSrc, atsInjIcimsFrameOffset, atsInjIcimsSteps, atsInjIcimsAddEntry, atsInjIcimsOpen, atsInjIcimsSearch, atsInjIcimsReadOptions, atsInjIcimsCommit, atsInjIcimsRead, atsInjIcimsClose,
     atsInjTypeInCombo, atsInjCommitOption, atsInjCloseCombo, atsInjCheckOption, atsInjSetChecked,
     atsInjClickYesNo, atsInjAttachFile, atsInjReadFileState, atsInjPlacesReady, atsInjScrollIntoView, atsInjSubmitState, atsInjErrors, atsInjSelectNative,
     atsInjEmailVerifyState, atsInjFillEmailCode,

@@ -215,3 +215,38 @@ test("workExperienceRecency: currently-held = Infinity; by end then start; else 
   assert.strictEqual(workExperienceRecency({ from: "2019-07", to: "YYYY-MM" }), 2019 * 12 + 7);
   assert.strictEqual(workExperienceRecency({}), -Infinity);
 });
+
+// ── FULL ISO DATES — the shape the website's profile editor actually stores ────────────────
+//
+// ⚠⚠ Every test above uses "YYYY-MM", which is what the ORIGINAL profile format stored — so this
+// whole recency suite passed green while the operator's real profile (full dates: "2026-05-15",
+// "2024-09-01", "2025-05-01", read live out of Supabase 2026-09-08) scored -Infinity across the
+// board and the ordering silently degraded to the profile's stored order. A fixture that only
+// ever uses one of two live formats cannot notice that the other one is broken.
+
+test("⚠ recency ranks FULL ISO dates, the format the website stores", () => {
+  assert.strictEqual(workExperienceRecency({ to: "2020-03-17" }), 2020 * 12 + 3);
+  // a full "from" still backs up a missing/placeholder "to"
+  assert.strictEqual(workExperienceRecency({ from: "2019-07-01", to: "YYYY-MM-DD" }), 2019 * 12 + 7);
+  // and the two formats are directly comparable, so a MIXED profile still orders correctly
+  assert.ok(workExperienceRecency({ to: "2023-01-05" }) > workExperienceRecency({ to: "2020-11" }));
+});
+
+test("⚠ sorts most-recent-first with the operator's real full-date entries", () => {
+  // The three jobs that filled GE Vernova (dates verbatim), deliberately supplied in a
+  // NON-recency order so a no-op sort cannot pass this.
+  const arr = [
+    { job_title: "CMR", from: "2024-09-01", to: "2026-05-01" },
+    { job_title: "Rivian", from: "2026-05-15", to: "2026-08-05" },
+    { job_title: "FSU", from: "2025-05-01", to: "2025-08-01" }
+  ];
+  assert.deepStrictEqual(titles(arr), ["Rivian", "CMR", "FSU"]);
+});
+
+test("⚠ a mixed-format profile does not put full dates last", () => {
+  const arr = [
+    { job_title: "MonthOnly", to: "2019-01" },
+    { job_title: "FullDate", to: "2024-08-05" }
+  ];
+  assert.deepStrictEqual(titles(arr), ["FullDate", "MonthOnly"]);
+});

@@ -4,6 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 import { isSupabaseConfigured, SITE_URL } from "@/lib/env";
 import { coerceProfile } from "@/lib/profile-schema";
 import { coerceBuckets, ensureStarterBuckets, STARTER_BUCKETS } from "@/lib/buckets";
+import { coerceEssays } from "@/lib/essays";
 import { ensureDefaultFieldWordings } from "@/lib/teach";
 import { coerceAiConfig, type AiConfig } from "@/lib/ai-config";
 import { coerceCredentials, coerceOnboardConfig, type Credentials, type OnboardConfig } from "@/lib/credentials";
@@ -15,6 +16,11 @@ export type ProfileSlice = {
   profile: unknown;
   defaults: unknown;
   buckets: unknown;
+  /** The operator's own written answers + style notes (web/lib/essays.ts). Rides WITH the profile
+   *  rather than as its own sync kind: the extension's AP_SYNC_PROFILE guard only looks at
+   *  profile/defaults/jobContext, so an essays-only push would be rejected as "nothing to sync" —
+   *  the same trap documented for buckets in lib/extension-sync.ts. */
+  essays: unknown;
   jobContext: { company: string };
 };
 // The WHOLE ai_config goes to the extension, not a hand-picked subset. It used to send
@@ -41,6 +47,7 @@ type ProfileRow = {
   job_context_json?: unknown;
   ai_config?: unknown;
   buckets_json?: unknown;
+  essays_json?: unknown;
 } | null;
 
 // ── Pure shaping (kept private — a "use server" file may only export async fns).
@@ -60,9 +67,12 @@ function shapeProfileSlice(row: ProfileRow): ProfileSlice {
     ensureStarterBuckets(row?.buckets_json != null ? coerceBuckets(row.buckets_json) : STARTER_BUCKETS),
     profile,
   );
+  // Essays: no starter set and no provisioning — an empty library is the honest initial state, and
+  // coerceEssays turns null into it.
+  const essays = coerceEssays(row?.essays_json);
   const jc = row?.job_context_json as { company?: string } | null;
   const jobContext = jc?.company !== undefined ? { company: jc.company as string } : { company: "" };
-  return { profile, defaults, buckets, jobContext };
+  return { profile, defaults, buckets, essays, jobContext };
 }
 
 function shapeAiSlice(row: ProfileRow): AiSlice {
@@ -119,7 +129,7 @@ export async function getProfileSyncSlice(): Promise<ProfileSliceResult> {
     if (!auth.ok) return auth;
     const { data } = await auth.supabase
       .from("profiles")
-      .select("profile_json, job_context_json, buckets_json")
+      .select("profile_json, job_context_json, buckets_json, essays_json")
       .eq("id", auth.user.id)
       .maybeSingle();
     return { ok: true, slice: shapeProfileSlice(data) };
@@ -166,7 +176,7 @@ export async function getSyncBundle(): Promise<BundleResult> {
 
     const { data: prow } = await supabase
       .from("profiles")
-      .select("profile_json, job_context_json, ai_config, buckets_json, credentials_json, onboard_config")
+      .select("profile_json, job_context_json, ai_config, buckets_json, essays_json, credentials_json, onboard_config")
       .eq("id", user.id)
       .maybeSingle();
 

@@ -26,8 +26,10 @@ with checks as (
          (select count(*) from information_schema.columns
            where table_schema = 'public' and table_name = 'profiles'
              and column_name in ('buckets_json','teach_dismissed_json','teach_deleted_json',
-                                 'credentials_json','onboard_config'))::text,
-         '5'
+                                 'credentials_json','onboard_config',
+                                 -- 0019: the essay voice library
+                                 'essays_json'))::text,
+         '6'
 
   union all
   -- 0015: the resumes kind constraint must allow 'source'

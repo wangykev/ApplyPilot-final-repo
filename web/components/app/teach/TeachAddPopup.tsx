@@ -220,14 +220,20 @@ export function TeachAddPopup({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose} role="presentation">
-      <div className={clsx("w-full rounded-xl border border-hairline bg-panel p-5 shadow-2xl", route === "both" ? "max-w-3xl" : "max-w-md")} onClick={(e) => e.stopPropagation()}>
-        <div className="mb-3 flex items-center justify-between">
+      {/* ⚠ SCROLLABLE, HEADER AND FOOTER PINNED (operator, 2026-09-03) — same fix and same reason as
+          RememberedAnswerPopup: with no height cap a long question (sponsorship-future) grew past
+          the viewport, and a `fixed` overlay leaves nothing to scroll, so Done/Cancel were
+          unreachable. `dvh` so a collapsing mobile toolbar cannot hide the footer. `min-h-0` on the
+          body is required or flex refuses to shrink it. */}
+      <div className={clsx("flex max-h-[calc(100dvh-2rem)] w-full flex-col rounded-xl border border-hairline bg-panel shadow-2xl", route === "both" ? "max-w-3xl" : "max-w-md")} onClick={(e) => e.stopPropagation()}>
+        <div className="flex shrink-0 items-center justify-between px-5 pt-5 pb-3">
           <h3 className="font-mono text-[11px] uppercase tracking-label text-ink-dim">{title}</h3>
           <button type="button" onClick={onClose} className="text-ink-faint hover:text-ink" aria-label="Close">
             <X className="h-4 w-4" />
           </button>
         </div>
 
+        <div className="min-h-0 flex-1 overflow-y-auto px-5">
         {/* the card being taught — always shown so the confirm has context */}
         <div className="mb-4 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2 text-xs">
           <p className="text-ink-dim">{card.question}</p>
@@ -367,7 +373,8 @@ export function TeachAddPopup({
           </div>
         )}
 
-        <div className="mt-5 flex justify-end gap-2">
+        </div>
+        <div className="flex shrink-0 justify-end gap-2 border-t border-hairline px-5 pt-4 pb-5">
           <button type="button" onClick={onClose} className="btn-ghost px-3 py-1.5 text-sm" disabled={saving}>
             Cancel
           </button>

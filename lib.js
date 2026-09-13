@@ -4,15 +4,41 @@
 // The injected engine can't import this (it's stringified), so anything the engine
 // needs is computed in the SW from these helpers and passed in as plain values.
 
-// Parse a profile "YYYY-MM" date into zero-padded { year, month } segments for the
-// Workday date spinbuttons — or null if it isn't a real year-month. Rejecting the
-// literal "YYYY-MM" placeholder is what stops us typing it into the form. Accepts an
-// un-padded month ("2023-5" → "05") and rejects out-of-range months ("2023-13").
+// Parse a profile date into zero-padded { year, month } segments for the Workday date
+// spinbuttons — or null if it isn't a real year-month. Rejecting the literal "YYYY-MM"
+// placeholder is what stops us typing it into the form. Accepts an un-padded month
+// ("2023-5" → "05") and rejects out-of-range months ("2023-13").
+//
+// ⚠⚠ A FULL "YYYY-MM-DD" IS ACCEPTED, AND THE DAY IS DISCARDED. This was `$`-anchored after
+// the month until 2026-09-08, so every full ISO date returned NULL — and the WEBSITE's profile
+// editor stores work-experience dates as full dates (live: "2026-05-15", "2024-09-01",
+// "2025-05-01"). The consequences were all silent, and none of them looked like a date bug:
+//
+//   • `fromParsed`/`toParsed` came back null, so the REQUIRED Workday From/To composite had
+//     nothing deterministic and fell through to the AI, which answered all THREE jobs with the
+//     same 8/2024–5/2028 — the operator's EDUCATION span. Three different jobs on a real
+//     application claiming identical employment dates, flagged `ai-date-guess` for a human to
+//     re-approve one at a time, for dates that were in the profile the whole time.
+//   • `workExperienceRecency` and `sortWorkExperienceByRecency` ALSO parse through here, so
+//     every entry scored -Infinity and "most recent job first" silently degraded to the
+//     profile's stored order.
+//
+// DISCARDING THE DAY IS NOT LOSING PRECISION — the Workday composite is MM/YYYY and has no day
+// slot, so month granularity is the form's own. (The inverse rule holds elsewhere and for the
+// same reason: a form with no day must not have one invented for it, and `parseYearMonthDay`
+// still refuses a partial "YYYY-MM" because a Month/DAY/Year composite genuinely needs one.)
+//
+// An out-of-range DAY still rejects the whole string: if "2024-06-99" is not a real date, its
+// month and year are not trustworthy evidence either — the same judgement parseYearMonthDay makes.
 function parseYearMonth(iso) {
-  const m = /^(\d{4})-(\d{1,2})$/.exec(String(iso == null ? "" : iso).trim());
+  const m = /^(\d{4})-(\d{1,2})(?:-(\d{1,2}))?$/.exec(String(iso == null ? "" : iso).trim());
   if (!m) return null;                       // no match — includes the "YYYY-MM" placeholder
   const month = parseInt(m[2], 10);
   if (month < 1 || month > 12) return null;  // out of range
+  if (m[3] !== undefined) {                  // a day was supplied — validate, then drop it
+    const day = parseInt(m[3], 10);
+    if (day < 1 || day > 31) return null;
+  }
   return { year: m[1], month: String(month).padStart(2, "0") };
 }
 
@@ -855,10 +881,40 @@ const RELOCATE_PAST_RE = /\bhave you (ever )?relocat|\bpreviously relocat|\bhave
 // ⚠ `reimburs` carries NO trailing  — the boundary fails INSIDE "reimbursed"/"reimbursement",
 // which let "Will relocation expenses be reimbursed?" through to a "Yes" about willingness.
 const RELOCATE_EMPLOYER_PROVISION_RE = /\b(assistance|package|allowance|stipend|benefit|paid for|cover the cost|who pays)\b|\breimburs|\bwill .*\bbe (provided|covered|offered)\b/i;
+// ⚠⚠ A THIRD REFUSAL: asking WHICH PLACES is not asking WHETHER (live 2026-09-08, Intel Workday).
+//
+// *"Please indicate your geographical preference by marking sites of interest including areas you are
+// open to relocating to:"* is a REQUIRED multi-select of Intel's sites — Austin TX, Chandler AZ,
+// Folsom CA, Hillsboro OR, Hudson MA, New Albany OH, Rio Rancho NM, Santa Clara CA, San Jose CA, All,
+// Other. The phrase "open to relocating to" tripped RELOCATE_ASK_RE, so this returned `willing` and
+// `relocationCandidates` supplied `["Yes","True"]` — an answer to a question nobody asked, against a
+// widget on which no option can ever match it. The group stayed empty, and because a rung HAD
+// "answered", the AI rescue downstream was gated out and the walk halted on a required blank field.
+//
+// The profile cannot answer this in ANY case: `willing_to_relocate` is a yes/no preference and holds
+// no opinion about Folsom vs Hillsboro. So the honest outcome is to refuse, let it fall through to the
+// AI, and have it arrive FLAGGED as a picker the operator can change — the same treatment the
+// employer-provision wording already gets, and for the same reason.
+//
+// ⚠ Checked BEFORE own_cost, so "mark the sites you would move to at your own expense" is refused too:
+// it is still a places question, and own_cost would answer it with a bare Yes/No just as wrongly.
+// ⚠ Kept NARROW on purpose — a genuine willingness question that merely NAMES a place must still be
+// answered ("Would you relocate to one of our offices?", "Are you willing to relocate to a different
+// location?"), so a bare place word is never enough: it takes "<place> of interest", an explicit
+// geographic PREFERENCE, a mark/select/rank verb aimed at places, or "which <place>".
+const RELOCATE_PLACE = "sites?|locations?|offices?|cities|city|campus|campuses|regions?|facilit(?:y|ies)|plants?";
+const RELOCATE_SITE_PICK_RE = new RegExp(
+  "\\b(?:" + RELOCATE_PLACE + ")\\b[^.?!]{0,30}\\bof interest\\b" +
+  "|\\bgeographic(?:al)?\\s+(?:preference|location)" +
+  "|\\b(?:mark|marking|select|selecting|choose|choosing|indicate|indicating|rank|ranking)\\b[^.?!]{0,60}\\b(?:" + RELOCATE_PLACE + ")\\b" +
+  "|\\bwhich\\s+(?:of\\s+the\\s+following\\s+)?(?:" + RELOCATE_PLACE + ")\\b",
+  "i"
+);
 function recognizeRelocationQuestion(label) {
   const t = String(label == null ? "" : label).replace(/\s+/g, " ").trim();
   if (!t || !RELOCATE_ASK_RE.test(t)) return null;
   if (RELOCATE_PAST_RE.test(t)) return null;
+  if (RELOCATE_SITE_PICK_RE.test(t)) return null;   // asks WHICH places — the profile holds no such fact
   if (RELOCATE_OWN_COST_RE.test(t)) return { kind: "own_cost" };
   if (RELOCATE_EMPLOYER_PROVISION_RE.test(t)) return null;
   return { kind: "willing" };
@@ -920,6 +976,109 @@ function errorSetUnchanged(a, b) {
 // "*"/whitespace (required marker), collapse internal whitespace.
 function normalizeLabel(s) {
   return String(s == null ? "" : s).toLowerCase().replace(/[*\s]+$/, "").replace(/\s+/g, " ").trim();
+}
+
+// ── ESSAY VOICE SAMPLES: pick the few worth spending prompt on (2026-09-03) ─────────────────────────
+//
+// The operator's own past answers are stored on the website (`profiles.essays_json`) and synced into
+// `chrome.storage.local.essays`. They go into an essay prompt as VOICE SAMPLES the model may also
+// mine for concrete facts — the operator's essays carry project detail their résumé does not.
+//
+// ⚠ A FEW, NOT ALL (operator's choice, and a hard requirement rather than a preference). Essays are
+// long; the library grows with every application; and both ATS prompt sites already truncate the
+// profile at 12 000 chars. Sending everything would grow the prompt without bound, cost more on
+// every fill, and eventually crowd out the profile itself. So: rank by overlap with the question
+// being answered, break ties by recency, and stop at a char budget.
+//
+// ⚠ RANKED ON THE STORED QUESTION FIRST, the text second. What makes a sample useful for "describe a
+// project with embedded systems" is that it ANSWERED something similar — the body is a weaker signal
+// (a long essay shares common words with everything, so weighting it equally lets the longest essay
+// win every question).
+const ESSAY_STOP_WORDS = new Set(["the", "a", "an", "and", "or", "to", "of", "in", "for", "with", "that",
+  "this", "it", "is", "are", "was", "were", "be", "been", "you", "your", "we", "our", "i", "my", "me",
+  "on", "at", "as", "by", "from", "have", "has", "had", "do", "does", "did", "please", "describe",
+  "tell", "us", "about", "why", "what", "how", "which", "who", "when", "one", "two", "any", "some",
+  "max", "words", "sentences", "characters", "answer", "question", "if", "so", "but", "not", "can"]);
+
+function essayTokens(s) {
+  return String(s == null ? "" : s)
+    .toLowerCase().replace(/[^a-z0-9+#. ]+/g, " ").split(/\s+/)
+    .filter((w) => w.length > 2 && !ESSAY_STOP_WORDS.has(w));
+}
+
+/**
+ * Choose the essays to show the model for ONE question.
+ *
+ * Returns newest-first among equally-scoring samples, each truncated to `perEssayChars` and the whole
+ * set to `totalChars`. An empty/absent library returns [] — every caller must treat the block as
+ * optional, because most operators will have none for a while.
+ */
+function selectEssaysForQuestion(essays, question, opts) {
+  const o = opts || {};
+  const max = o.max == null ? 3 : o.max;
+  const perEssayChars = o.perEssayChars == null ? 700 : o.perEssayChars;
+  const totalChars = o.totalChars == null ? 2200 : o.totalChars;
+  const list = Array.isArray(essays) ? essays.filter((e) => e && String(e.text || "").trim()) : [];
+  if (!list.length || max <= 0 || totalChars <= 0) return [];
+
+  const qTokens = new Set(essayTokens(question));
+  const scored = list.map((e, i) => {
+    const qs = new Set(essayTokens(e.question));
+    const ts = new Set(essayTokens(e.text));
+    let score = 0;
+    qTokens.forEach((t) => {
+      if (qs.has(t)) score += 3;        // it answered a question like this one — the strong signal
+      else if (ts.has(t)) score += 1;   // it merely mentions the topic
+    });
+    return { e, score, i };
+  });
+  // Recency breaks ties. `created_at` is an ISO string, so a plain compare is chronological; the
+  // original index is the last resort so the order is deterministic for equal timestamps (a test
+  // relies on that, and so does a stable prompt across re-fills of the same page).
+  scored.sort((a, b) => (b.score - a.score)
+    || String(b.e.created_at || "").localeCompare(String(a.e.created_at || ""))
+    || (a.i - b.i));
+
+  const out = [];
+  let used = 0;
+  for (const s of scored) {
+    if (out.length >= max) break;
+    const text = String(s.e.text || "").slice(0, perEssayChars);
+    if (used + text.length > totalChars) continue;   // skip this one, a shorter later one may fit
+    out.push({ ...s.e, text });
+    used += text.length;
+  }
+  return out;
+}
+
+/**
+ * The prompt block. ONE definition, so all four prompt sites (ATS single + batch, Workday single +
+ * batch) say exactly the same thing to the model — the wording is a safety property, not cosmetics.
+ *
+ * ⚠ The two instructions pull in opposite directions ON PURPOSE. "Match this voice" is why the
+ * samples are here at all; "you MAY reuse concrete facts" is the operator's explicit grant, because
+ * their essays describe projects in more detail than their résumé. The third line is the guard: a
+ * sample that answered a DIFFERENT question must not be pasted in wholesale, which is exactly what a
+ * model handed prose examples will otherwise do.
+ */
+function essayPromptBlock(essays, styleNotes) {
+  const style = String(styleNotes || "").trim();
+  const list = Array.isArray(essays) ? essays : [];
+  if (!list.length && !style) return "";
+  let out = "";
+  if (style) out += "\nHOW I WRITE (my own instructions): " + style;
+  if (list.length) {
+    out += "\nMY OWN PAST ANSWERS — my writing, not yours. Match this voice: sentence length,"
+      + " directness, how I open, how much detail I give."
+      + " You MAY reuse concrete facts from them (projects, tools, numbers) when they genuinely answer"
+      + " THIS question — they describe my work in more detail than my resume does."
+      + " Do NOT copy an answer wholesale if the question is different.";
+    list.forEach((e, i) => {
+      out += "\n--- sample " + (i + 1) + (e.question ? "\nQ: " + String(e.question).slice(0, 300) : "")
+        + "\nA: " + String(e.text || "");
+    });
+  }
+  return out;
 }
 
 // ── ERROR-TEXT ↔ FIELD-LABEL matching key (2026-08-07) ──────────────────────────────────────────────
@@ -2506,6 +2665,7 @@ function reportOutcome(status) {
 
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
+  selectEssaysForQuestion, essayPromptBlock,
   groupSelection, joinGroupValue, splitGroupValue, GROUP_JOIN, reviewValuesOf, isCompensationQuestion, isSignatureDateQuestion, signatureDateDemanded, signatureDateAskInText, isJobPostingGone, sameCalendarDate,
   recognizeClearanceQuestion, clearanceCandidates, clearanceAliases, CLEARANCE_ALIASES,
   recognizeRelocationQuestion, relocationCandidates,

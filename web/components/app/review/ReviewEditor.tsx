@@ -20,6 +20,8 @@ import Link from "next/link";
 import { Eye, EyeOff } from "lucide-react";
 import { clsx } from "@/lib/clsx";
 import type { ReviewBundle, ReviewEntry, FieldShape, WalkStatus } from "@/lib/review-summary";
+import { isEssayAnswer } from "@/lib/essays";
+import { captureEssay } from "@/app/app/teach/actions";
 import {
   editKindOf,
   checkedOf,
@@ -95,6 +97,11 @@ export function ReviewEditor({
   credentials?: { email: string; password: string } | null;
 }) {
   const [bundle, setBundle] = useState<ReviewBundle>(initialBundle);
+  // The employer, for an essay captured below. A REF, not a dep: `commit` is memoised on
+  // [patchEntry] and adding a changing value would rebuild every field editor on each render.
+  // Recorded as context only — a company name in a saved essay is never used to target a later
+  // answer (see web/lib/essays.ts).
+  const companyRef = useRef<string>(String(initialBundle?.tenant || ""));
   const [filter, setFilter] = useState<Filter>("all");
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const [saveState, setSaveState] = useState<SaveState>("idle");
@@ -166,6 +173,26 @@ export function ReviewEditor({
       } else if (entry.is_approved) {
         patch.is_approved = false;
         patch.approved_at = null;
+      }
+      // ⚠⚠ CAPTURE AN ESSAY THE OPERATOR JUST WROTE (2026-09-03). This is the one funnel every value
+      // edit passes through, and it is the only place that can see "the AI drafted X, the human
+      // replaced it with Y" — `edit_kind` is RECOMPUTED on every commit, never appended, so an
+      // operator who edits and later reverts destroys the evidence. Nothing downstream can recover
+      // it from the bundle afterwards, which is why capture happens here rather than in a sweep.
+      //
+      // `isEssayAnswer` judges the MERGED entry (with the new value and the fresh edit_kind), gating
+      // on length and prose shape rather than on the widget — a long essay routinely arrives in a
+      // plain text input, and a list can arrive in a textarea.
+      //
+      // Fire-and-forget, and deliberately not awaited or surfaced: this runs beside the bundle
+      // autosave, and losing a style sample must never delay or fail an approved answer. A duplicate
+      // from TextBox's blur-commit is collapsed server-side by dedupeEssays.
+      if (isEssayAnswer({ ...merged, ...patch })) {
+        void captureEssay({
+          question: String(merged.question_label_full || merged.question_label || ""),
+          text: String(value || ""),
+          company: companyRef.current || "",
+        }).catch(() => {});
       }
       // Preferred-name reveal (mirror the profile page + the form cascade): CHECKING "I have a
       // preferred name" reveals the preferred first/last fields. If the first fill had the box

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, ChevronDown, RotateCcw, Trash2 } from "lucide-react";
+import { Check, SkipForward, Plus, Sparkles, ShieldAlert, Loader2, ChevronDown, RotateCcw, Trash2, PenLine } from "lucide-react";
 import { BucketFieldPopup } from "@/components/form/BucketFieldPopup";
 import { isModeA, type Bucket } from "@/lib/buckets";
 import type { Profile } from "@/lib/profile-schema";
@@ -13,10 +13,12 @@ import {
   profileValueAt,
   humanize,
   isFuzzyTier,
+  looksLikeYesNoQuestion,
 } from "@/lib/teach";
 import { saveBuckets, saveProfile } from "@/app/app/profile/actions";
 import { liveSync } from "@/lib/extension-sync";
-import { saveDismissed, saveDeleted, recommendField, type FieldRecommendation } from "@/app/app/teach/actions";
+import { saveDismissed, saveDeleted, recommendField, captureEssay, type FieldRecommendation } from "@/app/app/teach/actions";
+import { essayShapeOk } from "@/lib/essays";
 import { ProfilePanel } from "@/components/app/teach/ProfilePanel";
 import { AnswerEditPopup } from "@/components/app/teach/AnswerEditPopup";
 import { TeachAddPopup, type ConfirmTarget, type AddResult } from "@/components/app/teach/TeachAddPopup";
@@ -221,6 +223,44 @@ export function TeachInbox({
     }
   };
 
+  // Save this answer into the essay library instead of teaching it as a remembered answer.
+  //
+  // ⚠ A long answer is a BAD remembered answer and a GOOD voice sample, which is why this exists as
+  // its own action rather than as an extra checkbox on the teach popup. A remembered answer fills by
+  // EXACT question wording, and an essay question is never worded the same way twice — so teaching
+  // this as one would almost never match, and on the rare day it did it would replay a stale,
+  // verbatim project list into a differently-worded question. The essay library is the other shape:
+  // never replayed, only ever shown to the model as "this is how I write".
+  //
+  // Auto-capture cannot reach these. It fires inside the review editor's `commit()`, so it only ever
+  // sees an answer being typed FROM NOW ON — every essay already sitting in a past bundle (i.e. all
+  // of them, the day this shipped) needs a hand to bring it across.
+  //
+  // Saving SKIPS the card afterwards, so the same answer does not keep nagging as a remembered
+  // answer once it has a better home. Skip is restorable from the Skipped section, so this is not a
+  // one-way door.
+  const saveAsEssay = async () => {
+    if (!card) return;
+    setSaving(true);
+    setNote(null);
+    const res = await captureEssay({
+      question: card.question,
+      text: card.answer,
+      company: card.company || "",
+      source: "manual",
+    });
+    setSaving(false);
+    if (res.ok) {
+      liveSync("profile");   // the extension reads the library from storage; push it like any profile edit
+      // ⚠ ORDER: `skip` clears the note itself, so the confirmation has to be written AFTER it or the
+      // save looks like it did nothing. Both land in one React batch, so the later write is what shows.
+      skip();
+      setNote("Saved to your essays");
+    } else {
+      setNote(`Couldn't save: ${res.error}`);
+    }
+  };
+
   const skip = () => {
     if (card) {
       const next = Array.from(new Set([...dismissed, card.key]));
@@ -283,7 +323,16 @@ export function TeachInbox({
     // through unchanged. (Mode-A teaches already get this — they set a boolean profile field.)
     value: card ? boolAnswerCandidates(card.answer) : [],
     category: recCat || "Other",
-    widget_hint: card && (card.widget === "radio" || card.widget === "checkbox") ? card.widget : "text",
+    // ⚠ A YES/NO QUESTION DEFAULTS TO "Yes / No", NOT Text (operator, 2026-09-03). Only the source
+    // card's WIDGET was consulted, so a yes/no question a tenant rendered as a dropdown (or one
+    // whose card carried no widget at all) seeded as free Text — and the operator then had to
+    // notice and change the Answer type by hand on every such field. The question and its approved
+    // answer are the evidence; see looksLikeYesNoQuestion for why the answer is the stronger of the
+    // two and why the wording test anchors on a leading auxiliary verb.
+    // "radio" is this popup's value for Yes / No (ANSWER_WIDGETS, RememberedAnswerPopup).
+    widget_hint: card && (card.widget === "radio" || card.widget === "checkbox")
+      ? card.widget
+      : (card && looksLikeYesNoQuestion(card.question, card.answer) ? "radio" : "text"),
     questions: card ? [card.question] : [],
     selectors: {},
   });
@@ -340,10 +389,21 @@ export function TeachInbox({
                 <p className="eyebrow">Question</p>
                 <h2 className="mt-1 text-lg font-medium leading-snug text-ink">{card.question}</h2>
               </div>
-              <button onClick={skip} className="btn-ghost shrink-0 px-3 py-1.5 text-xs" title="Don't remember this" disabled={saving}>
-                <SkipForward className="h-3.5 w-3.5" />
-                Skip
-              </button>
+              <div className="flex shrink-0 items-center gap-2">
+                {/* An essay-shaped answer belongs in the essay library, NOT in a remembered answer — a
+                    remembered answer matches on EXACT question wording, which an essay question never
+                    repeats. Offered here because auto-capture only ever sees answers typed from now on. */}
+                {essayShapeOk(card.answer, card.widget) && (
+                  <button onClick={saveAsEssay} className="btn-ghost px-3 py-1.5 text-xs" title="Save to your essay library" disabled={saving}>
+                    <PenLine className="h-3.5 w-3.5" />
+                    Save as essay
+                  </button>
+                )}
+                <button onClick={skip} className="btn-ghost px-3 py-1.5 text-xs" title="Don't remember this" disabled={saving}>
+                  <SkipForward className="h-3.5 w-3.5" />
+                  Skip
+                </button>
+              </div>
             </div>
 
             <div className="mt-4 flex flex-wrap items-center gap-2 rounded-lg border border-hairline bg-panel-raised/40 px-3 py-2">
