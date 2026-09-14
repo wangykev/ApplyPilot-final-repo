@@ -7344,25 +7344,47 @@ async function replayField(act, entry, budgets) {
   const sel = deriveFlatWrapperSel(entry);
   if (!sel) return { status: "error", detail: "could not derive a selector from field_id " + JSON.stringify(entry.field_id) };
   const loc = { wrapperSel: sel };
-  // ── THE REPLAY FOLLOWS THE REVIEW PAGE, INCLUDING FOR A SIGNATURE DATE (operator, 2026-08-08) ─────
-  // This used to re-derive a signature date to TODAY on every replay, to dodge Workday's
-  // "Error-Date / Enter today's date" on a bundle approved yesterday. That fixed a stale date and
-  // introduced a worse bug: it wrote a value the human had NOT approved — including onto a date they
-  // had left BLANK — and on the Self Identify page that write CASCADES, making Name and the disability
-  // group required. The rehearse then halted on two questions the human never saw, caused entirely by
-  // our own unapproved write.
+  // ── A SIGNATURE DATE IS ALWAYS TODAY, NEVER THE BUNDLE'S (operator, 2026-09-14) ───────────────────
+  // The replay otherwise follows the review page exactly. A signature date is the ONE deliberate
+  // exception, and it is not a shortcut: the field asserts WHEN YOU SIGNED. Replaying a date approved
+  // on an earlier day states a signing date that never happened, so the approved value is not merely
+  // stale, it is WRONG — which is why Workday rejects it. Today is the only truthful value, so this
+  // joins credentials and the résumé in the small family of things a submit run re-derives per visit
+  // instead of replaying from the bundle.
   //
-  // The rule is now the operator's: the replay always follows the review page. Today's date may only be
-  // written REACTIVELY — when Save & Continue actually comes back with "Enter today's date", the walk
-  // stamps it and re-clicks (see the signature-date remediation in runCdpReplayWalk). That keeps the
-  // approval contract intact and still clears the one error the proactive rewrite existed for.
-  const value = entry.current_value;
+  // ⚠ THIS REINSTATES A PROACTIVE STAMP THAT WAS REMOVED ON 2026-08-08, and the reason it is safe now
+  // is a LATER rule, not a change of mind. The August bug was that stamping wrote onto a date the human
+  // had left BLANK, and on the Self Identify page that write CASCADES — Name and the disability group
+  // become required — so a rehearse halted on two questions the human never saw. Since 2026-08-10 the
+  // fill answers that whole page UNCONDITIONALLY (signature date = today, disability from the profile),
+  // so the bundle already carries Name and disability and the cascade has nothing left to promote.
+  // The hazard that justified removing it has been closed by the fill, not merely accepted here.
+  //
+  // Live 2026-09-14 (Marvell + Intel wd1, both armed submits): the reactive remediation in
+  // runCdpReplayWalk could not save this. It sits in the nav-timeout branch, and the blocked page tripped
+  // sessionLooksDead first, so the walk returned "session-expired" before the stamp could ever run.
+  // Being proactive is what makes it independent of how the failure is classified.
+  //
+  // Narrow by construction: isSignatureDateQuestion rejects any label naming a different event (start /
+  // birth / graduation / expiry / from / to), so a real date question is never overwritten with today.
+  // The review-page reconcile already accepts EITHER the approved value OR today for these (lib.js),
+  // so a stamped date cannot read as a DISAGREE at the submit gate.
+  let value = entry.current_value;
+  const sigDateStamp = (widget === "date" || widget === "text")
+    && apMatch.isSignatureDateQuestion(entry.question_label);
+  if (sigDateStamp) {
+    const t = new Date();
+    value = `${t.getMonth() + 1}/${t.getDate()}/${t.getFullYear()}`;
+  }
   // A checkbox GROUP's answer is a SET. `groupSelection` prefers the authoritative array the review
   // editor writes and falls back to splitting the joined string for a bundle written before it
   // existed — so the replay never has to re-derive the human's choice from a display string when the
   // real one is right there.
   const groupSet = widget === "checkbox_group" ? apMatch.groupSelection(entry) : null;
-  const cleared = entry.edit_kind === "cleared" || value == null || value === "";
+  // ⚠ A STAMPED SIGNATURE DATE IS NEVER "CLEARED". Without the guard an entry the human had emptied
+  // (edit_kind "cleared") would take the blank branch and skip the stamp entirely — which is exactly
+  // the case that blocks the form, since Workday requires the date it is asking for.
+  const cleared = !sigDateStamp && (entry.edit_kind === "cleared" || value == null || value === "");
 
   // CLEARED (human emptied it, or the approved value is empty): leave blank. A fresh submit form starts
   // blank, so this is a verify-blank, not a destructive clear (choice widgets default to their placeholder).

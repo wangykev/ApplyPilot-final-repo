@@ -9989,35 +9989,64 @@ const sigEntry = (label, value) => ({
 });
 const sigField = () => ({ wrapperSel: '[data-automation-id="formField-dateSignedOn"]', fieldName: "dateSignedOn", widgetType: "text", value: "" });
 
-// RULE CHANGE (operator, 2026-08-08): the replay FOLLOWS THE REVIEW PAGE, including for a signature
-// date. Re-deriving it to today on every replay wrote a value the human had not approved — including
-// onto a date they left BLANK — and on the Self Identify page that write CASCADES (Name and the
-// disability group become required), so the rehearse halted on questions the human never saw. Today's
-// date is now written only REACTIVELY, when Workday answers Save & Continue with "Enter today's date"
-// (the stamp lives in runCdpReplayWalk, not here).
-test("replayField: a STALE signature date replays the APPROVED value, not today", async () => {
+// ⚠⚠ THIS RULE HAS FLIPPED TWICE. Read the whole history before changing it again — each flip was
+// driven by a live failure, and the CURRENT rule is only safe because of a fix made between them.
+//
+//   2026-08-07  PROACTIVE: the replay re-derived a signature date to today.
+//               → broke: it wrote onto a date the human had left BLANK, and on the Self Identify page
+//                 that write CASCADES (Name + the disability group become required), so a rehearse
+//                 halted on two questions the human never saw.
+//   2026-08-08  REACTIVE: the replay followed the review page; today was stamped only when Workday
+//               answered Save & Continue with "Enter today's date" (stamp in runCdpReplayWalk).
+//               → broke: that remediation lives in the nav-timeout branch, and on Marvell + Intel wd1
+//                 the blocked page tripped sessionLooksDead FIRST (its validation error carried an
+//                 "Error Code: VPS|…" banner), so the walk returned "session-expired" and three ARMED
+//                 submits were abandoned before the stamp could ever run.
+//   2026-09-14  PROACTIVE AGAIN (operator): "the date in the self identify page on workday ... should
+//               always be today's date, even if it was approved some other date."
+//
+// WHY THE 2026-08-07 HAZARD NO LONGER APPLIES — this is the load-bearing part. Since 2026-08-10 the
+// FILL answers the whole self-ID page UNCONDITIONALLY (signature date = today, disability from the
+// profile), so the bundle already carries Name and disability and the cascade has nothing left to
+// promote. The hazard was CLOSED by the fill, not merely tolerated here.
+//
+// And the rule is right on its own terms: the field asserts WHEN YOU SIGNED, so replaying a date
+// approved on an earlier day states a signing date that never happened. The approved value is not
+// stale, it is WRONG — which is exactly why Workday rejects it.
+test("⚠⚠ replayField: a STALE signature date is re-stamped to TODAY, not replayed", async () => {
   const f = sigField();
   const r = await replayField(makeFakeAct([f]), sigEntry("Date*", SIG_YESTERDAY), T_BUDGETS);
   assert.strictEqual(r.status, "filled");
-  assert.strictEqual(f.value, SIG_YESTERDAY, "the replay must not invent a value the review page did not approve");
-  assert.notStrictEqual(f.value, SIG_TODAY);
+  assert.strictEqual(f.value, SIG_TODAY, "a signature date is re-derived per visit, like a credential");
+  assert.notStrictEqual(f.value, SIG_YESTERDAY, "yesterday's date is a false claim about when you signed");
 });
 
-test("replayField: the explicit signature wordings are NOT re-derived either", async () => {
+test("⚠ replayField: every explicit signature wording is re-derived too", async () => {
   for (const label of ["Date Signed", "Today's Date", "Signature Date", "Date of Completion"]) {
     const f = sigField();
     await replayField(makeFakeAct([f]), sigEntry(label, SIG_YESTERDAY), T_BUDGETS);
-    assert.strictEqual(f.value, SIG_YESTERDAY, `${label} must replay what was approved`);
+    assert.strictEqual(f.value, SIG_TODAY, `${label} must be stamped with today`);
   }
 });
 
-test("replayField: an UNAPPROVED (blank) signature date is left alone — the cascade bug", async () => {
-  // The specific live failure: the proactive rewrite stamped a date the human had left blank, which made
-  // Name and the disability checkbox group required, and the rehearse then halted on both.
+test("⚠⚠ replayField: a BLANK approved signature date is stamped too (see the history above)", async () => {
+  // This is the exact case the 2026-08-08 reversal was protecting, and it is now the case that MATTERS:
+  // Workday is ASKING for this date, so leaving it blank is what blocks the form. Safe because the fill
+  // now answers the rest of the self-ID page, so stamping promotes nothing the bundle cannot answer.
   const f = sigField();
   const r = await replayField(makeFakeAct([f]), sigEntry("Date*", ""), T_BUDGETS);
-  assert.notStrictEqual(f.value, SIG_TODAY, "a blank approval must not become today's date");
-  assert.ok(r.status === "skipped" || f.value === "", `expected no write, got ${JSON.stringify(r)}`);
+  assert.strictEqual(r.status, "filled");
+  assert.strictEqual(f.value, SIG_TODAY, "a blank signature date must still be stamped — it blocks Save");
+});
+
+test("⚠⚠ replayField: a date naming a DIFFERENT event is never stamped", async () => {
+  // The whole safety of stamping rests on isSignatureDateQuestion staying narrow. A start date, a DOB
+  // or a graduation date is a FACT — overwriting one with today would file a false statement.
+  for (const label of ["Date of Birth", "Graduation Date", "Desired Start Date", "Expiration Date"]) {
+    const f = sigField();
+    await replayField(makeFakeAct([f]), sigEntry(label, SIG_YESTERDAY), T_BUDGETS);
+    assert.strictEqual(f.value, SIG_YESTERDAY, `${label} must replay the APPROVED value, never today`);
+  }
 });
 
 test("replayField: a signature date that is ALREADY today writes today (never yesterday)", async () => {

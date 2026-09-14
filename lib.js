@@ -359,14 +359,42 @@ function matchCandidates(candidates, optionTexts, opts) {
 // M31: classify a cdpReadSessionState snapshot as a likely-DEAD/expired Workday
 // session. CONSERVATIVE — a valid form (INCLUDING one showing ordinary VALIDATION
 // errors) is NEVER dead; a false positive would send a fine user to re-auth and lose
-// page state. Recon (Magna, 2026-06-15) proved `vpsErrorPresent` (the "Error Code:
-// VPS|" banner that appears on Save & Continue) is FALSE on a live validation error
-// and TRUE on a dead session — the clean discriminator. Deliberately does NOT key off
-// errorPageText / errorMarkers (a validation error sets those). One-tenant/one-pair
-// proof — re-check if another tenant's validation ever carries a VPS-like code.
+// page state. Deliberately does NOT key off errorPageText / errorMarkers (a validation
+// error sets those).
+//
+// ⚠⚠ `vpsErrorPresent` IS NOT THE CLEAN DISCRIMINATOR IT WAS BELIEVED TO BE — REFUTED
+// LIVE 2026-09-14. The Magna recon (2026-06-15) found VPS false on a live validation
+// error and true on a dead session, and this function trusted it ALONE. That was a
+// one-tenant/one-pair proof, and the comment here said so and asked for a re-check.
+// The re-check arrived: on Marvell and Intel wd1 an armed submit was blocked by an
+// ordinary SIGNATURE-DATE validation error on a fully live page, and the operator read
+// the banner off the screen themselves —
+//
+//     Error-Page Error
+//     - Error Code: VPS|a3d970ea-cbce-4fec-b158-fc9de52b902e
+//
+// …on a page they then FIXED BY HAND by typing today's date, which cleared the error.
+// A page that a human can repair by filling one field is self-evidently not an expired
+// session. The cost was not cosmetic: the walk returned "session-expired" and abandoned
+// three armed submits, and because that return happens BEFORE the nav-timeout branch it
+// also preempted the signature-date remediation that would have fixed the page.
+//
+// So VPS is now EVIDENCE, not PROOF: it counts only when the apply form is no longer
+// there to interact with. `nextButtonPresent` is the precise footer read, so "fields on
+// screen AND a footer Next to press" means the flow is still usable and whatever VPS is
+// reporting is a page-level error, not a dead session. The other three tests are
+// untouched, and they are what actually catch a real expiry — a dead session redirects
+// to login (passwordInput/signInButton/authUrl) or loses the form entirely.
+//
+// ⚠ The residual risk is deliberate and is the SAFE direction: a genuinely dead session
+// that still renders a full form now falls through to the walk's nav-timeout halt, which
+// stops with diagnostics for the operator instead of silently abandoning a submit. The
+// standing rule already says a dirty-state nav-timeout means "eyeball the page".
 function sessionLooksDead(state) {
   if (!state) return false;
-  if (state.vpsErrorPresent) return true;                                              // VPS| code (post-Save&Continue)
+  // A live, interactive apply form — fields to fill and a footer Next to press.
+  const liveApplyForm = (state.formFieldCount || 0) > 0 && !!state.nextButtonPresent;
+  if (state.vpsErrorPresent && !liveApplyForm) return true;                            // VPS| code on a page you can no longer use
   if (state.sessionBanner) return true;                                                // explicit "session expired" text
   if (state.passwordInputPresent || state.signInButtonPresent || state.authUrl) return true; // login/redirect
   if ((state.formFieldCount || 0) === 0 && !state.applyFlowPagePresent) return true;   // no form at all (hard redirect/blank)
