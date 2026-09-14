@@ -1,7 +1,11 @@
 // Unit tests for sessionLooksDead (lib.js) — the M31 session-death classifier.
 // CONSERVATIVE by design: a valid form — INCLUDING one showing ordinary validation
-// errors — is NEVER dead (the false-positive guard; recon-proven that a live
-// validation error has vpsErrorPresent=false).
+// errors — is NEVER dead (the false-positive guard).
+//
+// ⚠ The original claim in this header — "recon-proven that a live validation error has
+// vpsErrorPresent=false" — was REFUTED live on 2026-09-14 (Marvell + Intel wd1). See the
+// annotated VPS tests below; a live validation error CAN carry a VPS code, so VPS alone no
+// longer proves death. The false-positive guard is unchanged and now covers that case too.
 const { test } = require("node:test");
 const assert = require("node:assert");
 const { sessionLooksDead, isWorkdayMaintenance, cdpPageKey } = require("../lib.js");
@@ -36,8 +40,45 @@ test("sessionLooksDead: valid form with an ordinary VALIDATION error → alive (
   assert.strictEqual(sessionLooksDead(validationError), false);
 });
 
-test("sessionLooksDead: VPS error (dead session, post Save & Continue) → dead", () => {
-  assert.strictEqual(sessionLooksDead(Object.assign({}, validForm, { vpsErrorPresent: true })), true);
+// ⚠⚠ 2026-09-14 — THE VPS ASSUMPTION WAS REFUTED LIVE, AND THIS TEST USED TO ASSERT IT.
+// It read: VPS on an otherwise-valid form → dead. The Magna recon (one tenant, one pair) said VPS was
+// false on a live validation error and true on a dead session, so trusting it alone looked safe.
+// On Marvell and Intel wd1 an armed submit was blocked by an ordinary SIGNATURE-DATE validation error
+// on a completely live page, and the operator read the banner off their own screen:
+//
+//     Error-Page Error
+//     - Error Code: VPS|a3d970ea-cbce-4fec-b158-fc9de52b902e
+//
+// …then fixed it BY HAND by typing today's date, and the error cleared. A page a human repairs by
+// filling one field is not an expired session. Three armed submits were abandoned as "session-expired",
+// and that return also preempted the signature-date remediation that would have repaired the page.
+// VPS is therefore EVIDENCE, not PROOF — it counts only once the form is no longer usable.
+test("⚠⚠ VPS code on a LIVE apply form → ALIVE (the 2026-09-14 refutation)", () => {
+  // Exactly the live shape: fields on screen, a footer Next to press, VPS banner showing.
+  const vpsOnLiveForm = Object.assign({}, validForm, {
+    vpsErrorPresent: true,
+    errorMarkers: { count: 1, samples: ["Error-Page Error - Error Code: VPS|a3d970ea-cbce-4fec-b158-fc9de52b902e"] }
+  });
+  assert.strictEqual(sessionLooksDead(vpsOnLiveForm), false,
+    "a VPS banner on a page the operator can still fill is a page error, not a dead session");
+});
+
+test("VPS error with NO usable form → dead (the case the recon actually saw)", () => {
+  // The genuine post-Save & Continue expiry: the flow is gone, so there is nothing left to repair.
+  assert.strictEqual(sessionLooksDead(Object.assign({}, validForm, {
+    vpsErrorPresent: true, formFieldCount: 0, nextButtonPresent: false
+  })), true);
+  // …and fields with no footer Next is equally unusable.
+  assert.strictEqual(sessionLooksDead(Object.assign({}, validForm, {
+    vpsErrorPresent: true, nextButtonPresent: false
+  })), true);
+});
+
+test("⚠ the OTHER death signals still fire even on a live-looking form", () => {
+  // Narrowing VPS must not weaken the tests that actually catch a real expiry.
+  assert.strictEqual(sessionLooksDead(Object.assign({}, validForm, { vpsErrorPresent: true, sessionBanner: true })), true);
+  assert.strictEqual(sessionLooksDead(Object.assign({}, validForm, { vpsErrorPresent: true, authUrl: true })), true);
+  assert.strictEqual(sessionLooksDead(Object.assign({}, validForm, { vpsErrorPresent: true, passwordInputPresent: true })), true);
 });
 
 test("sessionLooksDead: explicit session banner → dead", () => {
