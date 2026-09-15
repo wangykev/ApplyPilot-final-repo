@@ -4,7 +4,7 @@
   "private": true,
   "description": "ApplyPilot Web — the main site for resume upload + extension control",
   "scripts": {
-    "dev": "node --max-old-space-size=4096 ./node_modules/next/dist/bin/next dev",
+    "dev": "node ./scripts/dev.mjs",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
