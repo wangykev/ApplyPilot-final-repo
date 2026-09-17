@@ -5917,6 +5917,10 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
   let fields = [];
   const before = [...block0.querySelectorAll("input, textarea, select")]
     .filter((e) => e.type !== "hidden" && vis(e)).length;
+  // How long the visible field count must hold still before the set is believed complete. Short
+  // enough to cost almost nothing against a 36ms render, long enough to span a progressive mount.
+  const QUIET_MS = 250;
+  let stableSince = 0, lastCount = -1;
   let first = true;
   while (Date.now() < deadline) {
     if (!first) await new Promise((r) => setTimeout(r, 25));
@@ -5933,15 +5937,32 @@ async function atsInjOrcOpenEntryAndWait(blockTitlePattern, budgetMs) {
     // homonym — but even there it is now backed up by the input count, below.
     const live = [...block.querySelectorAll("input, textarea, select")]
       .filter((e) => e.type !== "hidden" && vis(e));
+    // ⚠⚠ WAIT FOR THE FIELD SET TO SETTLE, NOT FOR THE FIRST INPUT TO APPEAR (live 2026-09-17).
+    // This used to snapshot and `break` the instant `live.length > before` — i.e. on the first render
+    // tick. ORC mounts an entry form PROGRESSIVELY, so on Emerson's education entry that captured
+    // exactly THREE fields (educationalEstablishment, major, gpa) and never saw the rest. The entry
+    // then could not commit, because the required one it never scanned — Education Level — was left
+    // blank, and the refusal was undiagnosable: the field was not "skipped", it was invisible.
+    //
+    // This is the repo's own standing rule, unapplied here: a stability predicate must be TIMED
+    // ("unchanged for N ms"), never "the first change I noticed". First-change is the one predicate
+    // guaranteed to fire mid-render.
+    //
+    // Cheap for the same reason the dense polling above is cheap — these are real page timers inside
+    // an injected function, so the settle costs one quiet period, not a service-worker round trip.
+    // The snapshot is kept on every tick so a form still growing when the budget runs out still
+    // returns the fullest set seen, rather than nothing.
     if (live.length > before) {
+      if (live.length !== lastCount) { lastCount = live.length; stableSince = Date.now(); }
       fields = live.map((e) => ({ id: e.id || null, name: e.name || null, type: e.type,
         role: e.getAttribute("role") || null,
         label: (e.id ? t(document.querySelector('label[for="' + (window.CSS && CSS.escape ? CSS.escape(e.id) : e.id) + '"]')) : "") || e.getAttribute("aria-label") || "",
         value: e.value || null }));
-      break;
+      if (Date.now() - stableSince >= QUIET_MS) break;
     }
   }
-  return { ok: true, pressed: t(add), fields, count: fields.length };
+  return { ok: true, pressed: t(add), fields, count: fields.length,
+    settled: fields.length > 0 && Date.now() - stableSince >= QUIET_MS };
 }
 
 // ── THE RÉSUMÉ IS ALWAYS REMOVED AND REPLACED ON A REPLAY (operator, 2026-08-21) ─────────────
