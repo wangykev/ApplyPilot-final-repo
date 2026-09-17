@@ -5442,6 +5442,17 @@ async function runOrcPreForm(tabId, credentials, opts) {
   const gmailEnabled = !!o.gmailEnabled;
   const MAX_ROUNDS = 10;
   const MAX_CODE_TRIES = 2;   // a fresh code costs an email round-trip; two is enough to survive one stale one
+  // ⚠⚠ THE CODE'S FRESHNESS FLOOR IS THE START OF THIS RUN, NOT THE CODE SCREEN (2026-09-17).
+  // Oracle sends the mail when the EMAIL step is submitted, and the code view is only recognised on
+  // the next round — measured "email step submitted → page changed after 730ms". A floor taken at the
+  // code screen is therefore ~a second LATE, so a fast-delivered code can carry an internalDate just
+  // before the floor and be discarded as stale forever, with the run then waiting minutes for a
+  // replacement that Oracle has no reason to send. Gmail's internalDate is Google's receive time, not
+  // ours, so there is no safety margin to rely on either.
+  // A run-scoped floor keeps the property the guard exists for — "no code that predates THIS run",
+  // which still refuses the stale codes an ORC inbox accumulates, one per apply attempt per tenant —
+  // while accepting every code this run actually caused, including one sent the instant we asked.
+  const runT0 = Date.now();
   const halt = (stopped, detail, extra) => {
     LOG(`⛔ ${stopped} — ${detail}`);
     return { halt: { ok: true, needs_operator: true, stopped, detail, ...(extra || {}) } };
@@ -5724,14 +5735,13 @@ async function runOrcPreForm(tabId, credentials, opts) {
       const CODE_WAIT_MS = 150000;     // first wait; the code is valid for 10 minutes
       const RESEND_WAIT_MS = 120000;   // each wait after a resend
       const MAX_RESENDS = 2;
-      const codeStageT0 = Date.now();
       let got = null, resends = 0, waitedTotal = 0;
       for (;;) {
         const wT0 = Date.now();
         const found = await gmailFindVerificationCode({
           token: tok.token, length: s.pinInputs || 6,
           timeoutMs: resends ? RESEND_WAIT_MS : CODE_WAIT_MS,
-          notBeforeMs: codeStageT0,
+          notBeforeMs: runT0,
         });
         waitedTotal += Date.now() - wT0;
         if (!found.ok && (found.status === 401 || found.status === 403)) {

@@ -120,8 +120,15 @@ test("⚠ the ORC caller waits minutes, not 30s, and fixes ONE absolute floor", 
     .split("\n").map((l) => l.replace(/\/\/[^\r\n]*/, "")).join("\n");
   const bg = strip(fs.readFileSync(path.join(__dirname, "..", "background.js"), "utf8"));
   assert.match(bg, /const CODE_WAIT_MS = 150000;/, "the code is valid 10 minutes — 30s was self-imposed");
-  assert.match(bg, /const codeStageT0 = Date\.now\(\);/, "one floor per code stage");
-  assert.match(bg, /notBeforeMs: codeStageT0/, "and it is passed as an ABSOLUTE instant");
+  assert.match(bg, /notBeforeMs: runT0/, "an ABSOLUTE instant, and a RUN-scoped one");
   assert.ok(!/sinceMs: Date\.now\(\) - resendAt/.test(bg),
     "the ~0ms per-press lookback must not come back");
+  // ⚠ The floor must be taken at the START OF THE RUN, not when the code screen is recognised.
+  // Oracle mails the code on the EMAIL step, and the code view is only seen on the next round
+  // (measured: "email step submitted → page changed after 730ms"), so a code-screen floor is ~a
+  // second late and can discard a fast-delivered code as stale forever.
+  const runFloor = bg.indexOf("const runT0 = Date.now();");
+  const codeBranch = bg.indexOf('if (view === "code")');
+  assert.ok(runFloor > 0 && codeBranch > 0, "both the run floor and the code branch must exist");
+  assert.ok(runFloor < codeBranch, "the floor is fixed BEFORE the code screen is ever reached");
 });
