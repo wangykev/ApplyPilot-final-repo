@@ -6582,6 +6582,9 @@ async function atsOrcDeleteTileAt(act, spec, index, log) {
 // back as the sole candidate. No display-string parsing, and nothing is re-derived.
 async function atsOrcAddApprovedEntry(act, spec, idx, emap, valueFor, log) {
   const records = [];
+  // Entry fields the form offered that the approved bundle had no value for. Oracle refuses an entry
+  // when a REQUIRED one of these is blank, so this list is where the cause of a refusal lives.
+  const skipped = [];
   const get = (fieldName, wt) => {
     try { return valueFor({ fieldName, entrySection: spec.source, entryIndex: idx, widgetType: wt || "text" }); }
     catch (e) { return undefined; }
@@ -6651,7 +6654,15 @@ async function atsOrcAddApprovedEntry(act, spec, idx, emap, valueFor, log) {
     const f = group[0];
     if (!f.id) continue;
     const want = get(spec.source + "[" + idx + "]." + key, f.role === "combobox" ? "dropdown" : "text");
-    if (want === undefined || !String(want).trim()) continue;
+    // ⚠⚠ RECORD WHAT WE SKIPPED. Oracle refuses an entry when a REQUIRED field inside it is blank,
+    // and a field with no approved value is skipped silently here — so the refusal could not name a
+    // cause. The fill path already learned this exact lesson (see its "LOG EVERY ENTRY FIELD'S
+    // OUTCOME" note: an unnamed refusal "is unactionable"); the restore path never got it, which is
+    // why an Emerson education entry failed with nothing to act on.
+    if (want === undefined || !String(want).trim()) {
+      skipped.push((f.label || key) + " [" + key + (f.role === "combobox" ? ", picker" : "") + "]");
+      continue;
+    }
     const flat = String(Array.isArray(want) ? want[0] : want).trim();
     let after = null;
     if (f.role === "combobox") {
@@ -6685,8 +6696,25 @@ async function atsOrcAddApprovedEntry(act, spec, idx, emap, valueFor, log) {
   if (!done || !done.ok || !done.closed) {
     const why = (done && done.error) || "Oracle refused the entry (a required field in it is unanswered)";
     log("⛔ " + tag + ": filled " + wrote + " field(s) from your approved review but the entry would NOT commit — " + why);
+    // ⚠⚠ SAY WHAT THE ENTRY ACTUALLY LOOKED LIKE. The fill path prints every entry field's outcome
+    // and notes its unmapped ones, and its comment explains why: without that, "Oracle refused the
+    // entry" is unactionable and cannot be diagnosed in one run. The restore path printed only the
+    // refusal, so an Emerson education entry failed three times over saying nothing useful. Oracle
+    // refuses on a blank REQUIRED entry field, so the skipped list below is where the cause is.
+    for (const r of records) {
+      log(`  ${r.fieldName} (${r.widgetType}) → ${r.status}${r.flag ? " · " + r.flag : ""}`
+        + `${r.after != null ? " · after=" + JSON.stringify(String(r.after).slice(0, 60)) : ""}`
+        + `${r.detail ? " · " + r.detail : ""}`);
+    }
+    if (skipped.length) {
+      log("  ⚠ the entry form ALSO offered these field(s), which your approved review had no value for "
+        + "— a REQUIRED one among them is the likely refusal: " + skipped.join(", "));
+    } else {
+      log("  (every field the entry form offered had an approved value, so the refusal is not a blank "
+        + "required entry field — look at the values themselves)");
+    }
     await act.eval(atsInjOrcEntryAction, spec.pattern, "cancel").catch(() => null);
-    return { ok: false, error: why, records, wrote, failed };
+    return { ok: false, error: why, records, wrote, failed, skipped };
   }
   log("✔ " + tag + ": RESTORED from your approved review — " + wrote + " field(s) written"
     + (failed ? ", " + failed + " could not be set" : ""));
