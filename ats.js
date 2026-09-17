@@ -3560,17 +3560,29 @@ function atsInjSubmitState(ats, scroll) {
   // duplicate-application hazard. This is the same rule this repo already learned on Workday's résumé
   // upload: role="alert" is the STATUS channel, not an error channel.
   //
-  // ⚠ TWO SIGNALS, AND SCOPED TO ORACLE, because the dangerous direction here is the OPPOSITE of the
-  // error read's. A false "confirmed" reports an application as filed when it is not, and the operator
-  // then never re-applies — a silently lost application, worse than a false refusal they can retry.
-  // So this requires the completion phrase AND corroboration that the form is actually done with
-  // (its Submit is gone, or it announced the save), and it never widens the generic wordings.
-  const orcConfirmed = ats === "oracle"
-    && /you'?re all set\b/i.test(bodyText)
-    && (!btn || /\bsaved\b/i.test(bodyText));
+  // ⚠⚠ "YOU'RE ALL SET" IS **NOT** A CONFIRMATION ON ORC — REFUTED BEFORE IT SHIPPED (2026-09-17).
+  // My first attempt at this added an oracle branch treating "you're all set" plus a "Saved"
+  // announcement as a confirmation. A second captured refusal killed it:
+  //
+  //     · You're all set, Kevin!
+  //     · Creating candidate info Saving job application info
+  //     · Your application couldn't be submitted. Try again.
+  //     · Saved
+  //
+  // The completion phrase and the save announcement sit RIGHT NEXT TO an explicit failure. So
+  // "You're all set" is the final step's HEADING and "Saved" refers to saving candidate info — not
+  // to the application being accepted. Two signals that co-occur with failure are not two signals.
+  //
+  // That is why nothing is added here. A false `confirmed` reports an application as filed when it
+  // is not, and the operator then never re-applies — a silently lost application, strictly worse
+  // than a refusal they can retry. Until ORC's real confirmation surface has been TRACED, the honest
+  // outcome for an ambiguous ORC page is the loop's existing `no-confirmation` halt, which says what
+  // the page looked like and asks the operator to look.
+  //
+  // What DID need fixing is the other half: the error read was harvesting those same status lines as
+  // validation errors. See the status-text exclusion in atsInjErrors.
   const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText)
-    || /\/(thanks|confirmation)(\?|$)/.test(location.href)
-    || orcConfirmed;
+    || /\/(thanks|confirmation)(\?|$)/.test(location.href);
   return { ok: true, hasSubmit: !!btn, hasFlowControl: !!flowNext,
     flowCaption: flowNext ? (flowNext.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30) : null,
     rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
@@ -3715,11 +3727,35 @@ function atsInjErrors(ats) {
   const sels = ats === "greenhouse" ? '[class*="error" i][class*="field" i], [id$="-error"], [role="alert"]'
     : ats === "lever" ? '.application-question.invalid, [class*="error" i], [role="alert"]'
       : '[class*="error" i], [role="alert"]';
+  // ⚠⚠ `role="alert"` IS THE STATUS CHANNEL, NOT AN ERROR CHANNEL (live 2026-09-17, Oracle).
+  // This repo already learned that on Workday's résumé upload, where announcing upload PROGRESS
+  // through role=alert produced a false `resume-not-attached` halt on a healthy upload. The same
+  // assumption sat here for every non-Greenhouse/Lever ATS, and ORC announces save progress the
+  // same way — so a submit was "refused" while quoting the page's own progress text:
+  //
+  //     submit refused — validation errors:
+  //       · You're all set, Kevin!
+  //       · Saving candidate info Saving job application info
+  //       · Saved
+  //
+  // A refusal built out of that is not evidence of anything. It also suppresses reportApplication,
+  // so the tracker keeps `needs_review` for a run whose real outcome is unknown.
+  //
+  // ⚠ NARROWED BY TEXT, NOT BY DROPPING THE SELECTOR. On some tenants role=alert is the ONLY error
+  // channel, so removing it would blind the gate. A line is discarded only when it READS as pure
+  // status AND carries no failure cue — the FAILURE_CUE half is load-bearing, because ORC renders
+  // real failures in the very same live region ("Your application couldn't be submitted. Try
+  // again." arrived alongside "Saved"). Anything uncertain is KEPT: an over-reported error costs a
+  // retry, a swallowed one would submit into a form the employer rejects.
+  const STATUS_LEAD = /^(you'?re all set\b|sav(ed|ing)\b|creating\b|submitting\b|uploading\b|loading\b|process(ing)?\b)/i;
+  const FAILURE_CUE = /could ?n'?t|can ?not|can't|unable|error|invalid|required|missing|try again|flagged|correction|issue|failed|must /i;
   const out = [];
   for (const el of document.querySelectorAll(sels)) {
     if (!vis(el)) continue;
     const t = (el.textContent || "").replace(/\s+/g, " ").trim();
-    if (t && t.length < 300 && !out.includes(t)) out.push(t);
+    if (!t || t.length >= 300 || out.includes(t)) continue;
+    if (STATUS_LEAD.test(t) && !FAILURE_CUE.test(t)) continue;   // progress, not a problem
+    out.push(t);
   }
   return { ok: true, errors: out.slice(0, 20) };
 }
