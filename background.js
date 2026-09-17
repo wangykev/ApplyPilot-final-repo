@@ -5752,9 +5752,14 @@ async function runOrcPreForm(tabId, credentials, opts) {
         const rs = await cdpEval(atsInjOrcClickButton, "^(send new code|resend|send another code|send code again)\\b", null)
           .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
         if (!rs || !rs.ok) {
+          // ⚠ CARRY THE GMAIL DIAGNOSTIC ONTO THIS BRANCH TOO (2026-09-17). This path used to report
+          // only "no resend control", discarding `found.error` — which is the half that says whether
+          // mail ARRIVED and could not be read, versus never arrived at all. Losing it here is how a
+          // run reports a button problem when the real story is in the inbox.
           return halt("verification-code-not-received",
-            `No code arrived in ${(waitedTotal / 1000).toFixed(0)}s and this gate offers no "Send New Code" `
-            + `control to press${rs && rs.error ? ` (${rs.error})` : ""} — type the code yourself and re-run.`);
+            `No code arrived in ${(waitedTotal / 1000).toFixed(0)}s (${found.error}) and this gate offers no `
+            + `"Send New Code" control to press${rs && rs.error ? ` (${rs.error})` : ""} — type the code `
+            + "yourself and re-run.");
         }
         resends++;
         LOG(`no code after ${(waitedTotal / 1000).toFixed(0)}s — pressed ${JSON.stringify(rs.caption || "Send New Code")} `
