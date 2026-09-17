@@ -498,14 +498,30 @@ async function gmailFindVerificationCode(opts) {
   const pollMs = o.pollMs != null ? o.pollMs : 5000;
   const sinceMs = o.sinceMs != null ? o.sinceMs : 300000;
   const maxResults = o.maxResults || 10;
+  // Same default the extractor uses — referenced only by the diagnostic message below.
+  const len = Number(o.length) > 0 ? Number(o.length) : 6;
   // Oracle's candidate mail comes from the tenant's Fusion pod, so the SENDER is as unreliable as
   // Workday's was. Key on tokens the body/subject carry instead, and let the code extractor's own
   // guards be the decisive filter.
   const q = o.query || ("newer_than:1h (oraclecloud OR oracle OR \"verification code\" OR \"Confirm Your Identity\")");
 
   const start = now();
-  const cutoffMs = start - sinceMs;
+  // ⚠⚠ PREFER AN ABSOLUTE FLOOR (`notBeforeMs`) OVER THE RELATIVE LOOKBACK (2026-09-17).
+  // `sinceMs` is a DURATION subtracted from the moment polling starts, which makes it wrong for the
+  // caller that needs it most. The ORC gate passed `Date.now() - resendAt` immediately after setting
+  // `resendAt = Date.now()`, so the lookback was ~0ms and the floor collapsed onto "this instant" —
+  // and it was recomputed on every press, marching forward each time. Gmail's search index also lags
+  // a live delivery by seconds, so a floor that moves with each poll is the one thing you cannot
+  // afford. An absolute instant, fixed once when the code STAGE began, is what the alnum sibling
+  // already uses (`notBeforeMs`) and it is the right shape: "no code that predates this run".
+  const cutoffMs = o.notBeforeMs != null ? Number(o.notBeforeMs) : (start - sinceMs);
   let lastErr = null;
+  // ⚠ COUNTERS, BECAUSE THE TWO FAILURES WERE INDISTINGUISHABLE. "No mail arrived" and "mail arrived
+  // and every message failed extraction" both produced the byte-identical
+  // "no verification code found within Ns", which cost a whole debugging round: the operator could
+  // see the emails in their inbox while the log insisted nothing was found. Never log the code or the
+  // body — a count and a subject are enough to tell the two apart.
+  let seen = 0, stale = 0, unparsed = 0, lastSubject = null;
 
   while (now() - start < timeoutMs) {
     const list = await gmailApiGet(o.token, "/messages?q=" + encodeURIComponent(q) + "&maxResults=" + maxResults, fetchFn);
@@ -521,16 +537,29 @@ async function gmailFindVerificationCode(opts) {
         else if (full.status === 401 || full.status === 403) return full;
       }
       msgs.sort((a, b) => Number(b.internalDate || 0) - Number(a.internalDate || 0)); // newest first
+      seen = msgs.length;
       for (const m of msgs) {
-        if (Number(m.internalDate || 0) < cutoffMs) continue; // stale — see the note above
+        if (Number(m.internalDate || 0) < cutoffMs) { stale++; continue; } // predates this run — see above
         const code = gmailExtractVerificationCode(gmailExtractBodyText(m.payload), o);
-        if (code) return { ok: true, code, messageId: m.id, internalDate: Number(m.internalDate || 0) };
+        if (code) return { ok: true, code, messageId: m.id, internalDate: Number(m.internalDate || 0), seen, stale };
+        unparsed++;
+        const hs = ((m.payload && m.payload.headers) || []).find((h) => /^subject$/i.test(h.name || ""));
+        if (hs && hs.value) lastSubject = String(hs.value).slice(0, 80);
       }
     }
     if (now() - start + pollMs >= timeoutMs) break;
     await sleep(pollMs);
   }
-  return { ok: false, error: lastErr ? ("Gmail lookup failed: " + (lastErr.error || lastErr.status)) : "no verification code found within " + Math.round(timeoutMs / 1000) + "s" };
+  if (lastErr) return { ok: false, error: "Gmail lookup failed: " + (lastErr.error || lastErr.status), seen, stale, unparsed };
+  // Say WHICH of the two failures this was, so the next person does not have to guess.
+  const why = unparsed
+    ? `${unparsed} matching message(s) arrived but no ${len}-digit code could be read from them`
+      + (lastSubject ? ` (latest subject: ${JSON.stringify(lastSubject)})` : "")
+    : stale
+      ? `${stale} matching message(s) found but all predate this run — no NEW code was sent`
+      : "no matching message arrived at all";
+  return { ok: false, seen, stale, unparsed,
+    error: `no verification code found within ${Math.round(timeoutMs / 1000)}s: ${why}` };
 }
 
 function gmailGetToken(interactive) {

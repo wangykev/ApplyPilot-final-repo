@@ -5449,7 +5449,9 @@ async function runOrcPreForm(tabId, credentials, opts) {
   const consentsAccepted = [];
   let codeTries = 0;
   let decoysSeen = 0;
-  let resendAt = 0;   // when we last pressed "Send New Code" — see the code branch's sinceMs guard
+  // (There used to be a `resendAt` here, feeding a per-press lookback into the Gmail poll. The code
+  // branch now fixes an ABSOLUTE floor once per code stage instead — see the note there for why a
+  // floor that moved with each press could exclude the very code the press had just asked for.)
   // ⚠⚠ A REJECTED AUTH STEP MUST BACK OFF, NOT HAMMER (live 2026-08-21). Observed: Oracle answered the
   // email step with its OWN server error — "Failed to lock the record in table IRC_ACCESS_TOKENS …
   // another user holds the lock", a row lock left by the PREVIOUS run's candidate session — and this
@@ -5700,15 +5702,36 @@ async function runOrcPreForm(tabId, credentials, opts) {
       // says how long it waited and how many codes it asked for.
       // ⚠ AND EACH WAIT AFTER A RESEND ONLY ACCEPTS MAIL NEWER THAN THE PRESS (`sinceMs`), so a stale
       // code from an earlier attempt cannot be typed into a gate that has already invalidated it.
-      const CODE_WAIT_MS = 30000;      // the operator's number
+      // ⚠⚠ 30s WAS FAR TOO SHORT, AND THE RESENDS MADE IT WORSE (live 2026-09-17, Emerson/ORC).
+      // Measured against the operator's own inbox: each "Send New Code" press produced mail about a
+      // MINUTE later (presses at ~30s and ~60s; mail timestamped 3:06pm and 3:07pm). With a 30s
+      // window the run chased its own tail — wait 30s, give up, resend, the previous code lands after
+      // the window closed, resend again, halt at 91s — while three perfectly good codes sat in the
+      // inbox. Oracle's own gate says so on screen: "Note that it may take some time before you
+      // receive the code."
+      //
+      // And there is no reason to hurry: the mail states "This code will expire in 10 minutes", so
+      // the budget was self-imposed. WAIT first, resend only as a genuine fallback for the case the
+      // resend logic was actually written for — ORC sometimes never sending the first mail at all.
+      //
+      // ⚠ THE FLOOR IS NOW ABSOLUTE AND FIXED ONCE (`codeStageT0`), not recomputed per press. It used
+      // to pass `Date.now() - resendAt` as a LOOKBACK straight after setting `resendAt = Date.now()`
+      // — a ~0ms window that marched forward on every resend, so a code delivered moments later could
+      // be excluded by the very press that asked for it. Gmail's search index also lags a live
+      // delivery, which a moving floor cannot tolerate. An absolute "nothing older than this run"
+      // floor still refuses the stale codes this guard exists for (the operator's inbox held one from
+      // 54 minutes earlier), while accepting every code this run caused.
+      const CODE_WAIT_MS = 150000;     // first wait; the code is valid for 10 minutes
+      const RESEND_WAIT_MS = 120000;   // each wait after a resend
       const MAX_RESENDS = 2;
+      const codeStageT0 = Date.now();
       let got = null, resends = 0, waitedTotal = 0;
       for (;;) {
         const wT0 = Date.now();
         const found = await gmailFindVerificationCode({
-          token: tok.token, length: s.pinInputs || 6, timeoutMs: CODE_WAIT_MS,
-          // After a resend, ignore anything older than that press.
-          ...(resends ? { sinceMs: Date.now() - resendAt } : {}),
+          token: tok.token, length: s.pinInputs || 6,
+          timeoutMs: resends ? RESEND_WAIT_MS : CODE_WAIT_MS,
+          notBeforeMs: codeStageT0,
         });
         waitedTotal += Date.now() - wT0;
         if (!found.ok && (found.status === 401 || found.status === 403)) {
@@ -5734,9 +5757,9 @@ async function runOrcPreForm(tabId, credentials, opts) {
             + `control to press${rs && rs.error ? ` (${rs.error})` : ""} — type the code yourself and re-run.`);
         }
         resends++;
-        resendAt = Date.now();
-        LOG(`no code in ${(CODE_WAIT_MS / 1000).toFixed(0)}s — pressed ${JSON.stringify(rs.caption || "Send New Code")} `
-          + `(${resends}/${MAX_RESENDS}) and waiting again; only mail newer than this press will be accepted`);
+        LOG(`no code after ${(waitedTotal / 1000).toFixed(0)}s — pressed ${JSON.stringify(rs.caption || "Send New Code")} `
+          + `(${resends}/${MAX_RESENDS}) and waiting ${(RESEND_WAIT_MS / 1000).toFixed(0)}s more; any code sent since this `
+          + "run's code step began is still accepted, so a mail already in flight is not thrown away");
       }
       // The code is NEVER logged — only that one was found, and how old it was.
       LOG(`got a verification code from Gmail (message ${got.messageId}, ${Math.max(0, Math.round((Date.now() - got.internalDate) / 1000))}s old) — entering it`);
