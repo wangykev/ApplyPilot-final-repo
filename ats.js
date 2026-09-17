@@ -3542,8 +3542,35 @@ function atsInjSubmitState(ats, scroll) {
   // `…/jobs/4823924101/confirmation`. Only `/thanks` was matched here, so the URL signal was dead on
   // Greenhouse and detection rested entirely on body text. That is a needlessly narrow gate for the
   // one question this function exists to answer.
+  // ⚠⚠ ORACLE DOES NOT SAY "THANK YOU FOR APPLYING" — IT SAYS "YOU'RE ALL SET" (live 2026-09-17).
+  // None of the wordings above appear on ORC's post-submission screen, so `confirmed` stayed FALSE on
+  // a successful submit. The outcome loop checks confirmation FIRST and errors LAST precisely so a
+  // success can never be read as a failure — but that ordering only helps if success is RECOGNISED.
+  // With it unrecognised, the loop fell through to the error read, which matches `[role="alert"]`, and
+  // ORC announces save progress through ARIA live regions. The result, captured verbatim off a FILED
+  // Oracle application:
+  //
+  //   submit refused — validation errors:
+  //     · You're all set, Kevin!
+  //     · Saving candidate info Saving job application info
+  //     · Saved
+  //
+  // So a submitted application returned stopped:"validation-errors", reportApplication never ran, and
+  // the tracker row stayed `needs_review` — a filed application that looks unsent, which is the
+  // duplicate-application hazard. This is the same rule this repo already learned on Workday's résumé
+  // upload: role="alert" is the STATUS channel, not an error channel.
+  //
+  // ⚠ TWO SIGNALS, AND SCOPED TO ORACLE, because the dangerous direction here is the OPPOSITE of the
+  // error read's. A false "confirmed" reports an application as filed when it is not, and the operator
+  // then never re-applies — a silently lost application, worse than a false refusal they can retry.
+  // So this requires the completion phrase AND corroboration that the form is actually done with
+  // (its Submit is gone, or it announced the save), and it never widens the generic wordings.
+  const orcConfirmed = ats === "oracle"
+    && /you'?re all set\b/i.test(bodyText)
+    && (!btn || /\bsaved\b/i.test(bodyText));
   const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText)
-    || /\/(thanks|confirmation)(\?|$)/.test(location.href);
+    || /\/(thanks|confirmation)(\?|$)/.test(location.href)
+    || orcConfirmed;
   return { ok: true, hasSubmit: !!btn, hasFlowControl: !!flowNext,
     flowCaption: flowNext ? (flowNext.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30) : null,
     rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,
