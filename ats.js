@@ -10164,7 +10164,29 @@ async function atsFillFields(act, ats, scan, fields, results, profile, defaults,
       // tier instead, which reads the stored credentials directly — the same source the fill used.
       if (o.valueFor && !atsCredentialKind(ats, f)) {
         const v = o.valueFor(f);
-        if (v === undefined) { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(fin()); continue; }
+        // ⚠⚠ A FILE FIELD IS EXEMPT FROM THIS SKIP, FOR THE SAME REASON A CREDENTIAL IS (live 2026-09-17).
+        // A bundle NEVER carries file bytes, so "does the bundle have a value for this field?" is the
+        // wrong question to ask about the résumé — its bytes come from IndexedDB on every visit, exactly
+        // like a credential comes from storage on every visit. The file branch below already knows this:
+        // it ignores `v` entirely and routes through `atsRouteField`, which maps exactly one field to the
+        // résumé. That routing was simply UNREACHABLE whenever the bundle had no entry under the live
+        // field's name, because this early skip fired first.
+        //
+        // WHAT IT COST, on Oracle's "OCI Software Engineer Intern - OVIP" armed submit:
+        //   résumé: removed "Kevin's Resume.pdf Remove" so it can be re-uploaded
+        //   resume-upload (file_upload, req) → skipped · no approved entry for this field
+        // The remove-and-replace pass (atsInjOrcResumeReset) deliberately REMOVES the attached résumé so
+        // the file input comes back — its own comment says "after which the ORDINARY field loop attaches
+        // it". The ordinary loop then skipped it, and the form was submitted with NO résumé on a required
+        // slot. So the reset left the form strictly WORSE than if it had never run: before it there was a
+        // résumé attached, after it there was none.
+        //
+        // The name mismatch is the trigger and is expected to recur: ORC renders the ATTACHED state on a
+        // re-visit and the upload control only after the remove, so the field the replay meets
+        // (`resume-upload`) need not be the one the fill recorded. Keying the résumé on a bundle entry
+        // therefore cannot work on this platform. A non-résumé file field still ends up skipped, just one
+        // line later and with a truer reason ("a file field that is not the résumé").
+        if (v === undefined && f.widgetType !== "file_upload") { rec.status = "skipped"; rec.detail = "no approved entry for this field"; results.push(fin()); continue; }
         // ⚠⚠ A REHEARSAL READS BEFORE IT WRITES (operator, 2026-08-21): "the rehearsal run should not
         // refill if it is correct. you can get all the information by looking at the page."
         //

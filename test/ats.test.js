@@ -4598,7 +4598,12 @@ test("the replay skips actuation when the form already holds the approved value"
   const src = fs.readFileSync(require("node:path").join(__dirname, "..", "ats.js"), "utf8");
   const i = src.indexOf('if (o.valueFor && !atsCredentialKind(ats, f))');
   assert.ok(i > 0, "the replay branch must exist");
-  const branch = stripJsComments(src.slice(i, i + 4200));   // wide enough to include the fall-through
+  // Wide enough to include the fall-through. ⚠ Widened 4200 → 6400 on 2026-09-17: the file-field
+  // exemption added to the `v === undefined` skip (see test/ats-replay-resume-exempt.test.js) carries
+  // a long note at the TOP of this branch, which pushed `rec.resolved` out of the old window and
+  // failed this test for reasons that had nothing to do with what it asserts. A window measured from
+  // the branch start is sensitive to anything inserted above the lines under test.
+  const branch = stripJsComments(src.slice(i, i + 6400));
 
   assert.ok(/tier = "already-correct"/.test(branch),
     "a field the form already holds must be recorded verified rather than rewritten");
