@@ -3573,16 +3573,33 @@ function atsInjSubmitState(ats, scroll) {
   // "You're all set" is the final step's HEADING and "Saved" refers to saving candidate info — not
   // to the application being accepted. Two signals that co-occur with failure are not two signals.
   //
-  // That is why nothing is added here. A false `confirmed` reports an application as filed when it
-  // is not, and the operator then never re-applies — a silently lost application, strictly worse
-  // than a refusal they can retry. Until ORC's real confirmation surface has been TRACED, the honest
-  // outcome for an ambiguous ORC page is the loop's existing `no-confirmation` halt, which says what
-  // the page looked like and asks the operator to look.
+  // …so the completion phrase ALONE is worthless. What makes it usable is the OTHER half of the pair.
   //
-  // What DID need fixing is the other half: the error read was harvesting those same status lines as
-  // validation errors. See the status-text exclusion in atsInjErrors.
+  // ── ORC CONFIRMATION, NOW GROUND-TRUTHED (operator, 2026-09-17) ────────────────────────────────
+  // Two live samples of the SAME page, one filed and one not, differing by exactly one line:
+  //
+  //   FILED      · You're all set, Kevin!  · Saving candidate info…  · Saved
+  //   NOT FILED  · You're all set, Kevin!  · Creating candidate info…
+  //              · Your application couldn't be submitted. Try again.   · Saved
+  //
+  // The filed one was verified independently, which is what licenses this rule at all: Oracle's own
+  // candidate portal lists "OCI Software Engineer Intern - OVIP … Oracle 334325 Applied on
+  // 09/17/2026, Status New", and the confirmation email arrived. Without that verification this stayed
+  // unimplemented on purpose — a false `confirmed` marks an application filed when it is not, and the
+  // operator never re-applies, which is strictly worse than a refusal they can retry.
+  //
+  // So confirmation is the save sequence WITH NO FAILURE ANYWHERE ON THE PAGE. The negative half is
+  // the load-bearing one: ORC renders its failures in the very same live region as its progress, so
+  // "we saw the save text" can only mean success once a failure has been ruled out. Scoped to oracle,
+  // and the generic wordings below are untouched.
+  const ORC_FAILURE = /could ?n'?t|can ?not\b|can't|unable|try again|flagged as possible spam|needs correction|this info is required|missing entry|add or modify/i;
+  const orcConfirmed = ats === "oracle"
+    && /you'?re all set\b/i.test(bodyText)
+    && /\bsaved\b/i.test(bodyText)
+    && !ORC_FAILURE.test(bodyText);
   const confirmed = /thank(s| you) for (applying|your application)|application (was |has been )?(submitted|received)|we('ve| have) received your application/i.test(bodyText)
-    || /\/(thanks|confirmation)(\?|$)/.test(location.href);
+    || /\/(thanks|confirmation)(\?|$)/.test(location.href)
+    || orcConfirmed;
   return { ok: true, hasSubmit: !!btn, hasFlowControl: !!flowNext,
     flowCaption: flowNext ? (flowNext.textContent || "").replace(/\s+/g, " ").trim().slice(0, 30) : null,
     rect: r ? { cx: Math.round(r.x + r.width / 2), cy: Math.round(r.y + r.height / 2), w: r.width } : null,

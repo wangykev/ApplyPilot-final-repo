@@ -102,10 +102,43 @@ test("⚠ the status filter needs BOTH halves — a status-leading line that nam
 
 // ── "You're all set" must NOT be a confirmation ──────────────────────────────────────────────────
 
-test("⚠⚠ 'You're all set' is NOT treated as a confirmation (the refuted fix)", () => {
-  const s = runSubmitState("You're all set, Kevin! Saving candidate info Saved");
+// ── ORC confirmation: the VERIFIED pair ─────────────────────────────────────────────────────────
+// These two are the same page, one filed and one not, differing by exactly one line. The filed one
+// was verified independently in Oracle's own candidate portal ("OCI Software Engineer Intern - OVIP
+// … Oracle 334325 Applied on 09/17/2026, Status New") plus the confirmation email — that external
+// check is what licenses detecting this at all.
+
+test("⚠⚠ the FILED ORC page confirms (save sequence, no failure anywhere)", () => {
+  const s = runSubmitState("You're all set, Kevin! Saving candidate info Saving job application info Saved");
+  assert.strictEqual(s.confirmed, true, "verified filed: Applied on 09/17/2026 in Oracle's portal");
+});
+
+test("⚠⚠ the NOT-FILED ORC page does NOT confirm — the failure line is the discriminator", () => {
+  const s = runSubmitState("You're all set, Kevin! Creating candidate info Saving job application info "
+    + "Your application couldn't be submitted. Try again. Saved");
   assert.strictEqual(s.confirmed, false,
-    "shape (c) proved this text co-occurs with failure — claiming submitted here loses an application");
+    "same completion + save text; only the failure line differs, so the negative half is load-bearing");
+});
+
+test("⚠ the completion phrase alone, with no save announced, is not a confirmation", () => {
+  assert.strictEqual(runSubmitState("You're all set, Kevin! Review your application.").confirmed, false);
+});
+
+test("⚠ every genuine ORC failure still blocks confirmation", () => {
+  for (const f of [
+    "Your application submission was flagged as possible spam.",
+    "Your form needs corrections Missing entry for required field: Where do you plan on working from?",
+    "Error: Please select a location from the dropdown menu and try again.",
+    "This info is required. (1 issue)",
+    "You need to add or modify some info before submitting your job application.",
+  ]) {
+    assert.strictEqual(runSubmitState("You're all set, Kevin! Saved " + f).confirmed, false,
+      `must not confirm alongside: ${f.slice(0, 44)}`);
+  }
+});
+
+test("⚠⚠ it is SCOPED to oracle — the same words on another ATS prove nothing", () => {
+  assert.strictEqual(runSubmitState("You're all set, Kevin! Saved", "greenhouse").confirmed, false);
 });
 
 test("⚠ the generic confirmation wordings are untouched", () => {
