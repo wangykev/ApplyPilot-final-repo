@@ -5183,8 +5183,24 @@ function atsInjOrcAuthScan() {
   // Every candidate list below is drawn from this, so a decoy can never become a selector.
   const shown = all.filter((e) => vis(e) && !isDecoy(e));
 
-  const pins = [...document.querySelectorAll('[id^="pin-code-"]')]
-    .filter((e) => !isDecoy(e))
+  // ⚠⚠ `input`, NOT ANY ELEMENT — THIS COUNT BECOMES THE EXPECTED CODE LENGTH (live 2026-09-17).
+  // The selector was a bare `[id^="pin-code-"]`, which matches the WRAPPER that shares the id prefix
+  // as well as the six boxes recon documented (`pin-code-1…6`). Measured on Emerson's gate:
+  // `pins=7`. That number is not cosmetic — it is passed to the Gmail poll as `length`, so the
+  // extractor searched for a SEVEN-digit code while Oracle mails a six-digit one:
+  //
+  //   43 matching message(s) arrived but no 7-digit code could be read from them
+  //   (latest subject: "Confirm your identity")
+  //
+  // i.e. the mail was arriving and being read the whole time, and one stray wrapper made every code
+  // unmatchable. It would also have had atsInjOrcFillPin typing a digit into a non-input.
+  //
+  // Restricted to real entry inputs and to non-hidden ones. ⚠ Deliberately NOT also filtered on
+  // visibility: this repo's own rule is that a box can be CSS-clipped and still be the real control
+  // (the Workday radio / ORC terms checkbox), so a `vis()` filter here could return 0 pins and make
+  // orcApplyView stop recognising the code screen at all — a worse failure than an inflated count.
+  const pins = [...document.querySelectorAll('input[id^="pin-code-"]')]
+    .filter((e) => !isDecoy(e) && String(e.type || "").toLowerCase() !== "hidden")
     .sort((a, b) => (parseInt(String(a.id).replace(/\D+/g, ""), 10) || 0) - (parseInt(String(b.id).replace(/\D+/g, ""), 10) || 0))
     .map((e) => "#" + esc(e.id));
 
